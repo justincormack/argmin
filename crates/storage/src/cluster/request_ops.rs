@@ -34,13 +34,13 @@ use crate::metadata_command::{
 };
 use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
-    complete_multipart_expected_object_parts, BucketWriteReservationNodeClient,
-    BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
-    BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
-    BuildDeleteSpecificObjectVersionCommandReq, BuildInsertDeleteMarkerCommandReq,
-    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
-    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
-    InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
+    BucketWriteReservationNodeClient, BuildCompleteMultipartObjectCommandReq,
+    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
+    BuildDeleteCurrentObjectCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
+    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
+    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
+    CreateStreamUploadPrecondition, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::traits::DurableBucketWriteReservationAcquire;
@@ -11967,6 +11967,18 @@ impl super::StorageCluster {
             return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         }
 
+        // Claim acquisition is the first durable mutation in this attempt. Capture one
+        // immutable request fence before discovery and carry it through claim insertion,
+        // command construction, and pending-slot installation so a same-epoch renewal
+        // cannot extend any stage independently.
+        let reclaim_effect_fence = self.current_route_effect_fence();
+        let reclaim_route = mutation_client.open_object_payload_reclaim_metadata_route(
+            self.operation_epoch(),
+            object_pg_id,
+            bucket,
+            key,
+            generation_id,
+        )?;
         let reclaim = {
             if self
                 .local_map
@@ -11977,8 +11989,8 @@ impl super::StorageCluster {
                 return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
             }
 
-            mutation_client
-                .get_object_payload_reclaim(object_pg_id, bucket, key, generation_id)
+            reclaim_route
+                .load_payload()
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
         };
 
@@ -12004,24 +12016,21 @@ impl super::StorageCluster {
                 Err(error) => return Err(error),
             }
         };
-        let reclaim_kind = reclaim.kind();
         let claim_id = self.next_object_payload_reclaim_claim_id()?;
         let owner_token = self.bucket_write_owner_token();
         let claimed_at = crate::clock::current_time_millis();
-        let claim = mutation_client
-            .acquire_object_payload_reclaim_claim(
-                object_pg_id,
-                bucket,
-                bucket_incarnation_generation,
-                key,
-                generation_id,
-                reclaim_kind,
-                &claim_id,
-                &owner_token,
-                self.operation_epoch(),
-                claimed_at,
-                claimed_at.checked_add(60_000),
-                claimed_at,
+        let claim = reclaim_route
+            .acquire_claim(
+                AcquireObjectPayloadReclaimClaimReq {
+                    reclaim_kind: reclaim.kind(),
+                    bucket_incarnation_generation,
+                    claim_id: &claim_id,
+                    owner_token: &owner_token,
+                    claimed_at,
+                    lease_deadline: claimed_at.checked_add(60_000),
+                    now: claimed_at,
+                },
+                reclaim_effect_fence,
             )
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
         let Some(claim) = claim else {
@@ -12029,16 +12038,6 @@ impl super::StorageCluster {
             return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
         };
         let reclaim_authority = ObjectPayloadReclaimClaimProof::from(&claim);
-        let reclaim_command_route = mutation_client
-            .open_object_payload_reclaim_command_metadata_route(
-                self.operation_epoch(),
-                object_pg_id,
-                bucket,
-                key,
-                generation_id,
-            )?;
-        let reclaim_effect_fence = self.current_route_effect_fence();
-
         let retained_reclaim_route = retained_mutation_client
             .open_retained_object_mutation_route(object_pg_id, self.operation_epoch(), bucket, key)
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
@@ -12116,14 +12115,13 @@ impl super::StorageCluster {
                     continue;
                 }
 
-                let command = match reclaim_command_route
-                    .build_delete_object_payload_reclaim_command(
-                        crate::node_client::BuildDeleteObjectPayloadReclaimCommandReq {
-                            payload: &reclaim,
-                            claim: &claim,
-                        },
-                        reclaim_effect_fence,
-                    ) {
+                let command = match reclaim_route.build_delete_object_payload_reclaim_command(
+                    crate::node_client::BuildDeleteObjectPayloadReclaimCommandReq {
+                        payload: &reclaim,
+                        claim: &claim,
+                    },
+                    reclaim_effect_fence,
+                ) {
                     Ok(command) => command,
                     Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
                         ..
@@ -16152,14 +16150,20 @@ impl super::StorageCluster {
                 });
                 continue;
             }
-            let reclaim_details = match node
+            let reclaim_route = node
                 .object_mutation_metadata_client()
-                .get_object_payload_reclaim(
+                .open_object_payload_reclaim_metadata_route(
+                    self.operation_epoch(),
                     self.object_metadata_pg(&root.bucket, &root.key),
                     &root.bucket,
                     &root.key,
                     root.generation_id,
-                ) {
+                );
+            let reclaim_details = match reclaim_route.and_then(|route| {
+                route
+                    .load_payload()
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
+            }) {
                 Ok(Some(reclaim)) => Some(Self::bucket_delete_debug_reclaim_details(&reclaim)),
                 Ok(None) => None,
                 Err(error) => {

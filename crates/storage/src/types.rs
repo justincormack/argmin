@@ -134,6 +134,31 @@ impl AdmittedRouteEffectFence {
         )
     }
 
+    pub(crate) fn intersect(self, other: Self) -> Result<Self, StoreError> {
+        if self.cluster_epoch != other.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: self.cluster_epoch,
+                operation_epoch: other.cluster_epoch,
+            });
+        }
+        let deadline = match (self.deadline, other.deadline) {
+            (None, None) => None,
+            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+            (Some(left), Some(right)) => Some(AdmittedRouteEffectDeadline {
+                authority_valid_until_ms: left
+                    .authority_valid_until_ms
+                    .min(right.authority_valid_until_ms),
+                local_valid_until_monotonic_ms: left
+                    .local_valid_until_monotonic_ms
+                    .min(right.local_valid_until_monotonic_ms),
+            }),
+        };
+        Ok(Self {
+            cluster_epoch: self.cluster_epoch,
+            deadline,
+        })
+    }
+
     pub(crate) fn deadline(self) -> Option<AdmittedRouteEffectDeadline> {
         self.deadline
     }

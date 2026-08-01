@@ -928,6 +928,7 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
                 "claim-a",
                 "owner-a",
                 ClusterEpoch::INITIAL,
+                AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 10,
                 Some(20),
                 10,
@@ -957,6 +958,7 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
             "claim-a",
             "owner-a",
             ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             10,
             Some(20),
             10,
@@ -978,6 +980,7 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
                 "claim-b",
                 "owner-b",
                 ClusterEpoch::INITIAL,
+                AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 11,
                 Some(30),
                 11,
@@ -997,6 +1000,7 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
             "claim-a",
             "owner-a",
             ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             12,
             Some(40),
             12,
@@ -1015,6 +1019,7 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
             "claim-b",
             "owner-b",
             ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             21,
             Some(40),
             21,
@@ -1072,6 +1077,75 @@ fn object_payload_reclaim_claim_is_single_owner_and_expires() {
 }
 
 #[test]
+fn object_payload_reclaim_claim_expiry_before_replacement_preserves_existing_claim() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 9).unwrap();
+    let bucket = trusted_bucket_name("claim-effect-expiry-bucket");
+    let key = trusted_object_key("object");
+    let generation_id = GenerationId::new(11).unwrap();
+    store
+        .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: 1,
+            segments: Vec::new(),
+        })
+        .unwrap();
+
+    let original = store
+        .acquire_object_payload_reclaim_claim(
+            &bucket,
+            3,
+            &key,
+            generation_id,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "claim-a",
+            "owner-a",
+            ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
+            1_000,
+            Some(1_500),
+            1_000,
+        )
+        .unwrap()
+        .expect("initial worker should acquire claim");
+
+    let clock = std::sync::Arc::new(crate::clock::test_time_override_guard(1_000));
+    let hook_clock = std::sync::Arc::clone(&clock);
+    store.test_install_before_object_payload_reclaim_claim_effect_check_hook(move || {
+        hook_clock.set(4_500);
+    });
+    let error = store
+        .acquire_object_payload_reclaim_claim(
+            &bucket,
+            3,
+            &key,
+            generation_id,
+            ObjectPayloadReclaimKind::ObjectSegments,
+            "claim-b",
+            "owner-b",
+            ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::bounded(ClusterEpoch::INITIAL, 5_000, 4_000),
+            2_000,
+            Some(3_000),
+            2_000,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        MetadataError::RouteEffectRejected {
+            source: StoreError::RouteMapExpired { .. }
+        }
+    ));
+    assert_eq!(
+        store.object_payload_reclaim_claim().unwrap(),
+        Some(original),
+        "expiry after reading an expired claim must roll back before deleting it"
+    );
+}
+
+#[test]
 fn object_payload_reclaim_claim_release_is_bucket_incarnation_fenced() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 10).unwrap();
@@ -1098,6 +1172,7 @@ fn object_payload_reclaim_claim_release_is_bucket_incarnation_fenced() {
             "claim",
             "owner",
             ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             10,
             None,
             10,
@@ -1166,6 +1241,7 @@ fn object_payload_reclaim_claim_does_not_clear_expired_different_root() {
             "claim-a",
             "owner-a",
             ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             10,
             Some(20),
             10,
@@ -1185,6 +1261,7 @@ fn object_payload_reclaim_claim_does_not_clear_expired_different_root() {
                 "claim-b",
                 "owner-b",
                 ClusterEpoch::INITIAL,
+                AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
                 21,
                 Some(40),
                 21,
@@ -1204,6 +1281,7 @@ fn object_payload_reclaim_claim_does_not_clear_expired_different_root() {
             "claim-a",
             "owner-a",
             ClusterEpoch::INITIAL,
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
             22,
             Some(50),
             22,
@@ -4414,6 +4492,7 @@ fn cluster_map_history_reference_summary_reports_payload_backfill_and_pending_co
             "history-floor-reclaim-claim",
             "history-floor-reclaim-owner",
             ClusterEpoch::new(1).unwrap(),
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap()),
             1,
             None,
             1,

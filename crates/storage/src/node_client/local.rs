@@ -165,7 +165,7 @@ struct LocalMultipartAbortMutationMetadataRoute<'a> {
     upload_id: UploadId,
 }
 
-struct LocalObjectPayloadReclaimCommandMetadataRoute<'a> {
+struct LocalObjectPayloadReclaimMetadataRoute<'a> {
     client: &'a LocalStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
@@ -3302,9 +3302,72 @@ impl MultipartAbortMutationMetadataRoute for LocalMultipartAbortMutationMetadata
     }
 }
 
-impl ObjectPayloadReclaimCommandMetadataRoute
-    for LocalObjectPayloadReclaimCommandMetadataRoute<'_>
-{
+impl ObjectPayloadReclaimMetadataRoute for LocalObjectPayloadReclaimMetadataRoute<'_> {
+    fn load_payload(&self) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        if let Some(reclaim) =
+            pg.get_object_segments_reclaim(&self.bucket, &self.key, self.generation_id)?
+        {
+            Ok(Some(ObjectPayloadReclaimCommand::Segments(reclaim)))
+        } else {
+            Ok(pg
+                .get_multipart_reclaim(&self.bucket, &self.key, self.generation_id)?
+                .map(ObjectPayloadReclaimCommand::Multipart))
+        }
+    }
+
+    fn acquire_claim(
+        &self,
+        request: AcquireObjectPayloadReclaimClaimReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        let routed_kind = if pg
+            .get_object_segments_reclaim(&self.bucket, &self.key, self.generation_id)?
+            .is_some()
+        {
+            Some(ObjectPayloadReclaimKind::ObjectSegments)
+        } else if pg
+            .get_multipart_reclaim(&self.bucket, &self.key, self.generation_id)?
+            .is_some()
+        {
+            Some(ObjectPayloadReclaimKind::Multipart)
+        } else {
+            None
+        };
+        let Some(routed_kind) = routed_kind else {
+            return Ok(None);
+        };
+        if routed_kind != request.reclaim_kind {
+            return Err(BucketSnapshotLoadError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "acquire object payload reclaim claim",
+                },
+            ));
+        }
+        match pg.acquire_object_payload_reclaim_claim(
+            &self.bucket,
+            request.bucket_incarnation_generation,
+            &self.key,
+            self.generation_id,
+            request.reclaim_kind,
+            request.claim_id,
+            request.owner_token,
+            self.route_cluster_epoch,
+            effect_fence,
+            request.claimed_at,
+            request.lease_deadline,
+            request.now,
+        ) {
+            Ok(claim) => Ok(claim),
+            Err(MetadataError::RouteEffectRejected { source }) => {
+                Err(BucketSnapshotLoadError::Store(source))
+            }
+            Err(error) => Err(BucketSnapshotLoadError::Metadata(error)),
+        }
+    }
+
     fn build_delete_object_payload_reclaim_command(
         &self,
         request: BuildDeleteObjectPayloadReclaimCommandReq<'_>,
@@ -3521,22 +3584,22 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
-    fn open_object_payload_reclaim_command_metadata_route(
+    fn open_object_payload_reclaim_metadata_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<Box<dyn ObjectPayloadReclaimCommandMetadataRoute + '_>, ObjectPgActionError> {
+    ) -> Result<Box<dyn ObjectPayloadReclaimMetadataRoute + '_>, ObjectPgActionError> {
         if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
             return Err(StoreError::RouteCapabilitySubjectMismatch {
-                operation: "open object payload reclaim command metadata route",
+                operation: "open object payload reclaim metadata route",
             }
             .into());
         }
         self.storage_node.require_open_pg(pg_id.get())?;
-        Ok(Box::new(LocalObjectPayloadReclaimCommandMetadataRoute {
+        Ok(Box::new(LocalObjectPayloadReclaimMetadataRoute {
             client: self,
             route_cluster_epoch,
             pg_id,
@@ -3692,53 +3755,11 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
         Self::get_payload_reclaim_root(self, pg_id)
     }
 
-    fn get_object_payload_reclaim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
-        Self::get_object_payload_reclaim(self, pg_id, bucket, key, generation_id)
-    }
-
     fn object_payload_reclaim_claim(
         &self,
         pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
         Self::object_payload_reclaim_claim(self, pg_id)
-    }
-
-    fn acquire_object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        reclaim_kind: ObjectPayloadReclaimKind,
-        claim_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        claimed_at: u64,
-        lease_deadline: Option<u64>,
-        now: u64,
-    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
-        Self::acquire_object_payload_reclaim_claim(
-            self,
-            pg_id,
-            bucket,
-            bucket_incarnation_generation,
-            key,
-            generation_id,
-            reclaim_kind,
-            claim_id,
-            owner_token,
-            cluster_epoch,
-            claimed_at,
-            lease_deadline,
-            now,
-        )
     }
 }
 
@@ -4704,65 +4725,12 @@ impl LocalStorageNodeClient {
         Ok(PgMetadataStore::get_payload_reclaim_root(&*pg)?)
     }
 
-    fn get_object_payload_reclaim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        if let Some(reclaim) =
-            PgMetadataStore::get_object_segments_reclaim(&*pg, bucket, key, generation_id)?
-        {
-            Ok(Some(ObjectPayloadReclaimCommand::Segments(reclaim)))
-        } else {
-            Ok(
-                PgMetadataStore::get_multipart_reclaim(&*pg, bucket, key, generation_id)?
-                    .map(ObjectPayloadReclaimCommand::Multipart),
-            )
-        }
-    }
-
     fn object_payload_reclaim_claim(
         &self,
         pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         Ok(PgMetadataStore::object_payload_reclaim_claim(&*pg)?)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn acquire_object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        reclaim_kind: ObjectPayloadReclaimKind,
-        claim_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        claimed_at: u64,
-        lease_deadline: Option<u64>,
-        now: u64,
-    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::acquire_object_payload_reclaim_claim(
-            &*pg,
-            bucket,
-            bucket_incarnation_generation,
-            key,
-            generation_id,
-            reclaim_kind,
-            claim_id,
-            owner_token,
-            cluster_epoch,
-            claimed_at,
-            lease_deadline,
-            now,
-        )?)
     }
 
     fn release_object_payload_reclaim_claim(

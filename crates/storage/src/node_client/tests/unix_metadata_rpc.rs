@@ -277,6 +277,7 @@ fn unix_storage_node_client_reads_cluster_map_history_reference_summary() {
             "unix-history-reclaim-claim",
             "unix-history-reclaim-owner",
             ClusterEpoch::new(2).unwrap(),
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(2).unwrap()),
             2,
             None,
             2,

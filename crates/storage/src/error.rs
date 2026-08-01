@@ -1163,6 +1163,12 @@ pub enum MetadataError {
     #[error("reclaim claim not found: {claim_id}")]
     ReclaimClaimNotFound { claim_id: String },
 
+    #[error("route effect fence rejected: {source}")]
+    RouteEffectRejected {
+        #[source]
+        source: StoreError,
+    },
+
     #[error("object not found")]
     ObjectNotFound,
 

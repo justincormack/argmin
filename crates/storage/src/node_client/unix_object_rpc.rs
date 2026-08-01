@@ -94,7 +94,7 @@ struct UnixMultipartAbortMutationMetadataRoute<'a> {
     upload_id: UploadId,
 }
 
-struct UnixObjectPayloadReclaimCommandMetadataRoute<'a> {
+struct UnixObjectPayloadReclaimMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
@@ -3229,7 +3229,108 @@ impl MultipartAbortMutationMetadataRoute for UnixMultipartAbortMutationMetadataR
     }
 }
 
-impl ObjectPayloadReclaimCommandMetadataRoute for UnixObjectPayloadReclaimCommandMetadataRoute<'_> {
+impl ObjectPayloadReclaimMetadataRoute for UnixObjectPayloadReclaimMetadataRoute<'_> {
+    fn load_payload(&self) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
+        let request = StorageRpcObjectPayloadReclaimExistsRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            generation_id: self.generation_id,
+        };
+        let payload = encode_object_payload_reclaim_exists_request(&request);
+        let response = self
+            .client
+            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimLoad, payload)
+            .map_err(BucketSnapshotLoadError::Store)?;
+        let response = decode_object_payload_reclaim_response(&response).map_err(|error| {
+            BucketSnapshotLoadError::Store(
+                self.client
+                    .rpc_payload_error("decode object payload reclaim response", error.to_string()),
+            )
+        })?;
+        if !reclaim_matches_bucket_key_generation(
+            response.reclaim.as_ref(),
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        ) {
+            return Err(BucketSnapshotLoadError::Store(
+                self.client.rpc_payload_error(
+                    "validate object payload reclaim response",
+                    "response reclaim payload does not match route".to_string(),
+                ),
+            ));
+        }
+        Ok(response.reclaim)
+    }
+
+    fn acquire_claim(
+        &self,
+        request: AcquireObjectPayloadReclaimClaimReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
+        effect_fence.require_valid_for(self.route_cluster_epoch)?;
+        let rpc_request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            bucket_incarnation_generation: request.bucket_incarnation_generation,
+            generation_id: self.generation_id,
+            reclaim_kind: request.reclaim_kind,
+            claim_id: request.claim_id.to_string(),
+            owner_token: request.owner_token.to_string(),
+            claimed_at: request.claimed_at,
+            lease_deadline: request.lease_deadline,
+            now: request.now,
+            effect_deadline: effect_fence.deadline().map(|deadline| {
+                StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }
+            }),
+        };
+        let payload =
+            encode_object_payload_reclaim_claim_acquire_request(&rpc_request).map_err(|error| {
+                BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
+                    "encode object payload reclaim claim acquire request",
+                    error.to_string(),
+                ))
+            })?;
+        let response = self.client.rpc_request_bucket_snapshot(
+            StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire,
+            payload,
+        )?;
+        let response = decode_object_payload_reclaim_claim_optional_record_response(&response)
+            .map_err(|error| {
+                BucketSnapshotLoadError::Store(self.client.rpc_payload_error(
+                    "decode object payload reclaim claim acquire response",
+                    error.to_string(),
+                ))
+            })?;
+        if let Some(record) = &response.record {
+            if record.bucket != self.bucket
+                || record.bucket_incarnation_generation != request.bucket_incarnation_generation
+                || record.key != self.key
+                || record.generation_id != self.generation_id
+                || record.reclaim_kind != request.reclaim_kind
+                || record.claim_id != request.claim_id
+                || record.owner_token != request.owner_token
+                || record.cluster_epoch != self.route_cluster_epoch
+                || record.pg_id != self.pg_id.get()
+                || record.claimed_at != request.claimed_at
+                || record.lease_deadline != request.lease_deadline
+            {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate object payload reclaim claim acquire response",
+                        "claim response identity does not match route request".to_string(),
+                    ),
+                ));
+            }
+        }
+        Ok(response.record)
+    }
+
     fn build_delete_object_payload_reclaim_command(
         &self,
         request: BuildDeleteObjectPayloadReclaimCommandReq<'_>,
@@ -4372,14 +4473,14 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         }))
     }
 
-    fn open_object_payload_reclaim_command_metadata_route(
+    fn open_object_payload_reclaim_metadata_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<Box<dyn ObjectPayloadReclaimCommandMetadataRoute + '_>, ObjectPgActionError> {
+    ) -> Result<Box<dyn ObjectPayloadReclaimMetadataRoute + '_>, ObjectPgActionError> {
         if route_cluster_epoch != self.cluster_epoch {
             return Err(StoreError::StaleMetadataOperation {
                 pg_id: pg_id.get(),
@@ -4388,7 +4489,7 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
             }
             .into());
         }
-        Ok(Box::new(UnixObjectPayloadReclaimCommandMetadataRoute {
+        Ok(Box::new(UnixObjectPayloadReclaimMetadataRoute {
             client: self,
             route_cluster_epoch,
             pg_id,
@@ -4724,41 +4825,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
         Ok(response.root)
     }
 
-    fn get_object_payload_reclaim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError> {
-        let pg_id = pg_id.pg_id();
-        let request = StorageRpcObjectPayloadReclaimExistsRequest {
-            object: self.object_request(pg_id, bucket, key),
-            generation_id,
-        };
-        let payload = encode_object_payload_reclaim_exists_request(&request);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectPayloadReclaimLoad, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_object_payload_reclaim_response(&response).map_err(|error| {
-            BucketSnapshotLoadError::Store(
-                self.rpc_payload_error("decode object payload reclaim response", error.to_string()),
-            )
-        })?;
-        if !reclaim_matches_bucket_key_generation(
-            response.reclaim.as_ref(),
-            bucket,
-            key,
-            generation_id,
-        ) {
-            return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                "validate object payload reclaim response",
-                "response reclaim payload does not match request".to_string(),
-            )));
-        }
-        Ok(response.reclaim)
-    }
-
     fn object_payload_reclaim_claim(
         &self,
         pg_id: ObjectMetadataScanPgId,
@@ -4784,80 +4850,6 @@ impl ObjectMutationMetadataNodeClient for UnixStorageNodeClient {
                 "validate object payload reclaim claim get response",
                 "claim response PG does not match request".to_string(),
             )));
-        }
-        Ok(response.record)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn acquire_object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        reclaim_kind: ObjectPayloadReclaimKind,
-        claim_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        claimed_at: u64,
-        lease_deadline: Option<u64>,
-        now: u64,
-    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError> {
-        let pg_id = pg_id.pg_id();
-        let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
-            object: StorageRpcObjectRequest {
-                node_id: self.node_id,
-                cluster_epoch,
-                pg_id,
-                bucket: bucket.clone(),
-                key: key.clone(),
-            },
-            bucket_incarnation_generation,
-            generation_id,
-            reclaim_kind,
-            claim_id: claim_id.to_string(),
-            owner_token: owner_token.to_string(),
-            claimed_at,
-            lease_deadline,
-            now,
-        };
-        let payload =
-            encode_object_payload_reclaim_claim_acquire_request(&request).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "encode object payload reclaim claim acquire request",
-                    error.to_string(),
-                ))
-            })?;
-        let response = self.rpc_request_bucket_snapshot(
-            StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire,
-            payload,
-        )?;
-        let response = decode_object_payload_reclaim_claim_optional_record_response(&response)
-            .map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode object payload reclaim claim acquire response",
-                    error.to_string(),
-                ))
-            })?;
-        if let Some(record) = &response.record {
-            if record.bucket != *bucket
-                || record.bucket_incarnation_generation != bucket_incarnation_generation
-                || record.key != *key
-                || record.generation_id != generation_id
-                || record.reclaim_kind != reclaim_kind
-                || record.claim_id != claim_id
-                || record.owner_token != owner_token
-                || record.cluster_epoch != cluster_epoch
-                || record.pg_id != pg_id.get()
-                || record.claimed_at != claimed_at
-                || record.lease_deadline != lease_deadline
-            {
-                return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "validate object payload reclaim claim acquire response",
-                    "claim response identity does not match request".to_string(),
-                )));
-            }
         }
         Ok(response.record)
     }

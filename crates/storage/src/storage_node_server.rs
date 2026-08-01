@@ -43,21 +43,22 @@ use crate::metadata_command::{
 #[cfg(test)]
 use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
-    complete_multipart_expected_object_parts, BucketMetadataNodeClient,
-    BucketWriteReservationNodeClient, BuildAbortMultipartUploadCommandReq,
-    BuildAuthorizedAbortMultipartUploadCommandReq, BuildCompleteMultipartObjectCommandReq,
-    BuildCreateMultipartUploadCommandReq, BuildCreateStreamUploadCommandReq,
-    BuildDeleteCurrentObjectCommandReq, BuildDeleteObjectPayloadReclaimCommandReq,
-    BuildDeleteSpecificObjectVersionCommandReq, BuildDirectPutCommitCommandReq,
-    BuildInsertDeleteMarkerCommandReq, BuildPutObjectMetadataCommandReq,
-    BuildStreamPartCommitCommandReq, BuildStreamPutCommitCommandReq, CreateBucketCommandBuild,
-    CreateStreamUploadPrecondition, DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload,
-    MarkBucketDeletingCommandBuild, ObjectDeleteStorageSnapshot,
-    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
-    ObjectMutationMetadataNodeClient, ObjectReadMetadataNodeClient,
-    ObjectVersionMetadataNodeClient, RetainedBucketWriteReservationNodeClient,
-    RetainedMetadataCommandNodeClient, RetainedObjectMutationMetadataNodeClient,
-    ShardAckNodeClient, ShardScavengerNodeClient, ShardScavengerObservationNodeClient,
+    complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
+    BucketMetadataNodeClient, BucketWriteReservationNodeClient,
+    BuildAbortMultipartUploadCommandReq, BuildAuthorizedAbortMultipartUploadCommandReq,
+    BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
+    BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
+    BuildDeleteObjectPayloadReclaimCommandReq, BuildDeleteSpecificObjectVersionCommandReq,
+    BuildDirectPutCommitCommandReq, BuildInsertDeleteMarkerCommandReq,
+    BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
+    BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
+    DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
+    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
+    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
+    RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
+    ShardScavengerObservationNodeClient,
 };
 use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
@@ -3826,6 +3827,30 @@ impl StorageNodeRouteFence {
             now_ms,
         })
     }
+
+    fn intersect_effect_fence(
+        self,
+        delegated: AdmittedRouteEffectFence,
+    ) -> Result<AdmittedRouteEffectFence, StoreError> {
+        let local = match (self.valid_until_ms, self.local_valid_until_monotonic_ms) {
+            (None, None) => AdmittedRouteEffectFence::unbounded(self.cluster_epoch),
+            (Some(valid_until_ms), Some(local_valid_until_monotonic_ms)) => {
+                AdmittedRouteEffectFence::bounded(
+                    self.cluster_epoch,
+                    valid_until_ms,
+                    local_valid_until_monotonic_ms,
+                )
+            }
+            _ => {
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: self.cluster_epoch,
+                    valid_until_ms: self.valid_until_ms.unwrap_or_default(),
+                    now_ms: crate::clock::current_time_millis(),
+                });
+            }
+        };
+        local.intersect(delegated)
+    }
 }
 
 impl Drop for StorageNodeRouteTransitionGuard {
@@ -3877,6 +3902,23 @@ enum StorageNodeMultipartUploadRouteError {
 enum StorageNodeObjectPayloadReclaimRouteError {
     Route(StorageRpcErrorResponse),
     Reclaim(BucketSnapshotLoadError),
+}
+
+fn object_payload_reclaim_route_open_error(
+    error: ObjectPgActionError,
+) -> StorageNodeObjectPayloadReclaimRouteError {
+    match error {
+        ObjectPgActionError::Store(error) => StorageNodeObjectPayloadReclaimRouteError::Reclaim(
+            BucketSnapshotLoadError::Store(error),
+        ),
+        ObjectPgActionError::Metadata(error) => StorageNodeObjectPayloadReclaimRouteError::Reclaim(
+            BucketSnapshotLoadError::Metadata(error),
+        ),
+        error => StorageNodeObjectPayloadReclaimRouteError::Route(StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::Internal,
+            message: format!("open object payload reclaim route failed: {error}"),
+        }),
+    }
 }
 
 #[derive(Debug)]
@@ -4651,14 +4693,18 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
             self.route.key,
             generation_id,
         )
-        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
+        .map_err(object_payload_reclaim_route_open_error)?;
+        route
+            .load_payload()
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4672,31 +4718,64 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         claimed_at: u64,
         lease_deadline: Option<u64>,
         now: u64,
+        effect_fence: AdmittedRouteEffectFence,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, StorageNodeObjectPayloadReclaimRouteError>
     {
         self.route
             .require_valid_now_response()
             .map_err(StorageNodeObjectPayloadReclaimRouteError::Route)?;
+        effect_fence
+            .require_valid_for(self.route.fence.cluster_epoch)
+            .map_err(BucketSnapshotLoadError::Store)
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)?;
+        let effect_fence = self
+            .route
+            .fence
+            .intersect_effect_fence(effect_fence)
+            .map_err(BucketSnapshotLoadError::Store)
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)?;
         let local_client = LocalStorageNodeClient::new(
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
             &local_client,
+            self.route.fence.cluster_epoch,
             self.route.pg_id,
             self.route.bucket,
-            bucket_incarnation_generation,
             self.route.key,
             generation_id,
-            reclaim_kind,
-            claim_id,
-            owner_token,
-            self.route.fence.cluster_epoch,
-            claimed_at,
-            lease_deadline,
-            now,
         )
-        .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
+        .map_err(object_payload_reclaim_route_open_error)?;
+        let expected_payload = route
+            .load_payload()
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)?;
+        let Some(expected_payload) = expected_payload else {
+            return Ok(None);
+        };
+        if expected_payload.kind() != reclaim_kind {
+            return Err(StorageNodeObjectPayloadReclaimRouteError::Route(
+                StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::PayloadDecode,
+                    message: "object payload reclaim claim kind does not match the routed root"
+                        .to_string(),
+                },
+            ));
+        }
+        route
+            .acquire_claim(
+                AcquireObjectPayloadReclaimClaimReq {
+                    reclaim_kind,
+                    bucket_incarnation_generation,
+                    claim_id,
+                    owner_token,
+                    claimed_at,
+                    lease_deadline,
+                    now,
+                },
+                effect_fence,
+            )
+            .map_err(StorageNodeObjectPayloadReclaimRouteError::Reclaim)
     }
 
     fn build_delete_object_payload_reclaim_command(
@@ -4711,16 +4790,15 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        let route =
-            ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
-                &local_client,
-                self.route.fence.cluster_epoch,
-                self.route.pg_id,
-                self.route.bucket,
-                self.route.key,
-                generation_id,
-            )
-            .map_err(StorageNodeObjectRouteError::Object)?;
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &local_client,
+            self.route.fence.cluster_epoch,
+            self.route.pg_id,
+            self.route.bucket,
+            self.route.key,
+            generation_id,
+        )
+        .map_err(StorageNodeObjectRouteError::Object)?;
         route
             .build_delete_object_payload_reclaim_command(
                 BuildDeleteObjectPayloadReclaimCommandReq { payload, claim },
@@ -11357,6 +11435,8 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
+        let effect_fence =
+            admitted_route_effect_fence(request.object.cluster_epoch, request.effect_deadline);
         match route.acquire_object_payload_reclaim_claim(
             request.bucket_incarnation_generation,
             request.generation_id,
@@ -11366,6 +11446,7 @@ impl StorageNodeConnectionHandler {
             request.claimed_at,
             request.lease_deadline,
             request.now,
+            effect_fence,
         ) {
             Ok(record) => {
                 let payload = encode_object_payload_reclaim_claim_optional_record_response(
@@ -24210,6 +24291,181 @@ mod tests {
     }
 
     #[test]
+    fn unix_payload_reclaim_claim_acquire_rebinds_and_rejects_expired_effect_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-expired-reclaim-claim-bucket");
+        let key = crate::tests::object_key("unix-expired-reclaim-claim-key");
+        let generation_id = GenerationId::new(91).unwrap();
+        let node = Arc::clone(&server._node);
+        {
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::put_object_segments_reclaim(
+                &*pg,
+                &crate::ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id,
+                    created_at: 1_000,
+                    segments: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let serving = thread::spawn(move || {
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap();
+            });
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let error = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            route
+                .acquire_claim(
+                    AcquireObjectPayloadReclaimClaimReq {
+                        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                        bucket_incarnation_generation: 1,
+                        claim_id: "unix-expired-reclaim-claim",
+                        owner_token: "unix-expired-reclaim-owner",
+                        claimed_at: 2_500,
+                        lease_deadline: Some(9_000),
+                        now: 2_500,
+                    },
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        serving.join().unwrap();
+
+        assert!(
+            PgMetadataStore::object_payload_reclaim_claim(&*node.get_pg(0).unwrap())
+                .unwrap()
+                .is_none(),
+            "expired portable effect authority must not insert a reclaim claim"
+        );
+    }
+
+    #[test]
+    fn unix_payload_reclaim_claim_acquire_is_bounded_by_server_route_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-server-expired-reclaim-claim-bucket");
+        let key = crate::tests::object_key("unix-server-expired-reclaim-claim-key");
+        let generation_id = GenerationId::new(92).unwrap();
+        let node = Arc::clone(&server._node);
+        {
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::put_object_segments_reclaim(
+                &*pg,
+                &crate::ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id,
+                    created_at: 1_000,
+                    segments: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let server_node = Arc::clone(&node);
+        let serving = thread::spawn(move || {
+            let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+            let hook_clock = Arc::clone(&clock);
+            server_node
+                .get_pg(0)
+                .unwrap()
+                .test_install_before_object_payload_reclaim_claim_effect_check_hook(move || {
+                    hook_clock.set(4_500);
+                });
+            server.accept_one().unwrap();
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+        let client_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 10_000, 10_000);
+        let error = crate::clock::with_time_and_monotonic_override(1_000, 1_000, || {
+            route
+                .acquire_claim(
+                    AcquireObjectPayloadReclaimClaimReq {
+                        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                        bucket_incarnation_generation: 1,
+                        claim_id: "unix-server-expired-reclaim-claim",
+                        owner_token: "unix-server-expired-reclaim-owner",
+                        claimed_at: 1_000,
+                        lease_deadline: Some(9_000),
+                        now: 1_000,
+                    },
+                    client_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        serving.join().unwrap();
+
+        assert!(
+            PgMetadataStore::object_payload_reclaim_claim(&*node.get_pg(0).unwrap())
+                .unwrap()
+                .is_none(),
+            "the shorter server route fence must prevent durable claim insertion"
+        );
+    }
+
+    #[test]
     fn unix_payload_reclaim_build_rebinds_and_rejects_expired_effect_deadline() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -24245,6 +24501,7 @@ mod tests {
                 "unix-expired-reclaim-build-claim",
                 "unix-expired-reclaim-build-owner",
                 config.cluster_epoch,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
                 1_000,
                 Some(9_000),
                 1_000,
@@ -24267,16 +24524,15 @@ mod tests {
             config.cluster_epoch,
             config.socket_path.clone(),
         );
-        let route =
-            ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
-                &client,
-                config.cluster_epoch,
-                ObjectMetadataPgId::new_for_test(PgId::new(0)),
-                &bucket,
-                &key,
-                generation_id,
-            )
-            .unwrap();
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
         let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
         let error = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
             route
@@ -24931,6 +25187,7 @@ mod tests {
                     1_000,
                     Some(4_000),
                     1_000,
+                    AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 4_000),
                 )
                 .unwrap()
                 .expect("active reclaim route must acquire the exact claim")
@@ -25195,6 +25452,7 @@ mod tests {
                 6_000,
                 Some(9_000),
                 6_000,
+                AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 4_000),
             ) {
                 Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
                     assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);

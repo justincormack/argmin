@@ -4839,7 +4839,7 @@ One-hundred-and-twenty-first Phase 3 slice:
 One-hundred-and-twenty-second Phase 3 slice:
 
 - payload-reclaim deletion command construction now goes through a scoped
-  `ObjectPayloadReclaimCommandMetadataRoute` bound to the route epoch, object
+  `ObjectPayloadReclaimMetadataRoute` bound to the route epoch, object
   PG, bucket, key, and generation. The builder accepts the complete durable
   reclaim root and claim record, derives the command's claim proof itself,
   and rejects crossed PG, epoch, object, generation, or reclaim-layout
@@ -4876,6 +4876,47 @@ One-hundred-and-twenty-second Phase 3 slice:
 - scoped payload-reclaim discovery and claim acquisition remain open in
   Phase 3; this slice removes only the raw command-construction authority.
 - all 2,565 storage tests and the full 7,887-test workspace suite pass.
+  Workspace-wide strict Clippy and the transitional storage boundary checker
+  also pass.
+
+One-hundred-and-twenty-third Phase 3 slice:
+
+- payload-reclaim root discovery, claim acquisition, and deletion-command
+  construction now share one `ObjectPayloadReclaimMetadataRoute` bound to the
+  route epoch, object PG, bucket, key, and generation. The maintenance worker
+  opens that route once and can no longer independently supply routing fields
+  to raw root-load or claim-acquisition methods.
+- the raw per-object reclaim load and claim-acquisition methods are removed
+  from `ObjectMutationMetadataNodeClient`. Embedded and Unix routes derive the
+  complete wire/storage subject from their captured authority; bucket-delete
+  diagnostics also use the scoped route rather than resampling a raw object
+  mutation call.
+- the storage-node adapter opens the same embedded route after active-primary
+  validation. It reloads the routed reclaim before claim mutation and rejects
+  a requested reclaim kind that does not match that durable root as
+  `PayloadDecode`, rather than allowing a crossed layout to reach PgStore.
+- installed Unix coverage retains equivalent wrong-PG canaries for root load,
+  claim acquisition, and command construction. A separate crossed-kind
+  regression proves the malformed request creates no singleton claim before a
+  matching request succeeds through the same scoped route.
+- claim acquisition now receives the same immutable effect fence captured
+  before reclaim discovery and used by command construction and pending-slot
+  installation. Embedded acquisition validates it at transaction entry and
+  again immediately before each possible claim deletion or insertion, after
+  all preceding claim/root reads. Unix acquisition carries a portable
+  deadline and rebinds it to the storage host's monotonic clock. The storage
+  node intersects that delegated fence with its own captured route fence, so
+  neither side can extend the other's authority. Storage RPC frame encoding
+  advances to version 14.
+- a deterministic same-epoch-renewal regression expires the captured fence
+  after the initial route check, transaction start, and durable-state reads,
+  proving no claim row or command-log entry is created and the reclaim root
+  remains retryable. A second transaction regression proves an expired claim
+  is not deleted when authority expires after it is read. Unix regressions
+  cover frontend deadline projection, codec transport, storage-host rebinding,
+  both client-first and storage-route-first expiry, and rejection without
+  claim mutation.
+- all 2,576 storage tests and the full 7,898-test workspace suite pass.
   Workspace-wide strict Clippy and the transitional storage boundary checker
   also pass.
 

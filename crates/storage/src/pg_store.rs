@@ -620,6 +620,9 @@ pub struct PgStore {
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    before_object_payload_reclaim_claim_effect_check:
+        std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+    #[cfg(test)]
     metadata_command_log_prefix_fast_path_hits: AtomicU64,
     #[cfg(test)]
     metadata_command_log_replay_validation_entries: AtomicU64,
@@ -824,6 +827,8 @@ pub(crate) fn inspect_pg_shard_inventory(
         clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
         #[cfg(test)]
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
         #[cfg(test)]
         metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
         #[cfg(test)]
@@ -1073,6 +1078,8 @@ impl PgStore {
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
             #[cfg(test)]
             metadata_command_log_prefix_fast_path_hits: AtomicU64::new(0),
             #[cfg(test)]

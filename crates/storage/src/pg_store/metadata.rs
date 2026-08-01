@@ -28,6 +28,29 @@ impl PgStore {
             .store(true, Ordering::Relaxed);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_before_object_payload_reclaim_claim_effect_check_hook(
+        &self,
+        hook: impl FnOnce() + Send + 'static,
+    ) {
+        *self
+            .before_object_payload_reclaim_claim_effect_check
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(hook));
+    }
+
+    #[cfg(test)]
+    fn maybe_run_before_object_payload_reclaim_claim_effect_check_hook(&self) {
+        let hook = self
+            .before_object_payload_reclaim_claim_effect_check
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_force_object_became_noncurrent_at(
         &self,
@@ -8828,6 +8851,7 @@ impl PgMetadataStore for PgStore {
         claim_id: &str,
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
+        effect_fence: AdmittedRouteEffectFence,
         claimed_at: u64,
         lease_deadline: Option<u64>,
         now: u64,
@@ -8853,6 +8877,9 @@ impl PgMetadataStore for PgStore {
             "acquire object payload reclaim claim (begin txn)",
             "acquire object payload reclaim claim (commit txn)",
             |store| {
+                effect_fence
+                    .require_valid_for(cluster_epoch)
+                    .map_err(|source| MetadataError::RouteEffectRejected { source })?;
                 let existing = store
                     .conn
                     .query_row(
@@ -8897,6 +8924,11 @@ impl PgMetadataStore for PgStore {
                                 source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
                             },
                         )?;
+                    #[cfg(test)]
+                    store.maybe_run_before_object_payload_reclaim_claim_effect_check_hook();
+                    effect_fence
+                        .require_valid_for(cluster_epoch)
+                        .map_err(|source| MetadataError::RouteEffectRejected { source })?;
                     store
                         .conn
                         .execute(
@@ -8933,6 +8965,11 @@ impl PgMetadataStore for PgStore {
                     return Ok(None);
                 }
 
+                #[cfg(test)]
+                store.maybe_run_before_object_payload_reclaim_claim_effect_check_hook();
+                effect_fence
+                    .require_valid_for(cluster_epoch)
+                    .map_err(|source| MetadataError::RouteEffectRejected { source })?;
                 store
                     .conn
                     .execute(

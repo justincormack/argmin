@@ -344,6 +344,7 @@ fn unix_object_payload_reclaim_claim_release_survives_expired_route() {
             "expired-reclaim-route-claim",
             "expired-reclaim-route-owner",
             config.cluster_epoch,
+            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
             10,
             Some(20),
             10,
@@ -3560,15 +3561,20 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     .unwrap()
     .expect("seeded PG reclaim root should exist");
     assert_eq!(pg_reclaim_root, reclaim_root);
-    let object_reclaim = ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
-        &client,
-        ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        &bucket,
-        &key,
-        reclaim_generation_id,
-    )
-    .unwrap()
-    .expect("seeded object reclaim should exist");
+    let reclaim_route =
+        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            ClusterEpoch::new(1).unwrap(),
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            reclaim_generation_id,
+        )
+        .unwrap();
+    let object_reclaim = reclaim_route
+        .load_payload()
+        .unwrap()
+        .expect("seeded object reclaim should exist");
     assert!(matches!(
         &object_reclaim,
         ObjectPayloadReclaimCommand::Segments(reclaim)
@@ -3576,23 +3582,21 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
                 && reclaim.key == key
                 && reclaim.generation_id == reclaim_generation_id
     ));
-    let claim = ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
-        &client,
-        ObjectMetadataPgId::new_for_test(PgId::new(0)),
-        &bucket,
-        1,
-        &key,
-        reclaim_generation_id,
-        object_reclaim.kind(),
-        "object-reclaim-claim",
-        "object-reclaim-owner",
-        ClusterEpoch::new(1).unwrap(),
-        100,
-        Some(1_000),
-        100,
-    )
-    .unwrap()
-    .expect("seeded object reclaim claim should be acquired");
+    let claim = reclaim_route
+        .acquire_claim(
+            AcquireObjectPayloadReclaimClaimReq {
+                reclaim_kind: object_reclaim.kind(),
+                bucket_incarnation_generation: 1,
+                claim_id: "object-reclaim-claim",
+                owner_token: "object-reclaim-owner",
+                claimed_at: 100,
+                lease_deadline: Some(1_000),
+                now: 100,
+            },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap()),
+        )
+        .unwrap()
+        .expect("seeded object reclaim claim should be acquired");
     assert_eq!(claim.bucket, bucket);
     assert_eq!(claim.key, key);
     assert_eq!(claim.generation_id, reclaim_generation_id);
@@ -4239,6 +4243,109 @@ fn unix_object_payload_reclaim_root_requires_pg_primary() {
 }
 
 #[test]
+fn unix_object_payload_reclaim_route_rejects_crossed_kind_before_claim_mutation() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("object-reclaim-kind-rpc-bucket");
+    let key = crate::tests::object_key("object-reclaim-kind-rpc-key");
+    let generation_id = GenerationId::new(91).unwrap();
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::put_object_segments_reclaim(
+            &*pg,
+            &ObjectSegmentsReclaimRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+                created_at: 12,
+                segments: Vec::new(),
+            },
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..3)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+        &client,
+        config.cluster_epoch,
+        ObjectMetadataPgId::new_for_test(PgId::new(0)),
+        &bucket,
+        &key,
+        generation_id,
+    )
+    .unwrap();
+    let crossed = route
+        .acquire_claim(
+            AcquireObjectPayloadReclaimClaimReq {
+                reclaim_kind: ObjectPayloadReclaimKind::Multipart,
+                bucket_incarnation_generation: 1,
+                claim_id: "object-reclaim-kind-claim",
+                owner_token: "object-reclaim-kind-owner",
+                claimed_at: 100,
+                lease_deadline: Some(1_000),
+                now: 100,
+            },
+            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        crossed,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    assert!(
+        ObjectMutationMetadataNodeClient::object_payload_reclaim_claim(
+            &client,
+            ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    let claim = route
+        .acquire_claim(
+            AcquireObjectPayloadReclaimClaimReq {
+                reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                bucket_incarnation_generation: 1,
+                claim_id: "object-reclaim-kind-claim",
+                owner_token: "object-reclaim-kind-owner",
+                claimed_at: 100,
+                lease_deadline: Some(1_000),
+                now: 100,
+            },
+            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+        )
+        .unwrap()
+        .expect("matching routed reclaim must be claimable");
+    assert_eq!(claim.bucket, bucket);
+    assert_eq!(claim.key, key);
+    assert_eq!(claim.generation_id, generation_id);
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
 fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
     macro_rules! assert_object_payload_decode {
         ($result:expr) => {
@@ -4311,6 +4418,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
                     "object-reclaim-role-claim",
                     "object-reclaim-role-owner",
                     ClusterEpoch::new(1).unwrap(),
+                    AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap()),
                     100,
                     Some(1_000),
                     100,
@@ -4363,61 +4471,61 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
         generation_id,
     ));
 
-    let reclaim = ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
-        &client,
-        correct_pg,
-        &bucket,
-        &key,
-        generation_id,
-    )
-    .unwrap()
-    .expect("correctly routed reclaim must load");
-    assert_eq!(reclaim.kind(), ObjectPayloadReclaimKind::ObjectSegments);
-    assert_bucket_payload_decode!(
-        ObjectMutationMetadataNodeClient::get_object_payload_reclaim(
+    let reclaim_route =
+        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
             &client,
-            wrong_pg,
-            &bucket,
-            &key,
-            generation_id,
-        )
-    );
-
-    let acquired = ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
-        &client,
-        correct_pg,
-        &bucket,
-        1,
-        &key,
-        generation_id,
-        ObjectPayloadReclaimKind::ObjectSegments,
-        "object-reclaim-role-claim",
-        "object-reclaim-role-owner",
-        ClusterEpoch::new(1).unwrap(),
-        100,
-        Some(1_000),
-        100,
-    )
-    .unwrap()
-    .expect("correctly routed reclaim claim must load idempotently");
-    assert_eq!(acquired, correct_claim);
-    assert_bucket_payload_decode!(
-        ObjectMutationMetadataNodeClient::acquire_object_payload_reclaim_claim(
-            &client,
-            wrong_pg,
-            &bucket,
-            1,
-            &key,
-            generation_id,
-            ObjectPayloadReclaimKind::ObjectSegments,
-            "object-reclaim-role-claim",
-            "object-reclaim-role-owner",
             ClusterEpoch::new(1).unwrap(),
-            100,
-            Some(1_000),
-            100,
+            correct_pg,
+            &bucket,
+            &key,
+            generation_id,
         )
-    );
+        .unwrap();
+    let reclaim = reclaim_route
+        .load_payload()
+        .unwrap()
+        .expect("correctly routed reclaim must load");
+    assert_eq!(reclaim.kind(), ObjectPayloadReclaimKind::ObjectSegments);
+    let wrong_reclaim_route =
+        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            ClusterEpoch::new(1).unwrap(),
+            wrong_pg,
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+    assert_bucket_payload_decode!(wrong_reclaim_route.load_payload());
+
+    let acquired = reclaim_route
+        .acquire_claim(
+            AcquireObjectPayloadReclaimClaimReq {
+                reclaim_kind: reclaim.kind(),
+                bucket_incarnation_generation: 1,
+                claim_id: "object-reclaim-role-claim",
+                owner_token: "object-reclaim-role-owner",
+                claimed_at: 100,
+                lease_deadline: Some(1_000),
+                now: 100,
+            },
+            AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap()),
+        )
+        .unwrap()
+        .expect("correctly routed reclaim claim must load idempotently");
+    assert_eq!(acquired, correct_claim);
+    assert_bucket_payload_decode!(wrong_reclaim_route.acquire_claim(
+        AcquireObjectPayloadReclaimClaimReq {
+            reclaim_kind: reclaim.kind(),
+            bucket_incarnation_generation: 1,
+            claim_id: "object-reclaim-role-claim",
+            owner_token: "object-reclaim-role-owner",
+            claimed_at: 100,
+            lease_deadline: Some(1_000),
+            now: 100,
+        },
+        AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap())
+    ));
 
     let bucket_root = ObjectMutationMetadataNodeClient::get_bucket_payload_reclaim_root(
         &client,
@@ -4455,7 +4563,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
     );
 
     let reclaim_command_route =
-        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
+        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
             &client,
             ClusterEpoch::new(1).unwrap(),
             correct_pg,
@@ -4481,24 +4589,15 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
                 && delete.reclaim_claim == ObjectPayloadReclaimClaimProof::from(&correct_claim)
     ));
 
-    let wrong_reclaim_command_route =
-        ObjectMutationMetadataNodeClient::open_object_payload_reclaim_command_metadata_route(
-            &client,
-            ClusterEpoch::new(1).unwrap(),
-            wrong_pg,
-            &bucket,
-            &key,
-            generation_id,
-        )
-        .unwrap();
-    assert_object_payload_decode!(wrong_reclaim_command_route
-        .build_delete_object_payload_reclaim_command(
+    assert_object_payload_decode!(
+        wrong_reclaim_route.build_delete_object_payload_reclaim_command(
             BuildDeleteObjectPayloadReclaimCommandReq {
                 payload: &reclaim,
                 claim: &wrong_claim,
             },
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::new(1).unwrap()),
-        ));
+        )
+    );
 
     assert_bucket_payload_decode!(
         retained_object_mutation_route(&client, wrong_pg, &bucket, &key)

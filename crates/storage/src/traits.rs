@@ -600,6 +600,7 @@ pub(crate) trait PgMetadataStore {
         claim_id: &str,
         owner_token: &str,
         cluster_epoch: ClusterEpoch,
+        effect_fence: AdmittedRouteEffectFence,
         claimed_at: u64,
         lease_deadline: Option<u64>,
         now: u64,

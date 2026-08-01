@@ -572,14 +572,14 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         upload_id: &UploadId,
     ) -> Result<Box<dyn MultipartAbortMutationMetadataRoute + '_>, ObjectPgActionError>;
 
-    fn open_object_payload_reclaim_command_metadata_route(
+    fn open_object_payload_reclaim_metadata_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<Box<dyn ObjectPayloadReclaimCommandMetadataRoute + '_>, ObjectPgActionError>;
+    ) -> Result<Box<dyn ObjectPayloadReclaimMetadataRoute + '_>, ObjectPgActionError>;
 
     fn open_stream_upload_creation_metadata_route(
         &self,
@@ -653,34 +653,9 @@ pub(crate) trait ObjectMutationMetadataNodeClient: Send + Sync {
         pg_id: ObjectMetadataScanPgId,
     ) -> Result<Option<PayloadReclaimRoot>, BucketSnapshotLoadError>;
 
-    fn get_object_payload_reclaim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError>;
-
     fn object_payload_reclaim_claim(
         &self,
         pg_id: ObjectMetadataScanPgId,
-    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
-
-    #[allow(clippy::too_many_arguments)]
-    fn acquire_object_payload_reclaim_claim(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-        reclaim_kind: ObjectPayloadReclaimKind,
-        claim_id: &str,
-        owner_token: &str,
-        cluster_epoch: ClusterEpoch,
-        claimed_at: u64,
-        lease_deadline: Option<u64>,
-        now: u64,
     ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
 }
 
@@ -721,7 +696,15 @@ pub(crate) trait MultipartAbortMutationMetadataRoute: Send {
     ) -> Result<Option<MetadataCommandEnvelope>, ObjectPgActionError>;
 }
 
-pub(crate) trait ObjectPayloadReclaimCommandMetadataRoute: Send {
+pub(crate) trait ObjectPayloadReclaimMetadataRoute: Send {
+    fn load_payload(&self) -> Result<Option<ObjectPayloadReclaimCommand>, BucketSnapshotLoadError>;
+
+    fn acquire_claim(
+        &self,
+        request: AcquireObjectPayloadReclaimClaimReq<'_>,
+        effect_fence: AdmittedRouteEffectFence,
+    ) -> Result<Option<ObjectPayloadReclaimClaimRecord>, BucketSnapshotLoadError>;
+
     fn build_delete_object_payload_reclaim_command(
         &self,
         request: BuildDeleteObjectPayloadReclaimCommandReq<'_>,
@@ -1108,6 +1091,37 @@ pub(crate) struct BuildDeleteObjectPayloadReclaimCommandReq<'a> {
     pub(crate) claim: &'a ObjectPayloadReclaimClaimRecord,
 }
 
+pub(crate) struct AcquireObjectPayloadReclaimClaimReq<'a> {
+    pub(crate) reclaim_kind: ObjectPayloadReclaimKind,
+    pub(crate) bucket_incarnation_generation: u64,
+    pub(crate) claim_id: &'a str,
+    pub(crate) owner_token: &'a str,
+    pub(crate) claimed_at: u64,
+    pub(crate) lease_deadline: Option<u64>,
+    pub(crate) now: u64,
+}
+
+pub(crate) fn require_object_payload_reclaim_subject(
+    bucket: &BucketName,
+    key: &ObjectKey,
+    generation_id: GenerationId,
+    payload: &ObjectPayloadReclaimCommand,
+    operation: &'static str,
+) -> Result<(), StoreError> {
+    let matches = match payload {
+        ObjectPayloadReclaimCommand::Segments(record) => {
+            record.bucket == *bucket && record.key == *key && record.generation_id == generation_id
+        }
+        ObjectPayloadReclaimCommand::Multipart(record) => {
+            record.bucket == *bucket && record.key == *key && record.generation_id == generation_id
+        }
+    };
+    if !matches {
+        return Err(StoreError::RouteCapabilitySubjectMismatch { operation });
+    }
+    Ok(())
+}
+
 pub(crate) fn require_object_payload_reclaim_command_subject(
     route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
@@ -1116,14 +1130,14 @@ pub(crate) fn require_object_payload_reclaim_command_subject(
     generation_id: GenerationId,
     request: &BuildDeleteObjectPayloadReclaimCommandReq<'_>,
 ) -> Result<(), ObjectPgActionError> {
-    let payload_matches = match request.payload {
-        ObjectPayloadReclaimCommand::Segments(record) => {
-            record.bucket == *bucket && record.key == *key && record.generation_id == generation_id
-        }
-        ObjectPayloadReclaimCommand::Multipart(record) => {
-            record.bucket == *bucket && record.key == *key && record.generation_id == generation_id
-        }
-    };
+    let payload_matches = require_object_payload_reclaim_subject(
+        bucket,
+        key,
+        generation_id,
+        request.payload,
+        "build delete object payload reclaim command",
+    )
+    .is_ok();
     let claim = request.claim;
     if !payload_matches
         || claim.pg_id != pg_id.get()

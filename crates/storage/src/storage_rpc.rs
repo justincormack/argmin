@@ -79,7 +79,7 @@ use std::io::{Read, Write};
 use std::num::{NonZeroU16, NonZeroU32};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 13;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 14;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -402,6 +402,9 @@ const STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_ACQUIRE_PAYLOAD_LEN: usize =
         + STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN
         + 4
         + STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN
+        + 8
+        + 1
+        + 8
         + 8
         + 1
         + 8
@@ -1731,6 +1734,7 @@ pub(crate) struct StorageRpcObjectPayloadReclaimClaimAcquireRequest {
     pub(crate) claimed_at: u64,
     pub(crate) lease_deadline: Option<u64>,
     pub(crate) now: u64,
+    pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4902,6 +4906,7 @@ pub(crate) fn encode_object_payload_reclaim_claim_acquire_request(
     put_u64(&mut out, request.claimed_at);
     put_optional_u64(&mut out, request.lease_deadline);
     put_u64(&mut out, request.now);
+    put_admitted_route_effect_deadline(&mut out, request.effect_deadline);
     Ok(out)
 }
 
@@ -4924,6 +4929,8 @@ pub(crate) fn decode_object_payload_reclaim_claim_acquire_request(
     let claimed_at = decoder.read_u64()?;
     let lease_deadline = decoder.read_optional_u64()?;
     let now = decoder.read_u64()?;
+    let effect_deadline =
+        decoder.read_admitted_route_effect_deadline("object payload reclaim claim acquire")?;
     decoder.finish()?;
     let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
         object,
@@ -4935,6 +4942,7 @@ pub(crate) fn decode_object_payload_reclaim_claim_acquire_request(
         claimed_at,
         lease_deadline,
         now,
+        effect_deadline,
     };
     encode_object_payload_reclaim_claim_acquire_request(&request)?;
     Ok(request)
@@ -18225,7 +18233,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&13u16.to_le_bytes());
+        expected.extend_from_slice(&14u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -18236,15 +18244,90 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_twelve_fixture() {
+    fn storage_rpc_frame_rejects_version_thirteen_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&12_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&13_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(12))
+            Err(StorageRpcFrameError::UnsupportedVersion(13))
+        );
+    }
+
+    #[test]
+    fn object_payload_reclaim_claim_acquire_round_trips_effect_deadline() {
+        let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(3),
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                pg_id: PgId::new(4),
+                bucket: BucketName::try_from("bucket").unwrap(),
+                key: ObjectKey::try_from("key".to_string()).unwrap(),
+            },
+            bucket_incarnation_generation: 7,
+            generation_id: GenerationId::new(8).unwrap(),
+            reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+            claim_id: "claim".to_string(),
+            owner_token: "owner".to_string(),
+            claimed_at: 1_000,
+            lease_deadline: Some(8_000),
+            now: 1_000,
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 7_000,
+                portable_wall_valid_until_ms: 6_000,
+            }),
+        };
+
+        let encoded = encode_object_payload_reclaim_claim_acquire_request(&request).unwrap();
+        assert_eq!(
+            decode_object_payload_reclaim_claim_acquire_request(&encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn maximum_object_payload_reclaim_claim_acquire_request_fits_kind_cap() {
+        let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(u32::MAX),
+                cluster_epoch: ClusterEpoch::new(u64::MAX).unwrap(),
+                pg_id: PgId::new(u32::MAX),
+                bucket: BucketName::try_from("a".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN)).unwrap(),
+                key: ObjectKey::try_from("k".repeat(STORAGE_RPC_MAX_OBJECT_KEY_LEN)).unwrap(),
+            },
+            bucket_incarnation_generation: u64::MAX,
+            generation_id: GenerationId::new(u64::MAX).unwrap(),
+            reclaim_kind: ObjectPayloadReclaimKind::Multipart,
+            claim_id: "c".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_ID_LEN),
+            owner_token: "o".repeat(STORAGE_RPC_MAX_BUCKET_WRITE_OWNER_TOKEN_LEN),
+            claimed_at: 1,
+            lease_deadline: Some(u64::MAX),
+            now: u64::MAX,
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: u64::MAX,
+                portable_wall_valid_until_ms: u64::MAX
+                    .saturating_sub(crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS),
+            }),
+        };
+        let payload = encode_object_payload_reclaim_claim_acquire_request(&request).unwrap();
+        assert_eq!(
+            payload.len(),
+            STORAGE_RPC_MAX_OBJECT_PAYLOAD_RECLAIM_CLAIM_ACQUIRE_PAYLOAD_LEN
+        );
+
+        let frame = encode_storage_rpc_frame(
+            1,
+            StorageRpcMessageKind::ObjectPayloadReclaimClaimAcquire,
+            &payload,
+        )
+        .unwrap();
+        let decoded = read_storage_rpc_request_frame_from(&mut Cursor::new(frame)).unwrap();
+        assert_eq!(decoded.payload, payload);
+        assert_eq!(
+            decode_object_payload_reclaim_claim_acquire_request(&decoded.payload).unwrap(),
+            request
         );
     }
 
