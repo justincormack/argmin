@@ -16,7 +16,7 @@ use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
     BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
     ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StorageCluster,
-    StorageClusterRouteAdmission, StoredObject, UploadState,
+    StorageClusterRouteAdmission, StoredObject,
 };
 
 use self::acl::NonBoeLoadedBucketHandle;
@@ -418,7 +418,7 @@ impl Coordinator {
         &self,
         req: &BeginStreamPartRequest<'_>,
         bucket_handle: &LoadedBucketHandle,
-        upload: &MultipartUploadRecord,
+        upload: storage::MultipartUploadPartCandidate,
     ) -> Result<AuthorizedBeginStreamPart, ServerError> {
         match ObjectAuthLoadedBucketHandle::classify(bucket_handle) {
             ObjectAuthLoadedBucketHandle::Boe(bucket_handle) => {
@@ -925,19 +925,6 @@ impl Coordinator {
                 && Self::requester_can_bucket_owner_account_admin(requester, bucket))
     }
 
-    pub(super) fn requester_can_manage_multipart_upload(
-        requester: &Requester,
-        bucket: &BucketSummary,
-        upload: &MultipartUploadRecord,
-    ) -> bool {
-        Self::requester_can_manage_multipart_upload_identity(
-            requester,
-            bucket,
-            &upload.owner,
-            &upload.initiator,
-        )
-    }
-
     pub(super) fn requester_can_manage_multipart_upload_identity(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -967,12 +954,28 @@ impl Coordinator {
         bucket: &BucketSummary,
         upload: &MultipartUploadRecord,
     ) -> bool {
+        Self::requester_can_write_multipart_upload_identity(
+            requester,
+            bucket,
+            &upload.owner,
+            &upload.initiator,
+        )
+    }
+
+    fn requester_can_write_multipart_upload_identity(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        owner: &OwnerIdentity,
+        initiator: &OwnerIdentity,
+    ) -> bool {
         Self::requester_can_object_write(
             requester,
             bucket,
             &bucket.acl_grants,
             Self::effective_public_write(bucket),
-        ) && Self::requester_can_manage_multipart_upload(requester, bucket, upload)
+        ) && Self::requester_can_manage_multipart_upload_identity(
+            requester, bucket, owner, initiator,
+        )
     }
 
     pub(super) fn requester_can_write_multipart_upload_with_bucket_policy(
@@ -999,6 +1002,36 @@ impl Coordinator {
                 ),
             },
             upload.key.as_str(),
+        )
+    }
+
+    pub(super) fn requester_can_write_multipart_part_with_bucket_policy(
+        &self,
+        requester: &Requester,
+        bucket: &BucketSummary,
+        bucket_tags: Option<&[(String, String)]>,
+        upload: &storage::MultipartUploadPartCandidate,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        self.requester_can_put_object_action_with_bucket_policy(
+            BucketPolicyActionAuthorization {
+                request: BucketPolicyRequestContext {
+                    requester,
+                    bucket,
+                    bucket_tags,
+                    action: auth::PolicyAction::PutObject,
+                    policy_context,
+                    policy,
+                },
+                default_allowed: Self::requester_can_write_multipart_upload_identity(
+                    requester,
+                    bucket,
+                    upload.owner(),
+                    upload.initiator(),
+                ),
+            },
+            upload.key().as_str(),
         )
     }
 
@@ -1040,6 +1073,20 @@ impl Coordinator {
         }
 
         match upload.encryption.managed_encryption_algorithm() {
+            Some(algorithm) => policy_context.with_managed_encryption(Some(algorithm)),
+            None => policy_context,
+        }
+    }
+
+    pub(super) fn with_multipart_part_managed_encryption_policy_context<'a>(
+        policy_context: PutObjectPolicyContext<'a>,
+        upload: &'a storage::MultipartUploadPartCandidate,
+    ) -> PutObjectPolicyContext<'a> {
+        if policy_context.managed_encryption.is_some() {
+            return policy_context;
+        }
+
+        match upload.encryption().managed_encryption_algorithm() {
             Some(algorithm) => policy_context.with_managed_encryption(Some(algorithm)),
             None => policy_context,
         }

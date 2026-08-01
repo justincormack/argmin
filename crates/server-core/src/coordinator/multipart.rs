@@ -435,29 +435,22 @@ impl Coordinator {
                     }
                 }
                 let upload = storage_node
-                    .load_in_progress_multipart_upload(
+                    .load_multipart_upload_for_part(
                         req.upload.bucket_name_typed(),
                         req.upload.key_typed(),
                         req.upload.upload_id(),
                     )
                     .map_err(Self::map_object_pg_action_error)?;
                 let authorized =
-                    self.authorize_begin_stream_part_with_upload(req, &bucket_handle, &upload)?;
-                let checksum_algorithm = authorized
-                    .upload
-                    .record()
-                    .checksum
-                    .map(MultipartChecksumConfig::algorithm);
+                    self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)?;
+                let checksum_algorithm = authorized.checksum_algorithm;
                 let session_id = storage_node
-                    .create_upload_part_stream_session_with_cleanup_deadline(
-                        &authorized.upload,
-                        authorized.part_number,
+                    .create_upload_part_stream_session_for_authorized_part_with_cleanup_deadline(
+                        authorized.upload,
                         &session_id,
                         cleanup_after,
                     )
-                    .map_err(|error| {
-                        Self::map_upload_part_stream_error(&authorized.upload_id, error)
-                    })?;
+                    .map_err(|error| Self::map_upload_part_stream_error(req.upload.upload_id(), error))?;
                 Ok(BeginStreamPartResult {
                     session_id,
                     checksum_algorithm,
@@ -495,24 +488,16 @@ impl Coordinator {
             request,
             |bucket_handle| {
                 let upload = route
-                    .load_in_progress_multipart_upload(req.upload.upload_id())
+                    .load_multipart_upload_for_part(req.upload.upload_id())
                     .map_err(Self::map_object_pg_action_error)?;
-                self.authorize_begin_stream_part_with_upload(req, &bucket_handle, &upload)
+                self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)
             },
         )?;
-        let checksum_algorithm = authorized
-            .upload
-            .record()
-            .checksum
-            .map(MultipartChecksumConfig::algorithm);
+        let checksum_algorithm = authorized.checksum_algorithm;
         let session_id = Self::random_session_id("failed to generate session ID")?;
         let session_id = route
-            .create_upload_part_stream_session(
-                &authorized.upload,
-                authorized.part_number,
-                &session_id,
-            )
-            .map_err(|error| Self::map_upload_part_stream_error(&authorized.upload_id, error))?;
+            .create_upload_part_stream_session(authorized.upload, &session_id)
+            .map_err(|error| Self::map_upload_part_stream_error(req.upload.upload_id(), error))?;
         Ok(BeginStreamPartResult {
             session_id,
             checksum_algorithm,

@@ -2594,14 +2594,108 @@ fail_with_matches \
     "The admitted ListParts route must accept only AuthorizedMultipartUploadListParts, not the broad authorized durable upload wrapper" \
     "$public_broad_list_parts_route_surfaces"
 
+server_core_upload_part_authorization_durable_leaks=$(
+    awk '
+    /fn authorize_upload_part_copy_(boe|non_boe)\(/ || /fn authorize_begin_stream_part_with_upload_(boe|non_boe)\(/ {
+        in_upload_part_authorization = 1
+        depth = 0
+    }
+    in_upload_part_authorization {
+        if ($0 ~ /MultipartUploadRecord|AuthorizedMultipartUploadRecord|load_in_progress_multipart_upload|assume_authorized/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_upload_part_authorization = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/authz/acl.rs crates/server-core/src/coordinator/authz/modern.rs
+)
+fail_with_matches \
+    "UploadPart authorization must use the storage-owned logical candidate and UploadPart-only capability rather than durable upload records" \
+    "$server_core_upload_part_authorization_durable_leaks"
+
+server_core_authorized_upload_part_result_durable_leaks=$(
+    awk '
+    /struct AuthorizedBeginStreamPart[[:space:]]*\{/ || /struct AuthorizedMultipartPartWrite[[:space:]]*\{/ {
+        in_upload_part_result = 1
+        depth = 0
+    }
+    in_upload_part_result {
+        if ($0 ~ /MultipartUploadRecord|AuthorizedMultipartUploadRecord/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_upload_part_result = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/authz_results.rs
+)
+fail_with_matches \
+    "Authorized UploadPart results must retain only the opaque storage-owned part capability and logical response state" \
+    "$server_core_authorized_upload_part_result_durable_leaks"
+
+server_core_upload_part_execution_durable_leaks=$(
+    awk '
+    /pub fn begin_stream_part_(with_storage_node_and_cleanup_deadline|on_admitted_route)\(/ || /pub fn upload_part_copy_on_admitted_route\(/ {
+        in_upload_part_execution = 1
+        depth = 0
+    }
+    in_upload_part_execution {
+        if ($0 ~ /MultipartUploadRecord|AuthorizedMultipartUploadRecord|load_in_progress_multipart_upload|\.record\(\)/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_upload_part_execution = 0
+        }
+    }
+    ' crates/server-core/src/coordinator/multipart.rs crates/server-core/src/coordinator/copy.rs
+)
+fail_with_matches \
+    "UploadPart execution must pass only the storage-owned part capability back to storage" \
+    "$server_core_upload_part_execution_durable_leaks"
+
+public_broad_upload_part_route_surfaces=$(
+    awk '
+    /impl ActiveMultipartObjectRoute/ {
+        in_active_multipart_route = 1
+    }
+    in_active_multipart_route && /pub fn create_upload_part_stream_session\(/ {
+        in_create_part_session = 1
+        signature = $0
+        next
+    }
+    in_create_part_session {
+        signature = signature $0
+        if ($0 ~ /\)[[:space:]]*->[[:space:]]*/) {
+            if (signature ~ /AuthorizedMultipartUploadRecord/) {
+                print FILENAME ":" FNR ":" signature
+            }
+            in_create_part_session = 0
+        }
+    }
+    ' crates/storage/src/cluster.rs
+)
+fail_with_matches \
+    "The admitted UploadPart route must accept only AuthorizedMultipartUploadPart, not the broad authorized durable upload wrapper" \
+    "$public_broad_upload_part_route_surfaces"
+
 multipart_management_opaque_capability_leaks=$(
     {
         rg -n --color=never \
-            'pub struct (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts)\(pub|impl[[:space:]]+(Clone|PartialEq|Eq)[[:space:]]+for[[:space:]]+(MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts)' \
+            'pub struct (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts|MultipartUploadPartCandidate|AuthorizedMultipartUploadPart)\(pub|impl[[:space:]]+(Clone|PartialEq|Eq)[[:space:]]+for[[:space:]]+(MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts|MultipartUploadPartCandidate|AuthorizedMultipartUploadPart)' \
             crates/storage/src/types.rs \
             || true
         awk '
-        /impl (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts)[[:space:]]*\{/ {
+        /impl (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts|MultipartUploadPartCandidate|AuthorizedMultipartUploadPart)[[:space:]]*\{/ {
             in_opaque_impl = 1
             opaque_impl = $0
             sub(/^.*impl /, "", opaque_impl)
@@ -2613,7 +2707,7 @@ multipart_management_opaque_capability_leaks=$(
                 method = $0
                 sub(/^.*fn[[:space:]]+/, "", method)
                 sub(/\(.*/, "", method)
-                if ((opaque_impl == "MultipartUploadAbortCandidate" && method != "owner" && method != "initiator" && method != "into_authorized_abort") || (opaque_impl == "AuthorizedMultipartUploadAbort" && method != "upload_id") || (opaque_impl == "MultipartUploadListPartsCandidate" && method != "owner" && method != "initiator" && method != "into_authorized_list_parts") || opaque_impl == "AuthorizedMultipartUploadListParts") {
+                if ((opaque_impl == "MultipartUploadAbortCandidate" && method != "owner" && method != "initiator" && method != "into_authorized_abort") || (opaque_impl == "AuthorizedMultipartUploadAbort" && method != "upload_id") || (opaque_impl == "MultipartUploadListPartsCandidate" && method != "owner" && method != "initiator" && method != "into_authorized_list_parts") || opaque_impl == "AuthorizedMultipartUploadListParts" || (opaque_impl == "MultipartUploadPartCandidate" && method != "key" && method != "owner" && method != "initiator" && method != "checksum_config" && method != "encryption" && method != "into_authorized_part") || opaque_impl == "AuthorizedMultipartUploadPart") {
                     print FILENAME ":" FNR ":" $0
                 }
             }
@@ -2636,7 +2730,7 @@ multipart_management_opaque_capability_leaks=$(
             }
             next
         }
-        /pub struct (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts)/ {
+        /pub struct (MultipartUploadAbortCandidate|AuthorizedMultipartUploadAbort|MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts|MultipartUploadPartCandidate|AuthorizedMultipartUploadPart)/ {
             if (derive ~ /Clone|PartialEq|Eq|Debug/) {
                 print FILENAME ":" FNR ":" derive
             }
@@ -2653,13 +2747,13 @@ fail_with_matches \
     "Multipart management candidates and operation capabilities must not expose, derive Debug over, clone, or compare their retained durable upload records" \
     "$multipart_management_opaque_capability_leaks"
 
-list_parts_capability_debug_leaks=$(
+multipart_operation_capability_debug_leaks=$(
     awk '
-    /impl std::fmt::Debug for (MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts)[[:space:]]*\{/ {
-        in_list_parts_debug = 1
+    /impl std::fmt::Debug for (MultipartUploadListPartsCandidate|AuthorizedMultipartUploadListParts|MultipartUploadPartCandidate|AuthorizedMultipartUploadPart)[[:space:]]*\{/ {
+        in_operation_debug = 1
         depth = 0
     }
-    in_list_parts_debug {
+    in_operation_debug {
         if ($0 ~ /self\.0/) {
             print FILENAME ":" FNR ":" $0
         }
@@ -2667,14 +2761,14 @@ list_parts_capability_debug_leaks=$(
         depth += gsub(/\{/, "{", line)
         depth -= gsub(/\}/, "}", line)
         if (depth == 0 && $0 ~ /\}/) {
-            in_list_parts_debug = 0
+            in_operation_debug = 0
         }
     }
     ' crates/storage/src/types.rs
 )
 fail_with_matches \
-    "ListParts candidate and capability Debug output must not reveal retained durable state, including the upload ID" \
-    "$list_parts_capability_debug_leaks"
+    "ListParts and UploadPart candidate/capability Debug output must not reveal retained durable state, including the upload ID" \
+    "$multipart_operation_capability_debug_leaks"
 
 multipart_upload_id_authority_derived_equality=$(
     awk '

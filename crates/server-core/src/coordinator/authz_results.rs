@@ -15,10 +15,10 @@ use s3_types::{
 };
 use storage::BucketObjectOwnership;
 use storage::{
-    AuthorizedMultipartUploadRecord, BucketAclSummary, BucketEncryptionConfig, BucketName,
-    BucketObjectLockConfig, BucketOwnershipControls, EffectiveBucketEncryptionConfig,
-    LeasedObjectReadSnapshot, ObjectKey, ObjectLockState, ObjectReadSnapshot, OwnerIdentity,
-    PublicAccessBlockConfig, UploadId,
+    AuthorizedMultipartUploadPart, AuthorizedMultipartUploadRecord, BucketAclSummary,
+    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
+    EffectiveBucketEncryptionConfig, LeasedObjectReadSnapshot, ObjectKey, ObjectLockState,
+    ObjectReadSnapshot, OwnerIdentity, PublicAccessBlockConfig,
 };
 
 #[derive(Debug)]
@@ -282,21 +282,15 @@ pub(super) struct AuthorizedCreateMultipartUpload {
 }
 
 pub(super) struct AuthorizedBeginStreamPart {
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) upload_id: UploadId,
-    pub(super) part_number: u32,
-    pub(super) upload: AuthorizedMultipartUploadRecord,
+    pub(super) upload: AuthorizedMultipartUploadPart,
+    pub(super) checksum_algorithm: Option<checksum::ChecksumAlgorithm>,
     pub(super) sse_customer: Option<SseCustomerWriteContext>,
 }
 
 #[derive(Debug)]
 pub(super) struct AuthorizedMultipartPartWrite {
-    pub(super) bucket: BucketName,
-    pub(super) key: ObjectKey,
-    pub(super) upload_id: UploadId,
-    pub(super) part_number: u32,
-    pub(super) upload: AuthorizedMultipartUploadRecord,
+    pub(super) upload: AuthorizedMultipartUploadPart,
+    pub(super) checksum_algorithm: Option<checksum::ChecksumAlgorithm>,
     pub(super) sse_customer: Option<SseCustomerWriteContext>,
 }
 
@@ -407,11 +401,8 @@ impl std::fmt::Debug for AuthorizedCopyObject {
 impl std::fmt::Debug for AuthorizedBeginStreamPart {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedBeginStreamPart")
-            .field("bucket", &self.bucket)
-            .field("key", &self.key)
-            .field("upload_id", &self.upload_id)
-            .field("part_number", &self.part_number)
             .field("upload", &self.upload)
+            .field("checksum_algorithm", &self.checksum_algorithm)
             .finish_non_exhaustive()
     }
 }

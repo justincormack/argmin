@@ -5217,6 +5217,89 @@ impl MultipartUploadListPartsLookup {
     }
 }
 
+/// Opaque in-progress upload used while authorizing UploadPart and UploadPartCopy.
+///
+/// Storage retains the complete durable upload record. Higher layers may inspect only the
+/// logical ownership, object key, checksum configuration, and encryption state required by the
+/// S3 authorization and encryption layers, then consume the candidate into the capability
+/// required to create the storage-owned part stream session.
+pub struct MultipartUploadPartCandidate(MultipartUploadRecord);
+
+impl MultipartUploadPartCandidate {
+    pub(crate) fn from_record(upload: MultipartUploadRecord) -> Self {
+        Self(upload)
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ObjectKey {
+        &self.0.key
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &OwnerIdentity {
+        &self.0.owner
+    }
+
+    #[must_use]
+    pub fn initiator(&self) -> &OwnerIdentity {
+        &self.0.initiator
+    }
+
+    #[must_use]
+    pub fn checksum_config(&self) -> Option<MultipartChecksumConfig> {
+        self.0.checksum
+    }
+
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.0.encryption
+    }
+
+    #[must_use]
+    pub fn into_authorized_part(self, part_number: u32) -> AuthorizedMultipartUploadPart {
+        AuthorizedMultipartUploadPart::assume_authorized(self.0, part_number)
+    }
+}
+
+impl std::fmt::Debug for MultipartUploadPartCandidate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartUploadPartCandidate")
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque capability authorizing stream-session creation for one exact in-progress upload.
+pub struct AuthorizedMultipartUploadPart {
+    upload: MultipartUploadRecord,
+    part_number: u32,
+}
+
+impl AuthorizedMultipartUploadPart {
+    pub(crate) fn assume_authorized(upload: MultipartUploadRecord, part_number: u32) -> Self {
+        Self {
+            upload,
+            part_number,
+        }
+    }
+
+    pub(crate) fn record(&self) -> &MultipartUploadRecord {
+        &self.upload
+    }
+
+    pub(crate) fn part_number(&self) -> u32 {
+        self.part_number
+    }
+}
+
+impl std::fmt::Debug for AuthorizedMultipartUploadPart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthorizedMultipartUploadPart")
+            .finish_non_exhaustive()
+    }
+}
+
 /// In-progress multipart part record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartPartRecord {
@@ -6312,6 +6395,38 @@ mod tests {
         };
         assert_eq!(identity.owner().principal, "lookup-owner");
         assert_eq!(identity.initiator().principal, "lookup-initiator");
+    }
+
+    #[test]
+    fn multipart_part_candidate_exposes_only_logical_authorization_state() {
+        let mut upload = management_lookup_test_upload(UploadState::InProgress);
+        upload.checksum = Some(
+            MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32, None)
+                .expect("CRC32 is a valid multipart checksum configuration"),
+        );
+        let upload_id = upload.upload_id.clone();
+        let candidate = MultipartUploadPartCandidate::from_record(upload);
+        assert_eq!(candidate.key().as_str(), "private-durable-key");
+        assert_eq!(candidate.owner().principal, "lookup-owner");
+        assert_eq!(candidate.initiator().principal, "lookup-initiator");
+        assert_eq!(
+            candidate.checksum_config().map(|config| config.algorithm()),
+            Some(ChecksumAlgorithm::Crc32)
+        );
+        assert!(matches!(candidate.encryption(), ObjectEncryption::None));
+        assert_eq!(
+            format!("{candidate:?}"),
+            "MultipartUploadPartCandidate { .. }"
+        );
+
+        let authorized = candidate.into_authorized_part(7);
+        assert_eq!(authorized.record().upload_id, upload_id);
+        assert_eq!(authorized.record().key.as_str(), "private-durable-key");
+        assert_eq!(authorized.part_number(), 7);
+        assert_eq!(
+            format!("{authorized:?}"),
+            "AuthorizedMultipartUploadPart { .. }"
+        );
     }
 
     #[test]

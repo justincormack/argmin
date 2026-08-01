@@ -1154,6 +1154,24 @@ capability. UploadPart and
 completion authorization still expose the broad authorized durable upload wrapper and remain
 pending, so implementation-order item 3 is not yet complete.
 
+The nineteenth bounded slice continues implementation-order item 3 with UploadPart and
+UploadPartCopy authorization. Storage now loads an exact in-progress upload into a one-use
+UploadPart candidate. The candidate exposes only the object key, owner and initiator identities,
+checksum configuration, and encryption state required by S3 policy, response, and encryption
+handling; it can be consumed with the validated part number into a non-cloneable, non-comparable
+UploadPart-only capability. The coordinator carries that opaque, part-bound capability plus the
+logical checksum algorithm and SSE-C response context. It derives the request subject from the
+already-authorized request and passes the capability back through the same admitted
+multipart-object route. Storage expands the
+capability to its complete durable upload record only inside the owner crate before using the
+existing local/Unix node-client, database, metadata-command, and storage-RPC representations.
+Candidate and capability `Debug` output is fully redacted, including the upload ID. Compiler
+visibility is the primary boundary, with checks rejecting durable upload records in both
+UploadPart authorization paths, their result and execution seams, broad admitted-route mutation
+arguments, new public capability methods, durable-state `Debug` output, clone, or equality
+surfaces. Multipart completion authorization still exposes the broad authorized durable upload
+wrapper and remains pending, so implementation-order item 3 is not yet complete.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

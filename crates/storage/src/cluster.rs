@@ -3422,6 +3422,21 @@ impl ActiveMultipartObjectRoute<'_> {
             .map(crate::MultipartUploadListPartsLookup::from_management_lookup)
     }
 
+    /// Load an in-progress upload through the logical UploadPart authorization boundary.
+    pub fn load_multipart_upload_for_part(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadPartCandidate, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .load_in_progress_multipart_upload_with_route_validation(
+                self.effect_route(),
+                upload_id,
+                || self.admission.require_valid_now(),
+            )
+            .map(crate::MultipartUploadPartCandidate::from_record)
+    }
+
     /// Load an in-progress upload through this exact admitted object route.
     pub fn load_in_progress_multipart_upload(
         &self,
@@ -3440,16 +3455,17 @@ impl ActiveMultipartObjectRoute<'_> {
     /// this admitted multipart route.
     pub fn create_upload_part_stream_session(
         &self,
-        authorized_upload: &AuthorizedMultipartUploadRecord,
-        part_number: u32,
+        authorized_upload: crate::AuthorizedMultipartUploadPart,
         session_id: &SessionId,
     ) -> Result<SessionId, ObjectPgActionError> {
+        let internal_authorized_upload =
+            AuthorizedMultipartUploadRecord::assume_authorized(authorized_upload.record().clone());
         self.admission
             .cluster
             .create_upload_part_stream_session_with_route_validation(
                 self.effect_route(),
-                authorized_upload,
-                part_number,
+                &internal_authorized_upload,
+                authorized_upload.part_number(),
                 session_id,
                 self.admission.authority_valid_until_ms(),
                 || self.admission.require_valid_now(),

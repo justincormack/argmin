@@ -602,13 +602,13 @@ impl Coordinator {
         let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(&dst_bucket_handle)?;
         let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(&dst_bucket_handle)?;
         let dst_upload = multipart_route
-            .load_in_progress_multipart_upload(upload_id)
+            .load_multipart_upload_for_part(upload_id)
             .map_err(Self::map_object_pg_action_error)?;
-        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+        let policy_context = Self::with_multipart_part_managed_encryption_policy_context(
             policy_context,
             &dst_upload,
         );
-        if !self.requester_can_write_multipart_upload_with_bucket_policy(
+        if !self.requester_can_write_multipart_part_with_bucket_policy(
             requester,
             &dst_bucket_info,
             dst_bucket_tags.as_deref(),
@@ -620,15 +620,18 @@ impl Coordinator {
         }
         Self::ensure_sse_c_allowed(
             &dst_bucket_info,
-            dst_upload.encryption.uses_sse_customer_headers(),
+            dst_upload.encryption().uses_sse_customer_headers(),
         )?;
-        self.ensure_write_encryption_supported(&dst_upload.encryption)?;
+        self.ensure_write_encryption_supported(dst_upload.encryption())?;
         let sse_customer = self.prepare_existing_sse_customer_write_context(
-            &dst_upload.encryption,
+            dst_upload.encryption(),
             req.sse_customer,
             SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
+        let checksum_algorithm = dst_upload
+            .checksum_config()
+            .map(|config| config.algorithm());
 
         let source = self.authorize_copy_source_read_snapshot(
             admission,
@@ -645,11 +648,8 @@ impl Coordinator {
         Ok(AuthorizedUploadPartCopy {
             source,
             destination: AuthorizedMultipartPartWrite {
-                bucket: req.upload.bucket_name_typed().clone(),
-                key: req.upload.key_typed().clone(),
-                upload_id: dst_upload.upload_id.clone(),
-                part_number,
-                upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(dst_upload),
+                upload: dst_upload.into_authorized_part(part_number),
+                checksum_algorithm,
                 sse_customer,
             },
         })
@@ -659,53 +659,41 @@ impl Coordinator {
         &self,
         req: &BeginStreamPartRequest<'_>,
         bucket_handle: NonBoeLoadedBucketHandle<'_>,
-        upload: &MultipartUploadRecord,
+        upload: storage::MultipartUploadPartCandidate,
     ) -> Result<AuthorizedBeginStreamPart, ServerError> {
-        let bucket = req.upload.bucket_name_typed();
-        let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let policy_context = req.effective_policy_context();
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
-        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
         let policy_context =
-            Self::with_multipart_upload_managed_encryption_policy_context(policy_context, upload);
-        if !self.requester_can_write_multipart_upload_with_bucket_policy(
+            Self::with_multipart_part_managed_encryption_policy_context(policy_context, &upload);
+        if !self.requester_can_write_multipart_part_with_bucket_policy(
             req.upload.requester(),
             &bucket_info,
             bucket_tags.as_deref(),
-            upload,
+            &upload,
             policy_context,
             bucket_policy.as_deref(),
         )? {
             return Err(ServerError::AccessDenied);
         }
-        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
-        self.ensure_write_encryption_supported(&upload.encryption)?;
+        Self::ensure_sse_c_allowed(
+            &bucket_info,
+            upload.encryption().uses_sse_customer_headers(),
+        )?;
+        self.ensure_write_encryption_supported(upload.encryption())?;
         let sse_customer = self.prepare_existing_sse_customer_write_context(
-            &upload.encryption,
+            upload.encryption(),
             req.sse_customer,
             SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
+        let checksum_algorithm = upload.checksum_config().map(|config| config.algorithm());
 
         Ok(AuthorizedBeginStreamPart {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload.upload_id.clone(),
-            part_number,
-            upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
+            upload: upload.into_authorized_part(part_number),
+            checksum_algorithm,
             sse_customer,
         })
     }
@@ -724,9 +712,9 @@ impl Coordinator {
         self.with_bucket_write_handle_for(&req.upload, request, |bucket_handle| {
             let upload = self
                 .storage_node()
-                .load_multipart_upload(bucket, key, upload_id)
-                .map_err(BucketHandleLoader::map_bucket_snapshot_error)?;
-            self.authorize_begin_stream_part_with_upload(req, &bucket_handle, &upload)
+                .load_multipart_upload_for_part(bucket, key, upload_id)
+                .map_err(Self::map_object_pg_action_error)?;
+            self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)
         })
     }
 

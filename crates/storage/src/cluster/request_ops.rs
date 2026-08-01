@@ -13708,6 +13708,24 @@ impl super::StorageCluster {
         )
     }
 
+    /// Test/composition entry point matching the production UploadPart capability boundary.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn create_upload_part_stream_session_for_authorized_part_with_cleanup_deadline(
+        &self,
+        authorized_upload: crate::AuthorizedMultipartUploadPart,
+        session_id: &SessionId,
+        cleanup_after: Option<u64>,
+    ) -> Result<SessionId, ObjectPgActionError> {
+        let internal_authorized_upload =
+            AuthorizedMultipartUploadRecord::assume_authorized(authorized_upload.record().clone());
+        self.create_upload_part_stream_session_with_cleanup_deadline(
+            &internal_authorized_upload,
+            authorized_upload.part_number(),
+            session_id,
+            cleanup_after,
+        )
+    }
+
     pub(super) fn create_upload_part_stream_session_with_route_validation(
         &self,
         route: super::MultipartObjectMutationEffectRoute<'_>,
@@ -13905,6 +13923,26 @@ impl super::StorageCluster {
             upload_id,
             || Ok(()),
         )
+    }
+
+    /// Load an in-progress upload through the logical UploadPart authorization boundary.
+    pub fn load_multipart_upload_for_part(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadPartCandidate, ObjectPgActionError> {
+        self.load_in_progress_multipart_upload_with_route_validation(
+            super::MultipartObjectMutationEffectRoute {
+                pg_id: self.object_metadata_pg(bucket, key),
+                bucket,
+                key,
+                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+            },
+            upload_id,
+            || Ok(()),
+        )
+        .map(crate::MultipartUploadPartCandidate::from_record)
     }
 
     pub(super) fn load_in_progress_multipart_upload_with_route_validation(

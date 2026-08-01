@@ -247,14 +247,14 @@ impl Coordinator {
         let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(&dst_bucket_handle)?;
         let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(&dst_bucket_handle)?;
         let dst_upload = multipart_route
-            .load_in_progress_multipart_upload(upload_id)
+            .load_multipart_upload_for_part(upload_id)
             .map_err(Self::map_object_pg_action_error)?;
-        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+        let policy_context = Self::with_multipart_part_managed_encryption_policy_context(
             policy_context,
             &dst_upload,
         );
         let modern_bucket_tags = PreloadedBucketTags::new(dst_bucket_tags.as_deref());
-        if write_multipart_upload_with_bucket_policy(
+        if write_multipart_part_with_bucket_policy(
             requester,
             modern_bucket,
             modern_bucket_tags,
@@ -267,15 +267,18 @@ impl Coordinator {
         }
         Self::ensure_sse_c_allowed(
             &dst_bucket_info,
-            dst_upload.encryption.uses_sse_customer_headers(),
+            dst_upload.encryption().uses_sse_customer_headers(),
         )?;
-        self.ensure_write_encryption_supported(&dst_upload.encryption)?;
+        self.ensure_write_encryption_supported(dst_upload.encryption())?;
         let sse_customer = self.prepare_existing_sse_customer_write_context(
-            &dst_upload.encryption,
+            dst_upload.encryption(),
             req.sse_customer,
             SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
+        let checksum_algorithm = dst_upload
+            .checksum_config()
+            .map(|config| config.algorithm());
         let source = self.authorize_copy_source_read_snapshot(
             admission,
             CopySourceReadSnapshotRequest {
@@ -291,11 +294,8 @@ impl Coordinator {
         Ok(AuthorizedUploadPartCopy {
             source,
             destination: AuthorizedMultipartPartWrite {
-                bucket: req.upload.bucket_name_typed().clone(),
-                key: req.upload.key_typed().clone(),
-                upload_id: dst_upload.upload_id.clone(),
-                part_number,
-                upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(dst_upload),
+                upload: dst_upload.into_authorized_part(part_number),
+                checksum_algorithm,
                 sse_customer,
             },
         })
@@ -305,11 +305,8 @@ impl Coordinator {
         &self,
         req: &BeginStreamPartRequest<'_>,
         bucket_handle: BoeLoadedBucketHandle<'_>,
-        upload: &MultipartUploadRecord,
+        upload: storage::MultipartUploadPartCandidate,
     ) -> Result<AuthorizedBeginStreamPart, ServerError> {
-        let bucket = req.upload.bucket_name_typed();
-        let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let policy_context = req.effective_policy_context();
         let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
@@ -317,45 +314,36 @@ impl Coordinator {
         let modern_bucket = BoeBucketSummary::assume_boe(&modern_bucket_info);
         let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
         let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
-        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
         let policy_context =
-            Self::with_multipart_upload_managed_encryption_policy_context(policy_context, upload);
+            Self::with_multipart_part_managed_encryption_policy_context(policy_context, &upload);
         let modern_bucket_tags = PreloadedBucketTags::new(bucket_tags.as_deref());
-        if write_multipart_upload_with_bucket_policy(
+        if write_multipart_part_with_bucket_policy(
             req.upload.requester(),
             modern_bucket,
             modern_bucket_tags,
-            upload,
+            &upload,
             &policy_context,
             bucket_policy.as_deref(),
         )? != ModernObjectWriteAuthorization::Allowed
         {
             return Err(ServerError::AccessDenied);
         }
-        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
-        self.ensure_write_encryption_supported(&upload.encryption)?;
+        Self::ensure_sse_c_allowed(
+            &bucket_info,
+            upload.encryption().uses_sse_customer_headers(),
+        )?;
+        self.ensure_write_encryption_supported(upload.encryption())?;
         let sse_customer = self.prepare_existing_sse_customer_write_context(
-            &upload.encryption,
+            upload.encryption(),
             req.sse_customer,
             SseCustomerSegmentScope::multipart_part(part_number)?,
             true,
         )?;
+        let checksum_algorithm = upload.checksum_config().map(|config| config.algorithm());
 
         Ok(AuthorizedBeginStreamPart {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            upload_id: upload.upload_id.clone(),
-            part_number,
-            upload: storage::AuthorizedMultipartUploadRecord::assume_authorized(upload.clone()),
+            upload: upload.into_authorized_part(part_number),
+            checksum_algorithm,
             sse_customer,
         })
     }
@@ -1018,6 +1006,31 @@ pub(in crate::coordinator) fn write_multipart_upload_with_bucket_policy(
         bucket,
         bucket_tags,
         upload.key.as_str(),
+        auth::PolicyAction::PutObject,
+        policy_context,
+        policy,
+    )?;
+    let allowed = put_object_policy_allows(requester, bucket, decision);
+    Ok(if allowed {
+        ModernObjectWriteAuthorization::Allowed
+    } else {
+        ModernObjectWriteAuthorization::Denied
+    })
+}
+
+pub(in crate::coordinator) fn write_multipart_part_with_bucket_policy(
+    requester: &Requester,
+    bucket: BoeBucketSummary<'_>,
+    bucket_tags: PreloadedBucketTags<'_>,
+    upload: &storage::MultipartUploadPartCandidate,
+    policy_context: &PutObjectPolicyContext<'_>,
+    policy: Option<&auth::BucketPolicy>,
+) -> Result<ModernObjectWriteAuthorization, ServerError> {
+    let decision = bucket_policy_decision_for_put_object_action_modern(
+        requester,
+        bucket,
+        bucket_tags,
+        upload.key().as_str(),
         auth::PolicyAction::PutObject,
         policy_context,
         policy,

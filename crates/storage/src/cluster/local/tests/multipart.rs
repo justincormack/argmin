@@ -699,6 +699,20 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
             crate::MetadataError::NoSuchUpload { .. }
         ))
     ));
+    let authorized_part = crossed_route
+        .load_multipart_upload_for_part(&upload_id)
+        .unwrap()
+        .into_authorized_part(7);
+    let session_id = crate::SessionId::try_from("41".repeat(16)).unwrap();
+    let error = route
+        .create_upload_part_stream_session(authorized_part, &session_id)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "create UploadPart stream session",
+        })
+    ));
     let error = route
         .list_parts_for_authorized_upload(&authorized_list_parts, None, 1_000)
         .unwrap_err();

@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use checksum::MultipartChecksumConfig;
 use storage::{BucketName, ObjectEncryption, ObjectKey, ObjectLayout, StoredObject};
 
 use super::read_core::{
@@ -590,27 +589,32 @@ impl Coordinator {
             )
         };
 
+        let bucket = req.upload.bucket_name_typed().clone();
+        let key = req.upload.key_typed().clone();
+        let upload_id = req.upload.upload_id().clone();
+        let part_number = req.part_number;
         let AuthorizedMultipartPartWrite {
-            bucket,
-            key,
-            upload_id,
-            part_number,
             upload,
+            checksum_algorithm,
             sse_customer,
         } = destination;
         let multipart_route = admission
-            .active_multipart_object_route(&bucket, &key)
+            .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
             .map_err(super::map_store_error)?;
-        let stream_cleanup = self.retained_stream_upload_cleanup(admission, &bucket, &key)?;
+        let stream_cleanup = self.retained_stream_upload_cleanup(
+            admission,
+            req.upload.bucket_name_typed(),
+            req.upload.key_typed(),
+        )?;
         let session_id = Self::random_session_id("failed to generate session ID")?;
         let session_id = multipart_route
-            .create_upload_part_stream_session(&upload, part_number, &session_id)
+            .create_upload_part_stream_session(upload, &session_id)
             .map_err(Self::map_object_pg_action_error)?;
         #[cfg(test)]
-        maybe_run_upload_part_copy_stream_session_hook(bucket.as_str(), key.as_str());
+        maybe_run_upload_part_copy_stream_session_hook(req.upload.bucket_name(), req.upload.key());
         let session = BeginStreamPartResult {
             session_id,
-            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
+            checksum_algorithm,
             sse_customer,
         };
         let session_id = &session.session_id;
