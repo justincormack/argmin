@@ -12485,14 +12485,38 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   command publisher typing is now in progress as a separate hardening phase
   rather than a blocker for the completed split-role functional integration
   gate.
-- The next multihost release slice is quantitative sustained qualification.
-  Extend the default 116-PG/256-retained-epoch workload across repeated
-  authority leadership-loss/restart and storage-host outage/rejoin cycles;
-  retain degraded-read assertions during each outage; collect per-host WAL,
-  checkpoint, fsync, RPC retry, authentication, connection-pressure, and
-  recovery-latency metrics; and enforce explicit bounds on durable write rate,
-  retained artifact/WAL size, and convergence time. Preserve all per-host
-  diagnostics when a bound fails.
+- The first quantitative sustained qualification slice is implemented behind
+  `scripts/uat-multihost-raft --quantitative`. It is deliberately unavailable
+  to reduced or volatile profiles: the gate requires a release build, 116 PGs,
+  256 retained route advances, at least eight one-MiB objects, at least three
+  authority failover/restart cycles, persistent storage, and at least five
+  minutes of subsequent steady traffic. After the functional failure cycles
+  and storage restart, the harness snapshots/purges, transfers leadership to
+  each authority to capture its process-local baseline, runs repeated S3
+  GET/HEAD/List verification while ordinary storage heartbeats continue, then
+  transfers leadership to every authority again for final counters. Per
+  authority it requires combined checkpoint and WAL deltas below 1 MiB/s, zero
+  new checkpoint/WAL/response-write errors, an empty durability queue, maximum
+  checkpoint store/WAL fsync/RPC operation latency below fixed release bounds,
+  a post-purge artifact no larger than 1 MiB, and a WAL no larger than 64 MiB.
+  It also rejects any internal authentication failure recorded by authority,
+  storage, or frontend logs. Raw baseline/final diagnostics and a compact
+  release summary are retained with failure artifacts.
+- The first reference-host quantitative run passed on 2026-08-02. Across
+  413-414 seconds per process, including the staggered leadership sweeps, the
+  three authorities wrote 7,368-8,648 durable bytes/s. Their restart artifacts
+  were 180,988 bytes and their sampled WALs were 3,494-160,330 bytes. Lifetime
+  maxima remained 9.1-43.1 ms for WAL file sync, 9.7-12.9 ms for checkpoint
+  store, and 21-223 ms for control-plane RPC operations. The run completed 41
+  full GET/HEAD/List rounds over 12 one-MiB objects with no checkpoint, WAL,
+  response-write, or authentication error increase.
+- Closing the complete quantitative gate still requires composing repeated
+  real storage-host outage/rejoin windows and the certified degraded-read
+  assertions into the same measured interval. Storage RPC
+  connection/admission pressure needs a bounded runtime counter before it can
+  become a quantitative assertion rather than a log heuristic. The existing
+  functional degraded-read smoke remains the correctness gate while those
+  workload and observability additions proceed.
 - Frontend process availability is now independent of full-cluster PG
   convergence. Dynamic startup constructs route handles, starts refresh and
   background workers, and binds the S3 listener from the current committed map

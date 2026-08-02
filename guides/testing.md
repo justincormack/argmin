@@ -201,6 +201,31 @@ one-MiB persistent objects, and three leader-loss/restart cycles:
   --no-cleanup-fail
 ```
 
+Add `--quantitative` for the sustained persistent-storage release gate:
+
+```bash
+./scripts/uat-multihost-raft \
+  --hosts grey0,grey1,grey2 \
+  --addresses 192.0.2.10,192.0.2.11,192.0.2.12 \
+  --release \
+  --quantitative \
+  --no-cleanup-fail
+```
+
+Quantitative mode requires the persistent 116-PG/256-retained-epoch profile,
+at least eight objects, at least three failover cycles, a release build, and a
+steady interval of at least five minutes. It transfers leadership to each
+authority to bracket process-local durability counters, then enforces less
+than 1 MiB/s of combined checkpoint and WAL bytes per authority, zero new
+checkpoint/WAL/response-write errors, a drained WAL durability queue, bounded
+checkpoint-store latency at or below five seconds, WAL file-sync latency at or
+below one second, control-plane RPC operation latency at or below 15 seconds,
+no logged internal authentication failures, a post-purge artifact no larger
+than 1 MiB, and a WAL no larger than 64 MiB.
+`--sustained-seconds` may lengthen the default 300-second interval but cannot
+shorten this release boundary. Raw baseline/final diagnostics and the release
+summary are preserved with the other failure artifacts.
+
 Use `--ssh-config PATH` (or `ARGMIN_MULTIHOST_RAFT_SSH_CONFIG`) when the host
 aliases live in a nondefault SSH client configuration. The option is applied to
 both `ssh` and `scp`.
