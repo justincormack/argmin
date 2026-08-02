@@ -9798,8 +9798,11 @@ impl super::StorageCluster {
             };
             let payload_lease = if let Some(live) = subject.stored.as_live() {
                 require_valid_route()?;
-                match self.acquire_object_payload_lease(route.bucket, route.key, live.generation_id)
-                {
+                match self.acquire_available_object_payload_lease(
+                    route.bucket,
+                    route.key,
+                    live.generation_id,
+                ) {
                     Ok(lease) => Some(lease),
                     Err(StoreError::NotFound) => {
                         work_budget
@@ -11911,15 +11914,41 @@ impl super::StorageCluster {
         generation_id: GenerationId,
     ) -> Result<ObjectPayloadLease, StoreError> {
         let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
-        let node_leases =
+        let acquired =
             self.local_map
                 .try_acquire_object_payload_lease(bucket, key, generation_id)?;
-        if node_leases.is_empty() {
+        if acquired.node_leases.is_empty() {
             return Err(StoreError::NotFound);
         }
         Ok(ObjectPayloadLease::new(
             std::sync::Arc::downgrade(self),
-            node_leases,
+            acquired,
+            runtime_state,
+            bucket.clone(),
+            key.clone(),
+            generation_id,
+            self.object_metadata_pg_id(bucket, key),
+        ))
+    }
+
+    fn acquire_available_object_payload_lease(
+        self: &std::sync::Arc<Self>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<ObjectPayloadLease, StoreError> {
+        let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
+        let acquired = self.local_map.try_acquire_available_object_payload_lease(
+            bucket,
+            key,
+            generation_id,
+        )?;
+        if acquired.node_leases.is_empty() {
+            return Err(StoreError::NotFound);
+        }
+        Ok(ObjectPayloadLease::new(
+            std::sync::Arc::downgrade(self),
+            acquired,
             runtime_state,
             bucket.clone(),
             key.clone(),
@@ -11942,9 +11971,46 @@ impl super::StorageCluster {
         if !locations.is_empty() && node_leases.is_empty() {
             return Err(StoreError::NotFound);
         }
+        let acquired = super::AcquiredObjectPayloadNodeLeases {
+            node_leases,
+            leased_node_ids: locations
+                .iter()
+                .map(super::ShardLocation::node_id)
+                .collect(),
+        };
         Ok(ObjectPayloadLease::new(
             std::sync::Arc::downgrade(self),
-            node_leases,
+            acquired,
+            runtime_state,
+            bucket.clone(),
+            key.clone(),
+            generation_id,
+            self.object_metadata_pg_id(bucket, key),
+        ))
+    }
+
+    pub(crate) fn acquire_available_object_payload_lease_for_shard_locations(
+        self: &std::sync::Arc<Self>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        locations: &[super::ShardLocation],
+    ) -> Result<ObjectPayloadLease, StoreError> {
+        let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
+        let acquired = self
+            .local_map
+            .try_acquire_available_object_payload_lease_on_locations(
+                bucket,
+                key,
+                generation_id,
+                locations,
+            )?;
+        if !locations.is_empty() && acquired.node_leases.is_empty() {
+            return Err(StoreError::NotFound);
+        }
+        Ok(ObjectPayloadLease::new(
+            std::sync::Arc::downgrade(self),
+            acquired,
             runtime_state,
             bucket.clone(),
             key.clone(),

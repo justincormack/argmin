@@ -1,5 +1,163 @@
 use super::*;
+use crate::node_client::{ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute};
 use crate::StorageClusterRouteHandle;
+
+struct PayloadLeaseUnavailableClient {
+    inner: Arc<dyn ObjectPayloadLeaseNodeClient>,
+}
+
+struct PayloadLeaseUnavailableRoute<'a> {
+    inner: Box<dyn ObjectPayloadLeaseRoute + 'a>,
+}
+
+impl ObjectPayloadLeaseNodeClient for PayloadLeaseUnavailableClient {
+    fn open_object_payload_lease_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        bucket: &crate::BucketName,
+        key: &crate::ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<Box<dyn ObjectPayloadLeaseRoute + '_>, StoreError> {
+        Ok(Box::new(PayloadLeaseUnavailableRoute {
+            inner: self.inner.open_object_payload_lease_route(
+                route_cluster_epoch,
+                bucket,
+                key,
+                generation_id,
+            )?,
+        }))
+    }
+}
+
+impl ObjectPayloadLeaseRoute for PayloadLeaseUnavailableRoute<'_> {
+    fn acquire_object_payload_lease(
+        &self,
+        _kind: ObjectPayloadLeaseKind,
+    ) -> Result<Option<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+        Err(StoreError::Io {
+            context: "connect storage-node object-payload lease RPC endpoint",
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        })
+    }
+
+    fn try_begin_object_payload_reclaim(
+        &self,
+        authority: &crate::metadata_command::ObjectPayloadReclaimClaimProof,
+    ) -> Result<bool, StoreError> {
+        self.inner.try_begin_object_payload_reclaim(authority)
+    }
+
+    fn object_payload_lease_count(&self) -> Result<usize, StoreError> {
+        self.inner.object_payload_lease_count()
+    }
+}
+
+fn retained_read_with_unavailable_lease_nodes(
+    unavailable_node_ids: &[NodeId],
+) -> Result<Vec<u8>, StoreError> {
+    let tmp = test_util::tempdir();
+    let mut map = LocalClusterMap::open(
+        tmp.path(),
+        &trace_node_ids(),
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    for node_id in unavailable_node_ids {
+        let inner = Arc::clone(map.node(*node_id).unwrap().object_payload_lease_client());
+        map.replace_object_payload_lease_client_for_tests(
+            *node_id,
+            Arc::new(PayloadLeaseUnavailableClient { inner }),
+        );
+    }
+    let map = Arc::new(map);
+    let cluster = current_cluster(&map);
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    let payload = b"retained EC read excludes every unleased shard location";
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        payload,
+    );
+
+    let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission
+        .active_object_read_route(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+        )
+        .unwrap();
+    let outcome = route
+        .load_leased_object_read_snapshot_if(|_| Ok::<_, ()>(()))
+        .unwrap()
+        .unwrap();
+    let segment = outcome.snapshot().object_segments[0].clone();
+    let generation_id = outcome.snapshot().stored.as_live().unwrap().generation_id;
+    let (_, _, leased_snapshot) = outcome.into_parts();
+    let retained = match route.retain_object_payload_read(leased_snapshot) {
+        Ok(retained) => retained,
+        Err(error) => {
+            assert_eq!(
+                cluster.object_payload_lease_holder_node_count(&bucket, &key, generation_id),
+                0,
+                "failed handoff must release broad and partially acquired narrow leases"
+            );
+            return Err(error);
+        }
+    };
+    let retained = retained.expect("live object should retain payload authority");
+
+    let unavailable = unavailable_node_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let _read_guard =
+        cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(move |location, _| {
+            assert!(
+                !unavailable.contains(&location.node_id()),
+                "retained read must not access an unleased shard location"
+            );
+            Ok(())
+        }));
+    let mut bytes = Vec::new();
+    retained.read_segment_payload_stored_bytes_into(&segment, &mut bytes)?;
+    drop(retained);
+    assert_eq!(
+        cluster.object_payload_lease_holder_node_count(&bucket, &key, generation_id),
+        0,
+        "retained read must release every successfully acquired node lease"
+    );
+    Ok(bytes)
+}
+
+#[test]
+fn retained_read_reconstructs_from_exact_successfully_leased_node_subset() {
+    let bytes =
+        retained_read_with_unavailable_lease_nodes(&[NodeId::new(0), NodeId::new(1)]).unwrap();
+    assert_eq!(
+        bytes,
+        b"retained EC read excludes every unleased shard location"
+    );
+}
+
+#[test]
+fn retained_read_rejects_a_leased_node_subset_below_ec_k() {
+    let error = retained_read_with_unavailable_lease_nodes(&[
+        NodeId::new(0),
+        NodeId::new(1),
+        NodeId::new(2),
+    ])
+    .unwrap_err();
+    assert!(matches!(error, StoreError::NotFound));
+}
 
 #[test]
 fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {

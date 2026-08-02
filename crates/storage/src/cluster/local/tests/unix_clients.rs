@@ -146,6 +146,53 @@ struct StorageNodeServerGuard {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
+struct StorageNodeServerPoolGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    socket_path: std::path::PathBuf,
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+struct ParkedUnixSocket {
+    original: std::path::PathBuf,
+    parked: std::path::PathBuf,
+}
+
+impl ParkedUnixSocket {
+    fn park(original: &std::path::Path) -> Self {
+        let parked = original.with_extension("parked");
+        std::fs::rename(original, &parked).unwrap();
+        Self {
+            original: original.to_path_buf(),
+            parked,
+        }
+    }
+}
+
+impl Drop for ParkedUnixSocket {
+    fn drop(&mut self) {
+        if self.parked.exists() {
+            std::fs::rename(&self.parked, &self.original).unwrap();
+        }
+    }
+}
+
+impl Drop for StorageNodeServerPoolGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        for _ in 0..self.threads.len() {
+            let _ = std::os::unix::net::UnixStream::connect(&self.socket_path);
+        }
+        for thread in self.threads.drain(..) {
+            if let Err(panic) = thread.join() {
+                if std::thread::panicking() {
+                    return;
+                }
+                std::panic::resume_unwind(panic);
+            }
+        }
+    }
+}
+
 impl Drop for StorageNodeServerGuard {
     fn drop(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
@@ -186,6 +233,30 @@ fn spawn_shared_storage_node_server(server: Arc<StorageNodeServer>) -> StorageNo
         stop,
         socket_path,
         thread: Some(thread),
+    }
+}
+
+fn spawn_shared_storage_node_server_pool(
+    server: Arc<StorageNodeServer>,
+    thread_count: usize,
+) -> StorageNodeServerPoolGuard {
+    let socket_path = server.socket_path_for_test();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let threads = (0..thread_count)
+        .map(|_| {
+            let thread_server = Arc::clone(&server);
+            let thread_stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                thread_server
+                    .serve_until_stop_for_test(&thread_stop)
+                    .unwrap();
+            })
+        })
+        .collect();
+    StorageNodeServerPoolGuard {
+        stop,
+        socket_path,
+        threads,
     }
 }
 
@@ -280,6 +351,103 @@ fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
         crate::cluster::ObjectPayloadReclaimAttempt::Completed,
         "reclaim should proceed through the refreshed map after lease release"
     );
+}
+
+#[test]
+fn unix_retained_read_reconstructs_when_one_shard_node_is_unavailable() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_ids = trace_node_ids();
+    let pg_id = PgId::new(0);
+    let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
+    let epoch = ClusterEpoch::INITIAL;
+    let route = StorageNodePgRoute {
+        pg_id: pg_id.get(),
+        cluster_epoch: epoch,
+        state: PgState::Active,
+        primary_node_id: node_ids[0],
+        metadata_transfer_destination_epoch: None,
+        acting_set: node_ids.to_vec(),
+    };
+    let socket_dir = tmp.path().join("retained-read-sockets");
+    private_socket_dir(&socket_dir);
+    let mut server_guards = Vec::new();
+    let mut client_configs = Vec::new();
+    let mut socket_paths = BTreeMap::new();
+    for node_id in node_ids {
+        let socket_path = socket_dir.join(format!("node-{}.sock", node_id.as_u32()));
+        let server = Arc::new(
+            StorageNodeServer::bind(StorageNodeProcessConfig {
+                node_id,
+                cluster_epoch: epoch,
+                route_map_validity: RouteMapValidity::Forever,
+                data_dir: tmp
+                    .path()
+                    .join(format!("retained-read-node-{}", node_id.as_u32())),
+                default_ec_shape: ec_shape,
+                pg_ids: vec![pg_id.get()],
+                socket_path: socket_path.clone(),
+                pg_routes: vec![route.clone()],
+                pending_metadata_command_recoveries: Vec::new(),
+                historical_pg_routes: Vec::new(),
+            })
+            .unwrap(),
+        );
+        server_guards.push(spawn_shared_storage_node_server_pool(server, 4));
+        client_configs.push(LocalUnixStorageNodeClientConfig::new(
+            node_id,
+            socket_path.clone(),
+        ));
+        socket_paths.insert(node_id, socket_path);
+    }
+
+    let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        node_ids[0],
+        node_ids,
+        &[pg_id.get()],
+        ec_shape,
+        epoch,
+    )
+    .unwrap();
+    map.install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+    let bucket = BucketName::new("retained-read-bucket").unwrap();
+    let key = ObjectKey::new("object").unwrap();
+    let payload = b"retained Unix EC read survives one unavailable shard node";
+    let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, payload);
+    let unavailable_node = committed
+        .locations
+        .iter()
+        .map(ShardLocation::node_id)
+        .find(|node_id| *node_id != route.primary_node_id)
+        .expect("EC placement must include a non-primary shard node");
+    let unavailable_socket = &socket_paths[&unavailable_node];
+    let parked_socket = ParkedUnixSocket::park(unavailable_socket);
+
+    let outcome = cluster
+        .load_leased_object_read_snapshot_if(
+            &bucket,
+            &key,
+            Some(committed.version_id),
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let segment = outcome.snapshot().object_segments[0].clone();
+    let (_, _, leased_snapshot) = outcome.into_parts();
+    let retained = cluster
+        .retain_object_payload_read(leased_snapshot)
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    retained
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, payload);
+    drop(retained);
+    drop(parked_socket);
+    drop(server_guards);
 }
 
 #[test]

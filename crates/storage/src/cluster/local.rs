@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use checksum::{ChecksumAlgorithm, ChecksumHasher};
 use placement::{NodeId, PlacementConstraint, PlacementError, TopologyKey};
 
-use super::{ProcessLocalRegistryKey, ShardLocation};
+use super::{AcquiredObjectPayloadNodeLeases, ProcessLocalRegistryKey, ShardLocation};
 use crate::control_plane::{
     digest_pg_routes, reconstruct_sparse_pg_route_at_epoch, ClusterRuntimeMapSnapshot,
     NodeRouteSnapshot, PgRouteSnapshot,
@@ -63,6 +63,32 @@ const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
+
+fn object_payload_lease_node_is_unavailable(error: &StoreError) -> bool {
+    if error.storage_node_failure_class()
+        == Some(crate::error::StorageNodeFailureClass::TransportInterrupted)
+    {
+        return true;
+    }
+    matches!(
+        error,
+        StoreError::Io {
+            context: "connect storage-node object-payload lease RPC endpoint",
+            source,
+        } if matches!(
+            source.kind(),
+            std::io::ErrorKind::NotFound
+                | std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::UnexpectedEof
+        )
+    )
+}
 
 fn static_route_digest_len(hasher: &mut ChecksumHasher, len: usize) {
     static_route_digest_u64(
@@ -3349,6 +3375,19 @@ impl LocalClusterMap {
     }
 
     #[cfg(test)]
+    pub(crate) fn replace_object_payload_lease_client_for_tests(
+        &mut self,
+        node_id: NodeId,
+        object_payload_lease_client: Arc<dyn ObjectPayloadLeaseNodeClient>,
+    ) {
+        let node = self
+            .nodes
+            .get_mut(&node_id)
+            .expect("test object-payload lease client node must exist");
+        node.object_payload_lease_client = object_payload_lease_client;
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace_shard_client_for_tests(
         &mut self,
         node_id: NodeId,
@@ -3560,21 +3599,58 @@ impl LocalClusterMap {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<Vec<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+    ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
+        self.try_acquire_object_payload_lease_inner(bucket, key, generation_id, false)
+    }
+
+    pub(crate) fn try_acquire_available_object_payload_lease(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
+        self.try_acquire_object_payload_lease_inner(bucket, key, generation_id, true)
+    }
+
+    fn try_acquire_object_payload_lease_inner(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        retain_available: bool,
+    ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
         let mut acquired: Vec<Box<dyn ObjectPayloadLeaseNodeLease>> =
             Vec::with_capacity(self.nodes.len());
-        for node in self.nodes.values() {
-            match node
+        let mut acquired_node_ids = BTreeSet::new();
+        for (node_id, node) in &self.nodes {
+            let result = node
                 .object_payload_lease_client()
-                .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)?
-                .acquire_object_payload_lease(
-                    crate::node_client::ObjectPayloadLeaseKind::BroadSnapshot,
-                )? {
-                Some(lease) => acquired.push(lease),
-                None => return Ok(Vec::new()),
+                .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
+                .and_then(|route| {
+                    route.acquire_object_payload_lease(
+                        crate::node_client::ObjectPayloadLeaseKind::BroadSnapshot,
+                    )
+                });
+            match result {
+                Ok(Some(lease)) => {
+                    acquired.push(lease);
+                    acquired_node_ids.insert(*node_id);
+                }
+                Ok(None) => {
+                    return Ok(AcquiredObjectPayloadNodeLeases {
+                        node_leases: Vec::new(),
+                        leased_node_ids: BTreeSet::new(),
+                    });
+                }
+                Err(error)
+                    if retain_available && object_payload_lease_node_is_unavailable(&error) => {}
+                Err(error) => return Err(error),
             }
         }
-        Ok(acquired)
+        Ok(AcquiredObjectPayloadNodeLeases {
+            node_leases: acquired,
+            leased_node_ids: acquired_node_ids,
+        })
     }
 
     pub(crate) fn try_acquire_object_payload_lease_on_locations(
@@ -3584,6 +3660,40 @@ impl LocalClusterMap {
         generation_id: GenerationId,
         locations: &[ShardLocation],
     ) -> Result<Vec<Box<dyn ObjectPayloadLeaseNodeLease>>, StoreError> {
+        self.try_acquire_object_payload_lease_on_locations_inner(
+            bucket,
+            key,
+            generation_id,
+            locations,
+            false,
+        )
+        .map(|acquired| acquired.node_leases)
+    }
+
+    pub(crate) fn try_acquire_available_object_payload_lease_on_locations(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        locations: &[ShardLocation],
+    ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
+        self.try_acquire_object_payload_lease_on_locations_inner(
+            bucket,
+            key,
+            generation_id,
+            locations,
+            true,
+        )
+    }
+
+    fn try_acquire_object_payload_lease_on_locations_inner(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        locations: &[ShardLocation],
+        retain_available: bool,
+    ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
         let mut node_ids = BTreeMap::new();
         for location in locations {
             let route = self
@@ -3621,21 +3731,40 @@ impl LocalClusterMap {
                 pg_id,
                 cluster_epoch: self.epoch,
             })?;
-            lease_clients.push(Arc::clone(node.object_payload_lease_client()));
+            lease_clients.push((node_id, Arc::clone(node.object_payload_lease_client())));
         }
 
         let mut acquired = Vec::with_capacity(lease_clients.len());
-        for lease_client in lease_clients {
-            match lease_client
-                .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)?
-                .acquire_object_payload_lease(
-                    crate::node_client::ObjectPayloadLeaseKind::ShardLocations,
-                )? {
-                Some(lease) => acquired.push(lease),
-                None => return Ok(Vec::new()),
+        let mut acquired_node_ids = BTreeSet::new();
+        for (node_id, lease_client) in lease_clients {
+            let result = lease_client
+                .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
+                .and_then(|route| {
+                    route.acquire_object_payload_lease(
+                        crate::node_client::ObjectPayloadLeaseKind::ShardLocations,
+                    )
+                });
+            match result {
+                Ok(Some(lease)) => {
+                    acquired.push(lease);
+                    acquired_node_ids.insert(node_id);
+                }
+                Ok(None) if retain_available => {}
+                Ok(None) => {
+                    return Ok(AcquiredObjectPayloadNodeLeases {
+                        node_leases: Vec::new(),
+                        leased_node_ids: BTreeSet::new(),
+                    });
+                }
+                Err(error)
+                    if retain_available && object_payload_lease_node_is_unavailable(&error) => {}
+                Err(error) => return Err(error),
             }
         }
-        Ok(acquired)
+        Ok(AcquiredObjectPayloadNodeLeases {
+            node_leases: acquired,
+            leased_node_ids: acquired_node_ids,
+        })
     }
 
     pub(crate) fn try_begin_object_payload_reclaim(

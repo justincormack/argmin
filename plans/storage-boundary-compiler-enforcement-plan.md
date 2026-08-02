@@ -5153,6 +5153,39 @@ One-hundred-and-thirtieth Phase 3 slice:
   Formatting, the transitional storage boundary checker, and workspace-wide
   strict Clippy also pass.
 
+One-hundred-and-thirty-first Phase 3 slice:
+
+- retained EC reads no longer require deletion-exclusion leases from every
+  shard owner before they can reconstruct. Dedicated retained-only broad and
+  narrow acquisitions record exactly which available storage nodes accepted
+  the subject-bound leases. A transport-unavailable node is omitted, while a
+  reachable node that refuses the broad lease because reclamation has started
+  still makes the snapshot attempt retry from fresh state. The existing all-or-
+  release broad and shard-location lease APIs used by active and maintenance
+  paths remain strict.
+- `RetainedObjectPayloadRead` now owns the immutable leased-node set as well
+  as the exact logical segment snapshot. Every retained shard read recomputes
+  placement from that snapshot and skips locations outside the leased set, so
+  connection failure cannot accidentally authorize reading an unleased shard.
+  Narrow acquisition is restricted to nodes protected by the partial broad
+  snapshot lease. The broad lease is released only after every nonempty
+  segment proves that at least its EC `k` shard locations are covered by the
+  narrow set; an insufficient subset fails closed and releases all broad and
+  partially acquired narrow leases.
+- deterministic embedded regressions prove reconstruction at exactly the
+  available leased subset, reject a subset below `k`, verify failed handoff
+  releases all leases, and make any attempted read from an unleased location
+  fail the test. An installed-Unix regression makes one non-primary shard
+  node's socket unavailable before snapshot loading and proves both partial
+  broad acquisition and the narrow handoff reconstruct the retained body from
+  the remaining nodes through the real connect-failure, read-handle, and
+  retained-read paths.
+- the multihost `storage-node-kill-fails-closed` UAT now proves a fresh GET,
+  HEAD, and List remain available after a non-primary shard node is killed,
+  while a new PUT still fails closed. All 2,626 storage tests and all 7,949
+  workspace tests pass. Formatting, workspace-wide strict Clippy, and the
+  transitional storage boundary checker also pass.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::io;
 use std::num::{NonZeroU16, NonZeroU64};
@@ -1399,9 +1399,15 @@ enum PlacedSegmentShardHealthReadMode {
     HistoricalInspection,
 }
 
+pub(crate) struct AcquiredObjectPayloadNodeLeases {
+    pub(crate) node_leases: Vec<Box<dyn ObjectPayloadLeaseNodeLease>>,
+    pub(crate) leased_node_ids: BTreeSet<NodeId>,
+}
+
 pub struct ObjectPayloadLease {
     cluster: Weak<StorageCluster>,
     node_leases: Vec<Box<dyn ObjectPayloadLeaseNodeLease>>,
+    leased_node_ids: BTreeSet<NodeId>,
     runtime_state: Arc<LocalClusterRuntimeState>,
     bucket: BucketName,
     key: ObjectKey,
@@ -1424,6 +1430,7 @@ pub struct RetainedObjectPayloadRead {
     key: ObjectKey,
     generation_id: GenerationId,
     segments: Vec<ObjectPayloadSegment>,
+    leased_node_ids: BTreeSet<NodeId>,
     lease: Mutex<Option<ObjectPayloadLease>>,
     repair_fence: Option<RetainedActiveRouteRepairFence>,
 }
@@ -1484,6 +1491,7 @@ impl RetainedObjectPayloadRead {
                 segment.placement_cluster_epoch(),
                 segment.stored_bytes_request(),
                 dst,
+                &self.leased_node_ids,
                 self.repair_fence.as_ref(),
             )
     }
@@ -1554,16 +1562,21 @@ impl LeasedObjectReadSnapshot {
 impl ObjectPayloadLease {
     fn new(
         cluster: Weak<StorageCluster>,
-        node_leases: Vec<Box<dyn ObjectPayloadLeaseNodeLease>>,
+        acquired: AcquiredObjectPayloadNodeLeases,
         runtime_state: Arc<LocalClusterRuntimeState>,
         bucket: BucketName,
         key: ObjectKey,
         generation_id: GenerationId,
         pg_id: u32,
     ) -> Self {
+        let AcquiredObjectPayloadNodeLeases {
+            node_leases,
+            leased_node_ids,
+        } = acquired;
         Self {
             cluster,
             node_leases,
+            leased_node_ids,
             runtime_state,
             bucket,
             key,
@@ -1585,6 +1598,10 @@ impl ObjectPayloadLease {
             pg_id: self.pg_id,
             remaining,
         }
+    }
+
+    fn leased_node_ids(&self) -> &BTreeSet<NodeId> {
+        &self.leased_node_ids
     }
 }
 
@@ -7005,26 +7022,51 @@ impl StorageCluster {
             });
         }
 
+        let broad_lease = payload_lease.ok_or(StoreError::NotFound)?;
+        let broad_leased_node_ids = broad_lease.leased_node_ids();
         let mut locations = Vec::new();
+        let mut segment_locations = Vec::with_capacity(segments.len());
         for segment in &segments {
             let request = segment.stored_bytes_request();
             if request.stored_size == 0 {
+                segment_locations.push(Vec::new());
                 continue;
             }
             require_valid_route()?;
-            locations.extend(self.segment_payload_shard_locations_at_placement_epoch(
+            let placed = self.segment_payload_shard_locations_at_placement_epoch(
                 segment.placement_cluster_epoch(),
                 &request,
-            )?);
+            )?;
+            locations.extend(
+                placed
+                    .iter()
+                    .filter(|location| broad_leased_node_ids.contains(&location.node_id()))
+                    .cloned(),
+            );
+            segment_locations.push(placed);
         }
         require_valid_route()?;
-        let narrow_lease = self.acquire_object_payload_lease_for_shard_locations(
+        let narrow_lease = self.acquire_available_object_payload_lease_for_shard_locations(
             &bucket,
             &key,
             live.generation_id,
             &locations,
         )?;
         require_valid_route()?;
+        let leased_node_ids = narrow_lease.leased_node_ids().clone();
+        for (segment, placed) in segments.iter().zip(&segment_locations) {
+            if segment.stored_bytes_request().stored_size == 0 {
+                continue;
+            }
+            let required = usize::from(segment.stored_bytes_request().ec.k);
+            let available = placed
+                .iter()
+                .filter(|location| leased_node_ids.contains(&location.node_id()))
+                .count();
+            if available < required {
+                return Err(StoreError::NotFound);
+            }
+        }
 
         let retained = RetainedObjectPayloadRead {
             cluster,
@@ -7032,10 +7074,11 @@ impl StorageCluster {
             key,
             generation_id: live.generation_id,
             segments,
+            leased_node_ids,
             lease: Mutex::new(Some(narrow_lease)),
             repair_fence,
         };
-        drop(payload_lease);
+        drop(broad_lease);
         Ok(Some(retained))
     }
 
@@ -16677,7 +16720,7 @@ impl StorageCluster {
             let route =
                 self.reconstructed_pg_route_at_epoch(data_pg.pg_id(), placement_cluster_epoch)?;
             self.try_read_placed_segment_stored_bytes_for_pg_route_snapshot_into(
-                &route, req, dst, None,
+                &route, req, dst, None, None,
             )?
         };
         match found {
@@ -16694,6 +16737,7 @@ impl StorageCluster {
         placement_cluster_epoch: ClusterEpoch,
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
+        leased_node_ids: &BTreeSet<NodeId>,
         repair_fence: Option<&RetainedActiveRouteRepairFence>,
     ) -> Result<(), StoreError> {
         self.require_current_payload_operation_epoch(req.data_pg_id)?;
@@ -16705,6 +16749,7 @@ impl StorageCluster {
             &route,
             req,
             dst,
+            Some(leased_node_ids),
             Some(&mut repair_targets),
         )? {
             true => {
@@ -17675,6 +17720,7 @@ impl StorageCluster {
                 req,
                 &mut segment,
                 None,
+                None,
             )? {
                 return Err(StoreError::NotFound);
             }
@@ -18125,6 +18171,7 @@ impl StorageCluster {
         route: &PgRouteSnapshot,
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
+        leased_node_ids: Option<&BTreeSet<NodeId>>,
         mut repair_targets: Option<&mut Vec<ShardIndex>>,
     ) -> Result<bool, StoreError> {
         let ec_config = validate_placed_segment_repair_ec_shape(req.ec)?;
@@ -18153,6 +18200,7 @@ impl StorageCluster {
                 &req.segment_okh,
                 req.segment_vid,
                 &locations,
+                leased_node_ids,
                 shard_index,
                 shard_size,
                 &mut all_shards,
@@ -18172,6 +18220,7 @@ impl StorageCluster {
                     &req.segment_okh,
                     req.segment_vid,
                     &locations,
+                    leased_node_ids,
                     shard_index,
                     shard_size,
                     &mut all_shards,
@@ -18555,6 +18604,7 @@ impl StorageCluster {
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         locations: &[ShardLocation],
+        leased_node_ids: Option<&BTreeSet<NodeId>>,
         shard_index: usize,
         shard_size: usize,
         all_shards: &mut [Option<Vec<u8>>],
@@ -18574,6 +18624,9 @@ impl StorageCluster {
         let Some(location) = locations.get(shard_index).copied() else {
             return Ok(());
         };
+        if leased_node_ids.is_some_and(|node_ids| !node_ids.contains(&location.node_id())) {
+            return Ok(());
+        }
         let shard_key = ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8);
         let ack = match self
             .load_payload_shard_ack_for_pg_route_snapshot(route, data_pg_id, &shard_key)

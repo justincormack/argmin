@@ -3163,7 +3163,9 @@ coarse_payload_lease_callers=$(
             && current_fn != "acquire_object_payload_lease" \
             && current_fn != "load_leased_object_read_snapshot_if_on_route<T, E>" \
             && current_fn != "try_acquire_object_payload_lease" \
+            && current_fn != "try_acquire_object_payload_lease_inner" \
             && current_fn != "try_acquire_object_payload_lease_on_locations" \
+            && current_fn != "try_acquire_object_payload_lease_on_locations_inner" \
             && current_fn != "acquire_object_payload_lease_session_admission" \
             && current_fn != "object_payload_lease_control_response" \
             && !in_test_hook) {
