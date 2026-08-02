@@ -81,6 +81,10 @@ mod allocator_cleanup_publisher_token_sealed {
     pub trait Sealed {}
 }
 
+mod terminal_session_retry_publisher_token_sealed {
+    pub trait Sealed {}
+}
+
 /// Compiler-visible authority to use the snapshot-sensitive install path.
 ///
 /// Implementations are generated exclusively from registry entries classified
@@ -98,6 +102,16 @@ pub(crate) trait SnapshotSensitiveMetadataCommandPublisher:
 /// an existing publisher token.
 pub(crate) trait AllocatorCleanupMetadataCommandPublisher:
     allocator_cleanup_publisher_token_sealed::Sealed
+{
+}
+
+/// Compiler-visible authority to publish a terminal session command.
+///
+/// Implementations are generated exclusively from registry entries classified
+/// as `TerminalSessionRetry`. The matching contender must remain visible until
+/// the publisher's retry loop can consume it.
+pub(crate) trait TerminalSessionRetryMetadataCommandPublisher:
+    terminal_session_retry_publisher_token_sealed::Sealed
 {
 }
 
@@ -131,6 +145,21 @@ macro_rules! define_metadata_command_publisher_token {
 
         impl super::allocator_cleanup_publisher_token_sealed::Sealed for $id {}
         impl super::AllocatorCleanupMetadataCommandPublisher for $id {}
+    };
+    ($id:ident, TerminalSessionRetry) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) struct $id {
+            _private: (),
+        }
+
+        impl $id {
+            pub(crate) const fn __from_registry_marker() -> Self {
+                Self { _private: () }
+            }
+        }
+
+        impl super::terminal_session_retry_publisher_token_sealed::Sealed for $id {}
+        impl super::TerminalSessionRetryMetadataCommandPublisher for $id {}
     };
     ($id:ident, $class:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4615,6 +4644,22 @@ mod tests {
         ));
         require_allocator_cleanup(metadata_command_publisher!(
             EstablishMultipartCompletionBarrier
+        ));
+    }
+
+    #[test]
+    fn terminal_session_publisher_marker_returns_typed_registry_token() {
+        fn require_terminal_session_retry(
+            _publisher: impl TerminalSessionRetryMetadataCommandPublisher,
+        ) {
+        }
+
+        require_terminal_session_retry(metadata_command_publisher!(AbortStreamUploadSession));
+        require_terminal_session_retry(metadata_command_publisher!(FinalizePutObjectStream));
+        require_terminal_session_retry(metadata_command_publisher!(FinalizeUploadPartStream));
+        require_terminal_session_retry(metadata_command_publisher!(AbortMultipartUploadLocked));
+        require_terminal_session_retry(metadata_command_publisher!(
+            AbortAuthorizedMultipartUploadLocked
         ));
     }
 

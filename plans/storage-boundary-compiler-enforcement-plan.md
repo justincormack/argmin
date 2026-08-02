@@ -5309,6 +5309,34 @@ Second Phase 4 slice (2026-08-02):
   boundary checker, formatting, workspace-wide strict Clippy, and the full
   7,949-test workspace suite.
 
+Third Phase 4 slice (2026-08-02):
+
+- all five `TerminalSessionRetry` publishers now receive tokens implementing a
+  class-specific sealed `TerminalSessionRetryMetadataCommandPublisher` trait.
+  PutObject and UploadPart stream finalization, stream-session abort, and both
+  multipart-abort paths cannot select this exceptional install behavior with a
+  token from another publisher class.
+- the typed installer returns the exhaustive, must-use
+  `TerminalSessionRetryInstallOutcome`: installed, matching contender visible,
+  unrelated contender visible, or contention without a visible command. It
+  never drains on the install boundary. Matching terminal evidence therefore
+  remains available for the owner loop or immediate exact-command convergence;
+  unrelated work is reconsidered only after the owner loop reruns its matching
+  predicate.
+- UploadPart finalization retains the matching command envelope long enough to
+  prove whether it owns the newly acquired bucket-write reservation before
+  deciding whether caller cleanup may release that proof. Multipart aborts
+  retain their existing exact matching and bucket-incarnation checks. Stream
+  PUT finalization and general stream abort preserve matching commands until
+  their established top-of-loop completion branches consume them.
+- terminal-session typed calls no longer participate in the temporary shell
+  helper-count inventory. The scanner requires their authoritative registry
+  marker and its adversarial fixture rejects an unmarked typed call. Remaining
+  raw publishers stay inventoried for later Phase 4 classes.
+- validation passed the focused 20-test terminal matching/install-race family,
+  the storage boundary checker, formatting, workspace-wide strict Clippy, and
+  the full 7,950-test workspace suite.
+
 ### Phase 5 — isolate test support
 
 1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside

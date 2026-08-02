@@ -228,6 +228,12 @@ uses of `try_set_pending_metadata_command_for_bucket`,
 Snapshot-sensitive publishers should prefer
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
 drains the winner and returns to the caller's fresh-snapshot loop.
+Terminal-session publishers use
+`install_terminal_session_retry_metadata_command`, whose exhaustive result
+distinguishes installation, a matching visible contender, an unrelated visible
+contender, and contention without a visible slot. The helper never drains a
+contender: the owner loop must preserve a matching terminal command and may
+drain unrelated work only after it has rerun its matching check.
 Matching-outcome retry publishers are the exception: they may use the lower
 level `try_install_pending_metadata_command_for_bucket` only when the
 publisher's retry loop first checks for an equivalent pending command and can
@@ -267,7 +273,9 @@ The object-PG snapshot-sensitive installer returns exhaustive, must-use
 exhaustive, must-use fresh-command and prebuilt-command outcomes. Those paths
 distinguish installed work from a drained pending-slot contender and handled
 log-index contention, so retry cannot be mistaken for successful allocation or
-cleanup.
+cleanup. Terminal-session publication returns the exhaustive, must-use
+`TerminalSessionRetryInstallOutcome`; matching command evidence is carried in
+that type and is never generically drained inside the typed installer.
 Publisher paths which still call lower-level installers remain inventoried here
 and in
 `scripts/check-storage-cluster-boundaries` until their Phase 4 typed API is

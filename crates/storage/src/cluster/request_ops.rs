@@ -13533,7 +13533,8 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(FinalizePutObjectStream);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(FinalizePutObjectStream);
         let super::PutObjectMutationEffectRoute {
             object_pg_id,
             bucket,
@@ -13684,24 +13685,26 @@ impl super::StorageCluster {
                         Err(error) => return Err(error),
                     };
                     require_valid_route().map_err(ObjectPgActionError::Store)?;
-                    let installed = match self
-                        .try_install_pending_metadata_command_for_bucket_with_effect_fence(
-                            pg_id,
-                            bucket,
-                            &command,
-                            Some(effect_fence),
-                        ) {
-                        Ok(installed) => installed,
-                        Err(ObjectPgActionError::Store(
-                            StoreError::MetadataCommandLogConflict { .. },
-                        )) => {
-                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    match self.install_terminal_session_retry_metadata_command(
+                        publisher,
+                        pg_id,
+                        bucket,
+                        &command,
+                        Some(effect_fence),
+                        |pending| {
+                            matches!(
+                                pending.payload(),
+                                MetadataCommandPayload::CommitDirectPutObject(commit)
+                                    if commit.matches_stream_session(bucket, key, session_id)
+                            )
+                        },
+                    )? {
+                        super::TerminalSessionRetryInstallOutcome::Installed => {}
+                        super::TerminalSessionRetryInstallOutcome::MatchingContenderVisible(_)
+                        | super::TerminalSessionRetryInstallOutcome::UnrelatedContenderVisible
+                        | super::TerminalSessionRetryInstallOutcome::ContentionWithoutVisibleCommand => {
                             continue;
                         }
-                        Err(error) => return Err(error),
-                    };
-                    if !installed {
-                        continue;
                     }
                     (command, true)
                 }
@@ -15289,7 +15292,8 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(StreamPartFinalizeSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
     ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(FinalizeUploadPartStream);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(FinalizeUploadPartStream);
         let super::MultipartObjectMutationEffectRoute {
             pg_id: object_pg_id,
             bucket,
@@ -15571,23 +15575,45 @@ impl super::StorageCluster {
                     release_bucket_write_proof_if_unowned!()?;
                     return Err(ObjectPgActionError::Store(error));
                 }
-                let installed = match self
-                    .try_install_pending_metadata_command_for_bucket_with_effect_fence(
-                        pg_id,
-                        bucket,
-                        &command,
-                        Some(effect_fence),
-                    ) {
-                    Ok(installed) => installed,
-                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                        ..
-                    })) => {
-                        if let Err(error) =
-                            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                        {
+                match self.install_terminal_session_retry_metadata_command(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &command,
+                    Some(effect_fence),
+                    |pending| {
+                        matches!(
+                            pending.payload(),
+                            MetadataCommandPayload::CommitStreamPart(commit)
+                                if commit.matches_request(
+                                    bucket,
+                                    key,
+                                    upload_id,
+                                    session_id,
+                                    part_number,
+                                )
+                        )
+                    },
+                ) {
+                    Ok(super::TerminalSessionRetryInstallOutcome::Installed) => {}
+                    Ok(super::TerminalSessionRetryInstallOutcome::MatchingContenderVisible(
+                        pending,
+                    )) => {
+                        let pending_owns_proof = matches!(
+                            pending.payload(),
+                            MetadataCommandPayload::CommitStreamPart(commit)
+                                if commit.bucket_write_reservation
+                                    == expected_command_bucket_write_reservation
+                        );
+                        if !pending_owns_proof {
                             release_bucket_write_proof_if_unowned!()?;
-                            return Err(error);
                         }
+                        continue;
+                    }
+                    Ok(
+                        super::TerminalSessionRetryInstallOutcome::UnrelatedContenderVisible
+                        | super::TerminalSessionRetryInstallOutcome::ContentionWithoutVisibleCommand,
+                    ) => {
                         release_bucket_write_proof_if_unowned!()?;
                         continue;
                     }
@@ -15595,27 +15621,6 @@ impl super::StorageCluster {
                         release_bucket_write_proof_if_unowned!()?;
                         return Err(error);
                     }
-                };
-                if !installed {
-                    let pending_owns_proof = match self
-                        .pending_metadata_command_for_bucket(pg_id, bucket)
-                    {
-                        Ok(Some(pending)) => matches!(
-                            pending.payload(),
-                            MetadataCommandPayload::CommitStreamPart(commit)
-                                if commit.matches_request(bucket, key, upload_id, session_id, part_number)
-                                    && commit.bucket_write_reservation == expected_command_bucket_write_reservation
-                        ),
-                        Ok(None) => false,
-                        Err(error) => {
-                            release_bucket_write_proof_if_unowned!()?;
-                            return Err(error.into());
-                        }
-                    };
-                    if !pending_owns_proof {
-                        release_bucket_write_proof_if_unowned!()?;
-                    }
-                    continue;
                 }
                 command
             };
@@ -16054,7 +16059,8 @@ impl super::StorageCluster {
         drain_mode: AbortMultipartUploadDrainMode,
         expected_bucket_incarnation_generation: Option<u64>,
     ) -> Result<bool, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(AbortMultipartUploadLocked);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(AbortMultipartUploadLocked);
         let pg_id = object_pg_id.pg_id();
         'retry_after_pending_conflict: loop {
             while let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -16131,36 +16137,42 @@ impl super::StorageCluster {
                 self.metadata_command_apply_test_hook_scope_id(),
             );
             self.maybe_run_before_metadata_command_pending_install_hook();
-            match self.try_set_pending_metadata_command_for_bucket(pg_id, bucket, &command) {
-                Ok(Some(())) => {}
-                Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
+            match self.install_terminal_session_retry_metadata_command(
+                publisher,
+                pg_id,
+                bucket,
+                &command,
+                None,
+                |pending| {
+                    metadata_command_is_matching_multipart_abort(pending, bucket, key, upload_id)
+                },
+            ) {
+                Ok(super::TerminalSessionRetryInstallOutcome::Installed) => {}
+                Ok(super::TerminalSessionRetryInstallOutcome::MatchingContenderVisible(
+                    pending,
+                )) => {
                     self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
-                    if let Some(pending) =
-                        self.pending_metadata_command_for_bucket(pg_id, bucket)?
-                    {
-                        if metadata_command_is_matching_multipart_abort(
-                            &pending, bucket, key, upload_id,
-                        ) {
-                            if expected_bucket_incarnation_generation.is_some_and(|expected| {
-                                !metadata_command_matches_bucket_incarnation(&pending, expected)
-                            }) {
-                                return Ok(false);
-                            }
-                            self.apply_exact_pending_object_metadata_command(
-                                pg_id,
-                                super::ExactPendingObjectMetadataCommand::for_checked_request(
-                                    &pending,
-                                ),
-                            )?;
-                            return Ok(true);
-                        }
+                    if expected_bucket_incarnation_generation.is_some_and(|expected| {
+                        !metadata_command_matches_bucket_incarnation(&pending, expected)
+                    }) {
+                        return Ok(false);
                     }
-                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    self.apply_exact_pending_object_metadata_command(
+                        pg_id,
+                        super::ExactPendingObjectMetadataCommand::for_checked_request(&pending),
+                    )?;
+                    return Ok(true);
+                }
+                Ok(
+                    super::TerminalSessionRetryInstallOutcome::UnrelatedContenderVisible
+                    | super::TerminalSessionRetryInstallOutcome::ContentionWithoutVisibleCommand,
+                ) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
                     continue 'retry_after_pending_conflict;
                 }
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
-                    return Err(error.into());
+                    return Err(error);
                 }
             }
             if let Err(error) =
@@ -16206,7 +16218,9 @@ impl super::StorageCluster {
         authorized_upload: &crate::AuthorizedMultipartUploadAbort,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<bool, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(AbortAuthorizedMultipartUploadLocked);
+        let publisher = crate::metadata_command::metadata_command_publisher!(
+            AbortAuthorizedMultipartUploadLocked
+        );
         let super::MultipartObjectMutationEffectRoute {
             pg_id: object_pg_id,
             bucket,
@@ -16285,36 +16299,37 @@ impl super::StorageCluster {
                 self.metadata_command_apply_test_hook_scope_id(),
             );
             self.maybe_run_before_metadata_command_pending_install_hook();
-            match self.try_set_pending_metadata_command_for_bucket_with_effect_fence(
+            match self.install_terminal_session_retry_metadata_command(
+                publisher,
                 pg_id,
                 bucket,
                 &command,
                 Some(effect_fence),
+                |pending| {
+                    metadata_command_is_matching_multipart_abort(pending, bucket, key, upload_id)
+                },
             ) {
-                Ok(Some(())) => {}
-                Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                Ok(super::TerminalSessionRetryInstallOutcome::Installed) => {}
+                Ok(super::TerminalSessionRetryInstallOutcome::MatchingContenderVisible(
+                    pending,
+                )) => {
                     self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
-                    if let Some(pending) =
-                        self.pending_metadata_command_for_bucket(pg_id, bucket)?
-                    {
-                        if metadata_command_is_matching_multipart_abort(
-                            &pending, bucket, key, upload_id,
-                        ) {
-                            self.apply_exact_pending_object_metadata_command(
-                                pg_id,
-                                super::ExactPendingObjectMetadataCommand::for_checked_request(
-                                    &pending,
-                                ),
-                            )?;
-                            return Ok(true);
-                        }
-                    }
-                    self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                    self.apply_exact_pending_object_metadata_command(
+                        pg_id,
+                        super::ExactPendingObjectMetadataCommand::for_checked_request(&pending),
+                    )?;
+                    return Ok(true);
+                }
+                Ok(
+                    super::TerminalSessionRetryInstallOutcome::UnrelatedContenderVisible
+                    | super::TerminalSessionRetryInstallOutcome::ContentionWithoutVisibleCommand,
+                ) => {
+                    self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
                     continue 'retry_after_pending_conflict;
                 }
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(&proof)?;
-                    return Err(error.into());
+                    return Err(error);
                 }
             }
             if let Err(error) =

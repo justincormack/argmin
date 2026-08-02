@@ -6480,6 +6480,14 @@ enum AllocatorCleanupPendingInstallOutcome {
     RetryAfterContention,
 }
 
+#[must_use = "terminal-session contention must preserve matching contenders"]
+enum TerminalSessionRetryInstallOutcome {
+    Installed,
+    MatchingContenderVisible(Box<MetadataCommandEnvelope>),
+    UnrelatedContenderVisible,
+    ContentionWithoutVisibleCommand,
+}
+
 enum ObjectPgPendingCommandInstall {
     Installed(MetadataCommandEnvelope),
     Pending(MetadataCommandEnvelope),
@@ -10174,6 +10182,7 @@ impl StorageCluster {
             .is_some())
     }
 
+    #[cfg(test)]
     fn try_set_pending_metadata_command_for_bucket(
         &self,
         pg_id: PgId,
@@ -10380,6 +10389,38 @@ impl StorageCluster {
             Ok(AllocatorCleanupPendingInstallOutcome::Installed)
         } else {
             Ok(AllocatorCleanupPendingInstallOutcome::RetryAfterContention)
+        }
+    }
+
+    fn install_terminal_session_retry_metadata_command(
+        &self,
+        _publisher: impl crate::metadata_command::TerminalSessionRetryMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        is_matching: impl FnOnce(&MetadataCommandEnvelope) -> bool,
+    ) -> Result<TerminalSessionRetryInstallOutcome, ObjectPgActionError> {
+        match self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+        ) {
+            Ok(true) => Ok(TerminalSessionRetryInstallOutcome::Installed),
+            Ok(false)
+            | Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
+                match self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    Some(pending) if is_matching(&pending) => Ok(
+                        TerminalSessionRetryInstallOutcome::MatchingContenderVisible(Box::new(
+                            pending,
+                        )),
+                    ),
+                    Some(_) => Ok(TerminalSessionRetryInstallOutcome::UnrelatedContenderVisible),
+                    None => Ok(TerminalSessionRetryInstallOutcome::ContentionWithoutVisibleCommand),
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -16492,7 +16533,8 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(AbortStreamUploadSession);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(AbortStreamUploadSession);
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
@@ -16564,10 +16606,22 @@ impl StorageCluster {
                         .clone(),
                 })),
             );
-            if !self
-                .try_install_object_pg_pending_command_or_drain(pg_id, bucket, &command, None)?
-            {
-                continue;
+            match self.install_terminal_session_retry_metadata_command(
+                publisher,
+                pg_id,
+                bucket,
+                &command,
+                None,
+                |pending| {
+                    pending_command_completes_stream_session(pending, bucket, key, session_id)
+                },
+            )? {
+                TerminalSessionRetryInstallOutcome::Installed => {}
+                TerminalSessionRetryInstallOutcome::MatchingContenderVisible(_)
+                | TerminalSessionRetryInstallOutcome::UnrelatedContenderVisible
+                | TerminalSessionRetryInstallOutcome::ContentionWithoutVisibleCommand => {
+                    continue;
+                }
             }
             self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
             return Ok(());
