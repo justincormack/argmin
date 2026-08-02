@@ -236,6 +236,15 @@ function publisher_helper(line) {
     if (line ~ /install_snapshot_sensitive_metadata_command_or_drain\(/) {
         return "install_snapshot_sensitive_metadata_command_or_drain"
     }
+    if (line ~ /install_allocator_cleanup_metadata_command_with_fresh_id\(/) {
+        return "install_allocator_cleanup_metadata_command_with_fresh_id"
+    }
+    if (line ~ /install_allocator_cleanup_pending_command_or_drain\(/) {
+        return "install_allocator_cleanup_pending_command_or_drain"
+    }
+    if (line ~ /install_allocator_cleanup_bucket_pg_command_or_retry\(/) {
+        return "install_allocator_cleanup_bucket_pg_command_or_retry"
+    }
     if (line ~ /set_pending_metadata_command_for_bucket\(/) {
         return "set_pending_metadata_command_for_bucket"
     }
@@ -255,6 +264,9 @@ function is_install_helper(name) {
         || name == "try_set_bucket_control_pending_command_or_retry" \
         || name == "try_set_bucket_control_pending_command_or_retry_with_work_budget" \
         || name == "install_snapshot_sensitive_metadata_command_or_drain" \
+        || name == "install_allocator_cleanup_metadata_command_with_fresh_id" \
+        || name == "install_allocator_cleanup_pending_command_or_drain" \
+        || name == "install_allocator_cleanup_bucket_pg_command_or_retry" \
         || name == "try_set_pending_metadata_command_for_bucket" \
         || name == "try_set_pending_metadata_command_for_bucket_with_effect_fence"
 }
@@ -323,7 +335,10 @@ pending_test_cfg {
     # Phase 4 typed publisher APIs make the permitted helper a Rust trait
     # choice. Keep scanning inside the typed helper for raw bypasses, but do
     # not retain its already compiler-enforced callers in the shell inventory.
-    if (helper == "install_snapshot_sensitive_metadata_command_or_drain") {
+    if (helper == "install_snapshot_sensitive_metadata_command_or_drain" \
+        || helper == "install_allocator_cleanup_metadata_command_with_fresh_id" \
+        || helper == "install_allocator_cleanup_pending_command_or_drain" \
+        || helper == "install_allocator_cleanup_bucket_pg_command_or_retry") {
         if (current_publisher_id == "") {
             print "TYPED_MISSING_MARKER\t" FILENAME ":" current_fn ":" helper
         }

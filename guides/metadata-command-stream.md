@@ -252,20 +252,24 @@ but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and
 restart from a fresh snapshot, not surface the conflict to the request.
 
-The registry generates one sealed publisher token per row. The shared object-
-PG snapshot-sensitive installer accepts only tokens whose registry class is
-`SnapshotSensitive`; changing one of those publishers to another class now
-breaks its production call site at compile time. Those typed calls no longer
-participate in the temporary shell helper-count inventory, although the
-boundary check still requires their authoritative registry marker and rejects
-every direct call or function-item reference to the private-field token
-constructor. The class-specific seal is implemented only by the
-`SnapshotSensitive` registry macro arm, so a token from another class cannot
-acquire snapshot-sensitive authority inside the crate. Their installer returns
-the exhaustive, must-use
-`SnapshotSensitiveInstallOutcome`, so draining a contender cannot be mistaken
-for successful installation. Publisher paths which still call lower-level
-installers remain inventoried here and in
+The registry generates one sealed publisher token per row. Typed installers
+accept only tokens whose registry class matches their retry/convergence path;
+changing a migrated publisher's class therefore breaks its production call
+site at compile time. Typed calls no longer participate in the temporary shell
+helper-count inventory, although the boundary check still requires their
+authoritative registry marker and rejects every direct call or function-item
+reference to the private-field token constructor. Class-specific seals are
+implemented only by the corresponding registry macro arms, so one publisher
+class cannot acquire another class's authority inside the crate.
+
+The object-PG snapshot-sensitive installer returns exhaustive, must-use
+`SnapshotSensitiveInstallOutcome`. Allocator/cleanup publication uses separate
+exhaustive, must-use fresh-command and prebuilt-command outcomes. Those paths
+distinguish installed work from a drained pending-slot contender and handled
+log-index contention, so retry cannot be mistaken for successful allocation or
+cleanup.
+Publisher paths which still call lower-level installers remain inventoried here
+and in
 `scripts/check-storage-cluster-boundaries` until their Phase 4 typed API is
 introduced.
 

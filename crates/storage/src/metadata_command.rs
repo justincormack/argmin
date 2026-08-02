@@ -77,6 +77,10 @@ mod snapshot_sensitive_publisher_token_sealed {
     pub trait Sealed {}
 }
 
+mod allocator_cleanup_publisher_token_sealed {
+    pub trait Sealed {}
+}
+
 /// Compiler-visible authority to use the snapshot-sensitive install path.
 ///
 /// Implementations are generated exclusively from registry entries classified
@@ -84,6 +88,16 @@ mod snapshot_sensitive_publisher_token_sealed {
 /// an existing publisher token.
 pub(crate) trait SnapshotSensitiveMetadataCommandPublisher:
     snapshot_sensitive_publisher_token_sealed::Sealed
+{
+}
+
+/// Compiler-visible authority to use allocator/cleanup publication paths.
+///
+/// Implementations are generated exclusively from registry entries classified
+/// as `AllocatorCleanup`; callers cannot add an implementation or reclassify
+/// an existing publisher token.
+pub(crate) trait AllocatorCleanupMetadataCommandPublisher:
+    allocator_cleanup_publisher_token_sealed::Sealed
 {
 }
 
@@ -102,6 +116,21 @@ macro_rules! define_metadata_command_publisher_token {
 
         impl super::snapshot_sensitive_publisher_token_sealed::Sealed for $id {}
         impl super::SnapshotSensitiveMetadataCommandPublisher for $id {}
+    };
+    ($id:ident, AllocatorCleanup) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) struct $id {
+            _private: (),
+        }
+
+        impl $id {
+            pub(crate) const fn __from_registry_marker() -> Self {
+                Self { _private: () }
+            }
+        }
+
+        impl super::allocator_cleanup_publisher_token_sealed::Sealed for $id {}
+        impl super::AllocatorCleanupMetadataCommandPublisher for $id {}
     };
     ($id:ident, $class:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4570,6 +4599,23 @@ mod tests {
         fn require_snapshot_sensitive(_publisher: impl SnapshotSensitiveMetadataCommandPublisher) {}
 
         require_snapshot_sensitive(metadata_command_publisher!(PutObjectMetadataIf));
+    }
+
+    #[test]
+    fn allocator_cleanup_publisher_marker_returns_typed_registry_token() {
+        fn require_allocator_cleanup(_publisher: impl AllocatorCleanupMetadataCommandPublisher) {}
+
+        require_allocator_cleanup(metadata_command_publisher!(ReservePutObjectGeneration));
+        require_allocator_cleanup(metadata_command_publisher!(ReserveNextObjectVersion));
+        require_allocator_cleanup(metadata_command_publisher!(
+            ReleaseObjectGenerationReservationCommandRequired
+        ));
+        require_allocator_cleanup(metadata_command_publisher!(
+            ReleaseObjectGenerationReservation
+        ));
+        require_allocator_cleanup(metadata_command_publisher!(
+            EstablishMultipartCompletionBarrier
+        ));
     }
 
     #[test]

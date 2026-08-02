@@ -2970,6 +2970,28 @@ impl super::StorageCluster {
         }
     }
 
+    fn install_allocator_cleanup_bucket_pg_command_or_retry(
+        &self,
+        _publisher: impl crate::metadata_command::AllocatorCleanupMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<super::AllocatorCleanupPendingInstallOutcome, BucketSnapshotLoadError> {
+        if self.try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            work_budget,
+        )? {
+            Ok(super::AllocatorCleanupPendingInstallOutcome::Installed)
+        } else {
+            Ok(super::AllocatorCleanupPendingInstallOutcome::RetryAfterContention)
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn try_set_bucket_control_pending_command_or_retry(
         &self,
@@ -14650,7 +14672,9 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<u64, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(EstablishMultipartCompletionBarrier);
+        let publisher = crate::metadata_command::metadata_command_publisher!(
+            EstablishMultipartCompletionBarrier
+        );
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let bucket_metadata_client = self
             .local_map
@@ -14737,8 +14761,9 @@ impl super::StorageCluster {
                     bucket_write_reservation,
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-            if !self
-                .try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+            match self
+                .install_allocator_cleanup_bucket_pg_command_or_retry(
+                    publisher,
                     pg_id,
                     bucket,
                     &command,
@@ -14747,7 +14772,8 @@ impl super::StorageCluster {
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
             {
-                continue;
+                super::AllocatorCleanupPendingInstallOutcome::Installed => {}
+                super::AllocatorCleanupPendingInstallOutcome::RetryAfterContention => continue,
             }
             match self.finish_pending_metadata_command_to_acting_set_with_work_budget(
                 pg_id,

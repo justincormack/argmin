@@ -5276,14 +5276,38 @@ First Phase 4 slice (2026-08-02):
   and UploadPart stream-session creation now carry their registered token to
   the installer. Their established fresh-snapshot retry and durable-effect
   fence behavior is unchanged.
-- the transitional publisher scanner still looks through the typed helper and
-  inventories any raw installer it contains, but no longer count-checks the
-  migrated typed call sites. The guide records the compiler-enforced boundary;
+- the transitional publisher scanner treats the typed helper as the new
+  compiler-enforced boundary and no longer count-checks its migrated call
+  sites. Any production publisher that still calls a raw installer remains in
+  the temporary inventory. The guide records the compiler-enforced boundary;
   lower-level snapshot-sensitive publishers and the four other classes remain
-  in the temporary inventory for later Phase 4 slices.
+  for later Phase 4 slices.
 - validation passed with the 18-test pending-install contention family, the
   registry/guide and typed-marker tests, the storage boundary checker,
   all-target/all-feature strict Clippy, and the full 7,948-test workspace suite.
+
+Second Phase 4 slice (2026-08-02):
+
+- all five `AllocatorCleanup` publishers now receive tokens implementing a
+  class-specific sealed `AllocatorCleanupMetadataCommandPublisher` trait.
+  Generation reservation, version reservation, both generation-release paths,
+  and the multipart completion barrier can no longer select their pending-slot
+  path with a token from another publisher class.
+- object-PG fresh-command installation returns the exhaustive, must-use
+  `AllocatorCleanupFreshInstallOutcome`, distinguishing installation, a drained
+  occupied slot, and a handled log-index conflict. Prebuilt object- and
+  bucket-PG commands return the exhaustive, must-use
+  `AllocatorCleanupPendingInstallOutcome`. Each owner loop retains its existing
+  retry budget, delay diagnostic, durable-effect fence, and exact-command
+  convergence behavior.
+- allocator/cleanup typed calls no longer participate in the temporary shell
+  helper-count inventory. The shared scanner requires their authoritative
+  registry marker, and its adversarial fixture proves an unmarked typed call is
+  rejected. Unmigrated production publishers remain inventoried until their
+  remaining classes receive typed APIs.
+- validation passed the 11-test allocator contention matrix, the storage
+  boundary checker, formatting, workspace-wide strict Clippy, and the full
+  7,949-test workspace suite.
 
 ### Phase 5 — isolate test support
 

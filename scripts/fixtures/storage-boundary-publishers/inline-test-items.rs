@@ -58,6 +58,15 @@ impl Fixture {
         install_snapshot_sensitive_metadata_command_or_drain();
     }
 
+    fn typed_allocator_cleanup_publisher_is_not_shell_inventoried() {
+        crate::metadata_command::metadata_command_publisher!(TypedAllocatorPublisher);
+        install_allocator_cleanup_metadata_command_with_fresh_id();
+    }
+
+    fn typed_allocator_cleanup_publisher_without_marker_is_rejected() {
+        install_allocator_cleanup_metadata_command_with_fresh_id();
+    }
+
     fn publisher_token_constructor_function_item_is_rejected() {
         let mint =
             crate::metadata_command::publisher::TypedSnapshotPublisher::__from_registry_marker;

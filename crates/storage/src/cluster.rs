@@ -6466,6 +6466,20 @@ enum SnapshotSensitiveInstallOutcome {
     ContenderDrained,
 }
 
+#[must_use = "allocator contention outcomes must restart or continue deliberately"]
+enum AllocatorCleanupFreshInstallOutcome {
+    Installed(Box<MetadataCommandEnvelope>),
+    PendingContenderDrained,
+    LogConflictHandled,
+}
+
+#[must_use = "RetryAfterContention must restart allocator/cleanup publication"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AllocatorCleanupPendingInstallOutcome {
+    Installed,
+    RetryAfterContention,
+}
+
 enum ObjectPgPendingCommandInstall {
     Installed(MetadataCommandEnvelope),
     Pending(MetadataCommandEnvelope),
@@ -10324,6 +10338,51 @@ impl StorageCluster {
         }
     }
 
+    fn install_allocator_cleanup_metadata_command_with_fresh_id(
+        &self,
+        _publisher: impl crate::metadata_command::AllocatorCleanupMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        completion_admission: bool,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
+    ) -> Result<AllocatorCleanupFreshInstallOutcome, ObjectPgActionError> {
+        match self.try_install_object_pg_pending_command_with_fresh_id(
+            pg_id,
+            bucket,
+            completion_admission,
+            effect_fence,
+            build_command,
+        )? {
+            ObjectPgPendingCommandInstall::Installed(command) => Ok(
+                AllocatorCleanupFreshInstallOutcome::Installed(Box::new(command)),
+            ),
+            ObjectPgPendingCommandInstall::Pending(command) => {
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
+                Ok(AllocatorCleanupFreshInstallOutcome::PendingContenderDrained)
+            }
+            ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
+                self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                Ok(AllocatorCleanupFreshInstallOutcome::LogConflictHandled)
+            }
+        }
+    }
+
+    fn install_allocator_cleanup_pending_command_or_drain(
+        &self,
+        _publisher: impl crate::metadata_command::AllocatorCleanupMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+    ) -> Result<AllocatorCleanupPendingInstallOutcome, ObjectPgActionError> {
+        if self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, command, effect_fence)? {
+            Ok(AllocatorCleanupPendingInstallOutcome::Installed)
+        } else {
+            Ok(AllocatorCleanupPendingInstallOutcome::RetryAfterContention)
+        }
+    }
+
     fn try_set_object_pg_pending_command_or_drain(
         &self,
         pg_id: PgId,
@@ -12087,7 +12146,8 @@ impl StorageCluster {
         reservation_id: &SessionId,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<GenerationId, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(ReservePutObjectGeneration);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(ReservePutObjectGeneration);
         let PutObjectMutationEffectRoute {
             object_pg_id,
             bucket,
@@ -12167,7 +12227,8 @@ impl StorageCluster {
             }
             self.maybe_run_before_metadata_command_pending_install_hook();
             require_valid_route().map_err(ObjectPgActionError::Store)?;
-            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+            let command = match self.install_allocator_cleanup_metadata_command_with_fresh_id(
+                publisher,
                 pg_id,
                 bucket,
                 false,
@@ -12187,9 +12248,8 @@ impl StorageCluster {
                     )
                 },
             )? {
-                ObjectPgPendingCommandInstall::Installed(command) => command,
-                ObjectPgPendingCommandInstall::Pending(command) => {
-                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                AllocatorCleanupFreshInstallOutcome::Installed(command) => *command,
+                AllocatorCleanupFreshInstallOutcome::PendingContenderDrained => {
                     work_budget
                         .sleep_after_contention(
                             "object generation reservation pending install retry budget exhausted",
@@ -12197,8 +12257,7 @@ impl StorageCluster {
                         .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
-                ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                AllocatorCleanupFreshInstallOutcome::LogConflictHandled => {
                     work_budget
                         .sleep_after_contention(
                             "object generation reservation log conflict retry budget exhausted",
@@ -12403,7 +12462,8 @@ impl StorageCluster {
         effect_fence: Option<AdmittedRouteEffectFence>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<VersionId, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(ReserveNextObjectVersion);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(ReserveNextObjectVersion);
         let mut work_budget = RequestWorkBudget::new(OBJECT_VERSION_RESERVATION_RETRY_BUDGET, None)
             .for_operation("reserve_object_version")
             .for_pg(pg_id);
@@ -12487,7 +12547,8 @@ impl StorageCluster {
             )?;
             self.maybe_run_before_object_version_command_id_hook();
             require_valid_route().map_err(ObjectPgActionError::Store)?;
-            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+            let command = match self.install_allocator_cleanup_metadata_command_with_fresh_id(
+                publisher,
                 pg_id,
                 bucket,
                 completion_admission,
@@ -12505,9 +12566,8 @@ impl StorageCluster {
                     )
                 },
             )? {
-                ObjectPgPendingCommandInstall::Installed(command) => command,
-                ObjectPgPendingCommandInstall::Pending(command) => {
-                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                AllocatorCleanupFreshInstallOutcome::Installed(command) => *command,
+                AllocatorCleanupFreshInstallOutcome::PendingContenderDrained => {
                     work_budget
                         .sleep_after_contention(
                             "object version reservation pending install retry budget exhausted",
@@ -12515,8 +12575,7 @@ impl StorageCluster {
                         .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
-                ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                AllocatorCleanupFreshInstallOutcome::LogConflictHandled => {
                     work_budget
                         .sleep_after_contention(
                             "object version reservation log conflict retry budget exhausted",
@@ -13291,7 +13350,7 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(
+        let publisher = crate::metadata_command::metadata_command_publisher!(
             ReleaseObjectGenerationReservationCommandRequired
         );
         let mut work_budget =
@@ -13341,7 +13400,8 @@ impl StorageCluster {
                 }
             }
 
-            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+            let command = match self.install_allocator_cleanup_metadata_command_with_fresh_id(
+                publisher,
                 pg_id,
                 bucket,
                 false,
@@ -13359,9 +13419,8 @@ impl StorageCluster {
                     )
                 },
             )? {
-                ObjectPgPendingCommandInstall::Installed(command) => command,
-                ObjectPgPendingCommandInstall::Pending(command) => {
-                    self.drain_pending_object_metadata_command(pg_id, &command)?;
+                AllocatorCleanupFreshInstallOutcome::Installed(command) => *command,
+                AllocatorCleanupFreshInstallOutcome::PendingContenderDrained => {
                     work_budget
                         .sleep_after_contention(
                             "object generation release pending install retry budget exhausted",
@@ -13369,8 +13428,7 @@ impl StorageCluster {
                         .map_err(ObjectPgActionError::Store)?;
                     continue;
                 }
-                ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
-                    self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                AllocatorCleanupFreshInstallOutcome::LogConflictHandled => {
                     work_budget
                         .sleep_after_contention(
                             "object generation release log conflict retry budget exhausted",
@@ -13909,7 +13967,9 @@ impl StorageCluster {
         key: &ObjectKey,
         reservation_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(ReleaseObjectGenerationReservation);
+        let publisher = crate::metadata_command::metadata_command_publisher!(
+            ReleaseObjectGenerationReservation
+        );
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         let mut work_budget =
             RequestWorkBudget::new(OBJECT_GENERATION_RESERVATION_RETRY_BUDGET, None)
@@ -13973,13 +14033,18 @@ impl StorageCluster {
                     ),
                 ),
             );
-            if !self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, &command, None)? {
-                work_budget
-                    .sleep_after_contention(
-                        "object generation release pending install retry budget exhausted",
-                    )
-                    .map_err(ObjectPgActionError::Store)?;
-                continue;
+            match self.install_allocator_cleanup_pending_command_or_drain(
+                publisher, pg_id, bucket, &command, None,
+            )? {
+                AllocatorCleanupPendingInstallOutcome::Installed => {}
+                AllocatorCleanupPendingInstallOutcome::RetryAfterContention => {
+                    work_budget
+                        .sleep_after_contention(
+                            "object generation release pending install retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
             }
             let mut command = command;
             loop {
