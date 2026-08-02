@@ -3131,6 +3131,28 @@ impl super::StorageCluster {
         }
     }
 
+    fn install_snapshot_sensitive_bucket_control_command_or_drain(
+        &self,
+        _publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<super::SnapshotSensitiveInstallOutcome, BucketSnapshotLoadError> {
+        if self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            work_budget,
+        )? {
+            Ok(super::SnapshotSensitiveInstallOutcome::Installed)
+        } else {
+            Ok(super::SnapshotSensitiveInstallOutcome::ContenderDrained)
+        }
+    }
+
     fn finish_pending_command_for_multipart_completion_barrier(
         &self,
         pg_id: PgId,
@@ -8114,7 +8136,7 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(PutBucketVersioning);
+        let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketVersioning);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
             bucket,
@@ -8215,14 +8237,16 @@ impl super::StorageCluster {
                 let command =
                     metadata_route.build_put_bucket_versioning_command(command_id, state)?;
                 require_valid_route()?;
-                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                match self.install_snapshot_sensitive_bucket_control_command_or_drain(
+                    publisher,
                     pg_id,
                     bucket,
                     &command,
                     Some(effect_fence),
                     &mut work_budget,
                 )? {
-                    continue;
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -8349,7 +8373,7 @@ impl super::StorageCluster {
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(PutBucketAcl);
+        let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketAcl);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
             bucket,
@@ -8441,14 +8465,16 @@ impl super::StorageCluster {
                 let command =
                     metadata_route.build_put_bucket_acl_command(command_id, acl_grants, summary)?;
                 require_valid_route()?;
-                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                match self.install_snapshot_sensitive_bucket_control_command_or_drain(
+                    publisher,
                     pg_id,
                     bucket,
                     &command,
                     Some(effect_fence),
                     &mut work_budget,
                 )? {
-                    continue;
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -8490,7 +8516,7 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mutation: BucketPropertyMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(PutBucketProperty);
+        let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketProperty);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
             bucket,
@@ -8577,14 +8603,16 @@ impl super::StorageCluster {
                 let command =
                     metadata_route.build_put_bucket_property_command(command_id, &mutation)?;
                 require_valid_route()?;
-                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                match self.install_snapshot_sensitive_bucket_control_command_or_drain(
+                    publisher,
                     pg_id,
                     bucket,
                     &command,
                     Some(effect_fence),
                     &mut work_budget,
                 )? {
-                    continue;
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -8691,7 +8719,7 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mutation: BucketSubresourceMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(PutBucketSubresource);
+        let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketSubresource);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
             bucket,
@@ -8765,14 +8793,16 @@ impl super::StorageCluster {
                 let command =
                     metadata_route.build_put_bucket_subresource_command(command_id, &mutation)?;
                 require_valid_route()?;
-                if !self.try_set_bucket_control_pending_command_or_retry_with_work_budget(
+                match self.install_snapshot_sensitive_bucket_control_command_or_drain(
+                    publisher,
                     pg_id,
                     bucket,
                     &command,
                     Some(effect_fence),
                     &mut work_budget,
                 )? {
-                    continue;
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };

@@ -58,6 +58,15 @@ impl Fixture {
         install_snapshot_sensitive_metadata_command_or_drain();
     }
 
+    fn typed_snapshot_sensitive_bucket_control_is_not_shell_inventoried() {
+        crate::metadata_command::metadata_command_publisher!(TypedSnapshotBucketControlPublisher);
+        install_snapshot_sensitive_bucket_control_command_or_drain();
+    }
+
+    fn typed_snapshot_sensitive_bucket_control_without_marker_is_rejected() {
+        install_snapshot_sensitive_bucket_control_command_or_drain();
+    }
+
     fn typed_allocator_cleanup_publisher_is_not_shell_inventoried() {
         crate::metadata_command::metadata_command_publisher!(TypedAllocatorPublisher);
         install_allocator_cleanup_metadata_command_with_fresh_id();

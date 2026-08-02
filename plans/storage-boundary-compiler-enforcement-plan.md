@@ -5387,6 +5387,24 @@ Fifth Phase 4 slice (2026-08-02):
   workspace-wide strict Clippy, and the full parallel 7,952-test workspace
   suite.
 
+Sixth Phase 4 slice (2026-08-02):
+
+- the four bucket-control `SnapshotSensitive` publishers now carry their
+  registry token through a typed control-slot installer. Bucket versioning,
+  ACL, bucket properties, and bucket subresources can no longer call the raw
+  control-slot retry helper from their production owner loops.
+- the typed boundary returns the existing exhaustive, must-use
+  `SnapshotSensitiveInstallOutcome`. Each publisher must distinguish a
+  successful install from a drained contender and restart from its current
+  bucket snapshot after contention; admitted publishers retain their immutable
+  effect fence at the durable control-slot insertion boundary.
+- the migrated calls leave the temporary shell helper-count inventory. The
+  scanner still requires each authoritative registry marker, and a dedicated
+  adversarial fixture proves an unmarked typed bucket-control call is rejected.
+- validation passed the 31-test focused bucket-control contention and deadline
+  matrix, the storage boundary checker, formatting, workspace-wide strict
+  Clippy, and the full parallel 7,967-test workspace suite.
+
 ### Phase 5 — isolate test support
 
 1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside

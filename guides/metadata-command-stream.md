@@ -269,6 +269,11 @@ that type and is never generically drained inside the typed installer.
 Matching-outcome publication provides the corresponding exhaustive, must-use
 `MatchingOutcomeRetryInstallOutcome`, retaining the exact command-owned result
 until the caller can converge it.
+Bucket-control snapshot-sensitive publication uses the same exhaustive
+`SnapshotSensitiveInstallOutcome` at its distinct fenced control-slot
+boundary. Versioning, ACL, bucket-property, and subresource publishers must
+therefore handle a drained contender by restarting from their current bucket
+snapshot rather than treating the attempted install as successful.
 Apply-validated publication likewise has separate exhaustive, must-use
 fresh-command and prebuilt bucket-PG outcomes. Stream append preserves the
 distinction between a drained visible contender and a handled log-index
