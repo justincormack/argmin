@@ -1,3 +1,4 @@
+use aws_sdk_s3::operation::{RequestId, RequestIdExt};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, ChecksumAlgorithm, ChecksumMode, ChecksumType,
@@ -3823,8 +3824,20 @@ fn test_get_object_part_with_checksum() {
                 .expect("expected per-part CRC32 checksum without ENABLED")
                 .to_string();
 
+            let parts_count = resp.parts_count();
+            let request_id = resp.request_id().map(str::to_owned);
+            let extended_request_id = resp.extended_request_id().map(str::to_owned);
+
             // Verify data matches
-            let body = resp.body.collect().await.unwrap().into_bytes();
+            let body = match resp.body.collect().await {
+                Ok(body) => body.into_bytes(),
+                Err(error) => {
+                    panic!(
+                        "GetObject part body collection failed: bucket={bucket:?} key={key:?} part_number={part_number} expected_body_len={} parts_count={parts_count:?} request_id={request_id:?} extended_request_id={extended_request_id:?} checksum_crc32={got_crc:?} error={error:?}",
+                        data.len(),
+                    );
+                }
+            };
             assert_eq!(
                 body.len(),
                 data.len(),
