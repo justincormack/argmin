@@ -89,6 +89,10 @@ mod matching_outcome_retry_publisher_token_sealed {
     pub trait Sealed {}
 }
 
+mod apply_validated_publisher_token_sealed {
+    pub trait Sealed {}
+}
+
 /// Compiler-visible authority to use the snapshot-sensitive install path.
 ///
 /// Implementations are generated exclusively from registry entries classified
@@ -127,6 +131,17 @@ pub(crate) trait TerminalSessionRetryMetadataCommandPublisher:
 /// the publisher extracts its command-owned result.
 pub(crate) trait MatchingOutcomeRetryMetadataCommandPublisher:
     matching_outcome_retry_publisher_token_sealed::Sealed
+{
+}
+
+/// Compiler-visible authority to publish a command whose application validates
+/// the durable state it consumes.
+///
+/// Implementations are generated exclusively from registry entries classified
+/// as `ApplyValidated`; callers cannot select this retry behavior with a token
+/// from another publisher class.
+pub(crate) trait ApplyValidatedMetadataCommandPublisher:
+    apply_validated_publisher_token_sealed::Sealed
 {
 }
 
@@ -191,7 +206,7 @@ macro_rules! define_metadata_command_publisher_token {
         impl super::matching_outcome_retry_publisher_token_sealed::Sealed for $id {}
         impl super::MatchingOutcomeRetryMetadataCommandPublisher for $id {}
     };
-    ($id:ident, $class:ident) => {
+    ($id:ident, ApplyValidated) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub(crate) struct $id {
             _private: (),
@@ -202,6 +217,9 @@ macro_rules! define_metadata_command_publisher_token {
                 Self { _private: () }
             }
         }
+
+        impl super::apply_validated_publisher_token_sealed::Sealed for $id {}
+        impl super::ApplyValidatedMetadataCommandPublisher for $id {}
     };
 }
 
@@ -4703,6 +4721,14 @@ mod tests {
         require_matching_outcome_retry(metadata_command_publisher!(
             CompleteMultipartUploadCommitSerialized
         ));
+    }
+
+    #[test]
+    fn apply_validated_publisher_marker_returns_typed_registry_token() {
+        fn require_apply_validated(_publisher: impl ApplyValidatedMetadataCommandPublisher) {}
+
+        require_apply_validated(metadata_command_publisher!(CreateBucket));
+        require_apply_validated(metadata_command_publisher!(CommitStreamSegmentAppend));
     }
 
     #[test]

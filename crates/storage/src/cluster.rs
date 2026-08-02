@@ -6496,6 +6496,20 @@ enum MatchingOutcomeRetryInstallOutcome {
     ContentionWithoutVisibleCommand,
 }
 
+#[must_use = "apply-validated contention outcomes must restart publication deliberately"]
+enum ApplyValidatedFreshInstallOutcome {
+    Installed(Box<MetadataCommandEnvelope>),
+    PendingContenderDrained,
+    LogConflictHandled,
+}
+
+#[must_use = "RetryAfterContention must restart apply-validated publication"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyValidatedPendingInstallOutcome {
+    Installed,
+    RetryAfterContention,
+}
+
 enum ObjectPgPendingCommandInstall {
     Installed(MetadataCommandEnvelope),
     Pending(MetadataCommandEnvelope),
@@ -10461,6 +10475,36 @@ impl StorageCluster {
                 }
             }
             Err(error) => Err(error),
+        }
+    }
+
+    fn install_apply_validated_metadata_command_with_fresh_id(
+        &self,
+        _publisher: impl crate::metadata_command::ApplyValidatedMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        completion_admission: bool,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        build_command: impl FnOnce(MetadataCommandId) -> MetadataCommandEnvelope,
+    ) -> Result<ApplyValidatedFreshInstallOutcome, ObjectPgActionError> {
+        match self.try_install_object_pg_pending_command_with_fresh_id(
+            pg_id,
+            bucket,
+            completion_admission,
+            effect_fence,
+            build_command,
+        )? {
+            ObjectPgPendingCommandInstall::Installed(command) => Ok(
+                ApplyValidatedFreshInstallOutcome::Installed(Box::new(command)),
+            ),
+            ObjectPgPendingCommandInstall::Pending(command) => {
+                self.drain_pending_object_metadata_command(pg_id, &command)?;
+                Ok(ApplyValidatedFreshInstallOutcome::PendingContenderDrained)
+            }
+            ObjectPgPendingCommandInstall::LogConflict { pending_visible } => {
+                self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)?;
+                Ok(ApplyValidatedFreshInstallOutcome::LogConflictHandled)
+            }
         }
     }
 
@@ -15849,7 +15893,8 @@ impl StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut work_budget: RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(CommitStreamSegmentAppend);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(CommitStreamSegmentAppend);
         let StreamAppendCommitRequest {
             bucket,
             key,
@@ -16007,7 +16052,8 @@ impl StorageCluster {
                 cleanup_stream_append_payload!();
                 return Err(ObjectPgActionError::Store(error));
             }
-            let command = match self.try_install_object_pg_pending_command_with_fresh_id(
+            let command = match self.install_apply_validated_metadata_command_with_fresh_id(
+                publisher,
                 pg_id,
                 bucket,
                 false,
@@ -16026,13 +16072,8 @@ impl StorageCluster {
                     )
                 },
             ) {
-                Ok(ObjectPgPendingCommandInstall::Installed(command)) => command,
-                Ok(ObjectPgPendingCommandInstall::Pending(command)) => {
-                    if let Err(error) = self.drain_pending_object_metadata_command(pg_id, &command)
-                    {
-                        cleanup_stream_append_payload!();
-                        return Err(error);
-                    }
+                Ok(ApplyValidatedFreshInstallOutcome::Installed(command)) => *command,
+                Ok(ApplyValidatedFreshInstallOutcome::PendingContenderDrained) => {
                     if let Err(error) = work_budget
                         .sleep_after_contention("stream append pending retry budget exhausted")
                     {
@@ -16041,13 +16082,7 @@ impl StorageCluster {
                     }
                     continue;
                 }
-                Ok(ObjectPgPendingCommandInstall::LogConflict { pending_visible }) => {
-                    if let Err(error) =
-                        self.drain_after_object_pg_log_conflict(pg_id, bucket, pending_visible)
-                    {
-                        cleanup_stream_append_payload!();
-                        return Err(error);
-                    }
+                Ok(ApplyValidatedFreshInstallOutcome::LogConflictHandled) => {
                     if let Err(error) = work_budget
                         .sleep_after_contention("stream append log conflict retry budget exhausted")
                     {

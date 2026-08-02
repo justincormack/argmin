@@ -5360,6 +5360,33 @@ Fourth Phase 4 slice (2026-08-02):
   storage boundary checker, formatting, workspace-wide strict Clippy, and the
   full 7,951-test workspace suite.
 
+Fifth Phase 4 slice (2026-08-02):
+
+- both `ApplyValidated` publishers now receive tokens implementing the
+  class-specific sealed `ApplyValidatedMetadataCommandPublisher` trait.
+  CreateBucket and stream-segment append cannot select their retry behavior
+  with a token from another publisher class. With the final publisher class
+  typed, the registry generator no longer has a catch-all class arm: adding a
+  class now requires an explicit compiler-visible token definition.
+- prebuilt CreateBucket installation returns the exhaustive, must-use
+  `ApplyValidatedPendingInstallOutcome`, requiring the owner loop to
+  distinguish installation from a drained contender and explicitly restart
+  after contention.
+- stream append uses the exhaustive, must-use
+  `ApplyValidatedFreshInstallOutcome`. It distinguishes successful fresh-ID
+  installation, a drained visible pending contender, and a handled log-index
+  conflict. This preserves the existing retry-budget diagnostics and the rule
+  that every collision after shard registration makes payload ownership
+  ambiguous and therefore requires reference-checked cleanup.
+- apply-validated typed calls no longer participate in the temporary shell
+  helper-count inventory. The scanner requires their authoritative registry
+  marker, and its adversarial fixture rejects an unmarked apply-validated
+  typed call.
+- validation passed the focused 24-test CreateBucket and stream-append
+  contention/cleanup matrix, the storage boundary checker, formatting,
+  workspace-wide strict Clippy, and the full parallel 7,952-test workspace
+  suite.
+
 ### Phase 5 — isolate test support
 
 1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside

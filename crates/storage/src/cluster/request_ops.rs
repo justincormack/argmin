@@ -1767,7 +1767,7 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         config: &CreateBucketConfig<'_>,
     ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(CreateBucket);
+        let publisher = crate::metadata_command::metadata_command_publisher!(CreateBucket);
         let bucket = BucketName::try_from(config.name).map_err(|reason| {
             MetadataError::InvalidBucketName {
                 reason: reason.to_string(),
@@ -1857,15 +1857,18 @@ impl super::StorageCluster {
                             }
                             CreateBucketCommandBuild::Command(command) => *command,
                         };
-                    if !self
-                        .try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+                    match self.install_apply_validated_bucket_pg_command_or_retry(
+                        publisher,
                         pg_id,
                         &bucket,
                         &command,
                         Some(effect_fence),
                         &mut work_budget,
                     )? {
-                        continue;
+                        super::ApplyValidatedPendingInstallOutcome::Installed => {}
+                        super::ApplyValidatedPendingInstallOutcome::RetryAfterContention => {
+                            continue;
+                        }
                     }
                     (command, true)
                 }
@@ -2989,6 +2992,28 @@ impl super::StorageCluster {
             Ok(super::AllocatorCleanupPendingInstallOutcome::Installed)
         } else {
             Ok(super::AllocatorCleanupPendingInstallOutcome::RetryAfterContention)
+        }
+    }
+
+    fn install_apply_validated_bucket_pg_command_or_retry(
+        &self,
+        _publisher: impl crate::metadata_command::ApplyValidatedMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<super::ApplyValidatedPendingInstallOutcome, BucketSnapshotLoadError> {
+        if self.try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            work_budget,
+        )? {
+            Ok(super::ApplyValidatedPendingInstallOutcome::Installed)
+        } else {
+            Ok(super::ApplyValidatedPendingInstallOutcome::RetryAfterContention)
         }
     }
 

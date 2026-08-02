@@ -269,6 +269,12 @@ that type and is never generically drained inside the typed installer.
 Matching-outcome publication provides the corresponding exhaustive, must-use
 `MatchingOutcomeRetryInstallOutcome`, retaining the exact command-owned result
 until the caller can converge it.
+Apply-validated publication likewise has separate exhaustive, must-use
+fresh-command and prebuilt bucket-PG outcomes. Stream append preserves the
+distinction between a drained visible contender and a handled log-index
+conflict because each path has its own retry-budget diagnostic and payload
+reference-check boundary; CreateBucket must explicitly restart when its
+prebuilt command loses the pending-slot race.
 Publisher paths which still call lower-level installers remain inventoried here
 and in
 `scripts/check-storage-cluster-boundaries` until their Phase 4 typed API is

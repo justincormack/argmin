@@ -251,6 +251,12 @@ function publisher_helper(line) {
     if (line ~ /install_matching_outcome_retry_metadata_command\(/) {
         return "install_matching_outcome_retry_metadata_command"
     }
+    if (line ~ /install_apply_validated_metadata_command_with_fresh_id\(/) {
+        return "install_apply_validated_metadata_command_with_fresh_id"
+    }
+    if (line ~ /install_apply_validated_bucket_pg_command_or_retry\(/) {
+        return "install_apply_validated_bucket_pg_command_or_retry"
+    }
     if (line ~ /set_pending_metadata_command_for_bucket\(/) {
         return "set_pending_metadata_command_for_bucket"
     }
@@ -275,6 +281,8 @@ function is_install_helper(name) {
         || name == "install_allocator_cleanup_bucket_pg_command_or_retry" \
         || name == "install_terminal_session_retry_metadata_command" \
         || name == "install_matching_outcome_retry_metadata_command" \
+        || name == "install_apply_validated_metadata_command_with_fresh_id" \
+        || name == "install_apply_validated_bucket_pg_command_or_retry" \
         || name == "try_set_pending_metadata_command_for_bucket" \
         || name == "try_set_pending_metadata_command_for_bucket_with_effect_fence"
 }
@@ -348,7 +356,9 @@ pending_test_cfg {
         || helper == "install_allocator_cleanup_pending_command_or_drain" \
         || helper == "install_allocator_cleanup_bucket_pg_command_or_retry" \
         || helper == "install_terminal_session_retry_metadata_command" \
-        || helper == "install_matching_outcome_retry_metadata_command") {
+        || helper == "install_matching_outcome_retry_metadata_command" \
+        || helper == "install_apply_validated_metadata_command_with_fresh_id" \
+        || helper == "install_apply_validated_bucket_pg_command_or_retry") {
         if (current_publisher_id == "") {
             print "TYPED_MISSING_MARKER\t" FILENAME ":" current_fn ":" helper
         }
