@@ -11491,6 +11491,14 @@ mod tests {
                 .send_vote(term, None, false)
                 .expect("test peer vote should receive a response");
             accept.join().expect("test peer accept should finish");
+            let worker_deadline = Instant::now() + Duration::from_secs(5);
+            while listener.active_workers() != 0 {
+                assert!(
+                    Instant::now() < worker_deadline,
+                    "test peer worker did not release its listener slot"
+                );
+                thread::sleep(Duration::from_millis(1));
+            }
             granted
         };
 
@@ -11567,7 +11575,10 @@ mod tests {
             "bounded checkpoint should compact the acknowledged WAL suffix"
         );
 
-        let no_op_metrics_before = authority.durability_metric_snapshots();
+        let no_op_wal_metrics_before = authority
+            .durability_metric_snapshots()
+            .wal
+            .expect("WAL-backed authority should report WAL metrics");
         let no_op_offsets_before = runtime
             .block_on(authority.status())
             .expect("status before no-op vote should read")
@@ -11576,10 +11587,26 @@ mod tests {
             send_vote(expected_vote.leader_id.term),
             "unchanged durable Raft state should receive a response"
         );
+        let no_op_wal_metrics_after = authority
+            .durability_metric_snapshots()
+            .wal
+            .expect("WAL-backed authority should report WAL metrics");
         assert_eq!(
-            authority.durability_metric_snapshots().wal,
-            no_op_metrics_before.wal,
-            "no-op peer vote must not append a WAL record"
+            (
+                no_op_wal_metrics_after.append_total,
+                no_op_wal_metrics_after.append_error_total,
+                no_op_wal_metrics_after.frame_bytes_total,
+                no_op_wal_metrics_after.file_sync_total,
+                no_op_wal_metrics_after.directory_sync_total,
+            ),
+            (
+                no_op_wal_metrics_before.append_total,
+                no_op_wal_metrics_before.append_error_total,
+                no_op_wal_metrics_before.frame_bytes_total,
+                no_op_wal_metrics_before.file_sync_total,
+                no_op_wal_metrics_before.directory_sync_total,
+            ),
+            "no-op peer vote must not perform physical WAL I/O"
         );
         assert_eq!(
             runtime
