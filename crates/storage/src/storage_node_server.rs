@@ -26,9 +26,10 @@ use crate::control_plane_lease::{
 use crate::data_dir::prepare_private_data_dir;
 use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
 use crate::metadata_command::{
-    is_stream_create_bucket_write_operation_kind, MetadataCommandEnvelope, MetadataCommandId,
-    MetadataCommandLogIndex, MetadataCommandPayload, ObjectPayloadReclaimCommand,
-    PutObjectMetadataMutation, ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+    is_stream_create_bucket_write_operation_kind, validate_metadata_command_recovery_certificate,
+    MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
+    ObjectPayloadReclaimCommand, PutObjectMetadataMutation,
+    ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
@@ -16606,56 +16607,23 @@ impl StorageNodeConnectionHandler {
         abandoned_source: Option<&MetadataCommandEnvelope>,
         command: &MetadataCommandEnvelope,
     ) -> Result<StorageNodeRouteFence, StorageRpcErrorResponse> {
-        if command != authorized_source
-            && (command.id().cluster_epoch() != authorized_source.id().cluster_epoch()
-                || command.id().pg_id() != authorized_source.id().pg_id()
-                || !command
-                    .payload()
-                    .is_authorized_recovery_derivative_of(authorized_source.payload())
-                || command.id().log_index() <= authorized_source.id().log_index())
-        {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::PayloadDecode,
-                message:
-                    "metadata command recovery command is not derived from its authorized source"
-                        .to_string(),
-            });
-        }
+        validate_metadata_command_recovery_certificate(
+            authorized_source,
+            abandoned_source,
+            command,
+        )
+        .map_err(|error| StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::PayloadDecode,
+            message: error.to_string(),
+        })?;
         let fence = self.validate_authorized_metadata_command_recovery_source(
             node_id,
             pg_id,
             authorized_source,
         )?;
-        if command.payload() == authorized_source.payload() {
-            if abandoned_source.is_some() {
-                return Err(StorageRpcErrorResponse {
-                    code: StorageRpcErrorCode::PayloadDecode,
-                    message:
-                        "same-payload metadata command recovery cannot carry an abandoned source"
-                            .to_string(),
-                });
-            }
-        } else {
-            let Some(abandoned_source) = abandoned_source else {
-                return Err(StorageRpcErrorResponse {
-                    code: StorageRpcErrorCode::PayloadDecode,
-                    message: "metadata command recovery follow-up requires its abandoned source"
-                        .to_string(),
-                });
-            };
-            if abandoned_source.id().cluster_epoch() != authorized_source.id().cluster_epoch()
-                || abandoned_source.id().pg_id() != authorized_source.id().pg_id()
-                || abandoned_source.payload() != authorized_source.payload()
-                || abandoned_source.id().log_index() < authorized_source.id().log_index()
-                || command.id().log_index() <= abandoned_source.id().log_index()
-            {
-                return Err(StorageRpcErrorResponse {
-                    code: StorageRpcErrorCode::PayloadDecode,
-                    message:
-                        "metadata command recovery follow-up is not bound to its abandoned reissue"
-                            .to_string(),
-                });
-            }
+        if command.payload() != authorized_source.payload() {
+            let abandoned_source = abandoned_source
+                .expect("validated recovery follow-up must carry its abandoned source");
             let pg = self
                 .node
                 .get_pg(pg_id.get())

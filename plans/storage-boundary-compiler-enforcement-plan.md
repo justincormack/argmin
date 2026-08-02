@@ -667,7 +667,7 @@ Node-client role classification (2026-07-19):
 | `MetadataCommandInspectionNodeClient` | genuinely generic metadata PG | read-only command state, checkpoints, retained-log ranges, acceptance, and abandonment inspection |
 | `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; serialized primary acceptance/application opens a non-nestable critical section bound to one PG and epoch, while recovery-only operations remain unavailable |
 | `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | opens a scoped peering route bound to one destination PG and epoch; the returned interface owns quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption without accepting replacement destination route arguments, command-ID allocation, or pending-slot publication |
-| `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | opens a non-nestable recovery critical section bound to one PG and epoch; the returned interface owns pending-slot reissue, explicitly authorized recovery apply, and durable abandonment without accepting replacement route arguments |
+| `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | opens a non-nestable primary recovery critical section bound to one PG and epoch; historical-replica apply and tombstone mutation instead open distinct single-use routes borrowing the exact PG, epoch, authorized source, optional abandoned source, and command |
 | `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | opens a non-cloneable retained stream-abort route borrowing one opaque prepared command; apply and finish accept no replacement PG, epoch, or command arguments |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
@@ -5117,6 +5117,41 @@ One-hundred-and-twenty-ninth Phase 3 slice:
   focused retained-abort constructor, Unix response-binding, and installed
   cleanup regressions. Formatting, the transitional storage boundary checker,
   and workspace-wide strict Clippy also pass.
+
+One-hundred-and-thirtieth Phase 3 slice:
+
+- certificate-bound recovery apply and abandonment on historical replicas are
+  no longer direct methods accepting replaceable PG, epoch, recovery-source,
+  abandoned-source, and command arguments. The recovery client now opens
+  distinct `MetadataCommandRecoveryReplicaApplyRoute` and
+  `MetadataCommandRecoveryReplicaAbandonRoute` capabilities borrowing that
+  complete subject; each route is consumed by its one operation.
+- primary recovery retains its separate non-nestable critical section because
+  it owns pending-slot inspection and replacement. The replica route exposes
+  neither operation, so callers cannot accidentally promote single-replica
+  recovery authority into reporting-primary authority.
+- one shared recovery-certificate validator now rejects unrelated payloads,
+  non-increasing command indexes, same-payload commands carrying an abandoned
+  source, and cleanup derivatives with missing, unrelated, or non-preceding
+  abandoned sources. Embedded and Unix route construction apply it alongside
+  the captured PG/epoch checks before mutation or transport.
+- embedded cleanup routes additionally require the exact abandoned reissue to
+  have a durable tombstone on the target replica before exposing either
+  operation. The storage-node RPC adapter reuses the shared structural
+  validator and independently proves current runtime-map recovery
+  authorization, historical acting-set membership, the durable tombstone, and
+  its bounded mutation fence.
+- the cluster recovery fanout now holds the exact single-use route through
+  each historical-replica effect. Embedded non-mutation and Unix no-server
+  regressions cross the route epoch and each command subject independently,
+  then exercise same-PG unrelated payloads, invalid index linkage, and
+  missing/extra abandoned sources for both operation-specific routes. The
+  embedded positive canary requires the durable tombstone, while the installed
+  Unix historical-recovery regression remains the positive transport canary.
+- all 2,604 storage tests and all 7,926 workspace tests pass, including the
+  focused recovery family and installed Unix historical-recovery path.
+  Formatting, the transitional storage boundary checker, and workspace-wide
+  strict Clippy also pass.
 
 ### Phase 4 — type metadata-command publication
 

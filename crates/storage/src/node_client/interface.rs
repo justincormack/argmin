@@ -1618,32 +1618,34 @@ pub(crate) trait MetadataCommandRecoveryNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<Box<dyn MetadataCommandRecoveryCriticalSection>, StoreError>;
 
-    /// Apply one authorized recovery command on a historical replica.
-    ///
-    /// The server serializes this single mutation internally. Unlike the
-    /// primary critical section, this capability does not authorize pending
-    /// slot inspection or replacement on the replica.
-    fn apply_metadata_command_and_record_on_recovery_replica(
-        &self,
+    /// Bind one historical-replica mutation to its exact recovery certificate
+    /// and command. The returned single-use capability cannot inspect or
+    /// replace the replica's pending slot.
+    fn open_metadata_command_recovery_replica_apply_route<'a>(
+        &'a self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<Box<dyn MetadataCommandRecoveryReplicaApplyRoute + 'a>, StoreError>;
 
-    /// Record one certificate-bound recovery tombstone on a historical replica.
-    ///
-    /// The server serializes only this mutation internally, without granting
-    /// the reporting-primary inspection and replacement capability.
-    fn record_metadata_command_abandoned_on_recovery_replica(
-        &self,
+    fn open_metadata_command_recovery_replica_abandon_route<'a>(
+        &'a self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, StoreError>;
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<Box<dyn MetadataCommandRecoveryReplicaAbandonRoute + 'a>, StoreError>;
+}
+
+pub(crate) trait MetadataCommandRecoveryReplicaApplyRoute: Send {
+    fn apply(self: Box<Self>) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait MetadataCommandRecoveryReplicaAbandonRoute: Send {
+    fn record_abandoned(self: Box<Self>) -> Result<MetadataCommandReplicaState, StoreError>;
 }
 
 /// Pending-command convergence and explicitly authorized recovery mutation

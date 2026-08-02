@@ -1639,6 +1639,68 @@ impl MetadataCommandEnvelope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataCommandRecoveryCertificateError {
+    CommandNotDerived,
+    SamePayloadHasAbandonedSource,
+    FollowUpMissingAbandonedSource,
+    FollowUpNotBoundToAbandonedSource,
+}
+
+impl std::fmt::Display for MetadataCommandRecoveryCertificateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::CommandNotDerived => {
+                "metadata command recovery command is not derived from its authorized source"
+            }
+            Self::SamePayloadHasAbandonedSource => {
+                "same-payload metadata command recovery cannot carry an abandoned source"
+            }
+            Self::FollowUpMissingAbandonedSource => {
+                "metadata command recovery follow-up requires its abandoned source"
+            }
+            Self::FollowUpNotBoundToAbandonedSource => {
+                "metadata command recovery follow-up is not bound to its abandoned reissue"
+            }
+        })
+    }
+}
+
+pub(crate) fn validate_metadata_command_recovery_certificate(
+    authorized_source: &MetadataCommandEnvelope,
+    abandoned_source: Option<&MetadataCommandEnvelope>,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), MetadataCommandRecoveryCertificateError> {
+    if command != authorized_source
+        && (command.id().cluster_epoch() != authorized_source.id().cluster_epoch()
+            || command.id().pg_id() != authorized_source.id().pg_id()
+            || !command
+                .payload()
+                .is_authorized_recovery_derivative_of(authorized_source.payload())
+            || command.id().log_index() <= authorized_source.id().log_index())
+    {
+        return Err(MetadataCommandRecoveryCertificateError::CommandNotDerived);
+    }
+    if command.payload() == authorized_source.payload() {
+        return match abandoned_source {
+            None => Ok(()),
+            Some(_) => Err(MetadataCommandRecoveryCertificateError::SamePayloadHasAbandonedSource),
+        };
+    }
+    let Some(abandoned_source) = abandoned_source else {
+        return Err(MetadataCommandRecoveryCertificateError::FollowUpMissingAbandonedSource);
+    };
+    if abandoned_source.id().cluster_epoch() != authorized_source.id().cluster_epoch()
+        || abandoned_source.id().pg_id() != authorized_source.id().pg_id()
+        || abandoned_source.payload() != authorized_source.payload()
+        || abandoned_source.id().log_index() < authorized_source.id().log_index()
+        || command.id().log_index() <= abandoned_source.id().log_index()
+    {
+        return Err(MetadataCommandRecoveryCertificateError::FollowUpNotBoundToAbandonedSource);
+    }
+    Ok(())
+}
+
 pub(crate) fn metadata_command_log_hash(
     cluster_epoch: ClusterEpoch,
     pg_id: PgId,

@@ -1715,6 +1715,145 @@ fn unix_storage_node_client_removes_pending_metadata_command_slot_idempotently()
 }
 
 #[test]
+fn unix_recovery_replica_route_rejects_crossed_authority_before_rpc() {
+    let client = test_unix_storage_node_client();
+    let source = test_metadata_command(0, 1);
+    let abandoned = test_metadata_command(0, 2);
+    let command = test_metadata_command(0, 3);
+    let wrong_pg = test_metadata_command(1, 4);
+    let future_epoch = ClusterEpoch::new(client.cluster_epoch.get() + 1).unwrap();
+    let future_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(future_epoch, PgId::new(0), command.id().log_index()),
+        command.payload().clone(),
+    );
+    let (certificate_source, reissued, cleanup, unrelated) =
+        test_metadata_command_recovery_chain(0);
+    let cleanup_before_abandoned =
+        MetadataCommandEnvelope::new(reissued.id(), cleanup.payload().clone());
+
+    assert!(matches!(
+        client
+            .open_metadata_command_recovery_replica_apply_route(
+                PgId::new(0),
+                future_epoch,
+                &source,
+                Some(&abandoned),
+                &command,
+            )
+            .err()
+            .expect("foreign recovery epoch must be rejected before RPC"),
+        StoreError::StalePayloadOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+
+    for (authorized_source, abandoned_source, command) in [
+        (&wrong_pg, Some(&abandoned), &command),
+        (&source, Some(&wrong_pg), &command),
+        (&source, Some(&abandoned), &wrong_pg),
+    ] {
+        assert!(matches!(
+            client
+                .open_metadata_command_recovery_replica_apply_route(
+                    PgId::new(0),
+                    client.cluster_epoch,
+                    authorized_source,
+                    abandoned_source,
+                    command,
+                )
+                .err()
+                .expect("crossed recovery command subject must be rejected before RPC"),
+            StoreError::MetadataCommandWrongPg {
+                command_pg_id: 1,
+                target_pg_id: 0,
+                ..
+            }
+        ));
+    }
+    assert!(matches!(
+        client
+            .open_metadata_command_recovery_replica_apply_route(
+                PgId::new(0),
+                client.cluster_epoch,
+                &source,
+                Some(&abandoned),
+                &future_command,
+            )
+            .err()
+            .expect("crossed recovery command epoch must be rejected before RPC"),
+        StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
+    ));
+    assert!(matches!(
+        client
+            .open_metadata_command_recovery_replica_abandon_route(
+                PgId::new(0),
+                client.cluster_epoch,
+                &wrong_pg,
+                Some(&abandoned),
+                &command,
+            )
+            .err()
+            .expect("crossed tombstone recovery subject must be rejected before RPC"),
+        StoreError::MetadataCommandWrongPg {
+            command_pg_id: 1,
+            target_pg_id: 0,
+            ..
+        }
+    ));
+
+    for (authorized_source, abandoned_source, command) in [
+        (&certificate_source, None, &unrelated),
+        (&certificate_source, Some(&reissued), &reissued),
+        (&certificate_source, None, &cleanup),
+        (&certificate_source, Some(&unrelated), &cleanup),
+        (
+            &certificate_source,
+            Some(&reissued),
+            &cleanup_before_abandoned,
+        ),
+    ] {
+        assert!(matches!(
+            client
+                .open_metadata_command_recovery_replica_apply_route(
+                    PgId::new(0),
+                    client.cluster_epoch,
+                    authorized_source,
+                    abandoned_source,
+                    command,
+                )
+                .err()
+                .expect("invalid recovery certificate must reject Unix replica apply before RPC"),
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open metadata command recovery replica route"
+            }
+        ));
+        assert!(matches!(
+            client
+                .open_metadata_command_recovery_replica_abandon_route(
+                    PgId::new(0),
+                    client.cluster_epoch,
+                    authorized_source,
+                    abandoned_source,
+                    command,
+                )
+                .err()
+                .expect(
+                    "invalid recovery certificate must reject Unix replica abandonment before RPC"
+                ),
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open metadata command recovery replica route"
+            }
+        ));
+    }
+}
+
+#[test]
 fn unix_storage_node_client_records_abandoned_metadata_command_idempotently() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);

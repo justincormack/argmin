@@ -2188,13 +2188,15 @@ impl super::StorageCluster {
                 let apply = match authorized_source {
                     Some(source) => node
                         .metadata_command_recovery_client()
-                        .apply_metadata_command_and_record_on_recovery_replica(
+                        .open_metadata_command_recovery_replica_apply_route(
                             pg_id,
                             command.id().cluster_epoch(),
                             source,
                             abandoned_source,
                             command,
-                        ),
+                        )
+                        .map_err(BucketSnapshotLoadError::Store)
+                        .and_then(|route| route.apply()),
                     None => node
                         .metadata_command_client()
                         .apply_metadata_command_and_record(pg_id, command),
@@ -2217,13 +2219,15 @@ impl super::StorageCluster {
             let apply = match authorized_source {
                 Some(source) => node
                     .metadata_command_recovery_client()
-                    .apply_metadata_command_and_record_on_recovery_replica(
+                    .open_metadata_command_recovery_replica_apply_route(
                         pg_id,
                         command.id().cluster_epoch(),
                         source,
                         abandoned_source,
                         command,
-                    ),
+                    )
+                    .map_err(BucketSnapshotLoadError::Store)
+                    .and_then(|route| route.apply()),
                 None => node
                     .metadata_command_client()
                     .apply_metadata_command_and_record(pg_id, command),
@@ -2357,13 +2361,14 @@ impl super::StorageCluster {
                     .record_metadata_command_abandoned_on_replica(pg_id, command),
                 MetadataCommandRouteMode::Recovery => node
                     .metadata_command_recovery_client()
-                    .record_metadata_command_abandoned_on_recovery_replica(
+                    .open_metadata_command_recovery_replica_abandon_route(
                         pg_id,
                         command.id().cluster_epoch(),
                         recovery_authorized_source.unwrap_or(command),
                         recovery_abandoned_source,
                         command,
-                    ),
+                    )
+                    .and_then(|route| route.record_abandoned()),
             };
             result.map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes,

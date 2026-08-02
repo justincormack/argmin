@@ -1411,6 +1411,180 @@ fn local_recovery_critical_section_rejects_future_epoch_command_without_mutation
 }
 
 #[test]
+fn local_recovery_replica_route_rejects_crossed_authority_without_mutation() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0, 1],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let epoch = ClusterEpoch::new(1).unwrap();
+    let source = test_metadata_command(0, 1);
+    let abandoned = test_metadata_command(0, 2);
+    let command = test_metadata_command(0, 3);
+    let wrong_pg = test_metadata_command(1, 4);
+    let future_epoch = ClusterEpoch::new(2).unwrap();
+    let future_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(future_epoch, PgId::new(0), command.id().log_index()),
+        command.payload().clone(),
+    );
+    let (certificate_source, reissued, cleanup, unrelated) =
+        test_metadata_command_recovery_chain(0);
+    let cleanup_before_abandoned =
+        MetadataCommandEnvelope::new(reissued.id(), cleanup.payload().clone());
+
+    for (authorized_source, abandoned_source, command) in [
+        (&wrong_pg, Some(&abandoned), &command),
+        (&source, Some(&wrong_pg), &command),
+        (&source, Some(&abandoned), &wrong_pg),
+    ] {
+        assert!(matches!(
+            client
+                .open_metadata_command_recovery_replica_apply_route(
+                    PgId::new(0),
+                    epoch,
+                    authorized_source,
+                    abandoned_source,
+                    command,
+                )
+                .err()
+                .expect("crossed recovery command subject must be rejected"),
+            StoreError::MetadataCommandWrongPg {
+                command_pg_id: 1,
+                target_pg_id: 0,
+                ..
+            }
+        ));
+    }
+    assert!(matches!(
+        client
+            .open_metadata_command_recovery_replica_apply_route(
+                PgId::new(0),
+                epoch,
+                &source,
+                Some(&abandoned),
+                &future_command,
+            )
+            .err()
+            .expect("crossed recovery command epoch must be rejected"),
+        StoreError::StaleMetadataOperation {
+            operation_epoch,
+            current_epoch,
+            ..
+        } if operation_epoch == future_epoch && current_epoch == epoch
+    ));
+    assert!(matches!(
+        client
+            .open_metadata_command_recovery_replica_abandon_route(
+                PgId::new(0),
+                epoch,
+                &wrong_pg,
+                Some(&abandoned),
+                &command,
+            )
+            .err()
+            .expect("crossed tombstone recovery subject must be rejected"),
+        StoreError::MetadataCommandWrongPg {
+            command_pg_id: 1,
+            target_pg_id: 0,
+            ..
+        }
+    ));
+
+    for (authorized_source, abandoned_source, command) in [
+        (&certificate_source, None, &unrelated),
+        (&certificate_source, Some(&reissued), &reissued),
+        (&certificate_source, None, &cleanup),
+        (&certificate_source, Some(&unrelated), &cleanup),
+        (
+            &certificate_source,
+            Some(&reissued),
+            &cleanup_before_abandoned,
+        ),
+        (&certificate_source, Some(&reissued), &cleanup),
+    ] {
+        assert!(matches!(
+            client
+                .open_metadata_command_recovery_replica_apply_route(
+                    PgId::new(0),
+                    epoch,
+                    authorized_source,
+                    abandoned_source,
+                    command,
+                )
+                .err()
+                .expect("invalid recovery certificate must reject replica apply"),
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open metadata command recovery replica route"
+            }
+        ));
+        assert!(matches!(
+            client
+                .open_metadata_command_recovery_replica_abandon_route(
+                    PgId::new(0),
+                    epoch,
+                    authorized_source,
+                    abandoned_source,
+                    command,
+                )
+                .err()
+                .expect("invalid recovery certificate must reject replica abandonment"),
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open metadata command recovery replica route"
+            }
+        ));
+    }
+
+    for pg_id in [0, 1] {
+        let pg = storage_node.get_pg(pg_id).unwrap();
+        assert_eq!(pg.max_metadata_command_log_index(epoch).unwrap(), 0);
+        assert_eq!(pg.max_metadata_command_log_index(future_epoch).unwrap(), 0);
+    }
+
+    let pg = storage_node.get_pg(0).unwrap();
+    pg.record_metadata_command_abandoned(client.node_id.as_u32(), &certificate_source)
+        .unwrap();
+    pg.record_metadata_command_abandoned(client.node_id.as_u32(), &reissued)
+        .unwrap();
+    drop(pg);
+    drop(
+        client
+            .open_metadata_command_recovery_replica_apply_route(
+                PgId::new(0),
+                epoch,
+                &certificate_source,
+                Some(&reissued),
+                &cleanup,
+            )
+            .expect("durably certified cleanup must open an embedded replica apply route"),
+    );
+    drop(
+        client
+            .open_metadata_command_recovery_replica_abandon_route(
+                PgId::new(0),
+                epoch,
+                &certificate_source,
+                Some(&reissued),
+                &cleanup,
+            )
+            .expect("durably certified cleanup must open an embedded replica abandonment route"),
+    );
+    assert_eq!(
+        storage_node
+            .get_pg(0)
+            .unwrap()
+            .max_metadata_command_log_index(epoch)
+            .unwrap(),
+        2,
+        "opening a certified route must not itself mutate metadata"
+    );
+}
+
+#[test]
 fn local_active_critical_section_rejects_command_for_another_pg_without_mutation() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(
@@ -3411,6 +3585,63 @@ fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope 
             ),
         ),
     )
+}
+
+fn test_metadata_command_recovery_chain(
+    pg_id: u32,
+) -> (
+    MetadataCommandEnvelope,
+    MetadataCommandEnvelope,
+    MetadataCommandEnvelope,
+    MetadataCommandEnvelope,
+) {
+    let epoch = ClusterEpoch::new(1).unwrap();
+    let bucket = crate::tests::bucket_name("metadata-recovery-certificate-bucket");
+    let key = crate::tests::object_key("metadata-recovery-certificate-object");
+    let session_id = crate::tests::stream_session_id("recovery-cert");
+    let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+    proof.operation_kind = PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND.to_string();
+    let source = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            epoch,
+            PgId::new(pg_id),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                CreateStreamUploadReq {
+                    session_id,
+                    bucket,
+                    key,
+                    target: StreamUploadTarget::PutObject,
+                    encryption: ObjectEncryption::None,
+                },
+                123,
+                proof,
+            ),
+        )),
+    );
+    let reissued = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            epoch,
+            PgId::new(pg_id),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        source.payload().clone(),
+    );
+    let cleanup = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            epoch,
+            PgId::new(pg_id),
+            MetadataCommandLogIndex::new(3).unwrap(),
+        ),
+        source
+            .payload()
+            .abandoned_recovery_follow_up()
+            .expect("PutObject stream creation requires generation cleanup"),
+    );
+    let unrelated = test_metadata_command(pg_id, 4);
+    (source, reissued, cleanup, unrelated)
 }
 
 #[path = "tests/unix_bucket_rpc.rs"]

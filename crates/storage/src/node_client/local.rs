@@ -1,6 +1,7 @@
 use super::*;
 use crate::metadata_command::{
-    AbortStreamUploadCommand, DeleteObjectPayloadReclaimCommand, DeleteObjectVersionMode,
+    validate_metadata_command_recovery_certificate, AbortStreamUploadCommand,
+    DeleteObjectPayloadReclaimCommand, DeleteObjectVersionMode,
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     DELETE_CURRENT_OBJECT_BUCKET_WRITE_OPERATION_KIND,
     DELETE_OBJECT_VERSION_BUCKET_WRITE_OPERATION_KIND,
@@ -6070,6 +6071,62 @@ impl LocalMetadataCommandRecoveryCriticalSection {
     }
 }
 
+struct LocalMetadataCommandRecoveryReplicaRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    authorized_source: &'a MetadataCommandEnvelope,
+    abandoned_source: Option<&'a MetadataCommandEnvelope>,
+    command: &'a MetadataCommandEnvelope,
+}
+
+impl LocalStorageNodeClient {
+    fn metadata_command_recovery_replica_route<'a>(
+        &'a self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<LocalMetadataCommandRecoveryReplicaRoute<'a>, StoreError> {
+        let validator = LocalMetadataCommandRecoveryCriticalSection {
+            client: self.clone(),
+            pg_id,
+            cluster_epoch,
+        };
+        validator.validate_command_route(authorized_source)?;
+        validator.validate_optional_command_route(abandoned_source)?;
+        validator.validate_command_route(command)?;
+        validate_metadata_command_recovery_certificate(
+            authorized_source,
+            abandoned_source,
+            command,
+        )
+        .map_err(|_| StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open metadata command recovery replica route",
+        })?;
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        if command.payload() != authorized_source.payload() {
+            let abandoned_source = abandoned_source
+                .expect("validated recovery follow-up must carry its abandoned source");
+            if !pg.metadata_command_abandoned(self.node_id.as_u32(), abandoned_source)? {
+                return Err(StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "open metadata command recovery replica route",
+                });
+            }
+        }
+        drop(pg);
+        Ok(LocalMetadataCommandRecoveryReplicaRoute {
+            client: self,
+            pg_id,
+            cluster_epoch,
+            authorized_source,
+            abandoned_source,
+            command,
+        })
+    }
+}
+
 impl MetadataCommandRecoveryNodeClient for LocalStorageNodeClient {
     fn open_metadata_command_recovery_critical_section(
         &self,
@@ -6084,43 +6141,64 @@ impl MetadataCommandRecoveryNodeClient for LocalStorageNodeClient {
         }))
     }
 
-    fn apply_metadata_command_and_record_on_recovery_replica(
-        &self,
+    fn open_metadata_command_recovery_replica_apply_route<'a>(
+        &'a self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        let route = LocalMetadataCommandRecoveryCriticalSection {
-            client: self.clone(),
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<Box<dyn MetadataCommandRecoveryReplicaApplyRoute + 'a>, StoreError> {
+        Ok(Box::new(self.metadata_command_recovery_replica_route(
             pg_id,
             cluster_epoch,
-        };
-        route.apply_metadata_command_and_record_for_recovery(
             authorized_source,
             abandoned_source,
             command,
-        )
+        )?))
     }
 
-    fn record_metadata_command_abandoned_on_recovery_replica(
-        &self,
+    fn open_metadata_command_recovery_replica_abandon_route<'a>(
+        &'a self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        let route = LocalMetadataCommandRecoveryCriticalSection {
-            client: self.clone(),
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<Box<dyn MetadataCommandRecoveryReplicaAbandonRoute + 'a>, StoreError> {
+        Ok(Box::new(self.metadata_command_recovery_replica_route(
             pg_id,
             cluster_epoch,
+            authorized_source,
+            abandoned_source,
+            command,
+        )?))
+    }
+}
+
+impl MetadataCommandRecoveryReplicaApplyRoute for LocalMetadataCommandRecoveryReplicaRoute<'_> {
+    fn apply(self: Box<Self>) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let route = LocalMetadataCommandRecoveryCriticalSection {
+            client: self.client.clone(),
+            pg_id: self.pg_id,
+            cluster_epoch: self.cluster_epoch,
         };
-        route.validate_command_route(authorized_source)?;
-        route.validate_optional_command_route(abandoned_source)?;
-        route.validate_command_route(command)?;
-        route.record_metadata_command_abandoned(command)
+        route.apply_metadata_command_and_record_for_recovery(
+            self.authorized_source,
+            self.abandoned_source,
+            self.command,
+        )
+    }
+}
+
+impl MetadataCommandRecoveryReplicaAbandonRoute for LocalMetadataCommandRecoveryReplicaRoute<'_> {
+    fn record_abandoned(self: Box<Self>) -> Result<MetadataCommandReplicaState, StoreError> {
+        let route = LocalMetadataCommandRecoveryCriticalSection {
+            client: self.client.clone(),
+            pg_id: self.pg_id,
+            cluster_epoch: self.cluster_epoch,
+        };
+        route.record_metadata_command_abandoned(self.command)
     }
 }
 

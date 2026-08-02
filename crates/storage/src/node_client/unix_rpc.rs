@@ -1,4 +1,5 @@
 use super::*;
+use crate::metadata_command::validate_metadata_command_recovery_certificate;
 use crate::BucketAclSummary;
 
 struct UnixRetainedPlacedShardRoute<'a> {
@@ -3651,6 +3652,86 @@ impl MetadataCommandPeeringRoute for UnixMetadataCommandPeeringRoute<'_> {
     }
 }
 
+struct UnixMetadataCommandRecoveryReplicaRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: PgId,
+    cluster_epoch: ClusterEpoch,
+    authorized_source: &'a MetadataCommandEnvelope,
+    abandoned_source: Option<&'a MetadataCommandEnvelope>,
+    command: &'a MetadataCommandEnvelope,
+}
+
+impl<'a> UnixMetadataCommandRecoveryReplicaRoute<'a> {
+    fn new(
+        client: &'a UnixStorageNodeClient,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<Self, StoreError> {
+        if cluster_epoch != client.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: client.cluster_epoch,
+            });
+        }
+        let route = Self {
+            client,
+            pg_id,
+            cluster_epoch,
+            authorized_source,
+            abandoned_source,
+            command,
+        };
+        route.validate_command_route(authorized_source)?;
+        if let Some(abandoned_source) = abandoned_source {
+            route.validate_command_route(abandoned_source)?;
+        }
+        route.validate_command_route(command)?;
+        validate_metadata_command_recovery_certificate(
+            authorized_source,
+            abandoned_source,
+            command,
+        )
+        .map_err(|_| StoreError::RouteCapabilitySubjectMismatch {
+            operation: "open metadata command recovery replica route",
+        })?;
+        Ok(route)
+    }
+
+    fn validate_command_route(&self, command: &MetadataCommandEnvelope) -> Result<(), StoreError> {
+        if command.id().pg_id() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id: self.client.node_id.as_u32(),
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id.get(),
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        if command.id().cluster_epoch() != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: self.pg_id.get(),
+                operation_epoch: command.id().cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(())
+    }
+
+    fn request(&self) -> StorageRpcMetadataCommandRecoveryRequest {
+        StorageRpcMetadataCommandRecoveryRequest {
+            node_id: self.client.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id: self.pg_id,
+            authorized_source: self.authorized_source.clone(),
+            abandoned_source: self.abandoned_source.cloned(),
+            command: self.command.clone(),
+        }
+    }
+}
+
 impl MetadataCommandRecoveryNodeClient for UnixStorageNodeClient {
     fn open_metadata_command_recovery_critical_section(
         &self,
@@ -3669,83 +3750,78 @@ impl MetadataCommandRecoveryNodeClient for UnixStorageNodeClient {
         ))
     }
 
-    fn apply_metadata_command_and_record_on_recovery_replica(
-        &self,
+    fn open_metadata_command_recovery_replica_apply_route<'a>(
+        &'a self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(BucketSnapshotLoadError::Store(
-                StoreError::StalePayloadOperation {
-                    pg_id: pg_id.get(),
-                    operation_epoch: cluster_epoch,
-                    current_epoch: self.cluster_epoch,
-                },
-            ));
-        }
-        let request = StorageRpcMetadataCommandRecoveryRequest {
-            node_id: self.node_id,
-            cluster_epoch,
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<Box<dyn MetadataCommandRecoveryReplicaApplyRoute + 'a>, StoreError> {
+        Ok(Box::new(UnixMetadataCommandRecoveryReplicaRoute::new(
+            self,
             pg_id,
-            authorized_source: authorized_source.clone(),
-            abandoned_source: abandoned_source.cloned(),
-            command: command.clone(),
-        };
-        let payload = encode_metadata_command_recovery_request(&request)
+            cluster_epoch,
+            authorized_source,
+            abandoned_source,
+            command,
+        )?))
+    }
+
+    fn open_metadata_command_recovery_replica_abandon_route<'a>(
+        &'a self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        authorized_source: &'a MetadataCommandEnvelope,
+        abandoned_source: Option<&'a MetadataCommandEnvelope>,
+        command: &'a MetadataCommandEnvelope,
+    ) -> Result<Box<dyn MetadataCommandRecoveryReplicaAbandonRoute + 'a>, StoreError> {
+        Ok(Box::new(UnixMetadataCommandRecoveryReplicaRoute::new(
+            self,
+            pg_id,
+            cluster_epoch,
+            authorized_source,
+            abandoned_source,
+            command,
+        )?))
+    }
+}
+
+impl MetadataCommandRecoveryReplicaApplyRoute for UnixMetadataCommandRecoveryReplicaRoute<'_> {
+    fn apply(self: Box<Self>) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        let payload = encode_metadata_command_recovery_request(&self.request())
             .map_err(|error| {
-                self.rpc_payload_error(
+                self.client.rpc_payload_error(
                     "encode metadata command recovery replica apply request",
                     error.to_string(),
                 )
             })
             .map_err(BucketSnapshotLoadError::Store)?;
-        self.metadata_command_apply_and_record_with_payload(
-            pg_id,
-            command,
+        self.client.metadata_command_apply_and_record_with_payload(
+            self.pg_id,
+            self.command,
             StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
             payload,
             "decode metadata command recovery replica apply response",
         )
     }
+}
 
-    fn record_metadata_command_abandoned_on_recovery_replica(
-        &self,
-        pg_id: PgId,
-        cluster_epoch: ClusterEpoch,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-    ) -> Result<MetadataCommandReplicaState, StoreError> {
-        if cluster_epoch != self.cluster_epoch {
-            return Err(StoreError::StalePayloadOperation {
-                pg_id: pg_id.get(),
-                operation_epoch: cluster_epoch,
-                current_epoch: self.cluster_epoch,
-            });
-        }
-        let request = StorageRpcMetadataCommandRecoveryRequest {
-            node_id: self.node_id,
-            cluster_epoch,
-            pg_id,
-            authorized_source: authorized_source.clone(),
-            abandoned_source: abandoned_source.cloned(),
-            command: command.clone(),
-        };
-        let payload = encode_metadata_command_recovery_request(&request).map_err(|error| {
-            self.rpc_payload_error(
-                "encode metadata command recovery replica abandonment request",
-                error.to_string(),
-            )
-        })?;
-        let response = self.rpc_request(
+impl MetadataCommandRecoveryReplicaAbandonRoute for UnixMetadataCommandRecoveryReplicaRoute<'_> {
+    fn record_abandoned(self: Box<Self>) -> Result<MetadataCommandReplicaState, StoreError> {
+        let payload =
+            encode_metadata_command_recovery_request(&self.request()).map_err(|error| {
+                self.client.rpc_payload_error(
+                    "encode metadata command recovery replica abandonment request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.client.rpc_request(
             StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned,
             payload,
         )?;
-        self.decode_metadata_command_abandonment_response(
-            pg_id,
+        self.client.decode_metadata_command_abandonment_response(
+            self.pg_id,
             &response,
             "decode metadata command recovery replica abandonment response",
         )
