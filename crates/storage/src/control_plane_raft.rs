@@ -80,6 +80,7 @@ use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
 };
+use crate::static_topology::StaticInitialControlPlaneTopology;
 use crate::PgId;
 use crate::{ClusterEpoch, PgState};
 
@@ -907,7 +908,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
     }
 
     #[must_use]
-    pub fn initial_topology_certificate(
+    pub(crate) fn initial_topology_certificate(
         &self,
     ) -> Option<&crate::control_plane::InitialClusterTopologyCertificate> {
         self.initial_topology_certificate.as_ref()
@@ -929,11 +930,31 @@ impl ControlPlaneRaftPeerTransportPolicy {
     }
 
     #[must_use]
-    pub fn with_initial_topology_certificate(
+    #[cfg(test)]
+    pub(crate) fn with_initial_topology_certificate(
         mut self,
         certificate: crate::control_plane::InitialClusterTopologyCertificate,
     ) -> Self {
         self.initial_topology_certificate = Some(certificate);
+        self
+    }
+
+    /// Bind a storage-owned static initial topology to Raft peer admission.
+    #[must_use]
+    pub fn with_static_initial_topology(
+        mut self,
+        topology: &StaticInitialControlPlaneTopology,
+    ) -> Self {
+        let certificate = topology.certificate();
+        self.topology = Some(ControlPlaneRaftTopologyIdentity {
+            generation: certificate.topology_generation(),
+            digest: certificate
+                .topology_digest()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        });
+        self.initial_topology_certificate = Some(certificate.clone());
         self
     }
 
@@ -4720,7 +4741,7 @@ impl ControlPlaneRaftAuthority {
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
         peer_policy: ControlPlaneRaftPeerTransportPolicy,
-        expected_bootstrap: ControlPlaneCommand,
+        expected_topology: &StaticInitialControlPlaneTopology,
         network: ControlPlaneRaftPeerNetworkConfig,
     ) -> Result<Self, ControlPlaneError> {
         let wal_path = durable_artifact_wal_path(artifact_path);
@@ -4731,7 +4752,7 @@ impl ControlPlaneRaftAuthority {
             Some(&wal_path),
             peer_policy,
             network,
-            Some(expected_bootstrap),
+            Some(expected_topology.bootstrap_command()),
         )
         .await
     }
@@ -5340,6 +5361,31 @@ impl ControlPlaneRaftAuthority {
         self.command_metrics
             .record_submission(queue_wait, operation, result.is_ok());
         result
+    }
+
+    /// Submit the certified bootstrap command retained by a storage-owned
+    /// static topology.
+    pub async fn submit_static_initial_topology(
+        &self,
+        topology: &StaticInitialControlPlaneTopology,
+    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        let peer_policy = self.static_peer_policy.as_ref().ok_or_else(|| {
+            ControlPlaneError::static_topology_failure(
+                "static initial topology submission requires a configured static peer policy",
+            )
+        })?;
+        let configured = peer_policy.initial_topology_certificate().ok_or_else(|| {
+            ControlPlaneError::static_topology_failure(
+                "static initial topology submission requires a configured topology certificate",
+            )
+        })?;
+        if topology.certificate() != configured {
+            return Err(ControlPlaneError::static_topology_failure(
+                "static initial topology submission does not match the authority's configured topology",
+            ));
+        }
+        self.submit_control_plane_command(topology.bootstrap_command())
+            .await
     }
 
     /// Returns local serving status only after a ReadIndex round confirms that
@@ -19929,6 +19975,102 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("initial topology does not match"));
+    }
+
+    fn static_initial_topology_for_submission_test(
+        storage_endpoint: &str,
+    ) -> StaticInitialControlPlaneTopology {
+        let placement = crate::derive_static_initial_pg_placement(
+            1,
+            1,
+            0,
+            crate::StaticStorageFailureDomain::None,
+            &["host-1".to_owned()],
+            &["disk-1".to_owned()],
+            &[crate::StaticStoragePlacementNode::new(
+                11, "host-1", "disk-1",
+            )],
+        )
+        .unwrap();
+        crate::derive_static_initial_control_plane_topology(
+            7,
+            &"ab".repeat(32),
+            &[1],
+            &[crate::StaticStorageNodeEndpoint::new(11, storage_endpoint)],
+            placement,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn static_topology_submission_rejects_crossed_authority_before_log_append() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let configured = static_initial_topology_for_submission_test("node-11");
+            let crossed = static_initial_topology_for_submission_test("crossed-node-11");
+            let cluster_name = "control-plane-raft-static-submission-binding-test";
+            let peer_policy = ControlPlaneRaftPeerTransportPolicy::new(
+                cluster_name,
+                BTreeMap::from([(1, BasicNode::new("raft-node-1"))]),
+                ControlPlaneRaftPeerTransportLimits::default(),
+            )
+            .with_static_initial_topology(&configured);
+            let log_store = ControlPlaneRaftLogStore::empty();
+            let raft = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+                1,
+                test_raft_config(cluster_name),
+                UnreachableRaftNetworkFactory,
+                log_store.clone(),
+                ControlPlaneRaftStateMachine::empty(),
+            )
+            .await
+            .unwrap();
+            let authority = ControlPlaneRaftAuthority::new_with_log_store_and_static_peer_policy(
+                raft,
+                log_store,
+                cluster_name,
+                peer_policy,
+            );
+            authority
+                .initialize_membership(BTreeMap::from([(1, BasicNode::new("raft-node-1"))]))
+                .await
+                .unwrap();
+            wait_for_local_leader(
+                authority.raft(),
+                "static submission binding test leadership",
+            )
+            .await;
+
+            let before = authority.status().await.unwrap();
+            let error = authority
+                .submit_static_initial_topology(&crossed)
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                &error,
+                ControlPlaneError::StaticTopologyFailure { .. }
+            ));
+            assert!(error.retained_diagnostic_contains(
+                "static initial topology submission does not match the authority's configured topology"
+            ));
+            let after = authority.status().await.unwrap();
+            assert_eq!(after.last_log_id(), before.last_log_id());
+            assert_eq!(after.committed(), before.committed());
+            assert_eq!(after.applied(), before.applied());
+            let snapshot = authority.current_control_plane_snapshot().await.unwrap();
+            assert!(snapshot.nodes().next().is_none());
+            assert!(snapshot.pgs().next().is_none());
+            assert!(snapshot.initial_topology().is_none());
+
+            let submitted = authority
+                .submit_static_initial_topology(&configured)
+                .await
+                .unwrap();
+            assert!(matches!(
+                submitted.into_outcome(),
+                ControlPlaneRaftCommandOutcome::Applied(_)
+            ));
+            authority.shutdown().await.unwrap();
+        });
     }
 
     #[test]

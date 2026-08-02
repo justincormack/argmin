@@ -613,8 +613,10 @@ pub use standalone::{
     StandaloneRouteIdentityPreparation,
 };
 pub use static_topology::{
-    derive_static_initial_pg_placement, StaticInitialPgPlacement, StaticStorageFailureDomain,
-    StaticStoragePlacementError, StaticStoragePlacementNode,
+    derive_static_initial_control_plane_topology, derive_static_initial_pg_placement,
+    StaticInitialControlPlaneTopology, StaticInitialPgPlacement, StaticStorageFailureDomain,
+    StaticStorageNodeEndpoint, StaticStoragePlacementError, StaticStoragePlacementNode,
+    StaticStorageTopologyError,
 };
 pub use storage_rpc::StorageNodeFailure;
 pub(crate) use storage_rpc_auth::StorageRpcClientAuthConfig;

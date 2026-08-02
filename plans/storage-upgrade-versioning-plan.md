@@ -1265,6 +1265,29 @@ an `argmin-s3` placement dependency or direct placement-engine types. Initial to
 assembly, raw control-plane commands, live topology transitions, and metadata-transfer
 orchestration remain pending parts of item 4.
 
+The twenty-fifth bounded slice continues implementation-order item 4 by containing the certified
+initial static control-plane topology. After the outer manifest computes its stable topology
+identity, it passes the topology generation and digest, logical Raft voter IDs, canonical logical
+storage-node endpoints, and the previously owner-validated placement to `storage`. Storage binds
+those inputs into one opaque `StaticInitialControlPlaneTopology`, validates the endpoint/node
+identity set, decodes the topology digest, constructs and validates the private PG/node bootstrap
+representations and `InitialClusterTopologyCertificate`, and retains the exact certified bootstrap
+command. `ServerConfig` carries only that opaque value. Raft peer policy binding, pending-static
+durable-authority construction, certified command submission, replication-envelope validation,
+and established-snapshot certificate matching now accept the opaque topology through
+storage-owned operations. `argmin-s3` no longer imports or constructs the certificate, computes
+the bootstrap-map digest, constructs `BootstrapCertifiedInitialClusterMap`, or inspects the
+snapshot's certificate. Submission compares the opaque topology's certificate with the exact
+certificate retained by the authority's configured static peer policy before entering command
+admission; a crossed topology therefore cannot append or commit a log entry. The acting-set
+mutation/certificate-persistence impossible-state
+regression is owner-local, while manifest tests retain only logical test projections for topology
+generation, voter IDs, and acting-set node IDs. A repository check rejects those raw certificate,
+command, and snapshot-inspection seams in `argmin-s3` and public fields on the opaque topology.
+Environment-only legacy-local bootstrap still uses its distinct uncertified local command path.
+Live topology transitions, metadata-transfer orchestration, and the remaining static
+control-plane administration and transport-bootstrap orchestration are pending parts of item 4.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology

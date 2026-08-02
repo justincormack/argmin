@@ -3016,6 +3016,40 @@ fail_with_matches \
     "Static storage placement interpretation and placement-engine topology must remain owned by storage" \
     "$argmin_static_storage_placement_leaks"
 
+argmin_static_initial_topology_representation_leaks=$(
+    rg -n --color=never \
+        '\bInitialClusterTopologyCertificate\b|\binitial_cluster_bootstrap_map_digest\b|\bBootstrapCertifiedInitialClusterMap\b|\bwith_initial_topology_certificate\b|\.initial_topology\(' \
+        crates/argmin-s3/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Static initial topology certificates, certified bootstrap commands, and applied-certificate inspection must remain owned by storage" \
+    "$argmin_static_initial_topology_representation_leaks"
+
+static_initial_topology_opaque_surface_leaks=$(
+    awk '
+    /pub struct StaticInitialControlPlaneTopology[[:space:]]*\{/ {
+        in_topology = 1
+        depth = 0
+    }
+    in_topology {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_topology = 0
+        }
+    }
+    ' crates/storage/src/static_topology.rs
+)
+fail_with_matches \
+    "The storage-owned static initial topology must not expose its retained certificate, nodes, or PG acting sets as public fields" \
+    "$static_initial_topology_opaque_surface_leaks"
+
 multipart_upload_id_authority_derived_equality=$(
     awk '
     /#\[derive\(/ {

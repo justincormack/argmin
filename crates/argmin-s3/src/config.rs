@@ -7,9 +7,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use storage::control_plane::{
-    ControlPlaneRpcClientEndpoint, InitialClusterTopologyCertificate, MAX_HEARTBEAT_LEASE_MS,
-};
+use storage::control_plane::{ControlPlaneRpcClientEndpoint, MAX_HEARTBEAT_LEASE_MS};
 use storage::control_plane_raft::{
     ControlPlaneRaftPeerClientEndpoint, ControlPlaneRaftPeerTransportLimits,
 };
@@ -18,8 +16,9 @@ use storage::storage_node_server::STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE
 use storage::storage_rpc_transport::StorageRpcClientEndpoint;
 use storage::LocalUnixStorageNodeClientConfig;
 use storage::{
-    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability, NodeId, PgId,
-    StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig,
+    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability,
+    StaticInitialControlPlaneTopology, StorageNodeStorageRpcClientCapability,
+    StorageRpcServerAuthConfig,
 };
 
 const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
@@ -374,12 +373,6 @@ pub(crate) struct ConfiguredStaticClusterIdentity {
     pub(crate) process_identity_digest: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ConfiguredStaticInitialClusterMap {
-    pub(crate) topology: InitialClusterTopologyCertificate,
-    pub(crate) pg_acting_sets: Vec<(PgId, Vec<NodeId>)>,
-}
-
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SecretConfigValue(String);
 
@@ -442,7 +435,7 @@ pub(crate) struct ServerConfig {
     pub(crate) storage_node_id: Option<u32>,
     pub(crate) storage_node_data_dir: Option<String>,
     pub(crate) static_cluster_identity: Option<ConfiguredStaticClusterIdentity>,
-    pub(crate) static_initial_cluster_map: Option<ConfiguredStaticInitialClusterMap>,
+    pub(crate) static_initial_cluster_map: Option<StaticInitialControlPlaneTopology>,
     pub(crate) storage_node_socket_path: Option<String>,
     pub(crate) storage_node_sockets: Vec<ConfiguredStorageNodeSocket>,
     pub(crate) storage_rpc_client_endpoints: Vec<(u32, StorageRpcClientEndpoint)>,

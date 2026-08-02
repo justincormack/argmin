@@ -65,6 +65,7 @@ use storage::control_plane_raft::{
     ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerNetworkConfig,
     ControlPlaneRaftPeerServerDurability, ControlPlaneRaftPeerServerListener,
     ControlPlaneRaftPeerServerPolicy, ControlPlaneRaftPeerTransportPolicy,
+    SubmittedControlPlaneRaftCommand,
 };
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
@@ -73,8 +74,9 @@ use storage::storage_node_server::{
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
-    PgMetadataTransferArtifact, PgMetadataTransferError, PgState, RouteMapValidity, StorageCluster,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle, StorageNodeFailureClass, StoreError,
+    PgMetadataTransferArtifact, PgMetadataTransferError, PgState, RouteMapValidity,
+    StaticInitialControlPlaneTopology, StorageCluster, StorageClusterRouteHandle,
+    StorageClusterRuntimeMapHandle, StorageNodeFailureClass, StoreError,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
@@ -86,7 +88,7 @@ use config::{
     ConfiguredControlPlaneRaftAuthCredential, ConfiguredControlPlaneRaftPeerListener,
     ConfiguredControlPlaneRpcListener, ConfiguredControlPlaneStorageAuthCredential,
     ConfiguredCredential, ConfiguredCredentialProfile, ConfiguredStaticClusterIdentity,
-    ConfiguredStaticInitialClusterMap, ProcessRole, ServerConfig,
+    ProcessRole, ServerConfig,
 };
 use server_http::http::HttpFrontend;
 
@@ -3014,6 +3016,23 @@ impl ExperimentalRaftControlPlane {
     ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
         self.ensure_not_durably_poisoned()?;
         let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
+        self.finish_submitted_raft_command(submitted, checkpoint_after_commit)
+    }
+
+    fn submit_raft_static_initial_topology(
+        &mut self,
+        topology: &StaticInitialControlPlaneTopology,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let submitted = self.block_on(self.authority.submit_static_initial_topology(topology))?;
+        self.finish_submitted_raft_command(submitted, true)
+    }
+
+    fn finish_submitted_raft_command(
+        &mut self,
+        submitted: SubmittedControlPlaneRaftCommand,
+        checkpoint_after_commit: bool,
+    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
         let outcome = submitted.into_outcome();
         if checkpoint_after_commit {
             if let Err(error) = self.store_durable_restart_artifact() {
@@ -3506,14 +3525,13 @@ fn build_experimental_raft_peer_transport_policy(
         config.control_plane_raft_peer_connect_timeout,
         config.control_plane_raft_peer_io_timeout,
     );
-    if let Some(identity) = &config.static_cluster_identity {
+    if let Some(initial) = &config.static_initial_cluster_map {
+        policy = policy.with_static_initial_topology(initial);
+    } else if let Some(identity) = &config.static_cluster_identity {
         policy = policy.with_topology_identity(
             identity.topology_generation,
             identity.topology_digest.clone(),
         );
-    }
-    if let Some(initial) = &config.static_initial_cluster_map {
-        policy = policy.with_initial_topology_certificate(initial.topology.clone());
     }
     if let Some(auth_policy) =
         build_experimental_raft_peer_auth_policy(config, cluster_name, local_node_id)?
@@ -4371,7 +4389,9 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                         node_id,
                         Path::new(state_path),
                         policy,
-                        initial_control_plane_bootstrap_command(config),
+                        config.static_initial_cluster_map.as_ref().expect(
+                            "static initialization requires configured initial topology",
+                        ),
                         network,
                     )
                     .await?
@@ -4950,8 +4970,11 @@ fn bootstrap_empty_experimental_raft_control_plane(
     }
 
     let node_count = config.storage_node_sockets.len();
-    let command = initial_control_plane_bootstrap_command(config);
-    match authority.submit_raft_command(command) {
+    let submitted = match &config.static_initial_cluster_map {
+        Some(topology) => authority.submit_raft_static_initial_topology(topology),
+        None => authority.submit_raft_command(initial_control_plane_bootstrap_command(config)),
+    };
+    match submitted {
         Ok(_) => {}
         Err(error)
             if experimental_raft_bootstrap_submit_error_was_concurrent_success(
@@ -5000,26 +5023,23 @@ fn wait_for_initial_experimental_raft_control_plane_with(
 }
 
 fn initial_control_plane_bootstrap_command(config: &ServerConfig) -> ControlPlaneCommand {
+    assert!(
+        config.static_initial_cluster_map.is_none(),
+        "static initial topology must use the storage-owned bootstrap operation"
+    );
     let nodes = config
         .storage_node_sockets
         .iter()
         .map(|entry| (NodeId::new(entry.node_id), entry.socket_path.clone()))
         .collect();
-    match &config.static_initial_cluster_map {
-        Some(initial) => ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
-            nodes,
-            pg_acting_sets: initial.pg_acting_sets.clone(),
-            topology: initial.topology.clone(),
-        },
-        None => ControlPlaneCommand::BootstrapInitialClusterMap {
-            nodes,
-            pg_ids: config
-                .storage_pg_ids
-                .iter()
-                .copied()
-                .map(storage::PgId::new)
-                .collect(),
-        },
+    ControlPlaneCommand::BootstrapInitialClusterMap {
+        nodes,
+        pg_ids: config
+            .storage_pg_ids
+            .iter()
+            .copied()
+            .map(storage::PgId::new)
+            .collect(),
     }
 }
 
@@ -5036,9 +5056,9 @@ fn establish_static_initial_control_plane_topology(
     loop {
         let snapshot =
             block_on_control_plane_raft(runtime, authority.current_control_plane_snapshot())?;
-        if snapshot.nodes().next().is_some() || snapshot.pgs().next().is_some() {
-            validate_static_initial_topology_certificate(&snapshot, expected)
-                .map_err(ControlPlaneError::static_topology_failure)?;
+        if validate_static_initial_topology_certificate(&snapshot, expected)
+            .map_err(ControlPlaneError::static_topology_failure)?
+        {
             return Ok(());
         }
         if !allow_bootstrap {
@@ -5054,8 +5074,7 @@ fn establish_static_initial_control_plane_topology(
         if status.linearized_authority_serving() {
             let submitted = block_on_control_plane_raft(
                 runtime,
-                authority
-                    .submit_control_plane_command(initial_control_plane_bootstrap_command(config)),
+                authority.submit_static_initial_topology(expected),
             );
             match submitted {
                 Ok(submitted) => match submitted.into_outcome() {
@@ -5085,8 +5104,7 @@ fn wait_for_static_initial_control_plane_topology(
         let snapshot = authority
             .current_snapshot()
             .map_err(|error| error.to_string())?;
-        if snapshot.nodes().next().is_some() || snapshot.pgs().next().is_some() {
-            validate_static_initial_topology_certificate(&snapshot, expected)?;
+        if validate_static_initial_topology_certificate(&snapshot, expected)? {
             return Ok(());
         }
         match bootstrap_empty_experimental_raft_control_plane(authority, config) {
@@ -5100,16 +5118,11 @@ fn wait_for_static_initial_control_plane_topology(
 
 fn validate_static_initial_topology_certificate(
     snapshot: &ClusterControlSnapshot,
-    expected: &ConfiguredStaticInitialClusterMap,
-) -> Result<(), String> {
-    if snapshot.initial_topology() != Some(&expected.topology) {
-        return Err(format!(
-            "applied initial topology certificate does not match configured topology; expected={:?} actual={:?}",
-            expected.topology,
-            snapshot.initial_topology()
-        ));
-    }
-    Ok(())
+    expected: &StaticInitialControlPlaneTopology,
+) -> Result<bool, String> {
+    expected
+        .validate_snapshot(snapshot)
+        .map_err(|error| error.to_string())
 }
 
 fn experimental_raft_control_plane_has_bootstrap_state(
@@ -7911,84 +7924,6 @@ mod tests {
                     digest: "a".repeat(64),
                 }
             )
-        );
-    }
-
-    #[test]
-    fn static_initial_topology_certificate_survives_later_acting_set_changes() {
-        let mut config = test_server_config();
-        config.storage_node_sockets = vec![
-            config::ConfiguredStorageNodeSocket {
-                node_id: 1,
-                socket_path: "/tmp/node-1.sock".to_string(),
-            },
-            config::ConfiguredStorageNodeSocket {
-                node_id: 2,
-                socket_path: "/tmp/node-2.sock".to_string(),
-            },
-        ];
-        let nodes = vec![
-            (NodeId::new(1), "/tmp/node-1.sock".to_string()),
-            (NodeId::new(2), "/tmp/node-2.sock".to_string()),
-        ];
-        let pg_acting_sets = vec![
-            (PgId::new(0), vec![NodeId::new(1)]),
-            (PgId::new(1), vec![NodeId::new(2)]),
-        ];
-        let topology =
-            storage::control_plane::InitialClusterTopologyCertificate::new_for_bootstrap_map(
-                7,
-                [0xaa; storage::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
-                vec![101, 102, 103],
-                &nodes,
-                &pg_acting_sets,
-            )
-            .unwrap();
-        let expected = ConfiguredStaticInitialClusterMap {
-            topology: topology.clone(),
-            pg_acting_sets,
-        };
-        config.static_initial_cluster_map = Some(expected.clone());
-        let mut state_machine =
-            storage::control_plane_command::ReplicatedControlPlaneStateMachine::empty();
-        let committed = state_machine
-            .apply_committed_command(
-                storage::control_plane_command::ControlPlaneLogId::new(1, 1).unwrap(),
-                initial_control_plane_bootstrap_command(&config),
-            )
-            .unwrap();
-        assert!(committed.applied_command().is_some());
-        state_machine
-            .apply_committed_command(
-                storage::control_plane_command::ControlPlaneLogId::new(1, 2).unwrap(),
-                ControlPlaneCommand::SetPgActingSet {
-                    pg_id: PgId::new(1),
-                    acting_set: vec![NodeId::new(1)],
-                },
-            )
-            .unwrap();
-        let snapshot = state_machine.snapshot().clone();
-        assert_eq!(
-            snapshot.pg(PgId::new(1)).unwrap().acting_set(),
-            &[NodeId::new(1)]
-        );
-
-        validate_static_initial_topology_certificate(&snapshot, &expected).unwrap();
-
-        let wrong_topology = ConfiguredStaticInitialClusterMap {
-            topology: storage::control_plane::InitialClusterTopologyCertificate::new(
-                8,
-                [0xaa; storage::control_plane::CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
-                *topology.bootstrap_map_digest(),
-                vec![101, 102, 103],
-            )
-            .unwrap(),
-            pg_acting_sets: expected.pg_acting_sets,
-        };
-        assert!(
-            validate_static_initial_topology_certificate(&snapshot, &wrong_topology)
-                .unwrap_err()
-                .contains("certificate")
         );
     }
 
