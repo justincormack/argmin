@@ -470,9 +470,11 @@ start_storage_node() {
     local node_id="$1"
     local socket_path
     local node_data_dir
+    local node_process_data_dir
     local node_log
     socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
     node_data_dir="$data_dir/storage-node-$(printf '%04d' "$node_id")"
+    node_process_data_dir="$data_dir/storage-node-$(printf '%04d' "$node_id")-process"
     node_log="$logs_dir/storage-node-$(printf '%04d' "$node_id").log"
     local control_plane_env=()
     if [[ -n "$control_plane_socket_path" ]]; then
@@ -489,7 +491,7 @@ start_storage_node() {
         ARGMIN_STORAGE_NODE_SOCKET_PATH="$socket_path" \
         "${control_plane_env[@]}" \
         ARGMIN_METADATA_COMMAND_CONFLICT_DIAGNOSTICS=1 \
-        ARGMIN_DATA_DIR="$data_dir" \
+        ARGMIN_DATA_DIR="$node_process_data_dir" \
         ARGMIN_LISTEN_ADDR="$listen_addr" \
         "${server_cmd[@]}"
     local index=$((${#server_pids[@]} - 1))
