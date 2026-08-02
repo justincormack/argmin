@@ -6461,7 +6461,7 @@ enum ReissuedPendingCommandDecision {
 
 #[must_use = "ContenderDrained must restart from a fresh snapshot"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotSensitiveCommandInstall {
+enum SnapshotSensitiveInstallOutcome {
     Installed,
     ContenderDrained,
 }
@@ -10302,22 +10302,23 @@ impl StorageCluster {
 
     fn install_snapshot_sensitive_metadata_command_or_drain(
         &self,
+        _publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         effect_fence: Option<AdmittedRouteEffectFence>,
-    ) -> Result<SnapshotSensitiveCommandInstall, ObjectPgActionError> {
+    ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
         match self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
             pg_id,
             bucket,
             command,
             effect_fence,
         ) {
-            Ok(true) => Ok(SnapshotSensitiveCommandInstall::Installed),
+            Ok(true) => Ok(SnapshotSensitiveInstallOutcome::Installed),
             Ok(false)
             | Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
                 self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
-                Ok(SnapshotSensitiveCommandInstall::ContenderDrained)
+                Ok(SnapshotSensitiveInstallOutcome::ContenderDrained)
             }
             Err(error) => Err(error),
         }

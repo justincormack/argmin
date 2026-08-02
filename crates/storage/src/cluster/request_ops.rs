@@ -9957,7 +9957,7 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(&StoredObject) -> Result<(T, VersionId, PutObjectMetadataMutation), E>,
     ) -> Result<Result<T, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(PutObjectMetadataIf);
+        let publisher = crate::metadata_command::metadata_command_publisher!(PutObjectMetadataIf);
         let super::ObjectMetadataMutationEffectRoute {
             pg_id: object_pg_id,
             bucket,
@@ -10116,6 +10116,7 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher,
                 pg_id,
                 bucket,
                 &command,
@@ -10128,8 +10129,8 @@ impl super::StorageCluster {
                 }
             };
             match install {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::Installed => {}
+                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     release_bucket_write_proof!()?;
                     continue;
                 }
@@ -10600,7 +10601,8 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(DeleteSpecificObjectVersionIf);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(DeleteSpecificObjectVersionIf);
         let super::ObjectMetadataMutationEffectRoute {
             pg_id: object_pg_id,
             bucket,
@@ -10742,6 +10744,7 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher,
                 pg_id,
                 bucket,
                 &command,
@@ -10756,8 +10759,8 @@ impl super::StorageCluster {
                 }
             };
             match install {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::Installed => {}
+                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -10781,7 +10784,7 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(DeleteCurrentObjectIf);
+        let publisher = crate::metadata_command::metadata_command_publisher!(DeleteCurrentObjectIf);
         let super::ObjectMetadataMutationEffectRoute {
             pg_id: object_pg_id,
             bucket,
@@ -10944,6 +10947,7 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher,
                 pg_id,
                 bucket,
                 &command,
@@ -10958,8 +10962,8 @@ impl super::StorageCluster {
                 }
             };
             match install {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::Installed => {}
+                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -10985,7 +10989,8 @@ impl super::StorageCluster {
         owner: OwnerIdentity,
         mut action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
     ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(InsertCurrentDeleteMarkerIf);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(InsertCurrentDeleteMarkerIf);
         let super::ObjectMetadataMutationEffectRoute {
             pg_id: object_pg_id,
             bucket,
@@ -11165,6 +11170,7 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher,
                 pg_id,
                 bucket,
                 &command,
@@ -11179,8 +11185,8 @@ impl super::StorageCluster {
                 }
             };
             match install {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::Installed => {}
+                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -11268,7 +11274,8 @@ impl super::StorageCluster {
         expected_bucket_incarnation_generation: u64,
         mut should_expire: impl FnMut(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
     ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(ExpireCurrentObjectIfDue);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(ExpireCurrentObjectIfDue);
         let Some(lifecycle_context) =
             self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
         else {
@@ -11511,9 +11518,9 @@ impl super::StorageCluster {
                 }
                 _ => unreachable!("lifecycle current expiry command changed payload kind"),
             };
-            let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
-            {
+            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher, pg_id, bucket, &command, None,
+            ) {
                 Ok(install) => install,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -11523,8 +11530,8 @@ impl super::StorageCluster {
                 }
             };
             match install {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::Installed => {}
+                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -11545,7 +11552,8 @@ impl super::StorageCluster {
         expected_bucket_incarnation_generation: u64,
         mut select_versions: impl FnMut(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
     ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(DeleteNoncurrentLiveVersionsIfDue);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(DeleteNoncurrentLiveVersionsIfDue);
         let Some(lifecycle_context) =
             self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
         else {
@@ -11684,7 +11692,7 @@ impl super::StorageCluster {
                     }
                 };
                 let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                    pg_id, bucket, &command, None,
+                    publisher, pg_id, bucket, &command, None,
                 ) {
                     Ok(install) => install,
                     Err(error) => {
@@ -11695,8 +11703,8 @@ impl super::StorageCluster {
                     }
                 };
                 match install {
-                    super::SnapshotSensitiveCommandInstall::Installed => {}
-                    super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         self.release_bucket_write_proof_for_object_metadata_command(
                             &bucket_write_reservation,
                         )?;
@@ -11724,7 +11732,8 @@ impl super::StorageCluster {
         expected_bucket_incarnation_generation: u64,
         mut should_delete: impl FnMut(Option<&str>, &[StoredObject]) -> Result<bool, E>,
     ) -> Result<Result<bool, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(DeleteExpiredDeleteMarkerIfDue);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(DeleteExpiredDeleteMarkerIfDue);
         let Some(lifecycle_context) =
             self.load_bucket_lifecycle_context(bucket, expected_bucket_incarnation_generation)?
         else {
@@ -11882,9 +11891,9 @@ impl super::StorageCluster {
                     return Err(error);
                 }
             };
-            let install = match self
-                .install_snapshot_sensitive_metadata_command_or_drain(pg_id, bucket, &command, None)
-            {
+            let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher, pg_id, bucket, &command, None,
+            ) {
                 Ok(install) => install,
                 Err(error) => {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -11894,8 +11903,8 @@ impl super::StorageCluster {
                 }
             };
             match install {
-                super::SnapshotSensitiveCommandInstall::Installed => {}
-                super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::Installed => {}
+                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -13802,7 +13811,7 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, MultipartUploadCreatePreparation), E>,
     ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(CreateMultipartUpload);
+        let publisher = crate::metadata_command::metadata_command_publisher!(CreateMultipartUpload);
         enum Attempt<T> {
             Complete(CreateMultipartUploadOutcome<T>),
             Retry,
@@ -13963,6 +13972,7 @@ impl super::StorageCluster {
                 require_valid_route()?;
                 match self
                     .install_snapshot_sensitive_metadata_command_or_drain(
+                        publisher,
                         pg_id,
                         bucket,
                         &command,
@@ -13970,8 +13980,8 @@ impl super::StorageCluster {
                     )
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
-                    super::SnapshotSensitiveCommandInstall::Installed => {}
-                    super::SnapshotSensitiveCommandInstall::ContenderDrained => {
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         return Ok(Ok(Attempt::Retry));
                     }
                 }
@@ -14062,7 +14072,8 @@ impl super::StorageCluster {
             &MultipartUploadRecord,
         ) -> Result<(AuthorizedMultipartUploadRecord, T), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(CreateUploadPartStreamSession);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(CreateUploadPartStreamSession);
         let BeginUploadPartStreamSessionReq {
             bucket,
             key,
@@ -14190,11 +14201,11 @@ impl super::StorageCluster {
                 }
             };
             let install_result = self.install_snapshot_sensitive_metadata_command_or_drain(
-                pg_id, &bucket, &command, None,
+                publisher, pg_id, &bucket, &command, None,
             );
             match install_result {
-                Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
-                Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => continue,
+                Ok(super::SnapshotSensitiveInstallOutcome::Installed) => {}
+                Ok(super::SnapshotSensitiveInstallOutcome::ContenderDrained) => continue,
                 Err(error) => {
                     release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
@@ -14275,7 +14286,8 @@ impl super::StorageCluster {
         cleanup_after: Option<u64>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<SessionId, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(CreateUploadPartStreamSession);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(CreateUploadPartStreamSession);
         let super::MultipartObjectMutationEffectRoute {
             pg_id: object_pg_id,
             bucket,
@@ -14427,13 +14439,14 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher,
                 pg_id,
                 bucket,
                 &command,
                 Some(effect_fence),
             ) {
-                Ok(super::SnapshotSensitiveCommandInstall::Installed) => {}
-                Ok(super::SnapshotSensitiveCommandInstall::ContenderDrained) => {
+                Ok(super::SnapshotSensitiveInstallOutcome::Installed) => {}
+                Ok(super::SnapshotSensitiveInstallOutcome::ContenderDrained) => {
                     release_caller_bucket_write_proof!()?;
                     continue;
                 }

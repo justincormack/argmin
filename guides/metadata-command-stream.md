@@ -252,9 +252,22 @@ but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and
 restart from a fresh snapshot, not surface the conflict to the request.
 
-The multipart publisher rows above are inventoried here and in
-`scripts/check-storage-cluster-boundaries` so future publisher changes cannot
-silently bypass the snapshot-sensitive restart rules.
+The registry generates one sealed publisher token per row. The shared object-
+PG snapshot-sensitive installer accepts only tokens whose registry class is
+`SnapshotSensitive`; changing one of those publishers to another class now
+breaks its production call site at compile time. Those typed calls no longer
+participate in the temporary shell helper-count inventory, although the
+boundary check still requires their authoritative registry marker and rejects
+every direct call or function-item reference to the private-field token
+constructor. The class-specific seal is implemented only by the
+`SnapshotSensitive` registry macro arm, so a token from another class cannot
+acquire snapshot-sensitive authority inside the crate. Their installer returns
+the exhaustive, must-use
+`SnapshotSensitiveInstallOutcome`, so draining a contender cannot be mistaken
+for successful installation. Publisher paths which still call lower-level
+installers remain inventoried here and in
+`scripts/check-storage-cluster-boundaries` until their Phase 4 typed API is
+introduced.
 
 ## Multipart Command-Stream Invariants
 

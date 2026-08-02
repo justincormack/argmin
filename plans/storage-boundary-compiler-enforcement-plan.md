@@ -5250,6 +5250,41 @@ Completion:
 - the publisher and `MetadataCommandLogConflict` count inventories are removed
   from the shell check
 
+First Phase 4 slice (2026-08-02):
+
+- the authoritative registry now generates one sealed zero-sized token for
+  every publisher ID. Registry entries classified as `SnapshotSensitive`
+  alone implement `SnapshotSensitiveMetadataCommandPublisher`, so changing a
+  migrated publisher's class makes its production call site fail to compile
+  instead of relying on a shell inventory update.
+- the snapshot-sensitive trait has its own private seal, implemented only by
+  the matching registry macro arm. Publisher tokens have private fields and
+  every reference to their crate-visible macro constructor, including a
+  function-item reference, is mechanically rejected outside
+  `metadata_command_publisher!`. Another module therefore cannot grant a
+  terminal or allocator publisher snapshot-sensitive authority.
+- `metadata_command_publisher!` still supplies the canonical live-entry marker
+  used to prove that every registered publisher has one production owner, but
+  it now also returns that owner's exact typed token. The boundary checker
+  requires a marker beside every migrated typed install call, while the Rust
+  type system prevents any publisher outside the registered
+  `SnapshotSensitive` class from using that path.
+- the shared object-PG snapshot-sensitive installer now requires that token
+  and returns the exhaustive, must-use `SnapshotSensitiveInstallOutcome` with
+  `Installed` and `ContenderDrained` variants.
+  Object metadata mutation and deletion, lifecycle expiry, multipart creation,
+  and UploadPart stream-session creation now carry their registered token to
+  the installer. Their established fresh-snapshot retry and durable-effect
+  fence behavior is unchanged.
+- the transitional publisher scanner still looks through the typed helper and
+  inventories any raw installer it contains, but no longer count-checks the
+  migrated typed call sites. The guide records the compiler-enforced boundary;
+  lower-level snapshot-sensitive publishers and the four other classes remain
+  in the temporary inventory for later Phase 4 slices.
+- validation passed with the 18-test pending-install contention family, the
+  registry/guide and typed-marker tests, the storage boundary checker,
+  all-target/all-feature strict Clippy, and the full 7,948-test workspace suite.
+
 ### Phase 5 — isolate test support
 
 1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside

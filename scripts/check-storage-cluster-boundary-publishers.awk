@@ -320,6 +320,15 @@ pending_test_cfg {
     if (helper == "" || is_install_helper(current_fn)) {
         next
     }
+    # Phase 4 typed publisher APIs make the permitted helper a Rust trait
+    # choice. Keep scanning inside the typed helper for raw bypasses, but do
+    # not retain its already compiler-enforced callers in the shell inventory.
+    if (helper == "install_snapshot_sensitive_metadata_command_or_drain") {
+        if (current_publisher_id == "") {
+            print "TYPED_MISSING_MARKER\t" FILENAME ":" current_fn ":" helper
+        }
+        next
+    }
     publisher_id = current_publisher_id == "" ? "<missing>" : current_publisher_id
     print "PUBLISHER\t" FILENAME ":" current_fn ":" publisher_id ":" helper
 }

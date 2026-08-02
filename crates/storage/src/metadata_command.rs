@@ -55,9 +55,8 @@ const METADATA_COMMAND_DELETE_FINALIZED_BUCKET: u16 = 24;
 
 /// The retry/convergence contract owned by a metadata-command publisher.
 ///
-/// This is the authoritative transitional classification registry. The typed
-/// publisher APIs planned in `storage-boundary-compiler-enforcement-plan.md`
-/// will eventually make these classes part of the callable API.
+/// This registry is the authoritative publisher classification. Its entries
+/// also generate sealed typed tokens used by the callable publication APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum MetadataCommandPublisherClass {
     SnapshotSensitive,
@@ -72,6 +71,50 @@ pub(crate) struct MetadataCommandPublisherDescriptor {
     pub(crate) canonical_name: &'static str,
     pub(crate) command_kind: &'static str,
     pub(crate) class: MetadataCommandPublisherClass,
+}
+
+mod snapshot_sensitive_publisher_token_sealed {
+    pub trait Sealed {}
+}
+
+/// Compiler-visible authority to use the snapshot-sensitive install path.
+///
+/// Implementations are generated exclusively from registry entries classified
+/// as `SnapshotSensitive`; callers cannot add an implementation or reclassify
+/// an existing publisher token.
+pub(crate) trait SnapshotSensitiveMetadataCommandPublisher:
+    snapshot_sensitive_publisher_token_sealed::Sealed
+{
+}
+
+macro_rules! define_metadata_command_publisher_token {
+    ($id:ident, SnapshotSensitive) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) struct $id {
+            _private: (),
+        }
+
+        impl $id {
+            pub(crate) const fn __from_registry_marker() -> Self {
+                Self { _private: () }
+            }
+        }
+
+        impl super::snapshot_sensitive_publisher_token_sealed::Sealed for $id {}
+        impl super::SnapshotSensitiveMetadataCommandPublisher for $id {}
+    };
+    ($id:ident, $class:ident) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) struct $id {
+            _private: (),
+        }
+
+        impl $id {
+            pub(crate) const fn __from_registry_marker() -> Self {
+                Self { _private: () }
+            }
+        }
+    };
 }
 
 macro_rules! define_metadata_command_publishers {
@@ -99,6 +142,10 @@ macro_rules! define_metadata_command_publishers {
                     )+
                 }
             }
+        }
+
+        pub(crate) mod publisher {
+            $(define_metadata_command_publisher_token!($id, $class);)+
         }
     };
 }
@@ -268,10 +315,11 @@ define_metadata_command_publishers! {
 
 /// Mark a production entry point as the owner of one registered publisher ID.
 ///
-/// The boundary check mechanically pairs these markers with discovered
-/// pending-slot installation calls and rejects unregistered or dead entries.
+/// The boundary check mechanically pairs these markers with discovered raw
+/// pending-slot installation calls, requires markers beside typed install
+/// calls, and rejects unregistered or dead entries.
 macro_rules! metadata_command_publisher {
-    ($id:ident) => {
+    ($id:ident) => {{
         const _: (
             &'static [crate::metadata_command::MetadataCommandPublisherId],
             crate::metadata_command::MetadataCommandPublisherDescriptor,
@@ -279,7 +327,8 @@ macro_rules! metadata_command_publisher {
             crate::metadata_command::MetadataCommandPublisherId::ALL,
             crate::metadata_command::MetadataCommandPublisherId::$id.descriptor(),
         );
-    };
+        crate::metadata_command::publisher::$id::__from_registry_marker()
+    }};
 }
 
 pub(crate) use metadata_command_publisher;
@@ -4515,6 +4564,13 @@ mod tests {
         SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
         SSE_S3_WRAP_NONCE_LEN,
     };
+
+    #[test]
+    fn snapshot_sensitive_publisher_marker_returns_typed_registry_token() {
+        fn require_snapshot_sensitive(_publisher: impl SnapshotSensitiveMetadataCommandPublisher) {}
+
+        require_snapshot_sensitive(metadata_command_publisher!(PutObjectMetadataIf));
+    }
 
     #[test]
     fn metadata_command_publisher_registry_matches_guide() {

@@ -3233,12 +3233,48 @@ MARKER	FixtureProductionPublisher:production_publisher_after_inline_test_module
 PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:production_publisher_after_inline_test_module:FixtureProductionPublisher:try_set_pending_metadata_command_for_bucket
 MARKER	LiveFeaturePublisher:production_feature_publisher_must_remain_visible
 PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:production_feature_publisher_must_remain_visible:LiveFeaturePublisher:try_install_pending_metadata_command_for_bucket
+MARKER	TypedSnapshotPublisher:typed_snapshot_sensitive_publisher_is_not_shell_inventoried
+TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_snapshot_sensitive_publisher_without_marker_is_rejected:install_snapshot_sensitive_metadata_command_or_drain
 EOF
 )
 if [[ "$publisher_scanner_fixture" != "$expected_publisher_scanner_fixture" ]]; then
     fail_with_matches \
         "Publisher scanner fixture changed; test-only scopes must be excluded without hiding production-feature publishers" \
         "$publisher_scanner_fixture"
+fi
+
+typed_publishers_missing_markers=$(
+    printf '%s\n' "$publisher_scan_output" \
+        | awk -F '\t' '$1 == "TYPED_MISSING_MARKER" { print $2 }'
+)
+fail_with_matches \
+    "Typed metadata-command publisher calls require an authoritative registry marker" \
+    "$typed_publishers_missing_markers"
+
+publisher_token_constructor_pattern='__from_registry_marker'
+direct_publisher_token_construction=$(
+    rg -n --color=never \
+        "$publisher_token_constructor_pattern" \
+        crates/storage/src \
+        -g '*.rs' \
+        -g '!metadata_command.rs' \
+        || true
+)
+fail_with_matches \
+    "Metadata-command publisher tokens must be obtained through metadata_command_publisher!" \
+    "$direct_publisher_token_construction"
+publisher_token_constructor_fixture=$(
+    rg -n --color=never \
+        "$publisher_token_constructor_pattern" \
+        scripts/fixtures/storage-boundary-publishers/inline-test-items.rs \
+        || true
+)
+if [[ -z "$publisher_token_constructor_fixture" ]] \
+    || ! printf '%s\n' "$publisher_token_constructor_fixture" \
+        | rg -q '__from_registry_marker[[:space:]]*;'; then
+    fail_with_matches \
+        "Publisher token-construction guard fixture no longer exercises the rejected function-item reference" \
+        "$publisher_token_constructor_fixture"
 fi
 
 registered_metadata_command_publishers=$(
@@ -3295,24 +3331,15 @@ expected_pending_command_publishers=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:begin_bucket_delete_if_current_with_route_validation:BeginBucketDelete:try_set_bucket_pg_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized_with_route_validation:CompleteMultipartUploadCommitSerialized:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:create_bucket_with_config_and_load_info_with_route_validation:CreateBucket:try_set_bucket_pg_pending_command_or_retry
-1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload_inner_with_route_validation:CreateMultipartUpload:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_route_validation:CreatePutObjectStreamSession:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session_with_route_validation:CreateUploadPartStreamSession:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:delete_bucket_from_acting_set:DeleteBucketFromActingSet:try_set_bucket_pg_pending_command_or_retry
-1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if_with_route_validation:DeleteCurrentObjectIf:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due:DeleteExpiredDeleteMarkerIfDue:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:delete_noncurrent_live_versions_if_due:DeleteNoncurrentLiveVersionsIfDue:install_snapshot_sensitive_metadata_command_or_drain
-1 crates/storage/src/cluster/request_ops.rs:delete_specific_object_version_if_with_route_validation:DeleteSpecificObjectVersionIf:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:establish_multipart_completion_barrier:EstablishMultipartCompletionBarrier:try_set_bucket_pg_pending_command_or_retry
-1 crates/storage/src/cluster/request_ops.rs:expire_current_object_if_due:ExpireCurrentObjectIfDue:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:finalize_put_object_stream_with_route_validation:FinalizePutObjectStream:try_install_pending_metadata_command_for_bucket
 1 crates/storage/src/cluster/request_ops.rs:finalize_upload_part_stream_with_route_validation:FinalizeUploadPartStream:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:insert_current_delete_marker_if_with_route_validation:InsertCurrentDeleteMarkerIf:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_acl_and_load_info_with_route_validation:PutBucketAcl:try_set_bucket_control_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_property_command_and_load_info_with_route_validation:PutBucketProperty:try_set_bucket_control_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_subresource_command_and_load_info_with_route_validation:PutBucketSubresource:try_set_bucket_control_pending_command_or_retry
 1 crates/storage/src/cluster/request_ops.rs:put_bucket_versioning_and_load_info_with_route_validation:PutBucketVersioning:try_set_bucket_control_pending_command_or_retry
-1 crates/storage/src/cluster/request_ops.rs:put_object_metadata_if_with_route_validation:PutObjectMetadataIf:install_snapshot_sensitive_metadata_command_or_drain
 1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:ReclaimObjectPayloadIfUnleased:try_install_object_pg_pending_command_or_drain
 EOF
 )
