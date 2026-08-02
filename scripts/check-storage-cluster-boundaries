@@ -4005,6 +4005,17 @@ fail_with_matches \
     "Storage-node wire errors and opaque diagnostics are private to storage; use StorageNodeFailureClass" \
     "$storage_rpc_wire_error_leaks"
 
+metadata_transfer_retry_policy_leaks=$(
+    rg -n --color=never \
+        '\bStorageNodeFailureClass\b|StoreError::' \
+        crates/argmin-s3/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Live metadata-transfer retry classification is storage-owned; argmin-s3 must use PgMetadataTransferError::requires_route_refresh_retry" \
+    "$metadata_transfer_retry_policy_leaks"
+
 control_plane_client_wire_leaks=$(
     rg -n --color=never \
         '\bControlPlaneRpcFrame(Transport|Exchange|ExchangeError)\b|\bwith_frame_transport\b|\bconnect_unix_stream_until\b' \

@@ -235,9 +235,7 @@ impl From<PgPeeringReconstructionFailure> for PgMetadataTransferError {
         match error {
             PgPeeringReconstructionFailure::Store(error) => Self::Store(error),
             PgPeeringReconstructionFailure::Apply(error) => Self::Apply(error),
-            PgPeeringReconstructionFailure::Reconstruction(error) => Self::Reconstruction {
-                message: error.to_string(),
-            },
+            PgPeeringReconstructionFailure::Reconstruction(error) => Self::reconstruction(error),
         }
     }
 }

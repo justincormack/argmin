@@ -6662,9 +6662,7 @@ impl StorageCluster {
         destination_epoch: ClusterEpoch,
     ) -> Result<PgMetadataProof, PgMetadataTransferError> {
         let commands = rebase_pg_metadata_transfer_artifact_commands(artifact, destination_epoch)
-            .map_err(|error| PgMetadataTransferError::Reconstruction {
-            message: error.to_string(),
-        })?;
+            .map_err(PgMetadataTransferError::reconstruction)?;
         Ok(metadata_transfer_destination_proof(
             artifact,
             &commands,

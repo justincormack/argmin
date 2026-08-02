@@ -1288,6 +1288,20 @@ Environment-only legacy-local bootstrap still uses its distinct uncertified loca
 Live topology transitions, metadata-transfer orchestration, and the remaining static
 control-plane administration and transport-bootstrap orchestration are pending parts of item 4.
 
+The twenty-sixth bounded slice starts the live-topology portion of implementation-order item 4 by
+moving metadata-transfer route-refresh classification into `storage`. `argmin-s3` no longer
+destructures `StoreError`, recursively unwraps shard failures, interprets storage-node failure
+classes, or recognizes reconstruction failures from rendered message fragments. The
+storage-owned `PgMetadataTransferError::requires_route_refresh_retry` operation exhaustively
+classifies its public transfer-error variants, uses the private nested store/RPC representations,
+and receives a typed reconstruction-specific route-refresh variant at the owner boundary.
+Owner-local tests pin local route expiry/staleness, nested shard failures, apply failures, every
+semantic storage-node class, and stale versus permanent reconstruction outcomes. Cross-crate
+retry-loop tests inject only an opaque owner-provided retry failure, and the repository boundary
+check rejects `StoreError` matching or storage-node failure classification in `argmin-s3`. The
+route/proof state machine, runtime-map reconstruction, and transfer artifact orchestration remain
+pending behind the planned storage-owned administration facade.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1560,12 +1574,20 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     are private. Durable reclaim/finalizer claims, roots, records, attempt outcomes, and structured
     debug snapshots are also private; HTTP receives an owner-rendered opaque diagnostic and
     cross-crate composition tests use test-only DTOs and logical observations.
-11. **Pending:** replace server-core's data-PG, placement-epoch, EC-placement, shard-location, and
-    historical-route handling with opaque storage-owned payload handles and logical I/O/lease
-    operations.
-12. **Pending:** move PG topology transitions and live metadata-transfer orchestration behind a
-    storage-owned control-plane/admin facade; move static storage-topology interpretation behind a
-    storage-owned builder without transferring outer manifest ownership.
+11. **Complete:** replace server-core's data-PG, placement-epoch, EC-placement, shard-location,
+    and historical-route handling with opaque storage-owned payload handles and logical
+    I/O/lease operations. Buffered/direct PutObject, streaming PutObject and UploadPart,
+    multipart completion, retained object reads, and multipart-manifest reads now cross the
+    production boundary through subject-bound opaque capabilities or logical projections.
+    Physical placement records and mutation APIs are private to `storage`; the remaining
+    feature-gated projections are narrow, read-only test facilities for cross-crate behavioral
+    assertions, while impossible physical-state tests are owner-local.
+12. **In progress:** deterministic static storage-placement interpretation and certified initial
+    topology/bootstrap assembly are storage-owned without transferring outer manifest ownership.
+    Metadata-transfer retry classification is now storage-owned and typed. The remaining work is
+    to move live PG topology transitions, the transfer state machine, runtime-map reconstruction,
+    and route/proof inspection behind a storage-owned control-plane/admin facade, followed by the
+    residual static control-plane administration and transport-bootstrap orchestration.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

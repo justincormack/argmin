@@ -76,7 +76,7 @@ use storage::{
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
     PgMetadataTransferArtifact, PgMetadataTransferError, PgState, RouteMapValidity,
     StaticInitialControlPlaneTopology, StorageCluster, StorageClusterRouteHandle,
-    StorageClusterRuntimeMapHandle, StorageNodeFailureClass, StoreError,
+    StorageClusterRuntimeMapHandle,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
@@ -1705,7 +1705,7 @@ fn retry_pg_metadata_transfer_export<T>(
     loop {
         match export(&source_cluster) {
             Ok(artifact) => return Ok(artifact),
-            Err(error) if metadata_transfer_error_is_transient_route_refresh(&error) => {
+            Err(error) if error.requires_route_refresh_retry() => {
                 match refresh_pg_metadata_transfer_export_route(control_plane, context)? {
                     MetadataTransferExportRouteRefresh::Retry(cluster) => {
                         source_cluster = cluster;
@@ -1856,7 +1856,7 @@ fn retry_pg_metadata_transfer_import(
     loop {
         match import(&destination_cluster) {
             Ok(proof) => return Ok(proof),
-            Err(error) if metadata_transfer_error_is_transient_route_refresh(&error) => {
+            Err(error) if error.requires_route_refresh_retry() => {
                 match refresh_pg_metadata_transfer_import_route(control_plane, context)? {
                     MetadataTransferImportRouteRefresh::Completed => {
                         return Ok(context.imported_proof);
@@ -2006,54 +2006,6 @@ fn control_plane_metadata_transfer_observation_error_is_retryable(
     error: &ControlPlaneError,
 ) -> bool {
     error.is_retryable_runtime_map_observation_error()
-}
-
-fn metadata_transfer_error_is_transient_route_refresh(error: &PgMetadataTransferError) -> bool {
-    match error {
-        PgMetadataTransferError::Store(store_error) => {
-            store_error_is_transient_route_refresh_for_metadata_transfer(store_error)
-        }
-        PgMetadataTransferError::Apply(storage::BucketSnapshotLoadError::Store(store_error)) => {
-            store_error_is_transient_route_refresh_for_metadata_transfer(store_error)
-        }
-        PgMetadataTransferError::Reconstruction { message } => {
-            message.starts_with("PG peering node ")
-                && message.contains(" reported epoch ")
-                && message.contains(", expected ")
-        }
-        _ => false,
-    }
-}
-
-fn store_error_is_transient_route_refresh_for_metadata_transfer(error: &StoreError) -> bool {
-    if error
-        .storage_node_failure_class()
-        .is_some_and(storage_node_failure_refreshes_metadata_transfer_route)
-    {
-        return true;
-    }
-    match error {
-        StoreError::RouteMapExpired { .. }
-        | StoreError::StaleMetadataOperation { .. }
-        | StoreError::StaleMetadataRoute { .. }
-        | StoreError::StaleShardLocation { .. } => true,
-        StoreError::ShardStore { source, .. } => {
-            store_error_is_transient_route_refresh_for_metadata_transfer(source)
-        }
-        _ => false,
-    }
-}
-
-fn storage_node_failure_refreshes_metadata_transfer_route(
-    failure: StorageNodeFailureClass,
-) -> bool {
-    match failure {
-        StorageNodeFailureClass::ShardLocationStale
-        | StorageNodeFailureClass::MetadataCommandContention
-        | StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
-        | StorageNodeFailureClass::TransportInterrupted => true,
-        StorageNodeFailureClass::PgRouteUnavailable => false,
-    }
 }
 
 fn control_plane_runtime_map_ready(
@@ -13940,47 +13892,6 @@ mod tests {
     }
 
     #[test]
-    fn metadata_transfer_retry_selects_storage_failure_classes() {
-        for failure in [
-            StorageNodeFailureClass::ShardLocationStale,
-            StorageNodeFailureClass::MetadataCommandContention,
-            StorageNodeFailureClass::MetadataTransferHistoricalRouteActive,
-            StorageNodeFailureClass::TransportInterrupted,
-        ] {
-            assert!(storage_node_failure_refreshes_metadata_transfer_route(
-                failure
-            ));
-        }
-        assert!(!storage_node_failure_refreshes_metadata_transfer_route(
-            StorageNodeFailureClass::PgRouteUnavailable
-        ));
-    }
-
-    #[test]
-    fn metadata_transfer_retry_treats_expired_route_map_as_transient() {
-        let error = PgMetadataTransferError::Store(StoreError::RouteMapExpired {
-            cluster_epoch: ClusterEpoch::new(31).unwrap(),
-            valid_until_ms: 2_000,
-            now_ms: 2_001,
-        });
-
-        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
-    }
-
-    #[test]
-    fn metadata_transfer_retry_treats_apply_route_expiry_as_transient() {
-        let error = PgMetadataTransferError::Apply(storage::BucketSnapshotLoadError::Store(
-            StoreError::RouteMapExpired {
-                cluster_epoch: ClusterEpoch::new(32).unwrap(),
-                valid_until_ms: 3_000,
-                now_ms: 3_001,
-            },
-        ));
-
-        assert!(metadata_transfer_error_is_transient_route_refresh(&error));
-    }
-
-    #[test]
     fn metadata_transfer_retries_refresh_expired_source_and_destination_routes() {
         let tmp = short_unix_socket_test_dir("metadata-transfer-route-refresh");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -14101,13 +14012,7 @@ mod tests {
             |cluster| {
                 export_attempts += 1;
                 if export_attempts == 1 {
-                    return Err(PgMetadataTransferError::Store(
-                        StoreError::RouteMapExpired {
-                            cluster_epoch: fenced_runtime.cluster_epoch(),
-                            valid_until_ms: 1,
-                            now_ms: 2,
-                        },
-                    ));
+                    return Err(PgMetadataTransferError::test_route_refresh_required());
                 }
                 assert!(
                     !std::ptr::eq(cluster, initial_source_cluster_ptr),
@@ -14210,13 +14115,7 @@ mod tests {
             retry_pg_metadata_transfer_import(&authority, initial_cluster, &context, |cluster| {
                 attempts += 1;
                 if attempts == 1 {
-                    return Err(PgMetadataTransferError::Store(
-                        StoreError::RouteMapExpired {
-                            cluster_epoch: destination_epoch,
-                            valid_until_ms: 1,
-                            now_ms: 2,
-                        },
-                    ));
+                    return Err(PgMetadataTransferError::test_route_refresh_required());
                 }
                 assert!(
                     !std::ptr::eq(cluster, initial_cluster_ptr),

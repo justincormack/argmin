@@ -1267,6 +1267,81 @@ pub enum PgMetadataTransferError {
     Apply(#[from] BucketSnapshotLoadError),
     #[error("PG metadata transfer reconstruction failed: {message}")]
     Reconstruction { message: String },
+    #[error("PG metadata transfer route changed during reconstruction: {message}")]
+    RouteRefreshRequired { message: String },
+}
+
+impl PgMetadataTransferError {
+    pub(crate) fn reconstruction(error: crate::peering::PgPeeringReconstructionError) -> Self {
+        let route_refresh_required = matches!(
+            error,
+            crate::peering::PgPeeringReconstructionError::StaleReplicaEpoch { .. }
+        );
+        let message = error.to_string();
+        if route_refresh_required {
+            Self::RouteRefreshRequired { message }
+        } else {
+            Self::Reconstruction { message }
+        }
+    }
+
+    /// Report whether retrying this transfer requires a fresh authoritative
+    /// route. This policy is storage-owned because it depends on private local,
+    /// RPC, reconstruction, and nested apply failure representations.
+    #[must_use]
+    pub fn requires_route_refresh_retry(&self) -> bool {
+        match self {
+            Self::Store(error) => store_error_requires_metadata_transfer_route_refresh(error),
+            Self::Apply(BucketSnapshotLoadError::Store(error)) => {
+                store_error_requires_metadata_transfer_route_refresh(error)
+            }
+            Self::Apply(BucketSnapshotLoadError::Metadata(_)) | Self::Reconstruction { .. } => {
+                false
+            }
+            Self::RouteRefreshRequired { .. } => true,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn test_route_refresh_required() -> Self {
+        Self::Store(StoreError::RouteMapExpired {
+            cluster_epoch: ClusterEpoch::INITIAL,
+            valid_until_ms: 1,
+            now_ms: 2,
+        })
+    }
+}
+
+fn store_error_requires_metadata_transfer_route_refresh(error: &StoreError) -> bool {
+    if error
+        .storage_node_failure_class()
+        .is_some_and(storage_node_failure_requires_metadata_transfer_route_refresh)
+    {
+        return true;
+    }
+    match error {
+        StoreError::RouteMapExpired { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleShardLocation { .. } => true,
+        StoreError::ShardStore { source, .. } => {
+            store_error_requires_metadata_transfer_route_refresh(source)
+        }
+        _ => false,
+    }
+}
+
+fn storage_node_failure_requires_metadata_transfer_route_refresh(
+    failure: StorageNodeFailureClass,
+) -> bool {
+    match failure {
+        StorageNodeFailureClass::ShardLocationStale
+        | StorageNodeFailureClass::MetadataCommandContention
+        | StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
+        | StorageNodeFailureClass::TransportInterrupted => true,
+        StorageNodeFailureClass::PgRouteUnavailable => false,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1396,6 +1471,105 @@ mod tests {
             failure.storage_node_failure_class(),
             Some(StorageNodeFailureClass::TransportInterrupted)
         );
+    }
+
+    #[test]
+    fn metadata_transfer_route_refresh_policy_is_storage_owned_and_exhaustive() {
+        for code in [
+            StorageRpcErrorCode::StaleShardLocation,
+            StorageRpcErrorCode::MetadataCommandContention,
+            StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
+            StorageRpcErrorCode::TransportTimeout,
+            StorageRpcErrorCode::TransportClosed,
+        ] {
+            assert!(
+                PgMetadataTransferError::Store(remote_failure(code)).requires_route_refresh_retry(),
+                "{code:?} should refresh the metadata-transfer route"
+            );
+        }
+        for code in [
+            StorageRpcErrorCode::InactivePgRoute,
+            StorageRpcErrorCode::NonActingSetAccess,
+            StorageRpcErrorCode::WrongClusterEpoch,
+            StorageRpcErrorCode::Internal,
+        ] {
+            assert!(
+                !PgMetadataTransferError::Store(remote_failure(code))
+                    .requires_route_refresh_retry(),
+                "{code:?} must not select route-refresh retry"
+            );
+        }
+
+        for error in [
+            StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            },
+            StoreError::StaleMetadataOperation {
+                pg_id: 2,
+                operation_epoch: ClusterEpoch::INITIAL,
+                current_epoch: ClusterEpoch::new(2).unwrap(),
+            },
+            StoreError::StaleMetadataRoute {
+                pg_id: 2,
+                route_epoch: ClusterEpoch::INITIAL,
+                current_epoch: ClusterEpoch::new(2).unwrap(),
+            },
+            StoreError::StaleShardLocation {
+                node_id: 1,
+                pg_id: 2,
+                location_epoch: ClusterEpoch::INITIAL,
+                current_epoch: ClusterEpoch::new(2).unwrap(),
+            },
+        ] {
+            assert!(PgMetadataTransferError::Store(error).requires_route_refresh_retry());
+        }
+
+        let nested = StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            source: Box::new(StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            }),
+        };
+        assert!(PgMetadataTransferError::Store(nested).requires_route_refresh_retry());
+
+        let applied = PgMetadataTransferError::Apply(BucketSnapshotLoadError::Store(
+            StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            },
+        ));
+        assert!(applied.requires_route_refresh_retry());
+
+        let stale_reconstruction = PgMetadataTransferError::reconstruction(
+            crate::peering::PgPeeringReconstructionError::StaleReplicaEpoch {
+                node_id: crate::NodeId::new(1),
+                replica_epoch: ClusterEpoch::INITIAL,
+                cluster_epoch: ClusterEpoch::new(2).unwrap(),
+            },
+        );
+        assert!(matches!(
+            stale_reconstruction,
+            PgMetadataTransferError::RouteRefreshRequired { .. }
+        ));
+        assert!(stale_reconstruction.requires_route_refresh_retry());
+
+        let permanent_reconstruction = PgMetadataTransferError::reconstruction(
+            crate::peering::PgPeeringReconstructionError::PendingMetadataCommand {
+                node_id: crate::NodeId::new(1),
+            },
+        );
+        assert!(matches!(
+            permanent_reconstruction,
+            PgMetadataTransferError::Reconstruction { .. }
+        ));
+        assert!(!permanent_reconstruction.requires_route_refresh_retry());
     }
 
     #[test]
