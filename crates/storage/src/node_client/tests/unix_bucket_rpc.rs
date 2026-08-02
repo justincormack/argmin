@@ -1,17 +1,22 @@
 use super::*;
 use crate::control_plane::{PendingMetadataCommandObservation, PendingMetadataCommandRecovery};
 use crate::storage_rpc::{
+    encode_aborting_multipart_upload_buckets_response, encode_bucket_delete_begin_roots_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
-    encode_bucket_execution_generations_response, encode_bucket_fast_path_identities_response,
-    encode_bucket_info_outcome_response, encode_bucket_list_response,
-    encode_bucket_snapshot_pair_response, encode_bucket_snapshot_response,
-    encode_bucket_write_reservations_list_response,
+    encode_bucket_delete_finalize_roots_response, encode_bucket_execution_generations_response,
+    encode_bucket_fast_path_identities_response, encode_bucket_info_outcome_response,
+    encode_bucket_list_response, encode_bucket_snapshot_pair_response,
+    encode_bucket_snapshot_response, encode_bucket_write_reservations_list_response,
+    encode_lifecycle_sweep_buckets_response, encode_lifecycle_sweep_roots_response,
+    StorageRpcAbortingMultipartUploadBucketsResponse, StorageRpcBucketDeleteBeginRootsResponse,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
-    StorageRpcBucketExecutionGenerationsResponse, StorageRpcBucketFastPathIdentitiesResponse,
-    StorageRpcBucketInfoOutcome, StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListResponse,
+    StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketExecutionGenerationsResponse,
+    StorageRpcBucketFastPathIdentitiesResponse, StorageRpcBucketInfoOutcome,
+    StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListResponse,
     StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
     StorageRpcBucketSnapshotPairResponse, StorageRpcBucketSnapshotResponse,
-    StorageRpcBucketWriteReservationsListResponse,
+    StorageRpcBucketWriteReservationsListResponse, StorageRpcLifecycleSweepBucketsResponse,
+    StorageRpcLifecycleSweepRootsResponse,
 };
 
 #[derive(Clone, Copy)]
@@ -120,6 +125,18 @@ fn bucket_for_pg(topology: &PgTopology, target_pg: u32, prefix: &str) -> BucketN
         .map(|suffix| crate::tests::bucket_name(format!("{prefix}-{suffix}")))
         .find(|bucket| topology.bucket_pg_for(bucket) == target_pg)
         .expect("test topology must route a generated bucket to the target PG")
+}
+
+fn key_for_object_pg(
+    topology: &PgTopology,
+    bucket: &BucketName,
+    target_pg: u32,
+    prefix: &str,
+) -> ObjectKey {
+    (0..10_000)
+        .map(|suffix| crate::tests::object_key(format!("{prefix}-{suffix}")))
+        .find(|key| topology.object_pg_for(bucket, key) == target_pg)
+        .expect("test topology must route a generated key to the target PG")
 }
 
 fn bucket_metadata_scan_route<'a>(
@@ -657,6 +674,310 @@ fn bucket_write_reservation_route<'a>(
     client
         .open_bucket_write_reservation_route(route_cluster_epoch, pg_id, bucket)
         .unwrap()
+}
+
+fn bucket_write_reservation_scan_route<'a>(
+    client: &'a UnixStorageNodeClient,
+    route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+) -> Box<dyn BucketWriteReservationScanRoute + 'a> {
+    client
+        .open_bucket_write_reservation_scan_route(route_cluster_epoch, pg_id)
+        .unwrap()
+}
+
+#[test]
+fn unix_bucket_write_reservation_scan_route_rejects_foreign_epoch_and_marker_before_rpc() {
+    let tmp = test_util::tempdir();
+    let topology = Arc::new(PgTopology::new(&[0, 1]).unwrap());
+    let foreign_bucket = bucket_for_pg(&topology, 1, "write-scan-foreign-marker");
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        tmp.path().join("unused.sock"),
+    )
+    .with_pg_topology(Arc::clone(&topology));
+    let requests_started = rpc_requests_started_for_test(&client);
+
+    let route = bucket_write_reservation_scan_route(
+        &client,
+        ClusterEpoch::new(1).unwrap(),
+        bucket_pg_id_for_test(0),
+    );
+    assert_bucket_metadata_payload_decode(
+        route
+            .get_bucket_delete_begin_roots(10, Some(&foreign_bucket), 16)
+            .unwrap_err(),
+    );
+    drop(route);
+
+    match client.open_bucket_write_reservation_scan_route(
+        ClusterEpoch::new(2).unwrap(),
+        bucket_pg_id_for_test(0),
+    ) {
+        Err(BucketSnapshotLoadError::Store(StoreError::StaleMetadataOperation { .. })) => {}
+        Err(error) => panic!("unexpected foreign-epoch route error: {error}"),
+        Ok(_) => panic!("foreign epoch opened a bucket write reservation scan route"),
+    }
+    assert_eq!(rpc_requests_started_for_test(&client), requests_started);
+}
+
+#[test]
+fn unix_bucket_write_reservation_scan_route_rejects_foreign_response_subjects() {
+    let tmp = test_util::tempdir();
+    let mut config = test_config(&tmp);
+    config.pg_ids = vec![0, 1];
+    let topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
+    let foreign_bucket = bucket_for_pg(&topology, 1, "write-scan-foreign-response");
+    let foreign_key = key_for_object_pg(&topology, &foreign_bucket, 1, "foreign-key");
+    let foreign_info = test_bucket_info(
+        foreign_bucket.clone(),
+        &crate::CanonicalUserId::from_principal("owner"),
+        &crate::AclGrants::default(),
+    );
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let server_thread = thread::spawn(move || {
+        for (expected_kind, payload) in [
+            (
+                StorageRpcMessageKind::BucketDeleteFinalizeRoots,
+                encode_bucket_delete_finalize_roots_response(
+                    &StorageRpcBucketDeleteFinalizeRootsResponse {
+                        roots: vec![BucketDeleteFinalizeRoot {
+                            bucket: foreign_bucket.clone(),
+                            bucket_incarnation_generation: 3,
+                        }],
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::BucketDeleteBeginRoots,
+                encode_bucket_delete_begin_roots_response(
+                    &StorageRpcBucketDeleteBeginRootsResponse {
+                        roots: vec![BucketDeleteBeginRoot {
+                            bucket: foreign_bucket.clone(),
+                            bucket_execution_generation: 2,
+                            bucket_incarnation_generation: 3,
+                        }],
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepRoots,
+                encode_lifecycle_sweep_roots_response(&StorageRpcLifecycleSweepRootsResponse {
+                    roots: vec![LifecycleSweepRoot {
+                        bucket: foreign_bucket.clone(),
+                        bucket_incarnation_generation: 3,
+                        source: crate::types::LifecycleSweepRootSource::LifecycleConfig,
+                    }],
+                })
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepBucketsList,
+                encode_lifecycle_sweep_buckets_response(&StorageRpcLifecycleSweepBucketsResponse {
+                    buckets: vec![foreign_info],
+                })
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList,
+                encode_aborting_multipart_upload_buckets_response(
+                    &StorageRpcAbortingMultipartUploadBucketsResponse {
+                        witnesses: vec![AbortingMultipartUploadBucketWitness {
+                            bucket: foreign_bucket,
+                            key: foreign_key,
+                        }],
+                    },
+                )
+                .unwrap(),
+            ),
+        ] {
+            let (mut connection, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut connection).unwrap();
+            assert_eq!(request.kind, expected_kind);
+            write_storage_rpc_frame_to(
+                &mut connection,
+                &StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                },
+            )
+            .unwrap();
+        }
+    });
+
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_pg_topology(topology);
+    let route = bucket_write_reservation_scan_route(
+        &client,
+        config.cluster_epoch,
+        bucket_pg_id_for_test(0),
+    );
+    assert_bucket_metadata_payload_decode(
+        route.get_bucket_delete_finalize_roots(10, 16).unwrap_err(),
+    );
+    assert_bucket_metadata_payload_decode(
+        route
+            .get_bucket_delete_begin_roots(10, None, 16)
+            .unwrap_err(),
+    );
+    assert_bucket_metadata_payload_decode(route.get_lifecycle_sweep_roots(10, 16).unwrap_err());
+    assert_bucket_metadata_payload_decode(route.list_buckets_with_lifecycle().unwrap_err());
+    let object_route = client
+        .open_object_mutation_scan_metadata_route(
+            config.cluster_epoch,
+            crate::ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap();
+    assert!(matches!(
+        object_route
+            .list_aborting_multipart_upload_bucket_witnesses()
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    server_thread.join().unwrap();
+}
+
+#[test]
+fn unix_bucket_write_reservation_scan_route_rejects_duplicate_or_unordered_responses() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
+    let bucket = bucket_for_pg(&topology, 0, "write-scan-duplicate-response");
+    let bucket_info = test_bucket_info(
+        bucket.clone(),
+        &crate::CanonicalUserId::from_principal("owner"),
+        &crate::AclGrants::default(),
+    );
+    let finalize_root = BucketDeleteFinalizeRoot {
+        bucket: bucket.clone(),
+        bucket_incarnation_generation: 3,
+    };
+    let begin_root = BucketDeleteBeginRoot {
+        bucket: bucket.clone(),
+        bucket_execution_generation: 2,
+        bucket_incarnation_generation: 3,
+    };
+    let lifecycle_root = LifecycleSweepRoot {
+        bucket: bucket.clone(),
+        bucket_incarnation_generation: 3,
+        source: crate::types::LifecycleSweepRootSource::LifecycleConfig,
+    };
+    let witness = AbortingMultipartUploadBucketWitness {
+        bucket: bucket.clone(),
+        key: key_for_object_pg(&topology, &bucket, 0, "duplicate-key"),
+    };
+
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&config.socket_path).unwrap();
+    let server_thread = thread::spawn(move || {
+        for (expected_kind, payload) in [
+            (
+                StorageRpcMessageKind::BucketDeleteFinalizeRoots,
+                encode_bucket_delete_finalize_roots_response(
+                    &StorageRpcBucketDeleteFinalizeRootsResponse {
+                        roots: vec![finalize_root.clone(), finalize_root],
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::BucketDeleteBeginRoots,
+                encode_bucket_delete_begin_roots_response(
+                    &StorageRpcBucketDeleteBeginRootsResponse {
+                        roots: vec![begin_root.clone(), begin_root],
+                    },
+                )
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepRoots,
+                encode_lifecycle_sweep_roots_response(&StorageRpcLifecycleSweepRootsResponse {
+                    roots: vec![lifecycle_root.clone(), lifecycle_root],
+                })
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::LifecycleSweepBucketsList,
+                encode_lifecycle_sweep_buckets_response(&StorageRpcLifecycleSweepBucketsResponse {
+                    buckets: vec![bucket_info.clone(), bucket_info],
+                })
+                .unwrap(),
+            ),
+            (
+                StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList,
+                encode_aborting_multipart_upload_buckets_response(
+                    &StorageRpcAbortingMultipartUploadBucketsResponse {
+                        witnesses: vec![witness.clone(), witness],
+                    },
+                )
+                .unwrap(),
+            ),
+        ] {
+            let (mut connection, _) = listener.accept().unwrap();
+            let request = read_storage_rpc_frame_from(&mut connection).unwrap();
+            assert_eq!(request.kind, expected_kind);
+            write_storage_rpc_frame_to(
+                &mut connection,
+                &StorageRpcFrame {
+                    request_id: request.request_id,
+                    kind: request.kind,
+                    payload: encode_storage_rpc_success_response(&payload),
+                },
+            )
+            .unwrap();
+        }
+    });
+
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    )
+    .with_pg_topology(topology);
+    let route = bucket_write_reservation_scan_route(
+        &client,
+        config.cluster_epoch,
+        bucket_pg_id_for_test(0),
+    );
+    assert_bucket_metadata_payload_decode(
+        route.get_bucket_delete_finalize_roots(10, 16).unwrap_err(),
+    );
+    assert_bucket_metadata_payload_decode(
+        route
+            .get_bucket_delete_begin_roots(10, None, 16)
+            .unwrap_err(),
+    );
+    assert_bucket_metadata_payload_decode(route.get_lifecycle_sweep_roots(10, 16).unwrap_err());
+    assert_bucket_metadata_payload_decode(route.list_buckets_with_lifecycle().unwrap_err());
+    let object_route = client
+        .open_object_mutation_scan_metadata_route(
+            config.cluster_epoch,
+            crate::ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap();
+    assert!(matches!(
+        object_route
+            .list_aborting_multipart_upload_bucket_witnesses()
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+    server_thread.join().unwrap();
 }
 
 #[test]
@@ -2429,6 +2750,11 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         bucket_pg_id_for_test(0),
         &bucket,
     );
+    let scan_route = bucket_write_reservation_scan_route(
+        &client,
+        ClusterEpoch::new(1).unwrap(),
+        bucket_pg_id_for_test(0),
+    );
 
     let reservations = route.durable_bucket_write_reservations().unwrap();
     assert_eq!(reservations.len(), 1);
@@ -2476,14 +2802,9 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
             120,
         )
         .unwrap();
-    let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
-        &client,
-        bucket_pg_id_for_test(0),
-        90,
-        None,
-        16,
-    )
-    .unwrap();
+    let begin_roots = scan_route
+        .get_bucket_delete_begin_roots(90, None, 16)
+        .unwrap();
     assert!(begin_roots.is_empty());
     retained_bucket_write_route(&client, bucket_pg_id_for_test(0), &bucket)
         .clear_durable_bucket_write_drain(&live_begin_drain)
@@ -2497,14 +2818,9 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
             80,
         )
         .unwrap();
-    let begin_roots = BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
-        &client,
-        bucket_pg_id_for_test(0),
-        90,
-        None,
-        16,
-    )
-    .unwrap();
+    let begin_roots = scan_route
+        .get_bucket_delete_begin_roots(90, None, 16)
+        .unwrap();
     assert_eq!(begin_roots.len(), 1);
     assert_eq!(begin_roots[0].bucket, bucket);
     retained_bucket_write_route(&client, bucket_pg_id_for_test(0), &bucket)
@@ -2568,13 +2884,7 @@ fn unix_bucket_write_reservation_client_routes_drain_and_finalize_coordination()
         .unwrap()
         .is_none());
 
-    let roots = BucketWriteReservationNodeClient::get_bucket_delete_finalize_roots(
-        &client,
-        bucket_pg_id_for_test(0),
-        90,
-        16,
-    )
-    .unwrap();
+    let roots = scan_route.get_bucket_delete_finalize_roots(90, 16).unwrap();
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].bucket, finalize_bucket);
 
@@ -2588,6 +2898,8 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
     let tmp = test_util::tempdir();
     let config = test_config(&tmp);
     let bucket = crate::tests::bucket_name("bucket-lifecycle-sweep-rpc");
+    let aborting_key = crate::tests::object_key("aborting-upload");
+    let aborting_upload_id = crate::tests::multipart_upload_id("lifecycle-aborting-upload");
     let owner = crate::CanonicalUserId::from_principal("owner");
     let bucket_incarnation_generation = {
         let node = SharedStorageNode::open_with_default_ec_shape(
@@ -2617,6 +2929,27 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
             },
         )
         .unwrap();
+        PgMetadataStore::create_multipart_upload(
+            &*pg,
+            &CreateMultipartUploadReq {
+                upload_id: aborting_upload_id.clone(),
+                bucket: bucket.clone(),
+                key: aborting_key.clone(),
+                tags: None,
+                metadata_blob: SerializedMetadataBlob::default(),
+                system_metadata_blob: SerializedSystemMetadataBlob::default(),
+                initiator: OwnerIdentity::from_principal("owner"),
+                owner: OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            },
+        )
+        .unwrap();
+        PgMetadataStore::set_upload_state(&*pg, &aborting_upload_id, UploadState::Aborting)
+            .unwrap();
         let generation = PgMetadataStore::head_bucket_raw(&*pg, &bucket)
             .unwrap()
             .bucket_incarnation_generation;
@@ -2625,9 +2958,9 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
     };
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    // One connection for each lifecycle RPC below: list, roots, acquire,
-    // heartbeat, record-error, and release.
-    let server_threads: Vec<_> = (0..6)
+    // One connection for each lifecycle RPC below: bucket list, aborting-upload
+    // list, roots, acquire, heartbeat, record-error, and release.
+    let server_threads: Vec<_> = (0..7)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -2645,23 +2978,34 @@ fn unix_bucket_write_reservation_client_routes_lifecycle_sweep_coordination() {
         bucket_pg_id_for_test(0),
         &bucket,
     );
-
-    let buckets = BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(
+    let scan_route = bucket_write_reservation_scan_route(
         &client,
+        ClusterEpoch::new(1).unwrap(),
         bucket_pg_id_for_test(0),
-    )
-    .unwrap();
-    assert_eq!(buckets.lifecycle_buckets.len(), 1);
-    assert_eq!(buckets.lifecycle_buckets[0].name, bucket);
-    assert!(buckets.aborting_buckets.is_empty());
+    );
 
-    let roots = BucketWriteReservationNodeClient::get_lifecycle_sweep_roots(
-        &client,
-        bucket_pg_id_for_test(0),
-        10,
-        16,
-    )
-    .unwrap();
+    let buckets = scan_route.list_buckets_with_lifecycle().unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].name, bucket);
+
+    let object_route = client
+        .open_object_mutation_scan_metadata_route(
+            config.cluster_epoch,
+            ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap();
+    let witnesses = object_route
+        .list_aborting_multipart_upload_bucket_witnesses()
+        .unwrap();
+    assert_eq!(
+        witnesses,
+        vec![AbortingMultipartUploadBucketWitness {
+            bucket: bucket.clone(),
+            key: aborting_key,
+        }]
+    );
+
+    let roots = scan_route.get_lifecycle_sweep_roots(10, 16).unwrap();
     assert_eq!(roots.len(), 1);
     assert_eq!(roots[0].bucket, bucket);
     assert_eq!(

@@ -6063,40 +6063,45 @@ impl PgMetadataStore for PgStore {
         Ok(buckets)
     }
 
-    fn list_buckets_with_aborting_multipart_uploads(
+    fn list_aborting_multipart_upload_bucket_witnesses(
         &self,
-    ) -> Result<Vec<BucketName>, MetadataError> {
+    ) -> Result<Vec<crate::types::AbortingMultipartUploadBucketWitness>, MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "PgStore::list_buckets_with_aborting_multipart_uploads",
+            "PgStore::list_aborting_multipart_upload_bucket_witnesses",
             "pg_id={}",
             self.pg_id
         );
         let mut stmt = self
             .conn
             .prepare_cached(
-                "SELECT DISTINCT bucket FROM multipart_uploads \
-                 WHERE state = ?1 ORDER BY bucket ASC",
+                "SELECT bucket, MIN(key) FROM multipart_uploads \
+                 WHERE state = ?1 GROUP BY bucket ORDER BY bucket ASC",
             )
             .map_err(|e| MetadataError::Db {
-                context: "prepare list buckets with aborting multipart uploads",
+                context: "prepare list aborting multipart upload bucket witnesses",
                 source: e.into(),
             })?;
         let rows = stmt
-            .query_map(params![UploadState::Aborting as u8], |row| row.get(0))
+            .query_map(params![UploadState::Aborting as u8], |row| {
+                Ok(crate::types::AbortingMultipartUploadBucketWitness {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                })
+            })
             .map_err(|e| MetadataError::Db {
-                context: "list buckets with aborting multipart uploads query",
+                context: "list aborting multipart upload bucket witnesses query",
                 source: e.into(),
             })?;
 
-        let mut buckets = Vec::new();
+        let mut witnesses = Vec::new();
         for row in rows {
-            buckets.push(row.map_err(|e| MetadataError::Db {
-                context: "list buckets with aborting multipart uploads row",
+            witnesses.push(row.map_err(|e| MetadataError::Db {
+                context: "list aborting multipart upload bucket witnesses row",
                 source: e.into(),
             })?);
         }
-        Ok(buckets)
+        Ok(witnesses)
     }
 
     #[cfg(test)]

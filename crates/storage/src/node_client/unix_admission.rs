@@ -500,6 +500,7 @@ pub(crate) fn storage_rpc_admission_class(
         StorageRpcMessageKind::ShardScavengerListFiles
         | StorageRpcMessageKind::BucketWriteReservationsList
         | StorageRpcMessageKind::LifecycleSweepBucketsList
+        | StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList
         | StorageRpcMessageKind::ObjectLifecycleVersionListLoad
         | StorageRpcMessageKind::ObjectListPage
         | StorageRpcMessageKind::ObjectVersionListPage

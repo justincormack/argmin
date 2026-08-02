@@ -3253,7 +3253,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
 }
 
 #[test]
-fn installed_unix_object_listing_routes_reject_misplaced_durable_rows_as_payload_decode() {
+fn installed_unix_object_scan_routes_reject_misplaced_durable_rows_as_payload_decode() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);
     config.pg_ids = vec![0, 1];
@@ -3306,7 +3306,7 @@ fn installed_unix_object_listing_routes_reject_misplaced_durable_rows_as_payload
         PgMetadataStore::create_multipart_upload(
             &*wrong_pg,
             &CreateMultipartUploadReq {
-                upload_id,
+                upload_id: upload_id.clone(),
                 bucket: bucket.clone(),
                 key,
                 tags: None,
@@ -3322,12 +3322,13 @@ fn installed_unix_object_listing_routes_reject_misplaced_durable_rows_as_payload
             },
         )
         .unwrap();
+        PgMetadataStore::set_upload_state(&*wrong_pg, &upload_id, UploadState::Aborting).unwrap();
         wrong_pg.refresh_metadata_command_state_digest().unwrap();
     }
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..3)
+    let server_threads: Vec<_> = (0..4)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -3374,6 +3375,15 @@ fn installed_unix_object_listing_routes_reject_misplaced_durable_rows_as_payload
         panic!("misplaced upload listing row must fail over installed Unix RPC");
     };
 
+    let aborting_error = client
+        .open_object_mutation_scan_metadata_route(
+            config.cluster_epoch,
+            ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+        )
+        .unwrap()
+        .list_aborting_multipart_upload_bucket_witnesses()
+        .expect_err("misplaced aborting upload witness must fail over installed Unix RPC");
+
     for error in [object_error, version_error, upload_error] {
         assert!(matches!(
             error,
@@ -3383,6 +3393,13 @@ fn installed_unix_object_listing_routes_reject_misplaced_durable_rows_as_payload
             })
         ));
     }
+    assert!(matches!(
+        aborting_error,
+        ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
     for thread in server_threads {
         thread.join().unwrap();
     }

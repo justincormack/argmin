@@ -229,6 +229,12 @@ struct LocalBucketMetadataScanRoute {
     pg_id: BucketPgId,
 }
 
+struct LocalBucketWriteReservationScanRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    _route_cluster_epoch: ClusterEpoch,
+    pg_id: BucketPgId,
+}
+
 struct LocalBucketMetadataRoute<'a> {
     client: &'a LocalStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
@@ -2119,39 +2125,89 @@ impl BucketWriteReservationNodeClient for LocalStorageNodeClient {
         }))
     }
 
+    fn open_bucket_write_reservation_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketWriteReservationScanRoute + '_>, BucketSnapshotLoadError> {
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalBucketWriteReservationScanRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+        }))
+    }
+}
+
+impl LocalBucketWriteReservationScanRoute<'_> {
+    fn require_bucket(
+        &self,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if self.client.storage_node.bucket_metadata_pg_for(bucket) != self.pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
+        }
+        Ok(())
+    }
+}
+
+impl BucketWriteReservationScanRoute for LocalBucketWriteReservationScanRoute<'_> {
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
-        Self::get_bucket_delete_finalize_roots(self, pg_id, now, limit)
+        let roots = self
+            .client
+            .get_bucket_delete_finalize_roots(self.pg_id, now, limit)?;
+        for root in &roots {
+            self.require_bucket(&root.bucket, "get bucket delete finalize roots")?;
+        }
+        Ok(roots)
     }
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
     ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError> {
-        Self::get_bucket_delete_begin_roots(self, pg_id, now, start_after_bucket, limit)
+        if let Some(bucket) = start_after_bucket {
+            self.require_bucket(bucket, "get bucket delete begin roots")?;
+        }
+        let roots = self.client.get_bucket_delete_begin_roots(
+            self.pg_id,
+            now,
+            start_after_bucket,
+            limit,
+        )?;
+        for root in &roots {
+            self.require_bucket(&root.bucket, "get bucket delete begin roots")?;
+        }
+        Ok(roots)
     }
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
-        Self::get_lifecycle_sweep_roots(self, pg_id, now, limit)
+        let roots = self
+            .client
+            .get_lifecycle_sweep_roots(self.pg_id, now, limit)?;
+        for root in &roots {
+            self.require_bucket(&root.bucket, "get lifecycle sweep roots")?;
+        }
+        Ok(roots)
     }
 
-    fn list_lifecycle_sweep_buckets(
-        &self,
-        pg_id: BucketPgId,
-    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
-        Self::list_lifecycle_sweep_buckets(self, pg_id)
+    fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
+        let buckets = self.client.list_buckets_with_lifecycle(self.pg_id)?;
+        for bucket in &buckets {
+            self.require_bucket(&bucket.name, "list lifecycle sweep buckets")?;
+        }
+        Ok(buckets)
     }
 }
 
@@ -4578,6 +4634,22 @@ impl LocalObjectMutationScanMetadataRoute<'_> {
 }
 
 impl ObjectMutationScanMetadataRoute for LocalObjectMutationScanMetadataRoute<'_> {
+    fn list_aborting_multipart_upload_bucket_witnesses(
+        &self,
+    ) -> Result<Vec<AbortingMultipartUploadBucketWitness>, ObjectPgActionError> {
+        let witnesses = self
+            .client
+            .list_aborting_multipart_upload_bucket_witnesses(self.pg_id)?;
+        for witness in &witnesses {
+            self.require_subject(
+                &witness.bucket,
+                &witness.key,
+                "list aborting multipart upload bucket witnesses",
+            )?;
+        }
+        Ok(witnesses)
+    }
+
     fn list_stream_uploads_for_bucket_page(
         &self,
         bucket: &BucketName,
@@ -5553,15 +5625,21 @@ impl LocalStorageNodeClient {
         )?)
     }
 
-    fn list_lifecycle_sweep_buckets(
+    fn list_buckets_with_lifecycle(
         &self,
         pg_id: BucketPgId,
-    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
+    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(LifecycleSweepBuckets {
-            lifecycle_buckets: PgMetadataStore::list_buckets_with_lifecycle(&*pg)?,
-            aborting_buckets: PgMetadataStore::list_buckets_with_aborting_multipart_uploads(&*pg)?,
-        })
+        Ok(PgMetadataStore::list_buckets_with_lifecycle(&*pg)?)
+    }
+
+    fn list_aborting_multipart_upload_bucket_witnesses(
+        &self,
+        pg_id: ObjectMetadataScanPgId,
+    ) -> Result<Vec<AbortingMultipartUploadBucketWitness>, ObjectPgActionError> {
+        let pg = self.storage_node.get_pg(pg_id.get())?;
+        PgMetadataStore::list_aborting_multipart_upload_bucket_witnesses(&*pg)
+            .map_err(ObjectPgActionError::Metadata)
     }
 
     #[allow(clippy::too_many_arguments)]

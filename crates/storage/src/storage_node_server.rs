@@ -45,7 +45,7 @@ use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
     complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
     BucketMetadataNodeClient, BucketMetadataRoute, BucketMetadataScanRoute,
-    BucketWriteReservationNodeClient, BucketWriteReservationRoute,
+    BucketWriteReservationNodeClient, BucketWriteReservationRoute, BucketWriteReservationScanRoute,
     BuildAbortMultipartUploadCommandReq, BuildAuthorizedAbortMultipartUploadCommandReq,
     BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
     BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
@@ -141,7 +141,7 @@ use crate::storage_rpc::{
     decode_stream_upload_bucket_write_reservation_update_request,
     decode_stream_upload_match_request, decode_stream_upload_session_request,
     decode_stream_uploads_list_request, decode_stream_uploads_pg_list_request,
-    encode_abort_multipart_cleanup_response,
+    encode_abort_multipart_cleanup_response, encode_aborting_multipart_upload_buckets_response,
     encode_bucket_delete_attempt_outcome_optional_record_response,
     encode_bucket_delete_begin_roots_response,
     encode_bucket_delete_finalize_claim_optional_record_response,
@@ -199,9 +199,9 @@ use crate::storage_rpc::{
     encode_stream_uploads_list_response, read_storage_rpc_request_frame_from,
     validate_read_handle_acquire_request, validate_read_handle_release_request,
     write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupResponse,
-    StorageRpcAbortMultipartCommandBuildRequest, StorageRpcAdmittedRouteEffectDeadline,
-    StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
-    StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse,
+    StorageRpcAbortMultipartCommandBuildRequest, StorageRpcAbortingMultipartUploadBucketsResponse,
+    StorageRpcAdmittedRouteEffectDeadline, StorageRpcAuthorizedAbortMultipartCommandBuildRequest,
+    StorageRpcBucketBatchRequest, StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse,
     StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
     StorageRpcBucketDeleteBeginRootsResponse, StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
@@ -348,13 +348,14 @@ use crate::types::{
 };
 use crate::DataPgId;
 use crate::{
-    BucketDeleteFinalizeClaimRecord, BucketInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
-    BucketSnapshotRequest, BucketSubresourceKind, BucketWriteDrainRecord,
-    BucketWriteReservationProof, BucketWriteReservationRecord, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, LifecycleSweepClaimRecord, MultipartUploadRecord, NodeId,
-    ObjectKey, ObjectPayloadReclaimClaimRecord, ObjectPayloadReclaimKind, ObjectPgActionError,
-    PayloadReclaimRoot, PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardKey,
-    ShardLocation, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
+    BucketDeleteBeginRoot, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketInfo,
+    BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSubresourceKind,
+    BucketWriteDrainRecord, BucketWriteReservationProof, BucketWriteReservationRecord,
+    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, LifecycleSweepClaimRecord,
+    LifecycleSweepRoot, MultipartUploadRecord, NodeId, ObjectKey, ObjectPayloadReclaimClaimRecord,
+    ObjectPayloadReclaimKind, ObjectPgActionError, PayloadReclaimRoot,
+    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardKey, ShardLocation,
+    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
 };
 use crate::{BucketFastPathIdentity, BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use checksum::{ChecksumAlgorithm, ChecksumHasher};
@@ -4609,7 +4610,7 @@ impl StorageNodeActiveBucketScanRoute<'_> {
         }
     }
 
-    fn open_local_route<'a>(
+    fn open_local_bucket_metadata_scan_route<'a>(
         &self,
         client: &'a LocalStorageNodeClient,
     ) -> Result<Box<dyn BucketMetadataScanRoute + 'a>, StorageNodeBucketRouteError> {
@@ -4621,6 +4622,15 @@ impl StorageNodeActiveBucketScanRoute<'_> {
         .map_err(Self::map_scan_error)
     }
 
+    fn open_local_bucket_write_reservation_scan_route<'a>(
+        &self,
+        client: &'a LocalStorageNodeClient,
+    ) -> Result<Box<dyn BucketWriteReservationScanRoute + 'a>, StorageNodeBucketRouteError> {
+        client
+            .open_bucket_write_reservation_scan_route(self.fence.cluster_epoch, self.pg_id)
+            .map_err(Self::map_scan_error)
+    }
+
     fn list_buckets(
         &self,
         owner_canonical_id: &str,
@@ -4630,7 +4640,7 @@ impl StorageNodeActiveBucketScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let route = self.open_local_route(&local_client)?;
+        let route = self.open_local_bucket_metadata_scan_route(&local_client)?;
         route
             .list_buckets(owner_canonical_id)
             .map_err(Self::map_scan_error)
@@ -4645,7 +4655,7 @@ impl StorageNodeActiveBucketScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let route = self.open_local_route(&local_client)?;
+        let route = self.open_local_bucket_metadata_scan_route(&local_client)?;
         route
             .load_bucket_execution_generations(buckets)
             .map_err(Self::map_scan_error)
@@ -4660,9 +4670,70 @@ impl StorageNodeActiveBucketScanRoute<'_> {
             self.handler.config.node_id,
             Arc::clone(&self.handler.node),
         );
-        let route = self.open_local_route(&local_client)?;
+        let route = self.open_local_bucket_metadata_scan_route(&local_client)?;
         route
             .load_bucket_fast_path_identities(buckets)
+            .map_err(Self::map_scan_error)
+    }
+
+    fn get_bucket_delete_finalize_roots(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteFinalizeRoot>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = self.open_local_bucket_write_reservation_scan_route(&local_client)?;
+        route
+            .get_bucket_delete_finalize_roots(now, limit)
+            .map_err(Self::map_scan_error)
+    }
+
+    fn get_bucket_delete_begin_roots(
+        &self,
+        now: u64,
+        start_after_bucket: Option<&BucketName>,
+        limit: usize,
+    ) -> Result<Vec<BucketDeleteBeginRoot>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = self.open_local_bucket_write_reservation_scan_route(&local_client)?;
+        route
+            .get_bucket_delete_begin_roots(now, start_after_bucket, limit)
+            .map_err(Self::map_scan_error)
+    }
+
+    fn get_lifecycle_sweep_roots(
+        &self,
+        now: u64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleSweepRoot>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = self.open_local_bucket_write_reservation_scan_route(&local_client)?;
+        route
+            .get_lifecycle_sweep_roots(now, limit)
+            .map_err(Self::map_scan_error)
+    }
+
+    fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = self.open_local_bucket_write_reservation_scan_route(&local_client)?;
+        route
+            .list_buckets_with_lifecycle()
             .map_err(Self::map_scan_error)
     }
 }
@@ -6796,6 +6867,25 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
         Ok(response)
     }
 
+    fn list_aborting_multipart_upload_bucket_witnesses(
+        &self,
+    ) -> Result<Vec<crate::types::AbortingMultipartUploadBucketWitness>, StorageNodeObjectRouteError>
+    {
+        self.require_valid_now()
+            .map_err(StorageNodeObjectRouteError::Route)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        ObjectMutationMetadataNodeClient::open_object_mutation_scan_metadata_route(
+            &local_client,
+            self.fence.cluster_epoch,
+            self.pg_id,
+        )
+        .and_then(|route| route.list_aborting_multipart_upload_bucket_witnesses())
+        .map_err(Self::map_object_scan_error)
+    }
+
     fn validate_stream_uploads(
         &self,
         page: &crate::StreamUploadRecordPage,
@@ -8083,7 +8173,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketDeleteAttemptOutcomeRecord => {
                 match decode_bucket_delete_attempt_outcome_record_request(&frame.payload) {
-                    Ok(request) => self.bucket_delete_attempt_outcome_record_response(request),
+                    Ok(request) => {
+                        self.bucket_delete_attempt_outcome_record_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8092,7 +8184,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketDeleteAttemptOutcomeGet => {
                 match decode_bucket_request(&frame.payload) {
-                    Ok(request) => self.bucket_delete_attempt_outcome_get_response(request),
+                    Ok(request) => {
+                        self.bucket_delete_attempt_outcome_get_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8110,7 +8204,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketWriteReservationsList => {
                 match decode_bucket_request(&frame.payload) {
-                    Ok(request) => self.bucket_write_reservations_list_response(request),
+                    Ok(request) => {
+                        self.bucket_write_reservations_list_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8119,7 +8215,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketDeleteFinalizeRoots => {
                 match decode_bucket_delete_finalize_roots_request(&frame.payload) {
-                    Ok(request) => self.bucket_delete_finalize_roots_response(request),
+                    Ok(request) => {
+                        self.bucket_delete_finalize_roots_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8128,7 +8226,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::BucketDeleteBeginRoots => {
                 match decode_bucket_delete_begin_roots_request(&frame.payload) {
-                    Ok(request) => self.bucket_delete_begin_roots_response(request),
+                    Ok(request) => self.bucket_delete_begin_roots_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8170,7 +8268,9 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::LifecycleSweepBucketsList => {
                 match decode_bucket_pg_request(&frame.payload) {
-                    Ok(request) => self.lifecycle_sweep_buckets_list_response(request),
+                    Ok(request) => {
+                        self.lifecycle_sweep_buckets_list_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8179,7 +8279,7 @@ impl StorageNodeConnectionHandler {
             }
             StorageRpcMessageKind::LifecycleSweepRoots => {
                 match decode_lifecycle_sweep_roots_request(&frame.payload) {
-                    Ok(request) => self.lifecycle_sweep_roots_response(request),
+                    Ok(request) => self.lifecycle_sweep_roots_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -8461,6 +8561,17 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectStreamUploadsPgList => {
                 match decode_stream_uploads_pg_list_request(&frame.payload) {
                     Ok(request) => self.stream_uploads_pg_list_response(route_permit, request),
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList => {
+                match decode_bucket_pg_request(&frame.payload) {
+                    Ok(request) => {
+                        self.aborting_multipart_upload_buckets_list_response(route_permit, request)
+                    }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -10199,164 +10310,160 @@ impl StorageNodeConnectionHandler {
 
     fn bucket_delete_attempt_outcome_record_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketDeleteAttemptOutcomeRecordRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
+        let route = match self.active_bucket_route_for_parts(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
             request.pg_id,
             &request.record.bucket,
             "bucket delete attempt outcome record",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let route = match local_client.open_bucket_write_reservation_route(
-            request.cluster_epoch,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.record.bucket,
-        ) {
             Ok(route) => route,
-            Err(error) => {
-                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
-            }
+            Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        match route.record_bucket_delete_attempt_outcome(&request.record) {
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let result = route
+            .open_local_bucket_write_reservation_route(&local_client)
+            .and_then(|route| {
+                route
+                    .record_bucket_delete_attempt_outcome(&request.record)
+                    .map_err(StorageNodeBucketRouteError::Bucket)
+            });
+        match result {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_delete_attempt_outcome_get_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.pg_id,
-            &request.bucket,
+        let route = match self.active_bucket_route(
+            route_permit,
+            &request,
             "bucket delete attempt outcome get",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let route = match local_client.open_bucket_write_reservation_route(
-            request.cluster_epoch,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.bucket,
-        ) {
             Ok(route) => route,
-            Err(error) => {
-                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
-            }
+            Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        match route.bucket_delete_attempt_outcome() {
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let result = route
+            .open_local_bucket_write_reservation_route(&local_client)
+            .and_then(|route| {
+                route
+                    .bucket_delete_attempt_outcome()
+                    .map_err(StorageNodeBucketRouteError::Bucket)
+            });
+        match result {
             Ok(record) => {
                 let payload = encode_bucket_delete_attempt_outcome_optional_record_response(
                     &StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse { record },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_write_reservations_list_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg_for_bucket(
-            request.pg_id,
-            &request.bucket,
+        let route = match self.active_bucket_route(
+            route_permit,
+            &request,
             "bucket write reservations list",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        let route = match local_client.open_bucket_write_reservation_route(
-            request.cluster_epoch,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            &request.bucket,
-        ) {
             Ok(route) => route,
-            Err(error) => {
-                return encode_storage_rpc_error_response(&bucket_snapshot_error_response(error));
-            }
+            Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        match route.durable_bucket_write_reservations() {
+        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
+        let result = route
+            .open_local_bucket_write_reservation_route(&local_client)
+            .and_then(|route| {
+                route
+                    .durable_bucket_write_reservations()
+                    .map_err(StorageNodeBucketRouteError::Bucket)
+            });
+        match result {
             Ok(records) => {
                 let payload = encode_bucket_write_reservations_list_response(
                     &StorageRpcBucketWriteReservationsListResponse { records },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_delete_finalize_roots_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketDeleteFinalizeRootsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
+        let route = match self.active_bucket_scan_route(
+            route_permit,
             request.route.node_id,
             request.route.cluster_epoch,
             request.route.pg_id,
+            "bucket delete roots",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg(request.route.pg_id, "bucket delete roots") {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::get_bucket_delete_finalize_roots(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.route.pg_id),
-            request.now,
-            request.limit,
-        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.get_bucket_delete_finalize_roots(request.now, request.limit) {
             Ok(roots) => {
                 let payload = encode_bucket_delete_finalize_roots_response(
                     &StorageRpcBucketDeleteFinalizeRootsResponse { roots },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn bucket_delete_begin_roots_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketDeleteBeginRootsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route(
+        let route = match self.active_bucket_scan_route(
+            route_permit,
             request.route.node_id,
             request.route.cluster_epoch,
             request.route.pg_id,
+            "bucket delete begin roots",
         ) {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) =
-            self.validate_primary_pg(request.route.pg_id, "bucket delete begin roots")
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::get_bucket_delete_begin_roots(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.route.pg_id),
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.get_bucket_delete_begin_roots(
             request.now,
             request.start_after_bucket.as_ref(),
             request.limit,
@@ -10367,7 +10474,12 @@ impl StorageNodeConnectionHandler {
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -10466,57 +10578,63 @@ impl StorageNodeConnectionHandler {
 
     fn lifecycle_sweep_buckets_list_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketPgRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg(request.pg_id, "lifecycle sweep bucket list") {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::list_lifecycle_sweep_buckets(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
+        let route = match self.active_bucket_scan_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            "lifecycle sweep bucket list",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.list_buckets_with_lifecycle() {
             Ok(buckets) => {
                 let payload = encode_lifecycle_sweep_buckets_response(
                     &StorageRpcLifecycleSweepBucketsResponse { buckets },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
     fn lifecycle_sweep_roots_response(
         &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcLifecycleSweepRootsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) =
-            self.validate_pg_route(request.node_id, request.cluster_epoch, request.pg_id)
-        {
-            return encode_storage_rpc_error_response(&error);
-        }
-        if let Err(error) = self.validate_primary_pg(request.pg_id, "lifecycle sweep roots") {
-            return encode_storage_rpc_error_response(&error);
-        }
-        let local_client = LocalStorageNodeClient::new(self.config.node_id, Arc::clone(&self.node));
-        match BucketWriteReservationNodeClient::get_lifecycle_sweep_roots(
-            &local_client,
-            self.validated_bucket_metadata_pg(request.pg_id),
-            request.now,
-            request.limit,
+        let route = match self.active_bucket_scan_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            "lifecycle sweep roots",
         ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        match route.get_lifecycle_sweep_roots(request.now, request.limit) {
             Ok(roots) => {
                 let payload = encode_lifecycle_sweep_roots_response(
                     &StorageRpcLifecycleSweepRootsResponse { roots },
                 )?;
                 Ok(encode_storage_rpc_success_response(&payload))
             }
-            Err(error) => encode_storage_rpc_error_response(&bucket_snapshot_error_response(error)),
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
+            }
         }
     }
 
@@ -11451,6 +11569,36 @@ impl StorageNodeConnectionHandler {
             uploads: page.uploads,
             next_session_id_marker: page.next_session_id_marker,
         })?;
+        Ok(encode_storage_rpc_success_response(&payload))
+    }
+
+    fn aborting_multipart_upload_buckets_list_response(
+        &self,
+        route_permit: &StorageNodeRouteAdmissionPermit,
+        request: StorageRpcBucketPgRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        let route = match self.active_primary_object_scan_route(
+            route_permit,
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+            "aborting multipart upload buckets list",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let witnesses = match route.list_aborting_multipart_upload_bucket_witnesses() {
+            Ok(witnesses) => witnesses,
+            Err(StorageNodeObjectRouteError::Route(error)) => {
+                return encode_storage_rpc_error_response(&error)
+            }
+            Err(StorageNodeObjectRouteError::Object(error)) => {
+                return encode_storage_rpc_error_response(&object_pg_error_response(error))
+            }
+        };
+        let payload = encode_aborting_multipart_upload_buckets_response(
+            &StorageRpcAbortingMultipartUploadBucketsResponse { witnesses },
+        )?;
         Ok(encode_storage_rpc_success_response(&payload))
     }
 
@@ -17206,12 +17354,6 @@ impl StorageNodeConnectionHandler {
             });
         }
         Ok(())
-    }
-
-    fn validated_bucket_metadata_pg(&self, pg_id: PgId) -> BucketPgId {
-        self.node
-            .bucket_metadata_pg(pg_id)
-            .expect("validated bucket metadata PG must belong to the installed topology")
     }
 
     fn validated_data_pg(&self, pg_id: PgId) -> DataPgId {

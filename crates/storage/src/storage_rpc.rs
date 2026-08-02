@@ -18,8 +18,8 @@ use crate::{
         METADATA_CANONICAL_STATE_ENCODING_VERSION,
     },
     types::{
-        AbortMultipartUploadCleanup, BucketAclSummary, BucketDeleteAttemptOutcomeKind,
-        BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
+        AbortMultipartUploadCleanup, AbortingMultipartUploadBucketWitness, BucketAclSummary,
+        BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
         BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketEncryptionConfig,
         BucketFastPathIdentity, BucketInfo, BucketObjectOwnership, BucketOwnershipControls,
         BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
@@ -28,11 +28,11 @@ use crate::{
         ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
         CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
         CreateStreamUploadReq, DeleteMarkerRecord, DirectPutCommitStorageSnapshot, EcShape,
-        EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepBuckets,
-        LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
-        ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
-        ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
-        ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepClaimRecord,
+        LifecycleSweepRoot, LifecycleSweepRootSource, ListMultipartUploadsPageStart,
+        ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
+        ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsResp,
+        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
         ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionFingerprint,
         MultipartCompletionPreflight, MultipartCompletionReplay, MultipartCompletionSnapshot,
         MultipartCompletionSubject, MultipartObjectIdentity, MultipartPartRecord,
@@ -79,7 +79,7 @@ use std::io::{Read, Write};
 use std::num::{NonZeroU16, NonZeroU32};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 14;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 15;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -749,6 +749,7 @@ pub(crate) enum StorageRpcMessageKind {
     ObjectMultipartManagementLookup = 76,
     ObjectStreamUploadSessionLoad = 77,
     ObjectStreamUploadRetainedAbortPrepare = 164,
+    ObjectAbortingMultipartUploadBucketsList = 171,
     ObjectStreamUploadSegmentsLoad = 78,
     ObjectStreamSegmentAppendPrepare = 79,
     ObjectStreamUploadBucketWriteReservationUpdate = 84,
@@ -1115,6 +1116,9 @@ impl StorageRpcMessageKind {
             Self::ObjectStreamUploadRetainedAbortPrepare => {
                 "object stream upload retained abort prepare"
             }
+            Self::ObjectAbortingMultipartUploadBucketsList => {
+                "object aborting multipart upload buckets list"
+            }
             Self::ObjectStreamUploadSegmentsLoad => "object stream upload segments load",
             Self::ObjectStreamSegmentAppendPrepare => "object stream segment append prepare",
             Self::ObjectStreamUploadBucketWriteReservationUpdate => {
@@ -1286,6 +1290,7 @@ impl StorageRpcMessageKind {
             76 => Ok(Self::ObjectMultipartManagementLookup),
             77 => Ok(Self::ObjectStreamUploadSessionLoad),
             164 => Ok(Self::ObjectStreamUploadRetainedAbortPrepare),
+            171 => Ok(Self::ObjectAbortingMultipartUploadBucketsList),
             78 => Ok(Self::ObjectStreamUploadSegmentsLoad),
             79 => Ok(Self::ObjectStreamSegmentAppendPrepare),
             84 => Ok(Self::ObjectStreamUploadBucketWriteReservationUpdate),
@@ -2779,7 +2784,12 @@ pub(crate) struct StorageRpcLifecycleSweepRootsResponse {
 
 #[derive(Debug, Clone)]
 pub(crate) struct StorageRpcLifecycleSweepBucketsResponse {
-    pub(crate) buckets: LifecycleSweepBuckets,
+    pub(crate) buckets: Vec<BucketInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcAbortingMultipartUploadBucketsResponse {
+    pub(crate) witnesses: Vec<AbortingMultipartUploadBucketWitness>,
 }
 
 pub(crate) struct StorageRpcListObjectsRequest {
@@ -3954,6 +3964,9 @@ fn message_kind_request_max_payload_len(
         }
         StorageRpcMessageKind::ObjectStreamUploadsPgList => {
             STORAGE_RPC_MAX_STREAM_UPLOADS_PG_LIST_REQUEST_PAYLOAD_LEN
+        }
+        StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList => {
+            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot => {
             STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN
@@ -8177,27 +8190,15 @@ pub(crate) fn encode_lifecycle_sweep_buckets_response(
     let mut out = Vec::new();
     put_u32(
         &mut out,
-        u32::try_from(response.buckets.lifecycle_buckets.len()).map_err(|_| {
+        u32::try_from(response.buckets.len()).map_err(|_| {
             StorageRpcPayloadError::PayloadTooLarge {
-                len: response.buckets.lifecycle_buckets.len(),
+                len: response.buckets.len(),
                 limit: u32::MAX as usize,
             }
         })?,
     );
-    for bucket in &response.buckets.lifecycle_buckets {
+    for bucket in &response.buckets {
         put_bucket_info(&mut out, bucket);
-    }
-    put_u32(
-        &mut out,
-        u32::try_from(response.buckets.aborting_buckets.len()).map_err(|_| {
-            StorageRpcPayloadError::PayloadTooLarge {
-                len: response.buckets.aborting_buckets.len(),
-                limit: u32::MAX as usize,
-            }
-        })?,
-    );
-    for bucket in &response.buckets.aborting_buckets {
-        put_string(&mut out, bucket.as_str());
     }
     Ok(out)
 }
@@ -8212,19 +8213,49 @@ pub(crate) fn decode_lifecycle_sweep_buckets_response(
     for _ in 0..lifecycle_count {
         lifecycle_buckets.push(decoder.read_bucket_info()?);
     }
-    let aborting_count =
-        decoder.read_bounded_remaining_count(1, "aborting bucket count exceeds payload")?;
-    let mut aborting_buckets = Vec::new();
-    for _ in 0..aborting_count {
-        aborting_buckets.push(decoder.read_bucket_name()?);
-    }
     decoder.finish()?;
     Ok(StorageRpcLifecycleSweepBucketsResponse {
-        buckets: LifecycleSweepBuckets {
-            lifecycle_buckets,
-            aborting_buckets,
-        },
+        buckets: lifecycle_buckets,
     })
+}
+
+pub(crate) fn encode_aborting_multipart_upload_buckets_response(
+    response: &StorageRpcAbortingMultipartUploadBucketsResponse,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let mut out = Vec::new();
+    put_u32(
+        &mut out,
+        u32::try_from(response.witnesses.len()).map_err(|_| {
+            StorageRpcPayloadError::PayloadTooLarge {
+                len: response.witnesses.len(),
+                limit: u32::MAX as usize,
+            }
+        })?,
+    );
+    for witness in &response.witnesses {
+        put_string(&mut out, witness.bucket.as_str());
+        put_string(&mut out, witness.key.as_str());
+    }
+    Ok(out)
+}
+
+pub(crate) fn decode_aborting_multipart_upload_buckets_response(
+    bytes: &[u8],
+) -> Result<StorageRpcAbortingMultipartUploadBucketsResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let count = decoder.read_bounded_remaining_count(
+        2,
+        "aborting multipart upload bucket count exceeds payload",
+    )?;
+    let mut witnesses = Vec::with_capacity(count);
+    for _ in 0..count {
+        witnesses.push(AbortingMultipartUploadBucketWitness {
+            bucket: decoder.read_bucket_name()?,
+            key: decoder.read_object_key()?,
+        });
+    }
+    decoder.finish()?;
+    Ok(StorageRpcAbortingMultipartUploadBucketsResponse { witnesses })
 }
 
 pub(crate) fn encode_lifecycle_sweep_claim_acquire_request(
@@ -18233,7 +18264,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&14u16.to_le_bytes());
+        expected.extend_from_slice(&15u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -18244,15 +18275,15 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_thirteen_fixture() {
+    fn storage_rpc_frame_rejects_version_fourteen_fixture() {
         let mut bytes =
             encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
         let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&13_u16.to_le_bytes());
+        bytes[version_offset..version_offset + 2].copy_from_slice(&14_u16.to_le_bytes());
 
         assert_eq!(
             decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(13))
+            Err(StorageRpcFrameError::UnsupportedVersion(14))
         );
     }
 
@@ -21177,6 +21208,11 @@ mod tests {
                 STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
             ),
             (
+                StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN,
+            ),
+            (
                 StorageRpcMessageKind::LifecycleSweepRoots,
                 STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_LIFECYCLE_SWEEP_ROOTS_REQUEST_PAYLOAD_LEN,
@@ -23360,6 +23396,21 @@ mod tests {
                 pg_id: 23,
             },
         )
+    }
+
+    #[test]
+    fn aborting_multipart_upload_bucket_witnesses_round_trip() {
+        let response = StorageRpcAbortingMultipartUploadBucketsResponse {
+            witnesses: vec![AbortingMultipartUploadBucketWitness {
+                bucket: BucketName::try_from("aborting-bucket").unwrap(),
+                key: ObjectKey::try_from("aborting-key").unwrap(),
+            }],
+        };
+        let encoded = encode_aborting_multipart_upload_buckets_response(&response).unwrap();
+        assert_eq!(
+            decode_aborting_multipart_upload_buckets_response(&encoded).unwrap(),
+            response
+        );
     }
 
     fn test_bucket_write_reservation_proof() -> BucketWriteReservationProof {

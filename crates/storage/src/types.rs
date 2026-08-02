@@ -4927,6 +4927,14 @@ pub struct LifecycleSweepBuckets {
     pub aborting_buckets: Vec<BucketName>,
 }
 
+/// Placement-verifiable evidence that one object-metadata PG contains an
+/// aborting multipart upload for a bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AbortingMultipartUploadBucketWitness {
+    pub bucket: BucketName,
+    pub key: ObjectKey,
+}
+
 // ── Multipart upload types ─────────────────────────────────────────
 
 /// Multipart upload state machine.

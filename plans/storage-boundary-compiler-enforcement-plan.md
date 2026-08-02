@@ -648,13 +648,13 @@ Node-client role classification (2026-07-19):
 | Interface | PG role | Capability direction |
 | --- | --- | --- |
 | `BucketMetadataNodeClient` | bucket metadata | exact reads/mutations use an active route bound to one epoch, bucket PG, and bucket; paired snapshots and delete-replica inspection use separate narrower routes; owner listing and batch generation/fast-path reads open an active scan route bound to one epoch and bucket PG |
-| `BucketWriteReservationNodeClient` | bucket metadata | active bucket route for acquisition, heartbeat, worker scans, and claim creation |
+| `BucketWriteReservationNodeClient` | bucket metadata | exact reservation/drain/claim operations open an active route bound to one epoch, bucket PG, and bucket; PG-wide delete/lifecycle discovery opens a separate active scan route bound to one epoch and bucket PG |
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
 | `ObjectGenerationMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; reservation lookup and next-generation inspection cannot replace that subject |
 | `ObjectVersionMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; ordinary and completion-priority version inspection retain distinct admission classes within that route |
 | `DirectPutMetadataNodeClient` | object metadata | opens an active primary route bound to one epoch, exact object PG, bucket, and key; commit snapshot and command construction cannot replace route identity |
 | `ObjectListingMetadataNodeClient` | object metadata scan | active object-metadata route for the scanned PG; listing fan-out constructs one capability per routed PG |
-| `ObjectMutationMetadataNodeClient` | object metadata and object-metadata scan | exact mutation, stream-session, multipart, and payload-reclaim operations open active routes bound to one epoch and their complete object/upload/generation subjects; maintenance discovery opens a separate active scan route bound to one epoch and one installed object-metadata scan PG |
+| `ObjectMutationMetadataNodeClient` | object metadata and object-metadata scan | exact mutation, stream-session, multipart, and payload-reclaim operations open active routes bound to one epoch and their complete object/upload/generation subjects; maintenance discovery opens a separate active scan route bound to one epoch and one installed object-metadata scan PG, including placement-verifiable witnesses for aborting multipart uploads |
 | `RetainedObjectMutationMetadataNodeClient` | object metadata | opens a retained route bound to one epoch, object-metadata PG, bucket, and key; the returned interface prepares stream aborts and releases payload-reclaim claims without accepting replacement route or object arguments |
 | `ObjectReadMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; version selection and subject-identity validation remain operations within that fixed route, with payload reads separately retaining their read lease |
 | `PlacedShardNodeClient`, `ShardAckNodeClient` | data | active placed-shard I/O opens an exact route bound to one node, epoch, data PG, shard index, and shard key; shard acknowledgement, current-placement cleanup, and repair/backfill work open an active route bound to one epoch and data PG |
@@ -5054,6 +5054,46 @@ One-hundred-and-twenty-seventh Phase 3 slice:
   boundary checker. The checker now relies on the compiler-scoped exact route
   for drain/lifecycle claim operations and retains its lexical guard only for
   the still-broad PG scan and retained-release interfaces.
+
+One-hundred-and-twenty-eighth Phase 3 slice:
+
+- the three remaining PG-wide DeleteBucket and lifecycle bucket-metadata
+  worker-discovery operations now open a `BucketWriteReservationScanRoute`
+  bound to one route epoch and one installed bucket-metadata PG. The parent
+  `BucketWriteReservationNodeClient` exposes only exact-route and scan-route
+  construction; neither returned interface accepts a replacement PG.
+- the former lifecycle-bucket scan also combined aborting multipart uploads
+  from the object-metadata partition. That mixed-role result is split rather
+  than weakening the new bucket scan: `ObjectMutationScanMetadataRoute` now
+  returns one bucket/key witness for each aborting-upload bucket in its scoped
+  object PG, and the cluster merges the separately authorized scans.
+- embedded and Unix scan routes validate every request marker and returned
+  bucket or bucket/key witness against the applicable scoped PG. Unix response
+  validation also rejects duplicate finalizer/lifecycle identities, duplicate
+  bucket/witness rows, and non-increasing DeleteBucket-begin pages so an
+  authenticated faulty peer cannot inject work outside the capability or
+  destabilize pagination.
+- storage-node dispatch consumes the frame's active route-admission permit and
+  constructs the scoped scan capability before any of the four reads. The
+  exact delete-attempt outcome and reservation-list handlers now likewise use
+  the admitted exact-bucket capability rather than holding admission only by
+  calling convention.
+- the mixed lifecycle/aborting-upload response is split into separate bucket-
+  and object-metadata RPCs, so storage RPC frame encoding advances to version
+  15 and explicitly rejects the incompatible version-14 layout.
+- deterministic no-server coverage rejects foreign epochs and foreign-PG
+  pagination markers before transport. Malicious-peer coverage rejects all
+  bucket-metadata response shapes and the object-metadata witness response,
+  plus duplicate or unordered responses. Installed Unix and routed embedded
+  tests remain positive canaries for drain, finalizer, lifecycle-root,
+  lifecycle-bucket, and aborting-upload discovery.
+- the transitional lifecycle scan/release source parser is removed. Exact,
+  retained, and PG-wide scan authority are now separate compiler-visible
+  interfaces; the remaining direct `PgMetadataStore` worker-access ban stays
+  in place.
+- all 2,597 storage tests and all 7,919 workspace tests pass, together with
+  workspace-wide strict Clippy, formatting, and the transitional storage
+  boundary checker.
 
 ### Phase 4 — type metadata-command publication
 

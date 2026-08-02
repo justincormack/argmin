@@ -1324,10 +1324,10 @@ impl UnixStorageNodeClient {
         Ok(response.roots)
     }
 
-    fn list_lifecycle_sweep_buckets(
+    fn list_buckets_with_lifecycle(
         &self,
         pg_id: BucketPgId,
-    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
+    ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
         let request = StorageRpcBucketPgRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -1644,6 +1644,12 @@ struct UnixBucketWriteReservationRoute<'a> {
     bucket: BucketName,
 }
 
+struct UnixBucketWriteReservationScanRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    pg_id: BucketPgId,
+    pg_topology: Arc<PgTopology>,
+}
+
 impl UnixBucketWriteReservationRoute<'_> {
     fn require_bucket_subject(
         &self,
@@ -1720,39 +1726,147 @@ impl BucketWriteReservationNodeClient for UnixStorageNodeClient {
         }))
     }
 
+    fn open_bucket_write_reservation_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketWriteReservationScanRoute + '_>, BucketSnapshotLoadError> {
+        if route_cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: route_cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            }
+            .into());
+        }
+        let pg_topology = self.pg_topology.as_ref().ok_or_else(|| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "open bucket write reservation scan route",
+                "bucket write reservation client has no installed PG topology".to_string(),
+            ))
+        })?;
+        Ok(Box::new(UnixBucketWriteReservationScanRoute {
+            client: self,
+            pg_id,
+            pg_topology: Arc::clone(pg_topology),
+        }))
+    }
+}
+
+impl UnixBucketWriteReservationScanRoute<'_> {
+    fn require_bucket(
+        &self,
+        bucket: &BucketName,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if self.pg_topology.bucket_pg_for(bucket) != self.pg_id.get() {
+            return Err(BucketSnapshotLoadError::Store(
+                self.client.rpc_payload_error(
+                    operation,
+                    "response bucket does not belong to the scoped bucket metadata PG".to_string(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl BucketWriteReservationScanRoute for UnixBucketWriteReservationScanRoute<'_> {
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError> {
-        Self::get_bucket_delete_finalize_roots(self, pg_id, now, limit)
+        let roots = self
+            .client
+            .get_bucket_delete_finalize_roots(self.pg_id, now, limit)?;
+        let mut identities = BTreeSet::new();
+        for root in &roots {
+            self.require_bucket(
+                &root.bucket,
+                "validate bucket delete finalize roots response",
+            )?;
+            if !identities.insert((&root.bucket, root.bucket_incarnation_generation)) {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate bucket delete finalize roots response",
+                        "response contains a duplicate finalizer root".to_string(),
+                    ),
+                ));
+            }
+        }
+        Ok(roots)
     }
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
     ) -> Result<Vec<BucketDeleteBeginRoot>, BucketSnapshotLoadError> {
-        Self::get_bucket_delete_begin_roots(self, pg_id, now, start_after_bucket, limit)
+        if let Some(bucket) = start_after_bucket {
+            self.require_bucket(bucket, "get bucket delete begin roots")?;
+        }
+        let roots = self.client.get_bucket_delete_begin_roots(
+            self.pg_id,
+            now,
+            start_after_bucket,
+            limit,
+        )?;
+        let mut previous = start_after_bucket;
+        for root in &roots {
+            self.require_bucket(&root.bucket, "validate bucket delete begin roots response")?;
+            if previous.is_some_and(|previous| root.bucket <= *previous) {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate bucket delete begin roots response",
+                        "response roots are not strictly after the pagination marker".to_string(),
+                    ),
+                ));
+            }
+            previous = Some(&root.bucket);
+        }
+        Ok(roots)
     }
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError> {
-        Self::get_lifecycle_sweep_roots(self, pg_id, now, limit)
+        let roots = self
+            .client
+            .get_lifecycle_sweep_roots(self.pg_id, now, limit)?;
+        let mut identities = BTreeSet::new();
+        for root in &roots {
+            self.require_bucket(&root.bucket, "validate lifecycle sweep roots response")?;
+            if !identities.insert((&root.bucket, root.bucket_incarnation_generation)) {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate lifecycle sweep roots response",
+                        "response contains a duplicate lifecycle root".to_string(),
+                    ),
+                ));
+            }
+        }
+        Ok(roots)
     }
 
-    fn list_lifecycle_sweep_buckets(
-        &self,
-        pg_id: BucketPgId,
-    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError> {
-        Self::list_lifecycle_sweep_buckets(self, pg_id)
+    fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
+        let buckets = self.client.list_buckets_with_lifecycle(self.pg_id)?;
+        let mut lifecycle_names = BTreeSet::new();
+        for bucket in &buckets {
+            self.require_bucket(&bucket.name, "validate lifecycle sweep buckets response")?;
+            if !lifecycle_names.insert(&bucket.name) {
+                return Err(BucketSnapshotLoadError::Store(
+                    self.client.rpc_payload_error(
+                        "validate lifecycle sweep buckets response",
+                        "response contains a duplicate lifecycle bucket".to_string(),
+                    ),
+                ));
+            }
+        }
+        Ok(buckets)
     }
 }
 
@@ -5180,6 +5294,51 @@ impl UnixObjectMutationScanMetadataRoute<'_> {
 }
 
 impl ObjectMutationScanMetadataRoute for UnixObjectMutationScanMetadataRoute<'_> {
+    fn list_aborting_multipart_upload_bucket_witnesses(
+        &self,
+    ) -> Result<Vec<AbortingMultipartUploadBucketWitness>, ObjectPgActionError> {
+        let request = StorageRpcBucketPgRequest {
+            node_id: self.client.node_id,
+            cluster_epoch: self.route_cluster_epoch,
+            pg_id: self.pg_id.pg_id(),
+        };
+        let payload = encode_bucket_pg_request(&request).map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "encode aborting multipart upload buckets request",
+                error.to_string(),
+            ))
+        })?;
+        let response = self
+            .client
+            .rpc_request(
+                StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList,
+                payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_aborting_multipart_upload_buckets_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode aborting multipart upload buckets response",
+                    error.to_string(),
+                ))
+            })?;
+        let mut buckets = BTreeSet::new();
+        for witness in &response.witnesses {
+            self.require_subject(
+                &witness.bucket,
+                &witness.key,
+                "validate aborting multipart upload buckets response",
+            )?;
+            if !buckets.insert(&witness.bucket) {
+                return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "validate aborting multipart upload buckets response",
+                    "response contains a duplicate bucket witness".to_string(),
+                )));
+            }
+        }
+        Ok(response.witnesses)
+    }
+
     fn list_stream_uploads_for_bucket_page(
         &self,
         bucket: &BucketName,

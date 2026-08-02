@@ -1232,6 +1232,7 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::ShardScavengerObservations
         | StorageRpcMessageKind::ShardScavengerObservationResolve
         | StorageRpcMessageKind::LifecycleSweepBucketsList
+        | StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList
         | StorageRpcMessageKind::LifecycleSweepRoots
         | StorageRpcMessageKind::LifecycleSweepClaimAcquire
         | StorageRpcMessageKind::LifecycleSweepClaimHeartbeat
@@ -1560,6 +1561,7 @@ mod tests {
 
     const LIFECYCLE_MAINTENANCE_WORKFLOW: &[StorageRpcMessageKind] = &[
         StorageRpcMessageKind::LifecycleSweepBucketsList,
+        StorageRpcMessageKind::ObjectAbortingMultipartUploadBucketsList,
         StorageRpcMessageKind::LifecycleSweepRoots,
         StorageRpcMessageKind::LifecycleSweepClaimAcquire,
         StorageRpcMessageKind::LifecycleSweepClaimHeartbeat,
@@ -2109,7 +2111,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 169, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 170, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

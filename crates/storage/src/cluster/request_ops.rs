@@ -35,7 +35,7 @@ use crate::metadata_command::{
 use crate::node::ReclaimQueueInsert;
 use crate::node_client::{
     complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
-    BucketWriteReservationNodeClient, BucketWriteReservationRoute,
+    BucketWriteReservationNodeClient, BucketWriteReservationRoute, BucketWriteReservationScanRoute,
     BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
     BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
     BuildDeleteSpecificObjectVersionCommandReq, BuildInsertDeleteMarkerCommandReq,
@@ -1319,6 +1319,14 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<Box<dyn BucketWriteReservationRoute + 'a>, BucketSnapshotLoadError> {
         client.open_bucket_write_reservation_route(self.operation_epoch(), pg_id, bucket)
+    }
+
+    fn open_bucket_write_reservation_scan_route<'a>(
+        &self,
+        client: &'a dyn BucketWriteReservationNodeClient,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketWriteReservationScanRoute + 'a>, BucketSnapshotLoadError> {
+        client.open_bucket_write_reservation_scan_route(self.operation_epoch(), pg_id)
     }
 
     #[cfg(test)]
@@ -8552,16 +8560,29 @@ impl super::StorageCluster {
     ) -> Result<LifecycleSweepBuckets, ObjectPgActionError> {
         let mut lifecycle_buckets = Vec::new();
         let mut aborting_buckets = Vec::new();
-        for pg_id in self.metadata_pg_ids() {
+        for raw_pg_id in self.metadata_pg_ids() {
+            let pg_id = PgId::new(raw_pg_id);
             let node = self
                 .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-            let buckets = node
-                .bucket_write_reservation_client()
-                .list_lifecycle_sweep_buckets(self.validated_bucket_metadata_pg(PgId::new(pg_id)))
-                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-            lifecycle_buckets.extend(buckets.lifecycle_buckets);
-            aborting_buckets.extend(buckets.aborting_buckets);
+                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+            let bucket_client = node.bucket_write_reservation_client();
+            lifecycle_buckets.extend(
+                self.open_bucket_write_reservation_scan_route(
+                    bucket_client.as_ref(),
+                    self.validated_bucket_metadata_pg(pg_id),
+                )
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                .list_buckets_with_lifecycle()
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
+            );
+            let object_client = node.object_mutation_metadata_client();
+            let witnesses = object_client
+                .open_object_mutation_scan_metadata_route(
+                    self.operation_epoch(),
+                    self.object_metadata_scan_pg(pg_id),
+                )?
+                .list_aborting_multipart_upload_bucket_witnesses()?;
+            aborting_buckets.extend(witnesses.into_iter().map(|witness| witness.bucket));
         }
         lifecycle_buckets.sort_by(|a, b| a.name.cmp(&b.name));
         aborting_buckets.sort();
@@ -8581,14 +8602,15 @@ impl super::StorageCluster {
             let node = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
+            let client = node.bucket_write_reservation_client();
             roots.extend(
-                node.bucket_write_reservation_client()
-                    .get_lifecycle_sweep_roots(
-                        self.validated_bucket_metadata_pg(PgId::new(pg_id)),
-                        now,
-                        LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG,
-                    )
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
+                self.open_bucket_write_reservation_scan_route(
+                    client.as_ref(),
+                    self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                )
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                .get_lifecycle_sweep_roots(now, LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG)
+                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
             );
         }
         for bucket in self.list_lifecycle_sweep_buckets()?.aborting_buckets {
@@ -12568,18 +12590,34 @@ impl super::StorageCluster {
                 return scan;
             }
         };
+        let client = node.bucket_write_reservation_client();
+        let route = match self.open_bucket_write_reservation_scan_route(
+            client.as_ref(),
+            self.validated_bucket_metadata_pg(pg_id),
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                scan.errors += 1;
+                let _ = observability::event(
+                    super::TRACE_TARGET,
+                    "bucket_begin_durable_scan_pg_error",
+                    Some(format_args!("pg_id={} error={:?}", pg_id.get(), error)),
+                );
+                scan.route_refresh_required =
+                    durable_reclaim_bucket_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
         let now = crate::clock::current_time_millis();
         let mut start_after_bucket = None;
         let mut queued_for_pg = 0usize;
         loop {
-            let roots = match node
-                .bucket_write_reservation_client()
-                .get_bucket_delete_begin_roots(
-                    self.validated_bucket_metadata_pg(pg_id),
-                    now,
-                    start_after_bucket.as_ref(),
-                    BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG,
-                ) {
+            let roots = match route.get_bucket_delete_begin_roots(
+                now,
+                start_after_bucket.as_ref(),
+                BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG,
+            ) {
                 Ok(roots) => roots,
                 Err(error) => {
                     scan.errors += 1;
@@ -12678,13 +12716,24 @@ impl super::StorageCluster {
                 return scan;
             }
         };
-        let roots = match node
-            .bucket_write_reservation_client()
-            .get_bucket_delete_finalize_roots(
-                self.validated_bucket_metadata_pg(pg_id),
-                crate::clock::current_time_millis(),
-                BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
-            ) {
+        let client = node.bucket_write_reservation_client();
+        let route = match self.open_bucket_write_reservation_scan_route(
+            client.as_ref(),
+            self.validated_bucket_metadata_pg(pg_id),
+        ) {
+            Ok(route) => route,
+            Err(error) => {
+                scan.errors += 1;
+                scan.route_refresh_required =
+                    durable_reclaim_bucket_scan_requires_route_refresh(&error);
+                scan.retry_required = !scan.route_refresh_required;
+                return scan;
+            }
+        };
+        let roots = match route.get_bucket_delete_finalize_roots(
+            crate::clock::current_time_millis(),
+            BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG,
+        ) {
             Ok(roots) => roots,
             Err(error) => {
                 scan.errors += 1;

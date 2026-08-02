@@ -1688,7 +1688,7 @@ fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
 }
 
 #[test]
-fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() {
+fn list_aborting_multipart_upload_bucket_witnesses_returns_one_key_per_bucket() {
     let (_dir, store) = make_pg_store();
     for bucket in ["alpha", "beta"] {
         store
@@ -1736,10 +1736,16 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
         .set_upload_state(&multipart_upload_id("upload-b1"), UploadState::Completing)
         .unwrap();
 
-    let buckets = store
-        .list_buckets_with_aborting_multipart_uploads()
+    let witnesses = store
+        .list_aborting_multipart_upload_bucket_witnesses()
         .unwrap();
-    assert_eq!(buckets, vec![bucket_name("alpha")]);
+    assert_eq!(
+        witnesses,
+        vec![crate::types::AbortingMultipartUploadBucketWitness {
+            bucket: bucket_name("alpha"),
+            key: object_key("key-1"),
+        }]
+    );
 }
 
 #[test]

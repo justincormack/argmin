@@ -178,16 +178,22 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Box<dyn BucketWriteReservationRoute + '_>, BucketSnapshotLoadError>;
 
+    fn open_bucket_write_reservation_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketWriteReservationScanRoute + '_>, BucketSnapshotLoadError>;
+}
+
+pub(crate) trait BucketWriteReservationScanRoute: Send {
     fn get_bucket_delete_finalize_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<BucketDeleteFinalizeRoot>, BucketSnapshotLoadError>;
 
     fn get_bucket_delete_begin_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         start_after_bucket: Option<&BucketName>,
         limit: usize,
@@ -195,15 +201,11 @@ pub(crate) trait BucketWriteReservationNodeClient: Send + Sync {
 
     fn get_lifecycle_sweep_roots(
         &self,
-        pg_id: BucketPgId,
         now: u64,
         limit: usize,
     ) -> Result<Vec<LifecycleSweepRoot>, BucketSnapshotLoadError>;
 
-    fn list_lifecycle_sweep_buckets(
-        &self,
-        pg_id: BucketPgId,
-    ) -> Result<LifecycleSweepBuckets, BucketSnapshotLoadError>;
+    fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError>;
 }
 
 pub(crate) trait BucketWriteReservationRoute: Send {
@@ -630,6 +632,10 @@ pub(crate) trait ObjectPayloadReclaimMetadataRoute: Send {
 }
 
 pub(crate) trait ObjectMutationScanMetadataRoute: Send {
+    fn list_aborting_multipart_upload_bucket_witnesses(
+        &self,
+    ) -> Result<Vec<AbortingMultipartUploadBucketWitness>, ObjectPgActionError>;
+
     fn list_stream_uploads_for_bucket_page(
         &self,
         bucket: &BucketName,
