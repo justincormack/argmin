@@ -14937,7 +14937,7 @@ impl super::StorageCluster {
         mut req: CompleteMultipartCommitRequest,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(
+        let publisher = crate::metadata_command::metadata_command_publisher!(
             CompleteMultipartUploadCommitSerialized
         );
         let super::MultipartObjectMutationEffectRoute {
@@ -15193,25 +15193,47 @@ impl super::StorageCluster {
                 }
             };
             // A matching completion contender carries the exact outcome this caller must return.
-            // Let the retry loop observe it instead of draining it generically and losing that
+            // Preserve it for the retry loop instead of draining it generically and losing that
             // request-shaped result.
-            let installed = match self
-                .try_install_pending_metadata_command_for_bucket_with_effect_fence(
-                    pg_id,
-                    &bucket,
-                    &command,
-                    Some(effect_fence),
-                ) {
-                Ok(installed) => installed,
-                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                    ..
-                })) => {
-                    if let Err(error) =
-                        self.drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
-                    {
+            match self.install_matching_outcome_retry_metadata_command(
+                publisher,
+                pg_id,
+                &bucket,
+                &command,
+                Some(effect_fence),
+                |pending| {
+                    matches!(
+                        pending.payload(),
+                        MetadataCommandPayload::CommitMultipartObject(commit)
+                            if commit.matches_request(
+                                &bucket,
+                                &key,
+                                &upload_id,
+                                generation_id,
+                                req.completion_fingerprint,
+                                &req.part_records,
+                            )
+                    )
+                },
+            ) {
+                Ok(super::MatchingOutcomeRetryInstallOutcome::Installed) => {}
+                Ok(super::MatchingOutcomeRetryInstallOutcome::MatchingContenderVisible(
+                    pending,
+                )) => {
+                    let pending_owns_proof = matches!(
+                        pending.payload(),
+                        MetadataCommandPayload::CommitMultipartObject(commit)
+                            if commit.bucket_write_reservation == bucket_write_reservation
+                    );
+                    if !pending_owns_proof {
                         release_bucket_write_proof!()?;
-                        return Err(error);
                     }
+                    continue 'retry_after_pending_conflict;
+                }
+                Ok(
+                    super::MatchingOutcomeRetryInstallOutcome::UnrelatedContenderVisible
+                    | super::MatchingOutcomeRetryInstallOutcome::ContentionWithoutVisibleCommand,
+                ) => {
                     release_bucket_write_proof!()?;
                     continue 'retry_after_pending_conflict;
                 }
@@ -15219,32 +15241,6 @@ impl super::StorageCluster {
                     release_bucket_write_proof!()?;
                     return Err(error);
                 }
-            };
-            if !installed {
-                let pending_owns_proof =
-                    match self.pending_metadata_command_for_bucket(pg_id, &bucket) {
-                        Ok(Some(pending)) => matches!(
-                            pending.payload(),
-                            MetadataCommandPayload::CommitMultipartObject(commit)
-                                if commit.matches_request(
-                                    &bucket,
-                                    &key,
-                                    &upload_id,
-                                    generation_id,
-                                    req.completion_fingerprint,
-                                    &req.part_records,
-                                ) && commit.bucket_write_reservation == bucket_write_reservation
-                        ),
-                        Ok(None) => false,
-                        Err(error) => {
-                            release_bucket_write_proof!()?;
-                            return Err(error.into());
-                        }
-                    };
-                if !pending_owns_proof {
-                    release_bucket_write_proof!()?;
-                }
-                continue 'retry_after_pending_conflict;
             }
             self.apply_multipart_completion_command(pg_id, &bucket, &command)?;
 

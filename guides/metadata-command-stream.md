@@ -234,25 +234,15 @@ distinguishes installation, a matching visible contender, an unrelated visible
 contender, and contention without a visible slot. The helper never drains a
 contender: the owner loop must preserve a matching terminal command and may
 drain unrelated work only after it has rerun its matching check.
-Matching-outcome retry publishers are the exception: they may use the lower
-level `try_install_pending_metadata_command_for_bucket` only when the
-publisher's retry loop first checks for an equivalent pending command and can
-return the response from that command. Every such exception must be documented
-in the table above, listed in the boundary script allowlist as a
-matching-outcome path, and covered by an install-race regression where the
-equivalent command wins the pending slot after snapshot/command construction.
-Terminal-session retry publishers follow the same lower-level install rule, but
-the reason is different: they preserve the equivalent pending command instead
-of draining a command that deletes the session row needed by the matching
-branch. If they need to inspect an occupied slot before generic drain, they may
-call `try_set_pending_metadata_command_for_bucket` directly; any caller-owned
-proof or reservation that did not enter the winning command must be released
-before the publisher finishes the equivalent contender. Every such publisher
-needs a same-command install-race regression. If the raw install reports
-`MetadataCommandLogConflict` because the prebuilt command id is already
-terminal, that is still ordinary unrelated contention: drain the current PG
-slot and restart from a fresh snapshot. Only an occupied slot with an equivalent
-terminal command is preserved for the matching branch.
+Matching-outcome publishers use
+`install_matching_outcome_retry_metadata_command`, whose exhaustive result
+also preserves a matching visible command instead of draining it. The command
+envelope carries the response row and reservation ownership evidence needed by
+the retrying caller. Unrelated or no-longer-visible contention returns to the
+owner loop, which reruns its matching check before any generic drain. Every
+matching-outcome publisher must be documented above and covered by an
+install-race regression where the equivalent command wins after command
+construction.
 If a PG-wide pending slot appears after the publisher has taken its snapshot
 but before it allocates the command id, `MetadataCommandLogConflict` is the
 same pre-publish contention class: the publisher must drain the winner and
@@ -276,6 +266,9 @@ log-index contention, so retry cannot be mistaken for successful allocation or
 cleanup. Terminal-session publication returns the exhaustive, must-use
 `TerminalSessionRetryInstallOutcome`; matching command evidence is carried in
 that type and is never generically drained inside the typed installer.
+Matching-outcome publication provides the corresponding exhaustive, must-use
+`MatchingOutcomeRetryInstallOutcome`, retaining the exact command-owned result
+until the caller can converge it.
 Publisher paths which still call lower-level installers remain inventoried here
 and in
 `scripts/check-storage-cluster-boundaries` until their Phase 4 typed API is

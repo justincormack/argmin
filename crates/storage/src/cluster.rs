@@ -6488,6 +6488,14 @@ enum TerminalSessionRetryInstallOutcome {
     ContentionWithoutVisibleCommand,
 }
 
+#[must_use = "matching-outcome contention must preserve command-owned results"]
+enum MatchingOutcomeRetryInstallOutcome {
+    Installed,
+    MatchingContenderVisible(Box<MetadataCommandEnvelope>),
+    UnrelatedContenderVisible,
+    ContentionWithoutVisibleCommand,
+}
+
 enum ObjectPgPendingCommandInstall {
     Installed(MetadataCommandEnvelope),
     Pending(MetadataCommandEnvelope),
@@ -10418,6 +10426,38 @@ impl StorageCluster {
                     ),
                     Some(_) => Ok(TerminalSessionRetryInstallOutcome::UnrelatedContenderVisible),
                     None => Ok(TerminalSessionRetryInstallOutcome::ContentionWithoutVisibleCommand),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn install_matching_outcome_retry_metadata_command(
+        &self,
+        _publisher: impl crate::metadata_command::MatchingOutcomeRetryMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        is_matching: impl FnOnce(&MetadataCommandEnvelope) -> bool,
+    ) -> Result<MatchingOutcomeRetryInstallOutcome, ObjectPgActionError> {
+        match self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+        ) {
+            Ok(true) => Ok(MatchingOutcomeRetryInstallOutcome::Installed),
+            Ok(false)
+            | Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
+                match self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+                    Some(pending) if is_matching(&pending) => Ok(
+                        MatchingOutcomeRetryInstallOutcome::MatchingContenderVisible(Box::new(
+                            pending,
+                        )),
+                    ),
+                    Some(_) => Ok(MatchingOutcomeRetryInstallOutcome::UnrelatedContenderVisible),
+                    None => Ok(MatchingOutcomeRetryInstallOutcome::ContentionWithoutVisibleCommand),
                 }
             }
             Err(error) => Err(error),

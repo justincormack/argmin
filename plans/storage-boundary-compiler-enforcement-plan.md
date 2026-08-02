@@ -5337,6 +5337,29 @@ Third Phase 4 slice (2026-08-02):
   the storage boundary checker, formatting, workspace-wide strict Clippy, and
   the full 7,950-test workspace suite.
 
+Fourth Phase 4 slice (2026-08-02):
+
+- the sole `MatchingOutcomeRetry` publisher, serialized multipart completion,
+  now receives a token implementing the class-specific sealed
+  `MatchingOutcomeRetryMetadataCommandPublisher` trait.
+- its typed installer returns the exhaustive, must-use
+  `MatchingOutcomeRetryInstallOutcome`: installed, matching contender visible,
+  unrelated contender visible, or contention without a visible command. The
+  installer never drains at this boundary, including after a command-log
+  conflict, so an equivalent completion command remains available to supply
+  the exact response row owned by the winning request.
+- matching evidence includes the command envelope. Multipart completion uses
+  it to distinguish a winning command that owns the caller's bucket-write
+  proof from one using a different proof, releasing only caller-owned authority
+  that did not enter the pending command. Unrelated contention returns to the
+  outer owner loop, which reruns exact-request matching before generic drain.
+- the migrated publisher no longer participates in the temporary shell helper
+  inventory. The scanner requires its authoritative registry marker, and its
+  adversarial fixture rejects an unmarked matching-outcome typed call.
+- validation passed the full 29-test multipart-completion storage module, the
+  storage boundary checker, formatting, workspace-wide strict Clippy, and the
+  full 7,951-test workspace suite.
+
 ### Phase 5 — isolate test support
 
 1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside

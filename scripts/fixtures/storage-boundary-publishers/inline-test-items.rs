@@ -76,6 +76,15 @@ impl Fixture {
         install_terminal_session_retry_metadata_command();
     }
 
+    fn typed_matching_outcome_publisher_is_not_shell_inventoried() {
+        crate::metadata_command::metadata_command_publisher!(TypedMatchingOutcomePublisher);
+        install_matching_outcome_retry_metadata_command();
+    }
+
+    fn typed_matching_outcome_publisher_without_marker_is_rejected() {
+        install_matching_outcome_retry_metadata_command();
+    }
+
     fn publisher_token_constructor_function_item_is_rejected() {
         let mint =
             crate::metadata_command::publisher::TypedSnapshotPublisher::__from_registry_marker;

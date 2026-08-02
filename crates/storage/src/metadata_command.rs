@@ -85,6 +85,10 @@ mod terminal_session_retry_publisher_token_sealed {
     pub trait Sealed {}
 }
 
+mod matching_outcome_retry_publisher_token_sealed {
+    pub trait Sealed {}
+}
+
 /// Compiler-visible authority to use the snapshot-sensitive install path.
 ///
 /// Implementations are generated exclusively from registry entries classified
@@ -112,6 +116,17 @@ pub(crate) trait AllocatorCleanupMetadataCommandPublisher:
 /// the publisher's retry loop can consume it.
 pub(crate) trait TerminalSessionRetryMetadataCommandPublisher:
     terminal_session_retry_publisher_token_sealed::Sealed
+{
+}
+
+/// Compiler-visible authority to publish a command whose matching contender
+/// carries the caller's response outcome.
+///
+/// Implementations are generated exclusively from registry entries classified
+/// as `MatchingOutcomeRetry`. The matching command must remain visible until
+/// the publisher extracts its command-owned result.
+pub(crate) trait MatchingOutcomeRetryMetadataCommandPublisher:
+    matching_outcome_retry_publisher_token_sealed::Sealed
 {
 }
 
@@ -160,6 +175,21 @@ macro_rules! define_metadata_command_publisher_token {
 
         impl super::terminal_session_retry_publisher_token_sealed::Sealed for $id {}
         impl super::TerminalSessionRetryMetadataCommandPublisher for $id {}
+    };
+    ($id:ident, MatchingOutcomeRetry) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) struct $id {
+            _private: (),
+        }
+
+        impl $id {
+            pub(crate) const fn __from_registry_marker() -> Self {
+                Self { _private: () }
+            }
+        }
+
+        impl super::matching_outcome_retry_publisher_token_sealed::Sealed for $id {}
+        impl super::MatchingOutcomeRetryMetadataCommandPublisher for $id {}
     };
     ($id:ident, $class:ident) => {
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4660,6 +4690,18 @@ mod tests {
         require_terminal_session_retry(metadata_command_publisher!(AbortMultipartUploadLocked));
         require_terminal_session_retry(metadata_command_publisher!(
             AbortAuthorizedMultipartUploadLocked
+        ));
+    }
+
+    #[test]
+    fn matching_outcome_publisher_marker_returns_typed_registry_token() {
+        fn require_matching_outcome_retry(
+            _publisher: impl MatchingOutcomeRetryMetadataCommandPublisher,
+        ) {
+        }
+
+        require_matching_outcome_retry(metadata_command_publisher!(
+            CompleteMultipartUploadCommitSerialized
         ));
     }
 
