@@ -30522,7 +30522,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_unix_control_plane_client_signs_admin_pg_update() {
+    fn authenticated_pg_admin_facade_signs_admin_pg_update() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -30561,17 +30561,15 @@ mod tests {
             );
         });
 
-        let client = AuthenticatedUnixControlPlaneClient::new(
+        let client = crate::ControlPlanePgAdminClient::new(
             UnixControlPlaneClient::new(&socket_path),
-            admin_auth_credential("auth-cluster", "admin-1"),
+            Some(admin_auth_credential("auth-cluster", "admin-1")),
         );
-        let cluster_epoch = crate::clock::with_time_override(2_000, || {
-            client.set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1)], 2_000)
-        })
-        .unwrap();
+        let cluster_epoch =
+            crate::clock::with_time_override(2_000, || client.set_acting_set(7, vec![1])).unwrap();
 
         server.join().unwrap();
-        assert!(cluster_epoch.get() >= 2);
+        assert!(cluster_epoch >= 2);
         let metrics = verifier_for_assert.metrics_snapshot();
         assert_eq!(metrics.accepted_total(), 2);
         assert_eq!(
@@ -33686,7 +33684,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_control_plane_client_sets_pg_acting_set_live() {
+    fn plain_pg_admin_facade_sets_pg_acting_set_live() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let state_path = tmp.path().join("control-plane.state");
@@ -33698,23 +33696,21 @@ mod tests {
         authority
             .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
             .unwrap();
-        authority
-            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
-            .unwrap();
         let previous_epoch = authority.snapshot().cluster_epoch();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut stream, _addr) = listener.accept().unwrap();
-            handle_control_plane_unix_stream(&mut authority, &mut stream, 2_000).unwrap();
+            for _ in 0..2 {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                handle_control_plane_unix_stream(&mut authority, &mut stream, 2_000).unwrap();
+            }
         });
 
-        let client = UnixControlPlaneClient::new(&socket_path);
-        let cluster_epoch = client
-            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1), NodeId::new(2)])
-            .unwrap();
+        let client =
+            crate::ControlPlanePgAdminClient::new(UnixControlPlaneClient::new(&socket_path), None);
+        let cluster_epoch = client.set_acting_set(7, vec![1, 2]).unwrap();
 
         server.join().unwrap();
-        assert!(cluster_epoch > previous_epoch);
+        assert!(cluster_epoch > previous_epoch.get());
         let authority =
             SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap();
         assert_eq!(
@@ -35173,7 +35169,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_unix_serving_pg_runtime_map_uses_check_applied_timeout_for_slow_response() {
+    fn authenticated_pg_status_facade_uses_check_applied_timeout_for_slow_response() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -35182,10 +35178,27 @@ mod tests {
             .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
         authority
             .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
             .unwrap();
+        heartbeat_with_pg_proof(&mut authority, 1, 7, PgState::Peering, proof, false, 2_000);
+        authority
+            .complete_pg_peering(
+                PgId::new(7),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(&mut authority, 1, 7, PgState::Active, proof, false, 2_002);
         let expected_epoch = authority.snapshot().cluster_epoch();
+        let expected_route_epoch =
+            authority.runtime_map_snapshot(2_003).unwrap().pg_routes()[0].cluster_epoch();
         let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
@@ -35194,28 +35207,22 @@ mod tests {
             handle_control_plane_unix_stream_with_auth(
                 &mut authority,
                 &mut stream,
-                2_000,
+                2_003,
                 &verifier,
             )
             .unwrap();
         });
 
-        let client = AuthenticatedUnixControlPlaneClient::new(
+        let client = crate::ControlPlanePgStatusClient::new(
             UnixControlPlaneClient::new(&socket_path),
-            frontend_auth_credential("auth-cluster", "frontend-1"),
+            Some(frontend_auth_credential("auth-cluster", "frontend-1")),
         );
-        let runtime_map = ControlPlaneRuntimeMapSource::serving_pg_runtime_map_snapshot(
-            &client,
-            PgId::new(7),
-            2_000,
-        )
-        .unwrap();
+        let (runtime_epoch, route_epoch) =
+            crate::clock::with_time_override(2_003, || client.serving_epochs(7, &[1])).unwrap();
 
         server.join().unwrap();
-        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
-        assert_eq!(runtime_map.pg_routes().len(), 1);
-        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
-        assert!(runtime_map.freshness_proof().is_serving_authority_read());
+        assert_eq!(runtime_epoch, expected_epoch.get());
+        assert_eq!(route_epoch, expected_route_epoch.get());
     }
 
     #[test]

@@ -1341,6 +1341,28 @@ fence/set/proof commands and the residual
 static control-plane administration and transport-bootstrap orchestration remain pending parts of
 item 4.
 
+The twenty-eighth bounded slice contains the manual operator PG administration and scoped
+readiness seam. `argmin-s3` now parses and renders only logical integer PG, node, epoch, and
+metadata-proof components. A storage-owned `ControlPlanePgAdminClient` binds the configured
+transport and optional admin credential, constructs the private PG/node/proof representations,
+performs checked acting-set, fence, and metadata-transfer installation operations, and returns
+only the resulting logical epoch. The metadata-transfer install input is opaque after construction,
+validates its logical acting-set and epoch invariants before dispatch, and has a redacted debug
+view. Offline acting-set mutation likewise opens and mutates the owner-private control-plane store
+inside `storage`; the process retains only its pre-existing process-lock orchestration. A separate
+opaque `ControlPlanePgStatusClient` owns the frontend-authenticated scoped runtime-map read and
+validates that the requested PG is Active, leased, and serving on the exact operator-supplied
+acting set before returning logical runtime and route epochs. Transport/protocol causes remain
+retained behind a redacted storage error, while readiness mismatches use owner-defined semantic
+diagnostics rather than process interpretation of route state. Owner-local coverage pins exact
+proof construction and input rejection, offline mutation, plain and authenticated live dispatch,
+and scoped readiness; process tests retain argument parsing, command composition, and CLI-visible
+success behavior. The repository boundary check rejects PG/proof/store/runtime-map reconstruction
+within the manual command seam and rejects representation accessors, public fields, derived
+diagnostics, or a general runtime-map-source implementation on the opaque facades. Residual static
+control-plane administration, authority-clock/Raft operator commands, transport bootstrap, and
+the process-hosted control-plane authority implementation remain pending parts of item 4.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1624,10 +1646,13 @@ Raft peer client and server transports are storage-owned and boundary-checked.
 12. **In progress:** deterministic static storage-placement interpretation and certified initial
     topology/bootstrap assembly are storage-owned without transferring outer manifest ownership.
     The automatic live PG metadata-transfer state machine, including route/proof inspection,
-    runtime-map reconstruction, artifact movement, and retry classification, is now contained
-    behind an opaque storage-owned administration operation. The remaining work is to contain the
-    manual operator PG fence/set/proof command surfaces and the residual static control-plane
-    administration and transport-bootstrap orchestration.
+    runtime-map reconstruction, artifact movement, and retry classification, is contained behind
+    an opaque storage-owned administration operation. Manual operator PG acting-set, fence,
+    metadata-transfer installation, offline state mutation, and scoped readiness operations are
+    also storage-owned and accept only logical integers or opaque inputs from the process. The
+    remaining work is to contain residual static control-plane administration, authority-clock and
+    Raft operator commands, transport bootstrap, and the process-hosted control-plane authority
+    implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

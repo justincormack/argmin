@@ -4070,6 +4070,90 @@ fail_with_matches \
     "Live metadata-transfer capabilities must expose only operation-specific private dispatch, not the full runtime-map source trait" \
     "$metadata_transfer_runtime_map_trait_leaks"
 
+manual_pg_admin_process_representation_leaks=$(
+    awk '
+    /^fn parse_control_plane_pg_acting_set_args/ {
+        in_manual_pg_admin = 1
+    }
+    in_manual_pg_admin && /^fn format_control_plane_runtime_map_diagnostics/ {
+        exit
+    }
+    in_manual_pg_admin && ($0 ~ /(^|[^A-Za-z0-9_])(PgId|NodeId|PgState|PgMetadataProof|PgMetadataTransferProof|FileControlPlaneStore|SingleAuthorityControlPlane)([^A-Za-z0-9_]|$)/ || $0 ~ /\.(set_pg_acting_set_checked|fence_pg_for_metadata_transfer_runtime_map_checked|set_pg_acting_set_with_metadata_transfer_checked|serving_pg_runtime_map_snapshot)\(/) {
+        print FILENAME ":" FNR ":" $0
+    }
+    ' crates/argmin-s3/src/main.rs
+)
+fail_with_matches \
+    "Manual PG administration and readiness commands must pass logical integers and opaque inputs to storage-owned facades rather than constructing or interpreting PG, proof, store, or runtime-map representations" \
+    "$manual_pg_admin_process_representation_leaks"
+
+manual_pg_admin_direct_dispatch_leaks=$(
+    awk '
+    /^mod tests[[:space:]]*\{/ {
+        exit
+    }
+    /^[[:space:]]*(pub([[:space:]]*\([^)]*\))?[[:space:]]+)?fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*/ {
+        current_fn = $0
+        sub(/^.*fn[[:space:]]+/, "", current_fn)
+        sub(/\(.*/, "", current_fn)
+    }
+    /\.(set_pg_acting_set_checked|fence_pg_for_metadata_transfer_runtime_map_checked|set_pg_acting_set_with_metadata_transfer_checked)\(/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    /\.serving_pg_runtime_map_snapshot\(/ && current_fn != "serving_pg_runtime_map_snapshot" {
+        print FILENAME ":" FNR ":" $0
+    }
+    ' crates/argmin-s3/src/main.rs
+)
+fail_with_matches \
+    "Production argmin-s3 code must dispatch manual PG mutations and scoped readiness through the storage-owned facades" \
+    "$manual_pg_admin_direct_dispatch_leaks"
+
+manual_pg_admin_opaque_surface_leaks=$(
+    {
+        rg -n -U --color=never \
+            'pub struct (ControlPlanePgAdminClient|ControlPlanePgStatusClient|ControlPlanePgMetadataTransferInstall|ControlPlanePgAdminInputError|ControlPlanePgAdminError)\(pub|pub struct (ControlPlanePgAdminClient|ControlPlanePgStatusClient|ControlPlanePgMetadataTransferInstall|ControlPlanePgAdminInputError|ControlPlanePgAdminError)[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:' \
+            crates/storage/src/control_plane_pg_admin.rs \
+            || true
+        rg -n -U --color=never \
+            '#\[derive\([^]]*(Debug|Clone|Copy|PartialEq|Eq)[^]]*\)\][[:space:]]*pub struct (ControlPlanePgAdminClient|ControlPlanePgStatusClient|ControlPlanePgMetadataTransferInstall|ControlPlanePgAdminInputError|ControlPlanePgAdminError)' \
+            crates/storage/src/control_plane_pg_admin.rs \
+            || true
+        awk '
+        /impl (ControlPlanePgAdminClient|ControlPlanePgStatusClient|ControlPlanePgMetadataTransferInstall|ControlPlanePgAdminInputError|ControlPlanePgAdminError)[[:space:]]*\{/ {
+            in_pg_admin_impl = 1
+            pg_admin_impl = $0
+            sub(/^.*impl /, "", pg_admin_impl)
+            sub(/[[:space:]]*\{.*/, "", pg_admin_impl)
+            depth = 0
+        }
+        in_pg_admin_impl {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if ((pg_admin_impl == "ControlPlanePgAdminClient" && method != "new" && method != "set_acting_set" && method != "fence_for_metadata_transfer" && method != "install_metadata_transfer") || (pg_admin_impl == "ControlPlanePgStatusClient" && method != "new" && method != "serving_epochs") || (pg_admin_impl == "ControlPlanePgMetadataTransferInstall" && method != "new") || pg_admin_impl == "ControlPlanePgAdminInputError" || pg_admin_impl == "ControlPlanePgAdminError") {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_pg_admin_impl = 0
+            }
+        }
+        ' crates/storage/src/control_plane_pg_admin.rs
+        rg -n -U --color=never \
+            'impl[^{]*ControlPlaneRuntimeMapSource[^{]*for[[:space:]]+ControlPlanePg(Admin|Status)' \
+            crates/storage/src/control_plane_pg_admin.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "Manual PG administration facades must retain clients, topology, proofs, and diagnostics opaquely and expose only their bounded logical operations" \
+    "$manual_pg_admin_opaque_surface_leaks"
+
 control_plane_client_wire_leaks=$(
     rg -n --color=never \
         '\bControlPlaneRpcFrame(Transport|Exchange|ExchangeError)\b|\bwith_frame_transport\b|\bconnect_unix_stream_until\b' \
