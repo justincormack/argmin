@@ -12108,10 +12108,11 @@ Phase 12.4 exit criteria:
   vote, last durable committed and applied log ids, last durable authority
   timestamp high-water, peer-auth failures, retry-confirmation outcomes, and
   poison reasons.
-- Phase 12.4 may close only with the bounded incremental ordinary-peer
-  acknowledgement path; replicated-mode production cutover remains blocked
-  until the remaining compact-history, split-refresh, and quantitative
-  write/load gates above pass.
+- The bounded incremental ordinary-peer acknowledgement path, compact-history
+  behavior, split refresh, and functional authenticated multihost composition
+  gates are implemented. Replicated-mode production release qualification now
+  remains blocked on the quantitative sustained write/load gate described
+  below, not on the completed functional integration slices.
 
 Supported deployment modes, replicated topologies, and gating:
 
@@ -12422,9 +12423,10 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   subtracted the clock-skew budget twice on the receiving host, and the
   frontend storage capability omitted the historical-shard read and
   reclaim-existence probe required by ordinary retained-payload GETs. This is
-  integration evidence for the composed path; the default 116-PG/256-epoch
-  multi-cycle profile and the complete server-local operation-capability gate
-  remain the release closeout.
+  integration evidence for the composed path. At that point, the default
+  116-PG/256-epoch multi-cycle profile and the complete server-local operation-
+  capability gate remained the release closeout; both were completed by the
+  later work recorded below.
 - A subsequent default-dimension attempt exposed that foreground and
   maintenance-authenticated cluster views had separate process-local reclaim
   queues. Foreground deletion could therefore persist recovery work but its
@@ -12433,7 +12435,8 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   clients now retain distinct credentials while sharing the process-local
   lease, recovery-flight, and work-queue state; refreshed generations inherit
   the same state. The reduced three-host workload covers this composed wiring
-  through versioned cleanup. The full default-dimension rerun remains required.
+  through versioned cleanup. At that point the full default-dimension rerun was
+  still required; the later run below completed it.
 - The next default-dimension run exposed two genuinely cross-host boundaries.
   Authenticated control-plane requests originally allowed no future timestamp
   skew, so an otherwise synchronized storage host approximately 100 ms ahead of
@@ -12446,8 +12449,8 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   make the pre-restart runtime map look fully serving. The restart gate now
   requires a strictly newer committed runtime-map epoch and all PGs serving,
   proving that the new incarnation was observed and its Peering transition
-  completed before post-restart traffic and cleanup begin. The full
-  default-dimension rerun remains required.
+  completed before post-restart traffic and cleanup begin. This attempt still
+  required the later complete default-dimension rerun recorded next.
 - The complete default-dimension three-host data-plane rerun now passes. It
   committed 256 retained route advances over 116 PGs, completed persistent
   create/PUT/GET/HEAD/list and versioned cleanup traffic, survived leadership
@@ -12465,23 +12468,39 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   exact authenticated response and payload envelope validate; every transport,
   authentication, request-identity, or decode failure retires it without
   retrying the possibly applied operation. This closes the initial static
-  authenticated multihost data-plane integration gate. Quantitative sustained
-  workload gates and certified degraded reads while a storage host is offline
-  remain separate release work.
-- The current storage restart step verifies durable recovery after the node
-  returns. It does not yet claim uninterrupted S3 reads while that storage host
-  is offline: lease expiry deliberately moves affected PGs to `Peering`, where
-  the current strict metadata policy fails closed. Continuous reads with at
-  least `k` surviving shards belong to the degraded-read availability gate and
-  must be added once Peering has a certified read policy; they must not be
-  simulated by extending leases or by harness retries.
+  authenticated multihost data-plane integration gate.
+- Capability-bound degraded reads are now implemented. A retained read
+  capability preserves the exact historical route and permits only the
+  read-side operations needed to reconstruct an object from at least `k`
+  reachable valid shards; it does not grant new-work, repair, reclaim, or
+  metadata-publication authority. The multihost
+  `storage-node-kill-fails-closed` smoke kills a non-primary shard node and
+  proves fresh GET, HEAD, and List continue across the real connection-failure
+  path while a new PUT fails closed. This closes the certified degraded-read
+  availability gate without extending leases or retrying writes.
+- Phase 3 of the storage-boundary compiler-enforcement plan is complete.
+  Authenticated Unix and TLS/TCP requests share one post-authentication
+  server-local capability boundary, and no request path can construct a
+  role-specific PG identity from arbitrary raw route data. Phase 4 metadata-
+  command publisher typing is now in progress as a separate hardening phase
+  rather than a blocker for the completed split-role functional integration
+  gate.
+- The next multihost release slice is quantitative sustained qualification.
+  Extend the default 116-PG/256-retained-epoch workload across repeated
+  authority leadership-loss/restart and storage-host outage/rejoin cycles;
+  retain degraded-read assertions during each outage; collect per-host WAL,
+  checkpoint, fsync, RPC retry, authentication, connection-pressure, and
+  recovery-latency metrics; and enforce explicit bounds on durable write rate,
+  retained artifact/WAL size, and convergence time. Preserve all per-host
+  diagnostics when a bound fails.
 - Frontend process availability is now independent of full-cluster PG
   convergence. Dynamic startup constructs route handles, starts refresh and
   background workers, and binds the S3 listener from the current committed map
-  even when one or more PGs are `Peering`; each request still fails closed at
-  the routed PG boundary unless that PG has a current Active serving route.
-  This preserves healthy-PG availability while recovery proceeds and removes
-  the former indefinite all-PG startup wait.
+  even when one or more PGs are `Peering`. Mutations still require the current
+  Active serving route; retained reads may instead use the narrow certified
+  degraded-read capability described above. This preserves healthy-PG and
+  reconstructible-read availability while recovery proceeds and removes the
+  former indefinite all-PG startup wait.
 - Authenticated storage RPC connection reuse now reserves stateful capacity at
   the server rather than relying on independent client pool limits. At most
   `max_connections - 1` ordinary connections may remain retained; a response
@@ -12492,28 +12511,30 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   close, so the sole slot cannot remain occupied by an idle pooled connection.
   Saturation coverage composes one ordinary authenticated TLS request with a
   subsequent stateful metadata-command session at that minimum limit.
-- Add shared authenticated test helpers first, in
+- Shared authenticated test helpers are implemented in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
-  so all replicated process and UAT tests can configure authenticated Unix
-  sockets without duplicating scoped-credential setup.
-- Convert standard Unix multi-node/UAT paths to authenticated mode. Unix sockets
-  remain the main local replicated and process-test transport, but replicated
-  mode has no unauthenticated opt-out. Keep unauthenticated Unix coverage only
-  for standalone and explicit auth-rejection tests.
+  allowing replicated process and UAT tests to configure authenticated Unix
+  sockets without duplicating scoped-credential setup. Migration of remaining
+  fixtures to shared manifest builders is cleanup rather than an activation
+  blocker.
+- Replicated Unix mode now requires authentication. Unix sockets remain the
+  main local replicated and process-test transport; unauthenticated Unix
+  coverage is confined to standalone compatibility and explicit auth-
+  rejection tests.
 - Do the Raft naming cleanup as a dedicated production-cutover slice, not
   piecemeal during WAL/auth work. That slice should remove or replace
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`, rename process/log/test labels and
   `ExperimentalRaftControlPlane`-style wrappers only once the replicated
   control-plane mode is no longer experimental, and update docs/security
   references together.
-- Lock the transport policy before adding TCP: every TCP/non-local internal
-  transport is authenticated-only. A TCP Raft peer, control-plane admin,
+- The transport policy is implemented: every TCP/non-local internal transport
+  is authenticated-only. A TCP Raft peer, control-plane admin,
   storage-node heartbeat, frontend runtime-map listener, or storage data-plane
   listener/client must reject startup without the required scoped credentials.
   There should be no unauthenticated TCP mode.
-- Introduce an internal cluster configuration-file surface with the TCP
+- The internal cluster configuration-file surface is implemented with the TCP
   transport slices rather than continuing to grow flat env vars. The first file
-  format should cover deployment mode, cluster identity, selected failure-domain
+  format covers deployment mode, cluster identity, selected failure-domain
   level and tolerance, hierarchical host/disk identities, control-plane and
   storage transport listeners, Raft and storage-node endpoints, scoped
   role/principal credential ids/versions and secret references, rotation
@@ -12523,12 +12544,13 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   generators. They never override any manifest field when
   `ARGMIN_CLUSTER_CONFIG_PATH` is active; mixed input fails closed before
   digest computation, state opening, or listener construction.
-- Add a **transport-independent storage RPC authentication and authorization
-  slice before TCP**. Define a bounded/versioned envelope over the existing
-  storage RPC payload and response frames, bind cluster/source/target identity,
-  operation kind and direction, topology generation, PG/shard route and epoch,
-  request or command identity, and operation-specific freshness/replay fields,
-  and authorize the authenticated role before storage dispatch or mutation.
+- The **transport-independent storage RPC authentication and authorization
+  slice** is implemented. It defines a bounded/versioned envelope over the
+  existing storage RPC payload and response frames and binds cluster, source,
+  and target identity; operation kind and direction; topology generation;
+  PG/shard route and epoch; request or command identity; and operation-specific
+  freshness/replay fields. It authorizes the authenticated role before storage
+  dispatch or mutation.
   Keep the authorization matrix explicit for frontend/coordinator,
   storage-node/repair, and maintenance operations rather than treating a valid
   MAC as permission for every storage RPC. The codec/policy foundation is now
@@ -12551,31 +12573,31 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   capabilities before storage effects. Because the full nested frame is
   covered, its route epoch,
   PG/shard identity, command identity, and payload cannot be relabeled
-  independently. Runtime Unix enforcement and a composed authenticated Unix
-  maintenance-client regression remain open and must land before this item is
-  considered complete.
-- Wire that storage auth boundary into Unix clients/listeners first and make it
-  mandatory in replicated mode. Add shared credential/test helpers and negative
-  coverage for every storage RPC operation family: missing/malformed auth,
-  wrong cluster/role/source/target, wrong operation or direction, stale topology
-  generation/route/epoch, replay outside the operation's idempotency contract,
-  tampered request/response, oversized/truncated frames, and rejection before
-  mutation. Standalone may explicitly opt out on local Unix; replicated Unix
-  must fail startup when required storage credentials are absent.
-- Add TCP Raft peer transport as a distinct multihost slice after the config
-  file/auth-helper work. TCP is not just an auth change: it affects peer
-  addressing, listener lifecycle, connection retry/backoff, source/target
+  independently. Runtime Unix enforcement and composed authenticated Unix
+  maintenance-client coverage are implemented.
+- The storage auth boundary is wired into Unix clients/listeners and is
+  mandatory in replicated mode. Shared credential/test helpers are in place.
+  Negative coverage spans every storage RPC operation family: missing or
+  malformed auth, wrong cluster/role/source/target, wrong operation or
+  direction, stale topology generation/route/epoch, replay outside the
+  operation's idempotency contract, tampered request/response,
+  oversized/truncated frames, and rejection before mutation. Standalone may
+  explicitly opt out on local Unix; replicated Unix must fail startup when
+  required storage credentials are absent.
+- TCP Raft peer transport is implemented as a distinct multihost slice after
+  the config-file/auth-helper work. TCP is not just an auth change: it affects
+  peer addressing, listener lifecycle, connection retry/backoff, source/target
   identity binding, and operational deployment shape. It must reuse the shared
   auth envelope and fail closed before OpenRaft dispatch.
-- Add TCP storage-node transport as a subsequent data-plane slice that reuses
-  the exact authenticated storage RPC envelope, authorization matrix, and
-  dispatch boundary already enforced on Unix. This slice enables multihost
-  replicated topologies without changing operation semantics and adds TCP
-  addressing, listener lifecycle, connection management/backoff, endpoint
-  discovery, frame and in-flight bounds, confidentiality, streaming behavior,
-  and ambiguous-response retry rules. Authenticated Unix storage RPC remains the
-  transport for local replicated topologies and process tests; TCP must not
-  introduce a second auth or authorization implementation.
+- TCP storage-node transport is implemented as a subsequent data-plane slice
+  that reuses the exact authenticated storage RPC envelope, authorization
+  matrix, and dispatch boundary already enforced on Unix. This slice enables
+  multihost replicated topologies without changing operation semantics and
+  adds TCP addressing, listener lifecycle, connection management/backoff,
+  endpoint discovery, frame and in-flight bounds, confidentiality, streaming
+  behavior, and ambiguous-response retry rules. Authenticated Unix storage RPC
+  remains the transport for local replicated topologies and process tests; TCP
+  must not introduce a second auth or authorization implementation.
 - Defer dynamic configured peer-policy updates and formal admin API
   restructuring unless the TCP/config-file work exposes a concrete ambiguity.
   Dynamic Raft membership and storage expansion are prerequisites for the

@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–2 complete; Phase 3 in progress
+Status: active — Phases 0–3 complete; Phase 4 in progress
 
 Related plans:
 

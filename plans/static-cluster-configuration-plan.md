@@ -1,6 +1,7 @@
 # Static Cluster Configuration Plan
 
-Status: implementation in progress
+Status: core static split-role implementation complete; quantitative release
+qualification and deferred topology modes remain
 
 Related plans:
 
@@ -160,11 +161,11 @@ coordination locks are opened atomically without following symlinks and must be
 regular files before their pathnames are treated as coordination metadata.
 This prepares state only. Split-role replicated storage and frontend startup
 now enforce mandatory storage-RPC authentication at the shared Unix/TLS-TCP
-dispatch boundary. Replicated-mode release certification remains unavailable
-until every stateful handler reaches its server-local, capability-requiring
-effect boundary. Certification requires composed positive and adversarial
-tests crossing both layers; outer authentication alone is not the release
-gate.
+dispatch boundary. Phase 3 of the storage-boundary compiler-enforcement plan
+completed the server-local capability requirement for stateful request paths;
+composed positive and adversarial tests cross both authentication and local
+capability layers. Phase 4 publisher typing is continuing hardening, not a
+prerequisite for the completed split-role functional integration gate.
 
 Replicated control-plane process identity is initialized through the same
 command, once per configured authority process id. This creates only the
@@ -952,7 +953,7 @@ loaded.
 
 ## Implementation Slices
 
-Progress as of 2026-07-21:
+Progress as of 2026-08-02:
 
 - Slice 1 is implemented: the manifest has strict version-1 TOML input types,
   a 4 MiB bounded atomic no-follow regular-file loader, closed enums and
@@ -1031,10 +1032,11 @@ Progress as of 2026-07-21:
   Initialization is idempotent and crash-resumable under the same durable
   marker/root/PG publication protocol. Split-role replicated runtime activation
   now has mandatory transport-independent storage-RPC authentication over Unix
-  and TLS/TCP. Complete release certification remains blocked on server-local
-  operation-capability enforcement. Composed workflow tests must cross the
-  authenticated principal-role check and the local route/subject capability
-  boundary before that gate closes.
+  and TLS/TCP. Phase 3 of the storage-boundary compiler-enforcement plan has
+  completed the server-local operation-capability gate. Composed workflow tests
+  cross both the authenticated principal-role check and the local route/subject
+  capability boundary; outer authentication alone is still not treated as
+  authorization.
 - Slice 5's material-resolution sub-slice is implemented: a selected process
   resolves bounded no-follow files into redacted binary credential material,
   rustls certified keys, and explicit root stores. Resolution is role/listener
@@ -1187,15 +1189,21 @@ Progress as of 2026-07-21:
   old and new object bytes. Foreground retained-payload reads explicitly carry
   only the two additional read-side capabilities they require: historical
   shard read and reclaim-existence lookup; repair and reclaim mutations remain
-  maintenance-only. The complete server-local operation-capability gate and
-  the default 116-PG/256-retained-epoch multi-cycle run remain open, so this
-  slice is integration evidence rather than final data-plane release closure.
+  maintenance-only. The server-local operation-capability gate completed with
+  Phase 3 of the storage-boundary compiler-enforcement plan. The complete
+  default 116-PG/256-retained-epoch, three-host, multi-cycle workload also
+  passes over authenticated TLS/TCP, closing the functional static split-role
+  data-plane integration gate.
   Foreground and maintenance role views share process-local leases, recovery
   flights, and maintenance queues while retaining separate typed signers; this
   prevents foreground durable cleanup from depending on a delayed safety scan.
-  The current restart check proves recovery after a storage node returns, not
-  uninterrupted reads during its absence. That stronger assertion remains
-  gated on the replicated Peering/degraded-read policy.
+  Retained reads across a storage-node outage are also implemented. The
+  capability-bound read path reconstructs data from at least `k` reachable
+  valid shards without granting mutation authority. The multihost
+  `storage-node-kill-fails-closed` smoke proves fresh GET, HEAD, and List remain
+  available after a non-primary shard node is killed while a new PUT fails
+  closed. Quantitative sustained workload qualification remains separate from
+  these completed functional gates.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
@@ -1243,8 +1251,9 @@ Progress as of 2026-07-21:
   authority state and fixed sidecars, temporary filename prefixes, storage
   data directories, and Unix sockets; exact or ancestor collisions fail before
   filesystem mutation.
-  Replicated replacement and dynamic topology lifecycle, storage/frontend
-  process mapping, and TCP transport remain open.
+  Replicated replacement, dynamic topology lifecycle, and replicated
+  `combined` activation remain open. Split-role storage/frontend process
+  mapping and authenticated Unix/TLS/TCP transport are implemented.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;
@@ -1257,7 +1266,7 @@ Progress as of 2026-07-21:
      digests plus the full-config fingerprint;
    - add order-independent test vectors and mutation sensitivity tests; and
    - expose redacted startup diagnostics.
-3. **Legacy mapping**
+3. **Runtime mapping**
    - map the resolved selected process into existing `ServerConfig`;
    - reject mixed file/env cluster configuration;
    - retain env-only standalone/test mode; and
@@ -1334,14 +1343,15 @@ Progress as of 2026-07-21:
      every required operation, alongside full role-by-kind and valid-MAC
      unauthorized-frame tests. This is process-role authorization, not the
      request-scoped route-capability layer; the storage-boundary plan governs
-     server-local trusted construction and storage-effect APIs. A composed real
-     Unix maintenance-client test
-     lands with the still-open Unix client/listener enforcement and manifest
-     credential activation sub-slice;
+     server-local trusted construction and storage-effect APIs. Composed real
+     Unix maintenance-client coverage, Unix client/listener enforcement, and
+     manifest credential activation are implemented for split-role processes;
    - reuse it unchanged over TCP (implemented for split-role storage and
      frontend runtime activation); and
-   - complete the server-local operation-capability gate, then promote the
-     cross-host workload to a complete data-plane release gate.
+   - complete the server-local operation-capability gate and promote the
+     cross-host workload to a complete functional data-plane integration gate
+     (implemented). Quantitative sustained release qualification remains in
+     the multihost plan.
 
 ## Required Tests
 
