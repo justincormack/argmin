@@ -4037,8 +4037,40 @@ metadata_transfer_retry_policy_leaks=$(
         || true
 )
 fail_with_matches \
-    "Live metadata-transfer retry classification is storage-owned; argmin-s3 must use PgMetadataTransferError::requires_route_refresh_retry" \
+    "Live metadata-transfer retry classification is storage-owned; argmin-s3 must use the opaque live-transfer operation" \
     "$metadata_transfer_retry_policy_leaks"
+
+metadata_transfer_representation_leaks=$(
+    rg -n --color=never \
+        '\bPgMetadataTransfer(Artifact|Error)\b|\.(metadata_transfer_(source|destination)_runtime_map|export_pg_metadata_transfer_artifact_for_live_transfer|import_pg_metadata_transfer_artifact_from_retained_log)\b|\b(MetadataTransfer(Export|Import)Context|metadata_transfer_peering_route|retry_pg_metadata_transfer_(export|import)|refresh_pg_metadata_transfer_(export|import)_route)\b' \
+        . \
+        -g 'crates/**/*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Live metadata-transfer routes, proofs, artifacts, reconstruction failures, and retry state machines are private to storage; use LivePgMetadataTransferAdmin" \
+    "$metadata_transfer_representation_leaks"
+
+metadata_transfer_opaque_surface_leaks=$(
+    rg -n -U --color=never \
+        'pub struct (LivePgMetadataTransfer(ReadClient|AdminClient|ControlPlaneClient|Admin|Summary|Error))\(pub|pub struct (LivePgMetadataTransfer(ReadClient|AdminClient|ControlPlaneClient|Admin|Summary|Error))[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:' \
+        crates/storage/src/live_pg_transfer.rs \
+        || true
+)
+fail_with_matches \
+    "Live metadata-transfer facades must not expose retained clients, topology, proofs, artifacts, or diagnostics as public fields" \
+    "$metadata_transfer_opaque_surface_leaks"
+
+metadata_transfer_runtime_map_trait_leaks=$(
+    rg -n -U --color=never \
+        'impl[^{]*ControlPlaneRuntimeMapSource[^{]*for[[:space:]]+LivePgMetadataTransfer' \
+        crates/storage/src/live_pg_transfer.rs \
+        || true
+)
+fail_with_matches \
+    "Live metadata-transfer capabilities must expose only operation-specific private dispatch, not the full runtime-map source trait" \
+    "$metadata_transfer_runtime_map_trait_leaks"
 
 control_plane_client_wire_leaks=$(
     rg -n --color=never \

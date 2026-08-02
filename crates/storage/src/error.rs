@@ -1260,7 +1260,7 @@ pub enum BucketSnapshotLoadError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum PgMetadataTransferError {
+pub(crate) enum PgMetadataTransferError {
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error(transparent)]
@@ -1289,7 +1289,7 @@ impl PgMetadataTransferError {
     /// route. This policy is storage-owned because it depends on private local,
     /// RPC, reconstruction, and nested apply failure representations.
     #[must_use]
-    pub fn requires_route_refresh_retry(&self) -> bool {
+    pub(crate) fn requires_route_refresh_retry(&self) -> bool {
         match self {
             Self::Store(error) => store_error_requires_metadata_transfer_route_refresh(error),
             Self::Apply(BucketSnapshotLoadError::Store(error)) => {
@@ -1300,16 +1300,6 @@ impl PgMetadataTransferError {
             }
             Self::RouteRefreshRequired { .. } => true,
         }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_route_refresh_required() -> Self {
-        Self::Store(StoreError::RouteMapExpired {
-            cluster_epoch: ClusterEpoch::INITIAL,
-            valid_until_ms: 1,
-            now_ms: 2,
-        })
     }
 }
 

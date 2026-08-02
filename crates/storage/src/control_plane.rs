@@ -56,7 +56,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 12;
+const CONTROL_PLANE_RPC_VERSION: u16 = 13;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -1580,6 +1580,7 @@ impl ClusterControlSnapshot {
             primary_node_id: primary,
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
+            active_metadata_proof: record.active_metadata_proof,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -1630,6 +1631,7 @@ impl ClusterControlSnapshot {
             primary_node_id: primary,
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
+            active_metadata_proof: record.active_metadata_proof,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -1668,6 +1670,7 @@ impl ClusterControlSnapshot {
             primary_node_id: primary,
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
+            active_metadata_proof: record.active_metadata_proof,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -1713,6 +1716,7 @@ impl ClusterControlSnapshot {
             primary_node_id: primary,
             acting_set: record.acting_set.clone(),
             state: record.state,
+            active_metadata_proof: None,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: record.peering_metadata_transfer,
             peering_metadata_transfer_destination_epoch:
@@ -4733,6 +4737,7 @@ pub struct PgRouteSnapshot {
     primary_node_id: NodeId,
     acting_set: Vec<NodeId>,
     state: PgState,
+    active_metadata_proof: Option<PgMetadataProof>,
     primary_lease_deadline_ms: Option<u64>,
     peering_metadata_transfer: Option<PgMetadataTransferProof>,
     peering_metadata_transfer_destination_epoch: Option<ClusterEpoch>,
@@ -4755,6 +4760,7 @@ impl PgRouteSnapshot {
             primary_node_id,
             acting_set,
             state,
+            active_metadata_proof: None,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -4787,6 +4793,11 @@ impl PgRouteSnapshot {
     #[must_use]
     pub fn state(&self) -> PgState {
         self.state
+    }
+
+    #[must_use]
+    pub(crate) fn active_metadata_proof(&self) -> Option<PgMetadataProof> {
+        self.active_metadata_proof
     }
 
     #[must_use]
@@ -4844,7 +4855,7 @@ enum PgActingSetRetryRouteDisposition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PgActingSetPreflightRoute {
     Absent,
-    Present(PgRouteSnapshot),
+    Present(Box<PgRouteSnapshot>),
 }
 
 fn pg_acting_set_preflight_deadline_error(pg_id: PgId) -> ControlPlaneError {
@@ -4865,6 +4876,7 @@ fn pg_acting_set_preflight_route(
         .iter()
         .find(|route| route.pg_id() == pg_id)
         .cloned()
+        .map(Box::new)
         .map(PgActingSetPreflightRoute::Present)
         .ok_or_else(|| {
             ControlPlaneError::rpc_protocol(format!(
@@ -5036,8 +5048,8 @@ pub struct ClusterRuntimeMapSnapshot {
 }
 
 const RUNTIME_MAP_CONTENT_DIGEST_LEN: usize = 32;
-const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v1";
-const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v1";
+const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v2";
+const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v2";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
@@ -5467,6 +5479,13 @@ pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSna
             },
         );
         // The lease deadline is renewed separately and does not change route content.
+        match route.active_metadata_proof() {
+            Some(proof) => {
+                digest_u8(hasher, 1);
+                digest_pg_metadata_proof(hasher, proof);
+            }
+            None => digest_u8(hasher, 0),
+        }
         match route.peering_metadata_transfer() {
             Some(transfer) => {
                 digest_u8(hasher, 1);
@@ -5736,6 +5755,7 @@ fn reconstruct_historical_pg_route(
         primary_node_id: primary,
         acting_set: record.acting_set.clone(),
         state: record.state,
+        active_metadata_proof: None,
         primary_lease_deadline_ms: None,
         peering_metadata_transfer: record.peering_metadata_transfer,
         peering_metadata_transfer_destination_epoch: record
@@ -5965,6 +5985,9 @@ fn reconstruct_pg_route_from_record(
         primary_node_id: primary,
         acting_set: record.acting_set.clone(),
         state: record.state,
+        active_metadata_proof: (record.state == PgState::Active)
+            .then_some(record.active_metadata_proof)
+            .flatten(),
         primary_lease_deadline_ms: None,
         peering_metadata_transfer: record.peering_metadata_transfer,
         peering_metadata_transfer_destination_epoch: peering_metadata_transfer_destination_epoch(
@@ -18434,6 +18457,13 @@ fn write_pg_route_snapshots(
         write_u32(out, route.pg_id().get());
         write_u32(out, route.primary_node_id().as_u32());
         write_pg_state(out, route.state());
+        match route.active_metadata_proof() {
+            Some(proof) => {
+                write_u8(out, 1);
+                write_pg_metadata_proof(out, proof);
+            }
+            None => write_u8(out, 0),
+        }
         write_option_u64(out, route.primary_lease_deadline_ms());
         match route.peering_metadata_transfer() {
             Some(transfer) => {
@@ -18760,6 +18790,13 @@ fn validate_runtime_map_routes(
                 route.state()
             )));
         }
+        if route.active_metadata_proof().is_some() && route.state() != PgState::Active {
+            return Err(ControlPlaneError::rpc_protocol(format!(
+                "{label} route for PG {} has an active metadata proof but is {:?}",
+                route.pg_id().get(),
+                route.state()
+            )));
+        }
         if route.peering_metadata_transfer().is_some()
             && (route
                 .peering_metadata_transfer_destination_epoch()
@@ -18886,6 +18923,15 @@ fn read_pg_route_snapshots(
         let pg_id = PgId::new(reader.read_u32()?);
         let primary_node_id = NodeId::new(reader.read_u32()?);
         let state = read_pg_state(reader)?;
+        let active_metadata_proof = match reader.read_u8()? {
+            0 => None,
+            1 => Some(read_pg_metadata_proof(reader)?),
+            tag => {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "invalid PG route active metadata proof tag {tag}"
+                )));
+            }
+        };
         let primary_lease_deadline_ms = reader.read_option_u64()?;
         let (
             peering_metadata_transfer,
@@ -19000,6 +19046,7 @@ fn read_pg_route_snapshots(
             primary_node_id,
             acting_set,
             state,
+            active_metadata_proof,
             primary_lease_deadline_ms,
             peering_metadata_transfer,
             peering_metadata_transfer_destination_epoch,
@@ -20146,7 +20193,7 @@ impl ControlPlaneError {
         }
     }
 
-    fn retained_diagnostic_message(&self) -> String {
+    pub(crate) fn retained_diagnostic_message(&self) -> String {
         match self {
             Self::Io { diagnostic } => {
                 format!("{}: {}", diagnostic.context, diagnostic.source)
@@ -35619,7 +35666,7 @@ mod tests {
     fn control_plane_rpc_rejects_previous_version_fixture() {
         let (mut writer, mut reader) = UnixStream::pair().unwrap();
         writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
-        write_u16_to_stream(&mut writer, 9);
+        write_u16_to_stream(&mut writer, CONTROL_PLANE_RPC_VERSION - 1);
         writer.write_all(&[0; 14]).unwrap();
 
         let error = read_control_plane_unix_request(&mut reader).unwrap_err();
@@ -35627,7 +35674,10 @@ mod tests {
         assert!(matches!(
             error,
             ControlPlaneError::RpcProtocol { diagnostic: message }
-                if message.as_str() == "unsupported control-plane RPC version 9"
+                if message.as_str() == format!(
+                    "unsupported control-plane RPC version {}",
+                    CONTROL_PLANE_RPC_VERSION - 1
+                )
         ));
     }
 
@@ -35845,6 +35895,7 @@ mod tests {
         write_u32(&mut payload, 7);
         write_u32(&mut payload, 1);
         write_pg_state(&mut payload, PgState::Active);
+        write_u8(&mut payload, 0);
         write_option_u64(&mut payload, None);
         write_u8(&mut payload, 0);
         write_u8(&mut payload, 0);
@@ -35984,6 +36035,7 @@ mod tests {
         snapshot.cluster_epoch = ClusterEpoch::new(2).unwrap();
         snapshot.pg_routes[0].cluster_epoch = snapshot.cluster_epoch;
         snapshot.pg_routes[0].state = PgState::Peering;
+        snapshot.pg_routes[0].active_metadata_proof = None;
         snapshot.pg_routes[0].primary_lease_deadline_ms = None;
         snapshot.pg_routes[0].pending_metadata_command_recovery =
             Some(PendingMetadataCommandRecovery::new(
@@ -36010,6 +36062,7 @@ mod tests {
         let route = &mut snapshot.pg_routes[0];
         route.cluster_epoch = snapshot.cluster_epoch;
         route.state = PgState::Peering;
+        route.active_metadata_proof = None;
         route.primary_lease_deadline_ms = None;
         route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
             ClusterEpoch::INITIAL,
@@ -36068,6 +36121,7 @@ mod tests {
         let route = &mut snapshot.pg_routes[0];
         route.cluster_epoch = snapshot.cluster_epoch;
         route.state = PgState::Peering;
+        route.active_metadata_proof = None;
         route.primary_lease_deadline_ms = None;
         route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
             ClusterEpoch::INITIAL,
@@ -36326,6 +36380,11 @@ mod tests {
                 primary_node_id: NodeId::new(1),
                 acting_set: vec![NodeId::new(1)],
                 state: PgState::Active,
+                active_metadata_proof: Some(PgMetadataProof {
+                    applied_log_index: 2,
+                    applied_log_hash: 3,
+                    state_digest: 4,
+                }),
                 primary_lease_deadline_ms: Some(12_345),
                 peering_metadata_transfer: None,
                 peering_metadata_transfer_destination_epoch: None,
@@ -36336,6 +36395,27 @@ mod tests {
             historical_pg_routes: Vec::new(),
             historical_cluster_epochs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn control_plane_rpc_round_trips_active_route_metadata_proof() {
+        let snapshot = runtime_map_test_snapshot_with_active_route();
+        let mut payload = Vec::new();
+        write_runtime_map_snapshot(&mut payload, &snapshot).unwrap();
+
+        let mut reader = PayloadReader::new(&payload);
+        let decoded = read_runtime_map_snapshot(&mut reader).unwrap();
+        reader.finish().unwrap();
+
+        assert_eq!(decoded, snapshot);
+        assert_eq!(
+            decoded.pg_routes()[0].active_metadata_proof(),
+            Some(PgMetadataProof {
+                applied_log_index: 2,
+                applied_log_hash: 3,
+                state_digest: 4,
+            })
+        );
     }
 
     #[test]
@@ -36352,6 +36432,14 @@ mod tests {
         renewed.pg_routes[0].primary_lease_deadline_ms = Some(22_345);
 
         assert_eq!(renewed.content_digest(), expected);
+
+        renewed.pg_routes[0].active_metadata_proof = Some(PgMetadataProof {
+            applied_log_index: 3,
+            applied_log_hash: 4,
+            state_digest: 5,
+        });
+        assert_ne!(renewed.content_digest(), expected);
+        renewed.pg_routes[0].active_metadata_proof = snapshot.pg_routes[0].active_metadata_proof;
 
         renewed.nodes[0].endpoint = "/tmp/argmin-node-1-replaced.sock".to_owned();
         assert_ne!(renewed.content_digest(), expected);
@@ -36614,6 +36702,7 @@ mod tests {
             let route = &mut snapshot.pg_routes[0];
             route.cluster_epoch = destination_epoch;
             route.state = PgState::Peering;
+            route.active_metadata_proof = None;
             route.primary_lease_deadline_ms = None;
             route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
                 source_epoch,
@@ -36639,6 +36728,7 @@ mod tests {
         let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
         let source_epoch = snapshot.historical_pg_routes[0].cluster_epoch();
         snapshot.historical_pg_routes[0].state = PgState::Peering;
+        snapshot.historical_pg_routes[0].active_metadata_proof = None;
         let expected_current_route = snapshot.pg_routes[0].clone();
         let now_ms = crate::clock::current_time_millis();
         snapshot.validity = RouteMapValidity::until_ms(now_ms + 10_000).unwrap();
@@ -36689,6 +36779,7 @@ mod tests {
     fn metadata_transfer_source_runtime_map_accepts_fresh_current_fence() {
         let mut snapshot = runtime_map_test_snapshot_with_active_route();
         snapshot.pg_routes[0].state = PgState::Peering;
+        snapshot.pg_routes[0].active_metadata_proof = None;
         snapshot.pg_routes[0].primary_lease_deadline_ms = None;
         let expected_current_route = snapshot.pg_routes[0].clone();
 

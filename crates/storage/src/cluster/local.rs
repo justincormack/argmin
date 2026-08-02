@@ -58,7 +58,7 @@ use crate::{
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
-const STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/static-route-map-content/v1";
+const STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/static-route-map-content/v2";
 const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1787,6 +1787,60 @@ impl LocalClusterMap {
             Some(pg_routes.into_iter().collect()),
             false,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_frontend_with_configs_and_runtime_map(
+        metadata_primary_node_id: NodeId,
+        configs: impl IntoIterator<Item = LocalNodeStoreConfig>,
+        default_ec_shape: EcShape,
+        runtime_map: &ClusterRuntimeMapSnapshot,
+    ) -> Result<Self, ClusterBuildError> {
+        let pg_ids = runtime_map
+            .pg_routes()
+            .iter()
+            .map(|route| route.pg_id().get())
+            .collect::<Vec<_>>();
+        let mut local_map = Self::open_with_configs_inner(
+            metadata_primary_node_id,
+            configs,
+            &pg_ids,
+            default_ec_shape,
+            runtime_map.cluster_epoch(),
+            Some(
+                runtime_map
+                    .pg_routes()
+                    .iter()
+                    .map(LocalPgRoute::from)
+                    .collect(),
+            ),
+            false,
+        )?;
+        local_map.bind_runtime_map_advertised_endpoints(runtime_map);
+        local_map.historical_pg_routes = runtime_map
+            .historical_pg_routes()
+            .iter()
+            .map(|route| ((route.pg_id(), route.cluster_epoch()), route.clone()))
+            .collect();
+        local_map.historical_cluster_epochs = runtime_map
+            .historical_cluster_epochs()
+            .iter()
+            .copied()
+            .collect();
+        let bound_lease = runtime_map
+            .bind_process_local_lease_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(|error| ClusterBuildError::RouteMapLeaseBinding {
+                message: error.to_string(),
+            })?;
+        local_map.route_map_lease = RwLock::new(LocalRouteMapLeaseSnapshot {
+            validity: runtime_map.validity(),
+            local_valid_until_monotonic_ms: bound_lease
+                .map(BoundRouteMapLease::local_valid_until_monotonic_ms),
+        });
+        Ok(local_map)
     }
 
     pub fn open_frontend_topology_only_with_epoch(

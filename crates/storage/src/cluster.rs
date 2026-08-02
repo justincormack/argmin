@@ -59,7 +59,7 @@ use crate::node_client::{
     MetadataCommandPeeringNodeClient, ObjectListingMetadataRoute, ObjectPayloadLeaseNodeLease,
     RetainedShardAckNodeClient, ShardAckRoute,
 };
-pub use crate::peering::PgMetadataTransferArtifact;
+pub(crate) use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{
     build_pg_metadata_transfer_artifact_from_retained_log_entries,
     build_pg_peering_replay_plan_from_retained_log_entries,
@@ -5210,8 +5210,8 @@ mod runtime_map_refresh_invalidation_tests {
         assert_eq!(
             static_route_authority_digest(&cluster),
             [
-                66, 83, 165, 3, 69, 249, 220, 125, 67, 159, 169, 196, 224, 90, 7, 197, 145, 174,
-                53, 74, 51, 120, 173, 127, 86, 133, 89, 7, 31, 122, 193, 166,
+                124, 152, 134, 10, 150, 105, 102, 183, 175, 28, 38, 118, 216, 220, 77, 128, 141,
+                38, 243, 230, 243, 96, 129, 59, 88, 145, 160, 234, 95, 74, 136, 8,
             ]
         );
 
@@ -6701,7 +6701,7 @@ impl StorageCluster {
             })
     }
 
-    pub fn metadata_transfer_imported_proof_at_epoch(
+    pub(crate) fn metadata_transfer_imported_proof_at_epoch(
         artifact: &PgMetadataTransferArtifact,
         destination_epoch: ClusterEpoch,
     ) -> Result<PgMetadataProof, PgMetadataTransferError> {
@@ -8255,7 +8255,8 @@ impl StorageCluster {
         )
     }
 
-    pub fn export_pg_metadata_transfer_artifact_from_retained_log(
+    #[cfg(test)]
+    pub(crate) fn export_pg_metadata_transfer_artifact_from_retained_log(
         &self,
         pg_id: PgId,
         source_node_id: NodeId,
@@ -8336,15 +8337,6 @@ impl StorageCluster {
             proof,
             retained_log_entries: Vec::new(),
         })
-    }
-
-    pub fn export_pg_metadata_transfer_artifact_from_checkpoint(
-        &self,
-        pg_id: PgId,
-        source_node_id: NodeId,
-    ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
-        self.export_pg_metadata_transfer_from_checkpoint(pg_id, source_node_id)
-            .map_err(Into::into)
     }
 
     fn metadata_transfer_source_state(
@@ -8584,20 +8576,6 @@ impl StorageCluster {
         Ok(artifact)
     }
 
-    pub fn export_pg_metadata_transfer_artifact_from_checkpoint_and_retained_suffix(
-        &self,
-        pg_id: PgId,
-        source_node_id: NodeId,
-        checkpoint: MetadataCommandCheckpoint,
-    ) -> Result<PgMetadataTransferArtifact, PgMetadataTransferError> {
-        self.export_pg_metadata_transfer_from_checkpoint_and_retained_suffix(
-            pg_id,
-            source_node_id,
-            checkpoint,
-        )
-        .map_err(Into::into)
-    }
-
     #[allow(dead_code)]
     pub(crate) fn export_pg_metadata_transfer_artifact_for_live_transfer_with_checkpoints(
         &self,
@@ -8723,7 +8701,7 @@ impl StorageCluster {
             .map_err(Into::into)
     }
 
-    pub fn export_pg_metadata_transfer_artifact_for_live_transfer(
+    pub(crate) fn export_pg_metadata_transfer_artifact_for_live_transfer(
         &self,
         pg_id: PgId,
         source_node_id: NodeId,
@@ -8995,7 +8973,7 @@ impl StorageCluster {
         Ok(proof)
     }
 
-    pub fn import_pg_metadata_transfer_artifact_from_retained_log(
+    pub(crate) fn import_pg_metadata_transfer_artifact_from_retained_log(
         &self,
         artifact: &PgMetadataTransferArtifact,
     ) -> Result<PgMetadataProof, PgMetadataTransferError> {
@@ -9535,7 +9513,7 @@ impl StorageCluster {
         )
     }
 
-    fn from_runtime_local_map(
+    pub(crate) fn from_runtime_local_map(
         local_map: Arc<LocalClusterMap>,
         runtime_map: &ClusterRuntimeMapSnapshot,
     ) -> Result<Arc<Self>, ClusterBuildError> {

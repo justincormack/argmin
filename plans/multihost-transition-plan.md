@@ -8171,7 +8171,7 @@ Metadata PG migration and backfill design notes:
   transfer path refreshes the PG-scoped source map, verifies that the fenced
   source route is semantically unchanged, recomputes the imported proof for
   the new next epoch, and retries within a bounded retry window. Command codec
-  version 14 and control-plane RPC version 12 carry this precondition, the
+  version 14 and control-plane RPC version 13 carry this precondition, the
   committed route destination epoch, and the typed destination-epoch mismatch
   response. Resume after transfer installation uses the marker's committed
   destination epoch rather than the current global epoch.

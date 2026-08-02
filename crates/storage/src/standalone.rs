@@ -12,7 +12,7 @@ const INITIALIZING_FILE_NAME: &str = ".argmin-standalone-route.initializing";
 const LOCK_FILE_NAME: &str = ".argmin-standalone-route.lock";
 const IDENTITY_MAGIC: &[u8; 8] = b"ARGSRTID";
 const INITIALIZING_MAGIC: &[u8; 8] = b"ARGSRTIN";
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 const DIGEST_LEN: usize = 32;
 const IDENTITY_LEN: usize = IDENTITY_MAGIC.len() + 2 + DIGEST_LEN + DIGEST_LEN;
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -68,7 +68,7 @@ impl StandaloneRouteIdentity {
     #[must_use]
     pub fn combined_with(self, other: Self) -> Self {
         let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-        hasher.update(b"argmin/standalone-combined-route-identity/v1");
+        hasher.update(b"argmin/standalone-combined-route-identity/v2");
         hasher.update(&self.0);
         hasher.update(&other.0);
         Self(
@@ -643,6 +643,16 @@ fn read_bounded_file_at(
     name: &'static str,
     expected_len: usize,
 ) -> Result<(Vec<u8>, FileIdentity), StandaloneRouteIdentityError> {
+    read_bounded_file_at_after_metadata(directory, data_dir, name, expected_len, || {})
+}
+
+fn read_bounded_file_at_after_metadata(
+    directory: &File,
+    data_dir: &Path,
+    name: &'static str,
+    expected_len: usize,
+    after_metadata: impl FnOnce(),
+) -> Result<(Vec<u8>, FileIdentity), StandaloneRouteIdentityError> {
     let path = data_dir.join(name);
     let mut file = open_file_at(
         directory,
@@ -662,9 +672,15 @@ fn read_bounded_file_at(
             reason: "identity artifact has an invalid length",
         });
     }
+    after_metadata();
     let mut bytes = Vec::with_capacity(expected_len);
     file.read_to_end(&mut bytes)
         .map_err(|error| StandaloneRouteIdentityError::io("read file", &path, error))?;
+    if bytes.len() != expected_len {
+        return Err(StandaloneRouteIdentityError::InvalidIdentity {
+            reason: "identity artifact has an invalid length",
+        });
+    }
     Ok((bytes, file_identity))
 }
 
@@ -672,15 +688,45 @@ fn verify_initializing_marker_at(
     directory: &File,
     data_dir: &Path,
 ) -> Result<FileIdentity, StandaloneRouteIdentityError> {
-    let expected = [INITIALIZING_MAGIC.as_slice(), &FORMAT_VERSION.to_be_bytes()].concat();
+    let expected_len = INITIALIZING_MAGIC.len() + std::mem::size_of::<u16>();
     let (actual, file_identity) =
-        read_bounded_file_at(directory, data_dir, INITIALIZING_FILE_NAME, expected.len())?;
-    if actual != expected {
+        read_bounded_file_at(directory, data_dir, INITIALIZING_FILE_NAME, expected_len)?;
+    validate_initializing_marker(&actual)?;
+    Ok(file_identity)
+}
+
+#[cfg(test)]
+fn verify_initializing_marker_at_after_metadata(
+    directory: &File,
+    data_dir: &Path,
+    after_metadata: impl FnOnce(),
+) -> Result<FileIdentity, StandaloneRouteIdentityError> {
+    let expected_len = INITIALIZING_MAGIC.len() + std::mem::size_of::<u16>();
+    let (actual, file_identity) = read_bounded_file_at_after_metadata(
+        directory,
+        data_dir,
+        INITIALIZING_FILE_NAME,
+        expected_len,
+        after_metadata,
+    )?;
+    validate_initializing_marker(&actual)?;
+    Ok(file_identity)
+}
+
+fn validate_initializing_marker(actual: &[u8]) -> Result<(), StandaloneRouteIdentityError> {
+    if &actual[..INITIALIZING_MAGIC.len()] != INITIALIZING_MAGIC {
         return Err(StandaloneRouteIdentityError::InvalidIdentity {
-            reason: "initialization marker is invalid",
+            reason: "initialization marker magic is invalid",
         });
     }
-    Ok(file_identity)
+    let version_offset = INITIALIZING_MAGIC.len();
+    let version = u16::from_be_bytes([actual[version_offset], actual[version_offset + 1]]);
+    if version != FORMAT_VERSION {
+        return Err(StandaloneRouteIdentityError::InvalidIdentity {
+            reason: "initialization marker version is unsupported",
+        });
+    }
+    Ok(())
 }
 
 fn encode_identity(identity: StandaloneRouteIdentity) -> Vec<u8> {
@@ -700,6 +746,29 @@ fn read_identity_at(
     name: &'static str,
 ) -> Result<(StandaloneRouteIdentity, FileIdentity), StandaloneRouteIdentityError> {
     let (bytes, file_identity) = read_bounded_file_at(directory, data_dir, name, IDENTITY_LEN)?;
+    let identity = decode_identity(&bytes)?;
+    Ok((identity, file_identity))
+}
+
+#[cfg(test)]
+fn read_identity_at_after_metadata(
+    directory: &File,
+    data_dir: &Path,
+    name: &'static str,
+    after_metadata: impl FnOnce(),
+) -> Result<(StandaloneRouteIdentity, FileIdentity), StandaloneRouteIdentityError> {
+    let (bytes, file_identity) = read_bounded_file_at_after_metadata(
+        directory,
+        data_dir,
+        name,
+        IDENTITY_LEN,
+        after_metadata,
+    )?;
+    let identity = decode_identity(&bytes)?;
+    Ok((identity, file_identity))
+}
+
+fn decode_identity(bytes: &[u8]) -> Result<StandaloneRouteIdentity, StandaloneRouteIdentityError> {
     if &bytes[..IDENTITY_MAGIC.len()] != IDENTITY_MAGIC {
         return Err(StandaloneRouteIdentityError::InvalidIdentity {
             reason: "identity magic is invalid",
@@ -724,7 +793,7 @@ fn read_identity_at(
     let digest = bytes[digest_offset..checksum_offset]
         .try_into()
         .expect("validated standalone route digest length");
-    Ok((StandaloneRouteIdentity(digest), file_identity))
+    Ok(StandaloneRouteIdentity(digest))
 }
 
 fn publish_identity_at(
@@ -855,12 +924,96 @@ mod tests {
         assert_eq!(
             bytes,
             vec![
-                65, 82, 71, 83, 82, 84, 73, 68, 0, 1, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-                7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 5, 181, 150, 88, 199, 142, 179,
-                251, 164, 203, 6, 107, 15, 222, 83, 89, 129, 213, 92, 193, 227, 78, 15, 219, 234,
-                128, 56, 14, 42, 67, 194, 57,
+                65, 82, 71, 83, 82, 84, 73, 68, 0, 2, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+                7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 88, 85, 185, 143, 36, 139, 121,
+                147, 39, 88, 34, 55, 142, 36, 118, 137, 210, 204, 137, 215, 28, 195, 224, 207, 24,
+                181, 197, 206, 95, 58, 218, 6,
             ]
         );
+    }
+
+    #[test]
+    fn initialization_marker_v2_is_exact() {
+        let temp = test_util::tempdir();
+        let data_dir = temp.path().join("standalone");
+        let preparation = StandaloneRouteIdentityPreparation::acquire(&data_dir).unwrap();
+
+        assert_eq!(
+            fs::read(data_dir.join(INITIALIZING_FILE_NAME)).unwrap(),
+            vec![65, 82, 71, 83, 82, 84, 73, 78, 0, 2]
+        );
+        drop(preparation);
+    }
+
+    #[test]
+    fn initialization_marker_length_is_revalidated_after_open() {
+        let temp = test_util::tempdir();
+
+        for (case, extension) in [("truncated", false), ("extended", true)] {
+            let data_dir = temp.path().join(format!("marker-{case}"));
+            let preparation = StandaloneRouteIdentityPreparation::acquire(&data_dir).unwrap();
+            let marker_path = data_dir.join(INITIALIZING_FILE_NAME);
+            let mut replacement = fs::read(&marker_path).unwrap();
+            if extension {
+                replacement.push(0);
+            } else {
+                replacement.pop().unwrap();
+            }
+
+            let result = verify_initializing_marker_at_after_metadata(
+                &preparation.directory,
+                &data_dir,
+                || fs::write(&marker_path, replacement).unwrap(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(StandaloneRouteIdentityError::InvalidIdentity {
+                        reason: "identity artifact has an invalid length"
+                    })
+                ),
+                "{case} marker was not rejected: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_length_is_revalidated_after_open() {
+        let temp = test_util::tempdir();
+
+        for (case, extension) in [("truncated", false), ("extended", true)] {
+            let data_dir = temp.path().join(format!("identity-{case}"));
+            drop(
+                StandaloneRouteIdentityPreparation::acquire(&data_dir)
+                    .unwrap()
+                    .bind(identity(7))
+                    .unwrap(),
+            );
+            let preparation = StandaloneRouteIdentityPreparation::acquire(&data_dir).unwrap();
+            let identity_path = data_dir.join(IDENTITY_FILE_NAME);
+            let mut replacement = fs::read(&identity_path).unwrap();
+            if extension {
+                replacement.push(0);
+            } else {
+                replacement.pop().unwrap();
+            }
+
+            let result = read_identity_at_after_metadata(
+                &preparation.directory,
+                &data_dir,
+                IDENTITY_FILE_NAME,
+                || fs::write(&identity_path, replacement).unwrap(),
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(StandaloneRouteIdentityError::InvalidIdentity {
+                        reason: "identity artifact has an invalid length"
+                    })
+                ),
+                "{case} identity was not rejected: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -1151,7 +1304,7 @@ mod tests {
 
     #[test]
     fn unsupported_identity_versions_fail_closed_after_valid_checksum() {
-        for version in [0_u16, FORMAT_VERSION + 1] {
+        for version in [1_u16, 3_u16] {
             let temp = test_util::tempdir();
             let data_dir = temp.path().join(format!("version-{version}"));
             drop(
@@ -1177,6 +1330,46 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn unsupported_initialization_marker_versions_fail_closed() {
+        for version in [1_u16, 3_u16] {
+            let temp = test_util::tempdir();
+            let data_dir = temp.path().join(format!("marker-version-{version}"));
+            drop(StandaloneRouteIdentityPreparation::acquire(&data_dir).unwrap());
+            fs::write(
+                data_dir.join(INITIALIZING_FILE_NAME),
+                [INITIALIZING_MAGIC.as_slice(), &version.to_be_bytes()].concat(),
+            )
+            .unwrap();
+
+            assert!(matches!(
+                StandaloneRouteIdentityPreparation::acquire(&data_dir),
+                Err(StandaloneRouteIdentityError::InvalidIdentity {
+                    reason: "initialization marker version is unsupported"
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn initialization_marker_rejects_invalid_magic_separately_from_version() {
+        let temp = test_util::tempdir();
+        let data_dir = temp.path().join("marker-magic");
+        drop(StandaloneRouteIdentityPreparation::acquire(&data_dir).unwrap());
+        fs::write(
+            data_dir.join(INITIALIZING_FILE_NAME),
+            [b"BADSRTIN".as_slice(), &FORMAT_VERSION.to_be_bytes()].concat(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            StandaloneRouteIdentityPreparation::acquire(&data_dir),
+            Err(StandaloneRouteIdentityError::InvalidIdentity {
+                reason: "initialization marker magic is invalid"
+            })
+        ));
     }
 
     #[test]
@@ -1218,6 +1411,13 @@ mod tests {
         assert_eq!(
             format!("{combined:?}"),
             "StandaloneRouteIdentity(\"<opaque>\")"
+        );
+        assert_eq!(
+            combined.0,
+            [
+                59, 253, 135, 60, 231, 234, 6, 114, 206, 189, 71, 53, 49, 42, 116, 119, 58, 211,
+                198, 113, 201, 123, 178, 95, 244, 180, 252, 14, 31, 196, 73, 144,
+            ]
         );
     }
 }

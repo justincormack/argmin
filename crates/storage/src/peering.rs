@@ -33,7 +33,7 @@ pub(crate) struct PgPeeringReplicaReplayPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PgMetadataTransferArtifact {
+pub(crate) struct PgMetadataTransferArtifact {
     pub(crate) pg_id: PgId,
     pub(crate) source_node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
@@ -45,7 +45,7 @@ pub struct PgMetadataTransferArtifact {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PgMetadataTransferBaseKind {
+pub(crate) enum PgMetadataTransferBaseKind {
     Empty,
     RetainedLogPrefix,
     Checkpoint,
@@ -53,37 +53,39 @@ pub enum PgMetadataTransferBaseKind {
 
 impl PgMetadataTransferArtifact {
     #[must_use]
-    pub fn pg_id(&self) -> PgId {
+    #[cfg(test)]
+    pub(crate) fn pg_id(&self) -> PgId {
         self.pg_id
     }
 
     #[must_use]
-    pub fn source_node_id(&self) -> NodeId {
+    #[cfg(test)]
+    pub(crate) fn source_node_id(&self) -> NodeId {
         self.source_node_id
     }
 
     #[must_use]
-    pub fn cluster_epoch(&self) -> ClusterEpoch {
+    pub(crate) fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster_epoch
     }
 
     #[must_use]
-    pub fn source_metadata_proof(&self) -> PgMetadataProof {
+    pub(crate) fn source_metadata_proof(&self) -> PgMetadataProof {
         self.proof
     }
 
     #[must_use]
-    pub fn source_base_metadata_proof(&self) -> PgMetadataProof {
+    pub(crate) fn source_base_metadata_proof(&self) -> PgMetadataProof {
         self.base_proof
     }
 
     #[must_use]
-    pub fn source_base_kind(&self) -> PgMetadataTransferBaseKind {
+    pub(crate) fn source_base_kind(&self) -> PgMetadataTransferBaseKind {
         self.base_kind
     }
 
     #[must_use]
-    pub fn checkpoint_base(&self) -> Option<&MetadataCommandCheckpoint> {
+    pub(crate) fn checkpoint_base(&self) -> Option<&MetadataCommandCheckpoint> {
         self.checkpoint_base.as_ref()
     }
 }

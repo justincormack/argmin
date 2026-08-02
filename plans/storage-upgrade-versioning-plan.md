@@ -640,7 +640,7 @@ but no version negotiation or supported compatibility window:
 | Surface | Current wire baseline | Authentication baseline | Negotiation and current disposition |
 | --- | --- | --- | --- |
 | Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 15` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
-| Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 12` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
+| Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 13` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
 | Raft peer RPC | `CONTROL_PLANE_RAFT_PEER_RPC_VERSION = 2` in `control_plane_raft.rs`; request, response, snapshot, peer-identity, checksum, and numeric OpenRaft tags share this baseline. | Shared control-plane authentication-envelope version 1, with the authenticated operation and peer identity bound to the inner frame. | The decoder rejects non-current versions before OpenRaft dispatch. There is no negotiation, and OpenRaft peers currently require the same binary. Treat any other version as incompatible. |
 
 These are ephemeral wire formats, so there is no in-place migration or authoritative rebuild
@@ -1302,6 +1302,45 @@ check rejects `StoreError` matching or storage-node failure classification in `a
 route/proof state machine, runtime-map reconstruction, and transfer artifact orchestration remain
 pending behind the planned storage-owned administration facade.
 
+The twenty-seventh bounded slice contains the complete automatic live PG metadata-transfer state
+machine behind `LivePgMetadataTransferAdmin`. The process layer supplies only the already parsed
+logical PG/node IDs, EC and admission configuration, one authority-bound opaque control-plane
+capability, and configured storage-node endpoints and credentials. Storage binds the read and
+admin roles to one retained transport client and validates their authenticated cluster identities;
+separately constructed endpoint sets cannot be supplied or compared by display labels. It then
+dispatches only the private operations needed by the transfer; the capability does not implement
+the general public runtime-map source trait. Storage now owns completed-transfer detection, fencing,
+source-lease expiry, scoped route observation, source and destination runtime-map authorization,
+cluster reconstruction, artifact export and import, destination-epoch rebasing, proof validation,
+and the bounded stale-route retry loops. A successful acting-set install is followed by a fresh
+PG-scoped serving read before destination I/O; the reconstructed mutation response is not treated
+as serving authority. If another runner completes peering between that mutation and the fresh
+read, the requested Active acting set is recognized as successful completion instead of being
+rejected as a non-Peering destination, but only when its active metadata proof equals the expected
+imported proof. Control-plane RPC version 13 carries that proof in Active route snapshots so both
+post-install and import-refresh completion checks fail closed on superseding transitions. Runtime-map
+content and current-state digest domains advance to version 2 and bind the Active proof. The
+static route-map content domain and combined standalone-route identity domain likewise advance to
+version 2 because both transitively encode those routes. Their containing standalone identity and
+initialization-marker format advances to version 2; exact version-2 fixtures and explicit version-1
+and version-3 rejection fixtures prevent the same semantic change from remaining under version 1.
+Both artifacts revalidate the exact bytes read after the initial descriptor metadata check, so a
+concurrent truncation or extension fails closed before fixed-offset parsing; deterministic
+owner-local mutation tests pin both races for the marker and identity.
+The operation returns only an opaque, redacted failure or a logical summary;
+its route snapshots, transfer proofs, artifacts, reconstruction failures, and retry classification
+are crate-private. Owner-local RPC-backed tests pin the already-completed path, the complete
+export/install/import transfer with an unrelated unserved PG, deterministic post-fence
+interruption, resume after post-install and post-import interruption, both stale-route refresh
+paths, completion racing the post-install observation, single-transport credential binding,
+matching-versus-mismatched concurrent completion proofs, and diagnostic redaction. The repository
+boundary check
+rejects automatic transfer representations or orchestration outside `storage` and rejects giving
+the opaque transfer capability the general runtime-map source interface. Manual operator PG
+fence/set/proof commands and the residual
+static control-plane administration and transport-bootstrap orchestration remain pending parts of
+item 4.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1370,11 +1409,11 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Metadata checkpoints and canonical state | `storage` | checkpoint encoding 1; canonical-state encoding 4 | Evidence required |
 | Storage-node RPC and authentication | `storage` | frame encoding 11; auth binding 2; auth transport envelope 1 | Blocked on Phase 1 TLS, topology, payload, maintenance, and error containment; then evidence required |
 | Control-plane logical state, commands, and snapshots | `storage` | state 26; command 14; snapshot 1 | Blocked on Phase 1 topology/admin-workflow containment; then evidence required |
-| Control-plane RPC and authentication | `storage` | RPC 12; shared authentication envelope 1 | Evidence required |
+| Control-plane RPC and authentication | `storage` | RPC 13; shared authentication envelope 1 | Evidence required |
 | Single-authority control-plane durable artifacts | `storage` | clock checkpoint 2; state identity 1; initialized marker 1; journal file 2; journal record 2 | Evidence required |
 | Raft peer RPC and authentication | `storage` | peer RPC 2; shared authentication envelope 1 | Evidence required |
 | Raft restart, sentinel, and WAL artifacts | `storage` | restart 4; restart sentinel 1; WAL record 1; WAL file 2 | Evidence required |
-| Standalone route identity and initialization marker | `storage` | shared format version 1 with distinct magic values; initialization-marker parsing currently compares the complete expected byte string | Evidence required: separate marker magic/version rejection and add too-old/too-new marker fixtures |
+| Standalone route identity and initialization marker | `storage` | static route-map digest 2; combined-route digest 2; shared artifact format 2 with distinct identity/initialization magic values | Recorded: exact current identity, marker, static digest, and combined digest fixtures; separate marker magic/version failures; exact old/new unsupported-version fixtures; deterministic post-metadata truncation/extension rejection for both artifacts |
 | User and system object metadata | `server-core` | user metadata 1; system metadata 1 | Recorded |
 | Checksum metadata embedded in SSE-C and SSE-S3 state | `server-core` | checksum metadata 1 | Evidence required |
 | Object encryption state | `storage` | SSE-C 3; SSE-S3 1, selected by a typed outer discriminator | Recorded |
@@ -1584,10 +1623,11 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     assertions, while impossible physical-state tests are owner-local.
 12. **In progress:** deterministic static storage-placement interpretation and certified initial
     topology/bootstrap assembly are storage-owned without transferring outer manifest ownership.
-    Metadata-transfer retry classification is now storage-owned and typed. The remaining work is
-    to move live PG topology transitions, the transfer state machine, runtime-map reconstruction,
-    and route/proof inspection behind a storage-owned control-plane/admin facade, followed by the
-    residual static control-plane administration and transport-bootstrap orchestration.
+    The automatic live PG metadata-transfer state machine, including route/proof inspection,
+    runtime-map reconstruction, artifact movement, and retry classification, is now contained
+    behind an opaque storage-owned administration operation. The remaining work is to contain the
+    manual operator PG fence/set/proof command surfaces and the residual static control-plane
+    administration and transport-bootstrap orchestration.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move
