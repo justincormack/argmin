@@ -2337,17 +2337,22 @@ if [[ -n "$server_binary" ]]; then
     server_cmd=("$server_binary")
 elif [[ "$topology" == "multihost" ]]; then
     build_cmd=(cargo build -p argmin-s3)
+    uat_build_variant=plain
     if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
         build_cmd+=(--features deep-tracing)
+        uat_build_variant=deep-tracing
     fi
     if local_debug_endpoint_enabled; then
         build_cmd+=(--features local-debug-endpoints)
+        uat_build_variant="${uat_build_variant}-local-debug-endpoints"
     fi
+    uat_target_dir="$ROOT/target/uat-s3-tests/$uat_build_variant"
+    build_cmd+=(--target-dir "$uat_target_dir")
     if ((release)); then
         build_cmd+=(--release)
-        built_binary="$ROOT/target/release/argmin-s3"
+        built_binary="$uat_target_dir/release/argmin-s3"
     else
-        built_binary="$ROOT/target/debug/argmin-s3"
+        built_binary="$uat_target_dir/debug/argmin-s3"
     fi
     echo "== argmin-s3 UAT build =="
     print_command "${build_cmd[@]}"
