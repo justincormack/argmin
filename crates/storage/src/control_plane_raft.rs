@@ -20039,6 +20039,13 @@ mod tests {
                 "static submission binding test leadership",
             )
             .await;
+            wait_for_authority_status_matching(
+                &authority,
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+                "static submission binding authority applies initialization",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
 
             let before = authority.status().await.unwrap();
             let error = authority
