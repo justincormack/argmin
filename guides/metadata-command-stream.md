@@ -274,6 +274,10 @@ Bucket-control snapshot-sensitive publication uses the same exhaustive
 boundary. Versioning, ACL, bucket-property, and subresource publishers must
 therefore handle a drained contender by restarting from their current bucket
 snapshot rather than treating the attempted install as successful.
+Bucket-delete begin and finalization use the same exhaustive outcome at the
+bucket-PG slot boundary. Fresh mark/finalize commands restart after a drained
+contender, while finalization retains its separate exact-command branch so a
+matching already-pending delete can converge without being rebuilt or drained.
 Apply-validated publication likewise has separate exhaustive, must-use
 fresh-command and prebuilt bucket-PG outcomes. Stream append preserves the
 distinction between a drained visible contender and a handled log-index

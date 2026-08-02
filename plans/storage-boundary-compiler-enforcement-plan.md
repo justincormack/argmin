@@ -5405,6 +5405,28 @@ Sixth Phase 4 slice (2026-08-02):
   matrix, the storage boundary checker, formatting, workspace-wide strict
   Clippy, and the full parallel 7,967-test workspace suite.
 
+Seventh Phase 4 slice (2026-08-02):
+
+- bucket-delete begin and acting-set finalization now carry their
+  `SnapshotSensitive` registry tokens through a typed bucket-PG pending-slot
+  installer. Neither production owner loop can call the raw bucket-PG retry
+  helper directly.
+- the typed boundary returns the exhaustive, must-use
+  `SnapshotSensitiveInstallOutcome`. A drained contender restarts fresh
+  MarkBucketDeleting or DeleteFinalizedBucket construction; finalization keeps
+  its existing pre-install exact-command branch, so a matching pending delete
+  is finished through its command-owned convergence path rather than drained.
+- admitted delete begin retains its immutable effect fence at pending-slot
+  insertion. Background finalization remains unfenced request work but retains
+  its bounded work budget and current deleting-bucket identity checks.
+- the two migrated calls leave the temporary helper-count inventory. The
+  scanner continues to require their authoritative registry markers, and an
+  adversarial fixture rejects an unmarked typed bucket-PG call.
+- validation passed the 74-test focused bucket-delete
+  contention/finalization matrix, the storage boundary checker, formatting,
+  workspace-wide strict Clippy, and the full parallel 7,967-test workspace
+  suite.
+
 ### Phase 5 — isolate test support
 
 1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside

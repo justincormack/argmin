@@ -2911,22 +2911,6 @@ impl super::StorageCluster {
         }
     }
 
-    fn try_set_bucket_pg_pending_command_or_retry_with_work_budget(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
-        work_budget: &mut super::RequestWorkBudget,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        self.try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
-            pg_id,
-            bucket,
-            command,
-            None,
-            work_budget,
-        )
-    }
-
     fn try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
         &self,
         pg_id: PgId,
@@ -2992,6 +2976,28 @@ impl super::StorageCluster {
             Ok(super::AllocatorCleanupPendingInstallOutcome::Installed)
         } else {
             Ok(super::AllocatorCleanupPendingInstallOutcome::RetryAfterContention)
+        }
+    }
+
+    fn install_snapshot_sensitive_bucket_pg_command_or_drain(
+        &self,
+        _publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<super::SnapshotSensitiveInstallOutcome, BucketSnapshotLoadError> {
+        if self.try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            work_budget,
+        )? {
+            Ok(super::SnapshotSensitiveInstallOutcome::Installed)
+        } else {
+            Ok(super::SnapshotSensitiveInstallOutcome::ContenderDrained)
         }
     }
 
@@ -3201,7 +3207,8 @@ impl super::StorageCluster {
         root: &BucketDeleteFinalizeRoot,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
         let bucket = &root.bucket;
-        crate::metadata_command::metadata_command_publisher!(DeleteBucketFromActingSet);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(DeleteBucketFromActingSet);
         let _ = observability::event(
             super::TRACE_TARGET,
             "bucket_finalize_delete_start",
@@ -3325,16 +3332,19 @@ impl super::StorageCluster {
                         ),
                     ),
                 );
-                if !self
-                    .try_set_bucket_pg_pending_command_or_retry_with_work_budget(
+                match self
+                    .install_snapshot_sensitive_bucket_pg_command_or_drain(
+                        publisher,
                         pg_id,
                         bucket,
                         &command,
+                        None,
                         &mut work_budget,
                     )
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
-                    continue;
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -5710,7 +5720,7 @@ impl super::StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         expected_bucket_identity: BucketIdentityGenerations,
     ) -> Result<(), BucketWriteDrainError> {
-        crate::metadata_command::metadata_command_publisher!(BeginBucketDelete);
+        let publisher = crate::metadata_command::metadata_command_publisher!(BeginBucketDelete);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
             bucket,
@@ -6924,8 +6934,9 @@ impl super::StorageCluster {
                     format!("iteration={loop_iteration} command_id={command_id:?}"),
                 );
                 require_valid_route()?;
-                if !self
-                    .try_set_bucket_pg_pending_command_or_retry_with_work_budget_and_effect_fence(
+                match self
+                    .install_snapshot_sensitive_bucket_pg_command_or_drain(
+                        publisher,
                         pg_id,
                         bucket,
                         &command,
@@ -6934,13 +6945,16 @@ impl super::StorageCluster {
                     )
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
-                    super::sleep_after_metadata_contention_retry_for(
-                        "bucket_delete_begin",
-                        Some(pg_id),
-                        "bucket delete pending install conflict",
-                        &mut metadata_contention_retries,
-                    );
-                    continue;
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                        super::sleep_after_metadata_contention_retry_for(
+                            "bucket_delete_begin",
+                            Some(pg_id),
+                            "bucket delete pending install conflict",
+                            &mut metadata_contention_retries,
+                        );
+                        continue;
+                    }
                 }
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,

@@ -239,6 +239,9 @@ function publisher_helper(line) {
     if (line ~ /install_snapshot_sensitive_bucket_control_command_or_drain\(/) {
         return "install_snapshot_sensitive_bucket_control_command_or_drain"
     }
+    if (line ~ /install_snapshot_sensitive_bucket_pg_command_or_drain\(/) {
+        return "install_snapshot_sensitive_bucket_pg_command_or_drain"
+    }
     if (line ~ /install_allocator_cleanup_metadata_command_with_fresh_id\(/) {
         return "install_allocator_cleanup_metadata_command_with_fresh_id"
     }
@@ -280,6 +283,7 @@ function is_install_helper(name) {
         || name == "try_set_bucket_control_pending_command_or_retry_with_work_budget" \
         || name == "install_snapshot_sensitive_metadata_command_or_drain" \
         || name == "install_snapshot_sensitive_bucket_control_command_or_drain" \
+        || name == "install_snapshot_sensitive_bucket_pg_command_or_drain" \
         || name == "install_allocator_cleanup_metadata_command_with_fresh_id" \
         || name == "install_allocator_cleanup_pending_command_or_drain" \
         || name == "install_allocator_cleanup_bucket_pg_command_or_retry" \
@@ -357,6 +361,7 @@ pending_test_cfg {
     # not retain its already compiler-enforced callers in the shell inventory.
     if (helper == "install_snapshot_sensitive_metadata_command_or_drain" \
         || helper == "install_snapshot_sensitive_bucket_control_command_or_drain" \
+        || helper == "install_snapshot_sensitive_bucket_pg_command_or_drain" \
         || helper == "install_allocator_cleanup_metadata_command_with_fresh_id" \
         || helper == "install_allocator_cleanup_pending_command_or_drain" \
         || helper == "install_allocator_cleanup_bucket_pg_command_or_retry" \
