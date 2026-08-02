@@ -644,12 +644,24 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     assert_eq!(abort.key, key);
     assert_eq!(abort.session_id, session_id);
     assert_eq!(abort.staged_segments, vec![segment.clone()]);
-    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(&client, &command)
+    let foreign_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+    let foreign_socket = config.socket_path.with_extension("foreign-epoch.sock");
+    let foreign_client = UnixStorageNodeClient::new(config.node_id, foreign_epoch, foreign_socket);
+    assert!(matches!(
+        foreign_client
+            .open_retained_stream_upload_abort_route(&command)
+            .err()
+            .expect("foreign retained route epoch must be rejected before RPC"),
+        StoreError::RouteAdmissionClusterMismatch {
+            admitted_epoch,
+            operation_epoch,
+        } if admitted_epoch == config.cluster_epoch && operation_epoch == foreign_epoch
+    ));
+    let command_route = client
+        .open_retained_stream_upload_abort_route(&command)
         .unwrap();
-    assert!(
-        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(&client, &command)
-            .unwrap()
-    );
+    command_route.apply().unwrap();
+    assert!(command_route.finish().unwrap());
 
     let part_command = retained_route
         .prepare_retained_stream_upload_abort(&part_session_id)
@@ -661,15 +673,11 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
     assert_eq!(abort.session_id, part_session_id);
     assert_eq!(abort.staged_segments, vec![part_segment.clone()]);
     assert!(abort.stream_create_bucket_write_reservation.is_none());
-    RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(&client, &part_command)
+    let part_command_route = client
+        .open_retained_stream_upload_abort_route(&part_command)
         .unwrap();
-    assert!(
-        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
-            &client,
-            &part_command,
-        )
-        .unwrap()
-    );
+    part_command_route.apply().unwrap();
+    assert!(part_command_route.finish().unwrap());
 
     for thread in server_threads {
         thread.join().unwrap();

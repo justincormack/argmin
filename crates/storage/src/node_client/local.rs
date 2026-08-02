@@ -6228,21 +6228,36 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
     }
 }
 
+struct LocalRetainedStreamUploadAbortMetadataRoute<'a> {
+    client: &'a LocalStorageNodeClient,
+    prepared: &'a PreparedRetainedStreamUploadAbort,
+}
+
 impl RetainedMetadataCommandNodeClient for LocalStorageNodeClient {
-    fn apply_retained_stream_upload_abort(
-        &self,
-        prepared: &PreparedRetainedStreamUploadAbort,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        self.apply_metadata_command_and_record_inner(prepared.pg_id().pg_id(), prepared.command())
+    fn open_retained_stream_upload_abort_route<'a>(
+        &'a self,
+        prepared: &'a PreparedRetainedStreamUploadAbort,
+    ) -> Result<Box<dyn RetainedStreamUploadAbortMetadataRoute + 'a>, StoreError> {
+        self.storage_node.require_open_pg(prepared.pg_id().get())?;
+        Ok(Box::new(LocalRetainedStreamUploadAbortMetadataRoute {
+            client: self,
+            prepared,
+        }))
+    }
+}
+
+impl RetainedStreamUploadAbortMetadataRoute for LocalRetainedStreamUploadAbortMetadataRoute<'_> {
+    fn apply(&self) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.client.apply_metadata_command_and_record_inner(
+            self.prepared.pg_id().pg_id(),
+            self.prepared.command(),
+        )
     }
 
-    fn finish_retained_stream_upload_abort(
-        &self,
-        prepared: &PreparedRetainedStreamUploadAbort,
-    ) -> Result<bool, StoreError> {
-        self.remove_pending_metadata_command_slot_inner(
-            prepared.pg_id().pg_id(),
-            prepared.command(),
+    fn finish(&self) -> Result<bool, StoreError> {
+        self.client.remove_pending_metadata_command_slot_inner(
+            self.prepared.pg_id().pg_id(),
+            self.prepared.command(),
         )
     }
 }

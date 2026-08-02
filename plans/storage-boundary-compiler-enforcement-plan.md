@@ -668,7 +668,7 @@ Node-client role classification (2026-07-19):
 | `MetadataCommandNodeClient` | genuinely generic metadata PG | ordinary active publisher and convergence authority; serialized primary acceptance/application opens a non-nestable critical section bound to one PG and epoch, while recovery-only operations remain unavailable |
 | `MetadataCommandPeeringNodeClient` | genuinely generic metadata PG | opens a scoped peering route bound to one destination PG and epoch; the returned interface owns quiesced-PG replay validation, retained-log catch-up, and metadata-transfer initialization/adoption without accepting replacement destination route arguments, command-ID allocation, or pending-slot publication |
 | `MetadataCommandRecoveryNodeClient` | genuinely generic metadata PG | opens a non-nestable recovery critical section bound to one PG and epoch; the returned interface owns pending-slot reissue, explicitly authorized recovery apply, and durable abandonment without accepting replacement route arguments |
-| `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | exact retained-route authority for applying and finishing an opaque stream-upload abort prepared from validated node state; callers cannot supply or redirect its PG or command |
+| `RetainedMetadataCommandNodeClient` | genuinely generic metadata PG | opens a non-cloneable retained stream-abort route borrowing one opaque prepared command; apply and finish accept no replacement PG, epoch, or command arguments |
 | `StorageNodeClient` | removed transitional mixed aggregate | production and cross-boundary test callers use role-specific interfaces; deliberately process-local assertions use the sanctioned raw-node test facade; private local helpers implement the embedded adapter without exposing another trait surface |
 
 The generic classifications are intentional. A metadata command can target a
@@ -5094,6 +5094,29 @@ One-hundred-and-twenty-eighth Phase 3 slice:
 - all 2,597 storage tests and all 7,919 workspace tests pass, together with
   workspace-wide strict Clippy, formatting, and the transitional storage
   boundary checker.
+
+One-hundred-and-twenty-ninth Phase 3 slice:
+
+- retained stream-abort application and pending-slot finish no longer remain
+  as operations directly callable on `RetainedMetadataCommandNodeClient`.
+  The client now opens a non-cloneable
+  `RetainedStreamUploadAbortMetadataRoute` borrowing both itself and one
+  opaque `PreparedRetainedStreamUploadAbort`; the returned operations accept
+  no PG, epoch, command, or stream subject arguments.
+- embedded route construction requires that the prepared command's exact
+  object-metadata PG is installed. Unix construction additionally binds the
+  prepared command epoch to the retained node client before transport. RPC
+  dispatch retains its independent retained-route, acting-set, primary, and
+  prepared-command validation before using the embedded route.
+- historical acting-set fanout and pending-slot finish now retain the prepared
+  authority for the complete operation instead of repeatedly passing it as an
+  operation argument. The installed Unix regression remains a positive canary
+  for both PutObject and UploadPart cleanup and now proves that a crossed epoch
+  is rejected before contacting a storage-node socket.
+- all 2,602 storage tests and all 7,924 workspace tests pass, including the
+  focused retained-abort constructor, Unix response-binding, and installed
+  cleanup regressions. Formatting, the transitional storage boundary checker,
+  and workspace-wide strict Clippy also pass.
 
 ### Phase 4 — type metadata-command publication
 

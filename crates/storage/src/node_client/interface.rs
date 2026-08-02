@@ -1446,15 +1446,16 @@ pub(crate) trait ShardScavengerObservationRoute: Send {
 /// prepared stream-upload abort. Keeping this separate prevents ordinary
 /// metadata-command publishers from invoking retained cleanup operations.
 pub(crate) trait RetainedMetadataCommandNodeClient: Send + Sync {
-    fn apply_retained_stream_upload_abort(
-        &self,
-        prepared: &PreparedRetainedStreamUploadAbort,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+    fn open_retained_stream_upload_abort_route<'a>(
+        &'a self,
+        prepared: &'a PreparedRetainedStreamUploadAbort,
+    ) -> Result<Box<dyn RetainedStreamUploadAbortMetadataRoute + 'a>, StoreError>;
+}
 
-    fn finish_retained_stream_upload_abort(
-        &self,
-        prepared: &PreparedRetainedStreamUploadAbort,
-    ) -> Result<bool, StoreError>;
+pub(crate) trait RetainedStreamUploadAbortMetadataRoute: Send {
+    fn apply(&self) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    fn finish(&self) -> Result<bool, StoreError>;
 }
 
 /// Read-only metadata-command state shared by active publication and peering.

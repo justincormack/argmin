@@ -7657,11 +7657,16 @@ impl StorageNodeRetainedStreamAbortCommandRoute<'_> {
             self.route.handler.config.node_id,
             Arc::clone(&self.route.handler.node),
         );
-        RetainedMetadataCommandNodeClient::apply_retained_stream_upload_abort(
+        let route = RetainedMetadataCommandNodeClient::open_retained_stream_upload_abort_route(
             &local_client,
             &self.prepared,
         )
-        .map_err(StorageNodeRetainedStreamAbortApplyError::Apply)
+        .map_err(|error| {
+            StorageNodeRetainedStreamAbortApplyError::Apply(BucketSnapshotLoadError::Store(error))
+        })?;
+        route
+            .apply()
+            .map_err(StorageNodeRetainedStreamAbortApplyError::Apply)
     }
 }
 
@@ -7674,11 +7679,14 @@ impl StorageNodeRetainedPrimaryStreamAbortCommandRoute<'_> {
             self.route.route.handler.config.node_id,
             Arc::clone(&self.route.route.handler.node),
         );
-        RetainedMetadataCommandNodeClient::finish_retained_stream_upload_abort(
+        let route = RetainedMetadataCommandNodeClient::open_retained_stream_upload_abort_route(
             &local_client,
             &self.prepared,
         )
-        .map_err(StorageNodeRetainedStreamAbortFinishError::Finish)
+        .map_err(StorageNodeRetainedStreamAbortFinishError::Finish)?;
+        route
+            .finish()
+            .map_err(StorageNodeRetainedStreamAbortFinishError::Finish)
     }
 }
 

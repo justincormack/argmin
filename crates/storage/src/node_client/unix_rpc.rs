@@ -3270,43 +3270,61 @@ impl UnixStorageNodeClient {
     }
 }
 
+struct UnixRetainedStreamUploadAbortMetadataRoute<'a> {
+    client: &'a UnixStorageNodeClient,
+    prepared: &'a PreparedRetainedStreamUploadAbort,
+}
+
 impl RetainedMetadataCommandNodeClient for UnixStorageNodeClient {
-    fn apply_retained_stream_upload_abort(
-        &self,
-        prepared: &PreparedRetainedStreamUploadAbort,
-    ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        self.metadata_command_apply_and_record_with_kind(
-            prepared.pg_id().pg_id(),
-            prepared.command(),
+    fn open_retained_stream_upload_abort_route<'a>(
+        &'a self,
+        prepared: &'a PreparedRetainedStreamUploadAbort,
+    ) -> Result<Box<dyn RetainedStreamUploadAbortMetadataRoute + 'a>, StoreError> {
+        let prepared_epoch = prepared.command().id().cluster_epoch();
+        if prepared_epoch != self.cluster_epoch {
+            return Err(StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: prepared_epoch,
+                operation_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(Box::new(UnixRetainedStreamUploadAbortMetadataRoute {
+            client: self,
+            prepared,
+        }))
+    }
+}
+
+impl RetainedStreamUploadAbortMetadataRoute for UnixRetainedStreamUploadAbortMetadataRoute<'_> {
+    fn apply(&self) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
+        self.client.metadata_command_apply_and_record_with_kind(
+            self.prepared.pg_id().pg_id(),
+            self.prepared.command(),
             StorageRpcMessageKind::MetadataCommandRetainedAbortApply,
             "decode retained stream abort apply response",
         )
     }
 
-    fn finish_retained_stream_upload_abort(
-        &self,
-        prepared: &PreparedRetainedStreamUploadAbort,
-    ) -> Result<bool, StoreError> {
+    fn finish(&self) -> Result<bool, StoreError> {
         let request = StorageRpcMetadataCommandRequest {
-            node_id: self.node_id,
-            cluster_epoch: self.cluster_epoch,
-            pg_id: prepared.pg_id().pg_id(),
-            command: prepared.command().clone(),
+            node_id: self.client.node_id,
+            cluster_epoch: self.client.cluster_epoch,
+            pg_id: self.prepared.pg_id().pg_id(),
+            command: self.prepared.command().clone(),
         };
         let payload = encode_metadata_command_request(&request).map_err(|error| {
-            self.rpc_payload_error(
+            self.client.rpc_payload_error(
                 "encode retained stream abort finish request",
                 error.to_string(),
             )
         })?;
-        let response = self.rpc_request(
+        let response = self.client.rpc_request(
             StorageRpcMessageKind::MetadataCommandRetainedAbortFinish,
             payload,
         )?;
         decode_metadata_command_pending_slot_remove_response(&response)
             .map(|response| response.removed)
             .map_err(|error| {
-                self.rpc_payload_error(
+                self.client.rpc_payload_error(
                     "decode retained stream abort finish response",
                     error.to_string(),
                 )
