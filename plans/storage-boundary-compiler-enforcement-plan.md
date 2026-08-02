@@ -5186,6 +5186,46 @@ One-hundred-and-thirty-first Phase 3 slice:
   workspace tests pass. Formatting, workspace-wide strict Clippy, and the
   transitional storage boundary checker also pass.
 
+Phase 3 completion audit (2026-08-02):
+
+- **Phase 3 is complete.** A fresh audit after the later storage, server, and
+  test changes found no production path which can construct a role-specific PG
+  ID from an arbitrary raw `PgId`. The role fields and production constructors
+  remain private to the installed node-runtime boundary; the only raw
+  constructors are `cfg(test)`, and wire requests continue to carry raw PG
+  evidence rather than pre-authorized role types.
+- every request-path stateful node-client family is either a factory for an
+  exact active route or an explicitly separate retained-cleanup, peering, or
+  recovery interface. The returned operation traits omit replacement PG,
+  epoch, and subject arguments wherever authority has already been selected.
+  The public request capabilities remain non-cloneable, have private fields,
+  borrow their originating admission where appropriate, and preserve the
+  immutable admitted deadline through the durable-effect boundary.
+- the generic `MetadataCommandNodeClient` remains intentionally confined to
+  storage-owned active publication and convergence code. It is not a request-
+  path escape from the subject-bound routes. Replacing its raw pending-slot
+  operations with compiler-classified publisher types is the explicit Phase 4
+  objective below; the Phase 3 audit does not treat that deferred publisher
+  typing as already complete.
+- embedded adapters validate their captured role, route, subject, operation,
+  and deadline before storage access. Authenticated Unix and TLS/TCP requests
+  share the storage-node dispatch boundary, which decodes raw route evidence,
+  validates it against the installed topology and authenticated node route,
+  and only then constructs server-local role and operation capabilities.
+  Retained cleanup and recovery use narrower interfaces and cannot acquire
+  ordinary new-work publisher authority.
+- the transitional boundary checker now guards the remaining API seams rather
+  than granting authority through its allowlists. Its metadata-command
+  publisher inventories remain only because Phase 4 has not yet replaced them
+  with compiler-visible classifications.
+- audit validation passed for the default production storage feature set, all
+  storage targets/features, `server-core/test-utils`, all server-http
+  targets/features, `./scripts/check-storage-cluster-boundaries`, strict
+  workspace Clippy, and all 7,949 tests in the current workspace tree. The
+  preceding completed slice separately passed all 2,626 storage tests and the
+  multihost `storage-node-kill-fails-closed` UAT. No Phase 3 residual item
+  remains open.
+
 ### Phase 4 — type metadata-command publication
 
 1. Replace the Phase 0 registry's discovery-only linkage with typed publisher
