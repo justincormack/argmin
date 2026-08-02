@@ -5668,6 +5668,14 @@ fn build_configured_unix_control_plane_client(
 fn build_frontend_control_plane_client_from_runtime_map_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<FrontendControlPlaneClient, String> {
+    if static_cluster_command_configured() {
+        let config = static_cluster_config::load_server_config_from_environment()
+            .map_err(|error| format!("configuration error: {error}"))?;
+        let fallback = control_plane_socket_path.to_str().ok_or_else(|| {
+            "control-plane command socket path must contain valid UTF-8".to_string()
+        })?;
+        return build_frontend_control_plane_client(&config, fallback);
+    }
     let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
     let auth_config = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_env()?;
     match auth_config {
@@ -6758,12 +6766,6 @@ enum FrontendControlPlaneStartupError {
         socket_path: String,
         source: Box<ControlPlaneError>,
     },
-    NoRoutedPgs,
-    NoRoutedNodes,
-    PgNotServing {
-        pg_id: u32,
-        cluster_epoch: ClusterEpoch,
-    },
     Permanent(String),
 }
 
@@ -6784,7 +6786,6 @@ impl FrontendControlPlaneStartupError {
             Self::RuntimeMapFetch { source, .. } => {
                 source.is_retryable_runtime_map_observation_error()
             }
-            Self::NoRoutedPgs | Self::NoRoutedNodes | Self::PgNotServing { .. } => true,
             Self::Permanent(_) => false,
         }
     }
@@ -6799,18 +6800,6 @@ impl std::fmt::Display for FrontendControlPlaneStartupError {
             } => write!(
                 formatter,
                 "failed to fetch control-plane runtime map from {socket_path}: {source}"
-            ),
-            Self::NoRoutedPgs => formatter.write_str("control-plane runtime map has no routed PGs"),
-            Self::NoRoutedNodes => {
-                formatter.write_str("control-plane runtime map has no routed nodes")
-            }
-            Self::PgNotServing {
-                pg_id,
-                cluster_epoch,
-            } => write!(
-                formatter,
-                "PG {pg_id} has no serving primary in cluster epoch {}",
-                cluster_epoch.get()
             ),
             Self::Permanent(message) => formatter.write_str(message),
         }
@@ -6859,8 +6848,9 @@ fn build_remote_frontend_storage_cluster(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> Result<Arc<StorageCluster>, String> {
-    if let Some(socket_path) = config.control_plane_socket_path.as_deref() {
-        return build_control_plane_frontend_storage_cluster(config, ec_config, socket_path)
+    if config.control_plane_socket_path.is_some() {
+        return build_control_plane_frontend_storage_clusters(config, ec_config)
+            .map(|clusters| clusters.foreground)
             .map_err(|error| error.to_string());
     }
     let cluster_epoch = ClusterEpoch::new(config.storage_cluster_epoch)
@@ -6903,23 +6893,6 @@ fn build_remote_frontend_storage_cluster(
     StorageCluster::from_static_local_map(Arc::new(local_map)).map_err(|e| e.to_string())
 }
 
-fn build_control_plane_frontend_storage_cluster(
-    config: &ServerConfig,
-    ec_config: &EcConfig,
-    control_plane_socket_path: &str,
-) -> Result<Arc<StorageCluster>, FrontendControlPlaneStartupError> {
-    let control_plane = build_frontend_control_plane_client(config, control_plane_socket_path)
-        .map_err(FrontendControlPlaneStartupError::permanent)?;
-    let runtime_map = control_plane
-        .runtime_map_snapshot(storage::clock::current_time_millis())
-        .map_err(|source| {
-            FrontendControlPlaneStartupError::runtime_map_fetch(control_plane_socket_path, source)
-        })?;
-    ensure_frontend_startup_runtime_map_is_serving(&runtime_map)?;
-    build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
-        .map_err(FrontendControlPlaneStartupError::permanent)
-}
-
 fn build_control_plane_frontend_storage_clusters(
     config: &ServerConfig,
     ec_config: &EcConfig,
@@ -6936,13 +6909,16 @@ fn build_control_plane_frontend_storage_clusters(
         .map_err(|source| {
             FrontendControlPlaneStartupError::runtime_map_fetch(socket_path, source)
         })?;
-    ensure_frontend_startup_runtime_map_is_serving(&runtime_map)?;
     let foreground =
         build_frontend_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
             .map_err(FrontendControlPlaneStartupError::permanent)?;
-    let Some(maintenance) =
-        build_maintenance_storage_cluster_from_runtime_map(config, ec_config, &runtime_map)
-            .map_err(FrontendControlPlaneStartupError::permanent)?
+    let Some(maintenance) = build_maintenance_storage_cluster_from_runtime_map(
+        config,
+        ec_config,
+        &runtime_map,
+        &foreground,
+    )
+    .map_err(FrontendControlPlaneStartupError::permanent)?
     else {
         return Ok(FrontendStorageClusters::dynamic_shared(foreground));
     };
@@ -6950,26 +6926,6 @@ fn build_control_plane_frontend_storage_clusters(
         foreground,
         maintenance,
     ))
-}
-
-fn ensure_frontend_startup_runtime_map_is_serving(
-    runtime_map: &ClusterRuntimeMapSnapshot,
-) -> Result<(), FrontendControlPlaneStartupError> {
-    if runtime_map.pg_routes().is_empty() {
-        return Err(FrontendControlPlaneStartupError::NoRoutedPgs);
-    }
-    if runtime_map.nodes().is_empty() {
-        return Err(FrontendControlPlaneStartupError::NoRoutedNodes);
-    }
-    for route in runtime_map.pg_routes() {
-        if route.state() != PgState::Active || route.primary_lease_deadline_ms().is_none() {
-            return Err(FrontendControlPlaneStartupError::PgNotServing {
-                pg_id: route.pg_id().get(),
-                cluster_epoch: runtime_map.cluster_epoch(),
-            });
-        }
-    }
-    Ok(())
 }
 
 fn build_frontend_storage_cluster_from_runtime_map(
@@ -7028,6 +6984,7 @@ fn build_maintenance_storage_cluster_from_runtime_map(
     config: &ServerConfig,
     ec_config: &EcConfig,
     runtime_map: &ClusterRuntimeMapSnapshot,
+    foreground: &StorageCluster,
 ) -> Result<Option<Arc<StorageCluster>>, String> {
     let Some(capability) = config.storage_rpc_maintenance_client_auth.clone() else {
         return Ok(None);
@@ -7038,7 +6995,25 @@ fn build_maintenance_storage_cluster_from_runtime_map(
         .map(|node| node.node_id())
         .ok_or_else(|| "control-plane runtime map has no routed nodes".to_string())?;
     if !config.storage_rpc_client_endpoints.is_empty() {
-        return StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_maintenance_auth(
+        return StorageCluster::from_runtime_map_with_storage_rpc_endpoints_and_maintenance_auth_sharing_process_state(
+                metadata_primary_node_id,
+                runtime_map,
+                EcShape {
+                    k: ec_config.data_shards(),
+                    m: ec_config.parity_shards(),
+                },
+                unix_storage_node_client_admission_settings(config),
+                config
+                    .storage_rpc_client_endpoints
+                    .iter()
+                    .map(|(node_id, endpoint)| (NodeId::new(*node_id), endpoint.clone())),
+                capability,
+                foreground,
+            )
+        .map(Some)
+        .map_err(|error| error.to_string());
+    }
+    StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_maintenance_auth_sharing_process_state(
             metadata_primary_node_id,
             runtime_map,
             EcShape {
@@ -7046,25 +7021,9 @@ fn build_maintenance_storage_cluster_from_runtime_map(
                 m: ec_config.parity_shards(),
             },
             unix_storage_node_client_admission_settings(config),
-            config
-                .storage_rpc_client_endpoints
-                .iter()
-                .map(|(node_id, endpoint)| (NodeId::new(*node_id), endpoint.clone())),
             capability,
+            foreground,
         )
-        .map(Some)
-        .map_err(|error| error.to_string());
-    }
-    StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings_and_maintenance_auth(
-        metadata_primary_node_id,
-        runtime_map,
-        EcShape {
-            k: ec_config.data_shards(),
-            m: ec_config.parity_shards(),
-        },
-        unix_storage_node_client_admission_settings(config),
-        capability,
-    )
     .map(Some)
     .map_err(|error| error.to_string())
 }
@@ -14495,13 +14454,6 @@ mod tests {
             },
         )
         .is_retryable());
-        assert!(FrontendControlPlaneStartupError::NoRoutedNodes.is_retryable());
-        assert!(FrontendControlPlaneStartupError::NoRoutedPgs.is_retryable());
-        assert!(FrontendControlPlaneStartupError::PgNotServing {
-            pg_id: 1,
-            cluster_epoch,
-        }
-        .is_retryable());
         assert!(!FrontendControlPlaneStartupError::runtime_map_fetch(
             "/tmp/control-plane.sock",
             ControlPlaneError::UnknownPg { pg_id: 1 },
@@ -15661,6 +15613,55 @@ mod tests {
                 .unwrap()
                 .state(),
             PgState::Active
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn dynamic_frontend_bootstraps_nonserving_map_so_recovery_can_start() {
+        let tmp = short_unix_socket_test_dir("fbr");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
+        let server = serve_one_control_plane_runtime_map(
+            socket_path.clone(),
+            NodeId::new(0),
+            endpoint.display().to_string(),
+        );
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::Frontend;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = None;
+        config.storage_node_socket_path = None;
+        config.storage_node_sockets.clear();
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+
+        let storage_clusters =
+            build_control_plane_frontend_storage_clusters(&config, &ec_config).unwrap();
+
+        server.join().unwrap();
+        assert!(matches!(
+            storage_clusters.authority,
+            FrontendStorageRouteAuthority::Dynamic
+        ));
+        let route = storage_clusters
+            .foreground
+            .local_pg_route(PgId::new(0))
+            .unwrap();
+        assert_eq!(route.state(), PgState::Peering);
+        let handles = frontend_route_handles(storage_clusters).unwrap();
+        assert_eq!(
+            handles
+                .foreground_route
+                .current()
+                .local_pg_route(PgId::new(0))
+                .unwrap()
+                .state(),
+            PgState::Peering,
+            "frontend startup route handles must remain available while one PG is Peering"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

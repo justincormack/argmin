@@ -631,10 +631,20 @@ CREATE TABLE bucket_delete_attempt_outcomes (
     cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
     bucket_execution_generation INTEGER NOT NULL CHECK (bucket_execution_generation >= 0),
     outcome          INTEGER NOT NULL CHECK (outcome IN (0, 1, 2, 3)),
-    phase            INTEGER NOT NULL CHECK (phase IN (0, 1, 2, 3, 4, 5, 6)),
+    phase            INTEGER NOT NULL CHECK (phase IN (0, 1, 2, 3, 4, 5, 6, 7)),
     detail           TEXT NOT NULL CHECK (length(detail) <= 1024),
     post_reservation_next_object_pg_id INTEGER CHECK (
         post_reservation_next_object_pg_id IS NULL OR post_reservation_next_object_pg_id >= 0
+    ),
+    stream_cleanup_next_object_pg_id INTEGER CHECK (
+        stream_cleanup_next_object_pg_id IS NULL OR stream_cleanup_next_object_pg_id >= 0
+    ),
+    stream_cleanup_next_session_id_marker TEXT,
+    stream_cleanup_aborted_uploads INTEGER NOT NULL CHECK (
+        stream_cleanup_aborted_uploads IN (0, 1)
+    ),
+    final_visibility_next_object_pg_id INTEGER CHECK (
+        final_visibility_next_object_pg_id IS NULL OR final_visibility_next_object_pg_id >= 0
     ),
     finalizer_next_object_pg_id INTEGER CHECK (
         finalizer_next_object_pg_id IS NULL OR finalizer_next_object_pg_id >= 0

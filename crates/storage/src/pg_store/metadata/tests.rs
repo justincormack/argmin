@@ -537,6 +537,10 @@ fn bucket_delete_attempt_outcome_records_last_state() {
         phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
         detail: "route expired".to_string(),
         post_reservation_next_object_pg_id: Some(7),
+        stream_cleanup_next_object_pg_id: Some(8),
+        stream_cleanup_next_session_id_marker: Some(SessionId::try_from("ab".repeat(16)).unwrap()),
+        stream_cleanup_aborted_uploads: true,
+        final_visibility_next_object_pg_id: Some(9),
         finalizer_next_object_pg_id: Some(9),
         updated_at: 11,
     };

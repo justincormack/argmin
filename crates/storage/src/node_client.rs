@@ -89,6 +89,7 @@ use crate::storage_rpc::{
     decode_scavenger_payload_references_response, decode_scavenger_shard_rows_response,
     decode_shard_ack_item_response, decode_shard_read_range_response, decode_shard_read_response,
     decode_shard_write_ack, decode_storage_rpc_response_payload,
+    decode_storage_rpc_response_payload_with_connection_disposition,
     decode_stream_part_finalize_snapshot_response, decode_stream_put_finalize_snapshot_response,
     decode_stream_segment_append_prepare_response, decode_stream_upload_match_response,
     decode_stream_upload_segments_response, decode_stream_upload_session_response,
@@ -487,6 +488,14 @@ fn storage_rpc_stream_error(
         }
         _ => StorageRpcErrorCode::PayloadDecode,
     };
+    let _ = observability::emit_flight_event(
+        "storage_rpc_client",
+        "storage_rpc_client_stream_error",
+        format!(
+            "node_id={} operation={operation:?} failure={code:?} error={error}",
+            node_id.as_u32()
+        ),
+    );
     StoreError::StorageRpc {
         node_id: node_id.as_u32(),
         operation,
@@ -1365,6 +1374,14 @@ fn storage_rpc_auth_store_error(
     operation: &'static str,
     error: impl std::fmt::Debug,
 ) -> StoreError {
+    let _ = observability::emit_flight_event(
+        "storage_rpc_client",
+        "storage_rpc_client_auth_error",
+        format!(
+            "node_id={} operation={operation:?} error={error:?}",
+            node_id.as_u32()
+        ),
+    );
     StoreError::StorageRpc {
         node_id: node_id.as_u32(),
         operation,

@@ -157,6 +157,15 @@ impl StorageRpcClientSigner {
         if principal_allows_operation(self.credential.principal(), kind) {
             return Ok(());
         }
+        let _ = observability::emit_flight_event(
+            "storage_rpc_client",
+            "storage_rpc_client_operation_unauthorized",
+            format!(
+                "principal={:?} kind={}",
+                self.credential.principal(),
+                kind.operation_name()
+            ),
+        );
         Err(storage_rpc_auth_protocol_error(format!(
             "configured principal is not authorized for {}",
             kind.operation_name()
@@ -1206,7 +1215,6 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         }
 
         StorageRpcMessageKind::ShardRepairWrite
-        | StorageRpcMessageKind::ShardHistoricalRead
         | StorageRpcMessageKind::PlacedSegmentShardRepairRecord
         | StorageRpcMessageKind::PlacedSegmentShardRepairs
         | StorageRpcMessageKind::PlacedSegmentShardRepairResolve
@@ -1238,7 +1246,6 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::LifecycleSweepClaimHeartbeat
         | StorageRpcMessageKind::LifecycleSweepClaimError
         | StorageRpcMessageKind::LifecycleSweepClaimRelease
-        | StorageRpcMessageKind::ObjectPayloadReclaimExists
         | StorageRpcMessageKind::ObjectBucketPayloadReclaimRoot
         | StorageRpcMessageKind::ObjectPayloadReclaimRoot
         | StorageRpcMessageKind::ObjectPayloadReclaimLoad
@@ -1247,6 +1254,14 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::ObjectPayloadReclaimClaimRelease
         | StorageRpcMessageKind::ObjectPayloadReclaimClaimGet => {
             StorageRpcAuthorizedRoles::MAINTENANCE_ONLY
+        }
+
+        StorageRpcMessageKind::ShardHistoricalRead => {
+            StorageRpcAuthorizedRoles::FRONTEND_STORAGE_MAINTENANCE
+        }
+
+        StorageRpcMessageKind::ObjectPayloadReclaimExists => {
+            StorageRpcAuthorizedRoles::FRONTEND_MAINTENANCE
         }
 
         StorageRpcMessageKind::ClaimHeartbeat
@@ -1557,6 +1572,11 @@ mod tests {
         StorageRpcMessageKind::MetadataCommandCheckpointCandidates,
         StorageRpcMessageKind::MetadataCommandCheckpointRecordCurrent,
         StorageRpcMessageKind::MetadataCommandLogCompact,
+    ];
+
+    const FOREGROUND_RETAINED_PAYLOAD_READ_WORKFLOW: &[StorageRpcMessageKind] = &[
+        StorageRpcMessageKind::ShardHistoricalRead,
+        StorageRpcMessageKind::ObjectPayloadReclaimExists,
     ];
 
     const LIFECYCLE_MAINTENANCE_WORKFLOW: &[StorageRpcMessageKind] = &[
@@ -2192,6 +2212,27 @@ mod tests {
             "bucket-delete finalization",
             BUCKET_DELETE_MAINTENANCE_WORKFLOW,
         );
+    }
+
+    #[test]
+    fn storage_rpc_auth_foreground_retained_payload_reads_use_frontend_capability() {
+        let credential = credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+
+        assert_authenticated_workflow(
+            &credential,
+            "foreground retained payload read",
+            FOREGROUND_RETAINED_PAYLOAD_READ_WORKFLOW,
+        );
+        assert!(!principal_allows_operation(
+            credential.principal(),
+            StorageRpcMessageKind::ShardRepairWrite
+        ));
+        assert!(!principal_allows_operation(
+            credential.principal(),
+            StorageRpcMessageKind::ObjectPayloadReclaimLoad
+        ));
     }
 
     #[test]

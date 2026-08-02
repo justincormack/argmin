@@ -3450,6 +3450,10 @@ fn begin_bucket_delete_adopts_final_visibility_phase_without_repeating_post_rese
             phase: crate::BucketDeleteAttemptPhase::FinalVisibilityCheck,
             detail: "resume from final visibility".to_string(),
             post_reservation_next_object_pg_id: Some(0),
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
             finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
@@ -3499,6 +3503,104 @@ fn begin_bucket_delete_adopts_final_visibility_phase_without_repeating_post_rese
 }
 
 #[test]
+fn begin_bucket_delete_resumes_final_visibility_from_durable_pg_cursor() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids: Vec<u32> = (0..16).collect();
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-final-visibility-cursor-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let stage = Arc::new(AtomicUsize::new(0));
+    let stage_for_hook = Arc::clone(&stage);
+    let _progress_hook_guard = cluster
+        .test_install_after_bucket_delete_final_visibility_progress_hook(Arc::new(
+            move |next_object_pg_id| {
+                match stage_for_hook.load(Ordering::SeqCst) {
+                    0 if next_object_pg_id == 8 => {
+                        stage_for_hook.store(1, Ordering::SeqCst);
+                        return Err(StoreError::RouteMapExpired {
+                            cluster_epoch: ClusterEpoch::INITIAL,
+                            valid_until_ms: 0,
+                            now_ms: 1,
+                        });
+                    }
+                    1 => {
+                        assert!(
+                            next_object_pg_id > 8,
+                            "final visibility retry revisited a completed PG frontier: {next_object_pg_id}"
+                        );
+                        stage_for_hook.store(2, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+    let first_error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(
+            first_error,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "first visibility pass should stop after persisting its cursor, got {first_error:?}"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("failed visibility pass should retain durable progress");
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::FinalVisibilityCheck
+    );
+    assert_eq!(outcome.final_visibility_next_object_pg_id, Some(8));
+    drop(bucket_pg);
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+    assert_eq!(
+        stage.load(Ordering::SeqCst),
+        2,
+        "retry should continue strictly after the persisted visibility frontier"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    assert_eq!(
+        crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+            .unwrap()
+            .state,
+        crate::BucketState::Deleting
+    );
+}
+
+#[test]
 fn begin_bucket_delete_adopts_final_visibility_proven_without_repeating_visibility_check() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
@@ -3544,6 +3646,10 @@ fn begin_bucket_delete_adopts_final_visibility_proven_without_repeating_visibili
             phase: crate::BucketDeleteAttemptPhase::FinalVisibilityProven,
             detail: "resume after final visibility proof".to_string(),
             post_reservation_next_object_pg_id: Some(0),
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
             finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
@@ -3706,6 +3812,127 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
         crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
     );
     assert_eq!(final_outcome.drain_id, preserved_drain.drain_id);
+}
+
+#[test]
+fn begin_bucket_delete_preserves_drain_after_post_proof_transport_interruption() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-transport-interruption-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let _hook_guard =
+        cluster.test_install_after_bucket_delete_final_visibility_proven_hook(Arc::new(|| {
+            Err(StoreError::Io {
+                context: "injected storage RPC response loss",
+                source: std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "injected response loss",
+                ),
+            })
+        }));
+
+    let error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::BucketWriteDrainError::Store(StoreError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::ConnectionReset
+        ),
+        "expected the injected transport interruption, got {error:?}"
+    );
+
+    let pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let drain = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+        .unwrap()
+        .expect("an ambiguous transport failure must preserve the durable delete drain");
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*pg, &bucket)
+        .unwrap()
+        .expect("an ambiguous transport failure must preserve resumable progress");
+    assert_eq!(outcome.drain_id, drain.drain_id);
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::FinalVisibilityProven
+    );
+}
+
+#[test]
+fn adopted_bucket_delete_does_not_touch_drain_through_expired_runtime_map() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-expired-adoption-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let bucket_info = cluster.test_head_bucket_raw(&bucket).unwrap();
+    let original = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain.record,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire a delete drain")
+        }
+    };
+    cluster.test_store_route_map_validity(RouteMapValidity::until_ms(0).unwrap());
+
+    let root = crate::BucketDeleteBeginRoot {
+        bucket: bucket.clone(),
+        bucket_execution_generation: bucket_info.bucket_execution_generation,
+        bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
+    };
+    let error = cluster.continue_adopted_bucket_delete(&root).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "expired background route must fail before drain adoption, got {error:?}"
+    );
+
+    let pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    assert_eq!(
+        crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+            .unwrap()
+            .expect("expired background route must leave the drain intact"),
+        original,
+        "expired background recovery must not heartbeat, replace, or clear the drain"
+    );
 }
 
 #[test]
@@ -4121,6 +4348,10 @@ fn begin_bucket_delete_adopts_stream_cleanup_phase_and_revalidates_after_reserva
             phase: crate::BucketDeleteAttemptPhase::StreamCleanup,
             detail: "resume from stream cleanup".to_string(),
             post_reservation_next_object_pg_id: None,
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
             finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
@@ -4162,6 +4393,107 @@ fn begin_bucket_delete_adopts_stream_cleanup_phase_and_revalidates_after_reserva
     );
     assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
     assert_eq!(outcome.drain_id, drain.record.drain_id);
+}
+
+#[test]
+fn begin_bucket_delete_resumes_stream_cleanup_from_durable_pg_cursor() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids: Vec<u32> = (0..16).collect();
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-stream-cleanup-cursor-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let stage = Arc::new(AtomicUsize::new(0));
+    let stage_for_hook = Arc::clone(&stage);
+    let _progress_hook_guard = cluster
+        .test_install_after_bucket_delete_stream_cleanup_progress_hook(Arc::new(
+            move |phase, next_object_pg_id| {
+                if phase != crate::TestBucketDeleteAttemptPhase::StreamCleanup {
+                    return Ok(());
+                }
+                match stage_for_hook.load(Ordering::SeqCst) {
+                    0 if next_object_pg_id == 8 => {
+                        stage_for_hook.store(1, Ordering::SeqCst);
+                        return Err(StoreError::RouteMapExpired {
+                            cluster_epoch: ClusterEpoch::INITIAL,
+                            valid_until_ms: 0,
+                            now_ms: 1,
+                        });
+                    }
+                    1 => {
+                        assert!(
+                            next_object_pg_id > 8,
+                            "stream cleanup retry revisited a completed PG frontier: {next_object_pg_id}"
+                        );
+                        stage_for_hook.store(2, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                Ok(())
+            },
+        ));
+
+    let first_error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(
+            first_error,
+            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
+        ),
+        "first stream cleanup pass should stop after persisting its cursor, got {first_error:?}"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("failed stream cleanup should retain durable progress");
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::StreamCleanup
+    );
+    assert_eq!(outcome.stream_cleanup_next_object_pg_id, Some(8));
+    drop(bucket_pg);
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+    assert_eq!(
+        stage.load(Ordering::SeqCst),
+        2,
+        "retry should continue strictly after the persisted stream-cleanup frontier"
+    );
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    assert_eq!(
+        crate::PgMetadataStore::head_bucket_raw(&*bucket_pg, &bucket)
+            .unwrap()
+            .state,
+        crate::BucketState::Deleting
+    );
 }
 
 #[test]
@@ -4337,6 +4669,10 @@ fn begin_bucket_delete_adopts_reservation_wait_phase_without_repeating_initial_s
             phase: crate::BucketDeleteAttemptPhase::ReservationWait,
             detail: "resume from reservation wait".to_string(),
             post_reservation_next_object_pg_id: None,
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
             finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
@@ -4566,6 +4902,10 @@ fn begin_bucket_delete_adopted_attempt_clears_drain_on_bucket_not_empty() {
             phase: crate::BucketDeleteAttemptPhase::ReservationWait,
             detail: "resume from reservation wait before terminal not-empty".to_string(),
             post_reservation_next_object_pg_id: None,
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
             finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
@@ -4664,6 +5004,10 @@ fn post_reservation_exact_bucket_frontier_is_identity_fenced_and_resettable() {
             phase: crate::BucketDeleteAttemptPhase::PostReservationObjectDrain,
             detail: "stale progress must not be trusted".to_string(),
             post_reservation_next_object_pg_id: Some(pg_count),
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
             finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },
@@ -4850,6 +5194,10 @@ fn begin_bucket_delete_adopts_completed_post_reservation_frontier_without_rescan
             phase: crate::BucketDeleteAttemptPhase::PostReservationObjectDrain,
             detail: "terminal post-reservation scan already completed".to_string(),
             post_reservation_next_object_pg_id: Some(terminal_post_reservation_next_object_pg_id),
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
             finalizer_next_object_pg_id: None,
             updated_at: crate::clock::current_time_millis(),
         },

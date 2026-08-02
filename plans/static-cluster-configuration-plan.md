@@ -1180,9 +1180,22 @@ Progress as of 2026-07-21:
   manifest mappings, and prove TLS endpoint retention after refresh.
   Replicated `combined` processes remain fail-closed until their embedded
   workflows receive the same operation-scoped credential composition. The
-  multi-process cross-host data-plane workload and complete server-local
-  operation-capability gate remain open, so this slice does not yet claim a
-  complete cross-host data plane.
+  first split-role three-host workload now composes static authorities,
+  storage nodes, and a frontend over authenticated TLS/TCP storage RPC. It
+  verifies persistent S3 create/PUT/GET/HEAD/list traffic across Raft leader
+  loss and authority restart, then restarts one storage node and verifies both
+  old and new object bytes. Foreground retained-payload reads explicitly carry
+  only the two additional read-side capabilities they require: historical
+  shard read and reclaim-existence lookup; repair and reclaim mutations remain
+  maintenance-only. The complete server-local operation-capability gate and
+  the default 116-PG/256-retained-epoch multi-cycle run remain open, so this
+  slice is integration evidence rather than final data-plane release closure.
+  Foreground and maintenance role views share process-local leases, recovery
+  flights, and maintenance queues while retaining separate typed signers; this
+  prevents foreground durable cleanup from depending on a delayed safety scan.
+  The current restart check proves recovery after a storage node returns, not
+  uninterrupted reads during its absence. That stronger assertion remains
+  gated on the replicated Peering/degraded-read policy.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state

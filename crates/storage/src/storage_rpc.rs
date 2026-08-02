@@ -309,6 +309,14 @@ const STORAGE_RPC_BUCKET_DELETE_ATTEMPT_OUTCOME_RECORD_MAX_LEN: usize =
         + 4
         + 1
         + 4
+        + 1
+        + 4
+        + SESSION_ID_LEN
+        + 1
+        + 1
+        + 4
+        + 1
+        + 4
         + 8;
 const STORAGE_RPC_MAX_BUCKET_OWNER_PRINCIPAL_LEN: usize = 1024;
 const STORAGE_RPC_MAX_BUCKET_OWNER_CANONICAL_ID_LEN: usize = 1024;
@@ -4154,6 +4162,7 @@ pub(crate) fn decode_health_response(
 pub(crate) fn encode_storage_rpc_success_response(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     put_u8(&mut out, 0);
+    put_u8(&mut out, 0);
     put_bytes(&mut out, payload);
     out
 }
@@ -4168,16 +4177,46 @@ pub(crate) fn encode_storage_rpc_error_response(
     }
     let mut out = Vec::new();
     put_u8(&mut out, 1);
+    put_u8(&mut out, 0);
     put_u16(&mut out, error.code.as_u16());
     put_string(&mut out, &error.message);
     Ok(out)
 }
 
-pub(crate) fn decode_storage_rpc_response_payload(
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DecodedStorageRpcResponsePayload {
+    pub(crate) response: Result<Vec<u8>, StorageRpcErrorResponse>,
+    pub(crate) connection_reusable: bool,
+}
+
+pub(crate) fn set_storage_rpc_response_connection_reusable(
+    bytes: &mut [u8],
+    connection_reusable: bool,
+) -> Result<(), StorageRpcPayloadError> {
+    let Some(encoded) = bytes.get_mut(1) else {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "response envelope has no connection disposition",
+        ));
+    };
+    *encoded = u8::from(connection_reusable);
+    Ok(())
+}
+
+pub(crate) fn decode_storage_rpc_response_payload_with_connection_disposition(
     bytes: &[u8],
-) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StorageRpcPayloadError> {
+) -> Result<DecodedStorageRpcResponsePayload, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let response = match decoder.read_u8()? {
+    let response_tag = decoder.read_u8()?;
+    let connection_reusable = match decoder.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown response connection disposition",
+            ))
+        }
+    };
+    let response = match response_tag {
         0 => Ok(decoder.read_bytes()?.to_vec()),
         1 => {
             let code = StorageRpcErrorCode::from_u16(decoder.read_u16()?)?;
@@ -4196,7 +4235,17 @@ pub(crate) fn decode_storage_rpc_response_payload(
         }
     };
     decoder.finish()?;
-    Ok(response)
+    Ok(DecodedStorageRpcResponsePayload {
+        response,
+        connection_reusable,
+    })
+}
+
+pub(crate) fn decode_storage_rpc_response_payload(
+    bytes: &[u8],
+) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StorageRpcPayloadError> {
+    decode_storage_rpc_response_payload_with_connection_disposition(bytes)
+        .map(|decoded| decoded.response)
 }
 
 pub(crate) fn encode_metadata_command_item(
@@ -13815,6 +13864,7 @@ impl<'a> StorageRpcDecoder<'a> {
             4 => BucketDeleteAttemptPhase::FinalVisibilityCheck,
             5 => BucketDeleteAttemptPhase::FinalVisibilityProven,
             6 => BucketDeleteAttemptPhase::MarkDeleting,
+            7 => BucketDeleteAttemptPhase::PostReservationStreamCleanup,
             _ => {
                 return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
                     "invalid bucket delete attempt phase",
@@ -13828,6 +13878,10 @@ impl<'a> StorageRpcDecoder<'a> {
             ),
         )?;
         let post_reservation_next_object_pg_id = self.read_optional_u32()?;
+        let stream_cleanup_next_object_pg_id = self.read_optional_u32()?;
+        let stream_cleanup_next_session_id_marker = self.read_optional_session_id()?;
+        let stream_cleanup_aborted_uploads = self.read_bool()?;
+        let final_visibility_next_object_pg_id = self.read_optional_u32()?;
         let finalizer_next_object_pg_id = self.read_optional_u32()?;
         let updated_at = self.read_u64()?;
         Ok(BucketDeleteAttemptOutcomeRecord {
@@ -13839,6 +13893,10 @@ impl<'a> StorageRpcDecoder<'a> {
             phase,
             detail,
             post_reservation_next_object_pg_id,
+            stream_cleanup_next_object_pg_id,
+            stream_cleanup_next_session_id_marker,
+            stream_cleanup_aborted_uploads,
+            final_visibility_next_object_pg_id,
             finalizer_next_object_pg_id,
             updated_at,
         })
@@ -16464,6 +16522,16 @@ fn put_bucket_delete_attempt_outcome_record(
     put_u8(out, record.phase as u8);
     put_string(out, &record.detail);
     put_optional_u32(out, record.post_reservation_next_object_pg_id);
+    put_optional_u32(out, record.stream_cleanup_next_object_pg_id);
+    put_optional_string(
+        out,
+        record
+            .stream_cleanup_next_session_id_marker
+            .as_ref()
+            .map(SessionId::as_str),
+    );
+    put_bool(out, record.stream_cleanup_aborted_uploads);
+    put_optional_u32(out, record.final_visibility_next_object_pg_id);
     put_optional_u32(out, record.finalizer_next_object_pg_id);
     put_u64(out, record.updated_at);
 }
@@ -18563,10 +18631,18 @@ mod tests {
 
     #[test]
     fn storage_rpc_response_payload_round_trips_success_and_error() {
-        let success = encode_storage_rpc_success_response(b"ok");
+        let mut success = encode_storage_rpc_success_response(b"ok");
         assert_eq!(
             decode_storage_rpc_response_payload(&success).unwrap(),
             Ok(b"ok".to_vec())
+        );
+        set_storage_rpc_response_connection_reusable(&mut success, true).unwrap();
+        assert_eq!(
+            decode_storage_rpc_response_payload_with_connection_disposition(&success).unwrap(),
+            DecodedStorageRpcResponsePayload {
+                response: Ok(b"ok".to_vec()),
+                connection_reusable: true,
+            }
         );
 
         let error = StorageRpcErrorResponse {
@@ -18578,6 +18654,15 @@ mod tests {
             decode_storage_rpc_response_payload(&error_bytes).unwrap(),
             Err(error)
         );
+
+        let mut invalid_disposition = success;
+        invalid_disposition[1] = 2;
+        assert!(matches!(
+            decode_storage_rpc_response_payload(&invalid_disposition),
+            Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown response connection disposition"
+            ))
+        ));
     }
 
     #[test]
@@ -19493,7 +19578,7 @@ mod tests {
         let response_payload_len =
             4 + usize::try_from(STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES).unwrap()
                 * worst_case_applied_entry_len;
-        let success_wrapped_len = 1 + 4 + response_payload_len;
+        let success_wrapped_len = 1 + 1 + 4 + response_payload_len;
 
         assert!(
             success_wrapped_len <= STORAGE_RPC_MAX_PAYLOAD_LEN,
@@ -21464,6 +21549,12 @@ mod tests {
                     phase: BucketDeleteAttemptPhase::FinalVisibilityProven,
                     detail: "e".repeat(BUCKET_DELETE_ATTEMPT_OUTCOME_DETAIL_MAX_LEN),
                     post_reservation_next_object_pg_id: Some(7),
+                    stream_cleanup_next_object_pg_id: Some(8),
+                    stream_cleanup_next_session_id_marker: Some(
+                        SessionId::try_from("ab".repeat(16)).unwrap(),
+                    ),
+                    stream_cleanup_aborted_uploads: true,
+                    final_visibility_next_object_pg_id: Some(9),
                     finalizer_next_object_pg_id: Some(9),
                     updated_at: 6,
                 },

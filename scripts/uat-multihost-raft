@@ -17,12 +17,16 @@ Options:
   --hosts H0,H1,H2       SSH host aliases (or ARGMIN_MULTIHOST_RAFT_HOSTS)
   --addresses A0,A1,A2   Advertised IPv4 addresses (or ARGMIN_MULTIHOST_RAFT_ADDRS)
   --binary PATH          Deploy an already-built argmin-s3 binary
+  --client-binary PATH   Use an already-built uat_pg_backfill_smoke binary
   --release              Build and deploy target/release/argmin-s3
   --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
+  --ssh-config PATH      Explicit SSH client config (or ARGMIN_MULTIHOST_RAFT_SSH_CONFIG)
   --storage-profile P    persistent or volatile-test (default: persistent)
   --port-base PORT       Raft port; control/recovery/storage use the next three (default: 24000)
   --pg-count N           Bootstrap PG count (default: 116)
   --retained-epochs N    Committed route epoch advances before failover (default: 256)
+  --data-objects N       Persistent S3 objects checked across failures (default: 8)
+  --heartbeat-lease-ms N Storage-node heartbeat lease (default: 5000)
   --repeat N             Leader transfer/loss/restart cycles (default: 3)
   --no-cleanup           Preserve remote and local state after every run
   --no-cleanup-fail      Preserve remote and local state only after failure
@@ -73,10 +77,10 @@ remote_exec() {
     shift
     local command
     command="$(shell_join "$@")"
-    print_command ssh "$host" "$command"
+    print_command ssh "${ssh_options[@]}" "$host" "$command"
     # shell_join quotes every remote argument.
     # shellcheck disable=SC2029
-    ssh "$host" "$command"
+    ssh "${ssh_options[@]}" "$host" "$command"
 }
 
 remote_exec_quiet() {
@@ -86,18 +90,22 @@ remote_exec_quiet() {
     command="$(shell_join "$@")"
     # shell_join quotes every remote argument.
     # shellcheck disable=SC2029
-    ssh "$host" "$command"
+    ssh "${ssh_options[@]}" "$host" "$command"
 }
 
 hosts_value="${ARGMIN_MULTIHOST_RAFT_HOSTS:-}"
 addresses_value="${ARGMIN_MULTIHOST_RAFT_ADDRS:-}"
 binary=""
+client_binary=""
 release=0
 remote_root="${ARGMIN_MULTIHOST_RAFT_REMOTE_ROOT:-/home/argmin-test/argmin-soak}"
+ssh_config="${ARGMIN_MULTIHOST_RAFT_SSH_CONFIG:-}"
 storage_profile="${ARGMIN_MULTIHOST_RAFT_STORAGE_PROFILE:-persistent}"
 port_base="${ARGMIN_MULTIHOST_RAFT_PORT_BASE:-24000}"
 pg_count="${ARGMIN_MULTIHOST_RAFT_PG_COUNT:-116}"
 retained_epochs="${ARGMIN_MULTIHOST_RAFT_RETAINED_EPOCHS:-256}"
+data_object_count="${ARGMIN_MULTIHOST_RAFT_DATA_OBJECTS:-8}"
+heartbeat_lease_ms="${ARGMIN_MULTIHOST_RAFT_HEARTBEAT_LEASE_MS:-5000}"
 repeat_count="${ARGMIN_MULTIHOST_RAFT_REPEAT:-3}"
 keep_always=0
 keep_failure=0
@@ -119,6 +127,11 @@ while (($# > 0)); do
             binary="$2"
             shift 2
             ;;
+        --client-binary)
+            [[ $# -ge 2 ]] || die "--client-binary requires a value"
+            client_binary="$2"
+            shift 2
+            ;;
         --release)
             release=1
             shift
@@ -126,6 +139,11 @@ while (($# > 0)); do
         --remote-root)
             [[ $# -ge 2 ]] || die "--remote-root requires a value"
             remote_root="$2"
+            shift 2
+            ;;
+        --ssh-config)
+            [[ $# -ge 2 ]] || die "--ssh-config requires a value"
+            ssh_config="$2"
             shift 2
             ;;
         --storage-profile)
@@ -146,6 +164,16 @@ while (($# > 0)); do
         --retained-epochs)
             [[ $# -ge 2 ]] || die "--retained-epochs requires a value"
             retained_epochs="$2"
+            shift 2
+            ;;
+        --data-objects)
+            [[ $# -ge 2 ]] || die "--data-objects requires a value"
+            data_object_count="$2"
+            shift 2
+            ;;
+        --heartbeat-lease-ms)
+            [[ $# -ge 2 ]] || die "--heartbeat-lease-ms requires a value"
+            heartbeat_lease_ms="$2"
             shift 2
             ;;
         --repeat)
@@ -176,15 +204,24 @@ done
 ((release == 0 || ${#binary} == 0)) || die "--binary cannot be combined with --release"
 [[ "$remote_root" == /* && "$remote_root" != "/" ]] || die "--remote-root must be a non-root absolute path"
 [[ "$remote_root" != *[[:space:]]* ]] || die "--remote-root cannot contain whitespace"
+declare -a ssh_options=() scp_options=()
+if [[ -n "$ssh_config" ]]; then
+    [[ -f "$ssh_config" ]] || die "--ssh-config does not name a regular file: $ssh_config"
+    ssh_options=(-F "$ssh_config")
+    scp_options=(-F "$ssh_config")
+fi
 case "$storage_profile" in
     persistent|volatile-test) ;;
     *) die "--storage-profile must be persistent or volatile-test" ;;
 esac
-for numeric in "$port_base" "$pg_count" "$retained_epochs" "$repeat_count"; do
+for numeric in "$port_base" "$pg_count" "$retained_epochs" "$data_object_count" "$heartbeat_lease_ms" "$repeat_count"; do
     [[ "$numeric" =~ ^[1-9][0-9]*$ ]] || die "numeric options must be positive integers"
 done
-((port_base >= 1024 && port_base <= 65532)) || die "--port-base must be between 1024 and 65532"
+((port_base >= 1024 && port_base <= 65531)) || die "--port-base must be between 1024 and 65531"
 ((pg_count <= 4096)) || die "--pg-count exceeds the manifest limit of 4096"
+((data_object_count <= 64)) || die "--data-objects must not exceed 64"
+((heartbeat_lease_ms >= 2000 && heartbeat_lease_ms <= 10000)) ||
+    die "--heartbeat-lease-ms must be between 2000 and 10000"
 
 declare -a hosts addresses
 split_exact_three "$hosts_value" "--hosts" hosts
@@ -209,6 +246,11 @@ for host in "${hosts[@]}"; do
     machine_id_hosts["$machine_id"]="$host"
 done
 
+profile_dir="debug"
+if ((release)); then
+    profile_dir="release"
+fi
+
 if [[ -z "$binary" ]]; then
     if ((release)); then
         print_command cargo build --release -p argmin-s3 --bin argmin-s3
@@ -223,6 +265,19 @@ elif [[ "$binary" != /* ]]; then
     binary="$ROOT/$binary"
 fi
 [[ -x "$binary" ]] || die "argmin-s3 binary is not executable: $binary"
+
+if [[ -z "$client_binary" ]]; then
+    client_build=(cargo build -p s3-tests --bin uat_pg_backfill_smoke)
+    if ((release)); then
+        client_build=(cargo build --release -p s3-tests --bin uat_pg_backfill_smoke)
+    fi
+    print_command "${client_build[@]}"
+    "${client_build[@]}"
+    client_binary="$ROOT/target/$profile_dir/uat_pg_backfill_smoke"
+elif [[ "$client_binary" != /* ]]; then
+    client_binary="$ROOT/$client_binary"
+fi
+[[ -x "$client_binary" ]] || die "S3 UAT client binary is not executable: $client_binary"
 command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the test PKI"
 command -v scp >/dev/null 2>&1 || die "scp is required"
 
@@ -237,22 +292,33 @@ chmod 700 "$local_run" "$material_dir"
 
 declare -a current_units=("" "" "")
 declare -a unit_generations=(0 0 0)
+declare -a storage_units=("" "" "")
+declare -a storage_unit_generations=(0 0 0)
+frontend_unit=""
+frontend_unit_generation=0
 cleanup_started=0
 
 collect_artifacts() {
-    local index host host_dir
+    local index host host_dir unit
     for index in 0 1 2; do
         host="${hosts[$index]}"
         host_dir="$local_run/$host"
         mkdir -p "$host_dir"
-        scp -q -r "$host:$remote_run/logs/." "$host_dir/logs" 2>/dev/null || true
+        scp "${scp_options[@]}" -q -r "$host:$remote_run/logs/." "$host_dir/logs" 2>/dev/null || true
         remote_exec_quiet "$host" find "$remote_run" -maxdepth 3 -type f -printf '%P %s bytes\n' \
             >"$host_dir/files.txt" 2>&1 || true
-        if [[ -n "${current_units[$index]}" ]]; then
-            remote_exec_quiet "$host" systemctl --user status "${current_units[$index]}" --no-pager \
-                >"$host_dir/unit-status.txt" 2>&1 || true
-            remote_exec_quiet "$host" journalctl --user-unit "${current_units[$index]}" --no-pager \
-                >"$host_dir/journal.txt" 2>&1 || true
+        for unit in "${current_units[$index]}" "${storage_units[$index]}"; do
+            [[ -n "$unit" ]] || continue
+            remote_exec_quiet "$host" systemctl --user status "$unit" --no-pager \
+                >"$host_dir/$unit-status.txt" 2>&1 || true
+            remote_exec_quiet "$host" journalctl --user-unit "$unit" --no-pager \
+                >"$host_dir/$unit-journal.txt" 2>&1 || true
+        done
+        if ((index == 0)) && [[ -n "$frontend_unit" ]]; then
+            remote_exec_quiet "$host" systemctl --user status "$frontend_unit" --no-pager \
+                >"$host_dir/$frontend_unit-status.txt" 2>&1 || true
+            remote_exec_quiet "$host" journalctl --user-unit "$frontend_unit" --no-pager \
+                >"$host_dir/$frontend_unit-journal.txt" 2>&1 || true
         fi
         remote_exec_quiet "$host" chronyc tracking >"$host_dir/chronyc-tracking.txt" 2>&1 || true
     done
@@ -260,7 +326,15 @@ collect_artifacts() {
 
 stop_processes() {
     local index
+    if [[ -n "$frontend_unit" ]]; then
+        remote_exec_quiet "${hosts[0]}" systemctl --user stop "$frontend_unit" \
+            >/dev/null 2>&1 || true
+    fi
     for index in 0 1 2; do
+        if [[ -n "${storage_units[$index]}" ]]; then
+            remote_exec_quiet "${hosts[$index]}" systemctl --user stop "${storage_units[$index]}" \
+                >/dev/null 2>&1 || true
+        fi
         if [[ -n "${current_units[$index]}" ]]; then
             remote_exec_quiet "${hosts[$index]}" systemctl --user stop "${current_units[$index]}" \
                 >/dev/null 2>&1 || true
@@ -292,9 +366,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "== argmin-s3 multihost Raft soak =="
-echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value storage_profile=$storage_profile pg_count=$pg_count retained_epochs=$retained_epochs repeat=$repeat_count"
-echo "binary=$binary remote_run=$remote_run"
+echo "== argmin-s3 multihost Raft and data-plane soak =="
+echo "run_id=$run_id hosts=$hosts_value addresses=$addresses_value storage_profile=$storage_profile pg_count=$pg_count retained_epochs=$retained_epochs data_objects=$data_object_count heartbeat_lease_ms=$heartbeat_lease_ms repeat=$repeat_count"
+echo "binary=$binary client_binary=$client_binary remote_run=$remote_run"
 if [[ "$storage_profile" == "volatile-test" ]]; then
     echo "NOTE: volatile-test storage is a functional/locking profile and is not durability release evidence"
 fi
@@ -335,6 +409,16 @@ for role in raft storage admin; do
         generated_auth_secrets["$secret"]="$role-$number"
     done
 done
+for credential in frontend-1 frontend-1-admin frontend-1-maintenance; do
+    secret_path="$material_dir/$credential.key"
+    (umask 077 && openssl rand -hex 32 >"$secret_path")
+    secret="$(<"$secret_path")"
+    [[ "$secret" =~ ^[0-9a-f]{64}$ ]] ||
+        die "openssl generated malformed $credential credential material"
+    [[ -z "${generated_auth_secrets[$secret]:-}" ]] ||
+        die "openssl generated duplicate credential material for ${generated_auth_secrets[$secret]} and $credential"
+    generated_auth_secrets["$secret"]="$credential"
+done
 
 declare -a mount_paths
 for index in 0 1 2; do
@@ -349,6 +433,7 @@ raft_port="$port_base"
 control_port=$((port_base + 1))
 recovery_port=$((port_base + 2))
 storage_port=$((port_base + 3))
+frontend_port=$((port_base + 4))
 cluster_id="multihost-raft-$run_id"
 
 cat >"$manifest_path" <<EOF
@@ -523,6 +608,44 @@ accept_from_ms = 0
 secret_ref = "file:$remote_run/material/admin-$number.key"
 EOF
 done
+
+cat >>"$manifest_path" <<EOF
+
+[[processes]]
+id = "frontend-1"
+host_id = "host-1"
+kind = "frontend"
+frontend_instance_id = "frontend-1"
+admin_instance_id = "frontend-1-admin"
+maintenance_instance_id = "frontend-1-maintenance"
+
+[[auth_credentials]]
+principal = "frontend"
+instance_id = "frontend-1"
+credential_id = "frontend-1"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/frontend-1.key"
+
+[[auth_credentials]]
+principal = "admin"
+instance_id = "frontend-1-admin"
+credential_id = "frontend-1-admin"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/frontend-1-admin.key"
+
+[[auth_credentials]]
+principal = "maintenance"
+instance_id = "frontend-1-maintenance"
+credential_id = "frontend-1-maintenance"
+credential_version = 1
+use_for_signing = true
+accept_from_ms = 0
+secret_ref = "file:$remote_run/material/frontend-1-maintenance.key"
+EOF
 chmod 600 "$manifest_path"
 
 binary_digest="$(sha256sum "$binary" | awk '{print $1}')"
@@ -539,16 +662,21 @@ for role in raft storage admin; do
         deploy_material+=("$material_dir/$role-$number.key")
     done
 done
+deploy_material+=(
+    "$material_dir/frontend-1.key"
+    "$material_dir/frontend-1-admin.key"
+    "$material_dir/frontend-1-maintenance.key"
+)
 
 for index in 0 1 2; do
     host="${hosts[$index]}"
     echo "== deploy to $host =="
-    print_command scp -q "$binary" "$host:$remote_run/argmin-s3.next"
-    scp -q "$binary" "$host:$remote_run/argmin-s3.next"
-    print_command scp -q "$manifest_path" "$host:$remote_run/cluster.toml"
-    scp -q "$manifest_path" "$host:$remote_run/cluster.toml"
-    print_command scp -q "${deploy_material[@]}" "$host:$remote_run/material/"
-    scp -q "${deploy_material[@]}" "$host:$remote_run/material/"
+    print_command scp "${scp_options[@]}" -q "$binary" "$host:$remote_run/argmin-s3.next"
+    scp "${scp_options[@]}" -q "$binary" "$host:$remote_run/argmin-s3.next"
+    print_command scp "${scp_options[@]}" -q "$manifest_path" "$host:$remote_run/cluster.toml"
+    scp "${scp_options[@]}" -q "$manifest_path" "$host:$remote_run/cluster.toml"
+    print_command scp "${scp_options[@]}" -q "${deploy_material[@]}" "$host:$remote_run/material/"
+    scp "${scp_options[@]}" -q "${deploy_material[@]}" "$host:$remote_run/material/"
     remote_exec "$host" mv "$remote_run/argmin-s3.next" "$remote_run/argmin-s3"
     remote_exec "$host" chmod 700 "$remote_run/argmin-s3"
     sensitive_paths=(
@@ -560,6 +688,11 @@ for index in 0 1 2; do
             sensitive_paths+=("$remote_run/material/$role-$number.key")
         done
     done
+    sensitive_paths+=(
+        "$remote_run/material/frontend-1.key"
+        "$remote_run/material/frontend-1-admin.key"
+        "$remote_run/material/frontend-1-maintenance.key"
+    )
     remote_exec "$host" chmod 600 "${sensitive_paths[@]}"
     remote_digest="$(remote_exec_quiet "$host" sha256sum "$remote_run/argmin-s3" | awk '{print $1}')"
     [[ "$remote_digest" == "$binary_digest" ]] || die "deployed binary checksum mismatch on $host"
@@ -570,7 +703,10 @@ for index in 0 1 2; do
     host="${hosts[$index]}"
     remote_exec "$host" "$remote_run/argmin-s3" validate-cluster-config "$remote_run/cluster.toml" "control-$number"
     remote_exec "$host" "$remote_run/argmin-s3" initialize-cluster-state "$remote_run/cluster.toml" "control-$number"
+    remote_exec "$host" "$remote_run/argmin-s3" validate-cluster-config "$remote_run/cluster.toml" "storage-$number"
+    remote_exec "$host" "$remote_run/argmin-s3" initialize-cluster-state "$remote_run/cluster.toml" "storage-$number"
 done
+remote_exec "${hosts[0]}" "$remote_run/argmin-s3" validate-cluster-config "$remote_run/cluster.toml" frontend-1
 
 start_authority() {
     local number="$1"
@@ -585,10 +721,6 @@ start_authority() {
         --property "StandardError=append:$remote_run/logs/control-$number.log" \
         --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         --setenv "ARGMIN_PROCESS_ID=control-$number" \
-        --setenv "ARGMIN_ACCOUNT_ID=111122223333" \
-        --setenv "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
-        --setenv "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
-        --setenv "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
         "$remote_run/argmin-s3"
 }
 
@@ -640,15 +772,192 @@ wait_for_raft_network() {
     done
 }
 
+start_storage() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    storage_unit_generations[index]=$((storage_unit_generations[index] + 1))
+    local unit="$run_name-storage-$number-${storage_unit_generations[$index]}"
+    storage_units[index]="$unit"
+    remote_exec "$host" systemd-run --user --collect --unit "$unit" \
+        --property "WorkingDirectory=$remote_run" \
+        --property "StandardOutput=append:$remote_run/logs/storage-$number.log" \
+        --property "StandardError=append:$remote_run/logs/storage-$number.log" \
+        --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        --setenv "ARGMIN_PROCESS_ID=storage-$number" \
+        --setenv "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS=$heartbeat_lease_ms" \
+        --setenv "ARGMIN_TRACE=1" \
+        --setenv "ARGMIN_TRACE_FILTER=storage" \
+        --setenv "ARGMIN_TRACE_FILE=$remote_run/logs/storage-$number.trace" \
+        "$remote_run/argmin-s3"
+}
+
+stop_storage() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local unit="${storage_units[$index]}"
+    [[ -n "$unit" ]] || return 0
+    remote_exec "$host" systemctl --user stop "$unit"
+    storage_units[index]=""
+}
+
+wait_storage_listener() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local unit="${storage_units[$index]}"
+    local attempt
+    for ((attempt = 0; attempt < 600; attempt++)); do
+        if ! remote_exec_quiet "$host" systemctl --user is-active --quiet "$unit"; then
+            remote_exec_quiet "$host" systemctl --user status "$unit" --no-pager >&2 || true
+            remote_exec_quiet "$host" tail -n 200 "$remote_run/logs/storage-$number.log" >&2 || true
+            die "storage-$number exited before binding its storage RPC listener"
+        fi
+        if remote_exec_quiet "$host" timeout 1 bash -c \
+            "echo >/dev/tcp/${addresses[$index]}/$storage_port" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    remote_exec_quiet "$host" tail -n 200 "$remote_run/logs/storage-$number.log" >&2 || true
+    die "storage-$number did not bind ${addresses[$index]}:$storage_port"
+}
+
+wait_for_storage_network() {
+    local source_index target_index deadline
+    deadline=$((SECONDS + 60))
+    for source_index in 0 1 2; do
+        for target_index in 0 1 2; do
+            while ! remote_exec_quiet "${hosts[$source_index]}" timeout 1 bash -c \
+                "echo >/dev/tcp/${addresses[$target_index]}/$storage_port" >/dev/null 2>&1; do
+                if ((SECONDS >= deadline)); then
+                    die "${hosts[$source_index]} cannot reach storage RPC ${addresses[$target_index]}:$storage_port"
+                fi
+                sleep 0.1
+            done
+        done
+    done
+}
+
+start_frontend() {
+    frontend_unit_generation=$((frontend_unit_generation + 1))
+    frontend_unit="$run_name-frontend-1-$frontend_unit_generation"
+    remote_exec "${hosts[0]}" systemd-run --user --collect --unit "$frontend_unit" \
+        --property "WorkingDirectory=$remote_run" \
+        --property "StandardOutput=append:$remote_run/logs/frontend-1.log" \
+        --property "StandardError=append:$remote_run/logs/frontend-1.log" \
+        --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        --setenv "ARGMIN_PROCESS_ID=frontend-1" \
+        --setenv "ARGMIN_ACCOUNT_ID=111122223333" \
+        --setenv "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
+        --setenv "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
+        --setenv "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
+        --setenv "ARGMIN_LISTEN_ADDR=${addresses[0]}:$frontend_port" \
+        --setenv "ARGMIN_TRACE=1" \
+        --setenv "ARGMIN_TRACE_FILTER=server_http,server_core,storage" \
+        --setenv "ARGMIN_TRACE_FILE=$remote_run/logs/frontend-1.trace" \
+        "$remote_run/argmin-s3"
+}
+
+wait_frontend_listener() {
+    local attempt
+    for ((attempt = 0; attempt < 600; attempt++)); do
+        if ! remote_exec_quiet "${hosts[0]}" systemctl --user is-active --quiet "$frontend_unit"; then
+            remote_exec_quiet "${hosts[0]}" systemctl --user status "$frontend_unit" --no-pager >&2 || true
+            remote_exec_quiet "${hosts[0]}" tail -n 200 "$remote_run/logs/frontend-1.log" >&2 || true
+            die "frontend-1 exited before binding its S3 listener"
+        fi
+        if timeout 1 bash -c "echo >/dev/tcp/${addresses[0]}/$frontend_port" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.1
+    done
+    remote_exec_quiet "${hosts[0]}" tail -n 200 "$remote_run/logs/frontend-1.log" >&2 || true
+    die "frontend-1 did not bind ${addresses[0]}:$frontend_port"
+}
+
 admin_command() {
     remote_exec_quiet "${hosts[0]}" env \
         "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         "ARGMIN_PROCESS_ID=control-1" \
+        "$remote_run/argmin-s3" "$@"
+}
+
+frontend_read_command() {
+    remote_exec_quiet "${hosts[0]}" env \
+        "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        "ARGMIN_PROCESS_ID=frontend-1" \
         "ARGMIN_ACCOUNT_ID=111122223333" \
         "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
         "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
         "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
         "$remote_run/argmin-s3" "$@"
+}
+
+last_runtime_epoch=""
+wait_runtime_map_ready() {
+    local minimum_exclusive_epoch="${1:--1}"
+    local deadline=$((SECONDS + 120))
+    local status=""
+    local runtime_epoch runtime_pg_routes active_serving_pg_routes trailing
+    while ((SECONDS < deadline)); do
+        if status="$(frontend_read_command control-plane-runtime-map-ready "$remote_run/unused.sock" 2>&1)"; then
+            read -r runtime_epoch runtime_pg_routes active_serving_pg_routes trailing <<<"$status"
+            if [[ "$runtime_epoch" =~ ^[0-9]+$ && "$runtime_pg_routes" == "$pg_count" &&
+                "$minimum_exclusive_epoch" =~ ^-?[0-9]+$ &&
+                "$runtime_epoch" -gt "$minimum_exclusive_epoch" &&
+                "$active_serving_pg_routes" == "$pg_count" && -z "$trailing" ]]; then
+                last_runtime_epoch="$runtime_epoch"
+                echo "runtime_map_ready $status"
+                return 0
+            fi
+            status="runtime-map status is not fully serving: $status"
+        fi
+        sleep 0.2
+    done
+    [[ -z "$status" ]] || echo "last_runtime_map_error=$status" >&2
+    frontend_read_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" >&2 || true
+    die "control-plane runtime map did not become ready"
+}
+
+data_plane_endpoint="http://${addresses[0]}:$frontend_port"
+data_plane_bucket_file="$local_run/data-plane-bucket"
+data_plane_body_file="$local_run/data-plane-body"
+data_plane_keys=()
+
+run_data_client() {
+    print_command env \
+        "S3_TEST_ENDPOINT=$data_plane_endpoint" \
+        "S3_TEST_BUCKET_PREFIX=argmin-multihost-" \
+        "S3_TEST_TIMEOUT_SECS=60" \
+        "AWS_TEST_ACCESS_KEY=argmin-multihost-primary" \
+        "AWS_TEST_SECRET_KEY=argmin-multihost-primary-secret" \
+        "AWS_TEST_REGION=us-east-1" \
+        "$client_binary" "$@"
+    env \
+        "S3_TEST_ENDPOINT=$data_plane_endpoint" \
+        "S3_TEST_BUCKET_PREFIX=argmin-multihost-" \
+        "S3_TEST_TIMEOUT_SECS=60" \
+        "AWS_TEST_ACCESS_KEY=argmin-multihost-primary" \
+        "AWS_TEST_SECRET_KEY=argmin-multihost-primary-secret" \
+        "AWS_TEST_REGION=us-east-1" \
+        "$client_binary" "$@"
+}
+
+put_data_plane_object() {
+    local key="$1"
+    run_data_client put "$data_plane_bucket_file" "$key" "$data_plane_body_file"
+    data_plane_keys+=("$key")
+}
+
+verify_data_plane_objects() {
+    local key
+    for key in "${data_plane_keys[@]}"; do
+        run_data_client get "$data_plane_bucket_file" "$key" "$data_plane_body_file"
+    done
+    run_data_client head "$data_plane_bucket_file" "${data_plane_keys[0]}" "$data_plane_body_file"
+    run_data_client list-contains "$data_plane_bucket_file" "${data_plane_keys[@]}"
 }
 
 status_field() {
@@ -740,6 +1049,16 @@ wait_for_raft_network
 wait_clock_status true
 echo "initial_authority_clock=$last_status"
 
+echo "== start authenticated TLS/TCP storage nodes =="
+for number in 1 2 3; do
+    start_storage "$number"
+done
+for number in 1 2 3; do
+    wait_storage_listener "$number"
+done
+wait_for_storage_network
+wait_runtime_map_ready
+
 echo "== build retained route history =="
 baseline_output="$(admin_command control-plane-set-pg-acting-set-live "$remote_run/unused.sock" 0 1 2 2>&1)"
 printf '%s\n' "$baseline_output" >&2
@@ -772,15 +1091,30 @@ while ((route_advances < retained_epochs)); do
     else
         die "could not parse route epoch from admin response"
     fi
-    if ((route_epoch == last_route_epoch + 1)); then
+    if ((route_epoch > last_route_epoch)); then
         route_advances=$((route_advances + 1))
         last_route_epoch="$route_epoch"
-    elif ((route_epoch != last_route_epoch)); then
-        die "route epoch changed non-sequentially from $last_route_epoch to $route_epoch"
+    elif ((route_epoch < last_route_epoch)); then
+        die "route epoch regressed from $last_route_epoch to $route_epoch"
     fi
 done
 echo "retained_route_history advances=$route_advances attempts=$route_attempts final_epoch=$last_route_epoch"
 admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
+wait_runtime_map_ready
+
+echo "== start split-role frontend and seed persistent S3 workload =="
+start_frontend
+wait_frontend_listener
+openssl rand -out "$data_plane_body_file" 1048576
+run_data_client create-put "$data_plane_bucket_file" object-000 "$data_plane_body_file"
+data_plane_keys+=(object-000)
+for ((object_index = 1; object_index < data_object_count; object_index++)); do
+    printf -v object_key 'object-%03d' "$object_index"
+    put_data_plane_object "$object_key"
+done
+verify_data_plane_objects
+run_data_client cleanup-versioned-stress 1 2 2 multihost-versioned "$data_plane_body_file"
+echo "data_plane_seed objects=${#data_plane_keys[@]} body_bytes=$(wc -c <"$data_plane_body_file")"
 
 for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     target_number=$((((iteration - 1) % 3) + 1))
@@ -821,21 +1155,42 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     admin_command control-plane-reestablish-authority-clock "$remote_run/unused.sock"
     wait_clock_status true "$((transferred_term + 1))"
 
+    failover_key="control-failover-$iteration"
+    put_data_plane_object "$failover_key"
+    verify_data_plane_objects
+
     start_authority "$target_number"
     wait_authority_listener "$target_number"
     stabilize_rejoined_clock "$((transferred_term + 1))"
     admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
 done
 
+echo "== restart storage node 1 and verify persistent S3 data =="
+wait_runtime_map_ready
+pre_storage_restart_epoch="$last_runtime_epoch"
+stop_storage 1
+start_storage 1
+wait_storage_listener 1
+wait_for_storage_network
+wait_runtime_map_ready "$pre_storage_restart_epoch"
+echo "storage_restart_converged previous_epoch=$pre_storage_restart_epoch current_epoch=$last_runtime_epoch"
+verify_data_plane_objects
+put_data_plane_object storage-restart-1
+verify_data_plane_objects
+echo "data_plane_restart_verified objects=${#data_plane_keys[@]}"
+
+run_data_client cleanup "$data_plane_bucket_file" "${data_plane_keys[@]}"
+
 echo "== final durable state =="
 for index in 0 1 2; do
     number=$((index + 1))
     remote_exec "${hosts[$index]}" test -s "$remote_run/state-$number/control.state"
     remote_exec "${hosts[$index]}" find "$remote_run/state-$number" -maxdepth 1 -type f -printf '%f %s bytes\n'
+    remote_exec "${hosts[$index]}" du -s -B1 "$remote_run/storage-$number"
 done
 
-if diagnostics="$(admin_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" 2>/dev/null)"; then
+if diagnostics="$(frontend_read_command control-plane-runtime-map-diagnostics "$remote_run/unused.sock" 2>/dev/null)"; then
     echo "$diagnostics"
 fi
 
-echo "OK: argmin-s3 multihost Raft soak passed"
+echo "OK: argmin-s3 multihost Raft and data-plane smoke passed"

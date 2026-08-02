@@ -81,7 +81,7 @@ const CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT: Duration = Duration::from_secs
 const CONTROL_PLANE_RPC_LIVENESS_IO_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_PLANE_RPC_LIVENESS_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS: u64 = 5_000;
-const CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
+const CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_HISTORY_ROUTE_REFERENCE_MIN_LEN: usize = 1 + 8 + 4;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
@@ -1618,26 +1618,32 @@ impl ClusterControlSnapshot {
                 pg_id: pg_id.get(),
                 node_id: primary.as_u32(),
             })?;
-        if !primary_record.membership.can_serve_primary()
-            || (primary_record.availability() != NodeAvailabilityState::Healthy
-                && refreshing_node_id != primary)
-        {
+        if !primary_record.membership.can_serve_primary() {
             return Err(ControlPlaneError::PgHasNoServingPrimary {
                 pg_id: pg_id.get(),
                 cluster_epoch: self.cluster_epoch,
             });
         }
-        let Some(primary_lease_deadline_ms) = primary_record.lease_deadline_ms else {
-            return Err(ControlPlaneError::PgHasNoServingPrimary {
-                pg_id: pg_id.get(),
-                cluster_epoch: self.cluster_epoch,
-            });
+        let non_serving_route = || PgRouteSnapshot {
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            primary_node_id: primary,
+            acting_set: record.acting_set.clone(),
+            state: PgState::Active,
+            primary_lease_deadline_ms: None,
+            peering_metadata_transfer: None,
+            peering_metadata_transfer_destination_epoch: None,
+            peering_metadata_transfer_source_route_epoch: None,
+            peering_metadata_transfer_source_node_id: None,
+            pending_metadata_command_recovery: None,
         };
-        if primary_lease_deadline_ms <= now_ms {
-            return Err(ControlPlaneError::PgHasNoServingPrimary {
-                pg_id: pg_id.get(),
-                cluster_epoch: self.cluster_epoch,
-            });
+        let Some(primary_lease_deadline_ms) = primary_record.lease_deadline_ms else {
+            return Ok(non_serving_route());
+        };
+        if primary_record.availability() != NodeAvailabilityState::Healthy
+            || primary_lease_deadline_ms <= now_ms
+        {
+            return Ok(non_serving_route());
         }
         match validate_pg_primary_active_observation(self, pg_id, primary) {
             Ok(()) => {}
@@ -1652,19 +1658,7 @@ impl ClusterControlSnapshot {
                 // Other nodes still need the new Active route to converge their local
                 // route maps and keep renewing leases, but they cannot serve as primary
                 // until the selected primary has reported the Active observation.
-                return Ok(PgRouteSnapshot {
-                    cluster_epoch: self.cluster_epoch,
-                    pg_id,
-                    primary_node_id: primary,
-                    acting_set: record.acting_set.clone(),
-                    state: PgState::Active,
-                    primary_lease_deadline_ms: None,
-                    peering_metadata_transfer: None,
-                    peering_metadata_transfer_destination_epoch: None,
-                    peering_metadata_transfer_source_route_epoch: None,
-                    peering_metadata_transfer_source_node_id: None,
-                    pending_metadata_command_recovery: None,
-                });
+                return Ok(non_serving_route());
             }
             Err(error) => return Err(error),
         }
@@ -14724,7 +14718,7 @@ fn storage_node_heartbeat_auth_replay_policy(
         max_window_ms: heartbeat
             .requested_lease_duration_ms
             .min(MAX_HEARTBEAT_LEASE_MS),
-        allowed_future_skew_ms: 0,
+        allowed_future_skew_ms: CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS,
     }
 }
 
@@ -14732,7 +14726,7 @@ fn control_plane_rpc_auth_replay_policy(authority_now_ms: u64) -> ControlPlaneAu
     ControlPlaneAuthReplayPolicy::TimestampWindow {
         now_ms: authority_now_ms,
         max_window_ms: CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS,
-        allowed_future_skew_ms: 0,
+        allowed_future_skew_ms: CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS,
     }
 }
 
@@ -14742,7 +14736,7 @@ fn control_plane_rpc_response_auth_replay_policy(
     ControlPlaneAuthReplayPolicy::TimestampWindow {
         now_ms: authority_now_ms,
         max_window_ms: CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS,
-        allowed_future_skew_ms: CONTROL_PLANE_RPC_RESPONSE_AUTH_FUTURE_SKEW_MS,
+        allowed_future_skew_ms: CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS,
     }
 }
 
@@ -33070,6 +33064,162 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_control_plane_accepts_storage_node_heartbeat_at_future_skew_boundary() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let signer = storage_node_auth_credential("auth-cluster", 1, 42);
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
+        let authority_now_ms = 2_000;
+        let signer_now_ms = authority_now_ms + CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS;
+        let heartbeat = NodeHeartbeat {
+            node_id: NodeId::new(1),
+            node_incarnation: 42,
+            endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+            observed_epoch: authority.snapshot().cluster_epoch(),
+            requested_lease_duration_ms: 100,
+            cluster_map_history_route_references: Default::default(),
+            pg_observations: Vec::new(),
+        };
+        let request = signed_storage_node_heartbeat_request(
+            &signer,
+            &heartbeat,
+            Some(signer_now_ms),
+            Some(signer_now_ms + heartbeat.requested_lease_duration_ms),
+        );
+
+        let response = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            authority_now_ms,
+            Some(&verifier),
+        )
+        .unwrap();
+
+        assert_eq!(response.kind, ControlPlaneRpcKind::RefreshNodeHeartbeat);
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            Some(authority_now_ms + heartbeat.requested_lease_duration_ms)
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_control_plane_rejects_storage_node_heartbeat_beyond_future_skew_budget() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let signer = storage_node_auth_credential("auth-cluster", 1, 42);
+        let verifier =
+            storage_node_auth_verifier("auth-cluster", vec![storage_node_auth_node_credential(1)]);
+        let authority_now_ms = 2_000;
+        let signer_now_ms = authority_now_ms + CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS + 1;
+        let heartbeat = NodeHeartbeat {
+            node_id: NodeId::new(1),
+            node_incarnation: 42,
+            endpoint: "/tmp/argmin-node-1.sock".to_owned(),
+            observed_epoch: authority.snapshot().cluster_epoch(),
+            requested_lease_duration_ms: 100,
+            cluster_map_history_route_references: Default::default(),
+            pg_observations: Vec::new(),
+        };
+        let request = signed_storage_node_heartbeat_request(
+            &signer,
+            &heartbeat,
+            Some(signer_now_ms),
+            Some(signer_now_ms + heartbeat.requested_lease_duration_ms),
+        );
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            authority_now_ms,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
+                if message.contains("ReplayFreshnessFailure")
+                    && message.contains("issued_delta_ms=Some(1001)")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .node(NodeId::new(1))
+                .unwrap()
+                .lease_deadline_ms(),
+            None
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::ReplayFreshnessFailure),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_control_plane_accepts_admin_request_at_future_skew_boundary() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let authority_now_ms = 2_000;
+        let signer_now_ms = authority_now_ms + CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS;
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+        let request = signed_admin_control_plane_request(
+            ControlPlaneRpcKind::SetPgActingSet,
+            &signer,
+            payload,
+            Some(signer_now_ms),
+            Some(signer_now_ms + CONTROL_PLANE_RPC_READ_AUTH_REPLAY_WINDOW_MS),
+        );
+
+        let response = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            authority_now_ms,
+            Some(&verifier),
+        )
+        .unwrap();
+
+        assert_eq!(response.kind, ControlPlaneRpcKind::SetPgActingSet);
+        assert_eq!(
+            authority.snapshot().pg(PgId::new(7)).unwrap().acting_set(),
+            &[NodeId::new(1)]
+        );
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
     fn authenticated_control_plane_rejects_storage_node_heartbeat_long_replay_window() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
@@ -42463,6 +42613,86 @@ mod tests {
             Some(NodeId::new(1))
         );
         assert!(authority.snapshot().runtime_map(2_006).is_ok());
+    }
+
+    #[test]
+    fn storage_node_refresh_recovers_when_another_active_primary_lease_expires() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+
+        for (pg_id, node_id, now_ms) in [(80, 1, 2_000), (81, 2, 2_100)] {
+            authority
+                .set_pg_acting_set(PgId::new(pg_id), vec![NodeId::new(node_id)])
+                .unwrap();
+            heartbeat_with_pg_observation(&mut authority, node_id, pg_id, PgState::Peering, now_ms);
+            authority
+                .complete_pg_peering(
+                    PgId::new(pg_id),
+                    NodeId::new(node_id),
+                    node_incarnation(&authority, node_id),
+                    now_ms + 1,
+                )
+                .unwrap();
+            heartbeat_with_pg_observation(
+                &mut authority,
+                node_id,
+                pg_id,
+                PgState::Active,
+                now_ms + 2,
+            );
+        }
+
+        let active_epoch = authority.snapshot().cluster_epoch();
+        for (pg_id, node_id, now_ms) in [(80, 1, 3_000), (81, 2, 3_001)] {
+            let mut heartbeat = heartbeat_from_record(&authority, node_id, active_epoch, now_ms);
+            heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+                pg_id: PgId::new(pg_id),
+                state: PgState::Active,
+                metadata_proof: PgMetadataProof::empty(),
+                pending_metadata_command: None,
+            }];
+            authority.heartbeat(heartbeat, now_ms).unwrap();
+        }
+
+        let mut node_2_heartbeat = heartbeat_from_record(&authority, 2, active_epoch, 3_200);
+        node_2_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(81),
+            state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
+            pending_metadata_command: None,
+        }];
+        let node_2_refresh = authority
+            .refresh_node_heartbeat(node_2_heartbeat, 3_200)
+            .expect("one expired primary must not prevent another node from refreshing");
+        let unavailable_route = node_2_refresh
+            .runtime_map()
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == PgId::new(80))
+            .unwrap();
+        assert_eq!(unavailable_route.state(), PgState::Active);
+        assert_eq!(unavailable_route.primary_node_id(), NodeId::new(1));
+        assert_eq!(unavailable_route.primary_lease_deadline_ms(), None);
+
+        let mut node_1_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 3_201);
+        node_1_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+            pg_id: PgId::new(80),
+            state: PgState::Active,
+            metadata_proof: PgMetadataProof::empty(),
+            pending_metadata_command: None,
+        }];
+        let node_1_refresh = authority
+            .refresh_node_heartbeat(node_1_heartbeat, 3_201)
+            .expect("the expired primary must be able to renew after receiving the current map");
+        assert!(node_1_refresh.lease().serving());
+        assert!(authority.snapshot().runtime_map(3_202).is_ok());
     }
 
     #[test]

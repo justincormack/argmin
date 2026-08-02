@@ -779,7 +779,13 @@ fn run_reclaim_worker(
                         root,
                     );
                 } else {
-                    match execution_node.continue_adopted_bucket_delete(&root) {
+                    let result = execution_node.continue_adopted_bucket_delete(&root);
+                    let _ = observability::event(
+                        TRACE_TARGET,
+                        "bucket_delete_begin_worker_result",
+                        Some(format_args!("root={root:?} result={result:?}")),
+                    );
+                    match result {
                         Ok(()) => {
                             begin_retry_after.remove(&root);
                             queue_owner.enqueue_bucket_delete_finalize(BucketDeleteFinalizeRoot {

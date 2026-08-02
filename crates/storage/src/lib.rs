@@ -530,6 +530,7 @@ pub enum TestBucketDeleteAttemptPhase {
     FinalVisibilityCheck,
     FinalVisibilityProven,
     MarkDeleting,
+    PostReservationStreamCleanup,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -545,6 +546,9 @@ impl From<TestBucketDeleteAttemptPhase> for types::BucketDeleteAttemptPhase {
             TestBucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
             TestBucketDeleteAttemptPhase::FinalVisibilityProven => Self::FinalVisibilityProven,
             TestBucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
+            TestBucketDeleteAttemptPhase::PostReservationStreamCleanup => {
+                Self::PostReservationStreamCleanup
+            }
         }
     }
 }
@@ -562,6 +566,9 @@ impl From<types::BucketDeleteAttemptPhase> for TestBucketDeleteAttemptPhase {
             types::BucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
             types::BucketDeleteAttemptPhase::FinalVisibilityProven => Self::FinalVisibilityProven,
             types::BucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
+            types::BucketDeleteAttemptPhase::PostReservationStreamCleanup => {
+                Self::PostReservationStreamCleanup
+            }
         }
     }
 }

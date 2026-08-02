@@ -3,7 +3,7 @@ use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
@@ -11,6 +11,7 @@ use rustls::pki_types::ServerName;
 use crate::deadline_io::DeadlineStream;
 
 pub const STORAGE_RPC_TLS_ALPN: &[u8] = b"argmin-storage-rpc/1";
+const STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT: usize = 8;
 
 pub trait StorageRpcStream: Read + Write + Send {
     fn set_operation_deadline(&mut self, deadline: Instant) -> io::Result<()>;
@@ -29,7 +30,31 @@ pub enum StorageRpcClientEndpoint {
         addresses: Vec<SocketAddr>,
         server_name: String,
         tls_client_config: Arc<rustls::ClientConfig>,
+        request_pool: Arc<StorageRpcClientConnectionPool>,
     },
+}
+
+#[doc(hidden)]
+pub struct StorageRpcClientConnectionPool {
+    state: Mutex<StorageRpcClientConnectionPoolState>,
+    available: Condvar,
+}
+
+#[derive(Default)]
+struct StorageRpcClientConnectionPoolState {
+    open: usize,
+    idle: Vec<IdleStorageRpcConnection>,
+}
+
+struct IdleStorageRpcConnection {
+    stream: BoxStorageRpcStream,
+    idle_since: Instant,
+}
+
+pub(crate) struct StorageRpcRequestConnection {
+    stream: Option<BoxStorageRpcStream>,
+    pool: Option<Arc<StorageRpcClientConnectionPool>>,
+    reusable: bool,
 }
 
 pub(crate) enum StorageRpcEndpointAuthorityIdentity<'a> {
@@ -82,6 +107,10 @@ impl StorageRpcClientEndpoint {
             addresses,
             server_name,
             tls_client_config,
+            request_pool: Arc::new(StorageRpcClientConnectionPool {
+                state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
+                available: Condvar::new(),
+            }),
         })
     }
 
@@ -133,6 +162,154 @@ impl StorageRpcClientEndpoint {
                 tls_client_config,
                 ..
             } => connect_tls_tcp(addresses, server_name, tls_client_config, deadline),
+        }
+    }
+
+    pub(crate) fn connect_request(
+        &self,
+        deadline: Instant,
+        io_timeout: Duration,
+        max_connections: usize,
+    ) -> io::Result<StorageRpcRequestConnection> {
+        match self {
+            Self::Unix { .. } => self
+                .connect(deadline)
+                .map(|stream| StorageRpcRequestConnection {
+                    stream: Some(stream),
+                    pool: None,
+                    reusable: false,
+                }),
+            Self::Tcp {
+                addresses,
+                server_name,
+                tls_client_config,
+                request_pool,
+                ..
+            } => request_pool.checkout(deadline, io_timeout, max_connections, || {
+                connect_tls_tcp(addresses, server_name, tls_client_config, deadline)
+            }),
+        }
+    }
+}
+
+impl StorageRpcClientConnectionPool {
+    fn checkout(
+        self: &Arc<Self>,
+        deadline: Instant,
+        io_timeout: Duration,
+        configured_max_connections: usize,
+        connect: impl FnOnce() -> io::Result<BoxStorageRpcStream>,
+    ) -> io::Result<StorageRpcRequestConnection> {
+        let max_connections = configured_max_connections
+            .clamp(1, STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT);
+        let max_idle_age = io_timeout / 2;
+        let mut connect = Some(connect);
+
+        loop {
+            remaining(deadline)?;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let now = Instant::now();
+            let idle_before = state.idle.len();
+            state
+                .idle
+                .retain(|idle| now.duration_since(idle.idle_since) < max_idle_age);
+            let expired = idle_before - state.idle.len();
+            state.open = state
+                .open
+                .checked_sub(expired)
+                .expect("storage RPC pool idle connection count exceeds open count");
+
+            if let Some(mut idle) = state.idle.pop() {
+                drop(state);
+                if idle.stream.set_operation_deadline(deadline).is_ok() {
+                    return Ok(StorageRpcRequestConnection {
+                        stream: Some(idle.stream),
+                        pool: Some(Arc::clone(self)),
+                        reusable: false,
+                    });
+                }
+                self.remove_open_connection();
+                continue;
+            }
+
+            if state.open < max_connections {
+                state.open += 1;
+                drop(state);
+                let result = connect
+                    .take()
+                    .expect("storage RPC pool starts at most one new connection")(
+                );
+                return match result {
+                    Ok(stream) => Ok(StorageRpcRequestConnection {
+                        stream: Some(stream),
+                        pool: Some(Arc::clone(self)),
+                        reusable: false,
+                    }),
+                    Err(error) => {
+                        self.remove_open_connection();
+                        Err(error)
+                    }
+                };
+            }
+
+            let wait = remaining(deadline)?;
+            let (next_state, timeout) = self
+                .available
+                .wait_timeout(state, wait)
+                .unwrap_or_else(|error| error.into_inner());
+            drop(next_state);
+            if timeout.timed_out() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "storage RPC connection pool deadline expired",
+                ));
+            }
+        }
+    }
+
+    fn remove_open_connection(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.open = state
+            .open
+            .checked_sub(1)
+            .expect("storage RPC pool connection release without checkout");
+        self.available.notify_one();
+    }
+
+    fn return_connection(&self, stream: BoxStorageRpcStream) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.idle.push(IdleStorageRpcConnection {
+            stream,
+            idle_since: Instant::now(),
+        });
+        self.available.notify_one();
+    }
+}
+
+impl StorageRpcRequestConnection {
+    pub(crate) fn stream_mut(&mut self) -> &mut BoxStorageRpcStream {
+        self.stream
+            .as_mut()
+            .expect("storage RPC request connection retains its stream until drop")
+    }
+
+    pub(crate) fn mark_reusable(&mut self) {
+        self.reusable = true;
+    }
+}
+
+impl Drop for StorageRpcRequestConnection {
+    fn drop(&mut self) {
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        let Some(pool) = self.pool.as_ref() else {
+            return;
+        };
+        if self.reusable {
+            pool.return_connection(stream);
+        } else {
+            pool.remove_open_connection();
         }
     }
 }
@@ -428,5 +605,46 @@ mod tests {
 
         assert_eq!(observer.read_timeout().unwrap(), None);
         assert_eq!(observer.write_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn request_pool_reuses_only_successfully_completed_connections() {
+        let pool = Arc::new(StorageRpcClientConnectionPool {
+            state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
+            available: Condvar::new(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (first_stream, _first_peer) = UnixStream::pair().unwrap();
+        let mut first = pool
+            .checkout(deadline, Duration::from_secs(1), 1, || {
+                accepted_unix_stream(first_stream, deadline)
+            })
+            .unwrap();
+
+        first.mark_reusable();
+        drop(first);
+        assert_eq!(pool.state.lock().unwrap().idle.len(), 1);
+
+        let reused = pool
+            .checkout(deadline, Duration::from_secs(1), 1, || {
+                panic!("a completed request should reuse its pooled connection")
+            })
+            .unwrap();
+        drop(reused);
+        {
+            let state = pool.state.lock().unwrap();
+            assert_eq!(state.open, 0);
+            assert!(state.idle.is_empty());
+        }
+
+        let (replacement_stream, _replacement_peer) = UnixStream::pair().unwrap();
+        let replacement = pool
+            .checkout(deadline, Duration::from_secs(1), 1, || {
+                accepted_unix_stream(replacement_stream, deadline)
+            })
+            .unwrap();
+        assert_eq!(pool.state.lock().unwrap().open, 1);
+        drop(replacement);
+        assert_eq!(pool.state.lock().unwrap().open, 0);
     }
 }

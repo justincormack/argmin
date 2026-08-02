@@ -5557,8 +5557,12 @@ fn bucket_delete_attempt_outcome_from_row(
     let outcome_raw: i64 = row.get(4)?;
     let phase_raw: i64 = row.get(5)?;
     let post_reservation_next_object_pg_id_raw: Option<i64> = row.get(7)?;
-    let finalizer_next_object_pg_id_raw: Option<i64> = row.get(8)?;
-    let updated_at_raw: i64 = row.get(9)?;
+    let stream_cleanup_next_object_pg_id_raw: Option<i64> = row.get(8)?;
+    let stream_cleanup_next_session_id_marker_raw: Option<String> = row.get(9)?;
+    let stream_cleanup_aborted_uploads_raw: i64 = row.get(10)?;
+    let final_visibility_next_object_pg_id_raw: Option<i64> = row.get(11)?;
+    let finalizer_next_object_pg_id_raw: Option<i64> = row.get(12)?;
+    let updated_at_raw: i64 = row.get(13)?;
     let outcome = match outcome_raw {
         0 => BucketDeleteAttemptOutcomeKind::Retryable,
         1 => BucketDeleteAttemptOutcomeKind::NotEmpty,
@@ -5582,6 +5586,7 @@ fn bucket_delete_attempt_outcome_from_row(
         4 => BucketDeleteAttemptPhase::FinalVisibilityCheck,
         5 => BucketDeleteAttemptPhase::FinalVisibilityProven,
         6 => BucketDeleteAttemptPhase::MarkDeleting,
+        7 => BucketDeleteAttemptPhase::PostReservationStreamCleanup,
         _ => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 5,
@@ -5634,11 +5639,55 @@ fn bucket_delete_attempt_outcome_from_row(
                 })
             })
             .transpose()?,
-        finalizer_next_object_pg_id: finalizer_next_object_pg_id_raw
+        stream_cleanup_next_object_pg_id: stream_cleanup_next_object_pg_id_raw
             .map(|raw| {
                 u32::try_from(raw).map_err(|_| {
                     rusqlite::Error::FromSqlConversionFailure(
                         8,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("invalid stream_cleanup_next_object_pg_id: {raw}")),
+                    )
+                })
+            })
+            .transpose()?,
+        stream_cleanup_next_session_id_marker: stream_cleanup_next_session_id_marker_raw
+            .map(|raw| {
+                SessionId::try_from(raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        9,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            })
+            .transpose()?,
+        stream_cleanup_aborted_uploads: match stream_cleanup_aborted_uploads_raw {
+            0 => false,
+            1 => true,
+            raw => {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid stream_cleanup_aborted_uploads: {raw}")),
+                ));
+            }
+        },
+        final_visibility_next_object_pg_id: final_visibility_next_object_pg_id_raw
+            .map(|raw| {
+                u32::try_from(raw).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("invalid final_visibility_next_object_pg_id: {raw}")),
+                    )
+                })
+            })
+            .transpose()?,
+        finalizer_next_object_pg_id: finalizer_next_object_pg_id_raw
+            .map(|raw| {
+                u32::try_from(raw).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        12,
                         rusqlite::types::Type::Integer,
                         Box::from(format!("invalid finalizer_next_object_pg_id: {raw}")),
                     )
@@ -5647,7 +5696,7 @@ fn bucket_delete_attempt_outcome_from_row(
             .transpose()?,
         updated_at: u64::try_from(updated_at_raw).map_err(|_| {
             rusqlite::Error::FromSqlConversionFailure(
-                9,
+                13,
                 rusqlite::types::Type::Integer,
                 Box::from(format!("invalid updated_at: {updated_at_raw}")),
             )
@@ -6872,14 +6921,24 @@ impl PgMetadataStore for PgStore {
         })?;
         let post_reservation_next_object_pg_id =
             record.post_reservation_next_object_pg_id.map(i64::from);
+        let stream_cleanup_next_object_pg_id =
+            record.stream_cleanup_next_object_pg_id.map(i64::from);
+        let stream_cleanup_next_session_id_marker = record
+            .stream_cleanup_next_session_id_marker
+            .as_ref()
+            .map(SessionId::as_str);
+        let final_visibility_next_object_pg_id =
+            record.final_visibility_next_object_pg_id.map(i64::from);
         let finalizer_next_object_pg_id = record.finalizer_next_object_pg_id.map(i64::from);
         self.conn
             .execute(
                 "INSERT INTO bucket_delete_attempt_outcomes \
                  (bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
                   outcome, phase, detail, post_reservation_next_object_pg_id, \
+                  stream_cleanup_next_object_pg_id, stream_cleanup_next_session_id_marker, \
+                  stream_cleanup_aborted_uploads, final_visibility_next_object_pg_id, \
                   finalizer_next_object_pg_id, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                  ON CONFLICT(bucket_name) DO UPDATE SET \
                    drain_id = excluded.drain_id, \
                    cluster_epoch = excluded.cluster_epoch, \
@@ -6888,6 +6947,10 @@ impl PgMetadataStore for PgStore {
                    phase = excluded.phase, \
                    detail = excluded.detail, \
                    post_reservation_next_object_pg_id = excluded.post_reservation_next_object_pg_id, \
+                   stream_cleanup_next_object_pg_id = excluded.stream_cleanup_next_object_pg_id, \
+                   stream_cleanup_next_session_id_marker = excluded.stream_cleanup_next_session_id_marker, \
+                   stream_cleanup_aborted_uploads = excluded.stream_cleanup_aborted_uploads, \
+                   final_visibility_next_object_pg_id = excluded.final_visibility_next_object_pg_id, \
                    finalizer_next_object_pg_id = excluded.finalizer_next_object_pg_id, \
                    updated_at = excluded.updated_at",
                 params![
@@ -6899,6 +6962,10 @@ impl PgMetadataStore for PgStore {
                     record.phase as u8,
                     &record.detail,
                     post_reservation_next_object_pg_id,
+                    stream_cleanup_next_object_pg_id,
+                    stream_cleanup_next_session_id_marker,
+                    record.stream_cleanup_aborted_uploads,
+                    final_visibility_next_object_pg_id,
                     finalizer_next_object_pg_id,
                     updated_at,
                 ],
@@ -6917,6 +6984,8 @@ impl PgMetadataStore for PgStore {
         match self.conn.query_row(
             "SELECT bucket_name, drain_id, cluster_epoch, bucket_execution_generation, \
                     outcome, phase, detail, post_reservation_next_object_pg_id, \
+                    stream_cleanup_next_object_pg_id, stream_cleanup_next_session_id_marker, \
+                    stream_cleanup_aborted_uploads, final_visibility_next_object_pg_id, \
                     finalizer_next_object_pg_id, updated_at \
              FROM bucket_delete_attempt_outcomes \
              WHERE bucket_name = ?1",

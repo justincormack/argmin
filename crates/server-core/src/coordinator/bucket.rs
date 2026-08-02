@@ -23,6 +23,11 @@ use super::{
 use crate::error::ServerError;
 
 pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
+    let _ = observability::event(
+        TRACE_TARGET,
+        "bucket_write_drain_error",
+        Some(format_args!("error={err:?}")),
+    );
     match err {
         storage::BucketWriteDrainError::Store(
             storage::StoreError::MetadataCommandLogConflict { .. }
@@ -51,6 +56,11 @@ impl Coordinator {
     pub(super) fn map_bucket_snapshot_load_error(
         err: storage::BucketSnapshotLoadError,
     ) -> ServerError {
+        let _ = observability::event(
+            TRACE_TARGET,
+            "bucket_snapshot_load_error",
+            Some(format_args!("error={err:?}")),
+        );
         match err {
             storage::BucketSnapshotLoadError::Store(
                 storage::StoreError::MetadataCommandLogConflict { .. }

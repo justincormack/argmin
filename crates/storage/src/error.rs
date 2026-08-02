@@ -877,6 +877,9 @@ pub enum ClusterBuildError {
     #[error("runtime-map node {id} has no installed remote storage-node client")]
     RuntimeMapStorageNodeClientMissing { id: u32 },
 
+    #[error("resolved storage RPC endpoints require authenticated client configuration")]
+    ResolvedStorageRpcEndpointsRequireAuthentication,
+
     #[error("remote storage-node client socket path {path:?} must be absolute")]
     RemoteStorageNodeClientSocketPathNotAbsolute { path: PathBuf },
 

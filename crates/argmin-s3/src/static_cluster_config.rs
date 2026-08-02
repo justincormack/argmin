@@ -926,9 +926,13 @@ impl ValidatedStaticClusterManifest {
         {
             let accepted_roles = match endpoint.protocol {
                 EndpointProtocol::RaftPeer => &[AuthPrincipal::RaftPeer][..],
-                EndpointProtocol::ControlPlane
-                | EndpointProtocol::AuthorityClockRecovery
-                | EndpointProtocol::StorageRpc => &[
+                EndpointProtocol::ControlPlane => &[
+                    AuthPrincipal::StorageNode,
+                    AuthPrincipal::Frontend,
+                    AuthPrincipal::Admin,
+                ][..],
+                EndpointProtocol::AuthorityClockRecovery => &[AuthPrincipal::Admin][..],
+                EndpointProtocol::StorageRpc => &[
                     AuthPrincipal::StorageNode,
                     AuthPrincipal::Frontend,
                     AuthPrincipal::Admin,
@@ -8916,6 +8920,21 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         assert!(frontend_config
             .storage_rpc_maintenance_client_auth
             .is_some());
+    }
+
+    #[test]
+    fn replicated_control_plane_does_not_resolve_storage_maintenance_credentials() {
+        let (_dir, manifest) =
+            materialized_replicated_manifest_from("control-1", replicated_unix_data_manifest());
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+
+        assert!(material
+            .auth_credentials
+            .iter()
+            .all(|credential| { credential.principal.principal != AuthPrincipal::Maintenance }));
+        manifest
+            .replicated_unix_control_plane_server_config(&material, |_| None)
+            .unwrap();
     }
 
     #[test]

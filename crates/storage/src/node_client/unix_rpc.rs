@@ -1886,8 +1886,9 @@ impl UnixStorageNodeClient {
                 ),
             );
         }
+        let io_timeout = storage_rpc_io_timeout(self.rpc_auth.as_deref());
         let deadline = started
-            .checked_add(storage_rpc_io_timeout(self.rpc_auth.as_deref()))
+            .checked_add(io_timeout)
             .ok_or_else(|| StoreError::Io {
                 context: "compute storage-node RPC deadline",
                 source: io::Error::new(
@@ -1895,51 +1896,61 @@ impl UnixStorageNodeClient {
                     "storage-node RPC deadline overflowed",
                 ),
             })?;
-        let mut stream = match self.endpoint.connect(deadline) {
-            Ok(stream) => {
-                if trace_rpc_lifecycle {
-                    let _ = observability::emit_flight_event(
-                        "storage_rpc_client",
-                        "storage_rpc_client_connected",
-                        format!(
-                            "node_id={} rpc_request_id={} kind={} elapsed_us={}",
-                            self.node_id.as_u32(),
-                            request_id,
-                            kind.operation_name(),
-                            started.elapsed().as_micros()
-                        ),
-                    );
+        let max_connections = self
+            .rpc_auth
+            .as_deref()
+            .map_or(self.rpc_admission.limit, |auth| {
+                auth.transport_limits().max_connections()
+            });
+        let mut connection =
+            match self
+                .endpoint
+                .connect_request(deadline, io_timeout, max_connections)
+            {
+                Ok(connection) => {
+                    if trace_rpc_lifecycle {
+                        let _ = observability::emit_flight_event(
+                            "storage_rpc_client",
+                            "storage_rpc_client_connected",
+                            format!(
+                                "node_id={} rpc_request_id={} kind={} elapsed_us={}",
+                                self.node_id.as_u32(),
+                                request_id,
+                                kind.operation_name(),
+                                started.elapsed().as_micros()
+                            ),
+                        );
+                    }
+                    connection
                 }
-                stream
-            }
-            Err(source) => {
-                if trace_rpc_lifecycle {
-                    let _ = observability::emit_flight_event(
-                        "storage_rpc_client",
-                        "storage_rpc_client_connect_failed",
-                        format!(
-                            "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
-                            self.node_id.as_u32(),
-                            request_id,
-                            kind.operation_name(),
-                            started.elapsed().as_micros(),
-                            source
-                        ),
-                    );
+                Err(source) => {
+                    if trace_rpc_lifecycle {
+                        let _ = observability::emit_flight_event(
+                            "storage_rpc_client",
+                            "storage_rpc_client_connect_failed",
+                            format!(
+                                "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
+                                self.node_id.as_u32(),
+                                request_id,
+                                kind.operation_name(),
+                                started.elapsed().as_micros(),
+                                source
+                            ),
+                        );
+                    }
+                    return Err(StoreError::Io {
+                        context: "connect storage-node RPC endpoint",
+                        source,
+                    });
                 }
-                return Err(StoreError::Io {
-                    context: "connect storage-node RPC endpoint",
-                    source,
-                });
-            }
-        };
+            };
         let request = StorageRpcFrame {
             request_id,
             kind,
             payload,
         };
         let request_proof = match write_unix_storage_rpc_request(
-            &mut stream,
+            connection.stream_mut(),
             self.node_id,
             self.rpc_auth.as_deref(),
             &request,
@@ -1978,7 +1989,7 @@ impl UnixStorageNodeClient {
             );
         }
         let response = match read_unix_storage_rpc_response(
-            &mut stream,
+            connection.stream_mut(),
             self.node_id,
             self.rpc_auth.as_deref(),
             request_proof.as_ref(),
@@ -2027,9 +2038,15 @@ impl UnixStorageNodeClient {
                 ),
             ));
         }
-        decode_storage_rpc_response_payload(&response.payload).map_err(|error| {
-            self.rpc_payload_error("decode storage RPC response", error.to_string())
-        })
+        let response =
+            decode_storage_rpc_response_payload_with_connection_disposition(&response.payload)
+                .map_err(|error| {
+                    self.rpc_payload_error("decode storage RPC response", error.to_string())
+                })?;
+        if response.connection_reusable {
+            connection.mark_reusable();
+        }
+        Ok(response.response)
     }
 
     pub(crate) fn acquire_rpc_admission(

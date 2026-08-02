@@ -161,6 +161,12 @@ For external AWS-backed workflows, prefer the wrapper scripts under
     owner-root credentials
   - runs `s3-tests` against that process as an external endpoint
   - forwards extra arguments to `cargo nextest run -p s3-tests`
+- `./scripts/uat-multihost-raft`
+  - deploys a static-manifest three-authority, three-storage-node, split-frontend
+    cluster to three distinct SSH hosts
+  - uses authenticated TLS/TCP for Raft, control-plane, and storage RPC traffic
+  - verifies persistent S3 data through Raft leader loss and a storage-node
+    restart
 - `./scripts/cleanup`
   - cleans up leftover external test buckets
   - loads the primary AWS credentials from `.env`
@@ -174,6 +180,56 @@ Long correctness soaks can use
 `./scripts/uat-correctness-soak --no-cleanup-fail` to remove each successful
 child run while retaining the failed run's data directory and server logs.
 Use `--no-cleanup` only when every child run must be retained.
+
+## Multihost Raft and Data-Plane Smoke
+
+`./scripts/uat-multihost-raft` is the production-shaped cross-host integration
+gate. It requires exactly three SSH host aliases and three advertised IPv4
+addresses. Each alias must support noninteractive SSH, identify a distinct
+machine through `/etc/machine-id`, provide `systemd-run --user`, and allow the
+selected five-port range between all hosts. The test generates a private test
+PKI and scoped credentials for each run; it does not use operator credentials.
+
+The default profile uses 116 PGs, 256 retained route-epoch advances, eight
+one-MiB persistent objects, and three leader-loss/restart cycles:
+
+```bash
+./scripts/uat-multihost-raft \
+  --hosts grey0,grey1,grey2 \
+  --addresses 192.0.2.10,192.0.2.11,192.0.2.12 \
+  --release \
+  --no-cleanup-fail
+```
+
+Use `--ssh-config PATH` (or `ARGMIN_MULTIHOST_RAFT_SSH_CONFIG`) when the host
+aliases live in a nondefault SSH client configuration. The option is applied to
+both `ssh` and `scp`.
+
+Use a reduced profile while developing the harness or a transport boundary:
+
+```bash
+./scripts/uat-multihost-raft \
+  --hosts grey0,grey1,grey2 \
+  --addresses 192.0.2.10,192.0.2.11,192.0.2.12 \
+  --pg-count 4 \
+  --retained-epochs 4 \
+  --data-objects 2 \
+  --repeat 1 \
+  --no-cleanup-fail
+```
+
+Successful runs remove local and remote state by default. `--no-cleanup-fail`
+preserves only failed runs, including process logs, flight traces, unit status,
+and durable state inventories. `--storage-profile volatile-test` is useful for
+functional or locking checks but is not durability evidence.
+
+The storage-node restart step currently verifies durable recovery after the
+node returns. Listener readiness alone is insufficient because the old lease
+and incarnation can still make the pre-restart map appear healthy. The harness
+therefore requires a strictly newer runtime-map epoch with every PG serving
+before issuing post-restart traffic. It does not assert uninterrupted reads
+while that node is offline; that is the separate degraded-read availability
+gate for PGs in `Peering`.
 
 ## Standalone `argmin-s3` UAT `s3-tests`
 

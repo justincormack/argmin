@@ -121,9 +121,11 @@ impl AdmittedRouteEffectFence {
     ) -> Self {
         let local_wall_ms = crate::clock::current_time_millis();
         let local_monotonic_ms = crate::clock::monotonic_time_millis();
-        let conservative_local_wall_deadline_ms = portable_wall_valid_until_ms
-            .saturating_sub(crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS);
-        let remaining_ms = conservative_local_wall_deadline_ms.saturating_sub(local_wall_ms);
+        // The sender derives this portable deadline from a process-local
+        // monotonic lease that already subtracts the authority clock-skew
+        // budget. Subtracting that budget again here would make the minimum
+        // valid lease unusable across an RPC boundary.
+        let remaining_ms = portable_wall_valid_until_ms.saturating_sub(local_wall_ms);
         let local_valid_until_monotonic_ms = local_monotonic_ms
             .checked_add(remaining_ms)
             .unwrap_or(local_monotonic_ms);
@@ -3404,6 +3406,7 @@ pub(crate) enum BucketDeleteAttemptPhase {
     FinalVisibilityCheck = 4,
     FinalVisibilityProven = 5,
     MarkDeleting = 6,
+    PostReservationStreamCleanup = 7,
 }
 
 /// Last durable DeleteBucket attempt outcome for a bucket.
@@ -3417,6 +3420,10 @@ pub(crate) struct BucketDeleteAttemptOutcomeRecord {
     pub phase: BucketDeleteAttemptPhase,
     pub detail: String,
     pub post_reservation_next_object_pg_id: Option<u32>,
+    pub stream_cleanup_next_object_pg_id: Option<u32>,
+    pub stream_cleanup_next_session_id_marker: Option<SessionId>,
+    pub stream_cleanup_aborted_uploads: bool,
+    pub final_visibility_next_object_pg_id: Option<u32>,
     pub finalizer_next_object_pg_id: Option<u32>,
     pub updated_at: u64,
 }
@@ -3936,6 +3943,7 @@ fn debug_bucket_delete_attempt_phase(phase: BucketDeleteAttemptPhase) -> &'stati
         BucketDeleteAttemptPhase::FinalVisibilityCheck => "final_visibility_check",
         BucketDeleteAttemptPhase::FinalVisibilityProven => "final_visibility_proven",
         BucketDeleteAttemptPhase::MarkDeleting => "mark_deleting",
+        BucketDeleteAttemptPhase::PostReservationStreamCleanup => "post_reservation_stream_cleanup",
     }
 }
 
@@ -7073,6 +7081,29 @@ mod tests {
     }
 
     #[test]
+    fn portable_route_effect_deadline_does_not_subtract_clock_skew_twice() {
+        let epoch = ClusterEpoch::new(7).unwrap();
+        let fence = crate::clock::with_time_and_monotonic_override(10_000, 50_000, || {
+            AdmittedRouteEffectFence::bind_portable(epoch, 12_000, 11_000)
+        });
+
+        crate::clock::with_time_and_monotonic_override(10_999, 50_999, || {
+            fence.require_valid_for(epoch).unwrap();
+        });
+        let error = crate::clock::with_time_and_monotonic_override(11_000, 51_000, || {
+            fence.require_valid_for(epoch).unwrap_err()
+        });
+        assert!(matches!(
+            error,
+            StoreError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 12_000,
+                now_ms: 11_000,
+            } if cluster_epoch == epoch
+        ));
+    }
+
+    #[test]
     fn object_payload_segment_debug_exposes_only_logical_layout() {
         let bucket = BucketName::try_from("bucket".to_string()).unwrap();
         let key = ObjectKey::try_from("key".to_string()).unwrap();
@@ -8062,6 +8093,12 @@ mod tests {
                 phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
                 detail: "line1\nline2\t\x1b[31m".to_string(),
                 post_reservation_next_object_pg_id: Some(17),
+                stream_cleanup_next_object_pg_id: Some(18),
+                stream_cleanup_next_session_id_marker: Some(
+                    SessionId::try_from("ab".repeat(16)).unwrap(),
+                ),
+                stream_cleanup_aborted_uploads: true,
+                final_visibility_next_object_pg_id: Some(19),
                 finalizer_next_object_pg_id: Some(19),
                 updated_at: 12_345,
             }),

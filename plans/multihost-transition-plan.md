@@ -12390,19 +12390,24 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   substitutes for the per-host durable-write profile. Add authenticated
   storage RPC over Unix and then TCP before treating the workload as a complete
   multihost data-plane release gate.
-- `./scripts/uat-multihost-raft` is the first authority-only implementation of
-  that real-host gate. It deploys one static-manifest authority to each of three
-  SSH-managed hosts, but all product traffic uses mutually authenticated
-  TLS/TCP Raft and control-plane endpoints. The gate validates the manifest and
-  initializes durable identity independently on each host, proves all-to-all
-  Raft reachability, commits 256 observed route-epoch advances over 116 PGs,
-  snapshots and purges, then transfers leadership to each voter in turn,
+- `./scripts/uat-multihost-raft` now implements the first real-host authority
+  and data-plane gate. It deploys one static-manifest authority and storage node
+  to each of three SSH-managed hosts plus a split-role frontend. Raft,
+  control-plane, and storage RPC traffic all use authenticated TLS/TCP. The gate
+  validates the manifest and initializes durable authority and storage identity
+  independently on each host, proves all-to-all Raft and storage-RPC
+  reachability, commits 256 observed route-epoch advances over 116 PGs,
+  snapshots and purges, then runs persistent S3 create/PUT/GET/HEAD/list and
+  versioned-cleanup traffic. It transfers leadership to each voter in turn,
   stops that leader, explicitly recovers the successor clock in a newer term,
-  and restarts and converges the old voter. Canonical no-op route commands do
-  not count toward the 256-epoch requirement. The default `persistent` profile
-  treats each configured state path as an operator-selected durability domain;
-  `volatile-test` is an explicit non-durability test policy. Filesystem type is
-  not inferred by platform-specific runtime probes.
+  verifies old and newly written object bytes through the failover, and restarts
+  and converges the old voter. A final storage-node restart must publish a new
+  incarnation while all prior and post-restart objects remain readable.
+  Canonical no-op route commands do not count toward the 256-epoch requirement.
+  The default `persistent` profile treats each configured state and data path as
+  an operator-selected durability domain; `volatile-test` is an explicit
+  non-durability test policy. Filesystem type is not inferred by
+  platform-specific runtime probes.
 - The first complete three-host run on the `grey0`, `grey1`, and `grey2`
   reference hosts passed all three transfer/loss/restart cycles and reached
   Raft term 9. Its final authority artifacts were approximately 80 KiB with
@@ -12410,6 +12415,83 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   path, not the complete multihost data-plane gate: storage-node placement,
   authenticated storage RPC traffic, S3 workload correctness, and quantitative
   per-host checkpoint/WAL/fsync metrics remain required before release cutover.
+- The first reduced composed data-plane run on those hosts also passed with
+  four PGs, four retained route advances, two one-MiB objects, one Raft
+  leader-loss cycle, and one storage-node restart. It exposed and fixed two
+  production boundaries before passing: portable route-effect deadlines had
+  subtracted the clock-skew budget twice on the receiving host, and the
+  frontend storage capability omitted the historical-shard read and
+  reclaim-existence probe required by ordinary retained-payload GETs. This is
+  integration evidence for the composed path; the default 116-PG/256-epoch
+  multi-cycle profile and the complete server-local operation-capability gate
+  remain the release closeout.
+- A subsequent default-dimension attempt exposed that foreground and
+  maintenance-authenticated cluster views had separate process-local reclaim
+  queues. Foreground deletion could therefore persist recovery work but its
+  immediate queue notification was invisible to the maintenance worker, making
+  convergence depend on the later durable safety scan. Role-scoped transport
+  clients now retain distinct credentials while sharing the process-local
+  lease, recovery-flight, and work-queue state; refreshed generations inherit
+  the same state. The reduced three-host workload covers this composed wiring
+  through versioned cleanup. The full default-dimension rerun remains required.
+- The next default-dimension run exposed two genuinely cross-host boundaries.
+  Authenticated control-plane requests originally allowed no future timestamp
+  skew, so an otherwise synchronized storage host approximately 100 ms ahead of
+  the current Raft leader could lose every heartbeat to freshness rejection.
+  Request authentication now accepts only the existing bounded one-second
+  control-plane clock-skew budget while retaining the independent replay
+  window. The subsequent run passed retained-history construction, S3 traffic,
+  leader loss, and storage restart, but showed that listener readiness can race
+  the restarted node's first heartbeat: the old incarnation and lease may still
+  make the pre-restart runtime map look fully serving. The restart gate now
+  requires a strictly newer committed runtime-map epoch and all PGs serving,
+  proving that the new incarnation was observed and its Peering transition
+  completed before post-restart traffic and cleanup begin. The full
+  default-dimension rerun remains required.
+- The complete default-dimension three-host data-plane rerun now passes. It
+  committed 256 retained route advances over 116 PGs, completed persistent
+  create/PUT/GET/HEAD/list and versioned cleanup traffic, survived leadership
+  transfer and loss of each of the three authorities in turn, restarted and
+  reconverged every authority, then restarted one storage node and verified all
+  pre-failure and post-failure object bytes before final cleanup. The run ended
+  at cluster epoch 493 with 116/116 PGs serving. Before passing, this workload
+  exposed local TCP ephemeral-port exhaustion: ordinary storage RPCs opened a
+  fresh authenticated TLS connection for every frame, so the 116-PG cleanup
+  scan eventually failed with `EADDRNOTAVAIL`. Ordinary complete request/
+  response exchanges now use a small endpoint-owned, deadline-bounded TCP
+  connection pool retained across runtime-map and historical-recovery cluster
+  generations. Dedicated stateful read, payload-lease, and metadata-command
+  sessions remain outside the pool. A connection is returned only after the
+  exact authenticated response and payload envelope validate; every transport,
+  authentication, request-identity, or decode failure retires it without
+  retrying the possibly applied operation. This closes the initial static
+  authenticated multihost data-plane integration gate. Quantitative sustained
+  workload gates and certified degraded reads while a storage host is offline
+  remain separate release work.
+- The current storage restart step verifies durable recovery after the node
+  returns. It does not yet claim uninterrupted S3 reads while that storage host
+  is offline: lease expiry deliberately moves affected PGs to `Peering`, where
+  the current strict metadata policy fails closed. Continuous reads with at
+  least `k` surviving shards belong to the degraded-read availability gate and
+  must be added once Peering has a certified read policy; they must not be
+  simulated by extending leases or by harness retries.
+- Frontend process availability is now independent of full-cluster PG
+  convergence. Dynamic startup constructs route handles, starts refresh and
+  background workers, and binds the S3 listener from the current committed map
+  even when one or more PGs are `Peering`; each request still fails closed at
+  the routed PG boundary unless that PG has a current Active serving route.
+  This preserves healthy-PG availability while recovery proceeds and removes
+  the former indefinite all-PG startup wait.
+- Authenticated storage RPC connection reuse now reserves stateful capacity at
+  the server rather than relying on independent client pool limits. At most
+  `max_connections - 1` ordinary connections may remain retained; a response
+  carries an authenticated connection-disposition bit, and clients return the
+  connection to their pool only when the server explicitly permits reuse.
+  Read-handle, payload-lease, and metadata-command sessions may use the
+  reserved slot. With `max_connections = 1`, ordinary exchanges complete and
+  close, so the sole slot cannot remain occupied by an idle pooled connection.
+  Saturation coverage composes one ordinary authenticated TLS request with a
+  subsequent stateful metadata-command session at that minimum limit.
 - Add shared authenticated test helpers first, in
   [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
   so all replicated process and UAT tests can configure authenticated Unix
@@ -13061,10 +13143,11 @@ Phase 12.4 progress:
 8. publish runtime maps only from committed state:
    - every epoch change is a committed state-machine transition;
    - storage nodes reject stale control-plane state by epoch/incarnation;
-   - frontends only start or refresh onto maps where every PG route is Active
-     with a serving lease, and they must stop mutating work when that lease or
-     read-index freshness expires before a replacement all-Active map is
-     installed;
+   - frontends may start and refresh onto a current committed map containing
+     non-serving PGs so healthy PGs remain available during recovery. Each
+     request must still require an Active serving route for its target PG, and
+     mutating work must stop when that route lease or read-index freshness
+     expires;
    - storage-node refresh may still receive non-serving maps for convergence,
      but those maps must not be exported as frontend-serving authority.
 9. define clock and lease semantics:

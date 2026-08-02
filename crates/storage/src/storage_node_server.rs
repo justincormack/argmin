@@ -197,11 +197,12 @@ use crate::storage_rpc::{
     encode_stream_segment_append_prepare_response, encode_stream_upload_match_response,
     encode_stream_upload_segments_response, encode_stream_upload_session_response,
     encode_stream_uploads_list_response, read_storage_rpc_request_frame_from,
-    validate_read_handle_acquire_request, validate_read_handle_release_request,
-    write_storage_rpc_frame_to, StorageRpcAbortMultipartCleanupResponse,
-    StorageRpcAbortMultipartCommandBuildRequest, StorageRpcAbortingMultipartUploadBucketsResponse,
-    StorageRpcAdmittedRouteEffectDeadline, StorageRpcAuthorizedAbortMultipartCommandBuildRequest,
-    StorageRpcBucketBatchRequest, StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse,
+    set_storage_rpc_response_connection_reusable, validate_read_handle_acquire_request,
+    validate_read_handle_release_request, write_storage_rpc_frame_to,
+    StorageRpcAbortMultipartCleanupResponse, StorageRpcAbortMultipartCommandBuildRequest,
+    StorageRpcAbortingMultipartUploadBucketsResponse, StorageRpcAdmittedRouteEffectDeadline,
+    StorageRpcAuthorizedAbortMultipartCommandBuildRequest, StorageRpcBucketBatchRequest,
+    StorageRpcBucketDeleteAttemptOutcomeOptionalRecordResponse,
     StorageRpcBucketDeleteAttemptOutcomeRecordRequest, StorageRpcBucketDeleteBeginRootsRequest,
     StorageRpcBucketDeleteBeginRootsResponse, StorageRpcBucketDeleteFinalizeClaimAcquireRequest,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
@@ -7857,7 +7858,7 @@ impl StorageNodeConnectionHandler {
     fn handle_session(
         &mut self,
         stream: &mut BoxStorageRpcStream,
-        _session_guard: StorageNodeActiveSessionGuard,
+        mut session_guard: StorageNodeActiveSessionGuard,
     ) -> Result<(), StorageNodeServerError> {
         let mut session =
             StorageNodeSession::new(Arc::clone(&self.read_handles), Arc::clone(&self.node));
@@ -7962,13 +7963,23 @@ impl StorageNodeConnectionHandler {
                 &self.metadata_command_locks,
                 session.current_rpc_context(),
             );
-            let response = match self.dispatch_frame(&mut session, &route_permit, &frame) {
+            let mut response = match self.dispatch_frame(&mut session, &route_permit, &frame) {
                 Ok(response) => response,
                 Err(error) => {
                     session.clear_metadata_command_lock_context(&self.metadata_command_locks);
                     return Err(error);
                 }
             };
+            let connection_reusable = session_guard.classify_connection(
+                session.has_active_read_state() || session.has_metadata_command_pg_locks(),
+            );
+            set_storage_rpc_response_connection_reusable(
+                &mut response.payload,
+                connection_reusable,
+            )
+            .map_err(|error| StorageNodeServerError::ResponsePayload {
+                message: error.to_string(),
+            })?;
             if trace_rpc_lifecycle {
                 let _ = observability::emit_flight_event(
                     "storage_rpc_server",
@@ -8000,6 +8011,9 @@ impl StorageNodeConnectionHandler {
                         started.elapsed().as_micros()
                     ),
                 );
+            }
+            if !connection_reusable {
+                return Ok(());
             }
         }
     }
@@ -18758,6 +18772,7 @@ fn trace_storage_rpc_lifecycle(kind: StorageRpcMessageKind) -> bool {
 #[derive(Debug, Default)]
 struct StorageNodeActiveSessionState {
     active: usize,
+    retained_ordinary: usize,
 }
 
 #[derive(Debug, Default)]
@@ -18777,6 +18792,8 @@ impl StorageNodeActiveSessions {
         }
         StorageNodeActiveSessionGuard {
             active_sessions: Arc::clone(self),
+            limit,
+            class: StorageNodeActiveSessionClass::Unclassified,
         }
     }
 
@@ -18786,17 +18803,29 @@ impl StorageNodeActiveSessions {
         if state.try_acquire(limit) {
             Some(StorageNodeActiveSessionGuard {
                 active_sessions: Arc::clone(self),
+                limit,
+                class: StorageNodeActiveSessionClass::Unclassified,
             })
         } else {
             None
         }
     }
 
-    fn release(&self) {
+    fn classify_connection(
+        &self,
+        class: &mut StorageNodeActiveSessionClass,
+        limit: usize,
+        stateful: bool,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.classify_connection(class, limit, stateful)
+    }
+
+    fn release(&self, class: StorageNodeActiveSessionClass) {
         self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .release();
+            .release(class);
         self.available.notify_one();
     }
 }
@@ -18810,21 +18839,72 @@ impl StorageNodeActiveSessionState {
         true
     }
 
-    fn release(&mut self) {
+    fn classify_connection(
+        &mut self,
+        class: &mut StorageNodeActiveSessionClass,
+        limit: usize,
+        stateful: bool,
+    ) -> bool {
+        if stateful {
+            if *class == StorageNodeActiveSessionClass::RetainedOrdinary {
+                self.retained_ordinary = self
+                    .retained_ordinary
+                    .checked_sub(1)
+                    .expect("retained ordinary storage session count underflow");
+            }
+            *class = StorageNodeActiveSessionClass::Stateful;
+            return true;
+        }
+
+        if *class == StorageNodeActiveSessionClass::RetainedOrdinary {
+            return true;
+        }
+        let ordinary_limit = limit.saturating_sub(1);
+        if self.retained_ordinary >= ordinary_limit {
+            return false;
+        }
+        self.retained_ordinary += 1;
+        *class = StorageNodeActiveSessionClass::RetainedOrdinary;
+        true
+    }
+
+    fn release(&mut self, class: StorageNodeActiveSessionClass) {
         self.active = self
             .active
             .checked_sub(1)
             .expect("storage-node active session release without acquire");
+        if class == StorageNodeActiveSessionClass::RetainedOrdinary {
+            self.retained_ordinary = self
+                .retained_ordinary
+                .checked_sub(1)
+                .expect("retained ordinary storage session release without classification");
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageNodeActiveSessionClass {
+    Unclassified,
+    RetainedOrdinary,
+    Stateful,
 }
 
 struct StorageNodeActiveSessionGuard {
     active_sessions: Arc<StorageNodeActiveSessions>,
+    limit: usize,
+    class: StorageNodeActiveSessionClass,
+}
+
+impl StorageNodeActiveSessionGuard {
+    fn classify_connection(&mut self, stateful: bool) -> bool {
+        self.active_sessions
+            .classify_connection(&mut self.class, self.limit, stateful)
+    }
 }
 
 impl Drop for StorageNodeActiveSessionGuard {
     fn drop(&mut self) {
-        self.active_sessions.release();
+        self.active_sessions.release(self.class);
     }
 }
 
@@ -19413,10 +19493,24 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
                 message: error.to_string(),
             }
         }
-        error @ StoreError::RouteMapExpired { .. } => StorageRpcErrorResponse {
-            code: StorageRpcErrorCode::StaleShardLocation,
-            message: error.to_string(),
-        },
+        error @ StoreError::RouteMapExpired {
+            cluster_epoch,
+            valid_until_ms,
+            now_ms,
+        } => {
+            let _ = observability::emit_flight_event(
+                "storage",
+                "storage_rpc_admitted_route_expired",
+                format!(
+                    "cluster_epoch={} valid_until_ms={valid_until_ms} now_ms={now_ms}",
+                    cluster_epoch.get()
+                ),
+            );
+            StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: error.to_string(),
+            }
+        }
         error @ (StoreError::IntegrityError { .. } | StoreError::ShardAckMismatch { .. }) => {
             StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::ShardIntegrity,
@@ -20310,6 +20404,28 @@ mod tests {
     fn storage_rpc_server_auth(
         credential: &ControlPlaneScopedCredential,
     ) -> StorageRpcServerAuthConfig {
+        storage_rpc_server_auth_with_max_connections(
+            credential,
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+        )
+    }
+
+    fn storage_rpc_test_transport_limits(
+        max_connections: usize,
+    ) -> crate::StorageRpcTransportLimits {
+        let defaults = crate::StorageRpcTransportLimits::DEFAULT;
+        crate::StorageRpcTransportLimits::new(
+            defaults.max_frame_bytes(),
+            max_connections,
+            defaults.io_timeout(),
+        )
+        .unwrap()
+    }
+
+    fn storage_rpc_server_auth_with_max_connections(
+        credential: &ControlPlaneScopedCredential,
+        max_connections: usize,
+    ) -> StorageRpcServerAuthConfig {
         StorageRpcServerAuthConfig::new(
             credential.cluster_id(),
             ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap(),
@@ -20317,17 +20433,31 @@ mod tests {
             STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
         )
         .unwrap()
+        .with_transport_limits(storage_rpc_test_transport_limits(max_connections))
     }
 
     fn storage_rpc_client_auth(
         credential: ControlPlaneScopedCredential,
         topology_generation: u64,
     ) -> Arc<StorageRpcClientAuthConfig> {
+        storage_rpc_client_auth_with_max_connections(
+            credential,
+            topology_generation,
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+        )
+    }
+
+    fn storage_rpc_client_auth_with_max_connections(
+        credential: ControlPlaneScopedCredential,
+        topology_generation: u64,
+        max_connections: usize,
+    ) -> Arc<StorageRpcClientAuthConfig> {
         Arc::new(
-            crate::FrontendStorageRpcClientCapability::new(
+            crate::FrontendStorageRpcClientCapability::new_with_transport_limits(
                 credential,
                 topology_generation,
                 STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                storage_rpc_test_transport_limits(max_connections),
             )
             .unwrap()
             .into(),
@@ -24254,14 +24384,150 @@ mod tests {
             Some(storage_rpc_client_auth(credential, 9)),
         );
 
+        for _ in 0..2 {
+            let payload = client
+                .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+                .unwrap();
+            let health = decode_health_response(&payload).unwrap();
+
+            assert_eq!(health.node_id, config.node_id);
+            assert_eq!(health.cluster_epoch, config.cluster_epoch);
+        }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn tls_tcp_ordinary_pool_reserves_single_connection_limit_for_stateful_session() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth_with_max_connections(&credential, 1))
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
+                bind_addr: "127.0.0.1:0".parse().unwrap(),
+                tls_server_config: storage_rpc_tls_server_config(),
+            }])
+            .bind()
+            .unwrap();
+        let address = server.tcp_listener_addr_for_test();
+        let join = thread::spawn(move || {
+            server.accept_one().unwrap();
+            server.accept_one().unwrap();
+        });
+        let endpoint = StorageRpcClientEndpoint::tcp(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth_with_max_connections(
+                credential, 9, 1,
+            )),
+        );
+
         let payload = client
             .rpc_request(StorageRpcMessageKind::Health, Vec::new())
             .unwrap();
-        let health = decode_health_response(&payload).unwrap();
+        assert_eq!(
+            decode_health_response(&payload).unwrap().node_id,
+            config.node_id
+        );
 
-        assert_eq!(health.node_id, config.node_id);
-        assert_eq!(health.cluster_epoch, config.cluster_epoch);
-        assert!(join.join().unwrap().is_ok());
+        let critical_section = MetadataCommandNodeClient::open_metadata_command_critical_section(
+            &client,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+        drop(critical_section);
+        drop(client);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn tls_tcp_distinct_ordinary_pools_leave_reserved_stateful_capacity() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth_with_max_connections(&credential, 2))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                    tls_server_config: storage_rpc_tls_server_config(),
+                }])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let new_client = || {
+            let endpoint = StorageRpcClientEndpoint::tcp(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap();
+            UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                config.node_id,
+                config.cluster_epoch,
+                endpoint,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(storage_rpc_client_auth_with_max_connections(
+                    credential.clone(),
+                    9,
+                    2,
+                )),
+            )
+        };
+        let first = new_client();
+        let second = new_client();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let payload = first
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        assert_eq!(
+            decode_health_response(&payload).unwrap().node_id,
+            config.node_id
+        );
+        accept.join().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let payload = second
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        assert_eq!(
+            decode_health_response(&payload).unwrap().node_id,
+            config.node_id
+        );
+        accept.join().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let critical_section = MetadataCommandNodeClient::open_metadata_command_critical_section(
+            &second,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+        accept.join().unwrap();
+        drop(critical_section);
+        drop(first);
+        drop(second);
     }
 
     #[test]
@@ -24315,21 +24581,29 @@ mod tests {
                 server.accept_one().unwrap()
             });
         });
-        let endpoint = StorageRpcClientEndpoint::tcp(
-            format!("tcp://localhost:{}", address.port()),
-            vec![address],
-            "localhost",
-            storage_rpc_tls_client_config(),
-        )
-        .unwrap();
-        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
-            config.node_id,
-            config.cluster_epoch,
-            endpoint,
-            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
-            Some(storage_rpc_client_auth(credential, 9)),
-        )
-        .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()));
+        let new_client = || {
+            let endpoint = StorageRpcClientEndpoint::tcp(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap();
+            UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                config.node_id,
+                config.cluster_epoch,
+                endpoint,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(storage_rpc_client_auth(credential.clone(), 9)),
+            )
+            .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()))
+        };
+        // The frontend's captured deadline is 1,500 ms away on its local
+        // monotonic clock. The production client must project that to the
+        // portable wall deadline (4,000 ms); no monotonic timestamp may cross
+        // the TLS/TCP boundary.
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let client = new_client();
         let reservation_route = client
             .open_bucket_write_reservation_route(
                 config.cluster_epoch,
@@ -24337,25 +24611,6 @@ mod tests {
                 &bucket,
             )
             .unwrap();
-        let drain_route = client
-            .open_bucket_write_reservation_route(
-                config.cluster_epoch,
-                BucketPgId::new_for_test(PgId::new(0)),
-                &drain_bucket,
-            )
-            .unwrap();
-        let expired_drain_route = client
-            .open_bucket_write_reservation_route(
-                config.cluster_epoch,
-                BucketPgId::new_for_test(PgId::new(0)),
-                &expired_drain_bucket,
-            )
-            .unwrap();
-        // The frontend's captured deadline is 1,500 ms away on its local
-        // monotonic clock. The production client must project that to the
-        // portable wall deadline (4,000 ms); no monotonic timestamp may cross
-        // the TLS/TCP boundary.
-        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
         let reservation = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
             reservation_route
                 .acquire_durable_bucket_write_reservation_with_effect_fence(
@@ -24374,7 +24629,17 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(reservation.bucket, bucket);
+        drop(reservation_route);
+        drop(client);
 
+        let client = new_client();
+        let drain_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &drain_bucket,
+            )
+            .unwrap();
         let drain = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
             drain_route
                 .begin_durable_bucket_write_drain_with_effect_fence(
@@ -24387,9 +24652,12 @@ mod tests {
                 .unwrap()
         });
         assert_eq!(drain.bucket, drain_bucket);
+        drop(drain_route);
+        drop(client);
 
         let shard_payload = b"portable fenced shard";
         let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+        let client = new_client();
         let shard_route = client
             .open_placed_shard_route(
                 crate::cluster::ShardLocation::new(
@@ -24408,7 +24676,17 @@ mod tests {
         });
         assert_eq!(shard_ack.stored_size, shard_payload.len() as u64);
         assert_eq!(node.read_shard_file(0, &shard_key).unwrap(), shard_payload);
+        drop(shard_route);
+        drop(client);
 
+        let client = new_client();
+        let expired_drain_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &expired_drain_bucket,
+            )
+            .unwrap();
         let drain_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
             expired_drain_route
                 .begin_durable_bucket_write_drain_with_effect_fence(
@@ -24430,7 +24708,10 @@ mod tests {
             ),
             "{drain_error:?}"
         );
+        drop(expired_drain_route);
+        drop(client);
 
+        let client = new_client();
         let pending_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
             MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence(
                 &client,
@@ -24451,7 +24732,9 @@ mod tests {
             ),
             "{pending_error:?}"
         );
+        drop(client);
 
+        let client = new_client();
         let expired_shard_route = client
             .open_placed_shard_route(
                 crate::cluster::ShardLocation::new(
@@ -24478,6 +24761,8 @@ mod tests {
             ),
             "{shard_error:?}"
         );
+        drop(expired_shard_route);
+        drop(client);
         join.join().unwrap();
 
         assert_eq!(node.read_shard_file(0, &shard_key).unwrap(), shard_payload);
@@ -35559,8 +35844,26 @@ mod tests {
         assert!(active_sessions.try_acquire(2));
         assert!(active_sessions.try_acquire(2));
         assert!(!active_sessions.try_acquire(2));
-        active_sessions.release();
+        active_sessions.release(StorageNodeActiveSessionClass::Unclassified);
         assert!(active_sessions.try_acquire(2));
+    }
+
+    #[test]
+    fn storage_node_active_sessions_reserve_capacity_from_retained_ordinary_connections() {
+        let active_sessions = Arc::new(StorageNodeActiveSessions::default());
+        let mut ordinary = active_sessions.try_acquire(2).unwrap();
+        assert!(ordinary.classify_connection(false));
+
+        let mut excess_ordinary = active_sessions.try_acquire(2).unwrap();
+        assert!(!excess_ordinary.classify_connection(false));
+        drop(excess_ordinary);
+
+        let mut stateful = active_sessions.try_acquire(2).unwrap();
+        assert!(stateful.classify_connection(true));
+        assert!(active_sessions.try_acquire(2).is_none());
+
+        drop(stateful);
+        assert!(active_sessions.try_acquire(2).is_some());
     }
 
     #[test]
