@@ -830,6 +830,9 @@ type RetainedStreamAbortHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> +
 type MetadataCommandPendingInstallHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type MetadataCommandDrainedTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 type MultipartCreateUploadIdPreparedTestHook = Arc<dyn Fn(&UploadId) + Send + Sync>;
 
 #[cfg(test)]
@@ -888,6 +891,8 @@ struct StorageClusterTestHooks {
     before_retained_stream_abort: Option<RetainedStreamAbortHook>,
     before_metadata_command_pending_install: Option<MetadataCommandPendingInstallHook>,
     #[cfg(test)]
+    after_metadata_command_drain: Option<MetadataCommandDrainedTestHook>,
+    #[cfg(test)]
     after_multipart_create_upload_id_prepared: Option<MultipartCreateUploadIdPreparedTestHook>,
     #[cfg(test)]
     before_multipart_create_command_install: Option<MultipartCreateCommandInstallTestHook>,
@@ -933,6 +938,11 @@ pub struct AfterRetainedStreamCleanupCapabilityTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub struct MetadataCommandPendingInstallHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub(crate) struct MetadataCommandDrainedTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1065,6 +1075,13 @@ impl Drop for MetadataCommandPendingInstallHookGuard {
             .lock()
             .unwrap()
             .before_metadata_command_pending_install = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCommandDrainedTestHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().after_metadata_command_drain = None;
     }
 }
 
@@ -8893,6 +8910,22 @@ impl StorageCluster {
     }
 
     #[cfg(test)]
+    fn maybe_run_after_metadata_command_drain_hook(&self) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_metadata_command_drain
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn maybe_run_after_metadata_command_drain_hook(&self) {}
+
+    #[cfg(test)]
     fn maybe_run_after_multipart_create_upload_id_prepared_hook(&self, upload_id: &UploadId) {
         let hook = self
             .test_hooks
@@ -10188,7 +10221,7 @@ impl StorageCluster {
             Ok(true) => Ok(SnapshotSensitiveInstallOutcome::Installed),
             Ok(false)
             | Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
-                self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+                self.drain_one_pending_object_metadata_command(pg_id, bucket)?;
                 Ok(SnapshotSensitiveInstallOutcome::ContenderDrained)
             }
             Err(error) => Err(error),
@@ -10354,17 +10387,6 @@ impl StorageCluster {
             }
             Err(error) => Err(error.into()),
         }
-    }
-
-    fn try_install_object_pg_pending_command_or_drain(
-        &self,
-        pg_id: PgId,
-        bucket: &BucketName,
-        command: &MetadataCommandEnvelope,
-        effect_fence: Option<AdmittedRouteEffectFence>,
-    ) -> Result<bool, ObjectPgActionError> {
-        self.maybe_run_before_metadata_command_pending_install_hook();
-        self.try_set_object_pg_pending_command_or_drain(pg_id, bucket, command, effect_fence)
     }
 
     fn pending_metadata_command_for_bucket(
@@ -11472,6 +11494,17 @@ impl StorageCluster {
             .unwrap()
             .before_metadata_command_pending_install = Some(hook);
         MetadataCommandPendingInstallHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_after_metadata_command_drain_hook(
+        &self,
+        hook: MetadataCommandDrainedTestHook,
+    ) -> MetadataCommandDrainedTestHookGuard {
+        self.test_hooks.lock().unwrap().after_metadata_command_drain = Some(hook);
+        MetadataCommandDrainedTestHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }
@@ -12677,14 +12710,16 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.drain_pending_metadata_command_with_recovery_gate_inner(
+        let outcome = self.drain_pending_metadata_command_with_recovery_gate_inner(
             pg_id,
             command,
             None,
             self,
             MetadataCommandRouteMode::Normal,
             None,
-        )
+        )?;
+        self.maybe_run_after_metadata_command_drain_hook();
+        Ok(outcome)
     }
 
     fn drain_pending_metadata_command_with_local_recovery_route(
@@ -14156,7 +14191,7 @@ impl StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
     ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(
+        let publisher = crate::metadata_command::metadata_command_publisher!(
             CommitDirectPutObjectFromPayloadShards
         );
         let PutObjectMutationEffectRoute {
@@ -14559,38 +14594,31 @@ impl StorageCluster {
             }
             if new_pending_command {
                 self.maybe_run_before_metadata_command_pending_install_hook();
-                let installed = match self
-                    .try_install_pending_metadata_command_for_bucket_with_effect_fence(
-                        pg_id,
-                        &req.bucket,
-                        &command,
-                        Some(effect_fence),
-                    ) {
-                    Ok(installed) => installed,
-                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                        ..
-                    })) => {
-                        if let Err(error) =
-                            self.drain_one_pending_object_metadata_command(pg_id, &req.bucket)
-                        {
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(error);
-                        }
-                        false
-                    }
+                let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                    publisher,
+                    pg_id,
+                    &req.bucket,
+                    &command,
+                    Some(effect_fence),
+                ) {
+                    Ok(install) => install,
                     Err(error) => {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
                 };
-                if !installed {
-                    sleep_direct_put_before_command_ownership_after_contention!(
-                        "direct PUT pending install retry budget exhausted"
-                    );
-                    continue;
+                match install {
+                    SnapshotSensitiveInstallOutcome::Installed => {
+                        payload_ownership = DirectPutPayloadOwnership::DurableCommand;
+                        disarm_payload_cleanup();
+                    }
+                    SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                        sleep_direct_put_before_command_ownership_after_contention!(
+                            "direct PUT pending install retry budget exhausted"
+                        );
+                        continue;
+                    }
                 }
-                payload_ownership = DirectPutPayloadOwnership::DurableCommand;
-                disarm_payload_cleanup();
             }
             break (command, new_pending_command);
         };
@@ -15300,7 +15328,7 @@ impl StorageCluster {
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<BucketWriteReservationDisposition, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(
+        let publisher = crate::metadata_command::metadata_command_publisher!(
             CreatePutObjectStreamSessionRecordUnderReservation
         );
         let bucket = &request.bucket;
@@ -15388,32 +15416,23 @@ impl StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             self.maybe_run_before_metadata_command_pending_install_hook();
-            let installed = match self
-                .try_install_pending_metadata_command_for_bucket_with_effect_fence(
-                    pg_id,
-                    bucket,
-                    &command,
-                    Some(route.effect_fence),
-                ) {
-                Ok(installed) => installed,
-                Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                    ..
-                })) => false,
-                Err(error) => return Err(error),
-            };
-            if !installed {
-                let cleanup = self
-                    .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                    .and_then(|_| {
-                        self.release_object_generation_reservation(bucket, key, session_id)
-                    });
-                cleanup?;
-                work_budget
-                    .sleep_after_contention(
-                        "put object stream create pending install retry budget exhausted",
-                    )
-                    .map_err(ObjectPgActionError::Store)?;
-                continue;
+            match self.install_snapshot_sensitive_metadata_command_or_drain(
+                publisher,
+                pg_id,
+                bucket,
+                &command,
+                Some(route.effect_fence),
+            )? {
+                SnapshotSensitiveInstallOutcome::Installed => {}
+                SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                    self.release_object_generation_reservation(bucket, key, session_id)?;
+                    work_budget
+                        .sleep_after_contention(
+                            "put object stream create pending install retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
             }
             if let Err(error) =
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)

@@ -220,14 +220,19 @@ Current production pending-command publishers:
 | `abort_authorized_multipart_upload_locked` | `AbortMultipartUpload` | `TerminalSessionRetry` | Rebuild authorized upload cleanup snapshot after unrelated contention and compare the current upload row to the authorized row before install. The foreground S3 path acquires its reservation and installs its pending command through the request admission's immutable effect fence. If an equivalent abort wins the pending slot, restart without draining so the matching branch returns the successful abort outcome. |
 
 Adding a production call site that creates or installs a pending metadata
-command requires updating this table and the boundary check allowlist. Direct
-uses of `try_set_pending_metadata_command_for_bucket`,
+command requires adding it to the authoritative Rust registry and updating
+this table. Production publisher entry points cannot directly use
+`try_set_pending_metadata_command_for_bucket`,
 `try_install_pending_metadata_command_for_bucket`,
 `try_install_object_pg_pending_command_with_fresh_id`, and
-`set_pending_metadata_command_for_bucket` are intentionally tracked.
-Snapshot-sensitive publishers should prefer
+`set_pending_metadata_command_for_bucket`; the boundary checker rejects any
+such call outside the compiler-classified typed installer implementations.
+Snapshot-sensitive publishers use
 `install_snapshot_sensitive_metadata_command_or_drain` so slot contention
-drains the winner and returns to the caller's fresh-snapshot loop.
+drains exactly the observed winner and returns to the caller's fresh-snapshot
+loop. The typed installer must not drain until the slot is empty: each owner
+iteration rechecks its request work budget and admitted route authority before
+handling another contender.
 Terminal-session publishers use
 `install_terminal_session_retry_metadata_command`, whose exhaustive result
 distinguishes installation, a matching visible contender, an unrelated visible

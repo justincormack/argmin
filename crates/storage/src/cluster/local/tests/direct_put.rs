@@ -894,6 +894,101 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
 }
 
 #[test]
+fn snapshot_sensitive_install_drains_only_the_observed_contender() {
+    let _guard = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "snapshot-install-one-drain-");
+    let first_key = key_for_object_pg(topology, &bucket, 2, "first-");
+    let candidate_key = key_for_object_pg(topology, &bucket, 2, "candidate-");
+    let second_key = key_for_object_pg(topology, &bucket, 2, "second-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(2);
+    let first_id = cluster.next_object_metadata_command_id(pg_id).unwrap();
+    let first = MetadataCommandEnvelope::new(
+        first_id,
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            first_key,
+            crate::SessionId::try_from("61".repeat(16)).unwrap(),
+            GenerationId::new(101).unwrap(),
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &first);
+
+    let next_log_index = MetadataCommandLogIndex::new(first_id.log_index().get() + 1).unwrap();
+    let candidate = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, next_log_index),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            candidate_key,
+            crate::SessionId::try_from("62".repeat(16)).unwrap(),
+            GenerationId::new(102).unwrap(),
+            crate::clock::current_time_millis(),
+        )),
+    );
+
+    let inserted_after_drain = Arc::new(Mutex::new(None));
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let inserted_after_drain_for_hook = Arc::clone(&inserted_after_drain);
+    let _hook_guard = cluster.test_install_after_metadata_command_drain_hook(Arc::new(move || {
+        let command_id = hook_cluster.next_object_metadata_command_id(pg_id).unwrap();
+        assert_eq!(command_id.log_index(), next_log_index);
+        let second = MetadataCommandEnvelope::new(
+            command_id,
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                hook_bucket.clone(),
+                second_key.clone(),
+                crate::SessionId::try_from("63".repeat(16)).unwrap(),
+                GenerationId::new(103).unwrap(),
+                crate::clock::current_time_millis(),
+            )),
+        );
+        insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &second);
+        *inserted_after_drain_for_hook.lock().unwrap() = Some(second);
+    }));
+
+    let outcome = cluster
+        .install_snapshot_sensitive_metadata_command_or_drain(
+            crate::metadata_command::metadata_command_publisher!(
+                CommitDirectPutObjectFromPayloadShards
+            ),
+            pg_id,
+            &bucket,
+            &candidate,
+            None,
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        crate::cluster::SnapshotSensitiveInstallOutcome::ContenderDrained
+    );
+    let inserted_after_drain = inserted_after_drain.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(inserted_after_drain),
+        "typed installation must return after draining its observed contender"
+    );
+}
+
+#[test]
 fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

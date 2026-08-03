@@ -5458,6 +5458,37 @@ Eighth Phase 4 slice (2026-08-03):
   storage boundary checker, formatting, workspace compilation, workspace-wide
   strict Clippy, and the full parallel 7,970-test workspace suite.
 
+Ninth Phase 4 slice (2026-08-03):
+
+- migrated the four remaining production publishers that directly selected a
+  raw object-PG pending-slot installer. Direct PUT commit, low-level PutObject
+  stream-session creation, admitted PutObject stream-session creation, and
+  payload reclaim now carry their registered `SnapshotSensitive` token through
+  `install_snapshot_sensitive_metadata_command_or_drain` and exhaustively
+  distinguish installation from a drained contender.
+- direct PUT retains its payload-ownership transition only after the typed
+  outcome proves command installation. Both stream-create paths release their
+  generation reservation and restart from fresh state after a drained
+  contender. Payload reclaim preserves its durable claim and retries command
+  construction after contention.
+- the shared snapshot-sensitive installer drains exactly the contender it
+  observed and then returns `ContenderDrained`; it does not loop until the PG
+  slot is empty. This preserves each owner loop's route-authority and work-
+  budget checkpoints under sustained same-PG publication. A deterministic
+  regression inserts a second contender immediately after the first drain and
+  requires it to remain pending when the typed install call returns.
+- removed the now-unused raw install-and-drain wrapper. The boundary checker no
+  longer has a production publisher allowlist: any raw publisher call is a
+  failure, while the authoritative registry marker and class-specific token
+  checks remain exhaustive.
+- the separate `MetadataCommandLogConflict` convergence inventory remains for
+  the next Phase 4 slice; its counts now reflect that the typed snapshot
+  installer owns the common pending-install conflict branch.
+- validation passed the seven focused pending-install contention, reservation,
+  and reclaim regressions, the storage boundary checker, formatting, workspace
+  compilation, workspace-wide strict Clippy, and the full parallel 7,973-test
+  workspace suite.
+
 ### Phase 5 — isolate test support
 
 1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside

@@ -12424,7 +12424,8 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<super::ObjectPayloadReclaimAttempt, ObjectPgActionError> {
-        crate::metadata_command::metadata_command_publisher!(ReclaimObjectPayloadIfUnleased);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(ReclaimObjectPayloadIfUnleased);
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
         let emit_outcome = |outcome: &'static str| {
@@ -12661,13 +12662,15 @@ impl super::StorageCluster {
                     }
                     Err(error) => return Err(error),
                 };
-                if !self.try_install_object_pg_pending_command_or_drain(
+                match self.install_snapshot_sensitive_metadata_command_or_drain(
+                    publisher,
                     pg_id,
                     bucket,
                     &command,
                     Some(reclaim_effect_fence),
                 )? {
-                    continue;
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 command_owns_reclaim_claim = true;
                 self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
@@ -13229,7 +13232,8 @@ impl super::StorageCluster {
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        crate::metadata_command::metadata_command_publisher!(CreatePutObjectStreamSession);
+        let publisher =
+            crate::metadata_command::metadata_command_publisher!(CreatePutObjectStreamSession);
         enum Attempt<T> {
             Complete(T),
             Retry,
@@ -13404,33 +13408,14 @@ impl super::StorageCluster {
                     return Err(error.into());
                 }
                 self.maybe_run_before_metadata_command_pending_install_hook();
-                let installed = match self
-                    .try_install_pending_metadata_command_for_bucket_with_effect_fence(
-                        pg_id,
-                        bucket,
-                        &command,
-                        Some(effect_fence),
-                    ) {
-                    Ok(installed) => installed,
-                    Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
-                        ..
-                    })) => {
-                        let cleanup = self
-                            .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                            .and_then(|_| {
-                                self.release_object_generation_reservation(
-                                    bucket,
-                                    key,
-                                    &create.session_id,
-                                )
-                            });
-                        if let Err(cleanup_error) = cleanup {
-                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                                cleanup_error,
-                            ));
-                        }
-                        return Ok(Ok(Attempt::Retry));
-                    }
+                let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &command,
+                    Some(effect_fence),
+                ) {
+                    Ok(install) => install,
                     Err(error) => {
                         let _ = self.release_object_generation_reservation(
                             bucket,
@@ -13442,22 +13427,20 @@ impl super::StorageCluster {
                         ));
                     }
                 };
-                if !installed {
-                    let cleanup = self
-                        .drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)
-                        .and_then(|_| {
-                            self.release_object_generation_reservation(
-                                bucket,
-                                key,
-                                &create.session_id,
-                            )
-                        });
-                    if let Err(cleanup_error) = cleanup {
-                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                            cleanup_error,
-                        ));
+                match install {
+                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                        if let Err(cleanup_error) = self.release_object_generation_reservation(
+                            bucket,
+                            key,
+                            &create.session_id,
+                        ) {
+                            return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                                cleanup_error,
+                            ));
+                        }
+                        return Ok(Ok(Attempt::Retry));
                     }
-                    return Ok(Ok(Attempt::Retry));
                 }
                 if let Err(error) =
                     self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)

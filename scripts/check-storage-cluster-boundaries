@@ -3373,20 +3373,9 @@ if [[ "$live_metadata_command_publishers" != "$registered_metadata_command_publi
         "$live_metadata_command_publishers"
 fi
 
-# This semantic inventory is temporary until typed publisher APIs make the
-# permitted low-level helper for each registered publisher a Rust-level choice.
-expected_pending_command_publishers=$(cat <<'EOF'
-1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards_with_route_validation:CommitDirectPutObjectFromPayloadShards:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:CreatePutObjectStreamSessionRecordUnderReservation:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_route_validation:CreatePutObjectStreamSession:try_install_pending_metadata_command_for_bucket
-1 crates/storage/src/cluster/request_ops.rs:reclaim_object_payload_if_unleased:ReclaimObjectPayloadIfUnleased:try_install_object_pg_pending_command_or_drain
-EOF
-)
-if [[ "$pending_command_publishers" != "$expected_pending_command_publishers" ]]; then
-    fail_with_matches \
-        "Pending metadata command publisher inventory changed; update guides/metadata-command-stream.md classification and this allowlist" \
-        "$pending_command_publishers"
-fi
+fail_with_matches \
+    "Production metadata-command publishers must use their compiler-classified typed installer" \
+    "$pending_command_publishers"
 
 # Semantic inventory that Rust does not yet enforce: every conflict branch
 # must remain aligned with the publisher finish/convergence contract.
@@ -3451,8 +3440,8 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster.rs:abort_stream_upload_session:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:apply_new_stream_append_command:exact-command-match
 1 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards_with_route_validation:exact-command-match
-3 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards_with_route_validation:metadata-command-log-conflict
-2 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
+2 crates/storage/src/cluster.rs:commit_direct_put_object_from_payload_shards_with_route_validation:metadata-command-log-conflict
+1 crates/storage/src/cluster.rs:create_put_object_stream_session_record_under_reservation:metadata-command-log-conflict
 2 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:exact-command-match
 1 crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata-command-log-conflict
 1 crates/storage/src/cluster.rs:install_matching_outcome_retry_metadata_command:metadata-command-log-conflict
@@ -3481,7 +3470,7 @@ expected_metadata_command_conflict_uses=$(cat <<'EOF'
 1 crates/storage/src/cluster/request_ops.rs:begin_upload_part_stream_session_with_cleanup_deadline:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:complete_multipart_upload_commit_serialized_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_multipart_upload_inner_with_route_validation:metadata-command-log-conflict
-2 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_route_validation:metadata-command-log-conflict
+1 crates/storage/src/cluster/request_ops.rs:create_put_object_stream_session_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:create_upload_part_stream_session_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_current_object_if_with_route_validation:metadata-command-log-conflict
 1 crates/storage/src/cluster/request_ops.rs:delete_expired_delete_marker_if_due:metadata-command-log-conflict
