@@ -1,12 +1,13 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–4 complete; Phase 5 not started
+Status: active — Phases 0–4 complete; Phase 5 audited, implementation not started
 
 Related plans:
 
 - [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
 - [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
 - [multihost-transition-plan.md](multihost-transition-plan.md)
+- [storage-upgrade-versioning-plan.md](storage-upgrade-versioning-plan.md)
 
 ## Goal
 
@@ -5585,21 +5586,125 @@ Eleventh Phase 4 correction (2026-08-03):
 
 ### Phase 5 — isolate test support
 
-1. Inventory feature-gated and `cfg(test)` raw mutation/read hooks used outside
-   their defining module.
-2. Move cross-crate fixtures into an internal test-support crate or explicit
-   dev-only API.
-3. Ensure production dependency graphs do not enable test hooks.
-4. Keep narrowly scoped deterministic fault-injection guards where production
-   code must contain the hook point.
+Audit update (2026-08-03): this phase is materially smaller in architectural
+scope than when the plan was written. The containment work tracked by
+`storage-upgrade-versioning-plan.md` moved storage-node protocols, physical
+payload representations, maintenance workers, claims, reclaim/finalization
+state, and most impossible-state fixtures into `storage`. The ordinary
+normal/build dependency graphs for `argmin-s3`, `server-core`, and
+`server-http` do not enable `storage/test-hooks` or
+`server-core/test-utils`. Phase 5 must preserve that property, but it does not
+need to repeat the completed production-representation containment work.
+
+The remaining problem is test-surface ownership rather than a general crate
+split. A separate `storage-test-support` crate is not the default design: it
+could reach owner-private state only by making more storage internals public.
+Prefer one explicit feature-gated `storage::test_support` module which can use
+crate-private implementation details and expose only semantic scenarios,
+logical observations, and deterministic fault guards. A separate crate is
+appropriate only for composition helpers implemented entirely through the
+normal public logical API.
+
+The audit found four remaining classes of work:
+
+1. **Raw or semantically different test execution paths.** Some coordinator
+   test adapters still bypass the admitted production route. In particular,
+   `RawStreamSegmentMutationRoute` uses the raw storage append path under
+   `test-utils`; `RawStreamPutFinalizationRoute` and the unbounded
+   `StorageCluster::finalize_put_object_stream` path remain production-visible;
+   and the public `begin_stream_put*` storage-node adapters have only test
+   callers. Cross-crate behavioral tests must exercise the admitted production
+   operation unless the test explicitly targets a lower storage boundary.
+   Remove, feature-gate, or replace these adapters with the same capability
+   path used by live HTTP requests. Do not retain a test helper whose success
+   depends on weaker route, deadline, or subject validation than production.
+
+2. **Owner-local impossible-state fixtures.** `server-core` still directly
+   asks storage test hooks to corrupt or remove durable multipart parts,
+   replace physical segment layouts, manufacture reclaim roots and deleting
+   buckets, insert lifecycle claims, alter upload/session state and timestamps,
+   and drive raw reclaim queues. Move tests whose assertion is about storage
+   corruption, recovery, physical layout, claims, or queue invariants into
+   `storage`. Where an S3/coordinator response to a storage failure genuinely
+   requires a cross-crate test, expose an opaque scenario-level fault or
+   logical observation rather than physical PG, shard, row, claim, or command
+   records. This work is the test-fixture portion of pending item 14 in
+   `storage-upgrade-versioning-plan.md`; that plan retains ownership of its
+   separate debug-PG containment work.
+
+3. **Consolidated dev-only support.** Move retained cross-crate test DTOs,
+   observations, and hook installers out of the `storage` crate root and off
+   production types where practical, into `storage::test_support`. Classify
+   every exported item as one of:
+
+   - a logical read-only observation;
+   - an opaque semantic fixture/scenario;
+   - a deterministic scheduling, contention, expiry, or failure guard; or
+   - a test-runtime lifecycle operation such as wake, drain, or cleanliness
+     verification.
+
+   Raw record constructors, physical mutation methods, generic storage-node
+   access, and owner-private format values are not acceptable cross-crate
+   categories. Keep process-level opaque Raft/control-plane test clients and
+   the small S3 test-server lifecycle surface where the test necessarily spans
+   a process or HTTP boundary. Consider hiding the latter behind the owning
+   test-server harness so `s3-tests` need not name storage hooks directly.
+
+4. **Feature-graph enforcement and cleanup.** Add a stable CI/boundary check
+   which obtains the complete workspace-member set from Cargo metadata and
+   examines every member's normal/build feature graph. The classification is
+   fail closed: maintain one explicit, reviewed allowlist of test-only packages
+   which may enable test support, reject an unclassified workspace member, and
+   reject a stale allowlist entry. The initial hook-enabled allowlist is exactly
+   `s3-tests`, a non-published executable test harness; adding another package
+   requires documenting why it is test-only and why it needs storage-private
+   support. Every non-allowlisted workspace member must prove that neither
+   `storage/test-hooks` nor `server-core/test-utils` is enabled. Dev-dependency
+   edges may enable the features while compiling a package's tests, but do not
+   exempt that package's normal/build graph from the check.
+   Review `server-core/test-utils` after the raw adapters are removed and stop
+   forwarding `storage/test-hooks` if its remaining cross-crate helpers no
+   longer require storage-private support. Keep all-feature compilation for
+   validating the test surface, but do not confuse that deliberately enabled
+   graph with a production dependency graph.
+
+Implementation slices:
+
+1. Inventory every externally consumed storage test-support symbol by owner,
+   consumer, category above, and whether it changes durable state. Record the
+   clean normal/build feature-graph baseline and the exhaustive workspace
+   package classification, initially allowing only `s3-tests` to enable hooks
+   through normal dependencies.
+2. Remove the raw/different-path coordinator adapters and make behavioral test
+   helpers use admitted production capabilities.
+3. Relocate impossible-state tests and replace necessary cross-crate raw
+   mutations with owner-defined opaque scenarios; consolidate the retained
+   surface under `storage::test_support`.
+4. Minimize downstream test feature forwarding, add the production feature-
+   graph check, update the upgrade/versioning plan's overlapping item, and
+   retire only the textual hook checks made structurally redundant by this
+   work.
 
 Completion:
 
-- production crates cannot name test-only storage mutation APIs
-- tests retain direct state inspection where it is necessary to prove durable
-  invariants
-- textual scans for public test hooks are retired where the dependency graph
-  enforces absence
+- every workspace package has a fail-closed classification, and normal/build
+  dependency graphs cannot enable test support except for explicitly reviewed
+  test-only packages on the narrow allowlist
+- production-visible coordinator and storage APIs contain no raw path retained
+  solely for tests
+- cross-crate behavioral tests use the same admitted capability path as
+  production unless they explicitly target a lower owner boundary
+- impossible-state construction and assertions about storage physical layout,
+  recovery internals, claims, and queues are owner-local; cross-crate tests may
+  invoke an owner-defined opaque failure scenario when their assertion is the
+  coordinator, HTTP, or S3 response to that scenario
+- retained cross-crate support is feature-gated, owner-namespaced, and limited
+  to logical observations, opaque semantic scenarios, deterministic fault
+  guards, and test-runtime lifecycle operations
+- tests retain the durable-state evidence necessary to prove invariants
+  without importing owner-private records or physical routing values
+- textual scans for public test hooks are retired only where module visibility,
+  feature graphs, or typed test-support APIs enforce the same invariant
 
 ### Phase 6 — shrink and redefine the boundary check
 
