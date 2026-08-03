@@ -7216,6 +7216,7 @@ impl super::StorageCluster {
         match error {
             BucketWriteDrainError::Store(
                 StoreError::MetadataCommandContention { .. }
+                | StoreError::PgNotActive { .. }
                 | StoreError::RouteMapExpired { .. }
                 | StoreError::StaleMetadataOperation { .. }
                 | StoreError::StaleMetadataRoute { .. }

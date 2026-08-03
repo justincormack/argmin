@@ -2919,6 +2919,68 @@ fn begin_bucket_delete_records_reservation_wait_blocker_and_adopts_after_release
 }
 
 #[test]
+fn begin_bucket_delete_preserves_drain_when_object_pg_enters_peering() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-peering-preserve-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let peering_pg_id = PgId::new(2);
+    let _exact_drain_hook_guard = cluster.test_install_before_bucket_delete_exact_drain_hook(
+        Arc::new(move |_has_progress, _next_object_pg_id| {
+            Err(StoreError::PgNotActive {
+                pg_id: peering_pg_id.get(),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: crate::PgState::Peering,
+            })
+        }),
+    );
+
+    let error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::BucketWriteDrainError::Store(StoreError::PgNotActive {
+            pg_id: 2,
+            state: crate::PgState::Peering,
+            ..
+        })
+    ));
+
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+            .unwrap()
+            .is_some(),
+        "a transient Peering failure must preserve the durable delete drain for adoption"
+    );
+    drop(bucket_pg);
+    assert!(matches!(
+        cluster.try_take_reclaim_work(),
+        Some(crate::ReclaimWorkItem::BucketDeleteBegin(root)) if root.bucket == bucket
+    ));
+}
+
+#[test]
 fn begin_bucket_delete_reaps_expired_durable_write_reservation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
