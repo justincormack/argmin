@@ -12,8 +12,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
@@ -60,10 +60,10 @@ use crate::control_plane::{
     connect_tcp_stream_until_async, connect_unix_stream_until, AuthorityIncarnation,
     ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneAuthorityClockCheckpointBinding,
     ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneRaftOperationErrorKind,
-    ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneRuntimeMapNodeLeaseDiagnostic,
-    ControlPlaneRuntimeMapStatus, DeadlineUnixStream, NodeAvailabilityState, NodeMembershipState,
-    RuntimeMapContentCertificate, RuntimeMapFreshnessProof,
-    CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS,
+    ControlPlaneRpcResponsePublication, ControlPlaneRuntimeMapDiagnosticSnapshot,
+    ControlPlaneRuntimeMapNodeLeaseDiagnostic, ControlPlaneRuntimeMapStatus, DeadlineUnixStream,
+    NodeAvailabilityState, NodeMembershipState, RuntimeMapContentCertificate,
+    RuntimeMapFreshnessProof, CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::control_plane_auth::{
     ControlPlaneAuthDecision, ControlPlaneAuthEnvelope, ControlPlaneAuthOperation,
@@ -2571,10 +2571,9 @@ impl SubmittedControlPlaneRaftCommand {
 /// topology.
 ///
 /// The value binds the submitted command to the exact owner-built topology and
-/// issuing Raft authority. The process may hold it across its durable
-/// response-publication step but cannot inspect or replace the Raft outcome
-/// before storage resolves it.
-pub struct UncertifiedInitialControlPlaneTopologySubmission {
+/// issuing Raft authority while storage publishes the durable checkpoint. It
+/// cannot leave the owning crate or be replaced before resolution.
+pub(crate) struct UncertifiedInitialControlPlaneTopologySubmission {
     authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
     topology: UncertifiedInitialControlPlaneTopology,
     submitted: SubmittedControlPlaneRaftCommand,
@@ -2586,6 +2585,166 @@ impl fmt::Debug for UncertifiedInitialControlPlaneTopologySubmission {
             .debug_struct("UncertifiedInitialControlPlaneTopologySubmission")
             .field("diagnostic", &"<redacted>")
             .finish_non_exhaustive()
+    }
+}
+
+/// Authority-bound admission and poison state for durable response publication.
+///
+/// Every clone belongs to one Raft authority. A durability failure first stops
+/// new response publication, waits for responses already holding admission to
+/// drain, and only then publishes the poisoned state. Callers can pass this
+/// opaque value to RPC servers but cannot create an independent publication
+/// domain for the same authority.
+#[derive(Clone)]
+pub struct ControlPlaneRaftDurabilityPublication {
+    authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
+    gate: Arc<(Mutex<ControlPlaneRaftDurabilityPublicationState>, Condvar)>,
+    poisoned: Arc<AtomicBool>,
+}
+
+#[derive(Default)]
+struct ControlPlaneRaftDurabilityPublicationState {
+    active_responses: usize,
+    poison_requested: bool,
+    diagnostic: Option<Box<str>>,
+}
+
+struct ControlPlaneRaftResponsePublicationPermit<'a> {
+    publication: &'a ControlPlaneRaftDurabilityPublication,
+}
+
+impl Drop for ControlPlaneRaftResponsePublicationPermit<'_> {
+    fn drop(&mut self) {
+        let (gate, responses_drained) = &*self.publication.gate;
+        let mut state = gate
+            .lock()
+            .expect("control-plane Raft response publication mutex poisoned");
+        state.active_responses = state
+            .active_responses
+            .checked_sub(1)
+            .expect("response publication permit count should be positive");
+        if state.active_responses == 0 {
+            responses_drained.notify_all();
+        }
+    }
+}
+
+impl ControlPlaneRaftDurabilityPublication {
+    fn new(authority_instance_id: ControlPlaneRaftAuthorityInstanceId) -> Self {
+        Self {
+            authority_instance_id,
+            gate: Arc::new((
+                Mutex::new(ControlPlaneRaftDurabilityPublicationState::default()),
+                Condvar::new(),
+            )),
+            poisoned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::Acquire)
+    }
+
+    pub fn ensure_available(&self) -> Result<(), ControlPlaneError> {
+        let (gate, _) = &*self.gate;
+        let state = gate
+            .lock()
+            .expect("control-plane Raft response publication mutex poisoned");
+        if !state.poison_requested && !self.poisoned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        Err(ControlPlaneError::durability_failure(
+            state.diagnostic.clone().unwrap_or_else(|| {
+                "control-plane Raft durable authority was poisoned before response publication"
+                    .into()
+            }),
+        ))
+    }
+
+    pub fn poison(&self, diagnostic: impl Into<Box<str>>) {
+        let (gate, responses_drained) = &*self.gate;
+        let mut state = gate
+            .lock()
+            .expect("control-plane Raft response publication mutex poisoned");
+        if state.poison_requested {
+            while !self.poisoned.load(Ordering::Acquire) {
+                state = responses_drained
+                    .wait(state)
+                    .expect("control-plane Raft response publication mutex poisoned");
+            }
+            return;
+        }
+        state.poison_requested = true;
+        state.diagnostic = Some(diagnostic.into());
+        while state.active_responses != 0 {
+            state = responses_drained
+                .wait(state)
+                .expect("control-plane Raft response publication mutex poisoned");
+        }
+        self.poisoned.store(true, Ordering::Release);
+        responses_drained.notify_all();
+    }
+
+    fn validate_authority(
+        &self,
+        authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
+    ) -> Result<(), ControlPlaneError> {
+        if self.authority_instance_id != authority_instance_id {
+            return Err(ControlPlaneError::invariant_failure(
+                "control-plane Raft durability publication belongs to another authority instance",
+            ));
+        }
+        Ok(())
+    }
+
+    fn publish<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T, ControlPlaneError>,
+    ) -> Result<T, ControlPlaneError> {
+        let _permit = self.response_publication_permit()?;
+        publish()
+    }
+
+    fn response_publication_permit(
+        &self,
+    ) -> Result<ControlPlaneRaftResponsePublicationPermit<'_>, ControlPlaneError> {
+        self.ensure_available()?;
+        let (gate, _) = &*self.gate;
+        let mut state = gate
+            .lock()
+            .expect("control-plane Raft response publication mutex poisoned");
+        if state.poison_requested || self.poisoned.load(Ordering::Acquire) {
+            return Err(ControlPlaneError::durability_failure(
+                state.diagnostic.clone().unwrap_or_else(|| {
+                    "control-plane Raft durable authority was poisoned before response publication"
+                        .into()
+                }),
+            ));
+        }
+        state.active_responses = state
+            .active_responses
+            .checked_add(1)
+            .expect("response publication permit count overflow");
+        Ok(ControlPlaneRaftResponsePublicationPermit { publication: self })
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftDurabilityPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRaftDurabilityPublication")
+            .field("diagnostic", &"<redacted>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRpcResponsePublication for ControlPlaneRaftDurabilityPublication {
+    fn publish(
+        &self,
+        publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+    ) -> Result<(), ControlPlaneError> {
+        ControlPlaneRaftDurabilityPublication::publish(self, publish)
     }
 }
 
@@ -2636,6 +2795,8 @@ pub struct ControlPlaneRaftAuthority {
         )>,
     >,
     authority_instance_id: OnceLock<ControlPlaneRaftAuthorityInstanceId>,
+    durability_publication: OnceLock<ControlPlaneRaftDurabilityPublication>,
+    uncertified_initial_topology_checkpoint_published: OnceLock<()>,
     checkpoint_publication: Arc<Mutex<Option<ControlPlaneRaftCheckpointPosition>>>,
     durable_artifact_path: Option<Arc<PathBuf>>,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
@@ -4681,6 +4842,21 @@ impl ControlPlaneRaftAuthority {
         Ok(Self::new_with_log_store(raft, log_store, cluster_name))
     }
 
+    /// Construct an in-memory Raft authority whose explicit checkpoint
+    /// publication is durable, for cross-crate behavioral tests.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn new_experimental_single_node_in_memory_with_checkpoint_for_test(
+        cluster_name: impl Into<String>,
+        node_id: ControlPlaneRaftNodeId,
+        artifact_path: &Path,
+    ) -> Result<Self, ControlPlaneError> {
+        Ok(
+            Self::new_experimental_single_node_in_memory(cluster_name, node_id)
+                .await?
+                .with_durable_artifact_path(artifact_path),
+        )
+    }
+
     pub async fn new_experimental_single_node_durable(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
@@ -4929,6 +5105,8 @@ impl ControlPlaneRaftAuthority {
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
             authority_instance_id: OnceLock::new(),
+            durability_publication: OnceLock::new(),
+            uncertified_initial_topology_checkpoint_published: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
@@ -4955,6 +5133,8 @@ impl ControlPlaneRaftAuthority {
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
             authority_instance_id: OnceLock::new(),
+            durability_publication: OnceLock::new(),
+            uncertified_initial_topology_checkpoint_published: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
@@ -4975,6 +5155,21 @@ impl ControlPlaneRaftAuthority {
         }
         let generated = ControlPlaneRaftAuthorityInstanceId::generate()?;
         Ok(*self.authority_instance_id.get_or_init(|| generated))
+    }
+
+    /// Return the single response-publication and durability-poison domain
+    /// bound to this authority.
+    pub fn durability_publication(
+        &self,
+    ) -> Result<ControlPlaneRaftDurabilityPublication, ControlPlaneError> {
+        if let Some(publication) = self.durability_publication.get() {
+            return Ok(publication.clone());
+        }
+        let publication = ControlPlaneRaftDurabilityPublication::new(self.authority_instance_id()?);
+        Ok(self
+            .durability_publication
+            .get_or_init(|| publication)
+            .clone())
     }
 
     #[must_use]
@@ -5476,10 +5671,10 @@ impl ControlPlaneRaftAuthority {
     /// Observe and, when necessary, submit the environment-configured
     /// uncertified initial topology.
     ///
-    /// The returned submitted command remains subject to the caller's existing
-    /// durable response-publication protocol. `None` means the topology was
-    /// either not configured or control-plane state was already initialized.
-    pub async fn prepare_uncertified_initial_control_plane_topology(
+    /// The returned submitted command remains internal to the combined durable
+    /// establishment operation. `None` means the topology was either not
+    /// configured or control-plane state was already initialized.
+    pub(crate) async fn prepare_uncertified_initial_control_plane_topology(
         &self,
         topology: &UncertifiedInitialControlPlaneTopology,
     ) -> Result<Option<UncertifiedInitialControlPlaneTopologySubmission>, ControlPlaneError> {
@@ -5508,7 +5703,7 @@ impl ControlPlaneRaftAuthority {
     ///
     /// A bootstrap rejection or leader-routing race is accepted only after a
     /// fresh authority read proves that some initial topology now exists.
-    pub async fn resolve_uncertified_initial_control_plane_topology_submission(
+    pub(crate) async fn resolve_uncertified_initial_control_plane_topology_submission(
         &self,
         submission: UncertifiedInitialControlPlaneTopologySubmission,
     ) -> Result<Option<u64>, ControlPlaneError> {
@@ -5550,6 +5745,95 @@ impl ControlPlaneRaftAuthority {
                 }
             }
             Err(error) => Err(error),
+        }
+    }
+
+    async fn publish_uncertified_initial_topology_checkpoint(
+        &self,
+        publication: &ControlPlaneRaftDurabilityPublication,
+    ) -> Result<(), ControlPlaneError> {
+        if self
+            .uncertified_initial_topology_checkpoint_published
+            .get()
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Err(error) = self.store_durable_restart_artifact().await {
+            publication.poison(format!(
+                "control-plane Raft durability checkpoint failed while establishing the \
+                 uncertified initial topology: {}",
+                error.retained_diagnostic_message()
+            ));
+            return Err(error.into_durability_failure(
+                "publish uncertified initial topology restart checkpoint",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Establish an environment-configured uncertified topology with durable
+    /// response publication owned by this authority.
+    ///
+    /// The submitted outcome is not resolved until a restart checkpoint that
+    /// contains the committed command has been durably published. Topology
+    /// observed from another authority is likewise not reported until it is in
+    /// this authority's own durable checkpoint. A checkpoint failure poisons
+    /// the authority's one response-publication domain before returning,
+    /// preventing any later RPC response from being published by this process.
+    pub async fn establish_uncertified_initial_control_plane_topology(
+        &self,
+        topology: &UncertifiedInitialControlPlaneTopology,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        let publication = self.durability_publication()?;
+        publication.validate_authority(self.authority_instance_id()?)?;
+        loop {
+            publication.ensure_available()?;
+            let submission = match self
+                .prepare_uncertified_initial_control_plane_topology(topology)
+                .await
+            {
+                Ok(Some(submission)) => submission,
+                Ok(None) => {
+                    let snapshot = self.current_control_plane_snapshot().await?;
+                    if topology.initialized_epoch(&snapshot).is_some() {
+                        self.publish_uncertified_initial_topology_checkpoint(&publication)
+                            .await?;
+                        let _ = self
+                            .uncertified_initial_topology_checkpoint_published
+                            .set(());
+                    }
+                    return Ok(None);
+                }
+                Err(error) if error.is_control_plane_leader_routing_rejection() => {
+                    ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            self.publish_uncertified_initial_topology_checkpoint(&publication)
+                .await?;
+            match self
+                .resolve_uncertified_initial_control_plane_topology_submission(submission)
+                .await
+            {
+                Ok(epoch) => {
+                    // A rejected submission may have observed a concurrently applied
+                    // topology only during resolution, after the pre-resolution
+                    // checkpoint was captured. Publish once more so the exact state
+                    // which justified success is locally restartable.
+                    self.publish_uncertified_initial_topology_checkpoint(&publication)
+                        .await?;
+                    let _ = self
+                        .uncertified_initial_topology_checkpoint_published
+                        .set(());
+                    return Ok(epoch);
+                }
+                Err(error) if error.is_control_plane_leader_routing_rejection() => {
+                    ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
         }
     }
 
@@ -18876,6 +19160,72 @@ mod tests {
         (authority1, authority2)
     }
 
+    async fn initialized_two_node_checkpoint_authorities(
+        cluster_name: &'static str,
+        node1: ControlPlaneRaftNodeId,
+        node2: ControlPlaneRaftNodeId,
+        artifact1: &Path,
+        artifact2: &Path,
+    ) -> (ControlPlaneRaftAuthority, ControlPlaneRaftAuthority) {
+        let network = InMemoryRaftNetworkFactory::default();
+        let config = test_raft_config(cluster_name);
+        let log_store1 = ControlPlaneRaftLogStore::empty();
+        let raft1 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node1,
+            config.clone(),
+            network.clone(),
+            log_store1.clone(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        let log_store2 = ControlPlaneRaftLogStore::empty();
+        let raft2 = Raft::<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>::new(
+            node2,
+            config,
+            network.clone(),
+            log_store2.clone(),
+            ControlPlaneRaftStateMachine::empty(),
+        )
+        .await
+        .unwrap();
+        network.register(node1, raft1.clone());
+        network.register(node2, raft2.clone());
+        let authority1 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft1, log_store1, cluster_name)
+                .with_durable_artifact_path(artifact1);
+        let authority2 =
+            ControlPlaneRaftAuthority::new_with_log_store(raft2, log_store2, cluster_name)
+                .with_durable_artifact_path(artifact2);
+
+        authority1
+            .initialize_membership(BTreeMap::from([
+                (node1, BasicNode::new(format!("node-{node1}"))),
+                (node2, BasicNode::new(format!("node-{node2}"))),
+            ]))
+            .await
+            .unwrap();
+        wait_for_local_leader(authority1.raft(), "two-node checkpoint leadership").await;
+        wait_for_authority_status_matching(
+            &authority1,
+            IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+            "two-node checkpoint leader applies initialization",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
+        let initialized = authority1.status().await.unwrap().applied().unwrap();
+        authority2
+            .wait_for_applied_log_id(
+                initialized,
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+                "two-node checkpoint follower applies initialization",
+            )
+            .await
+            .unwrap();
+
+        (authority1, authority2)
+    }
+
     async fn initialized_three_node_cluster_with_two_voters(
         cluster_name: &'static str,
         node1: ControlPlaneRaftNodeId,
@@ -20290,6 +20640,386 @@ mod tests {
             placement,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn raft_durability_publication_allows_concurrent_responses_before_exclusive_poison() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "control-plane-raft-durability-publication-test",
+                1,
+            )
+            .await
+            .unwrap();
+            let publication = authority.durability_publication().unwrap();
+            let first_publication = publication.clone();
+            let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+            let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+            let first = std::thread::spawn(move || {
+                first_publication.publish(|| {
+                    first_started_tx
+                        .send(())
+                        .expect("first response should report publication start");
+                    release_first_rx
+                        .recv()
+                        .expect("first response should be released");
+                    Ok(())
+                })
+            });
+            first_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first response should acquire a publication permit");
+
+            let second_publication = publication.clone();
+            let (second_finished_tx, second_finished_rx) = std::sync::mpsc::channel();
+            let second = std::thread::spawn(move || {
+                let result = second_publication.publish(|| Ok(()));
+                second_finished_tx
+                    .send(())
+                    .expect("second response should report completion");
+                result
+            });
+            second_finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("an unrelated response must not wait for the first socket write");
+            second
+                .join()
+                .expect("second response worker should exit")
+                .expect("second response should publish");
+
+            let poison_publication = publication.clone();
+            let poisoner = std::thread::spawn(move || {
+                poison_publication.poison("owner-local test durability failure")
+            });
+            let poison_wait_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let poison_requested = publication
+                    .gate
+                    .0
+                    .lock()
+                    .expect("response publication state should lock")
+                    .poison_requested;
+                if poison_requested {
+                    break;
+                }
+                assert!(
+                    Instant::now() < poison_wait_deadline,
+                    "poison publication should become pending"
+                );
+                std::thread::yield_now();
+            }
+            assert!(!publication.is_poisoned());
+            let error = publication
+                .publish(|| Ok(()))
+                .expect_err("a response arriving after poison was requested must be suppressed");
+            assert!(matches!(error, ControlPlaneError::DurabilityFailure { .. }));
+
+            release_first_tx
+                .send(())
+                .expect("first response should resume");
+            first
+                .join()
+                .expect("first response worker should exit")
+                .expect("first response should publish");
+            poisoner
+                .join()
+                .expect("poison publication worker should exit");
+            assert!(publication.is_poisoned());
+            assert!(authority
+                .durability_publication()
+                .unwrap()
+                .ensure_available()
+                .is_err());
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_uncertified_topology_establishment_publishes_before_resolution_and_restarts() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let directory = test_util::tempdir();
+            let artifact_path = directory.path().join("raft.state");
+            let cluster_name = "control-plane-raft-durable-uncertified-topology-test";
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name,
+                1,
+                &artifact_path,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(1)
+                .await
+                .unwrap();
+            authority
+                .wait_for_current_leader(
+                    1,
+                    Duration::from_secs(1),
+                    "durable uncertified topology test leadership",
+                )
+                .await
+                .unwrap();
+            wait_for_authority_status_matching(
+                &authority,
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+                "durable uncertified topology authority becomes serving",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+            let topology = crate::derive_uncertified_initial_control_plane_topology(
+                &[crate::StaticStorageNodeEndpoint::new(
+                    11,
+                    "/tmp/storage-node-11.sock",
+                )],
+                &[7],
+            )
+            .unwrap();
+
+            let epoch = authority
+                .establish_uncertified_initial_control_plane_topology(&topology)
+                .await
+                .unwrap()
+                .expect("empty durable authority should establish the topology");
+            assert!(artifact_path.is_file());
+            assert_eq!(
+                authority
+                    .establish_uncertified_initial_control_plane_topology(&topology)
+                    .await
+                    .unwrap(),
+                None,
+                "an established topology should be an idempotent no-op"
+            );
+            authority.shutdown().await.unwrap();
+
+            let restarted = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                cluster_name,
+                1,
+                &artifact_path,
+            )
+            .await
+            .unwrap();
+            let snapshot = restarted.current_control_plane_snapshot().await.unwrap();
+            assert_eq!(snapshot.cluster_epoch().get(), epoch);
+            assert!(snapshot.node(NodeId::new(11)).is_some());
+            assert!(snapshot.pg(PgId::new(7)).is_some());
+            restarted.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_uncertified_topology_establishment_retries_on_follower_until_leader_publishes() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let directory = test_util::tempdir();
+            let (leader, follower) = initialized_two_node_checkpoint_authorities(
+                "control-plane-raft-uncertified-leader-retry-test",
+                1,
+                2,
+                &directory.path().join("leader.state"),
+                &directory.path().join("follower.state"),
+            )
+            .await;
+            let topology = crate::derive_uncertified_initial_control_plane_topology(
+                &[
+                    crate::StaticStorageNodeEndpoint::new(1, "/tmp/storage-node-1.sock"),
+                    crate::StaticStorageNodeEndpoint::new(2, "/tmp/storage-node-2.sock"),
+                ],
+                &[7],
+            )
+            .unwrap();
+            let follower_submit_errors_before = follower
+                .durability_metric_snapshots()
+                .command
+                .submit_error_total;
+            let follower_establishment =
+                follower.establish_uncertified_initial_control_plane_topology(&topology);
+            let leader_establishment = async {
+                loop {
+                    let submit_errors = follower
+                        .durability_metric_snapshots()
+                        .command
+                        .submit_error_total;
+                    if submit_errors > follower_submit_errors_before {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                leader
+                    .establish_uncertified_initial_control_plane_topology(&topology)
+                    .await
+            };
+
+            let (follower_result, leader_result) =
+                futures_util::future::join(follower_establishment, leader_establishment).await;
+            assert!(leader_result.unwrap().is_some());
+            assert_eq!(
+                follower_result.unwrap(),
+                None,
+                "the follower should retry its routing rejection and observe leader publication"
+            );
+            assert!(
+                follower
+                    .durability_metric_snapshots()
+                    .command
+                    .submit_error_total
+                    > follower_submit_errors_before,
+                "the fixture must observe a real follower submission rejection"
+            );
+            let follower_snapshot = follower.current_control_plane_snapshot().await.unwrap();
+            assert!(follower_snapshot.node(NodeId::new(1)).is_some());
+            assert!(follower_snapshot.node(NodeId::new(2)).is_some());
+            assert!(follower_snapshot.pg(PgId::new(7)).is_some());
+
+            leader.shutdown().await.unwrap();
+            follower.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn follower_existing_topology_waits_for_its_own_checkpoint_when_leader_publication_fails() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let directory = test_util::tempdir();
+            let leader_path = directory.path().join("leader.state");
+            let follower_path = directory.path().join("follower.state");
+            let (leader, follower) = initialized_two_node_checkpoint_authorities(
+                "control-plane-raft-uncertified-follower-checkpoint-test",
+                1,
+                2,
+                &leader_path,
+                &follower_path,
+            )
+            .await;
+            fs::create_dir(&leader_path)
+                .expect("leader checkpoint target should become an invalid directory");
+            let topology = crate::derive_uncertified_initial_control_plane_topology(
+                &[
+                    crate::StaticStorageNodeEndpoint::new(1, "/tmp/storage-node-1.sock"),
+                    crate::StaticStorageNodeEndpoint::new(2, "/tmp/storage-node-2.sock"),
+                ],
+                &[7],
+            )
+            .unwrap();
+            let follower_checkpoint_total_before = follower
+                .durability_metric_snapshots()
+                .checkpoint
+                .store_total;
+            let follower_submit_errors_before = follower
+                .durability_metric_snapshots()
+                .command
+                .submit_error_total;
+            let follower_establishment =
+                follower.establish_uncertified_initial_control_plane_topology(&topology);
+            let leader_establishment = async {
+                loop {
+                    if follower
+                        .durability_metric_snapshots()
+                        .command
+                        .submit_error_total
+                        > follower_submit_errors_before
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                leader
+                    .establish_uncertified_initial_control_plane_topology(&topology)
+                    .await
+            };
+
+            let (follower_result, leader_result) =
+                futures_util::future::join(follower_establishment, leader_establishment).await;
+            assert!(matches!(
+                leader_result.expect_err("leader checkpoint publication must fail"),
+                ControlPlaneError::DurabilityFailure { .. }
+            ));
+            assert_eq!(
+                follower_result.unwrap(),
+                None,
+                "a follower may report observed topology only after its own checkpoint"
+            );
+            assert!(
+                follower
+                    .durability_metric_snapshots()
+                    .checkpoint
+                    .store_total
+                    > follower_checkpoint_total_before,
+                "existing-state observation must publish a follower-local checkpoint"
+            );
+            let artifact =
+                ControlPlaneRaftRestartArtifact::load_durable_artifact(&follower_path).unwrap();
+            let snapshot = artifact.state_machine.inner.snapshot();
+            assert!(snapshot.node(NodeId::new(1)).is_some());
+            assert!(snapshot.node(NodeId::new(2)).is_some());
+            assert!(snapshot.pg(PgId::new(7)).is_some());
+
+            leader.shutdown().await.unwrap();
+            follower.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn durable_uncertified_topology_checkpoint_failure_poisons_response_publication() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let directory = test_util::tempdir();
+            let artifact_path = directory.path().join("raft.state");
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
+                "control-plane-raft-uncertified-checkpoint-failure-test",
+                1,
+                &artifact_path,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(1)
+                .await
+                .unwrap();
+            authority
+                .wait_for_current_leader(
+                    1,
+                    Duration::from_secs(1),
+                    "uncertified checkpoint failure test leadership",
+                )
+                .await
+                .unwrap();
+            wait_for_authority_status_matching(
+                &authority,
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+                "uncertified checkpoint failure authority becomes serving",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+            fs::create_dir(&artifact_path)
+                .expect("checkpoint artifact path should become an invalid directory target");
+            let topology = crate::derive_uncertified_initial_control_plane_topology(
+                &[crate::StaticStorageNodeEndpoint::new(
+                    11,
+                    "/tmp/storage-node-11.sock",
+                )],
+                &[7],
+            )
+            .unwrap();
+
+            let error = authority
+                .establish_uncertified_initial_control_plane_topology(&topology)
+                .await
+                .expect_err("checkpoint failure must suppress the bootstrap result");
+            assert!(matches!(error, ControlPlaneError::DurabilityFailure { .. }));
+            let publication = authority.durability_publication().unwrap();
+            assert!(publication.is_poisoned());
+            let mut response_called = false;
+            let mut response = || {
+                response_called = true;
+                Ok(())
+            };
+            let response_error =
+                ControlPlaneRpcResponsePublication::publish(&publication, &mut response)
+                    .expect_err("a poisoned authority must suppress later response publication");
+            assert!(matches!(
+                response_error,
+                ControlPlaneError::DurabilityFailure { .. }
+            ));
+            assert!(!response_called);
+            authority.shutdown().await.unwrap();
+        });
     }
 
     #[test]

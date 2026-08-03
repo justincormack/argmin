@@ -3101,7 +3101,7 @@ fail_with_matches \
 argmin_uncertified_initial_topology_representation_leaks=$(
     {
         rg -n --color=never \
-            '\binitial_control_plane_bootstrap_command\b|\.bootstrap_initial_cluster_map\(' \
+            '\binitial_control_plane_bootstrap_command\b|\.bootstrap_initial_cluster_map\(|\.prepare_uncertified_initial_control_plane_topology\(|\.resolve_uncertified_initial_control_plane_topology_submission\(|\bUncertifiedInitialControlPlaneTopologySubmission\b|\bestablish_raft_uncertified_initial_topology\b' \
             crates/argmin-s3/src \
             -g '*.rs' \
             || true
@@ -3177,7 +3177,7 @@ uncertified_initial_topology_submission_surface_leaks=$(
         derive = $0
         next
     }
-    /pub struct UncertifiedInitialControlPlaneTopologySubmission[[:space:]]*\{/ {
+    /pub(\(crate\))? struct UncertifiedInitialControlPlaneTopologySubmission[[:space:]]*\{/ {
         if (derive ~ /Clone|PartialEq|Eq/) {
             print FILENAME ":" FNR ":" derive
         }
@@ -3220,6 +3220,94 @@ uncertified_initial_topology_submission_surface_leaks=$(
 fail_with_matches \
     "The uncertified initial-topology submission must remain one-use and opaque across durable publication" \
     "$uncertified_initial_topology_submission_surface_leaks"
+
+public_uncertified_initial_topology_split_apis=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+UncertifiedInitialControlPlaneTopologySubmission|async[[:space:]]+fn[[:space:]]+(prepare_uncertified_initial_control_plane_topology|resolve_uncertified_initial_control_plane_topology_submission)[[:space:]]*\()' \
+        crates/storage/src/control_plane_raft.rs \
+        || true
+)
+fail_with_matches \
+    "Uncertified initial-topology submission and resolution primitives must remain private to storage" \
+    "$public_uncertified_initial_topology_split_apis"
+
+raft_durability_publication_surface_leaks=$(
+    awk '
+    /#\[derive\(/ {
+        derive = $0
+        next
+    }
+    /pub struct ControlPlaneRaftDurabilityPublication[[:space:]]*\{/ {
+        if (derive ~ /Debug|PartialEq|Eq/) {
+            print FILENAME ":" FNR ":" derive
+        }
+        in_publication = 1
+        depth = 0
+    }
+    in_publication {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_publication = 0
+        }
+    }
+    /impl ControlPlaneRaftDurabilityPublication[[:space:]]*\{/ {
+        in_impl = 1
+        depth = 0
+    }
+    in_impl {
+        if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+            method = $0
+            sub(/^.*fn[[:space:]]+/, "", method)
+            sub(/\(.*/, "", method)
+            if (method != "is_poisoned" && method != "ensure_available" && method != "poison") {
+                print FILENAME ":" FNR ":" $0
+            }
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_impl = 0
+        }
+    }
+    {
+        if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+            derive = ""
+        }
+    }
+    ' crates/storage/src/control_plane_raft.rs
+)
+fail_with_matches \
+    "The authority-bound Raft durability publication must remain opaque and expose only admission and poison operations" \
+    "$raft_durability_publication_surface_leaks"
+
+argmin_raft_publication_authority_bypass=$(
+    awk '
+    /struct (ExperimentalRaftControlPlane|ExperimentalRaftPeerDurabilityContext)[[:space:]]*\{/ {
+        in_wrapper = 1
+        depth = 0
+    }
+    in_wrapper {
+        if ($0 ~ /ControlPlaneRaftDurabilityPublication|^[[:space:]]*(durable_)?publication[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_wrapper = 0
+        }
+    }
+    ' crates/argmin-s3/src/main.rs
+)
+fail_with_matches \
+    "Process Raft wrappers must derive durability publication from their retained authority, not accept an independent capability" \
+    "$argmin_raft_publication_authority_bypass"
 
 argmin_static_raft_membership_representation_leaks=$(
     rg -n --color=never \

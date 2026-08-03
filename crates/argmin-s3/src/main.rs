@@ -13,10 +13,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Condvar, Mutex,
-};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::Condvar;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,8 +31,6 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
-#[cfg(test)]
-use storage::control_plane::ControlPlaneRaftOperationErrorKind;
 use storage::control_plane::{
     ensure_control_plane_state_parent_directory, invalidate_authority_clock_restart_checkpoint,
     load_authority_clock_restart_checkpoint, store_authority_clock_restart_checkpoint,
@@ -1716,114 +1715,6 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     }
 }
 
-#[derive(Clone)]
-struct ExperimentalRaftDurabilityPublication {
-    gate: Arc<(Mutex<ExperimentalRaftDurabilityPublicationState>, Condvar)>,
-    poisoned: Arc<AtomicBool>,
-}
-
-#[derive(Default)]
-struct ExperimentalRaftDurabilityPublicationState {
-    active_responses: usize,
-    poison_requested: bool,
-}
-
-struct ExperimentalRaftResponsePublicationPermit<'a> {
-    publication: &'a ExperimentalRaftDurabilityPublication,
-}
-
-impl Drop for ExperimentalRaftResponsePublicationPermit<'_> {
-    fn drop(&mut self) {
-        let (gate, responses_drained) = &*self.publication.gate;
-        let mut state = gate
-            .lock()
-            .expect("experimental OpenRaft response publication mutex poisoned");
-        state.active_responses = state
-            .active_responses
-            .checked_sub(1)
-            .expect("response publication permit count should be positive");
-        if state.active_responses == 0 {
-            responses_drained.notify_all();
-        }
-    }
-}
-
-impl ExperimentalRaftDurabilityPublication {
-    fn new() -> Self {
-        Self {
-            gate: Arc::new((
-                Mutex::new(ExperimentalRaftDurabilityPublicationState::default()),
-                Condvar::new(),
-            )),
-            poisoned: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
-    fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Acquire)
-    }
-
-    fn publish_poison(&self, before_publish: impl FnOnce()) {
-        let (gate, responses_drained) = &*self.gate;
-        let mut state = gate
-            .lock()
-            .expect("experimental OpenRaft response publication mutex poisoned");
-        if state.poison_requested {
-            while !self.poisoned.load(Ordering::Acquire) {
-                state = responses_drained
-                    .wait(state)
-                    .expect("experimental OpenRaft response publication mutex poisoned");
-            }
-            return;
-        }
-        state.poison_requested = true;
-        while state.active_responses != 0 {
-            state = responses_drained
-                .wait(state)
-                .expect("experimental OpenRaft response publication mutex poisoned");
-        }
-        before_publish();
-        self.poisoned.store(true, Ordering::Release);
-        responses_drained.notify_all();
-    }
-
-    fn publish<T>(
-        &self,
-        publish: impl FnOnce() -> Result<T, ControlPlaneError>,
-    ) -> Result<T, ControlPlaneError> {
-        let _permit = self.response_publication_permit()?;
-        publish()
-    }
-
-    fn response_publication_permit(
-        &self,
-    ) -> Result<ExperimentalRaftResponsePublicationPermit<'_>, ControlPlaneError> {
-        let (gate, _) = &*self.gate;
-        let mut state = gate
-            .lock()
-            .expect("experimental OpenRaft response publication mutex poisoned");
-        if state.poison_requested || self.poisoned.load(Ordering::Acquire) {
-            return Err(ControlPlaneError::durability_failure(
-                "experimental OpenRaft durable authority was poisoned before response publication",
-            ));
-        }
-        state.active_responses = state
-            .active_responses
-            .checked_add(1)
-            .expect("response publication permit count overflow");
-        Ok(ExperimentalRaftResponsePublicationPermit { publication: self })
-    }
-}
-
-impl ControlPlaneRpcResponsePublication for ExperimentalRaftDurabilityPublication {
-    fn publish(
-        &self,
-        publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
-    ) -> Result<(), ControlPlaneError> {
-        ExperimentalRaftDurabilityPublication::publish(self, publish)
-    }
-}
-
 // RPC workers clone this wrapper so quorum waits never hold a process-wide
 // authority mutex. Every mutable correctness field remains explicitly shared.
 #[derive(Clone)]
@@ -1836,8 +1727,6 @@ struct ExperimentalRaftControlPlane {
     checkpoint_serving_reads: bool,
     resample_authority_time: bool,
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
-    durable_poison: Arc<Mutex<Option<String>>>,
-    durable_publication: ExperimentalRaftDurabilityPublication,
     #[cfg(test)]
     after_heartbeat_commit_hook: Arc<Mutex<Option<ExperimentalRaftAfterHeartbeatCommitHook>>>,
 }
@@ -1999,29 +1888,15 @@ impl ExperimentalRaftControlPlane {
         Ok((authority_now_ms, Some(authority)))
     }
 
-    fn durable_poison_error(&self) -> Option<ControlPlaneError> {
-        self.durable_poison
-            .lock()
-            .expect("experimental OpenRaft durable poison mutex poisoned")
-            .clone()
-            .map(ControlPlaneError::durability_failure)
-    }
-
     fn ensure_not_durably_poisoned(&self) -> Result<(), ControlPlaneError> {
-        if let Some(error) = self.durable_poison_error() {
-            Err(error)
-        } else {
-            Ok(())
-        }
+        self.authority.durability_publication()?.ensure_available()
     }
 
     fn poison_durable_authority(&self, message: String) {
-        self.durable_publication.publish_poison(|| {
-            *self
-                .durable_poison
-                .lock()
-                .expect("experimental OpenRaft durable poison mutex poisoned") = Some(message);
-        });
+        self.authority
+            .durability_publication()
+            .expect("Raft durability publication should already be initialized")
+            .poison(message);
     }
 
     fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError> {
@@ -2105,25 +1980,6 @@ impl ExperimentalRaftControlPlane {
         self.ensure_not_durably_poisoned()?;
         let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
         self.finish_submitted_raft_command(submitted, checkpoint_after_commit)
-    }
-
-    fn establish_raft_uncertified_initial_topology(
-        &mut self,
-        topology: &storage::UncertifiedInitialControlPlaneTopology,
-    ) -> Result<Option<u64>, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let Some(submitted) = self.block_on(
-            self.authority
-                .prepare_uncertified_initial_control_plane_topology(topology),
-        )?
-        else {
-            return Ok(None);
-        };
-        self.checkpoint_committed_raft_command()?;
-        self.block_on(
-            self.authority
-                .resolve_uncertified_initial_control_plane_topology_submission(submitted),
-        )
     }
 
     fn finish_submitted_raft_command(
@@ -2972,7 +2828,6 @@ fn bind_experimental_raft_peer_listener_with_policy(
 struct ExperimentalRaftPeerDurabilityContext {
     artifact_path: Option<Arc<PathBuf>>,
     checkpoint_lock: Arc<Mutex<()>>,
-    publication: ExperimentalRaftDurabilityPublication,
 }
 
 #[derive(Clone)]
@@ -2984,7 +2839,10 @@ struct ExperimentalRaftPeerServerDurability {
 
 impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurability {
     fn is_poisoned(&self) -> bool {
-        self.context.publication.is_poisoned()
+        self.authority
+            .durability_publication()
+            .expect("Raft durability publication should already be initialized")
+            .is_poisoned()
     }
 
     fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
@@ -3004,7 +2862,10 @@ impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurabili
             Some(&self.context.checkpoint_lock),
         );
         if result.is_err() {
-            self.context.publication.publish_poison(|| {});
+            self.authority
+                .durability_publication()
+                .expect("Raft durability publication should already be initialized")
+                .poison("control-plane Raft snapshot response checkpoint publication failed");
         }
         result
     }
@@ -3013,7 +2874,8 @@ impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurabili
         &self,
         publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
     ) -> Result<(), ControlPlaneError> {
-        self.context.publication.publish(publish)
+        let publication = self.authority.durability_publication()?;
+        ControlPlaneRpcResponsePublication::publish(&publication, publish)
     }
 }
 
@@ -3174,7 +3036,11 @@ fn spawn_experimental_raft_peer_checkpoint_loop(
     thread::spawn(move || {
         let mut tracker = ExperimentalRaftPeerCheckpointTracker::new(policy);
         loop {
-            if durability.publication.is_poisoned() {
+            if authority
+                .durability_publication()
+                .expect("Raft durability publication should already be initialized")
+                .is_poisoned()
+            {
                 return;
             }
             if let Err(error) = checkpoint_experimental_raft_peer_wal_if_due(
@@ -3184,7 +3050,7 @@ fn spawn_experimental_raft_peer_checkpoint_loop(
                 &mut tracker,
                 Instant::now(),
             ) {
-                publish_experimental_raft_checkpoint_monitor_poison(&durability);
+                publish_experimental_raft_checkpoint_monitor_poison(&authority);
                 eprintln!(
                     "experimental OpenRaft control-plane bounded peer WAL checkpoint failed; exiting to avoid serving after durability failure: {error}"
                 );
@@ -3195,10 +3061,11 @@ fn spawn_experimental_raft_peer_checkpoint_loop(
     })
 }
 
-fn publish_experimental_raft_checkpoint_monitor_poison(
-    durability: &ExperimentalRaftPeerDurabilityContext,
-) {
-    durability.publication.publish_poison(|| {});
+fn publish_experimental_raft_checkpoint_monitor_poison(authority: &ControlPlaneRaftAuthority) {
+    authority
+        .durability_publication()
+        .expect("Raft durability publication should already be initialized")
+        .poison("control-plane Raft checkpoint monitor observed a durability failure");
 }
 
 fn spawn_experimental_raft_peer_listener_loop(
@@ -3451,14 +3318,16 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
                 eprintln!("{error}");
                 std::process::exit(1);
             });
-    let durable_publication = ExperimentalRaftDurabilityPublication::new();
+    let durable_publication = authority.durability_publication().unwrap_or_else(|error| {
+        eprintln!("failed to initialize control-plane Raft durability publication: {error}");
+        std::process::exit(1);
+    });
     let multi_node_raft_peer_mode = raft_peer_policy
         .as_ref()
         .is_some_and(|policy| policy.peers().len() > 1);
     let raft_peer_durability = ExperimentalRaftPeerDurabilityContext {
         artifact_path: Some(Arc::clone(&durable_artifact_path)),
         checkpoint_lock: Arc::clone(&durable_checkpoint_lock),
-        publication: durable_publication.clone(),
     };
     let raft_peer_server_durability: Arc<dyn ControlPlaneRaftPeerServerDurability> =
         Arc::new(ExperimentalRaftPeerServerDurability {
@@ -3688,17 +3557,16 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         checkpoint_serving_reads: multi_node_raft_peer_mode,
         resample_authority_time: true,
         authority_clock: Some(Arc::clone(&authority_clock)),
-        durable_poison: Arc::new(Mutex::new(None)),
-        durable_publication: durable_publication.clone(),
         #[cfg(test)]
         after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
     };
     if config.static_initial_cluster_map.is_none() {
-        wait_for_initial_experimental_raft_control_plane(&mut control_plane, config)
-            .unwrap_or_else(|error| {
+        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
+            |error| {
                 eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
                 std::process::exit(1);
-            });
+            },
+        );
     }
     let listeners = bind_configured_control_plane_rpc_listeners(
         &config.control_plane_rpc_listeners,
@@ -3976,7 +3844,12 @@ fn bootstrap_empty_experimental_raft_control_plane(
     }
     let topology = uncertified_initial_control_plane_topology(config)
         .map_err(storage::StaticStorageTopologyError::into_control_plane_error)?;
-    let Some(epoch) = authority.establish_raft_uncertified_initial_topology(&topology)? else {
+    let Some(epoch) = authority.block_on(
+        authority
+            .authority
+            .establish_uncertified_initial_control_plane_topology(&topology),
+    )?
+    else {
         return Ok(());
     };
     process_info!(
@@ -3986,36 +3859,6 @@ fn bootstrap_empty_experimental_raft_control_plane(
         epoch
     );
     Ok(())
-}
-
-fn wait_for_initial_experimental_raft_control_plane(
-    authority: &mut ExperimentalRaftControlPlane,
-    config: &ServerConfig,
-) -> Result<(), ControlPlaneError> {
-    wait_for_initial_experimental_raft_control_plane_with(
-        || bootstrap_empty_experimental_raft_control_plane(authority, config),
-        || thread::sleep(Duration::from_millis(100)),
-    )
-}
-
-fn wait_for_initial_experimental_raft_control_plane_with(
-    mut bootstrap: impl FnMut() -> Result<(), ControlPlaneError>,
-    mut wait: impl FnMut(),
-) -> Result<(), ControlPlaneError> {
-    loop {
-        match bootstrap() {
-            Ok(()) => return Ok(()),
-            Err(error) if error.is_control_plane_leader_routing_rejection() => {
-                // Every voter keeps its peer endpoint available while waiting.
-                // A transient election or quorum gap between leadership
-                // observation and command admission must not terminate the
-                // process; the serving leader will bootstrap and followers
-                // will observe that applied state on a later iteration.
-            }
-            Err(error) => return Err(error),
-        }
-        wait();
-    }
 }
 
 fn uncertified_initial_control_plane_topology(
@@ -7311,6 +7154,7 @@ mod tests {
         runtime: tokio::runtime::Runtime,
         authority: Arc<ControlPlaneRaftAuthority>,
         control_plane: ExperimentalRaftControlPlane,
+        _owned_state_dir: Option<test_util::TempDir>,
     }
 
     impl ExperimentalRaftTestHarness {
@@ -7346,6 +7190,8 @@ mod tests {
     }
 
     fn experimental_raft_test_harness(name: &str) -> ExperimentalRaftTestHarness {
+        let state_dir = test_util::tempdir();
+        let artifact_path = state_dir.path().join("control-plane-raft.state");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -7353,10 +7199,13 @@ mod tests {
         let handle = runtime.handle().clone();
         let authority = runtime.block_on(async {
             let cluster_name = format!("argmin-s3-experimental-raft-{name}-{}", std::process::id());
-            let authority =
-                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1)
-                    .await
-                    .expect("experimental raft authority should initialize");
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory_with_checkpoint_for_test(
+                cluster_name,
+                1,
+                &artifact_path,
+            )
+            .await
+            .expect("experimental raft authority should initialize");
             authority
                 .initialize_single_node_membership(1)
                 .await
@@ -7387,91 +7236,14 @@ mod tests {
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: Arc::new(Mutex::new(None)),
-            durable_publication: ExperimentalRaftDurabilityPublication::new(),
             after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         ExperimentalRaftTestHarness {
             runtime,
             authority,
             control_plane,
+            _owned_state_dir: Some(state_dir),
         }
-    }
-
-    #[test]
-    fn durability_publication_allows_concurrent_responses_before_exclusive_poison() {
-        let publication = ExperimentalRaftDurabilityPublication::new();
-        let first_publication = publication.clone();
-        let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
-        let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
-        let first = thread::spawn(move || {
-            first_publication.publish(|| {
-                first_started_tx
-                    .send(())
-                    .expect("first response should report publication start");
-                release_first_rx
-                    .recv()
-                    .expect("first response should be released");
-                Ok(())
-            })
-        });
-        first_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("first response should acquire a publication permit");
-
-        let second_publication = publication.clone();
-        let (second_finished_tx, second_finished_rx) = std::sync::mpsc::channel();
-        let second = thread::spawn(move || {
-            let result = second_publication.publish(|| Ok(()));
-            second_finished_tx
-                .send(())
-                .expect("second response should report completion");
-            result
-        });
-        second_finished_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("an unrelated response must not wait for the first socket write");
-        second
-            .join()
-            .expect("second response worker should exit")
-            .expect("second response should publish");
-
-        let poison_publication = publication.clone();
-        let poisoner = thread::spawn(move || poison_publication.publish_poison(|| {}));
-        let poison_wait_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let poison_requested = publication
-                .gate
-                .0
-                .lock()
-                .expect("response publication state should lock")
-                .poison_requested;
-            if poison_requested {
-                break;
-            }
-            assert!(
-                Instant::now() < poison_wait_deadline,
-                "poison publication should become pending"
-            );
-            thread::yield_now();
-        }
-        assert!(!publication.is_poisoned());
-        let error = publication
-            .publish(|| Ok(()))
-            .expect_err("a response arriving after poison was requested must be suppressed");
-        assert!(matches!(error, ControlPlaneError::DurabilityFailure { .. }));
-
-        release_first_tx
-            .send(())
-            .expect("first response should resume");
-        first
-            .join()
-            .expect("first response worker should exit")
-            .expect("first response should publish");
-        poisoner
-            .join()
-            .expect("poison publication worker should exit");
-        assert!(publication.is_poisoned());
     }
 
     #[test]
@@ -7479,7 +7251,10 @@ mod tests {
         let harness = experimental_raft_test_harness("cloned-response-poison");
         let in_flight = harness.control_plane.clone();
         let poisoner = harness.control_plane.clone();
-        let publication = in_flight.durable_publication.clone();
+        let publication = in_flight
+            .authority
+            .durability_publication()
+            .expect("test authority durability publication should initialize");
         let published = Arc::new(AtomicBool::new(false));
         let worker_published = Arc::clone(&published);
         let (admitted_tx, admitted_rx) = std::sync::mpsc::channel();
@@ -7494,10 +7269,11 @@ mod tests {
             resume_rx
                 .recv()
                 .expect("in-flight clone should be released after poison");
-            publication.publish(|| {
+            let mut publish = || {
                 worker_published.store(true, Ordering::Release);
                 Ok(())
-            })
+            };
+            ControlPlaneRpcResponsePublication::publish(&publication, &mut publish)
         });
         admitted_rx
             .recv_timeout(Duration::from_secs(1))
@@ -7647,14 +7423,13 @@ mod tests {
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: Arc::new(Mutex::new(None)),
-            durable_publication: ExperimentalRaftDurabilityPublication::new(),
             after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         ExperimentalRaftTestHarness {
             runtime,
             authority,
             control_plane,
+            _owned_state_dir: None,
         }
     }
 
@@ -7682,8 +7457,6 @@ mod tests {
             checkpoint_serving_reads: false,
             resample_authority_time: false,
             authority_clock: None,
-            durable_poison: Arc::new(Mutex::new(None)),
-            durable_publication: ExperimentalRaftDurabilityPublication::new(),
             after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
         };
         spawn_control_plane_test_rpc_server(
@@ -7843,105 +7616,6 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_checkpoint_failure_poisons_durable_authority() {
-        let state_dir = short_unix_socket_test_dir("experimental-raft-checkpoint-poison");
-        let _ = fs::remove_dir_all(&state_dir);
-        fs::create_dir_all(&state_dir).unwrap();
-        let invalid_checkpoint_path = state_dir.join("checkpoint.state");
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime should build");
-        let handle = runtime.handle().clone();
-        let authority = runtime.block_on(async {
-            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                format!(
-                    "argmin-s3-experimental-raft-checkpoint-poison-{}",
-                    std::process::id()
-                ),
-                1,
-                &invalid_checkpoint_path,
-            )
-            .await
-            .expect("durable experimental raft authority should initialize");
-            authority
-                .initialize_single_node_membership(1)
-                .await
-                .expect("single-node raft membership should initialize");
-            authority
-                .wait_for_current_leader(
-                    1,
-                    Duration::from_secs(1),
-                    "checkpoint poison test leadership",
-                )
-                .await
-                .expect("single-node raft should become leader");
-            wait_for_experimental_raft_local_authority_serving(
-                &authority,
-                Duration::from_secs(1),
-                "checkpoint poison test committed membership",
-            )
-            .await
-            .expect("single-node raft should apply committed membership");
-            Arc::new(authority)
-        });
-        fs::create_dir(&invalid_checkpoint_path)
-            .expect("checkpoint artifact path should become an invalid directory target");
-        let mut control_plane = ExperimentalRaftControlPlane {
-            runtime: handle,
-            authority: Arc::clone(&authority),
-            durable_artifact_path: Some(Arc::new(invalid_checkpoint_path)),
-            durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
-            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
-            checkpoint_serving_reads: false,
-            resample_authority_time: false,
-            authority_clock: None,
-            durable_poison: Arc::new(Mutex::new(None)),
-            durable_publication: ExperimentalRaftDurabilityPublication::new(),
-            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
-        };
-        let mut config = test_server_config();
-        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
-            node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
-        }];
-        config.storage_pg_ids = vec![0];
-
-        let err = bootstrap_empty_experimental_raft_control_plane(&mut control_plane, &config)
-            .expect_err("checkpoint failure should reject the bootstrap response");
-        assert!(matches!(err, ControlPlaneError::DurabilityFailure { .. }));
-        assert!(control_plane
-            .durable_poison
-            .lock()
-            .expect("durable poison mutex should not be poisoned")
-            .is_some());
-        assert!(control_plane.durable_publication.is_poisoned());
-
-        let runtime_map_err = ControlPlaneRuntimeMapSource::runtime_map_snapshot(
-            &control_plane,
-            storage::clock::current_time_millis(),
-        )
-        .expect_err("poisoned durable authority should reject runtime-map service");
-        assert!(matches!(
-            runtime_map_err,
-            ControlPlaneError::DurabilityFailure { .. }
-        ));
-
-        let admin_err = control_plane
-            .set_pg_acting_set(PgId::new(0), vec![NodeId::new(1)])
-            .expect_err("poisoned durable authority should reject admin mutation");
-        assert!(matches!(
-            admin_err,
-            ControlPlaneError::DurabilityFailure { .. }
-        ));
-
-        runtime
-            .block_on(authority.shutdown())
-            .expect("durable experimental raft authority should shut down");
-    }
-
-    #[test]
     fn experimental_raft_control_plane_bootstrap_does_not_rewrite_existing_state() {
         let mut harness = experimental_raft_test_harness("process-bootstrap-idempotence-test");
         let mut config = test_server_config();
@@ -7979,59 +7653,6 @@ mod tests {
         assert!(retried_snapshot.pg(PgId::new(1)).is_none());
 
         harness.shutdown();
-    }
-
-    #[test]
-    fn experimental_raft_control_plane_bootstrap_retries_transient_quorum_loss() {
-        let mut attempts = 0_u8;
-        let mut waits = 0_u8;
-
-        wait_for_initial_experimental_raft_control_plane_with(
-            || {
-                attempts += 1;
-                if attempts == 1 {
-                    Err(ControlPlaneError::OpenRaftOperation {
-                        kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
-                        message: "command-authority read-index failed".to_owned(),
-                    })
-                } else {
-                    Ok(())
-                }
-            },
-            || waits += 1,
-        )
-        .expect("bootstrap should retry a transient leader-routing failure");
-
-        assert_eq!(attempts, 2);
-        assert_eq!(waits, 1);
-    }
-
-    #[test]
-    fn experimental_raft_control_plane_bootstrap_does_not_retry_fatal_raft_failure() {
-        let mut attempts = 0_u8;
-        let mut waits = 0_u8;
-
-        let error = wait_for_initial_experimental_raft_control_plane_with(
-            || {
-                attempts += 1;
-                Err(ControlPlaneError::OpenRaftOperation {
-                    kind: ControlPlaneRaftOperationErrorKind::Fatal,
-                    message: "durable log store failed".to_owned(),
-                })
-            },
-            || waits += 1,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            ControlPlaneError::OpenRaftOperation {
-                kind: ControlPlaneRaftOperationErrorKind::Fatal,
-                ..
-            }
-        ));
-        assert_eq!(attempts, 1);
-        assert_eq!(waits, 0);
     }
 
     #[test]
@@ -8464,7 +8085,6 @@ mod tests {
                 .durable_checkpoint_lock
                 .clone()
                 .expect("durable test authority should retain a checkpoint lock"),
-            publication: harness.control_plane.durable_publication.clone(),
         };
         let mut monitor_tracker = ExperimentalRaftPeerCheckpointTracker::default();
         let peering_monitor_started_at = Instant::now();
@@ -10157,11 +9777,9 @@ mod tests {
             ControlPlaneRaftPeerTransportLimits::default(),
         );
         let checkpoint_lock = Arc::new(Mutex::new(()));
-        let publication = ExperimentalRaftDurabilityPublication::new();
         let durability_context = ExperimentalRaftPeerDurabilityContext {
             artifact_path: Some(Arc::new(state_path.clone())),
             checkpoint_lock,
-            publication,
         };
         let server_policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
             .expect("test peer server policy should build")
@@ -10404,14 +10022,12 @@ mod tests {
                 .expect("stepped-down authority should have a persisted vote");
             (Arc::new(authority), initial_vote)
         });
-        let publication = ExperimentalRaftDurabilityPublication::new();
         let checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
             runtime.handle().clone(),
             Arc::clone(&authority),
             ExperimentalRaftPeerDurabilityContext {
                 artifact_path: Some(Arc::new(state_path.clone())),
                 checkpoint_lock: Arc::new(Mutex::new(())),
-                publication: publication.clone(),
             },
             ExperimentalRaftPeerCheckpointPolicy {
                 max_wal_suffix_bytes: u64::MAX,
@@ -10469,7 +10085,10 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        publication.publish_poison(|| {});
+        authority
+            .durability_publication()
+            .expect("test authority durability publication should initialize")
+            .poison("test checkpoint observer shutdown");
         checkpoint_loop
             .join()
             .expect("checkpoint observer should stop after poison gate closes");

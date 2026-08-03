@@ -1435,17 +1435,19 @@ addresses are not used as identifiers. The same token binds captured restart che
 issuing authority. Another authority rejects either capability before inspecting its outcome or
 local state, and the process cannot inspect or replace the Raft result. The existing
 process-hosted wrapper still performs its required durable response publication while holding that
-value between the two owner operations; moving that wrapper remains a later part of item 4.
+value between the two owner operations; the thirty-fourth bounded slice removes that split-phase
+surface.
 Owner-local tests pin the unchanged legacy command shape, invalid endpoint/PG rejection,
 no-node no-op, single-authority durability and idempotence, successful Raft submission,
 concurrent-success rejection before versus acceptance after initialization, and deterministic
 two-authority crossing rejection. Process tests retain
 startup composition and durable-publication failure behavior. The repository boundary check
 rejects rebuilding the uncertified command or node/PG representations in the process bootstrap
-functions and rejects expanding the opaque topology beyond its logical counts. The older
-process-hosted `ExperimentalRaftControlPlane` wrapper, residual certified-static administration,
-recovery endpoint and credential/transport assembly, transport bootstrap, and the process-hosted
-authority implementation remain pending parts of item 4.
+functions and rejects expanding the opaque topology beyond its logical counts. The residual
+certified-static administration and uncertified split-phase publication are completed by the
+thirty-third and thirty-fourth slices respectively. Recovery endpoint and credential/transport
+assembly, transport bootstrap, and the process-hosted authority implementation remain pending
+parts of item 4.
 
 The thirty-second bounded slice completes the storage-node TLS-profile containment gate.
 `argmin-s3` retains manifest/file ownership and supplies only resolved socket addresses, TLS
@@ -1479,6 +1481,34 @@ publication between its opaque prepare and resolution operations, so moving that
 coupled to moving its durability publisher. Recovery endpoint and credential/transport assembly,
 control-plane/Raft transport bootstrap, and the process-hosted control-plane authority remain
 separate item 12 work.
+
+The thirty-fourth bounded slice contains uncertified initial-topology submission, durable
+publication, and resolution in one storage-owned authority operation. Each Raft authority now
+owns exactly one opaque durability-publication domain; callers can clone its capability for RPC
+response admission and poison propagation but cannot construct a second domain. Process control
+plane and peer-durability wrappers retain only their authority and derive its publication domain
+at each use, so they cannot combine one authority with another authority's capability. The
+operation owns empty-state observation, leader-routing retries, command
+submission, durable restart-checkpoint publication, concurrent-result classification, and logical
+epoch resolution. It publishes no successful result until the committed command is present in a
+restartable checkpoint. Already-visible topology is likewise successful only after the observing
+authority has published its own local restart checkpoint; replicated apply visibility is not a
+durable-publication proof. A checkpoint failure retains its storage diagnostic, atomically closes
+response admission, waits for already admitted responses to drain, and leaves every clone
+poisoned. The former public split-phase submission value and prepare/resolve methods are now
+crate-private, and the process supplies only the opaque topology before logging its logical counts
+and established epoch. Owner-local tests pin concurrent response admission versus exclusive
+poison, one authority-wide poison domain, durable bootstrap restart recovery, idempotence, a real
+follower-routing rejection followed by leader publication, follower-local checkpoint publication
+when the leader's publication fails, checkpoint-failure poisoning, and the existing
+concurrent-bootstrap classification. Process tests
+retain only startup/runtime-map composition and use a storage-provided test authority with an
+explicit checkpoint target. The boundary check rejects process use or public re-exposure of the
+split-phase APIs and constrains the durability-publication capability to its opaque admission and
+poison surface. It also rejects storing an independently supplied publication capability in
+either process wrapper. Recovery endpoint and credential/transport assembly, control-plane/Raft transport
+bootstrap, and the remaining process-hosted control-plane authority implementation remain item 12
+work.
 
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
@@ -1776,9 +1806,10 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     The environment-only uncertified initial-map path is now contained behind an opaque
     storage-owned topology and authority operations. The duplicate process-owned certified-static
     bootstrap, snapshot validation, and rejection classification are removed; certified startup
-    now uses only the authority-owned establishment operation. The remaining work is to contain
-    the process-hosted uncertified bootstrap wrapper together with its durability publisher,
-    recovery endpoint and credential/transport assembly, transport bootstrap, and the
+    now uses only the authority-owned establishment operation. Uncertified submission, durable
+    checkpoint publication, leader retry, and resolution are likewise one storage-owned operation
+    using the authority's single opaque response-publication and poison domain. The remaining work
+    is recovery endpoint and credential/transport assembly, transport bootstrap, and the
     process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
