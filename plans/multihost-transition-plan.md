@@ -12497,15 +12497,20 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   to reduced or volatile profiles: the gate requires a release build, 116 PGs,
   256 retained route advances, at least eight one-MiB objects, at least three
   authority failover/restart cycles, persistent storage, and at least five
-  minutes of subsequent steady traffic. After the functional failure cycles
-  and storage restart, the harness snapshots/purges, transfers leadership to
-  each authority to capture its process-local baseline, runs repeated S3
-  GET/HEAD/List verification while ordinary storage heartbeats continue, then
+  minutes of measured outage/rejoin and subsequent steady traffic. Before the
+  failure cycles, the harness snapshots/purges and transfers leadership to
+  each authority to capture its process-local baseline. It then runs the whole-
+  host outage/rejoin cycles, continues repeated S3 GET/HEAD/List verification
+  while ordinary storage heartbeats run until the measured deadline, and
   transfers leadership to every authority again for final counters. Per
   authority it requires combined checkpoint and WAL deltas below 1 MiB/s, zero
   new checkpoint/WAL/response-write errors, an empty durability queue, maximum
   checkpoint store/WAL fsync/RPC operation latency below fixed release bounds,
   a post-purge artifact no larger than 1 MiB, and a WAL no larger than 64 MiB.
+  Process-local counters are closed and accumulated immediately before each
+  planned authority restart, then accounting resumes from zero for the new
+  process generation. This includes outage/rejoin I/O without treating a
+  deliberate process restart as a monotonic-counter regression.
   It also rejects any internal authentication failure recorded by authority,
   storage, or frontend logs. Raw baseline/final diagnostics and a compact
   release summary are retained with failure artifacts.
@@ -12533,15 +12538,19 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   SSH-supervised whole Argmin service outage on a still-manageable host; power,
   kernel, switch-port, and complete network-partition testing remain distinct
   gates and become easier to automate with a fourth supervision/client host.
-- The first reference-host functional pass of that composed gate completed on
-  three persistent-storage hosts with 116 PGs, 256 retained-route advances,
-  eight one-MiB objects, and three outage/rejoin cycles. Every host was stopped
-  in turn and both surviving frontends completed GET, HEAD, and List before
-  rejoin; the final map served all 116 PGs at epoch 510. Closing the complete
-  quantitative gate still requires running the same composed interval with the
-  sustained release thresholds enabled. Storage RPC connection/admission
-  pressure also needs a bounded runtime counter before it can become a
-  quantitative assertion rather than a log heuristic.
+- The composed quantitative gate passed on three persistent-storage hosts on
+  2026-08-03 with 116 PGs, 256 retained-route advances, eight initial one-MiB
+  objects, three whole-host outage/rejoin cycles, and ten sustained cross-
+  frontend GET/HEAD/List rounds. Every host was stopped in turn and both
+  surviving frontends completed retained reads before rejoin. Across the
+  process-generation boundaries, the three authorities wrote 9,976-12,624
+  durable bytes/s; restart artifacts were 211,651 bytes and sampled WALs were
+  3,451-220,468 bytes. Maximum checkpoint-store, WAL file-sync, and control-
+  plane RPC operation latency were 55.4 ms, 158.2 ms, and 175.9 ms
+  respectively, with no checkpoint, compaction, WAL, response-write, queue, or
+  authentication failure. Storage RPC connection/admission pressure still
+  needs a bounded runtime counter before it can become a quantitative
+  assertion rather than a log heuristic.
 - Frontend process availability is now independent of full-cluster PG
   convergence. Dynamic startup constructs route handles, starts refresh and
   background workers, and binds the S3 listener from the current committed map

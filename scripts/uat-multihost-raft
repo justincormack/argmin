@@ -337,6 +337,11 @@ declare -a quantitative_baseline_checkpoint_compaction_errors=(0 0 0)
 declare -a quantitative_baseline_wal_errors=(0 0 0)
 declare -a quantitative_baseline_rpc_write_errors=(0 0 0)
 declare -a quantitative_baseline_seconds=(0 0 0)
+declare -a quantitative_checkpoint_bytes=(0 0 0)
+declare -a quantitative_wal_bytes=(0 0 0)
+declare -a quantitative_checkpoint_store_us_max=(0 0 0)
+declare -a quantitative_wal_file_sync_us_max=(0 0 0)
+declare -a quantitative_rpc_operation_us_max=(0 0 0)
 
 collect_artifacts() {
     local index host host_dir unit
@@ -1287,19 +1292,20 @@ capture_quantitative_baseline() {
     quantitative_baseline_seconds[index]="$SECONDS"
 }
 
-capture_quantitative_result() {
+accumulate_quantitative_generation() {
     local number="$1"
+    local label="$2"
     local index=$((number - 1))
     local diagnostics checkpoint_line wal_line
     local checkpoint_bytes wal_bytes checkpoint_errors checkpoint_compaction_errors
     local wal_errors rpc_write_errors
-    local checkpoint_delta wal_delta durable_bytes elapsed_seconds durable_bytes_per_second
-    local wal_queue_depth checkpoint_store_us_max wal_file_sync_us_max rpc_operation_us_max
-    local artifact_bytes wal_file_bytes summary
+    local checkpoint_delta wal_delta
+    local checkpoint_store_us_max wal_file_sync_us_max rpc_operation_us_max
 
     diagnostics="$(frontend_read_command control-plane-runtime-map-diagnostics \
         "$remote_run/unused.sock")"
-    printf '%s\n' "$diagnostics" >"$metrics_dir/control-$number-final.txt"
+    printf '%s\n' "$diagnostics" \
+        >"$metrics_dir/control-$number-generation-${unit_generations[$index]}-$label.txt"
     checkpoint_line="control_plane_raft_checkpoint"
     wal_line="control_plane_raft_wal"
     checkpoint_bytes="$(diagnostic_value "$diagnostics" "$checkpoint_line" bytes_total)"
@@ -1327,6 +1333,59 @@ capture_quantitative_result() {
 
     checkpoint_delta=$((checkpoint_bytes - quantitative_baseline_checkpoint_bytes[index]))
     wal_delta=$((wal_bytes - quantitative_baseline_wal_bytes[index]))
+    quantitative_checkpoint_bytes[index]=$((quantitative_checkpoint_bytes[index] + checkpoint_delta))
+    quantitative_wal_bytes[index]=$((quantitative_wal_bytes[index] + wal_delta))
+    checkpoint_store_us_max="$(diagnostic_value \
+        "$diagnostics" "$checkpoint_line" store_us_max)"
+    wal_file_sync_us_max="$(diagnostic_value \
+        "$diagnostics" "$wal_line" file_sync_us_max)"
+    rpc_operation_us_max="$(diagnostic_max \
+        "$diagnostics" control_plane_rpc operation_us_max)"
+    if ((checkpoint_store_us_max > quantitative_checkpoint_store_us_max[index])); then
+        quantitative_checkpoint_store_us_max[index]="$checkpoint_store_us_max"
+    fi
+    if ((wal_file_sync_us_max > quantitative_wal_file_sync_us_max[index])); then
+        quantitative_wal_file_sync_us_max[index]="$wal_file_sync_us_max"
+    fi
+    if ((rpc_operation_us_max > quantitative_rpc_operation_us_max[index])); then
+        quantitative_rpc_operation_us_max[index]="$rpc_operation_us_max"
+    fi
+    ((checkpoint_store_us_max <= max_checkpoint_store_us)) ||
+        die "control-$number checkpoint store latency $checkpoint_store_us_max us exceeds $max_checkpoint_store_us us"
+    ((wal_file_sync_us_max <= max_wal_file_sync_us)) ||
+        die "control-$number WAL file-sync latency $wal_file_sync_us_max us exceeds $max_wal_file_sync_us us"
+    ((rpc_operation_us_max <= max_rpc_operation_us)) ||
+        die "control-$number RPC operation latency $rpc_operation_us_max us exceeds $max_rpc_operation_us us"
+}
+
+reset_quantitative_generation_baseline() {
+    local number="$1"
+    local index=$((number - 1))
+
+    quantitative_baseline_checkpoint_bytes[index]=0
+    quantitative_baseline_wal_bytes[index]=0
+    quantitative_baseline_checkpoint_errors[index]=0
+    quantitative_baseline_checkpoint_compaction_errors[index]=0
+    quantitative_baseline_wal_errors[index]=0
+    quantitative_baseline_rpc_write_errors[index]=0
+}
+
+capture_quantitative_result() {
+    local number="$1"
+    local index=$((number - 1))
+    local diagnostics checkpoint_line wal_line
+    local checkpoint_delta wal_delta durable_bytes elapsed_seconds durable_bytes_per_second
+    local wal_queue_depth checkpoint_store_us_max wal_file_sync_us_max rpc_operation_us_max
+    local artifact_bytes wal_file_bytes summary
+
+    accumulate_quantitative_generation "$number" final
+    diagnostics="$(<"$metrics_dir/control-$number-generation-${unit_generations[$index]}-final.txt")"
+    printf '%s\n' "$diagnostics" >"$metrics_dir/control-$number-final.txt"
+    checkpoint_line="control_plane_raft_checkpoint"
+    wal_line="control_plane_raft_wal"
+
+    checkpoint_delta="${quantitative_checkpoint_bytes[$index]}"
+    wal_delta="${quantitative_wal_bytes[$index]}"
     durable_bytes=$((checkpoint_delta + wal_delta))
     elapsed_seconds=$((SECONDS - quantitative_baseline_seconds[index]))
     ((elapsed_seconds > 0)) || die "control-$number quantitative interval was empty"
@@ -1337,18 +1396,9 @@ capture_quantitative_result() {
     wal_queue_depth="$(diagnostic_value "$diagnostics" "$wal_line" durability_queue_depth)"
     ((wal_queue_depth == 0)) ||
         die "control-$number ended with WAL durability queue depth $wal_queue_depth"
-    checkpoint_store_us_max="$(diagnostic_value \
-        "$diagnostics" "$checkpoint_line" store_us_max)"
-    wal_file_sync_us_max="$(diagnostic_value \
-        "$diagnostics" "$wal_line" file_sync_us_max)"
-    rpc_operation_us_max="$(diagnostic_max \
-        "$diagnostics" control_plane_rpc operation_us_max)"
-    ((checkpoint_store_us_max <= max_checkpoint_store_us)) ||
-        die "control-$number checkpoint store latency $checkpoint_store_us_max us exceeds $max_checkpoint_store_us us"
-    ((wal_file_sync_us_max <= max_wal_file_sync_us)) ||
-        die "control-$number WAL file-sync latency $wal_file_sync_us_max us exceeds $max_wal_file_sync_us us"
-    ((rpc_operation_us_max <= max_rpc_operation_us)) ||
-        die "control-$number RPC operation latency $rpc_operation_us_max us exceeds $max_rpc_operation_us us"
+    checkpoint_store_us_max="${quantitative_checkpoint_store_us_max[$index]}"
+    wal_file_sync_us_max="${quantitative_wal_file_sync_us_max[$index]}"
+    rpc_operation_us_max="${quantitative_rpc_operation_us_max[$index]}"
 
     artifact_bytes="$(remote_exec_quiet "${hosts[$index]}" stat -c %s \
         "$remote_run/state-$number/control.state")"
@@ -1489,7 +1539,14 @@ for ((iteration = 1; iteration <= repeat_count; iteration++)); do
     echo "== host-service outage iteration $iteration: stop frontend, storage, and Raft node $target_raft_node =="
     transfer_leadership_to "$target_number"
 
+    if ((quantitative)); then
+        wait_runtime_map_ready
+        accumulate_quantitative_generation "$target_number" before-restart
+    fi
     stop_host_services "$target_number"
+    if ((quantitative)); then
+        reset_quantitative_generation_baseline "$target_number"
+    fi
     command_process_number="$survivor_number"
     wait_clock_status false "$((transferred_term + 1))"
     [[ "$(status_field "$last_status" blocked_reason)" == "Some(RaftLeadershipChanged)" ]] ||
