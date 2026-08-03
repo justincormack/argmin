@@ -31,6 +31,16 @@ fail_with_matches() {
 
 echo "Storage cluster boundary checks"
 
+storage_test_feature_graph_failure=""
+if ! storage_test_feature_graph_output=$(
+    bash scripts/check-storage-test-feature-graph 2>&1
+); then
+    storage_test_feature_graph_failure=$storage_test_feature_graph_output
+fi
+fail_with_matches \
+    "Workspace normal/build feature graphs must enable storage test support only for the exhaustive reviewed test-only package allowlist" \
+    "$storage_test_feature_graph_failure"
+
 public_node_read_boundary_bypasses=$(
     awk '
     FNR == 1 {

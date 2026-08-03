@@ -13363,6 +13363,7 @@ impl super::StorageCluster {
         );
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_put_object_stream_session<T, E>(
         &self,
         bucket: &BucketName,
@@ -13378,6 +13379,7 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_put_object_stream_session_with_cleanup_deadline<T, E>(
         &self,
         bucket: &BucketName,
@@ -13677,6 +13679,7 @@ impl super::StorageCluster {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn finalize_put_object_stream<T, E>(
         &self,
         bucket: &BucketName,

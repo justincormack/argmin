@@ -1351,8 +1351,6 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let storage_node = coord.storage_node();
-
     let hook_clock = Arc::clone(&clock);
     let hook =
         cluster.test_install_before_stream_put_create_pending_install_hook(Arc::new(move || {
@@ -1392,6 +1390,13 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
 
     clock.set(1_000);
     let fresh_admission = coord.admit_storage_route_for_request().unwrap();
+    let cleanup = coord
+        .retained_stream_upload_cleanup(
+            &fresh_admission,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-stream-create"),
+        )
+        .unwrap();
     let prepared = coord
         .begin_stream_put_with_storage_admission_and_cleanup_deadline(
             &fresh_admission,
@@ -1413,12 +1418,7 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
         .unwrap();
     drop(fresh_admission);
     coord
-        .abort_stream_put_session_with_storage_node(
-            &storage_node,
-            prepared.authorized_write.bucket_typed(),
-            prepared.authorized_write.key_typed(),
-            &prepared.session_id,
-        )
+        .abort_stream_upload_with_retained_cleanup(&cleanup, &prepared.session_id)
         .unwrap();
 }
 
@@ -1959,7 +1959,13 @@ fn stream_put_finalization_expires_inside_command_build() {
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let storage_node = coord.storage_node();
+    let cleanup = coord
+        .retained_stream_upload_cleanup(
+            &admission,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-stream-finalize"),
+        )
+        .unwrap();
     let prepared = coord
         .begin_stream_put_with_storage_admission_and_cleanup_deadline(
             &admission,
@@ -2016,12 +2022,7 @@ fn stream_put_finalization_expires_inside_command_build() {
         .any(|session| session.session_id == prepared.session_id));
     drop(admission);
     coord
-        .abort_stream_put_session_with_storage_node(
-            &storage_node,
-            prepared.authorized_write.bucket_typed(),
-            prepared.authorized_write.key_typed(),
-            &prepared.session_id,
-        )
+        .abort_stream_upload_with_retained_cleanup(&cleanup, &prepared.session_id)
         .unwrap();
 }
 
@@ -8964,10 +8965,15 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
         "UploadPart finalization should not apply an object-PG command before the pre-commit gate"
     );
 
-    install_next_epoch_runtime_map_with_historical_routes(&runtime_handle, &initial, tmp.path());
+    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
+        &runtime_handle,
+        &initial,
+        tmp.path(),
+    );
 
     gate.release();
     let part = finalize_thread.join().unwrap().unwrap();
+    publication_thread.join().unwrap();
     let after_object_pg_proof = initial
         .test_object_pg_metadata_proof(&bucket_name, &object_key)
         .unwrap();
@@ -10879,81 +10885,57 @@ fn streaming_upload_part_pins_runtime_map_after_session_create() {
         })
         .unwrap();
 
-    let storage_node = coord.storage_node_for_request();
     let candidate_tmp = test_util::tempdir();
     let candidate = make_dynamic_runtime_map_candidate(open_test_storage_cluster(
         candidate_tmp.path(),
         &[0, 1],
     ));
+    let publication_thread = Arc::new(Mutex::new(None));
+    let hook_publication_thread = Arc::clone(&publication_thread);
+    let hook_handle = handle.clone();
     let hook_runtime_handle = runtime_handle.clone();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let session = {
-        let _hook_guard =
-            coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
-                bucket: Some(bucket.to_string()),
-                after_loaded: Some(Arc::new(move || {
-                    hook_runtime_handle.install(Arc::clone(&candidate)).unwrap();
-                })),
-                ..BucketWriteHandleTestHooks::default()
+    let _hook_guard = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+        bucket: Some(bucket.to_string()),
+        after_loaded: Some(Arc::new(move || {
+            let publishing_handle = hook_runtime_handle.clone();
+            let publishing_candidate = Arc::clone(&candidate);
+            let thread = thread::spawn(move || {
+                publishing_handle.install(publishing_candidate).unwrap();
             });
-
-        coord
-            .begin_stream_part_with_storage_node(
-                &storage_node,
-                &BeginStreamPartRequest {
-                    upload: multipart_object_request_with_expected_owner(
-                        bucket,
-                        "key",
-                        &upload.upload_id,
-                        test_requester(),
-                        None,
-                    ),
-                    part_number: 1,
-                    policy_context: PutObjectPolicyContext::default(),
-                    sse_customer: None,
-                },
-            )
-            .unwrap()
-    };
+            *hook_publication_thread.lock().unwrap() = Some(thread);
+            hook_handle.test_wait_until_route_publication_is_pending();
+        })),
+        ..BucketWriteHandleTestHooks::default()
+    });
     let data = b"streaming-upload-part-pinned-runtime-map";
-    coord
-        .append_stream_part_data_with_storage_node(
-            &storage_node,
-            &AppendStreamPartRequest {
-                bucket: BucketName::new(bucket).unwrap(),
-                key: ObjectKey::new("key").unwrap(),
-                upload_id: &upload.upload_id,
-                session_id: &session.session_id,
-                part_number: 1,
-                segment_index: 0,
-                data,
-                sse_customer: None,
-            },
-        )
-        .unwrap();
-    let crc64 = checksum::crc64::checksum(data);
-    let part = coord
-        .finalize_stream_part_with_storage_node(
-            &storage_node,
-            FinalizeStreamPartRequest {
-                upload: multipart_object_request_with_expected_owner(
-                    bucket,
-                    "key",
-                    &upload.upload_id,
-                    test_requester(),
-                    None,
-                ),
-                session_id: &session.session_id,
-                part_number: 1,
-                crc64,
-                total_size: data.len() as u64,
-                claimed_checksum: None,
-                computed_checksum: None,
-            },
-        )
+    let part = test_helpers::upload_part(
+        &coord,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                bucket,
+                "key",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            data,
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+    drop(_hook_guard);
+    publication_thread
+        .lock()
+        .unwrap()
+        .take()
+        .expect("UploadPart hook should start route publication")
+        .join()
         .unwrap();
 
     runtime_handle

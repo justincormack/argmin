@@ -1,0 +1,3 @@
+package	server-core	false
+package	s3-tests	true
+allow	s3-tests

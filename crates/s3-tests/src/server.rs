@@ -1,7 +1,6 @@
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use auth::AccountIdentity;
 use rustls::pki_types::pem::PemObject;
@@ -45,7 +44,6 @@ const POOL_SIZE: usize = 4;
 const TEST_PG_COUNT: u32 = 1;
 const TEST_MAX_CONNECTIONS: u32 = 512;
 const TEST_MAX_INFLIGHT_REQUESTS: u32 = 32;
-const SHARD_SCAVENGER_CLEAN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 fn configured_credential(
     access_key_id: &str,
@@ -106,7 +104,6 @@ pub struct TestServer {
     endpoint: String,
     sts_endpoint: Option<String>,
     tls_ca_pem: Option<&'static [u8]>,
-    storage_cluster: Arc<storage::StorageCluster>,
     control_coordinator: server_core::coordinator::Coordinator,
     _temp_dir: test_util::TempDir,
     _server_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -424,7 +421,6 @@ impl TestServer {
             endpoint,
             sts_endpoint,
             tls_ca_pem: (transport == TestServerTransport::Https).then_some(TEST_TLS_CA_CERT_PEM),
-            storage_cluster,
             control_coordinator,
             _temp_dir: temp_dir,
             _server_tasks: server_tasks,
@@ -453,20 +449,6 @@ impl TestServer {
         self.control_coordinator
             .run_lifecycle_sweep_for_test(now_millis)
     }
-
-    pub fn assert_shard_scavenger_clean(&self) {
-        assert_shard_scavenger_clean(&self.storage_cluster, "local test server")
-    }
-
-    pub async fn wait_for_shard_scavenger_clean(&self, timeout: Duration) -> Result<(), String> {
-        wait_for_shard_scavenger_clean(&self.storage_cluster, "local test server", timeout).await
-    }
-
-    pub async fn assert_shard_scavenger_clean_after_async_cleanup(&self, timeout: Duration) {
-        if let Err(message) = self.wait_for_shard_scavenger_clean(timeout).await {
-            panic!("{message}");
-        }
-    }
 }
 
 impl Drop for TestServer {
@@ -475,43 +457,6 @@ impl Drop for TestServer {
             task.abort();
         }
     }
-}
-
-fn assert_shard_scavenger_clean(storage_cluster: &storage::StorageCluster, context: &str) {
-    if let Err(message) = shard_scavenger_clean_check_message(storage_cluster, context) {
-        panic!("{message}");
-    }
-}
-
-async fn wait_for_shard_scavenger_clean(
-    storage_cluster: &storage::StorageCluster,
-    context: &str,
-    timeout: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    storage_cluster.test_wake_reclaim_worker();
-    let mut last_error = match shard_scavenger_clean_check_message(storage_cluster, context) {
-        Ok(()) => return Ok(()),
-        Err(message) => message,
-    };
-    loop {
-        if Instant::now() >= deadline {
-            return Err(last_error);
-        }
-        tokio::time::sleep(SHARD_SCAVENGER_CLEAN_POLL_INTERVAL).await;
-        storage_cluster.test_wake_reclaim_worker();
-        match shard_scavenger_clean_check_message(storage_cluster, context) {
-            Ok(()) => return Ok(()),
-            Err(message) => last_error = message,
-        }
-    }
-}
-
-fn shard_scavenger_clean_check_message(
-    storage_cluster: &storage::StorageCluster,
-    context: &str,
-) -> Result<(), String> {
-    storage_cluster.test_shard_scavenger_clean_check(context)
 }
 
 fn configure_local_tracing() {

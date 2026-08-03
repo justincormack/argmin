@@ -1,0 +1,12 @@
+[package]
+name = "storage"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["test-hooks"]
+test-hooks = []
+
+[lib]
+path = "lib.rs"

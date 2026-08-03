@@ -34,40 +34,6 @@ trait StreamSegmentMutationRoute {
     ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError>;
 }
 
-#[cfg(any(test, feature = "test-utils"))]
-struct RawStreamSegmentMutationRoute<'a> {
-    storage_node: &'a std::sync::Arc<storage::StorageCluster>,
-    bucket: &'a BucketName,
-    key: &'a ObjectKey,
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-impl StreamSegmentMutationRoute for RawStreamSegmentMutationRoute<'_> {
-    #[cfg(not(test))]
-    fn append_segment(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
-        self.storage_node
-            .append_stream_segment(self.bucket, self.key, input)
-    }
-
-    #[cfg(test)]
-    fn append_segment_with_after_prepare(
-        &self,
-        input: StreamSegmentAppendInput<'_>,
-        after_prepare: impl FnMut(),
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
-        self.storage_node
-            .test_append_stream_segment_with_after_prepare(
-                self.bucket,
-                self.key,
-                input,
-                after_prepare,
-            )
-    }
-}
-
 impl StreamSegmentMutationRoute for storage::ActivePutObjectRoute<'_> {
     #[cfg(not(test))]
     fn append_segment(
@@ -633,38 +599,11 @@ impl Coordinator {
         segment_index: u32,
         payload: super::StreamSegmentAppendPayload<'_>,
     ) -> Result<(), ServerError> {
-        self.append_stream_segment_for_storage_node(
-            &self.storage_node(),
-            bucket,
-            key,
-            session_id,
-            segment_index,
-            payload,
-        )
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub(super) fn append_stream_segment_for_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-        segment_index: u32,
-        payload: super::StreamSegmentAppendPayload<'_>,
-    ) -> Result<(), ServerError> {
-        self.append_stream_segment_on_route(
-            &RawStreamSegmentMutationRoute {
-                storage_node,
-                bucket,
-                key,
-            },
-            bucket,
-            key,
-            session_id,
-            segment_index,
-            payload,
-        )
+        let admission = self.admit_storage_route_for_request()?;
+        let route = admission
+            .active_put_object_route(bucket, key)
+            .map_err(super::map_store_error)?;
+        self.append_stream_segment_on_route(&route, bucket, key, session_id, segment_index, payload)
     }
 
     pub(super) fn append_stream_segment_on_admitted_put_route(
@@ -741,71 +680,13 @@ impl Coordinator {
     }
 
     #[cfg(test)]
-    pub(super) fn abort_stream_put_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        self.abort_stream_put_for_storage_node(&self.storage_node(), bucket, key, session_id)
-    }
-
-    pub(super) fn abort_stream_put_for_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        storage_node
-            .abort_stream_upload_session(bucket, key, session_id)
-            .map_err(Self::map_object_pg_action_error)
-    }
-
-    #[cfg(test)]
-    pub(super) fn abort_stream_put_for_cleanup(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        self.abort_stream_put_for_cleanup_with_storage_node(
-            &self.storage_node(),
-            bucket,
-            key,
-            session_id,
-        )
-    }
-
-    pub(super) fn abort_stream_put_for_cleanup_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match self.abort_stream_put_for_storage_node(storage_node, bucket, key, session_id) {
-                Ok(()) => return Ok(()),
-                Err(ServerError::OperationAborted | ServerError::SlowDown)
-                    if Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
-    #[cfg(test)]
     pub fn abort_stream_put(
         &self,
         bucket: &str,
         key: &str,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.abort_stream_put_for(
+        self.abort_stream_put_session(
             &trusted_bucket_name(bucket),
             &trusted_object_key(key),
             session_id,

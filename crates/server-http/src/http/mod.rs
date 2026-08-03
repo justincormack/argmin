@@ -12301,12 +12301,17 @@ mod tests {
         let requester = crate::coordinator::Requester::from_auth(supported)
             .with_request_epoch_seconds(Some(storage::clock::current_time_millis() / 1_000));
         let bucket_name = test_bucket_name(bucket);
+        let object_key = parse_object_key(key).unwrap();
         let upload_id = parse_present_upload_id(upload_id).unwrap();
-        let storage_node = fe.coordinator.storage_node_for_request();
+        let admission = fe.coordinator.admit_storage_route_for_request().unwrap();
+        let cleanup = fe
+            .coordinator
+            .retained_stream_upload_cleanup(&admission, &bucket_name, &object_key)
+            .unwrap();
         let session = fe
             .coordinator
-            .begin_stream_part_with_storage_node(
-                &storage_node,
+            .begin_stream_part_on_admitted_route(
+                &admission,
                 &BeginStreamPartRequest {
                     upload: multipart_object_request(
                         &bucket_name,
@@ -12329,11 +12334,11 @@ mod tests {
                 .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
                 .enumerate()
             {
-                fe.coordinator.append_stream_part_data_with_storage_node(
-                    &storage_node,
+                fe.coordinator.append_stream_part_data_on_admitted_route(
+                    &admission,
                     &crate::coordinator::AppendStreamPartRequest {
-                        bucket: parse_bucket_name(bucket).unwrap(),
-                        key: parse_object_key(key).unwrap(),
+                        bucket: bucket_name.clone(),
+                        key: object_key.clone(),
                         upload_id: &upload_id,
                         session_id: &session.session_id,
                         part_number,
@@ -12350,8 +12355,8 @@ mod tests {
                 ChecksumClaim::from_base64(expected.algorithm(), &encoded)
                     .expect("checksum helper must round-trip through base64")
             });
-            fe.coordinator.finalize_stream_part_with_storage_node(
-                &storage_node,
+            fe.coordinator.finalize_stream_part_with_storage_admission(
+                &admission,
                 FinalizeStreamPartRequest {
                     upload: multipart_object_request(
                         &bucket_name,
@@ -12371,12 +12376,9 @@ mod tests {
             )
         })();
         if result.is_err() {
-            let _ = fe.coordinator.abort_stream_part_session_with_storage_node(
-                &storage_node,
-                &parse_bucket_name(bucket).unwrap(),
-                &parse_object_key(key).unwrap(),
-                &session.session_id,
-            );
+            let _ = fe
+                .coordinator
+                .abort_stream_upload_with_retained_cleanup(&cleanup, &session.session_id);
         }
         result.unwrap()
     }

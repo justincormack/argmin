@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–4 complete; Phase 5 audited, implementation not started
+Status: active — Phases 0–4 complete; Phase 5 in progress
 
 Related plans:
 
@@ -5645,20 +5645,22 @@ The audit found four remaining classes of work:
 
    Raw record constructors, physical mutation methods, generic storage-node
    access, and owner-private format values are not acceptable cross-crate
-   categories. Keep process-level opaque Raft/control-plane test clients and
-   the small S3 test-server lifecycle surface where the test necessarily spans
-   a process or HTTP boundary. Consider hiding the latter behind the owning
-   test-server harness so `s3-tests` need not name storage hooks directly.
+   categories. Keep process-level opaque Raft/control-plane test clients where
+   the test necessarily spans a process boundary. The AWS-facing `s3-tests`
+   harness and its S3/STS wrapper suites must not enable or name storage test
+   hooks; local physical-invariant tests belong with the storage owner rather
+   than behind an S3 harness abstraction.
 
 4. **Feature-graph enforcement and cleanup.** Add a stable CI/boundary check
    which obtains the complete workspace-member set from Cargo metadata and
    examines every member's normal/build feature graph. The classification is
    fail closed: maintain one explicit, reviewed allowlist of test-only packages
    which may enable test support, reject an unclassified workspace member, and
-   reject a stale allowlist entry. The initial hook-enabled allowlist is exactly
-   `s3-tests`, a non-published executable test harness; adding another package
-   requires documenting why it is test-only and why it needs storage-private
-   support. Every non-allowlisted workspace member must prove that neither
+   reject a stale allowlist entry. The initial normal/build allowlist is empty:
+   even non-published AWS-facing harness packages must not inherit private
+   storage support. Adding an exception requires documenting why it is
+   test-only and why it needs storage-private support. Every non-allowlisted
+   workspace member must prove that neither
    `storage/test-hooks` nor `server-core/test-utils` is enabled. Dev-dependency
    edges may enable the features while compiling a package's tests, but do not
    exempt that package's normal/build graph from the check.
@@ -5673,8 +5675,7 @@ Implementation slices:
 1. Inventory every externally consumed storage test-support symbol by owner,
    consumer, category above, and whether it changes durable state. Record the
    clean normal/build feature-graph baseline and the exhaustive workspace
-   package classification, initially allowing only `s3-tests` to enable hooks
-   through normal dependencies.
+   package classification, with an empty hook-enabled allowlist.
 2. Remove the raw/different-path coordinator adapters and make behavioral test
    helpers use admitted production capabilities.
 3. Relocate impossible-state tests and replace necessary cross-crate raw
@@ -5684,6 +5685,34 @@ Implementation slices:
    graph check, update the upgrade/versioning plan's overlapping item, and
    retire only the textual hook checks made structurally redundant by this
    work.
+
+Implementation update (2026-08-03):
+
+- added a fail-closed Cargo feature-graph inventory to the storage boundary
+  checker. It derives every workspace member from Cargo metadata, checks each
+  normal/build graph's resolved package feature sets (including features on
+  the selected root package), rejects stale or publishable exceptions, and
+  currently has an empty hook-enabled allowlist. A miniature Cargo workspace
+  independently pins extraction of both forbidden features when they are
+  enabled through root defaults;
+- removed `storage/test-hooks` from the AWS-facing `s3-tests` harness. Its two
+  unused reclaim/scavenger physical-invariant methods were deleted rather than
+  hidden behind another S3-facing abstraction, so `s3-http-tests`,
+  `s3-local-tests`, and `sts-tests` no longer inherit the feature either;
+- moved the coordinator's streamed PUT and UploadPart test helpers onto one
+  captured `StorageClusterRouteAdmission` spanning session creation, segment
+  append, and finalization, with the same retained cleanup authority captured
+  before the first durable mutation. The raw segment/finalization route
+  implementations and storage-node-specific test adapters were removed, and
+  the underlying unbounded storage entry points are now test-hook gated;
+- moved active test aborts onto the admitted PutObject/UploadPart capability.
+  Expiry regressions now use the retained cleanup capability used by
+  production, rather than directing cleanup through an arbitrary raw
+  `StorageCluster`; and
+- rewrote the UploadPart runtime-map regressions to prove that admitted
+  creation/finalization holds publication until completion, instead of
+  pinning an independently captured raw cluster pointer or synchronously
+  publishing while the admitted operation is paused.
 
 Completion:
 

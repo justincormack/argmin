@@ -137,50 +137,6 @@ impl Coordinator {
         Ok(SessionId::try_from(encoded).expect("generated session IDs must be valid"))
     }
 
-    #[cfg(test)]
-    pub(super) fn create_stream_put_session_for_authorized_write(
-        &self,
-        authorized: &AuthorizedPutObjectWrite,
-    ) -> Result<SessionId, ServerError> {
-        self.create_stream_put_session_for_authorized_write_with_storage_node(
-            &self.storage_node(),
-            authorized,
-        )
-    }
-
-    pub(super) fn create_stream_put_session_for_authorized_write_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        authorized: &AuthorizedPutObjectWrite,
-    ) -> Result<SessionId, ServerError> {
-        self.create_stream_put_session_for_authorized_write_with_storage_node_and_cleanup_deadline(
-            storage_node,
-            authorized,
-            None,
-        )
-    }
-
-    pub(super) fn create_stream_put_session_for_authorized_write_with_storage_node_and_cleanup_deadline(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        authorized: &AuthorizedPutObjectWrite,
-        cleanup_after: Option<u64>,
-    ) -> Result<SessionId, ServerError> {
-        let stored_encryption = authorized.write_encryption.object_encryption();
-        let session_id = Self::random_session_id("failed to generate session ID")?;
-        storage_node
-            .create_put_object_stream_session_record_with_cleanup_deadline(
-                authorized.bucket_typed(),
-                authorized.key_typed(),
-                &session_id,
-                stored_encryption,
-                cleanup_after,
-            )
-            .map_err(Self::map_object_pg_action_error)?;
-
-        Ok(session_id)
-    }
-
     pub fn prepare_put_object_write(
         &self,
         req: &AuthorizePutObjectRequest<'_>,

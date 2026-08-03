@@ -1,0 +1,12 @@
+[package]
+name = "server-core"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["test-utils"]
+test-utils = []
+
+[lib]
+path = "lib.rs"

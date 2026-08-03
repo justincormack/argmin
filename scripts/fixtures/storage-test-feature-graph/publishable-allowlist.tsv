@@ -1,0 +1,4 @@
+package	server-core	false
+package	s3-tests	false
+allow	s3-tests
+enabled	s3-tests	storage/test-hooks

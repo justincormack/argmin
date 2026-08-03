@@ -1,10 +1,11 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use storage::{BucketName, ObjectKey, SessionId};
 use storage::{
-    BucketName, CreateMultipartUploadInput, CreateMultipartUploadOutcome,
-    FinalizeStreamPartOutcome, MultipartCompletionPart, ObjectKey, PreparedStreamPartCommit,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob, SessionId, StreamPartFinalizeInput,
-    StreamPartFinalizeSnapshot, UploadId,
+    CreateMultipartUploadInput, CreateMultipartUploadOutcome, FinalizeStreamPartOutcome,
+    MultipartCompletionPart, PreparedStreamPartCommit, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, StreamPartFinalizeInput, StreamPartFinalizeSnapshot, UploadId,
 };
 
 fn multipart_completion_fingerprint(
@@ -68,30 +69,6 @@ use crate::system_metadata::SystemMetadata;
 
 const COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES: usize = 1;
 pub(super) const COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET: Duration = Duration::from_secs(2);
-
-enum StreamPartFinalizeRoute<'a> {
-    #[cfg(any(test, feature = "test-utils"))]
-    Raw(&'a std::sync::Arc<storage::StorageCluster>),
-    Admitted(&'a storage::ActiveMultipartObjectRoute<'a>),
-}
-
-impl StreamPartFinalizeRoute<'_> {
-    fn finalize<T, E>(
-        &self,
-        _bucket: &BucketName,
-        _key: &ObjectKey,
-        input: StreamPartFinalizeInput<'_>,
-        action: impl FnMut(StreamPartFinalizeSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
-    ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, storage::ObjectPgActionError> {
-        match self {
-            #[cfg(any(test, feature = "test-utils"))]
-            Self::Raw(storage_node) => {
-                storage_node.finalize_upload_part_stream(_bucket, _key, input, action)
-            }
-            Self::Admitted(route) => route.finalize_stream_part(input, action),
-        }
-    }
-}
 
 fn complete_multipart_part_checksum(
     part: &MultipartCompletionPart,
@@ -276,52 +253,8 @@ impl Coordinator {
         &self,
         req: &AppendStreamPartRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.append_stream_part_data_with_storage_node(&self.storage_node(), req)
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn append_stream_part_data_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &AppendStreamPartRequest<'_>,
-    ) -> Result<(), ServerError> {
-        let write_encryption = self
-            .load_stream_part_write_encryption_with_storage_node(
-                storage_node,
-                &req.bucket,
-                &req.key,
-                req.session_id,
-                req.part_number,
-                req.sse_customer,
-            )
-            .map_err(|error| match error {
-                ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
-                | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
-                    ..
-                }) => ServerError::NoSuchUpload {
-                    upload_id: req.upload_id.to_string(),
-                },
-                other => other,
-            })?;
-        let payload_crc64 = checksum::crc64::checksum(req.data);
-        let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
-        self.append_stream_segment_for_storage_node(
-            storage_node,
-            &req.bucket,
-            &req.key,
-            req.session_id,
-            req.segment_index,
-            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
-        )
-        .map_err(|error| match error {
-            ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
-            | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
-                ..
-            }) => ServerError::NoSuchUpload {
-                upload_id: req.upload_id.to_string(),
-            },
-            other => other,
-        })
+        let admission = self.admit_storage_route_for_request()?;
+        self.append_stream_part_data_on_admitted_route(&admission, req)
     }
 
     pub fn append_stream_part_data_on_admitted_route(
@@ -379,84 +312,8 @@ impl Coordinator {
         &self,
         req: &BeginStreamPartRequest<'_>,
     ) -> Result<BeginStreamPartResult, ServerError> {
-        self.begin_stream_part_with_storage_node(&self.storage_node(), req)
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn begin_stream_part_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &BeginStreamPartRequest<'_>,
-    ) -> Result<BeginStreamPartResult, ServerError> {
-        self.begin_stream_part_with_storage_node_and_cleanup_deadline(storage_node, req, None)
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn begin_stream_part_with_storage_node_and_cleanup_deadline(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &BeginStreamPartRequest<'_>,
-        cleanup_after: Option<u64>,
-    ) -> Result<BeginStreamPartResult, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::begin_stream_part",
-            "bucket={:?} key={:?} upload_id={:?} part_number={}",
-            req.upload.bucket_name(),
-            req.upload.key(),
-            req.upload.upload_id(),
-            req.part_number
-        );
-        Self::validate_upload_part_number(req.part_number)?;
-        let request = BucketHandleRequest::new()
-            .requiring_policy_view()
-            .requiring_bucket_tags_if_abac_enabled();
-        let session_id = Self::random_session_id("failed to generate session ID")?;
-        self.with_bucket_write_handle_for_storage_node(
-            storage_node,
-            &req.upload,
-            request,
-            |bucket_handle| {
-                #[cfg(test)]
-                if self.should_probe_begin_stream_part_session(req.upload.bucket_name()) {
-                    let object_pg_ready = storage_node
-                        .try_probe_object_pg_available(
-                            req.upload.bucket_name_typed(),
-                            req.upload.key_typed(),
-                        )
-                        .map_err(Coordinator::map_object_pg_action_error)?;
-                    if !object_pg_ready {
-                        return Err(ServerError::InternalError {
-                            reason:
-                                "test probe: object pg still locked before begin_stream_part session"
-                                    .to_string(),
-                        });
-                    }
-                }
-                let upload = storage_node
-                    .load_multipart_upload_for_part(
-                        req.upload.bucket_name_typed(),
-                        req.upload.key_typed(),
-                        req.upload.upload_id(),
-                    )
-                    .map_err(Self::map_object_pg_action_error)?;
-                let authorized =
-                    self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)?;
-                let checksum_algorithm = authorized.checksum_algorithm;
-                let session_id = storage_node
-                    .create_upload_part_stream_session_for_authorized_part_with_cleanup_deadline(
-                        authorized.upload,
-                        &session_id,
-                        cleanup_after,
-                    )
-                    .map_err(|error| Self::map_upload_part_stream_error(req.upload.upload_id(), error))?;
-                Ok(BeginStreamPartResult {
-                    session_id,
-                    checksum_algorithm,
-                    sse_customer: authorized.sse_customer,
-                })
-            },
-        )
+        let admission = self.admit_storage_route_for_request()?;
+        self.begin_stream_part_on_admitted_route(&admission, req)
     }
 
     pub fn begin_stream_part_on_admitted_route(
@@ -492,6 +349,18 @@ impl Coordinator {
                 self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)
             },
         )?;
+        #[cfg(test)]
+        if self.should_probe_begin_stream_part_session(req.upload.bucket_name()) {
+            let object_pg_ready = route
+                .try_probe_object_pg_available()
+                .map_err(Coordinator::map_object_pg_action_error)?;
+            if !object_pg_ready {
+                return Err(ServerError::InternalError {
+                    reason: "test probe: object pg still locked before begin_stream_part session"
+                        .to_string(),
+                });
+            }
+        }
         let checksum_algorithm = authorized.checksum_algorithm;
         let session_id = Self::random_session_id("failed to generate session ID")?;
         let session_id = route
@@ -1390,21 +1259,13 @@ impl Coordinator {
         &self,
         req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
-        self.finalize_stream_part_with_storage_node(&self.storage_node(), req)
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn finalize_stream_part_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: FinalizeStreamPartRequest,
-    ) -> Result<UploadPartResult, ServerError> {
-        self.finalize_stream_part_on_route(StreamPartFinalizeRoute::Raw(storage_node), req)
+        let admission = self.admit_storage_route_for_request()?;
+        self.finalize_stream_part_with_storage_admission(&admission, req)
     }
 
     fn finalize_stream_part_on_route(
         &self,
-        storage_route: StreamPartFinalizeRoute<'_>,
+        route: &storage::ActiveMultipartObjectRoute<'_>,
         req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
         observability::trace_scope!(
@@ -1427,16 +1288,9 @@ impl Coordinator {
         let computed_checksum = req.computed_checksum;
         #[cfg(test)]
         if self.should_probe_finalize_stream_part_commit(req.upload.bucket_name()) {
-            let object_pg_ready = match &storage_route {
-                #[cfg(any(test, feature = "test-utils"))]
-                StreamPartFinalizeRoute::Raw(storage_node) => storage_node
-                    .try_probe_object_pg_available(
-                        req.upload.bucket_name_typed(),
-                        req.upload.key_typed(),
-                    ),
-                StreamPartFinalizeRoute::Admitted(route) => route.try_probe_object_pg_available(),
-            }
-            .map_err(Coordinator::map_object_pg_action_error)?;
+            let object_pg_ready = route
+                .try_probe_object_pg_available()
+                .map_err(Coordinator::map_object_pg_action_error)?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before finalize_stream_part commit"
@@ -1447,10 +1301,8 @@ impl Coordinator {
         let FinalizeStreamPartOutcome {
             value: mut result,
             last_modified,
-        } = storage_route
-            .finalize(
-                req.upload.bucket_name_typed(),
-                req.upload.key_typed(),
+        } = route
+            .finalize_stream_part(
                 StreamPartFinalizeInput {
                     upload_id,
                     session_id,
@@ -1570,7 +1422,7 @@ impl Coordinator {
         route: &storage::ActiveMultipartObjectRoute<'_>,
         req: FinalizeStreamPartRequest,
     ) -> Result<UploadPartResult, ServerError> {
-        self.finalize_stream_part_on_route(StreamPartFinalizeRoute::Admitted(route), req)
+        self.finalize_stream_part_on_route(route, req)
     }
 
     pub fn finalize_stream_part_with_storage_admission(
@@ -1582,7 +1434,7 @@ impl Coordinator {
         let route = admission
             .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
             .map_err(super::map_store_error)?;
-        self.finalize_stream_part_on_route(StreamPartFinalizeRoute::Admitted(&route), req)
+        self.finalize_stream_part_on_route(&route, req)
     }
 
     #[cfg(test)]
@@ -1592,22 +1444,13 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.abort_stream_part_session_with_storage_node(
-            &self.storage_node(),
-            bucket,
-            key,
-            session_id,
-        )
-    }
-
-    pub fn abort_stream_part_session_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        self.abort_stream_put_for_storage_node(storage_node, bucket, key, session_id)
+        let admission = self.admit_storage_route_for_request()?;
+        self.require_storage_route_admission(&admission)?;
+        admission
+            .active_multipart_object_route(bucket, key)
+            .map_err(super::map_store_error)?
+            .abort_stream_session(session_id)
+            .map_err(Self::map_object_pg_action_error)
     }
 }
 

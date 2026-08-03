@@ -37,48 +37,6 @@ trait StreamPutFinalizationRoute {
     fn try_probe_object_pg_available(&self) -> Result<bool, storage::ObjectPgActionError>;
 }
 
-struct RawStreamPutFinalizationRoute<'a> {
-    storage_node: &'a std::sync::Arc<storage::StorageCluster>,
-    bucket: &'a BucketName,
-    key: &'a ObjectKey,
-}
-
-impl StreamPutFinalizationRoute for RawStreamPutFinalizationRoute<'_> {
-    fn finalize(
-        &self,
-        session_id: &SessionId,
-        total_size: u64,
-        action: &mut dyn FnMut(
-            StreamPutFinalizeSnapshot,
-        ) -> Result<
-            storage::PreparedStreamPutCommit<SystemMetadata>,
-            ServerError,
-        >,
-    ) -> Result<
-        Result<storage::FinalizeStreamPutOutcome<SystemMetadata>, ServerError>,
-        storage::ObjectPgActionError,
-    > {
-        self.storage_node.finalize_put_object_stream(
-            self.bucket,
-            self.key,
-            session_id,
-            total_size,
-            action,
-        )
-    }
-
-    fn enqueue_object_payload_reclaim(&self, generation_id: storage::GenerationId) {
-        self.storage_node
-            .enqueue_object_payload_reclaim(self.bucket, self.key, generation_id);
-    }
-
-    #[cfg(test)]
-    fn try_probe_object_pg_available(&self) -> Result<bool, storage::ObjectPgActionError> {
-        self.storage_node
-            .try_probe_object_pg_available(self.bucket, self.key)
-    }
-}
-
 impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
     fn finalize(
         &self,
@@ -467,68 +425,12 @@ impl Coordinator {
         &self,
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<PreparedStreamPut, ServerError> {
-        let storage_node = self.storage_node();
-        self.begin_stream_put_with_storage_node(&storage_node, req)
-    }
-
-    pub fn begin_stream_put_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &AuthorizePutObjectRequest<'_>,
-    ) -> Result<PreparedStreamPut, ServerError> {
-        self.begin_stream_put_with_storage_node_and_cleanup_deadline(storage_node, req, None)
-    }
-
-    pub fn begin_stream_put_with_storage_node_and_cleanup_deadline(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &AuthorizePutObjectRequest<'_>,
-        cleanup_after: Option<u64>,
-    ) -> Result<PreparedStreamPut, ServerError> {
-        let session_id = Self::random_session_id("failed to generate session ID")?;
-        let request = BucketHandleRequest::new()
-            .requiring_policy_view()
-            .requiring_bucket_tags_if_abac_enabled();
-        storage_node
-            .create_put_object_stream_session_with_cleanup_deadline(
-                req.object.bucket.name_typed(),
-                req.object.key_typed(),
-                request.resolve_to_storage_request(),
-                cleanup_after,
-                |snapshot, existing_object| {
-                    let bucket = self
-                        .bucket_handle_loader()
-                        .load_bucket_handle_from_snapshot(
-                            snapshot,
-                            req.object.expected_bucket_owner(),
-                            request,
-                        )?;
-                    #[cfg(test)]
-                    self.maybe_run_bucket_write_handle_loaded_hook(
-                        req.object.bucket.name_typed().as_str(),
-                    );
-                    let authorized_write = self.authorize_put_object_write_with_existing_object(
-                        req,
-                        &bucket,
-                        existing_object.as_ref(),
-                    )?;
-                    let create = CreateStreamUploadReq {
-                        session_id: session_id.clone(),
-                        bucket: authorized_write.bucket_typed().clone(),
-                        key: authorized_write.key_typed().clone(),
-                        target: StreamUploadTarget::PutObject,
-                        encryption: authorized_write.write_encryption.object_encryption(),
-                    };
-                    Ok((
-                        PreparedStreamPut {
-                            authorized_write,
-                            session_id: session_id.clone(),
-                        },
-                        create,
-                    ))
-                },
-            )
-            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
+        let admission = self.admit_storage_route_for_request()?;
+        self.begin_stream_put_with_storage_admission_and_cleanup_deadline(
+            &admission,
+            req,
+            admission.authority_valid_until_ms(),
+        )
     }
 
     pub fn begin_stream_put_with_storage_admission_and_cleanup_deadline(
@@ -590,30 +492,11 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<SessionId, ServerError> {
-        self.create_stream_put_session_for_authorized_write(authorized)
-    }
-
-    pub fn begin_stream_put_session_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        authorized: &AuthorizedPutObjectWrite,
-    ) -> Result<SessionId, ServerError> {
-        self.create_stream_put_session_for_authorized_write_with_storage_node(
-            storage_node,
+        let admission = self.admit_storage_route_for_request()?;
+        self.begin_stream_put_session_with_storage_admission_and_cleanup_deadline(
+            &admission,
             authorized,
-        )
-    }
-
-    pub fn begin_stream_put_session_with_storage_node_and_cleanup_deadline(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        authorized: &AuthorizedPutObjectWrite,
-        cleanup_after: Option<u64>,
-    ) -> Result<SessionId, ServerError> {
-        self.create_stream_put_session_for_authorized_write_with_storage_node_and_cleanup_deadline(
-            storage_node,
-            authorized,
-            cleanup_after,
+            admission.authority_valid_until_ms(),
         )
     }
 
@@ -643,46 +526,8 @@ impl Coordinator {
         &self,
         req: &AppendStreamPutRequest<'_>,
     ) -> Result<(), ServerError> {
-        let write_encryption = self.load_stream_put_write_encryption(
-            req.bucket,
-            req.key,
-            req.session_id,
-            req.sse_customer,
-        )?;
-        let payload_crc64 = checksum::crc64::checksum(req.data);
-        let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
-        self.append_stream_segment_for(
-            req.bucket,
-            req.key,
-            req.session_id,
-            req.segment_index,
-            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
-        )
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn append_stream_put_data_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &AppendStreamPutRequest<'_>,
-    ) -> Result<(), ServerError> {
-        let write_encryption = self.load_stream_put_write_encryption_with_storage_node(
-            storage_node,
-            req.bucket,
-            req.key,
-            req.session_id,
-            req.sse_customer,
-        )?;
-        let payload_crc64 = checksum::crc64::checksum(req.data);
-        let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
-        self.append_stream_segment_for_storage_node(
-            storage_node,
-            req.bucket,
-            req.key,
-            req.session_id,
-            req.segment_index,
-            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
-        )
+        let admission = self.admit_storage_route_for_request()?;
+        self.append_stream_put_data_with_storage_admission(&admission, req)
     }
 
     pub fn append_stream_put_data_with_storage_admission(
@@ -742,53 +587,12 @@ impl Coordinator {
         authorized: &AuthorizedPutObjectWrite,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<PutObjectResult, ServerError> {
-        let write_encryption = self.load_stream_put_write_encryption(
-            authorized.bucket_typed(),
-            authorized.key_typed(),
-            req.session_id,
-            sse_customer,
-        )?;
-        self.finalize_stream_put_from_authorized_write(
-            &AuthorizedFinalizeStreamPutRequest {
-                session_id: req.session_id,
-                crc64: req.crc64,
-                total_size: req.total_size,
-                metadata_blob: req.metadata_blob,
-                system_metadata: req.system_metadata,
-                write_encryption: write_encryption.as_ref(),
-                cond: req.cond,
-            },
+        let admission = self.admit_storage_route_for_request()?;
+        self.finalize_authorized_stream_put_with_storage_admission(
+            &admission,
+            req,
             authorized,
-        )
-    }
-
-    pub fn finalize_authorized_stream_put_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &AuthorizedFinalizeStreamPutRequest<'_>,
-        authorized: &AuthorizedPutObjectWrite,
-        sse_customer: Option<&SseCustomerRequest>,
-    ) -> Result<PutObjectResult, ServerError> {
-        let write_encryption = self.load_stream_put_write_encryption_with_storage_node(
-            storage_node,
-            authorized.bucket_typed(),
-            authorized.key_typed(),
-            req.session_id,
             sse_customer,
-        )?;
-        self.finalize_stream_put_with_authorized_write_tags_with_storage_node(
-            storage_node,
-            &AuthorizedFinalizeStreamPutRequest {
-                session_id: req.session_id,
-                crc64: req.crc64,
-                total_size: req.total_size,
-                metadata_blob: req.metadata_blob,
-                system_metadata: req.system_metadata,
-                write_encryption: write_encryption.as_ref(),
-                cond: req.cond,
-            },
-            authorized,
-            AuthorizedWriteTags::Bound,
         )
     }
 
@@ -835,46 +639,12 @@ impl Coordinator {
         authorized: &AuthorizedPutObjectWrite,
         tags: AuthorizedWriteTags<'_>,
     ) -> Result<PutObjectResult, ServerError> {
-        self.finalize_stream_put_with_authorized_write_tags_with_storage_node(
-            &self.storage_node(),
-            req,
-            authorized,
-            tags,
-        )
-    }
-
-    pub(super) fn finalize_stream_put_with_authorized_write_tags_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &AuthorizedFinalizeStreamPutRequest<'_>,
-        authorized: &AuthorizedPutObjectWrite,
-        tags: AuthorizedWriteTags<'_>,
-    ) -> Result<PutObjectResult, ServerError> {
-        let tags = match tags {
-            AuthorizedWriteTags::Bound => authorized.tags(),
-            AuthorizedWriteTags::TrustedDerived(tags) => tags,
-        };
-        self.finalize_stream_put_with_storage_node(
-            storage_node,
-            &FinalizeStreamPutRequest {
-                object: ObjectRequest::new(
-                    authorized.bucket_typed().clone(),
-                    authorized.key_typed().clone(),
-                    authorized.requester().clone(),
-                    authorized.expected_bucket_owner(),
-                ),
-                session_id: req.session_id,
-                crc64: req.crc64,
-                total_size: req.total_size,
-                metadata_blob: req.metadata_blob,
-                system_metadata: req.system_metadata,
-                write_encryption: req.write_encryption,
-                tags,
-                cond: req.cond,
-                acl: authorized.acl(),
-                policy_context: PutObjectPolicyContext::default(),
-                requested_object_lock: authorized.requested_object_lock(),
-            },
+        let admission = self.admit_storage_route_for_request()?;
+        let route = admission
+            .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
+            .map_err(super::map_store_error)?;
+        self.finalize_stream_put_with_authorized_write_tags_on_admitted_route(
+            &route, req, authorized, tags,
         )
     }
 
@@ -932,14 +702,6 @@ impl Coordinator {
         &self,
         req: &FinalizeStreamPutRequest,
     ) -> Result<PutObjectResult, ServerError> {
-        self.finalize_stream_put_with_storage_node(&self.storage_node(), req)
-    }
-
-    pub(super) fn finalize_stream_put_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        req: &FinalizeStreamPutRequest,
-    ) -> Result<PutObjectResult, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::finalize_stream_put",
@@ -949,18 +711,27 @@ impl Coordinator {
             req.session_id,
             req.total_size
         );
+        let admission = self.admit_storage_route_for_request()?;
+        let route = admission
+            .active_put_object_route(req.object.bucket_name_typed(), req.object.key_typed())
+            .map_err(super::map_store_error)?;
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
-        let route = RawStreamPutFinalizationRoute {
-            storage_node,
-            bucket: req.object.bucket_name_typed(),
-            key: req.object.key_typed(),
-        };
-        self.with_bucket_write_handle_for_storage_node(
-            storage_node,
-            &req.object,
-            request,
-            |bucket_handle| self.finalize_stream_put_for_loaded_bucket(&route, bucket_handle, req),
-        )
+        route
+            .with_bucket_write_snapshot(request.resolve_to_storage_request(), |snapshot| {
+                let bucket_handle = self
+                    .bucket_handle_loader()
+                    .load_bucket_handle_from_snapshot(
+                        snapshot,
+                        req.object.expected_bucket_owner(),
+                        request,
+                    )?;
+                #[cfg(test)]
+                self.maybe_run_bucket_write_handle_loaded_hook(
+                    req.object.bucket_name_typed().as_str(),
+                );
+                self.finalize_stream_put_for_loaded_bucket(&route, bucket_handle, req)
+            })
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
     fn finalize_stream_put_for_loaded_bucket(
@@ -1079,17 +850,13 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.abort_stream_put_for_cleanup(bucket, key, session_id)
-    }
-
-    pub fn abort_stream_put_session_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        self.abort_stream_put_for_cleanup_with_storage_node(storage_node, bucket, key, session_id)
+        let admission = self.admit_storage_route_for_request()?;
+        self.require_storage_route_admission(&admission)?;
+        admission
+            .active_put_object_route(bucket, key)
+            .map_err(super::map_store_error)?
+            .abort_stream_session(session_id)
+            .map_err(Self::map_object_pg_action_error)
     }
 
     #[cfg(test)]

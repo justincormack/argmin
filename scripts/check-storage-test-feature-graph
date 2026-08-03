@@ -1,0 +1,110 @@
+#!/bin/env bash
+
+set -euo pipefail
+
+export LC_ALL=C
+
+for command in cargo jq awk; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "error: $command is required for scripts/check-storage-test-feature-graph" >&2
+        exit 1
+    fi
+done
+
+repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+validator=scripts/check-storage-test-feature-inventory.awk
+fixtures=scripts/fixtures/storage-test-feature-graph
+
+if ! awk -f "$validator" "$fixtures/valid.tsv" >/dev/null; then
+    echo "error: valid storage test-feature inventory fixture was rejected" >&2
+    exit 1
+fi
+
+for fixture in \
+    production-hook.tsv \
+    stale-allowlist.tsv \
+    publishable-allowlist.tsv
+do
+    if awk -f "$validator" "$fixtures/$fixture" >/dev/null 2>&1; then
+        echo "error: invalid storage test-feature inventory fixture was accepted: $fixture" >&2
+        exit 1
+    fi
+done
+
+inventory=$(mktemp)
+trap 'rm -f "$inventory"' EXIT
+
+build_inventory() {
+    local manifest_path=$1
+    local output=$2
+    local metadata package feature_tree
+
+    metadata=$(cargo metadata \
+        --manifest-path "$manifest_path" \
+        --no-deps \
+        --format-version 1)
+    jq -r '
+        .workspace_members[] as $workspace_id
+        | .packages[]
+        | select(.id == $workspace_id)
+        | ["package", .name, ((.publish == []) | tostring)]
+        | @tsv
+    ' <<<"$metadata" | sort -t $'\t' -k2,2 >"$output"
+
+    while IFS=$'\t' read -r record package _publish_disabled; do
+        [[ "$record" == package ]] || continue
+        feature_tree=$(cargo tree \
+            --manifest-path "$manifest_path" \
+            --edges normal,build \
+            --package "$package" \
+            --prefix none \
+            --format $'{lib}\t{f}')
+        awk -F '\t' -v package="$package" '
+            function has_feature(features, wanted, count, values, i) {
+                count = split(features, values, ",")
+                for (i = 1; i <= count; i++) {
+                    if (values[i] == wanted) {
+                        return 1
+                    }
+                }
+                return 0
+            }
+
+            $1 == "storage" && has_feature($2, "test-hooks") && !storage_seen++ {
+                print "enabled\t" package "\tstorage/test-hooks"
+            }
+            $1 == "server_core" && has_feature($2, "test-utils") && !server_core_seen++ {
+                print "enabled\t" package "\tserver-core/test-utils"
+            }
+        ' <<<"$feature_tree" >>"$output"
+    done < <(grep $'^package\t' "$output")
+}
+
+# There are deliberately no normal/build exceptions. In particular, the
+# AWS-facing S3 and STS suites must exercise only public behavior and must not
+# acquire storage or coordinator test-support features through their shared
+# harness. If a future exception is genuinely necessary, it must be explicit
+# here and the fail-closed validator requires the package to be non-published.
+
+root_default_fixture=$fixtures/root-default-workspace/Cargo.toml
+build_inventory "$root_default_fixture" "$inventory"
+for expected_record in \
+    $'enabled\tserver-core\tserver-core/test-utils' \
+    $'enabled\tstorage\tstorage/test-hooks'
+do
+    if ! grep -Fxq "$expected_record" "$inventory"; then
+        echo "error: root default feature inventory omitted: $expected_record" >&2
+        exit 1
+    fi
+done
+if awk -f "$validator" "$inventory" >/dev/null 2>&1; then
+    echo "error: root default features enabling storage test support were not detected" >&2
+    exit 1
+fi
+
+build_inventory Cargo.toml "$inventory"
+awk -f "$validator" "$inventory"
+
+echo "storage test feature graph checks passed"

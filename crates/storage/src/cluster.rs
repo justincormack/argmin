@@ -3489,6 +3489,16 @@ impl ActivePutObjectRoute<'_> {
             .load_stream_upload_session_on_route(self.effect_route(), session_id)
     }
 
+    pub fn abort_stream_session(&self, session_id: &SessionId) -> Result<(), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .abort_stream_upload_session_with_route_validation(
+                self.effect_route(),
+                session_id,
+                || self.admission.require_valid_now(),
+            )
+    }
+
     pub fn append_stream_segment(
         &self,
         input: StreamSegmentAppendInput<'_>,
@@ -3852,6 +3862,16 @@ impl ActiveMultipartObjectRoute<'_> {
         self.admission
             .cluster
             .load_stream_upload_session_on_route(self.stream_effect_route(), session_id)
+    }
+
+    pub fn abort_stream_session(&self, session_id: &SessionId) -> Result<(), ObjectPgActionError> {
+        self.admission
+            .cluster
+            .abort_stream_upload_session_with_route_validation(
+                self.stream_effect_route(),
+                session_id,
+                || self.admission.require_valid_now(),
+            )
     }
 
     pub fn append_stream_segment(
@@ -15601,6 +15621,7 @@ impl StorageCluster {
         );
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_put_object_stream_session_record(
         &self,
         bucket: &BucketName,
@@ -15613,6 +15634,7 @@ impl StorageCluster {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_put_object_stream_session_record_with_cleanup_deadline(
         &self,
         bucket: &BucketName,
@@ -16908,11 +16930,18 @@ impl StorageCluster {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ObjectPgActionError> {
-        let pg_id = self.object_metadata_pg(bucket, key).pg_id();
-        self.abort_stream_upload_session_with_work_budget(
+        let route = PutObjectMutationEffectRoute {
+            bucket_pg_id: self.bucket_metadata_pg(bucket),
+            object_pg_id: self.object_metadata_pg(bucket, key),
             bucket,
             key,
+            effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+        };
+        let pg_id = route.object_pg_id.pg_id();
+        self.abort_stream_upload_session_with_work_budget(
+            route,
             session_id,
+            || Ok(()),
             RequestWorkBudget::new(STREAM_UPLOAD_ABORT_RETRY_BUDGET, None)
                 .for_operation("abort_stream_upload_session")
                 .for_pg(pg_id),
@@ -16927,28 +16956,54 @@ impl StorageCluster {
         session_id: &SessionId,
         max_attempts: usize,
     ) -> Result<(), ObjectPgActionError> {
-        let pg_id = self.object_metadata_pg(bucket, key).pg_id();
-        self.abort_stream_upload_session_with_work_budget(
+        let route = PutObjectMutationEffectRoute {
+            bucket_pg_id: self.bucket_metadata_pg(bucket),
+            object_pg_id: self.object_metadata_pg(bucket, key),
             bucket,
             key,
+            effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
+        };
+        let pg_id = route.object_pg_id.pg_id();
+        self.abort_stream_upload_session_with_work_budget(
+            route,
             session_id,
+            || Ok(()),
             RequestWorkBudget::new(STREAM_UPLOAD_ABORT_RETRY_BUDGET, Some(max_attempts))
                 .for_operation("abort_stream_upload_session")
                 .for_pg(pg_id),
         )
     }
 
+    fn abort_stream_upload_session_with_route_validation(
+        &self,
+        route: PutObjectMutationEffectRoute<'_>,
+        session_id: &SessionId,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<(), ObjectPgActionError> {
+        self.abort_stream_upload_session_with_work_budget(
+            route,
+            session_id,
+            require_valid_route,
+            RequestWorkBudget::new(STREAM_UPLOAD_ABORT_RETRY_BUDGET, None)
+                .for_operation("abort_stream_upload_session")
+                .for_pg(route.object_pg_id.pg_id()),
+        )
+    }
+
     fn abort_stream_upload_session_with_work_budget(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
+        route: PutObjectMutationEffectRoute<'_>,
         session_id: &SessionId,
+        mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut work_budget: RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
         let publisher =
             crate::metadata_command::metadata_command_publisher!(AbortStreamUploadSession);
-        let object_pg_id = self.object_metadata_pg(bucket, key);
+        let bucket = route.bucket;
+        let key = route.key;
+        let object_pg_id = route.object_pg_id;
         let pg_id = object_pg_id.pg_id();
+        require_valid_route().map_err(ObjectPgActionError::Store)?;
         let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
         let stream_route = mutation_client.open_stream_upload_session_metadata_route(
             self.operation_epoch(),
@@ -16959,6 +17014,7 @@ impl StorageCluster {
         )?;
         let mut pending_completed_session = false;
         let observed_stream_session = loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
                 .check("stream abort initial recovery retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
@@ -16986,6 +17042,7 @@ impl StorageCluster {
         self.maybe_run_before_stream_abort_storage_hook();
 
         loop {
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
                 .check("stream abort retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
@@ -17017,6 +17074,7 @@ impl StorageCluster {
                 }
                 Err(error) => return Err(error),
             };
+            require_valid_route().map_err(ObjectPgActionError::Store)?;
             let command_id = match self.next_object_metadata_command_id(pg_id) {
                 Ok(command_id) => command_id,
                 Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
@@ -17049,7 +17107,7 @@ impl StorageCluster {
                 pg_id,
                 bucket,
                 &command,
-                None,
+                Some(route.effect_fence),
                 |pending| {
                     pending_command_completes_stream_session(pending, bucket, key, session_id)
                 },

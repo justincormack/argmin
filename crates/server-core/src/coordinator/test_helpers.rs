@@ -37,10 +37,15 @@ pub fn upload_part(
     coord: &Coordinator,
     req: &UploadPartRequest<'_>,
 ) -> Result<UploadPartResult, ServerError> {
-    let storage_node = coord.storage_node_for_request();
+    let admission = coord.admit_storage_route_for_request()?;
+    let cleanup = coord.retained_stream_upload_cleanup(
+        &admission,
+        req.upload.object.bucket.name_typed(),
+        req.upload.object.key_typed(),
+    )?;
     let upload_id = req.upload.upload_id().clone();
-    let session = coord.begin_stream_part_with_storage_node(
-        &storage_node,
+    let session = coord.begin_stream_part_on_admitted_route(
+        &admission,
         &BeginStreamPartRequest {
             upload: MultipartObjectRequest::new(
                 req.upload.object.bucket.name_typed().clone(),
@@ -58,8 +63,8 @@ pub fn upload_part(
     let session_id = &session.session_id;
     let result = (|| {
         for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-            coord.append_stream_part_data_with_storage_node(
-                &storage_node,
+            coord.append_stream_part_data_on_admitted_route(
+                &admission,
                 &AppendStreamPartRequest {
                     bucket: req.upload.object.bucket.name_typed().clone(),
                     key: req.upload.object.key_typed().clone(),
@@ -80,8 +85,8 @@ pub fn upload_part(
                 .or(session.checksum_algorithm);
             algo.map(|a| compute_checksum(a, req.data))
         };
-        coord.finalize_stream_part_with_storage_node(
-            &storage_node,
+        coord.finalize_stream_part_with_storage_admission(
+            &admission,
             FinalizeStreamPartRequest {
                 upload: MultipartObjectRequest::new(
                     req.upload.object.bucket.name_typed().clone(),
@@ -100,12 +105,7 @@ pub fn upload_part(
         )
     })();
     if result.is_err() {
-        let _ = coord.abort_stream_part_session_with_storage_node(
-            &storage_node,
-            req.upload.bucket_name_typed(),
-            req.upload.key_typed(),
-            session_id,
-        );
+        let _ = coord.abort_stream_upload_with_retained_cleanup(&cleanup, session_id);
     }
     result
 }
