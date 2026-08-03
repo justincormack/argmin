@@ -12406,36 +12406,6 @@ impl UnixControlPlaneClient {
         })
     }
 
-    fn retry_metadata_transfer_fence_after_response_loss(
-        &self,
-        pg_id: PgId,
-    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
-        let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
-        loop {
-            match self
-                .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_read_timeout(
-                    pg_id,
-                    CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
-                )
-                .and_then(|fenced| self.validate_metadata_transfer_fence_response(pg_id, fenced))
-            {
-                Ok(fenced) => return Ok(fenced),
-                Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                    if Instant::now() >= deadline {
-                        return Err(ControlPlaneError::RpcUnconfirmed {
-                            message: format!(
-                                "metadata-transfer fence for PG {} was not confirmed after lost control-plane RPC response: {error}",
-                                pg_id.get()
-                            ),
-                        });
-                    }
-                    std::thread::sleep(CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     fn retry_set_pg_acting_set_after_retryable_failure(
         &self,
         pg_id: PgId,
@@ -12586,6 +12556,7 @@ impl UnixControlPlaneClient {
             .0)
     }
 
+    #[cfg(test)]
     fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease(
         &self,
         pg_id: PgId,
@@ -12596,17 +12567,29 @@ impl UnixControlPlaneClient {
         )
     }
 
+    #[cfg(test)]
     fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_read_timeout(
         &self,
         pg_id: PgId,
         read_timeout: Duration,
     ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        self.fence_pg_for_metadata_transfer_runtime_map_with_source_lease_until(
+            pg_id,
+            Instant::now() + read_timeout,
+        )
+    }
+
+    fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_until(
+        &self,
+        pg_id: PgId,
+        deadline: Instant,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_id_request(&mut payload, pg_id);
-        let payload = self.send_request_with_read_timeout(
+        let payload = self.send_request_until(
             ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
             &payload,
-            read_timeout,
+            deadline,
         )?;
         let mut reader = PayloadReader::new(&payload);
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
@@ -12622,16 +12605,10 @@ impl UnixControlPlaneClient {
         &self,
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
-        match self
-            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease(pg_id)
-            .and_then(|fenced| self.validate_metadata_transfer_fence_response(pg_id, fenced))
-        {
-            Ok(fenced) => Ok(fenced),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                self.retry_metadata_transfer_fence_after_response_loss(pg_id)
-            }
-            Err(error) => Err(error),
-        }
+        retry_checked_metadata_transfer_fence(pg_id, |deadline| {
+            self.fence_pg_for_metadata_transfer_runtime_map_with_source_lease_until(pg_id, deadline)
+                .and_then(|fenced| self.validate_metadata_transfer_fence_response(pg_id, fenced))
+        })
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer(
@@ -13593,13 +13570,30 @@ impl AuthenticatedUnixControlPlaneClient {
         pg_id: PgId,
         authority_now_ms: u64,
     ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+        let retry_clock = AuthenticatedAdminRetryClock::new(authority_now_ms);
+        retry_checked_metadata_transfer_fence(pg_id, |deadline| {
+            self.fence_pg_for_metadata_transfer_runtime_map_with_source_lease_until(
+                pg_id,
+                retry_clock,
+                deadline,
+            )
+        })
+    }
+
+    fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_until(
+        &self,
+        pg_id: PgId,
+        retry_clock: AuthenticatedAdminRetryClock,
+        deadline: Instant,
+    ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_id_request(&mut payload, pg_id);
-        let payload = self.send_admin_request_with_read_timeout(
+        let payload = self.send_admin_request_until_and_clocks(
             ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
-            authority_now_ms,
             payload,
-            CONTROL_PLANE_RPC_IO_TIMEOUT,
+            deadline,
+            || Ok(retry_clock.now_ms()),
+            || Ok(crate::clock::current_time_millis()),
         )?;
         let (runtime_map, source_primary_lease_deadline_ms) =
             decode_authenticated_admin_mutation_success(
@@ -15357,6 +15351,45 @@ fn metadata_transfer_fence_observable(
         .iter()
         .find(|route| route.pg_id() == pg_id)
         .is_some_and(|route| route.state() == PgState::Peering)
+}
+
+fn retry_checked_metadata_transfer_fence(
+    pg_id: PgId,
+    mut attempt: impl FnMut(Instant) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError>,
+) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
+    let deadline = Instant::now() + CONTROL_PLANE_RPC_CHECK_APPLIED_DEADLINE;
+    let mut last_retryable_error = None;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            let diagnostic = last_retryable_error
+                .as_ref()
+                .map_or_else(|| "no attempt completed".to_owned(), ToString::to_string);
+            return Err(ControlPlaneError::RpcUnconfirmed {
+                message: format!(
+                    "metadata-transfer fence for PG {} was not confirmed before its retry deadline: {diagnostic}",
+                    pg_id.get()
+                ),
+            });
+        }
+        let attempt_deadline = (now + CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT).min(deadline);
+        match attempt(attempt_deadline) {
+            Ok(fenced) => return Ok(fenced),
+            Err(error)
+                if error.is_unconfirmed_control_plane_mutation()
+                    || error.is_retryable_read_only_rpc_transport_error()
+                    || error.is_transient_runtime_map_serving_gap() =>
+            {
+                last_retryable_error = Some(error);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let backoff = CONTROL_PLANE_RPC_CHECK_APPLIED_BACKOFF.min(remaining);
+                if !backoff.is_zero() {
+                    std::thread::sleep(backoff);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl ControlPlaneHeartbeatRuntimeMapSource for UnixControlPlaneClient {
@@ -32915,6 +32948,151 @@ mod tests {
         assert_eq!(metrics.rejected_total(), 0);
     }
 
+    fn assert_authenticated_metadata_transfer_fence_retries_before_and_after_apply<S>(
+        client: UnixControlPlaneClient,
+        mut accept: impl FnMut() -> S + Send + 'static,
+    ) where
+        S: std::io::Read + std::io::Write + Send + 'static,
+    {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        let active_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        authority
+            .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Peering,
+            active_proof,
+            false,
+            2_000,
+        );
+        authority
+            .complete_pg_peering(
+                PgId::new(43),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_001,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            43,
+            PgState::Active,
+            active_proof,
+            false,
+            2_002,
+        );
+        let active_epoch = authority.snapshot().cluster_epoch();
+        let expected_fence_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let verifier_for_assert = verifier.clone();
+        let server = std::thread::spawn(move || {
+            for request_number in 0..3 {
+                let mut stream = accept();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                assert_eq!(
+                    request.kind,
+                    ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap
+                );
+                let issued_at_ms = ControlPlaneAuthEnvelope::decode_frame(
+                    &request.payload,
+                    CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
+                )
+                .unwrap()
+                .header()
+                .issued_at_ms()
+                .unwrap();
+                if request_number == 0 {
+                    verify_control_plane_unix_request(request, Some(&verifier), issued_at_ms)
+                        .expect("first authenticated fence request should verify");
+                    drop(stream);
+                    assert_eq!(authority.snapshot().cluster_epoch(), active_epoch);
+                    continue;
+                }
+
+                let response = build_control_plane_unix_response_with_auth_and_response_clock(
+                    &mut authority,
+                    request,
+                    issued_at_ms,
+                    Some(&verifier),
+                    || Ok(issued_at_ms),
+                )
+                .expect("retried authenticated fence should apply or confirm");
+                if request_number == 1 {
+                    drop(response);
+                    drop(stream);
+                } else {
+                    write_control_plane_unix_response(&mut stream, response).unwrap();
+                    stream.flush().unwrap();
+                }
+                assert_eq!(authority.snapshot().cluster_epoch(), expected_fence_epoch);
+            }
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            client,
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let fenced = client
+            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+                PgId::new(43),
+                crate::clock::current_time_millis(),
+            )
+            .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(fenced.runtime_map().cluster_epoch(), expected_fence_epoch);
+        assert_eq!(fenced.source_primary_lease_deadline_ms(), Some(2_102));
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 3);
+        assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_transfer_fence_retries_before_and_after_apply() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        assert_authenticated_metadata_transfer_fence_retries_before_and_after_apply(
+            UnixControlPlaneClient::new(socket_path),
+            move || listener.accept().unwrap().0,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_metadata_transfer_fence_retries_before_and_after_apply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = control_plane_test_tls_endpoint(listener.local_addr().unwrap());
+        let server_config = control_plane_test_tls_server_config();
+        assert_authenticated_metadata_transfer_fence_retries_before_and_after_apply(
+            UnixControlPlaneClient::with_endpoints([endpoint]).unwrap(),
+            move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let connection = rustls::ServerConnection::new(Arc::clone(&server_config)).unwrap();
+                rustls::StreamOwned::new(connection, stream)
+            },
+        );
+    }
+
     #[test]
     fn authenticated_admin_metadata_transfer_confirms_after_lost_response() {
         let tmp = test_util::tempdir();
@@ -35002,7 +35180,7 @@ mod tests {
     }
 
     #[test]
-    fn unix_control_plane_client_retries_convergent_fence_after_lost_response() {
+    fn unix_control_plane_client_retries_convergent_fence_before_and_after_apply() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let state_path = tmp.path().join("control-plane.state");
@@ -35050,7 +35228,7 @@ mod tests {
         let expected_fence_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let server = std::thread::spawn(move || {
-            for request_number in 0..2 {
+            for request_number in 0..3 {
                 let (mut stream, _addr) = listener.accept().unwrap();
                 let request = read_control_plane_unix_request(&mut stream).unwrap();
                 assert_eq!(
@@ -35058,6 +35236,10 @@ mod tests {
                     ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap
                 );
                 if request_number == 0 {
+                    drop(request);
+                    drop(stream);
+                    assert_eq!(authority.snapshot().cluster_epoch(), active_epoch);
+                } else if request_number == 1 {
                     let response =
                         build_control_plane_unix_response(&mut authority, request, 2_003)
                             .expect("metadata-transfer fence should apply before response loss");
