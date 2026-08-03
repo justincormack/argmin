@@ -31,6 +31,7 @@ pub mod control_plane;
 pub mod control_plane_auth;
 pub mod control_plane_command;
 pub(crate) mod control_plane_lease;
+mod control_plane_operator_admin;
 mod control_plane_pg_admin;
 pub mod control_plane_raft;
 pub(crate) mod data_dir;
@@ -96,6 +97,10 @@ pub use cluster::{
 pub use cluster::{
     MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
     MetadataCommandApplyTestContext, MetadataCommandApplyTestKind, TestDirectPutWrittenSegment,
+};
+pub use control_plane_operator_admin::{
+    ControlPlaneAuthorityClockAdminClient, ControlPlaneAuthorityClockAdminStatus,
+    ControlPlaneOperatorAdminError, ControlPlaneRaftAdminClient,
 };
 pub use control_plane_pg_admin::{
     set_offline_control_plane_pg_acting_set, ControlPlanePgAdminClient, ControlPlanePgAdminError,

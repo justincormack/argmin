@@ -42,11 +42,10 @@ use storage::control_plane::{
     ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
     ControlPlaneAuthorityClock, ControlPlaneAuthorityClockCheckpointBinding,
     ControlPlaneAuthorityClockCheckpointTarget, ControlPlaneAuthorityClockContext,
-    ControlPlaneAuthorityClockStatus, ControlPlaneError, ControlPlaneFrontendAuthCredential,
-    ControlPlaneFrontendAuthCredentialInput, ControlPlaneHeartbeatRefresh,
-    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRpcResponsePublication,
-    ControlPlaneRpcServerListener, ControlPlaneRpcServerPolicy, ControlPlaneRpcServerRole,
-    ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
+    ControlPlaneError, ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
+    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
+    ControlPlaneRpcResponsePublication, ControlPlaneRpcServerListener, ControlPlaneRpcServerPolicy,
+    ControlPlaneRpcServerRole, ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
     ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
     FencedPgMetadataTransferSnapshot, FileControlPlaneStore, LeaseHorizonAuthorityBinding,
     PgMetadataTransferProof, SingleAuthorityControlPlane, UnixControlPlaneClient,
@@ -635,7 +634,7 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         }
         return match control_plane_authority_clock_status(Path::new(&path)) {
             Ok(status) => {
-                println!("{}", format_authority_clock_status(status));
+                println!("{status}");
                 Some(0)
             }
             Err(error) => {
@@ -662,7 +661,7 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         }
         return match reestablish_control_plane_authority_clock(Path::new(&path)) {
             Ok(status) => {
-                println!("{}", format_authority_clock_status(status));
+                println!("{status}");
                 Some(0)
             }
             Err(error) => {
@@ -682,7 +681,7 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
         };
         let Some(node_id) = args.next().and_then(|arg| {
             arg.to_string_lossy()
-                .parse::<ControlPlaneRaftNodeId>()
+                .parse::<u64>()
                 .ok()
                 .filter(|node_id| *node_id != 0)
         }) else {
@@ -1024,43 +1023,40 @@ fn set_control_plane_pg_acting_set_live(
         .map_err(|error| error.to_string())
 }
 
-fn transfer_control_plane_raft_leadership(
-    socket_path: &Path,
-    node_id: ControlPlaneRaftNodeId,
-) -> Result<(), String> {
-    build_admin_control_plane_client_from_command_auth_env(socket_path)?
-        .transfer_raft_leadership_to(node_id)
-        .map_err(|error| format!("failed to transfer control-plane Raft leadership: {error}"))
+fn transfer_control_plane_raft_leadership(socket_path: &Path, node_id: u64) -> Result<(), String> {
+    build_raft_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .transfer_leadership_to(node_id)
+        .map_err(|error| error.to_string())
 }
 
 fn trigger_control_plane_raft_snapshot_and_purge(
     socket_path: &Path,
 ) -> Result<Option<u64>, String> {
-    build_admin_control_plane_client_from_command_auth_env(socket_path)?
-        .trigger_raft_snapshot_and_purge()
-        .map_err(|error| format!("failed to trigger control-plane Raft snapshot purge: {error}"))
+    build_raft_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .trigger_snapshot_and_purge()
+        .map_err(|error| error.to_string())
 }
 
 fn trigger_control_plane_raft_election(socket_path: &Path) -> Result<(), String> {
-    build_admin_control_plane_client_from_command_auth_env(socket_path)?
-        .trigger_raft_election()
-        .map_err(|error| format!("failed to trigger control-plane Raft election: {error}"))
+    build_raft_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .trigger_election()
+        .map_err(|error| error.to_string())
 }
 
 fn control_plane_authority_clock_status(
     socket_path: &Path,
-) -> Result<ControlPlaneAuthorityClockStatus, String> {
-    build_admin_clock_recovery_client_from_command_auth_env(socket_path)?
-        .authority_clock_status()
-        .map_err(|error| format!("failed to read control-plane authority-clock status: {error}"))
+) -> Result<storage::ControlPlaneAuthorityClockAdminStatus, String> {
+    build_authority_clock_admin_client_from_command_auth_env(socket_path)?
+        .status()
+        .map_err(|error| error.to_string())
 }
 
 fn reestablish_control_plane_authority_clock(
     socket_path: &Path,
-) -> Result<ControlPlaneAuthorityClockStatus, String> {
-    build_admin_clock_recovery_client_from_command_auth_env(socket_path)?
-        .reestablish_authority_clock()
-        .map_err(|error| format!("failed to re-establish control-plane authority clock: {error}"))
+) -> Result<storage::ControlPlaneAuthorityClockAdminStatus, String> {
+    build_authority_clock_admin_client_from_command_auth_env(socket_path)?
+        .reestablish()
+        .map_err(|error| error.to_string())
 }
 
 fn control_plane_clock_recovery_socket_path(control_plane_socket_path: &Path) -> PathBuf {
@@ -1073,26 +1069,6 @@ fn control_plane_clock_recovery_socket_path(control_plane_socket_path: &Path) ->
         hash = hash.wrapping_mul(FNV_PRIME);
     }
     control_plane_socket_path.with_file_name(format!(".c-{hash:016x}"))
-}
-
-fn format_authority_clock_status(status: ControlPlaneAuthorityClockStatus) -> String {
-    format!(
-        "generation={} established={} blocked_reason={:?} committed_timestamp_high_water_ms={} bound_raft_term={} current_raft_term={} local_raft_authority_leader={} local_raft_authority_serving={}",
-        status.generation(),
-        status.established(),
-        status.blocked_reason(),
-        status
-            .committed_timestamp_high_water_ms()
-            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
-        status
-            .bound_raft_leadership_term()
-            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
-        status
-            .current_raft_leadership_term()
-            .map_or_else(|| "-".to_owned(), |value| value.to_string()),
-        status.local_raft_authority_leader(),
-        status.local_raft_authority_serving(),
-    )
 }
 
 fn fence_control_plane_pg_for_metadata_transfer_live(
@@ -4476,61 +4452,6 @@ impl FrontendControlPlaneClient {
     }
 }
 
-impl AdminControlPlaneClient {
-    fn authority_clock_status(&self) -> Result<ControlPlaneAuthorityClockStatus, String> {
-        match self {
-            Self::Plain(_) => {
-                Err("authority-clock status requires authenticated admin credentials".to_owned())
-            }
-            Self::Authenticated(client) => client
-                .authority_clock_status(storage::clock::current_time_millis())
-                .map_err(|error| error.to_string()),
-        }
-    }
-
-    fn reestablish_authority_clock(&self) -> Result<ControlPlaneAuthorityClockStatus, String> {
-        match self {
-            Self::Plain(_) => Err(
-                "authority-clock re-establishment requires authenticated admin credentials"
-                    .to_owned(),
-            ),
-            Self::Authenticated(client) => client
-                .reestablish_authority_clock(storage::clock::current_time_millis())
-                .map_err(|error| error.to_string()),
-        }
-    }
-
-    fn transfer_raft_leadership_to(
-        &self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> Result<(), ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.transfer_raft_leadership_to(node_id),
-            Self::Authenticated(client) => {
-                client.transfer_raft_leadership_to(node_id, storage::clock::current_time_millis())
-            }
-        }
-    }
-
-    fn trigger_raft_snapshot_and_purge(&self) -> Result<Option<u64>, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.trigger_raft_snapshot_and_purge(),
-            Self::Authenticated(client) => {
-                client.trigger_raft_snapshot_and_purge(storage::clock::current_time_millis())
-            }
-        }
-    }
-
-    fn trigger_raft_election(&self) -> Result<(), ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.trigger_raft_election(),
-            Self::Authenticated(client) => {
-                client.trigger_raft_election(storage::clock::current_time_millis())
-            }
-        }
-    }
-}
-
 fn configured_storage_node_auth_credential(
     configured: &ConfiguredControlPlaneStorageAuthCredential,
 ) -> Result<ControlPlaneStorageNodeAuthCredential, String> {
@@ -4796,6 +4717,37 @@ fn build_pg_admin_control_plane_client_from_command_auth_env(
             Some(client.credential().clone()),
         ),
     })
+}
+
+fn build_raft_admin_control_plane_client_from_command_auth_env(
+    control_plane_socket_path: &Path,
+) -> Result<storage::ControlPlaneRaftAdminClient, String> {
+    let admin = build_admin_control_plane_client_from_command_auth_env(control_plane_socket_path)?;
+    Ok(match admin {
+        AdminControlPlaneClient::Plain(client) => {
+            storage::ControlPlaneRaftAdminClient::new(client, None)
+        }
+        AdminControlPlaneClient::Authenticated(client) => {
+            storage::ControlPlaneRaftAdminClient::new(
+                client.inner().clone(),
+                Some(client.credential().clone()),
+            )
+        }
+    })
+}
+
+fn build_authority_clock_admin_client_from_command_auth_env(
+    control_plane_socket_path: &Path,
+) -> Result<storage::ControlPlaneAuthorityClockAdminClient, String> {
+    let admin = build_admin_clock_recovery_client_from_command_auth_env(control_plane_socket_path)?;
+    let (client, credential) = match admin {
+        AdminControlPlaneClient::Plain(client) => (client, None),
+        AdminControlPlaneClient::Authenticated(client) => {
+            (client.inner().clone(), Some(client.credential().clone()))
+        }
+    };
+    storage::ControlPlaneAuthorityClockAdminClient::new(client, credential)
+        .map_err(|error| error.to_string())
 }
 
 fn static_cluster_command_configured() -> bool {

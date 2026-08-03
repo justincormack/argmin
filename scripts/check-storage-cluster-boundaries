@@ -4154,6 +4154,67 @@ fail_with_matches \
     "Manual PG administration facades must retain clients, topology, proofs, and diagnostics opaquely and expose only their bounded logical operations" \
     "$manual_pg_admin_opaque_surface_leaks"
 
+operator_admin_direct_dispatch_leaks=$(
+    rg -n --color=never \
+        '\.(authority_clock_status|reestablish_authority_clock|transfer_raft_leadership_to|trigger_raft_snapshot_and_purge|trigger_raft_election)\(' \
+        crates/argmin-s3/src/main.rs \
+        || true
+)
+fail_with_matches \
+    "Production operator commands must dispatch Raft and authority-clock administration through storage-owned opaque capabilities" \
+    "$operator_admin_direct_dispatch_leaks"
+
+operator_admin_representation_leaks=$(
+    rg -n --color=never \
+        '\bControlPlaneAuthorityClockStatus\b' \
+        crates/argmin-s3/src/main.rs \
+        || true
+)
+fail_with_matches \
+    "Authority-clock operator commands must receive the storage-rendered opaque status rather than interpreting clock state" \
+    "$operator_admin_representation_leaks"
+
+operator_admin_opaque_surface_leaks=$(
+    {
+        rg -n -U --color=never \
+            'pub struct (ControlPlaneRaftAdminClient|ControlPlaneAuthorityClockAdminClient|ControlPlaneAuthorityClockAdminStatus|ControlPlaneOperatorAdminError)\(pub|pub struct (ControlPlaneRaftAdminClient|ControlPlaneAuthorityClockAdminClient|ControlPlaneAuthorityClockAdminStatus|ControlPlaneOperatorAdminError)[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:' \
+            crates/storage/src/control_plane_operator_admin.rs \
+            || true
+        rg -n -U --color=never \
+            '#\[derive\([^]]*(Debug|Clone|Copy|PartialEq|Eq)[^]]*\)\][[:space:]]*pub struct (ControlPlaneRaftAdminClient|ControlPlaneAuthorityClockAdminClient|ControlPlaneAuthorityClockAdminStatus|ControlPlaneOperatorAdminError)' \
+            crates/storage/src/control_plane_operator_admin.rs \
+            || true
+        awk '
+        /impl (ControlPlaneRaftAdminClient|ControlPlaneAuthorityClockAdminClient|ControlPlaneAuthorityClockAdminStatus|ControlPlaneOperatorAdminError)[[:space:]]*\{/ {
+            in_operator_admin_impl = 1
+            operator_admin_impl = $0
+            sub(/^.*impl /, "", operator_admin_impl)
+            sub(/[[:space:]]*\{.*/, "", operator_admin_impl)
+            depth = 0
+        }
+        in_operator_admin_impl {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if ((operator_admin_impl == "ControlPlaneRaftAdminClient" && method != "new" && method != "transfer_leadership_to" && method != "trigger_snapshot_and_purge" && method != "trigger_election") || (operator_admin_impl == "ControlPlaneAuthorityClockAdminClient" && method != "new" && method != "status" && method != "reestablish") || operator_admin_impl == "ControlPlaneAuthorityClockAdminStatus" || operator_admin_impl == "ControlPlaneOperatorAdminError") {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_operator_admin_impl = 0
+            }
+        }
+        ' crates/storage/src/control_plane_operator_admin.rs
+    }
+)
+fail_with_matches \
+    "Operator administration facades must retain transport, clock state, and diagnostics opaquely and expose only their bounded logical operations" \
+    "$operator_admin_opaque_surface_leaks"
+
 control_plane_client_wire_leaks=$(
     rg -n --color=never \
         '\bControlPlaneRpcFrame(Transport|Exchange|ExchangeError)\b|\bwith_frame_transport\b|\bconnect_unix_stream_until\b' \

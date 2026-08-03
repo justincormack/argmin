@@ -1363,6 +1363,28 @@ diagnostics, or a general runtime-map-source implementation on the opaque facade
 control-plane administration, authority-clock/Raft operator commands, transport bootstrap, and
 the process-hosted control-plane authority implementation remain pending parts of item 4.
 
+The twenty-ninth bounded slice contains the authority-clock and Raft operator-command seam.
+Ordinary Raft leadership transfer, snapshot/purge, and election commands now pass only a logical
+Raft node integer through an opaque `ControlPlaneRaftAdminClient`; storage owns plain-versus-signed
+dispatch, operation-specific RPC behavior, response-loss classification, and retained transport
+diagnostics. Authority-clock status and re-establishment use a distinct
+`ControlPlaneAuthorityClockAdminClient` that cannot be constructed without an authenticated admin
+credential whose scoped principal is explicitly `Admin`, so neither an unauthenticated recovery
+endpoint nor a frontend, storage-node, or service credential can become an authority-clock
+administrative capability.
+The process no longer receives or interprets `ControlPlaneAuthorityClockStatus`; storage returns an
+opaque status with an exact owner-rendered operator display and a redacted debug view. Both
+capabilities retain implementation causes behind a generic public error whose `Display`, `Debug`,
+and `source()` cannot expose endpoints, routes, epochs, proofs, or remote diagnostics. Owner-local
+tests pin no-network rejection of missing and wrong-principal credentials, exact established and
+blocked status rendering, opaque debug, authenticated dispatch, and retained-error redaction. The
+repository boundary check rejects direct raw operator RPC calls,
+clock-status interpretation in `argmin-s3`, and expanded or derived public surfaces on the opaque
+facades. Recovery endpoint derivation and credential/transport assembly remain part of the pending
+transport-bootstrap slice; the authority clock and Raft authority implementations remain pending
+with the process-hosted control-plane authority slice. Residual static control-plane bootstrap and
+administration likewise remain pending parts of item 4.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1649,10 +1671,12 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     runtime-map reconstruction, artifact movement, and retry classification, is contained behind
     an opaque storage-owned administration operation. Manual operator PG acting-set, fence,
     metadata-transfer installation, offline state mutation, and scoped readiness operations are
-    also storage-owned and accept only logical integers or opaque inputs from the process. The
-    remaining work is to contain residual static control-plane administration, authority-clock and
-    Raft operator commands, transport bootstrap, and the process-hosted control-plane authority
-    implementation.
+    also storage-owned and accept only logical integers or opaque inputs from the process.
+    Authority-clock and Raft operator commands are now contained behind separate opaque
+    storage-owned capabilities, with storage-rendered status and redacted retained diagnostics. The
+    remaining work is to contain residual static control-plane bootstrap and administration,
+    recovery endpoint and credential/transport assembly, transport bootstrap, and the
+    process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move
