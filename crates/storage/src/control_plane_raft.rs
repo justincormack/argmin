@@ -80,7 +80,9 @@ use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
 };
-use crate::static_topology::StaticInitialControlPlaneTopology;
+use crate::static_topology::{
+    StaticInitialControlPlaneTopology, UncertifiedInitialControlPlaneTopology,
+};
 use crate::PgId;
 use crate::{ClusterEpoch, PgState};
 
@@ -2561,6 +2563,28 @@ impl SubmittedControlPlaneRaftCommand {
     #[must_use]
     pub fn into_outcome(self) -> ControlPlaneRaftCommandOutcome {
         self.outcome
+    }
+}
+
+/// Opaque committed/rejected result of submitting an uncertified initial
+/// topology.
+///
+/// The value binds the submitted command to the exact owner-built topology and
+/// issuing Raft authority. The process may hold it across its durable
+/// response-publication step but cannot inspect or replace the Raft outcome
+/// before storage resolves it.
+pub struct UncertifiedInitialControlPlaneTopologySubmission {
+    authority_instance: Arc<()>,
+    topology: UncertifiedInitialControlPlaneTopology,
+    submitted: SubmittedControlPlaneRaftCommand,
+}
+
+impl fmt::Debug for UncertifiedInitialControlPlaneTopologySubmission {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UncertifiedInitialControlPlaneTopologySubmission")
+            .field("diagnostic", &"<redacted>")
+            .finish_non_exhaustive()
     }
 }
 
@@ -5411,6 +5435,85 @@ impl ControlPlaneRaftAuthority {
         self.validate_static_initial_topology_binding(topology)?;
         self.submit_control_plane_command(topology.bootstrap_command())
             .await
+    }
+
+    /// Observe and, when necessary, submit the environment-configured
+    /// uncertified initial topology.
+    ///
+    /// The returned submitted command remains subject to the caller's existing
+    /// durable response-publication protocol. `None` means the topology was
+    /// either not configured or control-plane state was already initialized.
+    pub async fn prepare_uncertified_initial_control_plane_topology(
+        &self,
+        topology: &UncertifiedInitialControlPlaneTopology,
+    ) -> Result<Option<UncertifiedInitialControlPlaneTopologySubmission>, ControlPlaneError> {
+        let snapshot = self.current_control_plane_snapshot().await?;
+        if topology.initialized_epoch(&snapshot).is_some() {
+            return Ok(None);
+        }
+        let Some(command) = topology.bootstrap_command() else {
+            return Ok(None);
+        };
+        self.submit_control_plane_command(command)
+            .await
+            .map(|submitted| {
+                Some(UncertifiedInitialControlPlaneTopologySubmission {
+                    authority_instance: Arc::clone(&self.checkpoint_instance),
+                    topology: topology.clone(),
+                    submitted,
+                })
+            })
+    }
+
+    /// Resolve a published uncertified-topology submission without exposing
+    /// empty-state or concurrent-bootstrap classification to the process
+    /// layer.
+    ///
+    /// A bootstrap rejection or leader-routing race is accepted only after a
+    /// fresh authority read proves that some initial topology now exists.
+    pub async fn resolve_uncertified_initial_control_plane_topology_submission(
+        &self,
+        submission: UncertifiedInitialControlPlaneTopologySubmission,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        let UncertifiedInitialControlPlaneTopologySubmission {
+            authority_instance,
+            topology,
+            submitted,
+        } = submission;
+        if !Arc::ptr_eq(&authority_instance, &self.checkpoint_instance) {
+            return Err(ControlPlaneError::rpc_remote(
+                "uncertified initial-topology submission belongs to another authority instance"
+                    .to_owned(),
+            ));
+        }
+        let result = match submitted.into_outcome() {
+            ControlPlaneRaftCommandOutcome::Applied(response) => Ok(response),
+            ControlPlaneRaftCommandOutcome::Rejected(error) => Err(error),
+        };
+        match result {
+            Ok(ControlPlaneCommandResponse::BootstrapInitialClusterMap) => {
+                let snapshot = self.current_control_plane_snapshot().await?;
+                topology.initialized_epoch(&snapshot).map(Some).ok_or_else(|| {
+                    ControlPlaneError::invariant_failure(
+                        "successful uncertified initial-topology submission left control-plane state empty",
+                    )
+                })
+            }
+            Ok(_) => Err(ControlPlaneError::invariant_failure(
+                "uncertified initial-topology submission returned the wrong response",
+            )),
+            Err(error)
+                if matches!(error, ControlPlaneError::BootstrapRequiresEmptyState)
+                    || error.is_control_plane_leader_routing_rejection() =>
+            {
+                let snapshot = self.current_control_plane_snapshot().await?;
+                match topology.initialized_epoch(&snapshot) {
+                    Some(epoch) => Ok(Some(epoch)),
+                    None => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Wait until the applied Raft membership exactly matches the static peer
@@ -20149,6 +20252,201 @@ mod tests {
             placement,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn uncertified_topology_submission_owns_empty_state_and_concurrent_success_classification() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let node_id = 1;
+            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "control-plane-raft-uncertified-topology-test",
+                node_id,
+            )
+            .await
+            .unwrap();
+            authority
+                .initialize_single_node_membership(node_id)
+                .await
+                .unwrap();
+            wait_for_local_leader(
+                authority.raft(),
+                "uncertified topology submission test leadership",
+            )
+            .await;
+            wait_for_authority_status_matching(
+                &authority,
+                IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+                "uncertified topology submission authority becomes serving",
+                ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+            )
+            .await;
+            let topology = crate::derive_uncertified_initial_control_plane_topology(
+                &[crate::StaticStorageNodeEndpoint::new(
+                    11,
+                    "/tmp/storage-node-11.sock",
+                )],
+                &[7],
+            )
+            .unwrap();
+
+            let empty_rejection = authority
+                .resolve_uncertified_initial_control_plane_topology_submission(
+                    UncertifiedInitialControlPlaneTopologySubmission {
+                        authority_instance: Arc::clone(&authority.checkpoint_instance),
+                        topology: topology.clone(),
+                        submitted: SubmittedControlPlaneRaftCommand {
+                            log_id: raft_log_id(1, node_id, 1),
+                            outcome: ControlPlaneRaftCommandOutcome::Rejected(
+                                ControlPlaneError::BootstrapRequiresEmptyState,
+                            ),
+                        },
+                    },
+                )
+                .await
+                .expect_err("an empty authority must not accept a concurrent-success claim");
+            assert!(matches!(
+                empty_rejection,
+                ControlPlaneError::BootstrapRequiresEmptyState
+            ));
+
+            let submitted = authority
+                .prepare_uncertified_initial_control_plane_topology(&topology)
+                .await
+                .unwrap()
+                .expect("empty authority should submit the owner-built bootstrap command");
+            assert_eq!(
+                format!("{submitted:?}"),
+                "UncertifiedInitialControlPlaneTopologySubmission { diagnostic: \"<redacted>\", .. }"
+            );
+            let epoch = authority
+                .resolve_uncertified_initial_control_plane_topology_submission(submitted)
+                .await
+                .unwrap()
+                .expect("applied bootstrap should report its logical epoch");
+            let snapshot = authority.current_control_plane_snapshot().await.unwrap();
+            assert_eq!(epoch, snapshot.cluster_epoch().get());
+            assert!(snapshot.node(NodeId::new(11)).is_some());
+            assert!(snapshot.pg(PgId::new(7)).is_some());
+            assert!(authority
+                .prepare_uncertified_initial_control_plane_topology(&topology)
+                .await
+                .unwrap()
+                .is_none());
+
+            assert_eq!(
+                authority
+                    .resolve_uncertified_initial_control_plane_topology_submission(
+                        UncertifiedInitialControlPlaneTopologySubmission {
+                            authority_instance: Arc::clone(&authority.checkpoint_instance),
+                            topology: topology.clone(),
+                            submitted: SubmittedControlPlaneRaftCommand {
+                                log_id: raft_log_id(1, node_id, 2),
+                                outcome: ControlPlaneRaftCommandOutcome::Rejected(
+                                    ControlPlaneError::BootstrapRequiresEmptyState,
+                                ),
+                            },
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                Some(epoch),
+                "a rejection is concurrent success only after a fresh state observation"
+            );
+            authority.shutdown().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn uncertified_topology_submission_rejects_a_different_raft_authority() {
+        ControlPlaneRaftTypeConfig::run(async {
+            let authority_a = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "control-plane-raft-uncertified-authority-a",
+                1,
+            )
+            .await
+            .unwrap();
+            let authority_b = ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "control-plane-raft-uncertified-authority-b",
+                2,
+            )
+            .await
+            .unwrap();
+            for (authority, node_id, context) in [
+                (&authority_a, 1, "uncertified authority A becomes serving"),
+                (&authority_b, 2, "uncertified authority B becomes serving"),
+            ] {
+                authority
+                    .initialize_single_node_membership(node_id)
+                    .await
+                    .unwrap();
+                wait_for_local_leader(authority.raft(), context).await;
+                wait_for_authority_status_matching(
+                    authority,
+                    IN_MEMORY_RAFT_FIXTURE_CONVERGENCE_TIMEOUT,
+                    context,
+                    ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+                )
+                .await;
+            }
+            assert!(!Arc::ptr_eq(
+                &authority_a.checkpoint_instance,
+                &authority_b.checkpoint_instance
+            ));
+
+            let topology_a = crate::derive_uncertified_initial_control_plane_topology(
+                &[crate::StaticStorageNodeEndpoint::new(
+                    11,
+                    "/tmp/storage-node-a.sock",
+                )],
+                &[7],
+            )
+            .unwrap();
+            let topology_b = crate::derive_uncertified_initial_control_plane_topology(
+                &[crate::StaticStorageNodeEndpoint::new(
+                    22,
+                    "/tmp/storage-node-b.sock",
+                )],
+                &[8],
+            )
+            .unwrap();
+
+            let submission_b = authority_b
+                .prepare_uncertified_initial_control_plane_topology(&topology_b)
+                .await
+                .unwrap()
+                .unwrap();
+            let epoch_b = authority_b
+                .resolve_uncertified_initial_control_plane_topology_submission(submission_b)
+                .await
+                .unwrap()
+                .unwrap();
+            let submission_a = authority_a
+                .prepare_uncertified_initial_control_plane_topology(&topology_a)
+                .await
+                .unwrap()
+                .unwrap();
+
+            let crossed = authority_b
+                .resolve_uncertified_initial_control_plane_topology_submission(submission_a)
+                .await
+                .expect_err("authority B must reject authority A's opaque submission");
+            assert!(crossed.retained_diagnostic_contains(
+                "uncertified initial-topology submission belongs to another authority instance"
+            ));
+            let snapshot_b = authority_b.current_control_plane_snapshot().await.unwrap();
+            assert_eq!(snapshot_b.cluster_epoch().get(), epoch_b);
+            assert!(snapshot_b.node(NodeId::new(22)).is_some());
+            assert!(snapshot_b.node(NodeId::new(11)).is_none());
+            assert!(authority_a
+                .current_control_plane_snapshot()
+                .await
+                .unwrap()
+                .node(NodeId::new(11))
+                .is_some());
+
+            authority_a.shutdown().await.unwrap();
+            authority_b.shutdown().await.unwrap();
+        });
     }
 
     #[test]

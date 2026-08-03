@@ -1,4 +1,6 @@
-use crate::control_plane::{ClusterControlSnapshot, InitialClusterTopologyCertificate};
+use crate::control_plane::{
+    ClusterControlSnapshot, ControlPlaneError, InitialClusterTopologyCertificate,
+};
 use crate::control_plane_command::{
     encode_control_plane_command, ControlPlaneCommand, ControlPlaneCommandStateMachine,
 };
@@ -89,6 +91,57 @@ pub struct StaticInitialControlPlaneTopology {
     nodes: Vec<(PlacementNodeId, String)>,
     pg_acting_sets: Vec<(PgId, Vec<PlacementNodeId>)>,
     certificate: InitialClusterTopologyCertificate,
+}
+
+/// Opaque storage-owned initial topology for the environment-only control
+/// plane configuration path.
+///
+/// Unlike [`StaticInitialControlPlaneTopology`], this legacy configuration has
+/// no outer manifest identity from which storage can derive a certificate.
+/// Storage still owns conversion of the logical node and PG integers into the
+/// private bootstrap command, validates that command before startup, and keeps
+/// those representations out of the process layer.
+#[derive(Clone)]
+pub struct UncertifiedInitialControlPlaneTopology {
+    nodes: Vec<(PlacementNodeId, String)>,
+    pg_ids: Vec<PgId>,
+}
+
+impl UncertifiedInitialControlPlaneTopology {
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    #[must_use]
+    pub fn pg_count(&self) -> usize {
+        self.pg_ids.len()
+    }
+
+    pub(crate) fn bootstrap_command(&self) -> Option<ControlPlaneCommand> {
+        if self.nodes.is_empty() {
+            return None;
+        }
+        Some(ControlPlaneCommand::BootstrapInitialClusterMap {
+            nodes: self.nodes.clone(),
+            pg_ids: self.pg_ids.clone(),
+        })
+    }
+
+    pub(crate) fn initialized_epoch(&self, snapshot: &ClusterControlSnapshot) -> Option<u64> {
+        (snapshot.nodes().next().is_some() || snapshot.pgs().next().is_some())
+            .then(|| snapshot.cluster_epoch().get())
+    }
+}
+
+impl fmt::Debug for UncertifiedInitialControlPlaneTopology {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UncertifiedInitialControlPlaneTopology")
+            .field("node_count", &self.nodes.len())
+            .field("pg_count", &self.pg_ids.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl StaticInitialControlPlaneTopology {
@@ -187,6 +240,15 @@ impl StaticStorageTopologyError {
             message: message.into(),
         }
     }
+
+    /// Translate this owner-formatted logical configuration failure into the
+    /// control-plane error boundary used by the process-hosted authority.
+    #[must_use]
+    pub fn into_control_plane_error(self) -> ControlPlaneError {
+        ControlPlaneError::InvalidInitialTopology {
+            message: self.message,
+        }
+    }
 }
 
 impl fmt::Debug for StaticStorageTopologyError {
@@ -277,6 +339,58 @@ pub fn derive_static_initial_control_plane_topology(
     ClusterControlSnapshot::empty()
         .apply_control_plane_command(topology.bootstrap_command())
         .map_err(|error| StaticStorageTopologyError::new(error.to_string()))?;
+    Ok(topology)
+}
+
+/// Validate logical environment configuration and retain its uncertified
+/// initial control-plane topology behind an opaque storage-owned value.
+pub fn derive_uncertified_initial_control_plane_topology(
+    node_endpoints: &[StaticStorageNodeEndpoint],
+    pg_ids: &[u32],
+) -> Result<UncertifiedInitialControlPlaneTopology, StaticStorageTopologyError> {
+    let mut endpoints = BTreeMap::new();
+    for node in node_endpoints {
+        if node.endpoint.is_empty() {
+            return Err(StaticStorageTopologyError::new(format!(
+                "environment storage node {} has an empty endpoint",
+                node.node_id
+            )));
+        }
+        if endpoints
+            .insert(node.node_id, node.endpoint.clone())
+            .is_some()
+        {
+            return Err(StaticStorageTopologyError::new(format!(
+                "environment storage node {} has duplicate endpoints",
+                node.node_id
+            )));
+        }
+    }
+    let topology = UncertifiedInitialControlPlaneTopology {
+        nodes: endpoints
+            .into_iter()
+            .map(|(node_id, endpoint)| (PlacementNodeId::new(node_id), endpoint))
+            .collect(),
+        pg_ids: pg_ids.iter().copied().map(PgId::new).collect(),
+    };
+    let Some(command) = topology.bootstrap_command() else {
+        // Preserve the existing environment behavior: no configured storage
+        // nodes means there is no initial-map bootstrap, irrespective of the
+        // default PG list.
+        return Ok(topology);
+    };
+    validate_control_plane_command_replication_size(&command).map_err(|error| {
+        StaticStorageTopologyError::new(format!(
+            "environment initial control-plane topology exceeds the replication envelope: {error}"
+        ))
+    })?;
+    ClusterControlSnapshot::empty()
+        .apply_control_plane_command(command)
+        .map_err(|error| {
+            StaticStorageTopologyError::new(format!(
+                "environment initial control-plane topology is invalid: {error}"
+            ))
+        })?;
     Ok(topology)
 }
 
@@ -562,6 +676,72 @@ mod tests {
             placement,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn uncertified_initial_topology_owns_and_validates_the_legacy_bootstrap_command() {
+        let topology = derive_uncertified_initial_control_plane_topology(
+            &[
+                StaticStorageNodeEndpoint::new(2, "/tmp/node-2.sock"),
+                StaticStorageNodeEndpoint::new(1, "/tmp/node-1.sock"),
+            ],
+            &[7, 3],
+        )
+        .unwrap();
+
+        assert_eq!(topology.node_count(), 2);
+        assert_eq!(topology.pg_count(), 2);
+        assert_eq!(
+            format!("{topology:?}"),
+            "UncertifiedInitialControlPlaneTopology { node_count: 2, pg_count: 2, .. }"
+        );
+        let command = topology.bootstrap_command().unwrap();
+        assert_eq!(
+            command,
+            ControlPlaneCommand::BootstrapInitialClusterMap {
+                nodes: vec![
+                    (PlacementNodeId::new(1), "/tmp/node-1.sock".to_owned()),
+                    (PlacementNodeId::new(2), "/tmp/node-2.sock".to_owned()),
+                ],
+                pg_ids: vec![PgId::new(7), PgId::new(3)],
+            }
+        );
+        let applied = ClusterControlSnapshot::empty()
+            .apply_control_plane_command(command)
+            .unwrap();
+        assert_eq!(
+            topology.initialized_epoch(applied.snapshot()),
+            Some(applied.snapshot().cluster_epoch().get())
+        );
+    }
+
+    #[test]
+    fn uncertified_initial_topology_preserves_no_node_noop_and_rejects_invalid_inputs() {
+        let empty = derive_uncertified_initial_control_plane_topology(&[], &[1, 2]).unwrap();
+        assert_eq!(empty.node_count(), 0);
+        assert_eq!(empty.pg_count(), 2);
+        assert!(empty.bootstrap_command().is_none());
+
+        let duplicate_endpoint = derive_uncertified_initial_control_plane_topology(
+            &[
+                StaticStorageNodeEndpoint::new(1, "/tmp/node-1.sock"),
+                StaticStorageNodeEndpoint::new(1, "/tmp/other-node-1.sock"),
+            ],
+            &[1],
+        )
+        .unwrap_err();
+        assert!(duplicate_endpoint
+            .to_string()
+            .contains("environment storage node 1 has duplicate endpoints"));
+
+        let duplicate_pg = derive_uncertified_initial_control_plane_topology(
+            &[StaticStorageNodeEndpoint::new(1, "/tmp/node-1.sock")],
+            &[1, 1],
+        )
+        .unwrap_err();
+        assert!(duplicate_pg
+            .to_string()
+            .contains("control-plane bootstrap repeats PG 1"));
     }
 
     #[test]

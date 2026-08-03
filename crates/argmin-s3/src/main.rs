@@ -2116,6 +2116,25 @@ impl ExperimentalRaftControlPlane {
         self.finish_submitted_raft_command(submitted, true)
     }
 
+    fn establish_raft_uncertified_initial_topology(
+        &mut self,
+        topology: &storage::UncertifiedInitialControlPlaneTopology,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        self.ensure_not_durably_poisoned()?;
+        let Some(submitted) = self.block_on(
+            self.authority
+                .prepare_uncertified_initial_control_plane_topology(topology),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.checkpoint_committed_raft_command()?;
+        self.block_on(
+            self.authority
+                .resolve_uncertified_initial_control_plane_topology_submission(submitted),
+        )
+    }
+
     fn finish_submitted_raft_command(
         &mut self,
         submitted: SubmittedControlPlaneRaftCommand,
@@ -2123,18 +2142,23 @@ impl ExperimentalRaftControlPlane {
     ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
         let outcome = submitted.into_outcome();
         if checkpoint_after_commit {
-            if let Err(error) = self.store_durable_restart_artifact() {
-                self.poison_durable_authority(format!(
-                    "experimental OpenRaft control-plane durability checkpoint failed after a \
-                     committed command; refusing to serve until restart: {error}"
-                ));
-                return Err(error);
-            }
+            self.checkpoint_committed_raft_command()?;
         }
         match outcome {
             ControlPlaneRaftCommandOutcome::Applied(response) => Ok(response),
             ControlPlaneRaftCommandOutcome::Rejected(error) => Err(error),
         }
+    }
+
+    fn checkpoint_committed_raft_command(&self) -> Result<(), ControlPlaneError> {
+        if let Err(error) = self.store_durable_restart_artifact() {
+            self.poison_durable_authority(format!(
+                "experimental OpenRaft control-plane durability checkpoint failed after a \
+                 committed command; refusing to serve until restart: {error}"
+            ));
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
@@ -3963,6 +3987,21 @@ fn bootstrap_empty_experimental_raft_control_plane(
     authority: &mut ExperimentalRaftControlPlane,
     config: &ServerConfig,
 ) -> Result<(), ControlPlaneError> {
+    if config.static_initial_cluster_map.is_none() {
+        let topology = uncertified_initial_control_plane_topology(config)
+            .map_err(storage::StaticStorageTopologyError::into_control_plane_error)?;
+        let Some(epoch) = authority.establish_raft_uncertified_initial_topology(&topology)? else {
+            return Ok(());
+        };
+        process_info!(
+            "experimental OpenRaft control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
+            topology.node_count(),
+            topology.pg_count(),
+            epoch
+        );
+        return Ok(());
+    }
+
     if experimental_raft_control_plane_has_bootstrap_state(authority)? {
         return Ok(());
     }
@@ -3971,10 +4010,11 @@ fn bootstrap_empty_experimental_raft_control_plane(
     }
 
     let node_count = config.storage_node_sockets.len();
-    let submitted = match &config.static_initial_cluster_map {
-        Some(topology) => authority.submit_raft_static_initial_topology(topology),
-        None => authority.submit_raft_command(initial_control_plane_bootstrap_command(config)),
-    };
+    let topology = config
+        .static_initial_cluster_map
+        .as_ref()
+        .expect("certified topology branch requires configured static initial topology");
+    let submitted = authority.submit_raft_static_initial_topology(topology);
     match submitted {
         Ok(_) => {}
         Err(error)
@@ -4023,25 +4063,17 @@ fn wait_for_initial_experimental_raft_control_plane_with(
     }
 }
 
-fn initial_control_plane_bootstrap_command(config: &ServerConfig) -> ControlPlaneCommand {
-    assert!(
-        config.static_initial_cluster_map.is_none(),
-        "static initial topology must use the storage-owned bootstrap operation"
-    );
-    let nodes = config
+fn uncertified_initial_control_plane_topology(
+    config: &ServerConfig,
+) -> Result<storage::UncertifiedInitialControlPlaneTopology, storage::StaticStorageTopologyError> {
+    let endpoints = config
         .storage_node_sockets
         .iter()
-        .map(|entry| (NodeId::new(entry.node_id), entry.socket_path.clone()))
-        .collect();
-    ControlPlaneCommand::BootstrapInitialClusterMap {
-        nodes,
-        pg_ids: config
-            .storage_pg_ids
-            .iter()
-            .copied()
-            .map(storage::PgId::new)
-            .collect(),
-    }
+        .map(|entry| {
+            storage::StaticStorageNodeEndpoint::new(entry.node_id, entry.socket_path.clone())
+        })
+        .collect::<Vec<_>>();
+    storage::derive_uncertified_initial_control_plane_topology(&endpoints, &config.storage_pg_ids)
 }
 
 fn wait_for_static_initial_control_plane_topology(
@@ -4104,33 +4136,19 @@ fn bootstrap_empty_control_plane(
     authority: &mut SingleAuthorityControlPlane<FileControlPlaneStore>,
     config: &ServerConfig,
 ) -> Result<(), String> {
-    if authority.snapshot().nodes().next().is_some() {
+    let topology =
+        uncertified_initial_control_plane_topology(config).map_err(|error| error.to_string())?;
+    let Some(epoch) = authority
+        .establish_uncertified_initial_control_plane_topology(&topology)
+        .map_err(|error| error.to_string())?
+    else {
         return Ok(());
-    }
-    if config.storage_node_sockets.is_empty() {
-        return Ok(());
-    }
-
-    let nodes: Vec<(NodeId, String)> = config
-        .storage_node_sockets
-        .iter()
-        .map(|entry| (NodeId::new(entry.node_id), entry.socket_path.clone()))
-        .collect();
-    let pg_ids: Vec<storage::PgId> = config
-        .storage_pg_ids
-        .iter()
-        .copied()
-        .map(storage::PgId::new)
-        .collect();
-    let node_count = nodes.len();
-    authority
-        .bootstrap_initial_cluster_map(nodes, pg_ids)
-        .map_err(|error| error.to_string())?;
+    };
     process_info!(
         "control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
-        node_count,
-        config.storage_pg_ids.len(),
-        authority.snapshot().cluster_epoch()
+        topology.node_count(),
+        topology.pg_count(),
+        epoch
     );
     Ok(())
 }

@@ -1418,6 +1418,33 @@ initial-map path, the older process-hosted
 assembly, transport bootstrap, and the process-hosted authority implementation remain pending
 parts of item 4.
 
+The thirty-first bounded slice contains the environment-only uncertified initial-map path. The
+process converts its outer configuration entries only into logical storage-node endpoint values
+and supplies logical PG integers to `derive_uncertified_initial_control_plane_topology`.
+Storage canonicalizes and validates the endpoint set, constructs the private node/PG bootstrap
+representations, checks the command against an empty state machine and the Raft replication
+envelope, and retains it inside an opaque topology exposing only node and PG counts. The
+single-authority operation owns empty-state observation, durable application, idempotent
+already-initialized behavior, and the logical established epoch. The Raft authority similarly
+owns pre-submission empty-state observation and post-publication resolution: a bootstrap rejection
+or leader-routing race is concurrent success only after a fresh authority read proves that initial
+state now exists. The submitted outcome is bound to the exact owner-built topology and exact
+issuing Raft authority identity inside a one-use opaque value; another authority rejects the
+capability before inspecting its outcome or local state, and the process cannot inspect or replace
+the Raft result. The existing
+process-hosted wrapper still performs its required durable response publication while holding that
+value between the two owner operations; moving that wrapper remains a later part of item 4.
+Owner-local tests pin the unchanged legacy command shape, invalid endpoint/PG rejection,
+no-node no-op, single-authority durability and idempotence, successful Raft submission,
+concurrent-success rejection before versus acceptance after initialization, and deterministic
+two-authority crossing rejection. Process tests retain
+startup composition and durable-publication failure behavior. The repository boundary check
+rejects rebuilding the uncertified command or node/PG representations in the process bootstrap
+functions and rejects expanding the opaque topology beyond its logical counts. The older
+process-hosted `ExperimentalRaftControlPlane` wrapper, residual certified-static administration,
+recovery endpoint and credential/transport assembly, transport bootstrap, and the process-hosted
+authority implementation remain pending parts of item 4.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1710,11 +1737,12 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     metadata-transfer installation, offline state mutation, and scoped readiness operations are
     also storage-owned and accept only logical integers or opaque inputs from the process.
     Authority-clock and Raft operator commands are now contained behind separate opaque
-    storage-owned capabilities, with storage-rendered status and redacted retained diagnostics. The
-    remaining work is to contain the environment-only uncertified initial-map path, the older
-    process-hosted bootstrap wrapper and residual static administration, recovery endpoint and
-    credential/transport assembly, transport bootstrap, and the process-hosted control-plane
-    authority implementation.
+    storage-owned capabilities, with storage-rendered status and redacted retained diagnostics.
+    The environment-only uncertified initial-map path is now contained behind an opaque
+    storage-owned topology and authority operations. The remaining work is to contain the older
+    process-hosted bootstrap wrapper and residual certified-static administration, recovery
+    endpoint and credential/transport assembly, transport bootstrap, and the process-hosted
+    control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

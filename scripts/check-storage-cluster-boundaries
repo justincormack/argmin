@@ -3027,6 +3027,129 @@ fail_with_matches \
     "Static initial topology certificates, certified bootstrap commands, and applied-certificate inspection must remain owned by storage" \
     "$argmin_static_initial_topology_representation_leaks"
 
+argmin_uncertified_initial_topology_representation_leaks=$(
+    {
+        rg -n --color=never \
+            '\binitial_control_plane_bootstrap_command\b|\.bootstrap_initial_cluster_map\(' \
+            crates/argmin-s3/src \
+            -g '*.rs' \
+            || true
+        awk '
+        /^fn bootstrap_empty_(experimental_raft_)?control_plane\(/ {
+            in_bootstrap = 1
+            depth = 0
+        }
+        in_bootstrap {
+            if ($0 ~ /ControlPlaneCommand::BootstrapInitialClusterMap|NodeId::new\(|PgId::new\(|\.snapshot\(\)\.nodes\(\)/) {
+                print FILENAME ":" FNR ":" $0
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_bootstrap = 0
+            }
+        }
+        ' crates/argmin-s3/src/main.rs
+    }
+)
+fail_with_matches \
+    "Environment initial-map construction, raw topology inspection, and direct bootstrap commands must remain owned by storage" \
+    "$argmin_uncertified_initial_topology_representation_leaks"
+
+uncertified_initial_topology_opaque_surface_leaks=$(
+    awk '
+    /pub struct UncertifiedInitialControlPlaneTopology[[:space:]]*\{/ {
+        in_topology = 1
+        depth = 0
+    }
+    in_topology {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_topology = 0
+        }
+    }
+    /impl UncertifiedInitialControlPlaneTopology[[:space:]]*\{/ {
+        in_impl = 1
+        depth = 0
+    }
+    in_impl {
+        if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+            method = $0
+            sub(/^.*fn[[:space:]]+/, "", method)
+            sub(/\(.*/, "", method)
+            if (method != "node_count" && method != "pg_count") {
+                print FILENAME ":" FNR ":" $0
+            }
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_impl = 0
+        }
+    }
+    ' crates/storage/src/static_topology.rs
+)
+fail_with_matches \
+    "The uncertified initial topology must expose only logical counts, not retained node, PG, or command representations" \
+    "$uncertified_initial_topology_opaque_surface_leaks"
+
+uncertified_initial_topology_submission_surface_leaks=$(
+    awk '
+    /#\[derive\(/ {
+        derive = $0
+        next
+    }
+    /pub struct UncertifiedInitialControlPlaneTopologySubmission[[:space:]]*\{/ {
+        if (derive ~ /Clone|PartialEq|Eq/) {
+            print FILENAME ":" FNR ":" derive
+        }
+        in_submission = 1
+        depth = 0
+    }
+    in_submission {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_submission = 0
+        }
+    }
+    /impl UncertifiedInitialControlPlaneTopologySubmission[[:space:]]*\{/ {
+        in_impl = 1
+        depth = 0
+    }
+    in_impl {
+        if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_impl = 0
+        }
+    }
+    {
+        if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+            derive = ""
+        }
+    }
+    ' crates/storage/src/control_plane_raft.rs
+)
+fail_with_matches \
+    "The uncertified initial-topology submission must remain one-use and opaque across durable publication" \
+    "$uncertified_initial_topology_submission_surface_leaks"
+
 argmin_static_raft_membership_representation_leaks=$(
     rg -n --color=never \
         '\.(effective|applied)_(membership_log_id|voters|learners)\(|\bestablished_peer_policy_convergence\b|\bvalidate_established_peer_policy\b|\bControlPlaneRaftEstablishedPeerPolicyConvergence\b' \

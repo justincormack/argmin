@@ -42,6 +42,7 @@ use crate::durable_journal::{
     DurableJournalAppendError, DurableJournalFile, DurableJournalFormat, DurableJournalIoContexts,
     DurableJournalObserver,
 };
+use crate::static_topology::UncertifiedInitialControlPlaneTopology;
 use crate::{
     ClusterEpoch, PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
     PgClusterMapHistoryRouteReferences, PgId, PgState, RouteMapValidity,
@@ -9411,6 +9412,27 @@ impl<S: ControlPlaneStore> SingleAuthorityControlPlane<S> {
             pg_ids,
         })?;
         Ok(self.snapshot.clone())
+    }
+
+    /// Establish the environment-configured uncertified initial topology if
+    /// this authority has no control-plane state yet.
+    ///
+    /// `Ok(None)` means either no storage nodes were configured or an initial
+    /// topology was already present. `Ok(Some(epoch))` means this call
+    /// durably established the supplied topology at the returned logical
+    /// cluster epoch.
+    pub fn establish_uncertified_initial_control_plane_topology(
+        &mut self,
+        topology: &UncertifiedInitialControlPlaneTopology,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        if topology.initialized_epoch(&self.snapshot).is_some() {
+            return Ok(None);
+        }
+        let Some(command) = topology.bootstrap_command() else {
+            return Ok(None);
+        };
+        self.apply_and_commit_command(command)?;
+        Ok(Some(self.snapshot.cluster_epoch().get()))
     }
 
     pub fn set_pg_acting_set(
@@ -41030,6 +41052,70 @@ mod tests {
             ),
             Err(ControlPlaneError::BootstrapRequiresEmptyState)
         ));
+    }
+
+    #[test]
+    fn single_authority_uncertified_topology_bootstrap_is_owner_validated_and_idempotent() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        let topology = crate::derive_uncertified_initial_control_plane_topology(
+            &[
+                crate::StaticStorageNodeEndpoint::new(2, "/tmp/node-2.sock"),
+                crate::StaticStorageNodeEndpoint::new(4, "/tmp/node-4.sock"),
+            ],
+            &[0, 3],
+        )
+        .unwrap();
+
+        let established_epoch = authority
+            .establish_uncertified_initial_control_plane_topology(&topology)
+            .unwrap()
+            .expect("empty authority should establish the configured topology");
+        assert_eq!(
+            established_epoch,
+            authority.snapshot().cluster_epoch().get()
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .nodes()
+                .map(NodeControlRecord::node_id)
+                .collect::<Vec<_>>(),
+            vec![NodeId::new(2), NodeId::new(4)]
+        );
+        assert!(store.load().unwrap().unwrap().pg(PgId::new(3)).is_some());
+
+        let crossed = crate::derive_uncertified_initial_control_plane_topology(
+            &[crate::StaticStorageNodeEndpoint::new(9, "/tmp/node-9.sock")],
+            &[9],
+        )
+        .unwrap();
+        assert_eq!(
+            authority
+                .establish_uncertified_initial_control_plane_topology(&crossed)
+                .unwrap(),
+            None
+        );
+        assert!(authority.snapshot().node(NodeId::new(9)).is_none());
+        assert!(authority.snapshot().pg(PgId::new(9)).is_none());
+    }
+
+    #[test]
+    fn single_authority_uncertified_topology_with_no_nodes_is_a_noop() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        let topology = crate::derive_uncertified_initial_control_plane_topology(&[], &[1]).unwrap();
+
+        assert_eq!(
+            authority
+                .establish_uncertified_initial_control_plane_topology(&topology)
+                .unwrap(),
+            None
+        );
+        assert!(authority.snapshot().nodes().next().is_none());
+        assert!(authority.snapshot().pgs().next().is_none());
     }
 
     #[test]
