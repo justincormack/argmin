@@ -528,7 +528,7 @@ impl LivePgMetadataTransferAdmin {
                 )
             })?;
         let source_route = peering_route(&source_runtime, pg_id)?;
-        if !route_matches_ignoring_global_epoch(&expected_source_route, source_route) {
+        if !transfer_route_matches(&expected_source_route, source_route) {
             return Err(format!(
                 "serving metadata transfer source for PG {} changed: expected route {:?}; actual route {:?}",
                 pg_id.get(), expected_source_route, source_route
@@ -902,7 +902,7 @@ impl LivePgMetadataTransferAdmin {
                         }
                     };
                     let refreshed_route = peering_route(&source_runtime, pg_id)?;
-                    if !route_matches_ignoring_global_epoch(source_route, refreshed_route) {
+                    if !transfer_route_matches(source_route, refreshed_route) {
                         return Err(format!(
                             "metadata transfer source route for PG {} changed while rebasing the destination epoch: expected {:?}; actual {:?}",
                             pg_id.get(), source_route, refreshed_route
@@ -989,7 +989,7 @@ impl LivePgMetadataTransferAdmin {
                     context.pg_id.get(), runtime_map.cluster_epoch().get(), context.expected_current_route
                 )
             })?;
-        if !route_matches_ignoring_global_epoch(&context.expected_current_route, current_route) {
+        if !transfer_route_matches(&context.expected_current_route, current_route) {
             return Err(format!(
                 "refreshed metadata transfer source for PG {} changed: expected route {:?}; actual route {:?} at authoritative epoch {}",
                 context.pg_id.get(), context.expected_current_route, current_route, runtime_map.cluster_epoch().get()
@@ -1180,7 +1180,7 @@ impl LivePgMetadataTransferAdmin {
                     context.pg_id.get()
                 )
             })?;
-        if !route_matches_ignoring_global_epoch(&expected_route, serving_route) {
+        if !transfer_route_matches(&expected_route, serving_route) {
             return Err(format!(
                 "serving metadata transfer destination for PG {} changed after scoped observation",
                 context.pg_id.get()
@@ -1296,11 +1296,8 @@ fn peering_source_route_matches(
     ))
 }
 
-fn route_matches_ignoring_global_epoch(
-    expected: &PgRouteSnapshot,
-    actual: &PgRouteSnapshot,
-) -> bool {
-    expected == &actual.with_cluster_epoch(expected.cluster_epoch())
+fn transfer_route_matches(expected: &PgRouteSnapshot, actual: &PgRouteSnapshot) -> bool {
+    expected.matches_metadata_transfer_route(actual)
 }
 
 fn active_route_matches(
@@ -1543,6 +1540,55 @@ mod tests {
         );
         assert_eq!(source_lease_wait_duration(1_250, 1_250), None);
         assert_eq!(source_lease_wait_duration(1_251, 1_250), None);
+    }
+
+    #[test]
+    fn transfer_route_stability_ignores_new_certified_peering_read_route() {
+        let tmp = test_util::tempdir();
+        let (authority, now_ms, pg_id, source_node_id, _) =
+            prepared_live_transfer_authority(tmp.path(), false);
+        let mut authority = authority.lock().unwrap();
+        authority.fence_pg_for_metadata_transfer(pg_id).unwrap();
+        let source_proof = authority
+            .snapshot()
+            .pg(pg_id)
+            .and_then(crate::control_plane::PgControlRecord::peering_metadata_proof_floor)
+            .unwrap();
+
+        let before = authority
+            .pg_runtime_map_snapshot(pg_id, now_ms.saturating_add(11))
+            .unwrap();
+        let before_route = before
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == pg_id)
+            .unwrap()
+            .clone();
+        assert_eq!(before_route.metadata_read_route(), None);
+
+        submit_heartbeat_until_serving(
+            &mut authority,
+            source_node_id,
+            tmp.path().join("source.sock").display().to_string(),
+            10_000,
+            vec![NodePgHeartbeatObservation {
+                pg_id,
+                state: PgState::Peering,
+                metadata_proof: source_proof,
+                pending_metadata_command: None,
+            }],
+            now_ms.saturating_add(20),
+        );
+        let after = authority
+            .serving_pg_runtime_map_snapshot(pg_id, now_ms.saturating_add(30))
+            .unwrap();
+        let after_route = after
+            .pg_routes()
+            .iter()
+            .find(|route| route.pg_id() == pg_id)
+            .unwrap();
+        assert!(after_route.metadata_read_route().is_some());
+        assert!(transfer_route_matches(&before_route, after_route));
     }
 
     #[test]

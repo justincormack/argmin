@@ -4890,6 +4890,14 @@ impl PgRouteSnapshot {
         route.cluster_epoch = cluster_epoch;
         route
     }
+
+    #[must_use]
+    pub(crate) fn matches_metadata_transfer_route(&self, other: &Self) -> bool {
+        self.without_serving_authority()
+            == other
+                .without_serving_authority()
+                .with_cluster_epoch(self.cluster_epoch)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5326,9 +5334,7 @@ impl ClusterRuntimeMapSnapshot {
             .iter()
             .find(|route| route.pg_id == pg_id)
             .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })?;
-        if current_route
-            != &expected_current_route.with_cluster_epoch(current_route.cluster_epoch())
-        {
+        if !expected_current_route.matches_metadata_transfer_route(current_route) {
             return Err(ControlPlaneError::rpc_protocol(format!(
                 "metadata-transfer source PG {} changed after its fence",
                 pg_id.get()
@@ -36916,6 +36922,14 @@ mod tests {
         snapshot.pg_routes[0].active_metadata_proof = None;
         snapshot.pg_routes[0].primary_lease_deadline_ms = None;
         let expected_current_route = snapshot.pg_routes[0].clone();
+        snapshot.pg_routes[0].metadata_read_route = Some(PgMetadataReadRoute::new(
+            NodeId::new(1),
+            PgMetadataProof {
+                applied_log_index: 1,
+                applied_log_hash: 2,
+                state_digest: 3,
+            },
+        ));
 
         let source = snapshot
             .metadata_transfer_source_runtime_map(
