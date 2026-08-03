@@ -1,0 +1,252 @@
+Raft admin errors lose unconfirmed-operation warnings
+Link: https://chatgpt.com/codex/cloud/security/findings/d40f64df771c819186b3d8754ca4b564?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: low
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6cdd898
+Author: justin@specialbusservice.com
+Created: 03/08/2026, 16:01:16
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Summary
+Introduced: the commit adds an opaque operator-admin error wrapper for Raft admin commands that removes the existing unconfirmed-operation semantics from the public/CLI error path.
+Raft administration RPCs deliberately classify response-loss-after-dispatch as RpcUnconfirmed and include operator-facing text saying the command may have applied and should not be retried without a confirmation predicate. This commit routes leadership transfer, snapshot/purge, and election commands through ControlPlaneRaftAdminClient, which converts every source ControlPlaneError into ControlPlaneOperatorAdminError. The public Display implementation then renders all source failures only as `control-plane <operation> failed`, and the Error implementation does not expose the source. argmin-s3 converts that redacted error to a String for the CLI. As a result, operators or automation cannot distinguish a rejected operation from a maybe-applied non-idempotent admin operation, increasing the chance of unsafe retries and control-plane availability disruption after transient response loss.
+
+# Resolution
+Fixed by commit `01257626` (`Contain ambiguous control-plane mutation outcomes`).
+
+The operator-admin facade now retains a storage-owned distinction between definite failures and mutating outcomes that could not be confirmed. A definite failure remains rendered as `control-plane <operation> failed`. An unconfirmed mutation instead renders a fixed, redacted warning that the operation may have applied and must not be retried without an operation-specific confirmation check. `Debug`, `Display`, and `Error::source()` continue to prevent the retained internal diagnostic from crossing the storage boundary.
+
+The fix also closes the adjacent ambiguity cases rather than limiting the classification to an EOF response loss. Once a mutating request may have been published, response loss, a wrong outer response kind, a malformed authenticated envelope, invalid response authentication, and an invalid operation-success payload all become `RpcUnconfirmed`. A fully decoded and authenticated remote rejection remains a definite failure, as does a failure before request publication. This classification is shared by authenticated and plain Raft administration and by authority-clock re-establishment.
+
+Permanent regressions cover:
+
+- an applied authenticated Raft mutation followed by response loss;
+- wrong-kind, malformed-envelope, invalid-authentication, and invalid-success-payload responses after application;
+- a valid authenticated remote rejection that remains definite;
+- a failure before request publication that remains definite;
+- the plain Raft administration path; and
+- authority-clock re-establishment with an invalid success payload.
+
+Verification for the fixing commit passed 2,671 storage tests, all 7,983 workspace tests, the storage boundary checker, formatting, and Clippy across all targets and features with warnings denied.
+
+# Validation
+## Rubric
+- [x] Underlying Raft admin response-loss path must deliberately classify maybe-applied operations as RpcUnconfirmed and include operator retry guidance.
+- [x] New ControlPlaneRaftAdminClient facade must route leadership transfer, snapshot/purge, and election through a wrapper that converts source ControlPlaneError values.
+- [x] ControlPlaneOperatorAdminError public Display/Debug/Error behavior must hide the underlying source and remove the `may have applied` / confirmation predicate text.
+- [x] argmin-s3 CLI path must convert the redacted wrapper with `to_string()`, making the loss operator-visible.
+- [x] A targeted dynamic PoC/debugger run must show an admin command applied under response loss while the operator-visible error is only generic.
+## Report
+Validated the finding as a semantic/security regression, not a memory-safety crash. Code review showed the underlying authenticated Raft admin client intentionally preserves maybe-applied semantics: crates/storage/src/control_plane.rs:13577-13581, 13601-13605, and 13623-13627 convert response-loss-after-dispatch into unconfirmed Raft admin errors, and crates/storage/src/control_plane.rs:15134-15138 formats the warning with `may have applied` and `confirmation predicate`. The new facade wraps all source errors for leadership transfer, snapshot/purge, and election at crates/storage/src/control_plane_operator_admin.rs:49-50, 65-66, and 77-78. Its public Display/Error path then suppresses the source: crates/storage/src/control_plane_operator_admin.rs:256-260 renders any Source as only `control-plane <operation> failed`, and crates/storage/src/control_plane_operator_admin.rs:268 implements Error without exposing `source()`. The CLI-facing helpers convert that redacted error to String at crates/argmin-s3/src/main.rs:1026-1043. Dynamic PoC: I added a targeted storage unit test that accepts an authenticated TransferRaftLeadership RPC, applies it to the test authority, then drops the Unix stream before a response. Running `cargo test -p storage operator_raft_admin_facade_redacts_unconfirmed_after_lost_response -- --nocapture` produced: `operator display after maybe-applied response loss: control-plane Raft leadership transfer failed` and `authority applied leadership transfers: [102]`. This demonstrates the operation may have applied, but the operator-visible error has lost the unconfirmed-operation warning. Existing targeted tests also passed: `authenticated_raft_admin_triggers_fail_unconfirmed_after_lost_response` confirms the underlying unconfirmed classification, and `operator_error_retains_source_without_exposing_it` confirms Display/debug/source redaction. Crash/ASan/Valgrind attempts: a direct crash was not expected because this is an error-semantics issue; the PoC test completed without a process crash. Valgrind was unavailable (`bash: command not found: valgrind`). Rust ASan could not be used because the stable toolchain rejects `-Z sanitizer=address`. I then used LLDB non-interactively and set a breakpoint on `ControlPlaneOperatorAdminError` Display; the backtrace stopped at crates/storage/src/control_plane_operator_admin.rs:258 from `ToString::to_string`, confirming the CLI/String path enters the redacting formatter.
+
+# Evidence
+crates/argmin-s3/src/main.rs (L1026 to 1043)
+  Note: The CLI-facing helpers now call the storage facade and convert the redacted wrapper to String, so operator output loses the unconfirmed-operation semantics.
+```
+fn transfer_control_plane_raft_leadership(socket_path: &Path, node_id: u64) -> Result<(), String> {
+    build_raft_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .transfer_leadership_to(node_id)
+        .map_err(|error| error.to_string())
+}
+
+fn trigger_control_plane_raft_snapshot_and_purge(
+    socket_path: &Path,
+) -> Result<Option<u64>, String> {
+    build_raft_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .trigger_snapshot_and_purge()
+        .map_err(|error| error.to_string())
+}
+
+fn trigger_control_plane_raft_election(socket_path: &Path) -> Result<(), String> {
+    build_raft_admin_control_plane_client_from_command_auth_env(socket_path)?
+        .trigger_election()
+        .map_err(|error| error.to_string())
+```
+
+crates/storage/src/control_plane_operator_admin.rs (L216 to 268)
+  Note: The wrapper stores the source privately, but public Display collapses any source failure to a generic `failed` message and the Error implementation does not expose the source.
+```
+pub struct ControlPlaneOperatorAdminError {
+    operation: &'static str,
+    failure: ControlPlaneOperatorAdminFailure,
+}
+
+enum ControlPlaneOperatorAdminFailure {
+    Source(Box<ControlPlaneError>),
+    AdminCredentialRequired,
+}
+
+impl ControlPlaneOperatorAdminError {
+    fn operation(operation: &'static str, source: ControlPlaneError) -> Self {
+        Self {
+            operation,
+            failure: ControlPlaneOperatorAdminFailure::Source(Box::new(source)),
+        }
+    }
+
+    fn admin_credential_required(operation: &'static str) -> Self {
+        Self {
+            operation,
+            failure: ControlPlaneOperatorAdminFailure::AdminCredentialRequired,
+        }
+    }
+}
+
+impl fmt::Debug for ControlPlaneOperatorAdminError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            operation,
+            failure: _,
+        } = self;
+        formatter
+            .debug_struct("ControlPlaneOperatorAdminError")
+            .field("operation", operation)
+            .field("diagnostic", &"<redacted>")
+            .finish()
+    }
+}
+
+impl fmt::Display for ControlPlaneOperatorAdminError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "control-plane {}", self.operation)?;
+        match &self.failure {
+            ControlPlaneOperatorAdminFailure::Source(_source) => formatter.write_str(" failed"),
+            ControlPlaneOperatorAdminFailure::AdminCredentialRequired => {
+                formatter.write_str(" requires authenticated admin credentials")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneOperatorAdminError {}
+```
+
+crates/storage/src/control_plane_operator_admin.rs (L37 to 79)
+  Note: The new Raft admin facade wraps all underlying Raft admin operation errors into ControlPlaneOperatorAdminError, including RpcUnconfirmed errors.
+```
+    pub fn transfer_leadership_to(
+        &self,
+        node_id: u64,
+    ) -> Result<(), ControlPlaneOperatorAdminError> {
+        let result = match &self.dispatch {
+            ControlPlaneRaftAdminDispatch::Plain(client) => {
+                client.transfer_raft_leadership_to(node_id)
+            }
+            ControlPlaneRaftAdminDispatch::Authenticated(client) => {
+                client.transfer_raft_leadership_to(node_id, crate::clock::current_time_millis())
+            }
+        };
+        result.map_err(|source| {
+            ControlPlaneOperatorAdminError::operation("Raft leadership transfer", source)
+        })
+    }
+
+    pub fn trigger_snapshot_and_purge(
+        &self,
+    ) -> Result<Option<u64>, ControlPlaneOperatorAdminError> {
+        let result = match &self.dispatch {
+            ControlPlaneRaftAdminDispatch::Plain(client) => {
+                client.trigger_raft_snapshot_and_purge()
+            }
+            ControlPlaneRaftAdminDispatch::Authenticated(client) => {
+                client.trigger_raft_snapshot_and_purge(crate::clock::current_time_millis())
+            }
+        };
+        result.map_err(|source| {
+            ControlPlaneOperatorAdminError::operation("Raft snapshot/purge trigger", source)
+        })
+    }
+
+    pub fn trigger_election(&self) -> Result<(), ControlPlaneOperatorAdminError> {
+        let result = match &self.dispatch {
+            ControlPlaneRaftAdminDispatch::Plain(client) => client.trigger_raft_election(),
+            ControlPlaneRaftAdminDispatch::Authenticated(client) => {
+                client.trigger_raft_election(crate::clock::current_time_millis())
+            }
+        };
+        result.map_err(|source| {
+            ControlPlaneOperatorAdminError::operation("Raft election trigger", source)
+        })
+```
+
+crates/storage/src/control_plane.rs (L13570 to 13627)
+  Note: The authenticated Raft admin methods intentionally convert response loss after dispatch into unconfirmed errors for leadership transfer, snapshot/purge, and election.
+```
+        let payload = match self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::TransferRaftLeadership,
+            authority_now_ms,
+            payload,
+            CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft leadership transfer",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let reader = PayloadReader::new(&payload);
+        reader.finish()?;
+        Ok(())
+    }
+
+    pub fn trigger_raft_snapshot_and_purge(
+        &self,
+        authority_now_ms: u64,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        let payload = match self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT,
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft snapshot/purge trigger",
+                    error,
+                ));
+            }
+            Err(error) => return Err(error),
+        };
+        let mut reader = PayloadReader::new(&payload);
+        let snapshot_index = reader.read_option_u64()?;
+        reader.finish()?;
+        Ok(snapshot_index)
+    }
+
+    pub fn trigger_raft_election(&self, authority_now_ms: u64) -> Result<(), ControlPlaneError> {
+        let payload = match self.send_admin_request_with_read_timeout(
+            ControlPlaneRpcKind::TriggerRaftElection,
+            authority_now_ms,
+            Vec::new(),
+            CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
+        ) {
+            Ok(payload) => payload,
+            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                return Err(unconfirmed_raft_admin_trigger(
+                    "control-plane Raft election trigger",
+                    error,
+                ));
+```
+
+crates/storage/src/control_plane.rs (L15130 to 15139)
+  Note: The underlying unconfirmed error contains the important `may have applied` and `confirmation predicate` warning that the new public wrapper suppresses.
+```
+fn unconfirmed_raft_admin_trigger(
+    operation: &'static str,
+    error: ControlPlaneError,
+) -> ControlPlaneError {
+    ControlPlaneError::RpcUnconfirmed {
+        message: format!(
+            "{operation} may have applied, but the control-plane RPC response was lost; \
+             automatic retry requires an operation-specific confirmation predicate: {error}"
+        ),
+    }
+```
