@@ -1,0 +1,191 @@
+Peering reads can use uncertified divergent metadata
+Link: https://chatgpt.com/codex/cloud/security/findings/83bce0946d108191baeee130b81d27d8?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: fe8663b
+Author: justin@specialbusservice.com
+Created: 03/08/2026, 11:54:39
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the commit adds PG peering metadata read routes and switches read paths from the active primary to metadata_pg_read_node. The certification logic accepts higher-index metadata proofs without verifying that they are the committed proof or a cryptographically/logically proven descendant of it.
+During PG peering, the new read route selection accepts any acting-set node whose observed metadata proof passes validate_peering_metadata_proof_floor. That ultimately relies on metadata_proof_satisfies_active_floor, which returns true if observed.applied_log_index is greater than the floor, without checking applied_log_hash or state_digest. The route then authorizes normal object reads through metadata_pg_read_node and open_object_read_metadata_route. A replica with a higher but divergent metadata log can therefore be used as the authority for bucket/object ACLs, delete markers, object existence, tags, and listings during peering. In security terms, a stale/divergent public ACL or missing delete/private transition can be used to serve object data or listings that should no longer be readable.
+
+# Resolution
+Fixed in commit [063bdc4a029e92c6f67f1fc897ee0c51999723f8](https://github.com/justincormack/argmin/commit/063bdc4a029e92c6f67f1fc897ee0c51999723f8) (`Require exact proofs for peering metadata reads`).
+
+Peering read certification is now separate from the broader recovery-progress validator. `peering_metadata_read_route_for_snapshot` issues a `PgMetadataReadRoute` only when the observed complete metadata proof exactly equals the committed Peering floor, or exactly equals the imported metadata proof carried by the active transfer certificate. An arbitrary higher log index, including one paired with a divergent log hash or state digest, no longer grants read authority. Existing health, current-epoch, `Peering`, and empty-pending-command requirements remain in force.
+
+The provenance-aware progression predicate remains available to Peering completion and metadata migration/recovery, where later progress has separate recovery semantics. It is no longer used as a serving-read certification predicate. This preserves recovery behavior without treating an unproven descendant tuple as committed authorization state. Progress beyond the committed proof now fails closed for metadata reads until the control plane durably commits or otherwise certifies it.
+
+Regression coverage proves that the exact committed floor remains readable, higher divergent and below-floor proofs are rejected, pending commands suppress certification, and imported transfers accept only their exact imported proof rather than either the source floor or another proof. The storage invariant guide and multihost transition plan now document this strict boundary. The complete workspace suite passed with 7,978 tests, and `cargo clippy --all-targets --all-features -- -D warnings` passed.
+
+# Validation
+## Rubric
+- [x] Locate the newly introduced peering metadata read-route and floor-validation code in changed files.
+- [x] Construct a proof pair where observed.applied_log_index is higher than the committed floor but applied_log_hash and state_digest differ.
+- [x] Show the actual validate_peering_metadata_proof_floor path accepts that divergent proof.
+- [x] Show peering_metadata_read_route_for_snapshot turns the accepted divergent proof into a PgMetadataReadRoute.
+- [x] Confirm downstream object metadata reads consume the peering route and the storage node only checks equality with the routed proof, with no committed-floor/descendant revalidation.
+## Report
+Validated the suspected logic bug in commit fe8663b4. I added a targeted unit PoC inside crates/storage/src/control_plane.rs and ran it against the real storage crate. The PoC constructs a committed floor PgMetadataProof { applied_log_index: 42, applied_log_hash: 0xaaa, state_digest: 0x111 } and an observed proof { applied_log_index: 43, applied_log_hash: 0xdead_beef, state_digest: 0x222 }. Despite the different hash and digest, validate_peering_metadata_proof_floor(...).is_ok() succeeds, and peering_metadata_read_route_for_snapshot returns a PgMetadataReadRoute containing the divergent observed proof. Command output: `running 1 test ... security_poc_peering_read_route_accepts_higher_divergent_metadata_proof ... ok`. Debugger evidence: lldb breakpoint at crates/storage/src/control_plane.rs:22727 showed active_floor=(index=42, hash=2730, digest=273), observed=(index=43, hash=3735928559, digest=546), with stack frame #1 in validate_peering_metadata_proof_floor at control_plane.rs:23044. Code evidence: control_plane.rs:22723-22728 accepts `observed.applied_log_index > active_floor.applied_log_index || observed == active_floor`; control_plane.rs:23020-23044 uses that predicate for peering floor validation; control_plane.rs:4738-4768 selects a peering metadata read route and stores `observation.metadata_proof` as the route proof. Downstream, local.rs:4135-4149 converts a Peering route into MetadataReadAuthorization::peering, request_ops.rs:9729-9744 uses metadata_pg_read_node/open_object_read_metadata_route for object read authorization, and node.rs:1453-1457 only checks the current observation equals the route proof and has no pending command, not that the proof equals or descends from the committed floor. I attempted a crash-style reproduction via the test harness; no crash is expected because this is an authorization/certification logic flaw. Valgrind was attempted but unavailable in the container (`valgrind not installed in container; memory checking not applicable to this logic flaw`).
+
+# Evidence
+crates/storage/src/cluster/local.rs (L4135 to 4149)
+  Note: Read routing now returns the peering metadata_read_route as a valid metadata authority instead of rejecting non-active PGs.
+```
+        let (node_id, authorization) = match route.state() {
+            PgState::Active => (
+                route.primary_node_id(),
+                MetadataReadAuthorization::active(pg_id),
+            ),
+            PgState::Peering => {
+                let read_route = route.metadata_read_route().ok_or(StoreError::PgNotActive {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.epoch,
+                    state: route.state(),
+                })?;
+                (
+                    read_route.node_id(),
+                    MetadataReadAuthorization::peering(pg_id, read_route),
+                )
+```
+
+crates/storage/src/cluster/request_ops.rs (L9729 to 9744)
+  Note: Object read authorization now obtains metadata through metadata_pg_read_node, so a peering read route can decide whether an object is readable.
+```
+        let pg_id = route.pg_id.pg_id();
+        require_valid_route()?;
+        let read_node = self
+            .local_map
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        let object_read_client = read_node.object_read_metadata_client();
+        require_valid_route()?;
+        let object_read_route = object_read_client.open_object_read_metadata_route(
+            self.operation_epoch(),
+            route.pg_id,
+            route.bucket,
+            route.key,
+            read_node.authorization(),
+        )?;
+        let subject = object_read_route.load_object_read_auth_subject(route.version_id)?;
+        Ok(action(&subject.stored))
+```
+
+crates/storage/src/control_plane.rs (L22723 to 22728)
+  Note: The floor check accepts any observed proof with a greater applied_log_index, without requiring matching hash-chain ancestry or state digest consistency with the committed floor.
+```
+fn metadata_proof_satisfies_active_floor(
+    active_floor: PgMetadataProof,
+    observed: PgMetadataProof,
+) -> bool {
+    observed.applied_log_index > active_floor.applied_log_index || observed == active_floor
+}
+```
+
+crates/storage/src/control_plane.rs (L4738 to 4768)
+  Note: New peering read-route selection certifies a node for metadata reads based on validate_peering_metadata_proof_floor and then stores that node's observed proof as the read authority.
+```
+fn peering_metadata_read_route_for_snapshot(
+    snapshot: &ClusterControlSnapshot,
+    record: &PgControlRecord,
+    now_ms: u64,
+) -> Option<PgMetadataReadRoute> {
+    let committed_floor = record.peering_metadata_proof_floor_context()?;
+    record.acting_set.iter().copied().find_map(|node_id| {
+        let node = snapshot.node(node_id)?;
+        if !node.can_serve_primary(snapshot.cluster_epoch, now_ms) {
+            return None;
+        }
+        let observation = node.pg_observation(record.pg_id)?;
+        if observation.observed_epoch != snapshot.cluster_epoch
+            || observation.state != PgState::Peering
+            || observation.has_pending_metadata_command()
+            || validate_peering_metadata_proof_floor(
+                snapshot.cluster_epoch,
+                record.pg_id,
+                node_id,
+                Some(committed_floor),
+                record.peering_metadata_transfer,
+                observation.metadata_proof,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        Some(PgMetadataReadRoute::new(
+            node_id,
+            observation.metadata_proof,
+        ))
+```
+
+crates/storage/src/node.rs (L1453 to 1457)
+  Note: The storage node only checks that its current proof equals the route's proof and has no pending command; it does not re-validate that the proof is the committed floor or a proven descendant.
+```
+        let observation =
+            Self::pg_heartbeat_observation_from_pg(&pg, node_id, pg_id, crate::PgState::Peering)?;
+        if observation.has_pending_metadata_command()
+            || observation.metadata_proof != read_route.proof()
+        {
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+Severity remains medium. The issue is not a false positive: control_plane.rs accepts higher-index divergent proofs, local.rs and request_ops.rs route peering metadata reads into normal object authorization, and node.rs does not revalidate committed proof ancestry. It is in scope because this is production argmin-s3 storage/control-plane/frontend code. The impact can be serious confidentiality loss for affected objects, but high/critical is not justified because exploitation is timing- and state-dependent: the PG must be peering and an acting-set node must hold divergent or stale metadata that authorizes the read. There is no evidence of direct unauthenticated auth bypass under normal active PG operation, RCE, credential disclosure, or persistent compromise.
+## Likelihood
+high - The code defect is directly evidenced and unit-PoC validated, and the read path is reachable from S3 operations. However, practical exploitation requires a rare peering/failure window, a higher-index divergent replica, stale metadata that favors the attacker, and request timing during that window. The attacker controls the S3 request but not necessarily the cluster divergence. | Remote network vector
+## Impact
+high - If exploited, a stale or divergent metadata replica can authorize reads, HEADs, tags, object existence checks, and listings that should be denied after ACL changes, deletes, or private transitions. This can disclose private object data and metadata for affected PGs during peering.
+## Assumptions
+- Production deployments may run argmin-s3 in frontend/storage-node/control-plane roles configured by environment variables, not only the default all-in-one local mode.
+- An attacker can send S3-compatible read, head, listing, or metadata requests to the frontend when it is exposed by the operator.
+- Exploitability requires a PG peering window and an acting-set node with higher-index but divergent or stale metadata that still marks data public, present, or otherwise readable.
+- Static analysis was limited to repository artifacts; no cloud or deployment APIs were queried.
+- argmin-s3 frontend is reachable over its S3 HTTP endpoint
+- the affected bucket/object PG is in PgState::Peering
+- a committed peering metadata proof floor exists
+- an acting-set node can_serve_primary for the current epoch and has no pending metadata command
+- that node reports a higher applied_log_index with divergent applied_log_hash or state_digest
+- the divergent metadata authorizes a read/listing that committed metadata would deny, such as stale public ACL, missing private transition, missing delete marker, or stale tags
+## Path
+Remote S3 client
+  -> argmin-s3 frontend
+  -> admitted storage route
+  -> Peering PgMetadataReadRoute
+  -> divergent acting-set metadata node
+  -> stale authz metadata
+  -> private/deleted data or listing disclosed
+## Path evidence
+- `crates/argmin-s3/Cargo.toml:1-8` - Declares argmin-s3 as the production binary entrypoint.
+- `crates/argmin-s3/src/config.rs:28-50` - Shows production process roles include frontend, storage-node, combined, and control-plane modes.
+- `crates/argmin-s3/src/config.rs:583-612` - Shows runtime credentials and secret keys are environment-provided and the frontend listen address defaults to 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:6185-6216` - Frontend binds a TCP listener at the configured S3 HTTP address.
+- `crates/server-http/src/http/mod.rs:1750-1763` - HTTP requests are dispatched on an admitted storage route.
+- `crates/server-http/src/http/mod.rs:2235-2248` - S3 GET Object reaches coordinator get_object_on_admitted_route.
+- `crates/storage/src/control_plane.rs:4738-4768` - Peering metadata read route chooses an acting-set node and stores that node's observed metadata proof as the read authority.
+- `crates/storage/src/control_plane.rs:22723-22728` - The proof-floor predicate accepts a higher applied_log_index without checking applied_log_hash or state_digest consistency.
+- `crates/storage/src/control_plane.rs:23020-23048` - validate_peering_metadata_proof_floor uses the weak active-floor predicate for peering read-route validation.
+- `crates/storage/src/cluster/local.rs:4135-4149` - Peering routes are converted into MetadataReadAuthorization::peering instead of rejecting non-active PGs.
+- `crates/storage/src/cluster/request_ops.rs:9729-9744` - Object read authorization loads metadata through metadata_pg_read_node and open_object_read_metadata_route.
+- `crates/storage/src/node.rs:1453-1457` - The storage node checks only no-pending-command and equality with the routed proof, not committed-floor ancestry.
+- `crates/server-core/src/coordinator/authz/acl.rs:1089-1138` - Read authorization decision is made from the loaded StoredObject metadata.
+- `crates/server-core/src/coordinator/authz.rs:717-740` - Object read permission depends on owner, ACL grants, public_read, and public access block metadata.
+## Narrative
+The finding is a real in-scope security vulnerability. The newly introduced peering read-route code selects an acting-set node for metadata reads after validate_peering_metadata_proof_floor succeeds, but the active-floor predicate accepts any observed proof with a greater applied_log_index, regardless of applied_log_hash or state_digest. Downstream S3 GET/listing authorization loads object metadata through metadata_pg_read_node and open_object_read_metadata_route, and the node only checks that its current proof equals the routed proof. Therefore, during peering, divergent or stale metadata can be treated as authoritative for ACLs, delete markers, tags, existence, and listings. Impact can be high for affected objects, but likelihood is low because exploitation requires a failure/peering window plus divergent metadata and timing, so medium severity is appropriate.
+## Controls
+- AWS SigV4 authentication is performed for signed requests; missing auth becomes AuthContext::anonymous.
+- Coordinator enforces bucket/object ACLs, bucket policies, ownership controls, and public access blocks based on loaded metadata.
+- Frontend listen address defaults to loopback 127.0.0.1:9000 and TLS is optional via ARGMIN_TLS_CERT_PATH/ARGMIN_TLS_KEY_PATH.
+- Peering route selection requires current observed_epoch, PgState::Peering, can_serve_primary, and no pending metadata command.
+- Storage node rechecks no pending metadata command and equality with the routed proof.
+- HTTP server has connection and in-flight request limits, but these do not mitigate the metadata certification flaw.
+## Blindspots
+- No deployment manifests, Kubernetes resources, Terraform, Dockerfiles, or load balancer definitions were found in the repository checkout, so real public exposure is unknown.
+- The validation PoC proves the core predicate and route selection but is not an end-to-end external S3 disclosure reproduction.
+- Static analysis cannot determine how often production clusters enter the required divergent peering state.
+- No cloud APIs were queried and no runtime cluster was inspected.
