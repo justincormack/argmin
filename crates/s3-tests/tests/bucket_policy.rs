@@ -406,17 +406,25 @@ async fn eventually_raw_bucket_location(
     }
 }
 
-async fn get_object_eventually(
+async fn get_object_body_eventually(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     key: &str,
-) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
-    eventually_ok("GetObject", || {
-        client
+) -> bytes::Bytes {
+    eventually_ok("GetObject body", || async {
+        let object = client
             .get_object()
             .bucket(bucket)
             .key(key)
             .send_retrying_operation_aborted("get object in bucket policy test")
+            .await
+            .map_err(|error| format!("GetObject request failed: {error:?}"))?;
+        object
+            .body
+            .collect()
+            .await
+            .map(|body| body.into_bytes())
+            .map_err(|error| format!("GetObject body collection failed: {error:?}"))
     })
     .await
 }
@@ -14631,8 +14639,7 @@ fn test_bucket_policy_upload_part_and_complete_allow_same_account_non_initiator_
         )
         .await;
 
-        let object = get_object_eventually(client, &bucket, key).await;
-        let body = object.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_eventually(client, &bucket, key).await;
         assert_eq!(body.as_ref(), vec![b'y'; 1024].as_slice());
 
         cleanup(&bucket, &[key]).await;
@@ -14739,8 +14746,7 @@ fn test_bucket_policy_boe_upload_part_and_complete_allow_same_account_non_initia
         )
         .await;
 
-        let object = get_object_eventually(client, &bucket, key).await;
-        let body = object.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_eventually(client, &bucket, key).await;
         assert_eq!(body.as_ref(), vec![b'y'; 1024].as_slice());
 
         cleanup(&bucket, &[key]).await;
@@ -15191,8 +15197,7 @@ fn test_bucket_policy_completed_abort_denies_same_account_non_initiator_with_put
         )
         .await;
 
-        let object = get_object_eventually(client, &bucket, key).await;
-        let body = object.body.collect().await.unwrap().into_bytes();
+        let body = get_object_body_eventually(client, &bucket, key).await;
         assert_eq!(body.as_ref(), vec![b'q'; 1024].as_slice());
 
         cleanup(&bucket, &[key]).await;
@@ -15305,8 +15310,8 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .send_retrying_operation_aborted("get source bucket policy for upload part copy")
             .await
             .unwrap();
-        let source_probe = get_object_eventually(alt_client, &src_bucket, "public/foo").await;
-        let source_probe_body = source_probe.body.collect().await.unwrap().into_bytes();
+        let source_probe_body =
+            get_object_body_eventually(alt_client, &src_bucket, "public/foo").await;
         assert_eq!(source_probe_body.as_ref(), b"public/foo");
 
         let upload = alt_client
