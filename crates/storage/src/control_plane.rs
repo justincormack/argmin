@@ -4750,15 +4750,11 @@ fn peering_metadata_read_route_for_snapshot(
         if observation.observed_epoch != snapshot.cluster_epoch
             || observation.state != PgState::Peering
             || observation.has_pending_metadata_command()
-            || validate_peering_metadata_proof_floor(
-                snapshot.cluster_epoch,
-                record.pg_id,
-                node_id,
-                Some(committed_floor),
+            || !peering_metadata_proof_is_read_certified(
+                committed_floor,
                 record.peering_metadata_transfer,
                 observation.metadata_proof,
             )
-            .is_err()
         {
             return None;
         }
@@ -4767,6 +4763,17 @@ fn peering_metadata_read_route_for_snapshot(
             observation.metadata_proof,
         ))
     })
+}
+
+fn peering_metadata_proof_is_read_certified(
+    committed_floor: PeeringMetadataProofFloor,
+    transfer: Option<PgMetadataTransferProof>,
+    actual: PgMetadataProof,
+) -> bool {
+    let expected = transfer
+        .map(PgMetadataTransferProof::metadata_proof)
+        .unwrap_or(committed_floor.proof);
+    actual == expected
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43619,7 +43626,7 @@ mod tests {
     }
 
     #[test]
-    fn pg_route_certifies_clean_peering_metadata_descendant() {
+    fn pg_route_certifies_only_exact_committed_peering_metadata_proof() {
         let tmp = test_util::tempdir();
         let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -43736,8 +43743,8 @@ mod tests {
                 .pg_route(PgId::new(24), 2_023)
                 .unwrap()
                 .metadata_read_route(),
-            Some(PgMetadataReadRoute::new(NodeId::new(2), ahead_proof)),
-            "a clean replica that satisfies the committed floor remains readable"
+            None,
+            "uncertified progress beyond the committed floor must not become read authority"
         );
 
         heartbeat_with_pg_proof(
@@ -43780,6 +43787,56 @@ mod tests {
             None,
             "a pending command makes the replica's visible state ambiguous"
         );
+    }
+
+    #[test]
+    fn peering_metadata_read_certification_requires_exact_expected_proof() {
+        let floor_proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        let floor = PeeringMetadataProofFloor {
+            proof: floor_proof,
+            epoch: Some(ClusterEpoch::new(4).unwrap()),
+            imported: false,
+        };
+        let ahead_proof = PgMetadataProof {
+            applied_log_index: 8,
+            applied_log_hash: 0x123,
+            state_digest: 0x456,
+        };
+        assert!(peering_metadata_proof_is_read_certified(
+            floor,
+            None,
+            floor_proof
+        ));
+        assert!(!peering_metadata_proof_is_read_certified(
+            floor,
+            None,
+            ahead_proof
+        ));
+
+        let imported_proof = PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 0x789,
+            state_digest: 0xabc,
+        };
+        let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
+            ClusterEpoch::new(3).unwrap(),
+            floor_proof,
+            imported_proof,
+        );
+        assert!(peering_metadata_proof_is_read_certified(
+            floor,
+            Some(transfer),
+            imported_proof
+        ));
+        assert!(!peering_metadata_proof_is_read_certified(
+            floor,
+            Some(transfer),
+            floor_proof
+        ));
     }
 
     #[test]

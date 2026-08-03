@@ -12561,17 +12561,17 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   former indefinite all-PG startup wait.
 - Peering metadata reads now have a control-plane-certified serving route that
   is independent of primary identity. The authority selects a healthy Peering
-  replica only when its complete metadata proof satisfies the committed floor
-  under the existing provenance-aware Peering recovery rules and it reports no
-  pending command. This permits a clean survivor to expose acknowledged
-  metadata commands newer than a stale control-plane heartbeat floor without
-  weakening imported-transfer validation. The certificate's node and actual
-  proof are carried in the runtime map and durable storage-node route
-  configuration. Storage rechecks the current certificate, exact local proof,
-  and empty pending slot under the same PG lock as each read. Bucket and object
-  point reads, bucket/object/version/multipart listings, multipart
-  classification, and ListParts may use this route. All metadata mutations
-  continue to require the Active primary. Composed Unix coverage proves GET,
+  replica only when its complete metadata proof exactly equals the committed
+  floor or exact imported transfer proof and it reports no pending command.
+  The broader provenance-aware progression rules used by Peering recovery do
+  not grant read authority: progress beyond that proof remains unavailable
+  until the control plane durably commits or otherwise certifies it. The
+  certificate's node and exact proof are carried in the runtime map and durable
+  storage-node route configuration. Storage rechecks the current certificate,
+  exact local proof, and empty pending slot under the same PG lock as each read.
+  Bucket and object point reads, bucket/object/version/multipart listings,
+  multipart classification, and ListParts may use this route. All metadata
+  mutations continue to require the Active primary. Composed Unix coverage proves GET,
   ListBuckets, object List, ListParts, and payload reconstruction while Peering,
   plus rejection of a generation reservation through the same frontend map.
   Direct embedded coverage additionally proves that pending-command insertion

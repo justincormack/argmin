@@ -31,11 +31,11 @@ Every public `StorageCluster` operation must fit one of these classes:
   metadata proof in the current control-plane `PgMetadataReadRoute`. The
   authority may issue that certificate only when the replica is healthy,
   reports `Peering`, has no pending metadata command, and its complete metadata
-  proof satisfies the committed Peering floor under the same provenance-aware
-  progression rules used by Peering recovery. The certificate binds the
-  replica's actual proof, including any acknowledged metadata commands beyond
-  a stale heartbeat floor; imported-transfer floors retain their stricter
-  transfer-proof validation.
+  proof exactly equals the committed Peering floor or the exact imported
+  transfer proof. The broader provenance-aware progression rules used by
+  Peering recovery do not grant read authority. A replica ahead of the
+  committed floor remains unavailable for metadata reads until the authority
+  durably commits or otherwise certifies that progress.
 - Storage-node handlers and embedded read routes bind each read authorization
   to its exact PG, then recheck the current route, certificate, exact metadata
   proof, and empty pending slot while holding that PG's lock used for the
