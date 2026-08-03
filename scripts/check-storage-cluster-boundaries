@@ -3078,14 +3078,25 @@ fail_with_matches \
 
 argmin_static_initial_topology_representation_leaks=$(
     rg -n --color=never \
-        '\bInitialClusterTopologyCertificate\b|\binitial_cluster_bootstrap_map_digest\b|\bBootstrapCertifiedInitialClusterMap\b|\bwith_initial_topology_certificate\b|\.initial_topology\(' \
+        '\bInitialClusterTopologyCertificate\b|\binitial_cluster_bootstrap_map_digest\b|\bBootstrapCertifiedInitialClusterMap\b|\bwith_initial_topology_certificate\b|\.initial_topology\(|\.submit_static_initial_topology\(|\.validate_snapshot\(|\bwait_for_static_initial_control_plane_topology\b|\bexperimental_raft_bootstrap_submit_error_was_concurrent_success\b|\bexperimental_raft_control_plane_has_bootstrap_state\b' \
         crates/argmin-s3/src \
         -g '*.rs' \
         || true
 )
 fail_with_matches \
-    "Static initial topology certificates, certified bootstrap commands, and applied-certificate inspection must remain owned by storage" \
+    "Static initial topology certificates, certified bootstrap submission, snapshot validation, and concurrent-result classification must remain owned by storage" \
     "$argmin_static_initial_topology_representation_leaks"
+
+public_static_initial_topology_bypass_apis=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+(submit_static_initial_topology|validate_snapshot)[[:space:]]*\(' \
+        crates/storage/src/control_plane_raft.rs \
+        crates/storage/src/static_topology.rs \
+        || true
+)
+fail_with_matches \
+    "Certified topology submission and snapshot validation primitives must remain private to storage" \
+    "$public_static_initial_topology_bypass_apis"
 
 argmin_uncertified_initial_topology_representation_leaks=$(
     {

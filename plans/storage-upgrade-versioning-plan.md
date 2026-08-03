@@ -1393,8 +1393,8 @@ boundary check rejects direct raw operator RPC calls,
 clock-status interpretation in `argmin-s3`, and expanded or derived public surfaces on the opaque
 facades. Recovery endpoint derivation and credential/transport assembly remain part of the pending
 transport-bootstrap slice; the authority clock and Raft authority implementations remain pending
-with the process-hosted control-plane authority slice. Residual static control-plane bootstrap and
-administration likewise remain pending parts of item 4.
+with the process-hosted control-plane authority slice. The residual duplicate static
+control-plane bootstrap and administration path is completed by the thirty-third bounded slice.
 
 The thirtieth bounded slice contains certified static Raft membership convergence and initial
 topology establishment. `ControlPlaneRaftAuthority` now validates live effective and applied
@@ -1461,6 +1461,24 @@ storage ALPN use, raw endpoint/listener construction, and Rustls profile constru
 static manifest mapper, and rejects making the private profile constant or raw constructors
 public. Storage-node TLS profile ownership is complete; control-plane/Raft transport bootstrap
 and the process-hosted control-plane authority remain separate item 12 work.
+
+The thirty-third bounded slice removes the duplicate process-owned certified-static bootstrap
+path. Static startup establishes the configured topology exactly once through
+`ControlPlaneRaftAuthority::establish_static_initial_topology`, which owns the retained-policy
+binding, membership convergence, snapshot validation, serving-state gate, submission, and
+concurrent-result classification. The later process-hosted wrapper and periodic lease loop now
+run only for the environment-only uncertified topology path; they no longer re-read certified
+snapshots, submit a second certified command, or classify a certified rejection. The deleted
+process impossible-state tests duplicated the owner-local authority tests that pin rejection
+before initialization and idempotent concurrent establishment after initialization. The boundary
+check rejects direct certified submission, static snapshot validation, and the removed
+process-level classifier/helper surfaces. The underlying certified-command submission and static
+snapshot-validation primitives are crate-private, and the boundary check also rejects making
+either API public again. The uncertified wrapper still performs the required checkpoint
+publication between its opaque prepare and resolution operations, so moving that wrapper remains
+coupled to moving its durability publisher. Recovery endpoint and credential/transport assembly,
+control-plane/Raft transport bootstrap, and the process-hosted control-plane authority remain
+separate item 12 work.
 
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
@@ -1756,10 +1774,12 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     Authority-clock and Raft operator commands are now contained behind separate opaque
     storage-owned capabilities, with storage-rendered status and redacted retained diagnostics.
     The environment-only uncertified initial-map path is now contained behind an opaque
-    storage-owned topology and authority operations. The remaining work is to contain the older
-    process-hosted bootstrap wrapper and residual certified-static administration, recovery
-    endpoint and credential/transport assembly, transport bootstrap, and the process-hosted
-    control-plane authority implementation.
+    storage-owned topology and authority operations. The duplicate process-owned certified-static
+    bootstrap, snapshot validation, and rejection classification are removed; certified startup
+    now uses only the authority-owned establishment operation. The remaining work is to contain
+    the process-hosted uncertified bootstrap wrapper together with its durability publisher,
+    recovery endpoint and credential/transport assembly, transport bootstrap, and the
+    process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

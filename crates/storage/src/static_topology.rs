@@ -155,7 +155,7 @@ impl StaticInitialControlPlaneTopology {
     ///
     /// `Ok(false)` means the snapshot is empty and may be bootstrapped;
     /// `Ok(true)` means the configured topology is already established.
-    pub fn validate_snapshot(
+    pub(crate) fn validate_snapshot(
         &self,
         snapshot: &ClusterControlSnapshot,
     ) -> Result<bool, StaticStorageTopologyError> {

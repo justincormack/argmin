@@ -5464,7 +5464,7 @@ impl ControlPlaneRaftAuthority {
 
     /// Submit the certified bootstrap command retained by a storage-owned
     /// static topology.
-    pub async fn submit_static_initial_topology(
+    pub(crate) async fn submit_static_initial_topology(
         &self,
         topology: &StaticInitialControlPlaneTopology,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {

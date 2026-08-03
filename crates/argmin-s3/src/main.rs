@@ -69,8 +69,8 @@ use storage::storage_node_server::{
 use storage::{
     CanonicalUserId, ClusterEpoch, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
-    PgState, RouteMapValidity, StaticInitialControlPlaneTopology, StorageCluster,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    PgState, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
+    StorageClusterRuntimeMapHandle,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
@@ -2107,15 +2107,6 @@ impl ExperimentalRaftControlPlane {
         self.finish_submitted_raft_command(submitted, checkpoint_after_commit)
     }
 
-    fn submit_raft_static_initial_topology(
-        &mut self,
-        topology: &StaticInitialControlPlaneTopology,
-    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let submitted = self.block_on(self.authority.submit_static_initial_topology(topology))?;
-        self.finish_submitted_raft_command(submitted, true)
-    }
-
     fn establish_raft_uncertified_initial_topology(
         &mut self,
         topology: &storage::UncertifiedInitialControlPlaneTopology,
@@ -3702,19 +3693,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         #[cfg(test)]
         after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
     };
-    wait_for_initial_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
-        |error| {
-            eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
-            std::process::exit(1);
-        },
-    );
-    if config.static_initial_cluster_map.is_some() {
-        wait_for_static_initial_control_plane_topology(&mut control_plane, config).unwrap_or_else(
-            |error| {
-                eprintln!("failed to establish static control-plane topology: {error}");
+    if config.static_initial_cluster_map.is_none() {
+        wait_for_initial_experimental_raft_control_plane(&mut control_plane, config)
+            .unwrap_or_else(|error| {
+                eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
                 std::process::exit(1);
-            },
-        );
+            });
     }
     let listeners = bind_configured_control_plane_rpc_listeners(
         &config.control_plane_rpc_listeners,
@@ -3861,7 +3845,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             .is_none_or(|status| status.linearized_authority_serving());
         let expiry_now_ms = storage::clock::current_time_millis();
         let expiry = if local_raft_authority_serving {
-            if multi_node_raft_peer_mode {
+            if multi_node_raft_peer_mode && config.static_initial_cluster_map.is_none() {
                 bootstrap_empty_experimental_raft_control_plane(&mut authority, config)
                     .unwrap_or_else(|error| {
                         eprintln!(
@@ -3987,47 +3971,18 @@ fn bootstrap_empty_experimental_raft_control_plane(
     authority: &mut ExperimentalRaftControlPlane,
     config: &ServerConfig,
 ) -> Result<(), ControlPlaneError> {
-    if config.static_initial_cluster_map.is_none() {
-        let topology = uncertified_initial_control_plane_topology(config)
-            .map_err(storage::StaticStorageTopologyError::into_control_plane_error)?;
-        let Some(epoch) = authority.establish_raft_uncertified_initial_topology(&topology)? else {
-            return Ok(());
-        };
-        process_info!(
-            "experimental OpenRaft control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
-            topology.node_count(),
-            topology.pg_count(),
-            epoch
-        );
+    if config.static_initial_cluster_map.is_some() {
         return Ok(());
     }
-
-    if experimental_raft_control_plane_has_bootstrap_state(authority)? {
+    let topology = uncertified_initial_control_plane_topology(config)
+        .map_err(storage::StaticStorageTopologyError::into_control_plane_error)?;
+    let Some(epoch) = authority.establish_raft_uncertified_initial_topology(&topology)? else {
         return Ok(());
-    }
-    if config.storage_node_sockets.is_empty() {
-        return Ok(());
-    }
-
-    let node_count = config.storage_node_sockets.len();
-    let topology = config
-        .static_initial_cluster_map
-        .as_ref()
-        .expect("certified topology branch requires configured static initial topology");
-    let submitted = authority.submit_raft_static_initial_topology(topology);
-    match submitted {
-        Ok(_) => {}
-        Err(error)
-            if experimental_raft_bootstrap_submit_error_was_concurrent_success(
-                authority, &error,
-            )? => {}
-        Err(error) => return Err(error),
-    }
-    let epoch = authority.current_snapshot()?.cluster_epoch();
+    };
     process_info!(
         "experimental OpenRaft control-plane bootstrapped {} nodes and {} PG acting sets at epoch {}",
-        node_count,
-        config.storage_pg_ids.len(),
+        topology.node_count(),
+        topology.pg_count(),
         epoch
     );
     Ok(())
@@ -4074,62 +4029,6 @@ fn uncertified_initial_control_plane_topology(
         })
         .collect::<Vec<_>>();
     storage::derive_uncertified_initial_control_plane_topology(&endpoints, &config.storage_pg_ids)
-}
-
-fn wait_for_static_initial_control_plane_topology(
-    authority: &mut ExperimentalRaftControlPlane,
-    config: &ServerConfig,
-) -> Result<(), String> {
-    let expected = config
-        .static_initial_cluster_map
-        .as_ref()
-        .ok_or_else(|| "static initial cluster map is not configured".to_string())?;
-    loop {
-        let snapshot = authority
-            .current_snapshot()
-            .map_err(|error| error.to_string())?;
-        if validate_static_initial_topology_certificate(&snapshot, expected)? {
-            return Ok(());
-        }
-        match bootstrap_empty_experimental_raft_control_plane(authority, config) {
-            Ok(()) => {}
-            Err(error) if experimental_raft_error_is_non_local_leader(&error) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn validate_static_initial_topology_certificate(
-    snapshot: &ClusterControlSnapshot,
-    expected: &StaticInitialControlPlaneTopology,
-) -> Result<bool, String> {
-    expected
-        .validate_snapshot(snapshot)
-        .map_err(|error| error.to_string())
-}
-
-fn experimental_raft_control_plane_has_bootstrap_state(
-    authority: &ExperimentalRaftControlPlane,
-) -> Result<bool, ControlPlaneError> {
-    Ok(authority.current_snapshot()?.nodes().next().is_some())
-}
-
-fn experimental_raft_bootstrap_submit_error_was_concurrent_success(
-    authority: &ExperimentalRaftControlPlane,
-    error: &ControlPlaneError,
-) -> Result<bool, ControlPlaneError> {
-    Ok(
-        experimental_raft_bootstrap_submit_error_can_be_concurrent_success(error)
-            && experimental_raft_control_plane_has_bootstrap_state(authority)?,
-    )
-}
-
-fn experimental_raft_bootstrap_submit_error_can_be_concurrent_success(
-    error: &ControlPlaneError,
-) -> bool {
-    matches!(error, ControlPlaneError::BootstrapRequiresEmptyState)
-        || experimental_raft_error_is_non_local_leader(error)
 }
 
 fn bootstrap_empty_control_plane(
@@ -8133,45 +8032,6 @@ mod tests {
         ));
         assert_eq!(attempts, 1);
         assert_eq!(waits, 0);
-    }
-
-    #[test]
-    fn experimental_raft_bootstrap_concurrent_success_requires_initialized_state() {
-        let harness = experimental_raft_test_harness("bootstrap-concurrent-empty-test");
-        assert!(
-            !experimental_raft_bootstrap_submit_error_was_concurrent_success(
-                &harness.control_plane,
-                &ControlPlaneError::BootstrapRequiresEmptyState,
-            )
-            .expect("empty experimental raft control-plane snapshot should read"),
-            "potentially benign bootstrap rejection must not be accepted while state is empty"
-        );
-
-        harness.shutdown();
-    }
-
-    #[test]
-    fn experimental_raft_bootstrap_concurrent_success_is_idempotent_after_state_exists() {
-        let mut harness = experimental_raft_test_harness("bootstrap-concurrent-success-test");
-        let mut config = test_server_config();
-        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
-            node_id: 1,
-            socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
-        }];
-        config.storage_pg_ids = vec![0];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
-            .expect("experimental raft control-plane bootstrap should succeed");
-
-        assert!(
-            experimental_raft_bootstrap_submit_error_was_concurrent_success(
-                &harness.control_plane,
-                &ControlPlaneError::BootstrapRequiresEmptyState,
-            )
-            .expect("bootstrapped experimental raft control-plane snapshot should read"),
-            "potentially benign bootstrap rejection is accepted only after state exists"
-        );
-
-        harness.shutdown();
     }
 
     #[test]
