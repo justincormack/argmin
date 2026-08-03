@@ -47,7 +47,7 @@ impl ControlPlaneRaftAdminClient {
             }
         };
         result.map_err(|source| {
-            ControlPlaneOperatorAdminError::operation("Raft leadership transfer", source)
+            ControlPlaneOperatorAdminError::mutating_operation("Raft leadership transfer", source)
         })
     }
 
@@ -63,7 +63,10 @@ impl ControlPlaneRaftAdminClient {
             }
         };
         result.map_err(|source| {
-            ControlPlaneOperatorAdminError::operation("Raft snapshot/purge trigger", source)
+            ControlPlaneOperatorAdminError::mutating_operation(
+                "Raft snapshot/purge trigger",
+                source,
+            )
         })
     }
 
@@ -75,7 +78,7 @@ impl ControlPlaneRaftAdminClient {
             }
         };
         result.map_err(|source| {
-            ControlPlaneOperatorAdminError::operation("Raft election trigger", source)
+            ControlPlaneOperatorAdminError::mutating_operation("Raft election trigger", source)
         })
     }
 }
@@ -126,7 +129,10 @@ impl ControlPlaneAuthorityClockAdminClient {
             .authority_clock_status(crate::clock::current_time_millis())
             .map(ControlPlaneAuthorityClockAdminStatus)
             .map_err(|source| {
-                ControlPlaneOperatorAdminError::operation("authority-clock status", source)
+                ControlPlaneOperatorAdminError::read_only_operation(
+                    "authority-clock status",
+                    source,
+                )
             })
     }
 
@@ -137,7 +143,7 @@ impl ControlPlaneAuthorityClockAdminClient {
             .reestablish_authority_clock(crate::clock::current_time_millis())
             .map(ControlPlaneAuthorityClockAdminStatus)
             .map_err(|source| {
-                ControlPlaneOperatorAdminError::operation(
+                ControlPlaneOperatorAdminError::mutating_operation(
                     "authority-clock re-establishment",
                     source,
                 )
@@ -219,16 +225,26 @@ pub struct ControlPlaneOperatorAdminError {
 }
 
 enum ControlPlaneOperatorAdminFailure {
-    Source(Box<ControlPlaneError>),
+    Definite(Box<ControlPlaneError>),
+    MutatingOutcomeUnconfirmed(Box<ControlPlaneError>),
     AdminCredentialRequired,
 }
 
 impl ControlPlaneOperatorAdminError {
-    fn operation(operation: &'static str, source: ControlPlaneError) -> Self {
+    fn read_only_operation(operation: &'static str, source: ControlPlaneError) -> Self {
         Self {
             operation,
-            failure: ControlPlaneOperatorAdminFailure::Source(Box::new(source)),
+            failure: ControlPlaneOperatorAdminFailure::Definite(Box::new(source)),
         }
+    }
+
+    fn mutating_operation(operation: &'static str, source: ControlPlaneError) -> Self {
+        let failure = if matches!(source, ControlPlaneError::RpcUnconfirmed { .. }) {
+            ControlPlaneOperatorAdminFailure::MutatingOutcomeUnconfirmed(Box::new(source))
+        } else {
+            ControlPlaneOperatorAdminFailure::Definite(Box::new(source))
+        };
+        Self { operation, failure }
     }
 
     fn admin_credential_required(operation: &'static str) -> Self {
@@ -257,7 +273,11 @@ impl fmt::Display for ControlPlaneOperatorAdminError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "control-plane {}", self.operation)?;
         match &self.failure {
-            ControlPlaneOperatorAdminFailure::Source(_source) => formatter.write_str(" failed"),
+            ControlPlaneOperatorAdminFailure::Definite(_source) => formatter.write_str(" failed"),
+            ControlPlaneOperatorAdminFailure::MutatingOutcomeUnconfirmed(_source) => formatter
+                .write_str(
+                    " may have applied but could not be confirmed; do not retry without an operation-specific confirmation check",
+                ),
             ControlPlaneOperatorAdminFailure::AdminCredentialRequired => {
                 formatter.write_str(" requires authenticated admin credentials")
             }
@@ -448,6 +468,28 @@ mod tests {
     }
 
     #[test]
+    fn raft_admin_failure_before_request_publication_is_definite() {
+        let directory = test_util::tempdir();
+        let socket_path = directory.path().join("missing-control-plane.sock");
+        let (credential, _verifier) = admin_auth("operator-cluster");
+        let client = ControlPlaneRaftAdminClient::new(
+            UnixControlPlaneClient::new(socket_path),
+            Some(credential),
+        );
+
+        let error = client.transfer_leadership_to(91).unwrap_err();
+        assert!(matches!(
+            &error.failure,
+            ControlPlaneOperatorAdminFailure::Definite(_)
+        ));
+        assert_eq!(
+            error.to_string(),
+            "control-plane Raft leadership transfer failed"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
     fn authority_clock_capability_dispatches_authenticated_status() {
         let directory = test_util::tempdir();
         let state_path = directory.path().join("control-plane.state");
@@ -565,18 +607,19 @@ mod tests {
     }
 
     #[test]
-    fn operator_error_retains_source_without_exposing_it() {
+    fn operator_error_preserves_unconfirmed_mutation_without_exposing_its_source() {
         const SENSITIVE_DIAGNOSTIC: &str =
             "route epoch 41 proof 012345 endpoint /secret/control-plane.sock";
-        let error = ControlPlaneOperatorAdminError::operation(
+        let error = ControlPlaneOperatorAdminError::mutating_operation(
             "Raft leadership transfer",
             ControlPlaneError::RpcUnconfirmed {
                 message: SENSITIVE_DIAGNOSTIC.to_owned(),
             },
         );
 
-        let ControlPlaneOperatorAdminFailure::Source(source) = &error.failure else {
-            panic!("operation failure should retain its source inside storage");
+        let ControlPlaneOperatorAdminFailure::MutatingOutcomeUnconfirmed(source) = &error.failure
+        else {
+            panic!("unconfirmed mutation should retain its source inside storage");
         };
         assert!(matches!(
             source.as_ref(),
@@ -585,7 +628,10 @@ mod tests {
         ));
 
         let display = error.to_string();
-        assert_eq!(display, "control-plane Raft leadership transfer failed");
+        assert_eq!(
+            display,
+            "control-plane Raft leadership transfer may have applied but could not be confirmed; do not retry without an operation-specific confirmation check"
+        );
         assert!(!display.contains(SENSITIVE_DIAGNOSTIC));
         let debug = format!("{error:?}");
         assert_eq!(
@@ -594,5 +640,56 @@ mod tests {
         );
         assert!(!debug.contains(SENSITIVE_DIAGNOSTIC));
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn operator_error_distinguishes_definite_failures_and_read_only_operations() {
+        const SENSITIVE_DIAGNOSTIC: &str =
+            "route epoch 42 proof 67890 endpoint /another/secret/control-plane.sock";
+        let definite = ControlPlaneOperatorAdminError::mutating_operation(
+            "Raft election trigger",
+            ControlPlaneError::rpc_remote(SENSITIVE_DIAGNOSTIC.to_owned()),
+        );
+        assert!(matches!(
+            &definite.failure,
+            ControlPlaneOperatorAdminFailure::Definite(_)
+        ));
+        assert_eq!(
+            definite.to_string(),
+            "control-plane Raft election trigger failed"
+        );
+        assert!(!definite.to_string().contains(SENSITIVE_DIAGNOSTIC));
+
+        let read_only = ControlPlaneOperatorAdminError::read_only_operation(
+            "authority-clock status",
+            ControlPlaneError::RpcUnconfirmed {
+                message: SENSITIVE_DIAGNOSTIC.to_owned(),
+            },
+        );
+        assert!(matches!(
+            &read_only.failure,
+            ControlPlaneOperatorAdminFailure::Definite(_)
+        ));
+        assert_eq!(
+            read_only.to_string(),
+            "control-plane authority-clock status failed"
+        );
+        assert!(!read_only.to_string().contains(SENSITIVE_DIAGNOSTIC));
+
+        let clock_mutation = ControlPlaneOperatorAdminError::mutating_operation(
+            "authority-clock re-establishment",
+            ControlPlaneError::RpcUnconfirmed {
+                message: SENSITIVE_DIAGNOSTIC.to_owned(),
+            },
+        );
+        assert!(matches!(
+            &clock_mutation.failure,
+            ControlPlaneOperatorAdminFailure::MutatingOutcomeUnconfirmed(_)
+        ));
+        assert_eq!(
+            clock_mutation.to_string(),
+            "control-plane authority-clock re-establishment may have applied but could not be confirmed; do not retry without an operation-specific confirmation check"
+        );
+        assert!(!clock_mutation.to_string().contains(SENSITIVE_DIAGNOSTIC));
     }
 }

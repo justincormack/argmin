@@ -11929,6 +11929,54 @@ impl UnixControlPlaneClient {
         self.send_request_until(kind, payload, Instant::now() + read_timeout)
     }
 
+    fn send_mutating_request_with_read_timeout(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        read_timeout: Duration,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        debug_assert!(kind.mutating_admin_operation().is_some());
+        let deadline = Instant::now() + read_timeout;
+        let mut last_routing_error = None;
+        let mut endpoint_pass = self.endpoint_pass();
+        while !endpoint_pass.is_exhausted() {
+            let response = match self.send_request_raw_response_with_endpoint_pass_until_classified(
+                kind,
+                payload,
+                deadline,
+                &mut endpoint_pass,
+            ) {
+                Ok(response) => response,
+                Err(error) if error.request_may_have_been_sent() => {
+                    return Err(unconfirmed_admin_mutation_response(
+                        kind,
+                        error.into_error(),
+                    ));
+                }
+                Err(error) => return Err(error.into_error()),
+            };
+            let response = decode_control_plane_rpc_response_frame(response)
+                .map_err(|error| unconfirmed_admin_mutation_response(kind, error))?;
+            match response {
+                DecodedControlPlaneRpcResponse::Rejection(error)
+                    if error.is_control_plane_leader_routing_rejection() =>
+                {
+                    last_routing_error = Some(error);
+                    self.prefer_next_endpoint_after_failure(&endpoint_pass);
+                }
+                DecodedControlPlaneRpcResponse::Rejection(error) => {
+                    self.prefer_successful_endpoint(&endpoint_pass);
+                    return Err(error);
+                }
+                DecodedControlPlaneRpcResponse::Success(payload) => {
+                    self.prefer_successful_endpoint(&endpoint_pass);
+                    return Ok(payload);
+                }
+            }
+        }
+        Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
+    }
+
     fn send_request_until(
         &self,
         kind: ControlPlaneRpcKind,
@@ -11981,7 +12029,24 @@ impl UnixControlPlaneClient {
         deadline: Instant,
         endpoint_pass: &mut ControlPlaneEndpointPass,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let request_frame = encode_control_plane_rpc_frame(kind, payload)?;
+        self.send_request_raw_response_with_endpoint_pass_until_classified(
+            kind,
+            payload,
+            deadline,
+            endpoint_pass,
+        )
+        .map_err(ControlPlaneRpcFrameExchangeError::into_error)
+    }
+
+    fn send_request_raw_response_with_endpoint_pass_until_classified(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        deadline: Instant,
+        endpoint_pass: &mut ControlPlaneEndpointPass,
+    ) -> Result<Vec<u8>, ControlPlaneRpcFrameExchangeError> {
+        let request_frame = encode_control_plane_rpc_frame(kind, payload)
+            .map_err(ControlPlaneRpcFrameExchangeError::before_request)?;
         let mut response = None;
         let mut last_pre_request_error = None;
         while let Some(endpoint_index) = endpoint_pass.next() {
@@ -11991,20 +12056,22 @@ impl UnixControlPlaneClient {
                     break;
                 }
                 Err(error) if !error.request_may_have_been_sent() => {
-                    last_pre_request_error = Some(error.into_error());
+                    last_pre_request_error = Some(error);
                     self.prefer_next_endpoint_after_failure(endpoint_pass);
                 }
-                Err(error) => return Err(error.into_error()),
+                Err(error) => return Err(error),
             }
         }
         let (response_kind, response_payload) = response.ok_or_else(|| {
             last_pre_request_error.expect("endpoint set is non-empty and every connect failed")
         })?;
         if response_kind != kind {
-            return Err(ControlPlaneError::rpc_protocol(format!(
-                "response kind {:?} did not match request kind {:?}",
-                response_kind, kind
-            )));
+            return Err(ControlPlaneRpcFrameExchangeError::after_request_started(
+                ControlPlaneError::rpc_protocol(format!(
+                    "response kind {:?} did not match request kind {:?}",
+                    response_kind, kind
+                )),
+            ));
         }
         Ok(response_payload)
     }
@@ -12535,7 +12602,7 @@ impl UnixControlPlaneClient {
             expected_destination_epoch,
         ) {
             Ok(cluster_epoch) => Ok(cluster_epoch),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
+            Err(error) if error.is_unconfirmed_control_plane_mutation() => self
                 .wait_for_metadata_transfer_install_applied(
                     pg_id,
                     &acting_set,
@@ -12710,7 +12777,7 @@ impl UnixControlPlaneClient {
                     runtime_map.cluster_epoch().get()
                 ),
             }),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
+            Err(error) if error.is_unconfirmed_control_plane_mutation() => self
                 .wait_for_metadata_transfer_install_applied(
                     pg_id,
                     &acting_set,
@@ -12725,64 +12792,43 @@ impl UnixControlPlaneClient {
     pub fn transfer_raft_leadership_to(&self, node_id: u64) -> Result<(), ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, node_id);
-        let payload = match self.send_request_with_read_timeout(
+        let payload = self.send_mutating_request_with_read_timeout(
             ControlPlaneRpcKind::TransferRaftLeadership,
             &payload,
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        ) {
-            Ok(payload) => payload,
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                return Err(unconfirmed_raft_admin_trigger(
-                    "control-plane Raft leadership transfer",
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let reader = PayloadReader::new(&payload);
-        reader.finish()?;
-        Ok(())
+        )?;
+        decode_admin_mutation_success(ControlPlaneRpcKind::TransferRaftLeadership, || {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            Ok(())
+        })
     }
 
     pub fn trigger_raft_snapshot_and_purge(&self) -> Result<Option<u64>, ControlPlaneError> {
-        let payload = match self.send_request_with_read_timeout(
+        let payload = self.send_mutating_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
             &[],
             CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT,
-        ) {
-            Ok(payload) => payload,
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                return Err(unconfirmed_raft_admin_trigger(
-                    "control-plane Raft snapshot/purge trigger",
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let mut reader = PayloadReader::new(&payload);
-        let snapshot_index = reader.read_option_u64()?;
-        reader.finish()?;
-        Ok(snapshot_index)
+        )?;
+        decode_admin_mutation_success(ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge, || {
+            let mut reader = PayloadReader::new(&payload);
+            let snapshot_index = reader.read_option_u64()?;
+            reader.finish()?;
+            Ok(snapshot_index)
+        })
     }
 
     pub fn trigger_raft_election(&self) -> Result<(), ControlPlaneError> {
-        let payload = match self.send_request_with_read_timeout(
+        let payload = self.send_mutating_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftElection,
             &[],
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        ) {
-            Ok(payload) => payload,
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                return Err(unconfirmed_raft_admin_trigger(
-                    "control-plane Raft election trigger",
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let reader = PayloadReader::new(&payload);
-        reader.finish()?;
-        Ok(())
+        )?;
+        decode_admin_mutation_success(ControlPlaneRpcKind::TriggerRaftElection, || {
+            let reader = PayloadReader::new(&payload);
+            reader.finish()?;
+            Ok(())
+        })
     }
 }
 
@@ -12974,34 +13020,14 @@ impl AuthenticatedUnixControlPlaneClient {
     where
         F: FnMut() -> Result<u64, ControlPlaneError>,
     {
-        let mut last_routing_error = None;
-        let mut endpoint_pass = self.inner.endpoint_pass();
-        while !endpoint_pass.is_exhausted() {
-            let request =
-                self.sign_admin_control_plane_request(kind, authority_now_ms()?, payload.clone())?;
-            let response = self
-                .inner
-                .send_request_raw_response_with_endpoint_pass_until(
-                    kind,
-                    &request,
-                    Instant::now() + read_timeout,
-                    &mut endpoint_pass,
-                )?;
-            let response =
-                self.verify_admin_control_plane_response(kind, authority_now_ms()?, &response)?;
-            match decode_control_plane_rpc_response(response) {
-                Err(error) if error.is_control_plane_leader_routing_rejection() => {
-                    last_routing_error = Some(error);
-                    self.inner
-                        .prefer_next_endpoint_after_failure(&endpoint_pass);
-                }
-                result => {
-                    self.inner.prefer_successful_endpoint(&endpoint_pass);
-                    return result;
-                }
-            }
-        }
-        Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
+        let authority_now_ms = std::cell::RefCell::new(&mut authority_now_ms);
+        self.send_admin_request_until_and_clocks(
+            kind,
+            payload,
+            Instant::now() + read_timeout,
+            || authority_now_ms.borrow_mut()(),
+            || authority_now_ms.borrow_mut()(),
+        )
     }
 
     #[cfg(test)]
@@ -13038,24 +13064,57 @@ impl AuthenticatedUnixControlPlaneClient {
         R: FnMut() -> Result<u64, ControlPlaneError>,
         S: FnMut() -> Result<u64, ControlPlaneError>,
     {
-        self.send_verified_request_with_endpoint_failover_until(
-            kind,
-            deadline,
-            || {
-                self.sign_admin_control_plane_request(
+        let mut last_routing_error = None;
+        let mut endpoint_pass = self.inner.endpoint_pass();
+        while !endpoint_pass.is_exhausted() {
+            let request = self.sign_admin_control_plane_request(
+                kind,
+                request_authority_now_ms()?,
+                payload.clone(),
+            )?;
+            let response = match self
+                .inner
+                .send_request_raw_response_with_endpoint_pass_until_classified(
                     kind,
-                    request_authority_now_ms()?,
-                    payload.clone(),
-                )
-            },
-            |response| {
-                self.verify_admin_control_plane_response(
-                    kind,
-                    response_authority_now_ms()?,
-                    response,
-                )
-            },
-        )
+                    &request,
+                    deadline,
+                    &mut endpoint_pass,
+                ) {
+                Ok(response) => response,
+                Err(error) if error.request_may_have_been_sent() => {
+                    return Err(classify_authenticated_admin_post_request_error(
+                        kind,
+                        error.into_error(),
+                    ));
+                }
+                Err(error) => return Err(error.into_error()),
+            };
+            let response_now_ms = response_authority_now_ms()
+                .map_err(|error| classify_authenticated_admin_post_request_error(kind, error))?;
+            let response = self
+                .verify_admin_control_plane_response(kind, response_now_ms, &response)
+                .map_err(|error| classify_authenticated_admin_post_request_error(kind, error))?;
+            let response = decode_control_plane_rpc_response_frame(response)
+                .map_err(|error| classify_authenticated_admin_post_request_error(kind, error))?;
+            match response {
+                DecodedControlPlaneRpcResponse::Rejection(error)
+                    if error.is_control_plane_leader_routing_rejection() =>
+                {
+                    last_routing_error = Some(error);
+                    self.inner
+                        .prefer_next_endpoint_after_failure(&endpoint_pass);
+                }
+                DecodedControlPlaneRpcResponse::Rejection(error) => {
+                    self.inner.prefer_successful_endpoint(&endpoint_pass);
+                    return Err(error);
+                }
+                DecodedControlPlaneRpcResponse::Success(payload) => {
+                    self.inner.prefer_successful_endpoint(&endpoint_pass);
+                    return Ok(payload);
+                }
+            }
+        }
+        Err(last_routing_error.expect("leader routing retry requires at least one endpoint"))
     }
 
     fn admin_pg_runtime_map_snapshot_with_read_timeout(
@@ -13398,13 +13457,17 @@ impl AuthenticatedUnixControlPlaneClient {
             payload,
             CONTROL_PLANE_RPC_IO_TIMEOUT,
         )?;
-        let mut reader = PayloadReader::new(&payload);
-        let raw_cluster_epoch = reader.read_u64()?;
-        let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
-            ControlPlaneError::rpc_protocol(format!("invalid cluster epoch {raw_cluster_epoch}"))
-        })?;
-        reader.finish()?;
-        Ok(cluster_epoch)
+        decode_authenticated_admin_mutation_success(ControlPlaneRpcKind::SetPgActingSet, || {
+            let mut reader = PayloadReader::new(&payload);
+            let raw_cluster_epoch = reader.read_u64()?;
+            let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
+                ControlPlaneError::rpc_protocol(format!(
+                    "invalid cluster epoch {raw_cluster_epoch}"
+                ))
+            })?;
+            reader.finish()?;
+            Ok(cluster_epoch)
+        })
     }
 
     pub fn set_pg_acting_set_checked(
@@ -13464,10 +13527,17 @@ impl AuthenticatedUnixControlPlaneClient {
             payload,
             CONTROL_PLANE_RPC_IO_TIMEOUT,
         )?;
-        let mut reader = PayloadReader::new(&payload);
-        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
-        let source_primary_lease_deadline_ms = reader.read_option_u64()?;
-        reader.finish()?;
+        let (runtime_map, source_primary_lease_deadline_ms) =
+            decode_authenticated_admin_mutation_success(
+                ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
+                || {
+                    let mut reader = PayloadReader::new(&payload);
+                    let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+                    let source_primary_lease_deadline_ms = reader.read_option_u64()?;
+                    reader.finish()?;
+                    Ok((runtime_map, source_primary_lease_deadline_ms))
+                },
+            )?;
         self.inner.validate_metadata_transfer_fence_response(
             pg_id,
             FencedPgMetadataTransferRuntimeMap::new(runtime_map, source_primary_lease_deadline_ms),
@@ -13496,10 +13566,15 @@ impl AuthenticatedUnixControlPlaneClient {
             payload,
             CONTROL_PLANE_RPC_IO_TIMEOUT,
         )?;
-        let mut reader = PayloadReader::new(&payload);
-        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
-        reader.finish()?;
-        Ok(runtime_map)
+        decode_authenticated_admin_mutation_success(
+            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
+            || {
+                let mut reader = PayloadReader::new(&payload);
+                let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+                reader.finish()?;
+                Ok(runtime_map)
+            },
+        )
     }
 
     pub fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
@@ -13536,7 +13611,7 @@ impl AuthenticatedUnixControlPlaneClient {
                     runtime_map.cluster_epoch().get()
                 ),
             }),
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => self
+            Err(error) if error.is_unconfirmed_control_plane_mutation() => self
                 .wait_for_metadata_transfer_install_applied(
                     pg_id,
                     &acting_set,
@@ -13574,70 +13649,58 @@ impl AuthenticatedUnixControlPlaneClient {
     ) -> Result<(), ControlPlaneError> {
         let mut payload = Vec::new();
         write_u64(&mut payload, node_id);
-        let payload = match self.send_admin_request_with_read_timeout(
+        let payload = self.send_admin_request_with_read_timeout(
             ControlPlaneRpcKind::TransferRaftLeadership,
             authority_now_ms,
             payload,
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        ) {
-            Ok(payload) => payload,
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                return Err(unconfirmed_raft_admin_trigger(
-                    "control-plane Raft leadership transfer",
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let reader = PayloadReader::new(&payload);
-        reader.finish()?;
-        Ok(())
+        )?;
+        decode_authenticated_admin_mutation_success(
+            ControlPlaneRpcKind::TransferRaftLeadership,
+            || {
+                let reader = PayloadReader::new(&payload);
+                reader.finish()?;
+                Ok(())
+            },
+        )
     }
 
     pub fn trigger_raft_snapshot_and_purge(
         &self,
         authority_now_ms: u64,
     ) -> Result<Option<u64>, ControlPlaneError> {
-        let payload = match self.send_admin_request_with_read_timeout(
+        let payload = self.send_admin_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
             authority_now_ms,
             Vec::new(),
             CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT,
-        ) {
-            Ok(payload) => payload,
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                return Err(unconfirmed_raft_admin_trigger(
-                    "control-plane Raft snapshot/purge trigger",
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let mut reader = PayloadReader::new(&payload);
-        let snapshot_index = reader.read_option_u64()?;
-        reader.finish()?;
-        Ok(snapshot_index)
+        )?;
+        decode_authenticated_admin_mutation_success(
+            ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+            || {
+                let mut reader = PayloadReader::new(&payload);
+                let snapshot_index = reader.read_option_u64()?;
+                reader.finish()?;
+                Ok(snapshot_index)
+            },
+        )
     }
 
     pub fn trigger_raft_election(&self, authority_now_ms: u64) -> Result<(), ControlPlaneError> {
-        let payload = match self.send_admin_request_with_read_timeout(
+        let payload = self.send_admin_request_with_read_timeout(
             ControlPlaneRpcKind::TriggerRaftElection,
             authority_now_ms,
             Vec::new(),
             CONTROL_PLANE_RPC_LEADERSHIP_TRANSFER_TIMEOUT,
-        ) {
-            Ok(payload) => payload,
-            Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
-                return Err(unconfirmed_raft_admin_trigger(
-                    "control-plane Raft election trigger",
-                    error,
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        let reader = PayloadReader::new(&payload);
-        reader.finish()?;
-        Ok(())
+        )?;
+        decode_authenticated_admin_mutation_success(
+            ControlPlaneRpcKind::TriggerRaftElection,
+            || {
+                let reader = PayloadReader::new(&payload);
+                reader.finish()?;
+                Ok(())
+            },
+        )
     }
 
     pub fn authority_clock_status(
@@ -13738,10 +13801,15 @@ impl AuthenticatedUnixControlPlaneClient {
             || Ok(authority_now_ms),
             || Ok(crate::clock::current_time_millis()),
         )?;
-        let mut reader = PayloadReader::new(&payload);
-        let status = read_authority_clock_status(&mut reader)?;
-        reader.finish()?;
-        Ok(status)
+        decode_authenticated_admin_mutation_success(
+            ControlPlaneRpcKind::ReestablishAuthorityClock,
+            || {
+                let mut reader = PayloadReader::new(&payload);
+                let status = read_authority_clock_status(&mut reader)?;
+                reader.finish()?;
+                Ok(status)
+            },
+        )
     }
 
     pub fn reestablish_authority_clock(
@@ -13784,7 +13852,7 @@ impl AuthenticatedUnixControlPlaneClient {
                         CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF.min(remaining),
                     );
                 }
-                Err(error) if error.is_maybe_applied_control_plane_rpc_response_loss() => {
+                Err(error) if error.is_unconfirmed_control_plane_mutation() => {
                     let expected_generation = expected
                         .generation()
                         .checked_add(1)
@@ -15134,16 +15202,58 @@ fn metadata_transfer_install_applied(
         })
 }
 
-fn unconfirmed_raft_admin_trigger(
-    operation: &'static str,
+fn unconfirmed_admin_mutation_response(
+    kind: ControlPlaneRpcKind,
     error: ControlPlaneError,
 ) -> ControlPlaneError {
+    let operation = kind
+        .mutating_admin_operation()
+        .expect("admin mutation response requires a mutating RPC kind");
     ControlPlaneError::RpcUnconfirmed {
         message: format!(
-            "{operation} may have applied, but the control-plane RPC response was lost; \
+            "{operation} may have applied, but no valid operation result was received; \
              automatic retry requires an operation-specific confirmation predicate: {error}"
         ),
     }
+}
+
+fn unconfirmed_authenticated_admin_mutation_response(
+    kind: ControlPlaneRpcKind,
+    error: ControlPlaneError,
+) -> ControlPlaneError {
+    let operation = kind
+        .mutating_admin_operation()
+        .expect("authenticated admin mutation response requires a mutating RPC kind");
+    ControlPlaneError::RpcUnconfirmed {
+        message: format!(
+            "{operation} may have applied, but no valid authenticated operation result was received; automatic retry requires an operation-specific confirmation predicate: {error}"
+        ),
+    }
+}
+
+fn decode_admin_mutation_success<T>(
+    kind: ControlPlaneRpcKind,
+    decode: impl FnOnce() -> Result<T, ControlPlaneError>,
+) -> Result<T, ControlPlaneError> {
+    decode().map_err(|error| unconfirmed_admin_mutation_response(kind, error))
+}
+
+fn classify_authenticated_admin_post_request_error(
+    kind: ControlPlaneRpcKind,
+    error: ControlPlaneError,
+) -> ControlPlaneError {
+    if kind.mutating_admin_operation().is_some() {
+        unconfirmed_authenticated_admin_mutation_response(kind, error)
+    } else {
+        error
+    }
+}
+
+fn decode_authenticated_admin_mutation_success<T>(
+    kind: ControlPlaneRpcKind,
+    decode: impl FnOnce() -> Result<T, ControlPlaneError>,
+) -> Result<T, ControlPlaneError> {
+    decode().map_err(|error| unconfirmed_authenticated_admin_mutation_response(kind, error))
 }
 
 fn authority_clock_admin_remaining(deadline: Instant) -> Result<Duration, ControlPlaneError> {
@@ -16214,6 +16324,35 @@ impl ControlPlaneRpcKind {
             | Self::ReestablishAuthorityClock => {
                 ControlPlaneAuthOperation::AdminControlPlaneCommand
             }
+        }
+    }
+
+    fn mutating_admin_operation(self) -> Option<&'static str> {
+        match self {
+            Self::SetPgActingSet => Some("control-plane PG acting-set update"),
+            Self::SetPgActingSetWithMetadataTransfer => {
+                Some("control-plane PG metadata-transfer acting-set update")
+            }
+            Self::SetPgActingSetWithMetadataTransferRuntimeMap => {
+                Some("control-plane PG metadata-transfer acting-set update")
+            }
+            Self::FencePgForMetadataTransferRuntimeMap => {
+                Some("control-plane PG metadata-transfer fence")
+            }
+            Self::TransferRaftLeadership => Some("control-plane Raft leadership transfer"),
+            Self::TriggerRaftSnapshotAndPurge => Some("control-plane Raft snapshot/purge trigger"),
+            Self::TriggerRaftElection => Some("control-plane Raft election trigger"),
+            Self::ReestablishAuthorityClock => {
+                Some("control-plane authority-clock re-establishment")
+            }
+            Self::RuntimeMapSnapshot
+            | Self::RefreshNodeHeartbeat
+            | Self::PgRuntimeMapSnapshot
+            | Self::RuntimeMapStatus
+            | Self::PendingMetadataCommandRecoveries
+            | Self::AuthorityClockStatus
+            | Self::RuntimeMapDiagnostics
+            | Self::ServingPgRuntimeMapSnapshot => None,
         }
     }
 
@@ -17344,19 +17483,35 @@ fn encode_control_plane_rpc_response(
     Ok(payload)
 }
 
+enum DecodedControlPlaneRpcResponse {
+    Success(Vec<u8>),
+    Rejection(ControlPlaneError),
+}
+
 fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, ControlPlaneError> {
+    match decode_control_plane_rpc_response_frame(payload)? {
+        DecodedControlPlaneRpcResponse::Success(payload) => Ok(payload),
+        DecodedControlPlaneRpcResponse::Rejection(error) => Err(error),
+    }
+}
+
+fn decode_control_plane_rpc_response_frame(
+    payload: Vec<u8>,
+) -> Result<DecodedControlPlaneRpcResponse, ControlPlaneError> {
     let mut reader = PayloadReader::new(&payload);
     let status = reader.read_u8()?;
     match status {
         0 => {
             let response = reader.read_bytes()?.to_vec();
             reader.finish()?;
-            Ok(response)
+            Ok(DecodedControlPlaneRpcResponse::Success(response))
         }
         1 => {
             let message = reader.read_string()?.to_owned();
             reader.finish()?;
-            Err(ControlPlaneError::rpc_remote(message))
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::rpc_remote(message),
+            ))
         }
         2 => {
             let pg_id = reader.read_u32()?;
@@ -17371,36 +17526,42 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             })?;
             let pending_command_checksum = reader.read_u64()?;
             reader.finish()?;
-            Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
-                pg_id,
-                node_id,
-                cluster_epoch,
-                pending: PendingMetadataCommandObservation::new(
-                    pending_cluster_epoch,
-                    pending_log_index,
-                    pending_command_checksum,
-                ),
-            })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::PgPeeringPendingMetadataCommand {
+                    pg_id,
+                    node_id,
+                    cluster_epoch,
+                    pending: PendingMetadataCommandObservation::new(
+                        pending_cluster_epoch,
+                        pending_log_index,
+                        pending_command_checksum,
+                    ),
+                },
+            ))
         }
         3 => {
             let pg_id = reader.read_u32()?;
             let cluster_epoch =
                 read_cluster_epoch(&mut reader, "metadata migration source cluster epoch")?;
             reader.finish()?;
-            Err(ControlPlaneError::PgMetadataMigrationSourceNotReady {
-                pg_id,
-                cluster_epoch,
-            })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::PgMetadataMigrationSourceNotReady {
+                    pg_id,
+                    cluster_epoch,
+                },
+            ))
         }
         4 => {
             let pg_id = reader.read_u32()?;
             let cluster_epoch =
                 read_cluster_epoch(&mut reader, "PG serving-primary cluster epoch")?;
             reader.finish()?;
-            Err(ControlPlaneError::PgHasNoServingPrimary {
-                pg_id,
-                cluster_epoch,
-            })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::PgHasNoServingPrimary {
+                    pg_id,
+                    cluster_epoch,
+                },
+            ))
         }
         5 => {
             let pg_id = reader.read_u32()?;
@@ -17408,11 +17569,13 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             let cluster_epoch =
                 read_cluster_epoch(&mut reader, "PG primary-observation cluster epoch")?;
             reader.finish()?;
-            Err(ControlPlaneError::PgPrimaryMissingActiveObservation {
-                pg_id,
-                node_id,
-                cluster_epoch,
-            })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::PgPrimaryMissingActiveObservation {
+                    pg_id,
+                    node_id,
+                    cluster_epoch,
+                },
+            ))
         }
         6 => {
             let pg_id = reader.read_u32()?;
@@ -17421,12 +17584,14 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
                 read_cluster_epoch(&mut reader, "PG primary-observation cluster epoch")?;
             let state = read_pg_state(&mut reader)?;
             reader.finish()?;
-            Err(ControlPlaneError::PgPrimaryObservationNotActive {
-                pg_id,
-                node_id,
-                cluster_epoch,
-                state,
-            })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::PgPrimaryObservationNotActive {
+                    pg_id,
+                    node_id,
+                    cluster_epoch,
+                    state,
+                },
+            ))
         }
         7 => {
             let pg_id = reader.read_u32()?;
@@ -17434,50 +17599,66 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
                 read_cluster_epoch(&mut reader, "PG acting-set readiness cluster epoch")?;
             let state = read_pg_state(&mut reader)?;
             reader.finish()?;
-            Err(ControlPlaneError::PgActingSetChangeNotReady {
-                pg_id,
-                cluster_epoch,
-                state,
-            })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::PgActingSetChangeNotReady {
+                    pg_id,
+                    cluster_epoch,
+                    state,
+                },
+            ))
         }
         8 => {
             let pg_id = reader.read_u32()?;
             reader.finish()?;
-            Err(ControlPlaneError::UnknownPg { pg_id })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::UnknownPg { pg_id },
+            ))
         }
         9 => {
             let kind = ControlPlaneRaftOperationErrorKind::from_wire_tag(reader.read_u8()?)?;
             let message = reader.read_string()?.to_owned();
             reader.finish()?;
-            Err(ControlPlaneError::OpenRaftOperation { kind, message })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::OpenRaftOperation { kind, message },
+            ))
         }
         10 => {
             reader.finish()?;
-            Err(ControlPlaneError::AuthorityNotServing)
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::AuthorityNotServing,
+            ))
         }
         11 => {
             reader.finish()?;
-            Err(ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority)
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority,
+            ))
         }
         12 => {
             let node_id = reader.read_u32()?;
             reader.finish()?;
-            Err(ControlPlaneError::UnknownNode { node_id })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::UnknownNode { node_id },
+            ))
         }
         13 => {
             let pg_id = reader.read_u32()?;
             let node_id = reader.read_u32()?;
             reader.finish()?;
-            Err(ControlPlaneError::UnknownActingSetNode { pg_id, node_id })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::UnknownActingSetNode { pg_id, node_id },
+            ))
         }
         14 => {
             let established_term = reader.read_option_u64()?;
             let current_term = reader.read_u64()?;
             reader.finish()?;
-            Err(ControlPlaneError::AuthorityClockLeadershipChanged {
-                established_term,
-                current_term,
-            })
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
+                ControlPlaneError::AuthorityClockLeadershipChanged {
+                    established_term,
+                    current_term,
+                },
+            ))
         }
         15 => {
             let pg_id = reader.read_u32()?;
@@ -17486,13 +17667,13 @@ fn decode_control_plane_rpc_response(payload: Vec<u8>) -> Result<Vec<u8>, Contro
             let actual_destination_epoch =
                 read_cluster_epoch(&mut reader, "actual metadata transfer destination epoch")?;
             reader.finish()?;
-            Err(
+            Ok(DecodedControlPlaneRpcResponse::Rejection(
                 ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
                     pg_id,
                     expected_destination_epoch,
                     actual_destination_epoch,
                 },
-            )
+            ))
         }
         _ => Err(ControlPlaneError::rpc_protocol(format!(
             "invalid control-plane RPC response status {status}"
@@ -20484,8 +20665,14 @@ impl ControlPlaneError {
     }
 
     #[must_use]
-    fn is_retryable_pg_acting_set_checked_error(&self) -> bool {
+    fn is_unconfirmed_control_plane_mutation(&self) -> bool {
         self.is_maybe_applied_control_plane_rpc_response_loss()
+            || matches!(self, Self::RpcUnconfirmed { .. })
+    }
+
+    #[must_use]
+    fn is_retryable_pg_acting_set_checked_error(&self) -> bool {
+        self.is_unconfirmed_control_plane_mutation()
             || self.is_transient_runtime_map_serving_gap()
             || matches!(
                 self,
@@ -30138,6 +30325,62 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_authority_clock_invalid_success_payload_is_unconfirmed() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let expected = ControlPlaneAuthorityClockStatus {
+            generation: 7,
+            established: false,
+            blocked_reason: Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged),
+            committed_timestamp_high_water_ms: Some(1_000),
+            bound_raft_leadership_term: None,
+            current_raft_leadership_term: Some(3),
+            local_raft_authority_leader: true,
+            local_raft_authority_serving: true,
+        };
+        let server = std::thread::spawn(move || {
+            let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let request = verify_control_plane_unix_request(request, Some(&verifier), 2_000)
+                .expect("authority-clock mutation request should authenticate");
+            assert_eq!(request.kind, ControlPlaneRpcKind::ReestablishAuthorityClock);
+            let response = build_control_plane_verified_response(
+                request.kind,
+                Ok(vec![0xff]),
+                request.response_auth,
+                2_000,
+            )
+            .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            admin_auth_credential("auth-cluster", "admin-1"),
+        );
+        let error = crate::clock::with_time_override(2_000, || {
+            client.reestablish_authority_clock_from_status_with_attempt_timeout(
+                expected,
+                2_000,
+                Instant::now() + Duration::from_secs(1),
+                Duration::from_millis(100),
+            )
+        })
+        .unwrap_err();
+
+        server.join().unwrap();
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcUnconfirmed { ref message }
+                if message.contains("authority-clock re-establishment")
+                    && message.contains("may have applied")
+                    && message.contains("confirmation predicate")
+        ));
+    }
+
+    #[test]
     fn authenticated_authority_clock_recovery_status_moves_past_response_loss() {
         let tmp = test_util::tempdir();
         let failing_socket = tmp.path().join("failing.sock");
@@ -31730,7 +31973,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_unix_control_plane_client_rejects_unsigned_admin_response() {
+    fn authenticated_unix_control_plane_client_treats_unsigned_admin_response_as_unconfirmed() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
@@ -31753,11 +31996,13 @@ mod tests {
             .expect_err("unsigned admin response should be rejected");
 
         server.join().unwrap();
-        assert!(
-            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
-            if message.contains("control-plane auth envelope")),
-            "unexpected error: {error}"
-        );
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcUnconfirmed { ref message }
+                if message.contains("PG acting-set update")
+                    && message.contains("may have applied")
+                    && message.contains("confirmation predicate")
+        ));
     }
 
     #[test]
@@ -32213,6 +32458,223 @@ mod tests {
             3
         );
         assert_eq!(metrics.rejected_total(), 0);
+    }
+
+    #[test]
+    fn operator_raft_admin_facade_preserves_unconfirmed_outcomes_after_application() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut authority = RecordingRaftAdminAuthority::default();
+            for expected_kind in [
+                ControlPlaneRpcKind::TransferRaftLeadership,
+                ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+                ControlPlaneRpcKind::TriggerRaftElection,
+            ] {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                assert_eq!(request.kind, expected_kind);
+                build_control_plane_unix_response_with_auth(
+                    &mut authority,
+                    request,
+                    2_000,
+                    Some(&verifier),
+                )
+                .expect("recording Raft admin trigger should apply before response loss");
+                drop(stream);
+            }
+            authority
+        });
+
+        let client = crate::control_plane_operator_admin::ControlPlaneRaftAdminClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            Some(admin_auth_credential("auth-cluster", "admin-1")),
+        );
+        let errors = crate::clock::with_time_override(2_000, || {
+            [
+                client.transfer_leadership_to(102).unwrap_err(),
+                client.trigger_snapshot_and_purge().unwrap_err(),
+                client.trigger_election().unwrap_err(),
+            ]
+        });
+
+        for (error, operation) in errors.into_iter().zip([
+            "Raft leadership transfer",
+            "Raft snapshot/purge trigger",
+            "Raft election trigger",
+        ]) {
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "control-plane {operation} may have applied but could not be confirmed; do not retry without an operation-specific confirmation check"
+                )
+            );
+            assert!(std::error::Error::source(&error).is_none());
+            assert_eq!(
+                format!("{error:?}"),
+                format!(
+                    "ControlPlaneOperatorAdminError {{ operation: \"{operation}\", diagnostic: \"<redacted>\" }}"
+                )
+            );
+        }
+
+        let authority = server.join().unwrap();
+        assert_eq!(authority.transferred_to, vec![102]);
+        assert_eq!(authority.snapshot_purge_triggers, 1);
+        assert_eq!(authority.election_triggers, 1);
+    }
+
+    #[derive(Clone, Copy)]
+    enum AppliedRaftAdminResponseFault {
+        WrongOuterKind,
+        MalformedAuthenticatedEnvelope,
+        InvalidAuthentication,
+        InvalidOperationPayload,
+    }
+
+    #[test]
+    fn operator_raft_admin_facade_treats_every_invalid_post_application_response_as_unconfirmed() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut authority = RecordingRaftAdminAuthority::default();
+            for fault in [
+                AppliedRaftAdminResponseFault::WrongOuterKind,
+                AppliedRaftAdminResponseFault::MalformedAuthenticatedEnvelope,
+                AppliedRaftAdminResponseFault::InvalidAuthentication,
+                AppliedRaftAdminResponseFault::InvalidOperationPayload,
+            ] {
+                let (mut stream, _addr) = listener.accept().unwrap();
+                let request = read_control_plane_unix_request(&mut stream).unwrap();
+                let request =
+                    verify_control_plane_unix_request(request, Some(&verifier), 2_000).unwrap();
+                let VerifiedControlPlaneRpcRequest {
+                    kind,
+                    payload,
+                    response_auth,
+                } = request;
+                assert_eq!(kind, ControlPlaneRpcKind::TransferRaftLeadership);
+                let mut reader = PayloadReader::new(&payload);
+                let node_id = reader.read_u64().unwrap();
+                reader.finish().unwrap();
+                authority.transfer_raft_leadership_to(node_id).unwrap();
+
+                let mut response = match fault {
+                    AppliedRaftAdminResponseFault::MalformedAuthenticatedEnvelope => {
+                        ControlPlaneRpcResponse {
+                            kind,
+                            payload: vec![0xff],
+                        }
+                    }
+                    AppliedRaftAdminResponseFault::InvalidOperationPayload => {
+                        build_control_plane_verified_response(
+                            kind,
+                            Ok(vec![0xff]),
+                            response_auth,
+                            2_000,
+                        )
+                        .unwrap()
+                    }
+                    AppliedRaftAdminResponseFault::WrongOuterKind
+                    | AppliedRaftAdminResponseFault::InvalidAuthentication => {
+                        build_control_plane_verified_response(
+                            kind,
+                            Ok(Vec::new()),
+                            response_auth,
+                            2_000,
+                        )
+                        .unwrap()
+                    }
+                };
+                match fault {
+                    AppliedRaftAdminResponseFault::WrongOuterKind => {
+                        response.kind = ControlPlaneRpcKind::TriggerRaftElection;
+                    }
+                    AppliedRaftAdminResponseFault::InvalidAuthentication => {
+                        let last = response
+                            .payload
+                            .last_mut()
+                            .expect("authenticated response should not be empty");
+                        *last ^= 0xff;
+                    }
+                    AppliedRaftAdminResponseFault::MalformedAuthenticatedEnvelope
+                    | AppliedRaftAdminResponseFault::InvalidOperationPayload => {}
+                }
+                write_control_plane_unix_response(&mut stream, response).unwrap();
+            }
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let request =
+                verify_control_plane_unix_request(request, Some(&verifier), 2_000).unwrap();
+            let response = build_control_plane_unix_admission_error_response(
+                request,
+                ControlPlaneError::UnknownNode { node_id: 999 },
+                2_000,
+            )
+            .unwrap();
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+            authority
+        });
+
+        let client = crate::control_plane_operator_admin::ControlPlaneRaftAdminClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            Some(admin_auth_credential("auth-cluster", "admin-1")),
+        );
+        crate::clock::with_time_override(2_000, || {
+            for node_id in 201..=204 {
+                let error = client.transfer_leadership_to(node_id).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    "control-plane Raft leadership transfer may have applied but could not be confirmed; do not retry without an operation-specific confirmation check"
+                );
+                assert!(std::error::Error::source(&error).is_none());
+            }
+
+            let rejected = client.transfer_leadership_to(999).unwrap_err();
+            assert_eq!(
+                rejected.to_string(),
+                "control-plane Raft leadership transfer failed"
+            );
+        });
+
+        let authority = server.join().unwrap();
+        assert_eq!(authority.transferred_to, vec![201, 202, 203, 204]);
+    }
+
+    #[test]
+    fn operator_plain_raft_admin_facade_preserves_post_application_ambiguity() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut authority = RecordingRaftAdminAuthority::default();
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            let mut response =
+                build_control_plane_unix_response(&mut authority, request, 2_000).unwrap();
+            response.kind = ControlPlaneRpcKind::TriggerRaftElection;
+            write_control_plane_unix_response(&mut stream, response).unwrap();
+            authority
+        });
+
+        let client = crate::control_plane_operator_admin::ControlPlaneRaftAdminClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            None,
+        );
+        let error = client.transfer_leadership_to(205).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "control-plane Raft leadership transfer may have applied but could not be confirmed; do not retry without an operation-specific confirmation check"
+        );
+        assert!(std::error::Error::source(&error).is_none());
+
+        let authority = server.join().unwrap();
+        assert_eq!(authority.transferred_to, vec![205]);
     }
 
     #[test]

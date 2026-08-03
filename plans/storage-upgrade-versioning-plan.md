@@ -1374,11 +1374,22 @@ endpoint nor a frontend, storage-node, or service credential can become an autho
 administrative capability.
 The process no longer receives or interprets `ControlPlaneAuthorityClockStatus`; storage returns an
 opaque status with an exact owner-rendered operator display and a redacted debug view. Both
-capabilities retain implementation causes behind a generic public error whose `Display`, `Debug`,
-and `source()` cannot expose endpoints, routes, epochs, proofs, or remote diagnostics. Owner-local
-tests pin no-network rejection of missing and wrong-principal credentials, exact established and
-blocked status rendering, opaque debug, authenticated dispatch, and retained-error redaction. The
-repository boundary check rejects direct raw operator RPC calls,
+capabilities retain implementation causes behind an opaque public error whose `Display`, `Debug`,
+and `source()` cannot expose endpoints, routes, epochs, proofs, or remote diagnostics. Storage
+classifies every mutating request that lacks a valid operation result as `RpcUnconfirmed`,
+separately from valid remote rejections and failures before request publication. Authenticated
+dispatch additionally requires that the result authenticate as the response to the exact operation.
+This includes response loss, wrong outer kinds, malformed or incorrectly authenticated responses,
+and invalid success payloads. The facade renders fixed operator guidance that the
+mutation may have applied and must not be retried without an operation-specific confirmation check.
+Read-only status failures cannot acquire that mutation classification. Owner-local tests pin
+no-network rejection of missing and wrong-principal
+credentials, exact established and blocked status rendering, opaque debug, authenticated dispatch,
+retained-error redaction, valid authenticated remote rejection, and applied plain or authenticated
+Raft commands followed by lost, wrong-kind, malformed, incorrectly authenticated, or undecodable
+responses through the public operator facade. Authority-clock coverage also pins invalid signed
+success payloads as unconfirmed before the existing confirmation state machine. The repository
+boundary check rejects direct raw operator RPC calls,
 clock-status interpretation in `argmin-s3`, and expanded or derived public surfaces on the opaque
 facades. Recovery endpoint derivation and credential/transport assembly remain part of the pending
 transport-bootstrap slice; the authority clock and Raft authority implementations remain pending
