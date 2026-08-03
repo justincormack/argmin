@@ -13,7 +13,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
@@ -50,6 +50,7 @@ use openraft::ServerState;
 use openraft::StoredMembership;
 use openraft::{AnyError, Config, SnapshotPolicy};
 use placement::NodeId;
+use ring::rand::SecureRandom as _;
 use rustls::pki_types::ServerName;
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
@@ -2574,7 +2575,7 @@ impl SubmittedControlPlaneRaftCommand {
 /// response-publication step but cannot inspect or replace the Raft outcome
 /// before storage resolves it.
 pub struct UncertifiedInitialControlPlaneTopologySubmission {
-    authority_instance: Arc<()>,
+    authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
     topology: UncertifiedInitialControlPlaneTopology,
     submitted: SubmittedControlPlaneRaftCommand,
 }
@@ -2585,6 +2586,31 @@ impl fmt::Debug for UncertifiedInitialControlPlaneTopologySubmission {
             .debug_struct("UncertifiedInitialControlPlaneTopologySubmission")
             .field("diagnostic", &"<redacted>")
             .finish_non_exhaustive()
+    }
+}
+
+const CONTROL_PLANE_RAFT_AUTHORITY_INSTANCE_ID_LEN: usize = 16;
+
+/// Random process-local identity for capabilities issued by one Raft authority.
+///
+/// The identity is never rendered, serialized, or exposed outside storage. It
+/// avoids using an allocation address as an authority identifier while still
+/// rejecting capabilities crossed between otherwise equivalent authorities.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ControlPlaneRaftAuthorityInstanceId([u8; CONTROL_PLANE_RAFT_AUTHORITY_INSTANCE_ID_LEN]);
+
+impl ControlPlaneRaftAuthorityInstanceId {
+    fn generate() -> Result<Self, ControlPlaneError> {
+        let mut bytes = [0u8; CONTROL_PLANE_RAFT_AUTHORITY_INSTANCE_ID_LEN];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| {
+                ControlPlaneError::io(
+                    "generate process-local Raft authority identity",
+                    std::io::Error::other("secure random generation failed"),
+                )
+            })?;
+        Ok(Self(bytes))
     }
 }
 
@@ -2609,7 +2635,7 @@ pub struct ControlPlaneRaftAuthority {
             RuntimeMapContentCertificate,
         )>,
     >,
-    checkpoint_instance: Arc<()>,
+    authority_instance_id: OnceLock<ControlPlaneRaftAuthorityInstanceId>,
     checkpoint_publication: Arc<Mutex<Option<ControlPlaneRaftCheckpointPosition>>>,
     durable_artifact_path: Option<Arc<PathBuf>>,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
@@ -4902,7 +4928,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
-            checkpoint_instance: Arc::new(()),
+            authority_instance_id: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
@@ -4928,7 +4954,7 @@ impl ControlPlaneRaftAuthority {
             volatile_heartbeat_overlay: Mutex::new(None),
             runtime_map_content_certificate: Mutex::new(None),
             runtime_map_overlay_content_certificate: Mutex::new(None),
-            checkpoint_instance: Arc::new(()),
+            authority_instance_id: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
@@ -4939,6 +4965,16 @@ impl ControlPlaneRaftAuthority {
     #[must_use]
     fn raft(&self) -> &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine> {
         &self.raft
+    }
+
+    fn authority_instance_id(
+        &self,
+    ) -> Result<ControlPlaneRaftAuthorityInstanceId, ControlPlaneError> {
+        if let Some(identity) = self.authority_instance_id.get() {
+            return Ok(*identity);
+        }
+        let generated = ControlPlaneRaftAuthorityInstanceId::generate()?;
+        Ok(*self.authority_instance_id.get_or_init(|| generated))
     }
 
     #[must_use]
@@ -5454,11 +5490,12 @@ impl ControlPlaneRaftAuthority {
         let Some(command) = topology.bootstrap_command() else {
             return Ok(None);
         };
+        let authority_instance_id = self.authority_instance_id()?;
         self.submit_control_plane_command(command)
             .await
             .map(|submitted| {
                 Some(UncertifiedInitialControlPlaneTopologySubmission {
-                    authority_instance: Arc::clone(&self.checkpoint_instance),
+                    authority_instance_id,
                     topology: topology.clone(),
                     submitted,
                 })
@@ -5476,11 +5513,11 @@ impl ControlPlaneRaftAuthority {
         submission: UncertifiedInitialControlPlaneTopologySubmission,
     ) -> Result<Option<u64>, ControlPlaneError> {
         let UncertifiedInitialControlPlaneTopologySubmission {
-            authority_instance,
+            authority_instance_id,
             topology,
             submitted,
         } = submission;
-        if !Arc::ptr_eq(&authority_instance, &self.checkpoint_instance) {
+        if authority_instance_id != self.authority_instance_id()? {
             return Err(ControlPlaneError::rpc_remote(
                 "uncertified initial-topology submission belongs to another authority instance"
                     .to_owned(),
@@ -6046,13 +6083,13 @@ impl ControlPlaneRaftAuthority {
     pub async fn store_durable_restart_artifact(&self) -> Result<Option<u64>, ControlPlaneError> {
         let checkpoint = self.capture_durable_restart_checkpoint().await?;
         let path = self.configured_durable_artifact_path()?;
-        let checkpoint_instance = Arc::clone(&self.checkpoint_instance);
+        let authority_instance_id = self.authority_instance_id()?;
         let checkpoint_publication = Arc::clone(&self.checkpoint_publication);
         let checkpoint_metrics = Arc::clone(&self.checkpoint_metrics);
         let log_store = self.log_store.clone();
         tokio::task::spawn_blocking(move || {
             Self::persist_durable_restart_checkpoint_inner(
-                &checkpoint_instance,
+                authority_instance_id,
                 &checkpoint_publication,
                 &checkpoint_metrics,
                 log_store.as_ref(),
@@ -6071,9 +6108,10 @@ impl ControlPlaneRaftAuthority {
     pub async fn capture_durable_restart_checkpoint(
         &self,
     ) -> Result<ControlPlaneRaftCapturedRestartCheckpoint, ControlPlaneError> {
+        let authority_instance_id = self.authority_instance_id()?;
         Ok(ControlPlaneRaftCapturedRestartCheckpoint {
             artifact: self.capture_durable_restart_artifact().await?,
-            authority_instance: Arc::clone(&self.checkpoint_instance),
+            authority_instance_id,
         })
     }
 
@@ -6118,7 +6156,7 @@ impl ControlPlaneRaftAuthority {
     ) -> Result<Option<u64>, ControlPlaneError> {
         let path = self.configured_durable_artifact_path()?;
         Self::persist_durable_restart_checkpoint_inner(
-            &self.checkpoint_instance,
+            self.authority_instance_id()?,
             &self.checkpoint_publication,
             &self.checkpoint_metrics,
             self.log_store.as_ref(),
@@ -6135,14 +6173,14 @@ impl ControlPlaneRaftAuthority {
     }
 
     fn persist_durable_restart_checkpoint_inner(
-        checkpoint_instance: &Arc<()>,
+        authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
         checkpoint_publication: &Mutex<Option<ControlPlaneRaftCheckpointPosition>>,
         checkpoint_metrics: &ControlPlaneRaftCheckpointMetrics,
         log_store: Option<&ControlPlaneRaftLogStore>,
         checkpoint: ControlPlaneRaftCapturedRestartCheckpoint,
         path: &Path,
     ) -> Result<Option<u64>, ControlPlaneError> {
-        if !Arc::ptr_eq(&checkpoint.authority_instance, checkpoint_instance) {
+        if checkpoint.authority_instance_id != authority_instance_id {
             return Err(ControlPlaneError::rpc_remote(
                 "captured OpenRaft restart checkpoint belongs to another authority instance"
                     .to_string(),
@@ -7148,7 +7186,7 @@ struct ControlPlaneRaftRestartArtifact {
 
 pub struct ControlPlaneRaftCapturedRestartCheckpoint {
     artifact: ControlPlaneRaftRestartArtifact,
-    authority_instance: Arc<()>,
+    authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
 }
 
 /// Opaque proof that this authority captured, certified, and durably published
@@ -20111,7 +20149,7 @@ mod tests {
                 },
                 state_machine: state_machine.export_restart_artifact(),
             },
-            authority_instance: Arc::new(()),
+            authority_instance_id: ControlPlaneRaftAuthorityInstanceId::generate().unwrap(),
         };
         checkpoint.artifact.validate_restart_pair().unwrap();
         let policy = ControlPlaneRaftPeerTransportPolicy::new(
@@ -20179,7 +20217,7 @@ mod tests {
                 },
                 state_machine: state_machine.export_restart_artifact(),
             },
-            authority_instance: Arc::new(()),
+            authority_instance_id: ControlPlaneRaftAuthorityInstanceId::generate().unwrap(),
         };
         let policy = ControlPlaneRaftPeerTransportPolicy::new(
             "test-cluster",
@@ -20292,7 +20330,7 @@ mod tests {
             let empty_rejection = authority
                 .resolve_uncertified_initial_control_plane_topology_submission(
                     UncertifiedInitialControlPlaneTopologySubmission {
-                        authority_instance: Arc::clone(&authority.checkpoint_instance),
+                        authority_instance_id: authority.authority_instance_id().unwrap(),
                         topology: topology.clone(),
                         submitted: SubmittedControlPlaneRaftCommand {
                             log_id: raft_log_id(1, node_id, 1),
@@ -20337,7 +20375,7 @@ mod tests {
                 authority
                     .resolve_uncertified_initial_control_plane_topology_submission(
                         UncertifiedInitialControlPlaneTopologySubmission {
-                            authority_instance: Arc::clone(&authority.checkpoint_instance),
+                            authority_instance_id: authority.authority_instance_id().unwrap(),
                             topology: topology.clone(),
                             submitted: SubmittedControlPlaneRaftCommand {
                                 log_id: raft_log_id(1, node_id, 2),
@@ -20388,10 +20426,10 @@ mod tests {
                 )
                 .await;
             }
-            assert!(!Arc::ptr_eq(
-                &authority_a.checkpoint_instance,
-                &authority_b.checkpoint_instance
-            ));
+            assert!(
+                authority_a.authority_instance_id().unwrap()
+                    != authority_b.authority_instance_id().unwrap()
+            );
 
             let topology_a = crate::derive_uncertified_initial_control_plane_topology(
                 &[crate::StaticStorageNodeEndpoint::new(

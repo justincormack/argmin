@@ -1429,9 +1429,11 @@ already-initialized behavior, and the logical established epoch. The Raft author
 owns pre-submission empty-state observation and post-publication resolution: a bootstrap rejection
 or leader-routing race is concurrent success only after a fresh authority read proves that initial
 state now exists. The submitted outcome is bound to the exact owner-built topology and exact
-issuing Raft authority identity inside a one-use opaque value; another authority rejects the
-capability before inspecting its outcome or local state, and the process cannot inspect or replace
-the Raft result. The existing
+issuing Raft authority identity inside a one-use opaque value. That process-local identity is a
+storage-owned cryptographically random token which is neither rendered nor serialized; allocation
+addresses are not used as identifiers. The same token binds captured restart checkpoints to their
+issuing authority. Another authority rejects either capability before inspecting its outcome or
+local state, and the process cannot inspect or replace the Raft result. The existing
 process-hosted wrapper still performs its required durable response publication while holding that
 value between the two owner operations; moving that wrapper remains a later part of item 4.
 Owner-local tests pin the unchanged legacy command shape, invalid endpoint/PG rejection,
