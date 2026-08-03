@@ -73,6 +73,10 @@ pub(crate) struct MetadataCommandPublisherDescriptor {
     pub(crate) class: MetadataCommandPublisherClass,
 }
 
+mod metadata_command_publisher_token_sealed {
+    pub trait Sealed {}
+}
+
 mod snapshot_sensitive_publisher_token_sealed {
     pub trait Sealed {}
 }
@@ -93,13 +97,24 @@ mod apply_validated_publisher_token_sealed {
     pub trait Sealed {}
 }
 
+/// Compiler-visible authority owned by every registered metadata-command
+/// publisher, independent of its contention class.
+///
+/// Generic pending-slot progress helpers require this common token so a
+/// production owner cannot drain command-stream state without identifying its
+/// authoritative registry entry.
+pub(crate) trait MetadataCommandPublisher:
+    metadata_command_publisher_token_sealed::Sealed + Copy
+{
+}
+
 /// Compiler-visible authority to use the snapshot-sensitive install path.
 ///
 /// Implementations are generated exclusively from registry entries classified
 /// as `SnapshotSensitive`; callers cannot add an implementation or reclassify
 /// an existing publisher token.
 pub(crate) trait SnapshotSensitiveMetadataCommandPublisher:
-    snapshot_sensitive_publisher_token_sealed::Sealed
+    MetadataCommandPublisher + snapshot_sensitive_publisher_token_sealed::Sealed
 {
 }
 
@@ -109,7 +124,7 @@ pub(crate) trait SnapshotSensitiveMetadataCommandPublisher:
 /// as `AllocatorCleanup`; callers cannot add an implementation or reclassify
 /// an existing publisher token.
 pub(crate) trait AllocatorCleanupMetadataCommandPublisher:
-    allocator_cleanup_publisher_token_sealed::Sealed
+    MetadataCommandPublisher + allocator_cleanup_publisher_token_sealed::Sealed
 {
 }
 
@@ -119,7 +134,7 @@ pub(crate) trait AllocatorCleanupMetadataCommandPublisher:
 /// as `TerminalSessionRetry`. The matching contender must remain visible until
 /// the publisher's retry loop can consume it.
 pub(crate) trait TerminalSessionRetryMetadataCommandPublisher:
-    terminal_session_retry_publisher_token_sealed::Sealed
+    MetadataCommandPublisher + terminal_session_retry_publisher_token_sealed::Sealed
 {
 }
 
@@ -130,7 +145,7 @@ pub(crate) trait TerminalSessionRetryMetadataCommandPublisher:
 /// as `MatchingOutcomeRetry`. The matching command must remain visible until
 /// the publisher extracts its command-owned result.
 pub(crate) trait MatchingOutcomeRetryMetadataCommandPublisher:
-    matching_outcome_retry_publisher_token_sealed::Sealed
+    MetadataCommandPublisher + matching_outcome_retry_publisher_token_sealed::Sealed
 {
 }
 
@@ -141,7 +156,7 @@ pub(crate) trait MatchingOutcomeRetryMetadataCommandPublisher:
 /// as `ApplyValidated`; callers cannot select this retry behavior with a token
 /// from another publisher class.
 pub(crate) trait ApplyValidatedMetadataCommandPublisher:
-    apply_validated_publisher_token_sealed::Sealed
+    MetadataCommandPublisher + apply_validated_publisher_token_sealed::Sealed
 {
 }
 
@@ -158,6 +173,8 @@ macro_rules! define_metadata_command_publisher_token {
             }
         }
 
+        impl super::metadata_command_publisher_token_sealed::Sealed for $id {}
+        impl super::MetadataCommandPublisher for $id {}
         impl super::snapshot_sensitive_publisher_token_sealed::Sealed for $id {}
         impl super::SnapshotSensitiveMetadataCommandPublisher for $id {}
     };
@@ -173,6 +190,8 @@ macro_rules! define_metadata_command_publisher_token {
             }
         }
 
+        impl super::metadata_command_publisher_token_sealed::Sealed for $id {}
+        impl super::MetadataCommandPublisher for $id {}
         impl super::allocator_cleanup_publisher_token_sealed::Sealed for $id {}
         impl super::AllocatorCleanupMetadataCommandPublisher for $id {}
     };
@@ -188,6 +207,8 @@ macro_rules! define_metadata_command_publisher_token {
             }
         }
 
+        impl super::metadata_command_publisher_token_sealed::Sealed for $id {}
+        impl super::MetadataCommandPublisher for $id {}
         impl super::terminal_session_retry_publisher_token_sealed::Sealed for $id {}
         impl super::TerminalSessionRetryMetadataCommandPublisher for $id {}
     };
@@ -203,6 +224,8 @@ macro_rules! define_metadata_command_publisher_token {
             }
         }
 
+        impl super::metadata_command_publisher_token_sealed::Sealed for $id {}
+        impl super::MetadataCommandPublisher for $id {}
         impl super::matching_outcome_retry_publisher_token_sealed::Sealed for $id {}
         impl super::MatchingOutcomeRetryMetadataCommandPublisher for $id {}
     };
@@ -218,6 +241,8 @@ macro_rules! define_metadata_command_publisher_token {
             }
         }
 
+        impl super::metadata_command_publisher_token_sealed::Sealed for $id {}
+        impl super::MetadataCommandPublisher for $id {}
         impl super::apply_validated_publisher_token_sealed::Sealed for $id {}
         impl super::ApplyValidatedMetadataCommandPublisher for $id {}
     };

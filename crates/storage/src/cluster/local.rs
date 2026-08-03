@@ -1191,6 +1191,12 @@ pub(crate) struct MetadataCommandRecoveryGuard {
     flights: Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
 }
 
+impl MetadataCommandRecoveryGuard {
+    pub(crate) fn matches_command(&self, pg_id: PgId, command: &MetadataCommandEnvelope) -> bool {
+        self.key == MetadataCommandRecoveryKey::new(pg_id, command)
+    }
+}
+
 impl Drop for MetadataCommandRecoveryGuard {
     fn drop(&mut self) {
         {

@@ -112,6 +112,88 @@ impl Fixture {
         install_apply_validated_metadata_command_with_fresh_id();
     }
 
+    fn typed_generic_drain_is_not_shell_inventoried() {
+        crate::metadata_command::metadata_command_publisher!(TypedGenericDrainPublisher);
+        drain_one_pending_object_metadata_command();
+    }
+
+    fn typed_generic_drain_without_marker_is_rejected() {
+        drain_pending_object_metadata_commands_for_publisher();
+    }
+
+    fn raw_generic_drain_from_publisher_is_rejected() {
+        crate::metadata_command::metadata_command_publisher!(RawGenericDrainPublisher);
+        drain_pending_object_metadata_commands_for_bucket();
+    }
+
+    fn raw_generic_drain_from_unmarked_wrapper_is_rejected() {
+        drain_pending_object_metadata_commands_for_bucket();
+    }
+
+    fn raw_inner_drain_from_unmarked_wrapper_is_rejected() {
+        drain_pending_metadata_command_with_authority_inner();
+    }
+
+    fn recovery_authority_construction_from_unmarked_wrapper_is_rejected() {
+        MetadataCommandRecoveryDrainAuthority::new();
+    }
+
+    fn recovery_authority_constructor_function_item_is_rejected() {
+        let _mint = MetadataCommandRecoveryDrainAuthority::new;
+    }
+
+    fn recovery_invocation_construction_from_unmarked_wrapper_is_rejected() {
+        MetadataCommandDrainAuthority::for_recovery();
+    }
+
+    fn recovery_wrapper_from_unmarked_wrapper_is_rejected() {
+        drain_pending_metadata_command_with_local_recovery_route();
+    }
+
+    fn recovery_execution_route_from_unmarked_wrapper_is_rejected() {
+        MetadataCommandExecutionRoute::recovery();
+    }
+
+    fn recovery_execution_route_struct_literal_is_rejected() {
+        let _route = MetadataCommandExecutionRoute { mode: MetadataCommandRouteMode::Recovery };
+    }
+
+    fn recovery_proof_derivation_from_unmarked_wrapper_is_rejected() {
+        route.for_reissued_command();
+    }
+
+    fn recovery_leader_construction_from_unmarked_wrapper_is_rejected() {
+        authority.admit_leader();
+    }
+
+    fn recovery_apply_from_unmarked_wrapper_is_rejected() {
+        apply_metadata_command_to_acting_set_for_recovery();
+    }
+
+    fn recovery_reissued_apply_from_unmarked_wrapper_is_rejected() {
+        apply_reissued_metadata_command_to_acting_set_for_recovery();
+    }
+
+    fn recovery_abandon_from_unmarked_wrapper_is_rejected() {
+        record_abandoned_metadata_command_to_acting_set_for_recovery();
+    }
+
+    fn recovery_pending_removal_from_unmarked_wrapper_is_rejected() {
+        remove_pending_metadata_command_for_bucket_recovery();
+    }
+
+    fn recovery_reissue_from_unmarked_wrapper_is_rejected() {
+        reissue_pending_metadata_command_with_route_mode();
+    }
+
+    fn recovery_bucket_finisher_from_unmarked_wrapper_is_rejected() {
+        finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget();
+    }
+
+    fn retired_recovery_finisher_from_unmarked_wrapper_is_rejected() {
+        finish_pending_metadata_command_recovery_with_work_budget();
+    }
+
     fn publisher_token_constructor_function_item_is_rejected() {
         let mint =
             crate::metadata_command::publisher::TypedSnapshotPublisher::__from_registry_marker;

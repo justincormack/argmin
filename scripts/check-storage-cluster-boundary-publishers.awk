@@ -15,6 +15,9 @@ function canonicalize_function(name) {
     if (name == "commit_stream_segment_append_with_work_budget") {
         return "commit_stream_segment_append"
     }
+    if (name == "abort_stream_upload_session_with_work_budget") {
+        return "abort_stream_upload_session"
+    }
     return name
 }
 
@@ -209,6 +212,57 @@ function update_function_context(line) {
 }
 
 function publisher_helper(line) {
+    if (line ~ /MetadataCommandRecoveryDrainAuthority::new/) {
+        return "metadata_command_recovery_authority_constructor"
+    }
+    if (line ~ /MetadataCommandDrainAuthority::for_recovery/) {
+        return "metadata_command_recovery_invocation_constructor"
+    }
+    if (line ~ /\.admit_leader\(/) {
+        return "metadata_command_recovery_leader_constructor"
+    }
+    if (line ~ /drain_pending_metadata_command_with_authority_inner/) {
+        return "metadata_command_authorized_drain_primitive"
+    }
+    if (line ~ /drain_pending_metadata_command_with_recovery_authority/) {
+        return "metadata_command_recovery_authority_drain"
+    }
+    if (line ~ /drain_pending_metadata_command_with_local_recovery_route/) {
+        return "metadata_command_local_recovery_drain"
+    }
+    if (line ~ /drain_pending_metadata_command_with_authorized_recovery_route/) {
+        return "metadata_command_historical_recovery_drain"
+    }
+    if (line ~ /MetadataCommandExecutionRoute::recovery/) {
+        return "metadata_command_recovery_execution_route"
+    }
+    if (line ~ /MetadataCommandExecutionRoute[[:space:]]*\{/) {
+        return "metadata_command_execution_route_struct_literal"
+    }
+    if (line ~ /\.for_reissued_command\(/) {
+        return "metadata_command_recovery_proof_derivation"
+    }
+    if (line ~ /apply_reissued_metadata_command_to_acting_set_for_recovery/) {
+        return "metadata_command_recovery_apply_reissued"
+    }
+    if (line ~ /apply_metadata_command_to_acting_set_for_recovery/) {
+        return "metadata_command_recovery_apply"
+    }
+    if (line ~ /record_abandoned_metadata_command_to_acting_set_for_recovery/) {
+        return "metadata_command_recovery_record_abandoned"
+    }
+    if (line ~ /remove_pending_metadata_command_for_bucket_recovery/) {
+        return "metadata_command_recovery_remove_pending"
+    }
+    if (line ~ /reissue_pending_metadata_command_with_route_mode/) {
+        return "metadata_command_recovery_reissue"
+    }
+    if (line ~ /finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget/) {
+        return "metadata_command_recovery_bucket_finisher"
+    }
+    if (line ~ /finish_pending_metadata_command_recovery/) {
+        return "retired_metadata_command_recovery_finisher"
+    }
     if (line ~ /try_set_pending_metadata_command_for_bucket_with_effect_fence\(/) {
         return "try_set_pending_metadata_command_for_bucket_with_effect_fence"
     }
@@ -263,6 +317,17 @@ function publisher_helper(line) {
     if (line ~ /install_apply_validated_bucket_pg_command_or_retry\(/) {
         return "install_apply_validated_bucket_pg_command_or_retry"
     }
+    if (line ~ /drain_one_pending_object_metadata_command\(/) {
+        return "drain_one_pending_object_metadata_command"
+    }
+    if (line ~ /drain_pending_object_metadata_commands_for_publisher(_collect)?\(/) {
+        return "drain_pending_object_metadata_commands_for_publisher"
+    }
+    if (line ~ /drain_pending_object_metadata_commands_for_bucket(_collect_unclassified)?\(/ \
+        || line ~ /drain_pending_metadata_command_with_recovery_gate\(/ \
+        || line ~ /drain_pending_metadata_command_with_recovery_gate_inner\(/) {
+        return "raw_pending_object_metadata_command_drain"
+    }
     if (line ~ /set_pending_metadata_command_for_bucket\(/) {
         return "set_pending_metadata_command_for_bucket"
     }
@@ -291,6 +356,12 @@ function is_install_helper(name) {
         || name == "install_matching_outcome_retry_metadata_command" \
         || name == "install_apply_validated_metadata_command_with_fresh_id" \
         || name == "install_apply_validated_bucket_pg_command_or_retry" \
+        || name == "drain_one_pending_object_metadata_command" \
+        || name == "drain_pending_object_metadata_commands_for_publisher" \
+        || name == "drain_after_object_pg_log_conflict" \
+        || name == "drain_pending_object_metadata_commands_for_publisher_collect" \
+        || name == "next_object_metadata_command_id_or_drain_with_completion_admission" \
+        || name == "raw_pending_object_metadata_command_drain" \
         || name == "try_set_pending_metadata_command_for_bucket" \
         || name == "try_set_pending_metadata_command_for_bucket_with_effect_fence"
 }
@@ -353,7 +424,18 @@ pending_test_cfg {
     }
 
     helper = publisher_helper($0)
-    if (helper == "" || is_install_helper(current_fn)) {
+    if (helper == "") {
+        next
+    }
+    if (helper ~ /^metadata_command_.*recovery/ \
+        || helper == "metadata_command_authorized_drain_primitive") {
+        if ($0 ~ /^    (pub(\([^)]*\))? |pub\(crate\) |pub\(super\) )?fn /) {
+            next
+        }
+        print "RECOVERY_DRAIN_USE\t" FILENAME ":" current_fn ":" helper
+        next
+    }
+    if (is_install_helper(current_fn)) {
         next
     }
     # Phase 4 typed publisher APIs make the permitted helper a Rust trait
@@ -368,7 +450,9 @@ pending_test_cfg {
         || helper == "install_terminal_session_retry_metadata_command" \
         || helper == "install_matching_outcome_retry_metadata_command" \
         || helper == "install_apply_validated_metadata_command_with_fresh_id" \
-        || helper == "install_apply_validated_bucket_pg_command_or_retry") {
+        || helper == "install_apply_validated_bucket_pg_command_or_retry" \
+        || helper == "drain_one_pending_object_metadata_command" \
+        || helper == "drain_pending_object_metadata_commands_for_publisher") {
         if (current_publisher_id == "") {
             print "TYPED_MISSING_MARKER\t" FILENAME ":" current_fn ":" helper
         }

@@ -424,15 +424,54 @@ outcome is only valid after an exact matching predicate has succeeded.
 | `drain_pending_metadata_command_pg_slot` and `drain_pending_multipart_completion_barrier_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
 | `finish_pending_command_for_multipart_completion_barrier` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 pins the multipart serialization rules. |
 
-The boundary script inventories production uses of
-`MetadataCommandLogConflict` and `metadata_command_log_conflict_matches`.
-Adding a new broad match must update that inventory and document why it is
-pre-publish retry, exact-command convergence, or fail-closed validation.
-Pre-publish command-id allocation conflicts are retryable only for
-snapshot-sensitive loops that immediately drain the durable PG slot and rerun
-their request action from a fresh snapshot. Finish/convergence conflicts after
-any replica may have accepted the command still require exact command bytes and
-hash-chain proof, or must fail closed.
+Pre-publish conflict handling belongs to the compiler-classified publisher.
+Every registered publisher token implements exactly one sealed class trait,
+and even its generic contender-drain paths require that token. A pre-publish
+conflict branch drains at most one contender before returning to its
+route-authority, work-budget, and fresh-snapshot checks. Preflight paths that
+must inspect applied commands for idempotence retain a separate token-gated
+collecting drain with one shared finite work budget. Terminal and
+matching-outcome classes preserve equivalent pending commands through their
+exhaustive typed outcomes instead of draining them.
+
+Storage-owned inspection and recovery do not borrow a publisher token. They
+must instead hold an opaque, non-copy recovery-drain authority which borrows
+one request work budget across every contender. The primitive drain itself
+accepts only a typed per-invocation authority derived from either that recovery
+authority or a registered publisher token; it has no optional raw-budget or
+default-budget path. Both authority states have fields private to a child
+module, preventing same-module struct-literal construction. The boundary
+scanner inventories every live recovery-authority constructor, conversion,
+primitive call, recovery wrapper, recovery execution-route construction, and
+recovery-only bucket finisher (including function-item references), so an
+unmarked publisher cannot mint or invoke recovery authority without changing
+the audited inventory. The primitive converts its joined leader guard into an
+opaque leader capability. Every lower historical apply, abandonment, reissue,
+and pending-slot removal boundary requires a proof borrowed from that live
+capability, so neither a direct lower call nor a recovery execution-route
+struct literal can escape the joined guard's lifetime. The proof is also bound
+to the joined guard's exact `(PG, log index, checksum)` recovery subject, and
+every lower boundary checks that subject before storage access. Reissue returns
+a newly derived proof bound to the replacement command only after validating a
+same-epoch, later-index chain with either identical payload or the one explicit
+abandoned-command cleanup derivative. Thus a leader for one command cannot be
+redirected to another command, while legitimate recovery follow-ups remain
+explicitly certified. A cleanup proof also retains the exact abandoned-command
+predecessor: lower mutation and subsequent same-payload reissue both require
+that context, and omission is rejected rather than silently broadening the
+proof. The scanner inventories those lower calls and
+struct-literal syntax as defense in depth. Production exposes no raw
+all-command drain: the remaining unclassified convenience drain is test-only,
+and the scanner rejects any production reference to it, including from an
+unmarked wrapper.
+
+Finish/convergence handling is a separate storage-engine boundary. A caller
+may report a pending command as its request's outcome only through an
+`ExactPendingObjectMetadataCommand` created after matching that exact request.
+After any replica may have accepted a command, convergence still requires exact
+command bytes and hash-chain proof; divergent same-index state fails closed.
+These compiler-visible publisher and exact-command boundaries replace the old
+shell inventory of function-name occurrence counts.
 
 ## Object Version Reservations
 

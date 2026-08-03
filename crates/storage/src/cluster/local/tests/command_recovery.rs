@@ -1168,7 +1168,7 @@ fn pending_slot_drain_records_diagnostic_action() {
     ));
 
     cluster
-        .drain_pending_object_metadata_commands_for_bucket_collect(pg_id, &bucket)
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
         .unwrap();
 
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
@@ -7041,8 +7041,45 @@ fn stream_create_recovery_rejects_crossed_reservation_authority_without_mutation
             ),
         )),
     );
+    let crossed_command = MetadataCommandEnvelope::new(
+        crate::metadata_command::MetadataCommandId::new(
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            crate::metadata_command::MetadataCommandLogIndex::new(
+                command.id().log_index().get() + 1,
+            )
+            .unwrap(),
+        ),
+        command.payload().clone(),
+    );
+    let crossed_error = cluster
+        .test_apply_metadata_command_to_acting_set_for_recovery_under_leader(
+            &command,
+            &crossed_command,
+            &cluster,
+        )
+        .expect_err("one command's recovery leader must not authorize another command");
+    assert!(
+        matches!(
+            &crossed_error.source,
+            crate::BucketSnapshotLoadError::Store(
+                crate::StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "metadata-command-recovery-subject"
+                }
+            )
+        ),
+        "unexpected crossed recovery-subject error: {crossed_error:?}"
+    );
+    assert_eq!(crossed_error.applied_nodes, 0);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(2).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+    }
     let error = cluster
-        .apply_metadata_command_to_acting_set_for_recovery(&command, &cluster)
+        .test_apply_metadata_command_to_acting_set_for_recovery(&command, &cluster)
         .expect_err("crossed stream-create recovery authority must fail");
     assert!(
         matches!(
@@ -7200,6 +7237,170 @@ fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanu
             ),
             Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
         ));
+    }
+}
+
+#[test]
+fn abandoned_stream_create_cleanup_derivative_reissues_and_converges() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let session_id = crate::SessionId::try_from("5b".repeat(16)).unwrap();
+    let _generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &session_id)
+        .unwrap();
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::PUT_OBJECT_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let command = MetadataCommandEnvelope::new(
+        crate::metadata_command::MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::PutObject,
+                    encryption: crate::ObjectEncryption::None,
+                },
+                123,
+                proof,
+            ),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .record_metadata_command_abandoned(NodeId::new(0).as_u32(), &command)
+        .unwrap();
+
+    let cleanup_without_predecessor = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            command.id().cluster_epoch(),
+            pg_id,
+            MetadataCommandLogIndex::new(command.id().log_index().get() + 1).unwrap(),
+        ),
+        command
+            .payload()
+            .abandoned_recovery_follow_up()
+            .expect("PUT stream creation has a certified reservation-release derivative"),
+    );
+    let omitted_predecessor_error = cluster
+        .test_apply_recovery_derivative_without_predecessor(
+            &command,
+            &cleanup_without_predecessor,
+            &cluster,
+        )
+        .expect_err("cleanup derivative proof must retain its abandoned source");
+    assert!(
+        matches!(
+            omitted_predecessor_error.source,
+            crate::BucketSnapshotLoadError::Store(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "metadata-command-recovery-predecessor-context"
+            })
+        ),
+        "unexpected omitted predecessor error: {omitted_predecessor_error:?}"
+    );
+    assert_eq!(omitted_predecessor_error.applied_nodes, 0);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let conflict_once = Arc::new(AtomicBool::new(true));
+    let first_cleanup_log_index = Arc::new(AtomicU64::new(0));
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_session = session_id.clone();
+    let conflict_once_hook = Arc::clone(&conflict_once);
+    let first_cleanup_log_index_hook = Arc::clone(&first_cleanup_log_index);
+    let hook_map = Arc::clone(&map);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, candidate| {
+            match candidate.payload() {
+                MetadataCommandPayload::ReleaseObjectGeneration(release)
+                    if release.matches_request(&hook_bucket, &hook_key, &hook_session)
+                        && node_id == NodeId::new(1)
+                        && conflict_once_hook.swap(false, Ordering::SeqCst) =>
+                {
+                    first_cleanup_log_index_hook
+                        .store(candidate.id().log_index().get(), Ordering::SeqCst);
+                    for replica_node_id in node_ids {
+                        hook_map
+                            .node(replica_node_id)
+                            .unwrap()
+                            .storage_node()
+                            .get_pg(candidate.id().pg_id().get())?
+                            .record_metadata_command_abandoned(
+                                replica_node_id.as_u32(),
+                                candidate,
+                            )?;
+                    }
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id: node_id.as_u32(),
+                        pg_id: candidate.id().pg_id().get(),
+                        cluster_epoch: candidate.id().cluster_epoch(),
+                        log_index: candidate.id().log_index().get(),
+                    });
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    ));
+
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    drop(hook_guard);
+    assert!(!conflict_once.load(Ordering::SeqCst));
+    let first_cleanup_log_index = first_cleanup_log_index.load(Ordering::SeqCst);
+    assert_ne!(first_cleanup_log_index, 0);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id
+            ),
+            Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
+        ));
+        assert_eq!(
+            pg.max_metadata_command_log_index(cluster.operation_epoch())
+                .unwrap(),
+            first_cleanup_log_index + 1
+        );
     }
 }
 

@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–3 complete; Phase 4 in progress
+Status: active — Phases 0–4 complete; Phase 5 not started
 
 Related plans:
 
@@ -5488,6 +5488,100 @@ Ninth Phase 4 slice (2026-08-03):
   and reclaim regressions, the storage boundary checker, formatting, workspace
   compilation, workspace-wide strict Clippy, and the full parallel 7,973-test
   workspace suite.
+
+Tenth Phase 4 slice (2026-08-03):
+
+- every registry token now implements one common sealed
+  `MetadataCommandPublisher` trait in addition to its single class-specific
+  trait. Generic single-contender and idempotence-collecting object-PG drains
+  require that common token, so publisher-owned progress cannot omit its
+  authoritative registry identity.
+- every pre-publish `MetadataCommandLogConflict` branch now drains at most one
+  contender before returning to the owner loop's route-authority, work-budget,
+  and fresh-snapshot checks. The separate collecting drain remains for
+  preflights that must inspect applied command results to recognize an
+  idempotent stream or multipart creation.
+- post-acceptance convergence remains a storage-engine operation. Reporting a
+  pending command as the current request's result still requires an
+  `ExactPendingObjectMetadataCommand` constructed only after exact request
+  matching, while generic recovery drains cannot manufacture that proof.
+- the publisher scanner now rejects a registered publisher which calls an
+  unclassified recovery/inspection drain, and its adversarial fixture covers
+  both a missing token marker and a marked raw-drain bypass. This stable symbol
+  prohibition replaces the former occurrence-count inventory without
+  reintroducing a hand-maintained publisher list.
+- removed the final `MetadataCommandLogConflict` function/count allowlist and
+  updated the command-stream guide to describe the compiler-visible publisher,
+  conflict-drain, and exact-command convergence boundaries. The Phase 4 audit
+  confirms all production publishers have one Rust classification and no raw
+  pending installer or raw publisher drain remains reachable from a registered
+  owner path; Phase 4 is complete.
+- validation passed the six focused publisher/conflict/adversarial regressions,
+  the storage boundary checker, formatting, workspace-wide strict Clippy, and
+  the full parallel workspace suite (7,978 tests).
+
+Eleventh Phase 4 correction (2026-08-03):
+
+- corrected the remaining publisher loops which could drain successive
+  contenders without returning to their route and request-work boundaries.
+  Stream append and stream abort now drain exactly one observed command, apply
+  contention backoff, and re-enter their bounded owner loop. The same audit
+  corrected multipart abort and streamed PUT/UploadPart finalization.
+- removed the production unclassified all-command drain. Direct-PUT cleanup
+  now delegates directly to the separately bounded generation-release
+  publisher instead of hiding recovery in an unmarked best-effort wrapper.
+- storage-owned multipart lookup, lifecycle inspection, and append preparation
+  now use an opaque, non-copy recovery-drain authority borrowing one shared
+  finite work budget. Publisher idempotence collection similarly retains its
+  publisher token and one shared budget across the complete preflight.
+- strengthened the publisher scanner so an unclassified drain is rejected
+  even from an unmarked wrapper; the adversarial fixture pins both marked and
+  unmarked bypass attempts. Deterministic stream append and abort regressions
+  inject a second contender after the first drain and prove it remains pending
+  when the owner returns to its exhausted budget boundary.
+- closed the lower-level bypass as well: the primitive drain now requires a
+  non-optional typed per-invocation authority derived from either the
+  publisher token or the opaque recovery authority. Historical recovery
+  wrappers create an explicitly bounded recovery authority rather than asking
+  the primitive to manufacture a default budget. Authority fields are private
+  to a child module, preventing struct-literal forgery, and the checker now
+  inventories every use of the live constructor, recovery conversion,
+  primitive, and recovery wrappers. Adversarial fixtures pin unmarked live
+  primitive/construction/wrapper calls and constructor function-item aliases.
+- removed the separately callable recovery-finishing helpers. The joined
+  leader guard, authority budget, and recovery mutation now share one lexical
+  scope inside the authority-gated drain primitive. The audited live-symbol
+  inventory also covers construction of the lower recovery execution route
+  and invocation of its bucket-PG finisher; fixtures reject both those bypass
+  forms and the retired finishing-helper spelling.
+- closed the remaining lower-mutation escape hatch. Joining recovery now
+  produces an opaque leader capability which owns the actual leader guard;
+  historical apply, reissued apply, abandonment, reissue, and pending-slot
+  removal require a proof borrowed from that live capability. The recovery
+  execution route carries the same unforgeable proof. Its fields cannot be
+  constructed outside the authority child module, and its lifetime prevents
+  the proof surviving the guard. The boundary checker now inventories every
+  lower recovery mutator, leader construction, and execution-route struct
+  literal; adversarial fixtures pin each formerly expressible bypass.
+- bound the opaque recovery-leader proof to the joined guard's exact PG,
+  log-index, and command-checksum subject. Every lower recovery mutation now
+  rejects a proof for another command before node access. Ordinary reissue and
+  the sanctioned abandoned-command cleanup follow-up derive a new proof bound
+  to the exact replacement only after validating the same-epoch, increasing-log
+  chain and allowed payload relationship; generic proof substitution is no
+  longer possible. An adversarial acting-set regression uses a live leader for
+  command A against command B and pins zero applied nodes and no durable
+  mutation, while the terminal cleanup regression pins the valid derivative.
+- corrected cleanup-derivative reissue without weakening its certificate.
+  Once a proof has an abandoned-command predecessor, every lower mutation and
+  later same-payload reissue must carry that exact source; callers cannot omit
+  or substitute it. The deterministic regression now covers abandoned stream
+  creation, certified generation-release derivation, a consumed cleanup log
+  index, same-payload cleanup reissue, and terminal convergence, and separately
+  asserts that dropping predecessor context fails before node access.
+- validation passed the focused contention regressions, the storage boundary
+  checker, formatting, workspace-wide strict Clippy, and the full parallel
+  workspace suite (7,981 tests).
 
 ### Phase 5 — isolate test support
 

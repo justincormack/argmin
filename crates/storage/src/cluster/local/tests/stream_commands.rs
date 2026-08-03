@@ -2,6 +2,28 @@ use super::*;
 use crate::cluster::{segment_payload_placement_key, StreamAppendCommitRequest};
 use crate::metadata_command::ReleaseObjectGenerationCommand;
 
+fn pending_release_command(
+    cluster: &crate::StorageCluster,
+    map: &LocalClusterMap,
+    pg_id: PgId,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    reservation_id: &str,
+) -> MetadataCommandEnvelope {
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReleaseObjectGeneration(ReleaseObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::SessionId::try_from(reservation_id.repeat(16)).unwrap(),
+        )),
+    )
+}
+
 #[test]
 fn applied_stream_create_matching_binds_requested_cleanup_deadline_for_both_targets() {
     let bucket = crate::tests::bucket_name("applied-stream-cleanup-bucket");
@@ -573,6 +595,79 @@ fn stream_put_create_retries_after_pending_install_conflict() {
 }
 
 #[test]
+fn stream_abort_yields_after_one_pending_drain_before_budget_recheck() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("73".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let pg_id = PgId::new(object_pg);
+    let first = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "74");
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &first);
+
+    let inserted = Arc::new(Mutex::new(None));
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let inserted_for_hook = Arc::clone(&inserted);
+    let _hook = cluster.test_install_after_metadata_command_drain_hook(Arc::new(move || {
+        let second = pending_release_command(
+            &hook_cluster,
+            &hook_map,
+            pg_id,
+            &hook_bucket,
+            &hook_key,
+            "75",
+        );
+        insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &second);
+        *inserted_for_hook.lock().unwrap() = Some(second);
+    }));
+
+    let error = cluster
+        .test_abort_stream_upload_session_with_max_attempts(&bucket, &key, &session_id, 1)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+            context: "stream abort initial pending drain retry budget exhausted"
+        })
+    ));
+    let inserted = inserted.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(inserted),
+        "stream abort must return to its budget boundary after one contender"
+    );
+    for node_id in node_ids {
+        let node = map.node(node_id).unwrap().storage_node();
+        let pg = node.get_pg(object_pg).unwrap();
+        assert!(crate::PgMetadataStore::get_stream_upload(&*pg, &session_id).is_ok());
+    }
+}
+
+#[test]
 fn stream_abort_missing_session_does_not_succeed_after_unrelated_pending_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1028,6 +1123,106 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
             vec![segment.clone()]
         );
     }
+}
+
+#[test]
+fn stream_append_yields_after_one_pending_drain_before_budget_recheck() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("70".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"single contender stream append drain";
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: checksum::crc64::checksum(payload),
+                payload_crc64: checksum::crc64::checksum(payload),
+                segment_okh: [0x70; 16],
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    let pg_id = PgId::new(object_pg);
+    let first = pending_release_command(&cluster, &map, pg_id, &bucket, &key, "71");
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &first);
+
+    let inserted = Arc::new(Mutex::new(None));
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let inserted_for_hook = Arc::clone(&inserted);
+    let _hook = cluster.test_install_after_metadata_command_drain_hook(Arc::new(move || {
+        let second = pending_release_command(
+            &hook_cluster,
+            &hook_map,
+            pg_id,
+            &hook_bucket,
+            &hook_key,
+            "72",
+        );
+        insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &second);
+        *inserted_for_hook.lock().unwrap() = Some(second);
+    }));
+
+    let error = cluster
+        .test_commit_stream_segment_append_with_max_attempts(
+            StreamAppendCommitRequest {
+                bucket: &bucket,
+                key: &key,
+                session_id: &session_id,
+                segment_index: segment.segment_index,
+                segment_record: &segment,
+                shard_batch: &shard_batch,
+            },
+            1,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+            context: "stream append pending drain retry budget exhausted"
+        })
+    ));
+    let inserted = inserted.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(inserted),
+        "stream append must return to its budget boundary after one contender"
+    );
 }
 
 #[test]
