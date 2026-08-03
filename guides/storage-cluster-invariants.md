@@ -289,7 +289,7 @@ script in the same change.
 | `load_stream_upload_session`, `prepare_stream_segment_append` | Epoch-fenced routed metadata PG; prepare drains pending object command state before allocating the next staged segment generation |
 | `list_stream_upload_sessions_best_effort` | Best-effort routed metadata PG fanout |
 | `create_bucket_with_config_and_load_info`, `put_bucket_versioning_and_load_info`, `put_bucket_acl_and_load_info`, `put_bucket_object_lock_and_load_info`, `put_bucket_encryption_and_load_info`, `put_bucket_public_access_block_and_load_info`, `delete_bucket_public_access_block_and_load_info`, `put_bucket_ownership_controls_and_load_info`, `delete_bucket_ownership_controls_and_load_info`, `put_bucket_abac_enabled_and_load_info`, `put_bucket_subresource_and_load_info`, `delete_bucket_subresource_and_load_info` | Epoch-fenced routed metadata PG command apply |
-| `try_probe_bucket_pg_available`, `load_bucket_snapshot`, `load_bucket_snapshot_pair`, `head_bucket_info`, `get_bucket_subresource` | Epoch-fenced routed metadata PG |
+| `try_probe_bucket_pg_available`, `load_bucket_snapshot`, `head_bucket_info`, `get_bucket_subresource` | Epoch-fenced routed metadata PG |
 | `with_bucket_write_snapshot` | Epoch-fenced routed metadata PG plus durable bucket-PG-primary write reservation acquire/release |
 | `list_buckets_for_owner`, `list_lifecycle_sweep_buckets` | Epoch-fenced routed metadata PG fanout |
 | `begin_bucket_delete` | Epoch-fenced routed metadata PG fanout |

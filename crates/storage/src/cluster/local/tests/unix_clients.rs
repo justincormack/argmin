@@ -2729,27 +2729,6 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
         outcome,
         crate::BucketCreateAttemptOutcome::Created(_)
     ));
-    let destination_bucket = crate::tests::bucket_name("remote-bucket-metadata-destination");
-    let destination_config = crate::CreateBucketConfig {
-        name: destination_bucket.as_str(),
-        owner_principal: "owner",
-        owner_canonical_id: &owner,
-        acl_grants: &acl_grants,
-        public_read: false,
-        public_write: false,
-        versioning: crate::BucketVersioningState::Disabled,
-        object_lock: crate::BucketObjectLockConfig::default(),
-        ownership_controls: crate::BucketOwnershipControls {
-            object_ownership: crate::BucketObjectOwnership::ObjectWriter,
-        },
-    };
-    assert!(matches!(
-        cluster
-            .create_bucket_with_config_and_load_info(&destination_config)
-            .unwrap(),
-        crate::BucketCreateAttemptOutcome::Created(_)
-    ));
-
     let runtime_map =
         crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
     let admission = runtime_map.admit_current_route().unwrap();
@@ -2769,38 +2748,6 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
             .name,
         bucket
     );
-    let pair = admission
-        .active_bucket_route_pair(&bucket, &destination_bucket)
-        .unwrap()
-        .load_bucket_snapshot_pair(
-            crate::BucketSnapshotRequest::default(),
-            crate::BucketSnapshotRequest::default(),
-        )
-        .unwrap();
-    match pair {
-        crate::BucketSnapshotPair::Distinct {
-            source,
-            destination,
-        } => {
-            assert_eq!(source.bucket.name, bucket);
-            assert_eq!(destination.bucket.name, destination_bucket);
-        }
-        crate::BucketSnapshotPair::Same { .. } => {
-            panic!("distinct bucket routes returned a same-bucket snapshot")
-        }
-    }
-    assert!(matches!(
-        admission
-            .active_bucket_route_pair(&bucket, &bucket)
-            .unwrap()
-            .load_bucket_snapshot_pair(
-                crate::BucketSnapshotRequest::default(),
-                crate::BucketSnapshotRequest::default(),
-            )
-            .unwrap(),
-        crate::BucketSnapshotPair::Same { .. }
-    ));
-
     let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
     assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &bucket).is_err());
     let remote = SharedStorageNode::open_with_default_ec_shape(
@@ -4476,136 +4423,6 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
     assert_eq!(renewed_proof.cluster_epoch, proof_epoch);
     assert!(renewed_record.lease_deadline > initial_lease_deadline);
     assert_eq!(renewed_proof.lease_deadline, renewed_record.lease_deadline);
-}
-
-#[test]
-fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
-    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
-    let node_id = NodeId::new(1);
-    let ec_shape = EcShape { k: 1, m: 0 };
-    let remote_data_dir = tmp.path().join("remote-bucket-snapshot-pair-node-1");
-    let socket_path = tmp
-        .path()
-        .join("sockets")
-        .join("bucket-snapshot-pair-node-1.sock");
-    private_socket_dir(socket_path.parent().unwrap());
-    let server_config = StorageNodeProcessConfig {
-        node_id,
-        cluster_epoch: ClusterEpoch::INITIAL,
-        route_map_validity: RouteMapValidity::Forever,
-        data_dir: remote_data_dir.clone(),
-        default_ec_shape: ec_shape,
-        pg_ids: vec![0],
-        socket_path: socket_path.clone(),
-        pg_routes: vec![StorageNodePgRoute {
-            pg_id: 0,
-            cluster_epoch: ClusterEpoch::INITIAL,
-            state: PgState::Active,
-            primary_node_id: node_id,
-            metadata_transfer_destination_epoch: None,
-            metadata_read_route: None,
-            acting_set: vec![node_id],
-        }],
-
-        pending_metadata_command_recoveries: Vec::new(),
-        historical_pg_routes: Vec::new(),
-    };
-    let source_bucket = crate::tests::bucket_name("remote-pair-source");
-    let destination_bucket = crate::tests::bucket_name("remote-pair-destination");
-    let owner = crate::CanonicalUserId::from_principal("owner");
-    {
-        let remote = SharedStorageNode::open_with_default_ec_shape(
-            &server_config.data_dir,
-            &server_config.pg_ids,
-            server_config.default_ec_shape,
-        )
-        .unwrap();
-        let remote_pg = remote.get_pg(0).unwrap();
-        for bucket in [&source_bucket, &destination_bucket] {
-            crate::PgMetadataStore::create_bucket(
-                &*remote_pg,
-                bucket,
-                "owner",
-                &owner,
-                &crate::AclGrants::default(),
-                false,
-                false,
-            )
-            .unwrap();
-        }
-        let source_tags =
-            crate::SerializedBucketTagSet::new("<Tagging><TagSet></TagSet></Tagging>".to_string());
-        crate::PgMetadataStore::put_bucket_subresource(
-            &*remote_pg,
-            &source_bucket,
-            crate::types::PutBucketSubresource::tagging(&source_tags),
-        )
-        .unwrap();
-        crate::PgMetadataStore::put_bucket_subresource(
-            &*remote_pg,
-            &destination_bucket,
-            crate::types::PutBucketSubresource {
-                kind: crate::types::BucketSubresourceKind::Cors,
-                body: "<CORSConfiguration/>",
-                aux: crate::types::BucketSubresourceAux::None,
-            },
-        )
-        .unwrap();
-        remote_pg.refresh_metadata_command_state_digest().unwrap();
-    }
-    let server = StorageNodeServer::bind(server_config).unwrap();
-    let _server_guard = spawn_storage_node_server(server);
-
-    let frontend_data_dir = tmp.path().join("frontend-bucket-snapshot-pair-routing");
-    let mut map = LocalClusterMap::open_with_configs(
-        node_id,
-        [LocalNodeStoreConfig::new(
-            node_id,
-            frontend_data_dir.join("node-0001"),
-        )],
-        &[0],
-        ec_shape,
-    )
-    .unwrap();
-    map.install_unix_bucket_metadata_clients([LocalUnixBucketMetadataNodeClientConfig::new(
-        node_id,
-        socket_path,
-    )])
-    .unwrap();
-    let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
-
-    let pair = cluster
-        .load_bucket_snapshot_pair(
-            (
-                &source_bucket,
-                crate::BucketSnapshotRequest {
-                    tags: crate::BucketSnapshotTagsRequest::Always,
-                    ..Default::default()
-                },
-            ),
-            (
-                &destination_bucket,
-                crate::BucketSnapshotRequest {
-                    cors: true,
-                    ..Default::default()
-                },
-            ),
-        )
-        .unwrap();
-    assert_eq!(
-        pair.source().tags,
-        crate::LoadedBucketSubresource::Loaded(crate::SerializedBucketTagSet::new(
-            "<Tagging><TagSet></TagSet></Tagging>".to_string(),
-        ))
-    );
-    assert_eq!(
-        pair.destination().cors,
-        crate::LoadedBucketSubresource::Loaded("<CORSConfiguration/>".to_string())
-    );
-    let frontend_pg = map.node(node_id).unwrap().storage_node().get_pg(0).unwrap();
-    assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &source_bucket).is_err());
-    assert!(crate::PgMetadataStore::head_bucket_raw(&*frontend_pg, &destination_bucket).is_err());
 }
 
 #[test]

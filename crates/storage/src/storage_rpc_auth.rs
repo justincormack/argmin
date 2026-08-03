@@ -1331,7 +1331,6 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::ObjectGenerationNext
         | StorageRpcMessageKind::ObjectGenerationReservation
         | StorageRpcMessageKind::BucketSnapshotLoad
-        | StorageRpcMessageKind::BucketSnapshotPairLoad
         | StorageRpcMessageKind::DirectPutCommitSnapshotLoad
         | StorageRpcMessageKind::DirectPutCommitCommandBuild
         | StorageRpcMessageKind::MultipartCompletionBarrierCommandBuild
@@ -2131,7 +2130,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 170, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 169, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

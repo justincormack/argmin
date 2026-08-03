@@ -81,10 +81,10 @@ use crate::storage_rpc::{
     decode_bucket_mark_deleting_command_build_request,
     decode_bucket_metadata_control_command_build_request,
     decode_bucket_metadata_control_pending_match_request, decode_bucket_pg_request,
-    decode_bucket_request, decode_bucket_snapshot_pair_request, decode_bucket_snapshot_request,
-    decode_bucket_subresource_get_request, decode_bucket_write_drain_begin_request,
-    decode_bucket_write_drain_clear_expired_request, decode_bucket_write_drain_heartbeat_request,
-    decode_bucket_write_drain_record_request, decode_bucket_write_reservation_acquire_request,
+    decode_bucket_request, decode_bucket_snapshot_request, decode_bucket_subresource_get_request,
+    decode_bucket_write_drain_begin_request, decode_bucket_write_drain_clear_expired_request,
+    decode_bucket_write_drain_heartbeat_request, decode_bucket_write_drain_record_request,
+    decode_bucket_write_reservation_acquire_request,
     decode_bucket_write_reservation_heartbeat_request,
     decode_bucket_write_reservation_proof_request, decode_bucket_write_reservation_record_request,
     decode_cluster_map_history_reference_summary_request,
@@ -151,9 +151,9 @@ use crate::storage_rpc::{
     encode_bucket_delete_finalize_roots_response, encode_bucket_execution_generations_response,
     encode_bucket_fast_path_identities_response, encode_bucket_info_outcome_response,
     encode_bucket_list_response, encode_bucket_mark_deleting_command_build_response,
-    encode_bucket_metadata_control_command_build_response, encode_bucket_snapshot_pair_response,
-    encode_bucket_snapshot_response, encode_bucket_subresource_get_response,
-    encode_bucket_write_drain_begin_response, encode_bucket_write_drain_optional_record_response,
+    encode_bucket_metadata_control_command_build_response, encode_bucket_snapshot_response,
+    encode_bucket_subresource_get_response, encode_bucket_write_drain_begin_response,
+    encode_bucket_write_drain_optional_record_response,
     encode_bucket_write_reservation_record_response,
     encode_bucket_write_reservations_list_response,
     encode_cluster_map_history_reference_summary_response,
@@ -220,12 +220,11 @@ use crate::storage_rpc::{
     StorageRpcBucketMetadataControlCommandBuildRequest,
     StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcBucketMetadataControlMutation,
     StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketPgRequest,
-    StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotPairOutcome,
-    StorageRpcBucketSnapshotPairRequest, StorageRpcBucketSnapshotPairResponse,
-    StorageRpcBucketSnapshotRequest, StorageRpcBucketSnapshotResponse,
-    StorageRpcBucketSubresourceGetRequest, StorageRpcBucketSubresourceGetResponse,
-    StorageRpcBucketWriteDrainBeginOutcome, StorageRpcBucketWriteDrainBeginRequest,
-    StorageRpcBucketWriteDrainBeginResponse, StorageRpcBucketWriteDrainClearExpiredRequest,
+    StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotRequest,
+    StorageRpcBucketSnapshotResponse, StorageRpcBucketSubresourceGetRequest,
+    StorageRpcBucketSubresourceGetResponse, StorageRpcBucketWriteDrainBeginOutcome,
+    StorageRpcBucketWriteDrainBeginRequest, StorageRpcBucketWriteDrainBeginResponse,
+    StorageRpcBucketWriteDrainClearExpiredRequest,
     StorageRpcBucketWriteDrainOptionalRecordResponse, StorageRpcBucketWriteDrainRecordRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcBucketWriteReservationProofRequest,
@@ -354,7 +353,7 @@ use crate::types::{
 use crate::DataPgId;
 use crate::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketInfo,
-    BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSubresourceKind,
+    BucketName, BucketSnapshot, BucketSnapshotRequest, BucketSubresourceKind,
     BucketWriteDrainRecord, BucketWriteReservationProof, BucketWriteReservationRecord,
     CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, LifecycleSweepClaimRecord,
     LifecycleSweepRoot, MultipartUploadRecord, NodeId, ObjectKey, ObjectPayloadReclaimClaimRecord,
@@ -4044,11 +4043,6 @@ struct StorageNodeBucketDeleteReplicaHeadRoute<'a> {
     bucket: &'a BucketName,
 }
 
-struct StorageNodeActiveBucketRoutePair<'a> {
-    source: StorageNodeActiveBucketRoute<'a>,
-    destination: StorageNodeActiveBucketRoute<'a>,
-}
-
 struct StorageNodeActiveObjectRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -4856,33 +4850,6 @@ impl StorageNodeBucketDeleteReplicaHeadRoute<'_> {
         )
         .map_err(StorageNodeBucketRouteError::Bucket)?
         .head_bucket_replica_for_delete()
-        .map_err(StorageNodeBucketRouteError::Bucket);
-        result
-    }
-}
-
-impl StorageNodeActiveBucketRoutePair<'_> {
-    fn load_snapshot_pair(
-        &self,
-        source_request: BucketSnapshotRequest,
-        destination_request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshotPair, StorageNodeBucketRouteError> {
-        self.source.require_valid_now()?;
-        self.destination.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.source.handler.config.node_id,
-            Arc::clone(&self.source.handler.node),
-        );
-        let result = BucketMetadataNodeClient::open_bucket_metadata_route_pair(
-            &local_client,
-            self.source.fence.cluster_epoch,
-            self.source.pg_id,
-            self.source.bucket,
-            self.destination.pg_id,
-            self.destination.bucket,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)?
-        .load_bucket_snapshot_pair(source_request, destination_request)
         .map_err(StorageNodeBucketRouteError::Bucket);
         result
     }
@@ -9727,15 +9694,6 @@ impl StorageNodeConnectionHandler {
                     }),
                 }
             }
-            StorageRpcMessageKind::BucketSnapshotPairLoad => {
-                match decode_bucket_snapshot_pair_request(&frame.payload) {
-                    Ok(request) => self.bucket_snapshot_pair_response(route_permit, request),
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
-            }
             StorageRpcMessageKind::BucketCreateCommandBuild => {
                 match decode_create_bucket_command_build_request(&frame.payload) {
                     Ok(request) => self.bucket_create_command_build_response(request),
@@ -12995,46 +12953,6 @@ impl StorageNodeConnectionHandler {
                 let payload = encode_bucket_snapshot_response(&StorageRpcBucketSnapshotResponse {
                     outcome: StorageRpcBucketSnapshotOutcome::BucketNotFound { name },
                 });
-                Ok(encode_storage_rpc_success_response(&payload))
-            }
-            Err(StorageNodeBucketRouteError::Route(error)) => {
-                encode_storage_rpc_error_response(&error)
-            }
-            Err(StorageNodeBucketRouteError::Bucket(error)) => {
-                encode_storage_rpc_error_response(&bucket_snapshot_error_response(error))
-            }
-        }
-    }
-
-    fn bucket_snapshot_pair_response(
-        &self,
-        route_permit: &StorageNodeRouteAdmissionPermit,
-        request: StorageRpcBucketSnapshotPairRequest,
-    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_bucket_route_pair(
-            route_permit,
-            &request.source.bucket,
-            &request.destination.bucket,
-            "bucket snapshot pair load",
-        ) {
-            Ok(route) => route,
-            Err(error) => return encode_storage_rpc_error_response(&error),
-        };
-        match route.load_snapshot_pair(request.source.request, request.destination.request) {
-            Ok(pair) => {
-                let payload =
-                    encode_bucket_snapshot_pair_response(&StorageRpcBucketSnapshotPairResponse {
-                        outcome: StorageRpcBucketSnapshotPairOutcome::Loaded(Box::new(pair)),
-                    });
-                Ok(encode_storage_rpc_success_response(&payload))
-            }
-            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
-                MetadataError::BucketNotFound { name },
-            ))) => {
-                let payload =
-                    encode_bucket_snapshot_pair_response(&StorageRpcBucketSnapshotPairResponse {
-                        outcome: StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name },
-                    });
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(StorageNodeBucketRouteError::Route(error)) => {
@@ -19034,21 +18952,6 @@ impl StorageNodeConnectionHandler {
         Ok(StorageNodeRetainedPrimaryStreamAbortCommandRoute {
             route: StorageNodeRetainedPrimaryStreamAbortRoute { route },
             prepared,
-        })
-    }
-
-    fn active_bucket_route_pair<'a>(
-        &'a self,
-        route_permit: &'a StorageNodeRouteAdmissionPermit,
-        source: &'a StorageRpcBucketRequest,
-        destination: &'a StorageRpcBucketRequest,
-        operation: &'static str,
-    ) -> Result<StorageNodeActiveBucketRoutePair<'a>, StorageRpcErrorResponse> {
-        let source = self.active_bucket_route(route_permit, source, operation)?;
-        let destination = self.active_bucket_route(route_permit, destination, operation)?;
-        Ok(StorageNodeActiveBucketRoutePair {
-            source,
-            destination,
         })
     }
 
@@ -28851,11 +28754,9 @@ mod tests {
             StorageNodeServer::bind(config.clone()).unwrap()
         }));
         let bucket = crate::tests::bucket_name("active-route-bucket");
-        let destination_bucket = crate::tests::bucket_name("active-route-destination");
         crate::clock::with_time_override(1_000, || {
             let pg = server._node.get_pg(0).unwrap();
             create_probe_bucket_direct(&pg, &bucket);
-            create_probe_bucket_direct(&pg, &destination_bucket);
         });
         let mut handler = server.connection_handler();
         let route_permit = server
@@ -28866,12 +28767,6 @@ mod tests {
             cluster_epoch: config.cluster_epoch,
             pg_id: PgId::new(0),
             bucket: bucket.clone(),
-        };
-        let destination_request = StorageRpcBucketRequest {
-            node_id: config.node_id,
-            cluster_epoch: config.cluster_epoch,
-            pg_id: PgId::new(0),
-            bucket: destination_bucket.clone(),
         };
         let foreign_permit = StorageNodeRouteAdmissionGate::default()
             .acquire(StorageNodeRouteAdmissionClass::Active);
@@ -28957,16 +28852,6 @@ mod tests {
                 .metadata_read_bucket_route(&route_permit, &request, "test bucket read")
                 .unwrap()
         });
-        let pair_route = crate::clock::with_time_override(1_000, || {
-            handler
-                .active_bucket_route_pair(
-                    &route_permit,
-                    &request,
-                    &destination_request,
-                    "test bucket pair read",
-                )
-                .unwrap()
-        });
         let reservation = crate::clock::with_time_override(1_000, || {
             route
                 .acquire_write_reservation(
@@ -29000,24 +28885,6 @@ mod tests {
                     .name,
                 bucket
             );
-            match pair_route
-                .load_snapshot_pair(
-                    BucketSnapshotRequest::default(),
-                    BucketSnapshotRequest::default(),
-                )
-                .unwrap()
-            {
-                BucketSnapshotPair::Distinct {
-                    source,
-                    destination,
-                } => {
-                    assert_eq!(source.bucket.name, bucket);
-                    assert_eq!(destination.bucket.name, destination_bucket);
-                }
-                BucketSnapshotPair::Same { .. } => {
-                    panic!("distinct active routes returned a same-bucket snapshot")
-                }
-            }
             route
                 .validate_write_reservation(&BucketWriteReservationProof::from(&reservation))
                 .unwrap();
@@ -29063,21 +28930,6 @@ mod tests {
                 panic!("captured route should expire before node access: {error}")
             }
             Ok(info) => panic!("expired captured route unexpectedly loaded {info:?}"),
-        });
-        crate::clock::with_time_override(6_000, || {
-            match pair_route.load_snapshot_pair(
-                BucketSnapshotRequest::default(),
-                BucketSnapshotRequest::default(),
-            ) {
-                Err(StorageNodeBucketRouteError::Route(error)) => {
-                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
-                    assert!(error.message.contains("expired at 5000ms, now 6000ms"));
-                }
-                Err(StorageNodeBucketRouteError::Bucket(error)) => {
-                    panic!("captured pair route should expire before node access: {error}")
-                }
-                Ok(pair) => panic!("expired captured pair route unexpectedly loaded {pair:?}"),
-            }
         });
         crate::clock::with_time_override(6_000, || {
             match route.heartbeat_write_reservation(

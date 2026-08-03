@@ -51,15 +51,6 @@ struct UnixBucketMetadataRoute<'a> {
     bucket: BucketName,
 }
 
-struct UnixBucketMetadataRoutePair<'a> {
-    client: &'a UnixStorageNodeClient,
-    route_cluster_epoch: ClusterEpoch,
-    source_pg_id: BucketPgId,
-    source_bucket: BucketName,
-    destination_pg_id: BucketPgId,
-    destination_bucket: BucketName,
-}
-
 struct UnixBucketDeleteReplicaMetadataRoute<'a> {
     client: &'a UnixStorageNodeClient,
     route_cluster_epoch: ClusterEpoch,
@@ -4199,64 +4190,6 @@ impl UnixStorageNodeClient {
         }
     }
 
-    fn load_bucket_snapshot_pair(
-        &self,
-        source_pg_id: BucketPgId,
-        source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: BucketPgId,
-        destination: (&BucketName, BucketSnapshotRequest),
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        let request = StorageRpcBucketSnapshotPairRequest {
-            source: StorageRpcBucketSnapshotRequest {
-                bucket: StorageRpcBucketRequest {
-                    node_id: self.node_id,
-                    cluster_epoch: self.cluster_epoch,
-                    pg_id: source_pg_id.pg_id(),
-                    bucket: source.0.clone(),
-                },
-                request: source.1,
-            },
-            destination: StorageRpcBucketSnapshotRequest {
-                bucket: StorageRpcBucketRequest {
-                    node_id: self.node_id,
-                    cluster_epoch: self.cluster_epoch,
-                    pg_id: destination_pg_id.pg_id(),
-                    bucket: destination.0.clone(),
-                },
-                request: destination.1,
-            },
-        };
-        let payload = encode_bucket_snapshot_pair_request(&request);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::BucketSnapshotPairLoad, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_bucket_snapshot_pair_response(&response).map_err(|error| {
-            BucketSnapshotLoadError::Store(
-                self.rpc_payload_error("decode bucket snapshot pair response", error.to_string()),
-            )
-        })?;
-        match response.outcome {
-            StorageRpcBucketSnapshotPairOutcome::Loaded(pair) => {
-                self.validate_bucket_snapshot_pair_response(&pair, source, destination)?;
-                Ok(*pair)
-            }
-            StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name } => {
-                if name != *source.0 && name != *destination.0 {
-                    return Err(BucketSnapshotLoadError::Store(
-                        self.rpc_payload_error(
-                            "validate bucket snapshot pair response",
-                            "bucket-not-found response name does not match either request bucket"
-                                .to_string(),
-                        ),
-                    ));
-                }
-                Err(BucketSnapshotLoadError::Metadata(
-                    MetadataError::BucketNotFound { name },
-                ))
-            }
-        }
-    }
-
     fn build_create_bucket_command(
         &self,
         pg_id: BucketPgId,
@@ -4649,36 +4582,6 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         self.open_bucket_metadata_route(route_cluster_epoch, pg_id, bucket)
     }
 
-    fn open_bucket_metadata_route_pair(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        source_pg_id: BucketPgId,
-        source_bucket: &BucketName,
-        destination_pg_id: BucketPgId,
-        destination_bucket: &BucketName,
-    ) -> Result<Box<dyn BucketMetadataRoutePair + '_>, BucketSnapshotLoadError> {
-        self.validate_bucket_route_subject(
-            route_cluster_epoch,
-            source_pg_id,
-            source_bucket,
-            "open source bucket metadata route pair",
-        )?;
-        self.validate_bucket_route_subject(
-            route_cluster_epoch,
-            destination_pg_id,
-            destination_bucket,
-            "open destination bucket metadata route pair",
-        )?;
-        Ok(Box::new(UnixBucketMetadataRoutePair {
-            client: self,
-            route_cluster_epoch,
-            source_pg_id,
-            source_bucket: source_bucket.clone(),
-            destination_pg_id,
-            destination_bucket: destination_bucket.clone(),
-        }))
-    }
-
     fn open_bucket_delete_replica_metadata_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -4954,22 +4857,6 @@ impl BucketMetadataRoute for UnixBucketMetadataRoute<'_> {
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
         self.client
             .get_bucket_subresource(self.pg_id, &self.bucket, kind)
-    }
-}
-
-impl BucketMetadataRoutePair for UnixBucketMetadataRoutePair<'_> {
-    fn load_bucket_snapshot_pair(
-        &self,
-        source_request: BucketSnapshotRequest,
-        destination_request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        debug_assert_eq!(self.route_cluster_epoch, self.client.cluster_epoch);
-        self.client.load_bucket_snapshot_pair(
-            self.source_pg_id,
-            (&self.source_bucket, source_request),
-            self.destination_pg_id,
-            (&self.destination_bucket, destination_request),
-        )
     }
 }
 

@@ -43,7 +43,7 @@ public_node_read_boundary_bypasses=$(
     /^[[:space:]]*#\[/ {
         next
     }
-    /^[[:space:]]*pub fn (load_bucket_snapshot_pair|load_multipart_upload|load_in_progress_multipart_upload|load_multipart_completion_snapshot|load_multipart_completion_preflight|load_in_progress_multipart_upload_for_listing|list_multipart_parts_for_authorized_upload|lookup_multipart_upload_management|load_stream_upload_session|prepare_stream_segment_append|list_all_stream_uploads_best_effort)\(/ {
+    /^[[:space:]]*pub fn (load_multipart_upload|load_in_progress_multipart_upload|load_multipart_completion_snapshot|load_multipart_completion_preflight|load_in_progress_multipart_upload_for_listing|list_multipart_parts_for_authorized_upload|lookup_multipart_upload_management|load_stream_upload_session|prepare_stream_segment_append|list_all_stream_uploads_best_effort)\(/ {
         if (!pending_test_cfg) {
             print FILENAME ":" FNR ":" $0
         }
@@ -853,11 +853,11 @@ migrated_simple_object_read_bypasses=$(
         if ($0 ~ /multipart_creation_route[[:space:]]*$/) {
             pending_multipart_creation_route = 1
         }
-        if ($0 ~ /\.open_multipart_upload_lookup_metadata_route\(/ \
+        if ($0 ~ /\.(open_multipart_upload_lookup_metadata_route|open_multipart_upload_read_route)\(/ \
             || $0 ~ /multipart_lookup_route[[:space:]]*$/) {
             pending_multipart_lookup_route = 1
         }
-        if ($0 ~ /\.open_authorized_multipart_upload_metadata_route\(/ \
+        if ($0 ~ /\.(open_authorized_multipart_upload_metadata_route|open_authorized_multipart_upload_read_route)\(/ \
             || $0 ~ /authorized_multipart_route[[:space:]]*$/) {
             pending_authorized_multipart_route = 1
         }
@@ -1295,13 +1295,13 @@ multipart_lookup_metadata_bypasses=$(
         next
     }
     {
-        if ($0 ~ /\.open_multipart_upload_lookup_metadata_route\(/ \
+        if ($0 ~ /\.(open_multipart_upload_lookup_metadata_route|open_multipart_upload_read_route)\(/ \
             || $0 ~ /multipart_lookup_route[[:space:]]*$/) {
             pending_multipart_lookup_route = 1
         }
         if ($0 ~ /\.(load_multipart_upload|load_in_progress_multipart_upload|load_in_progress_multipart_upload_for_listing|lookup_multipart_upload_management)\(/) {
             if (pending_multipart_lookup_route \
-                || $0 ~ /\.open_multipart_upload_lookup_metadata_route\(/ \
+                || $0 ~ /\.(open_multipart_upload_lookup_metadata_route|open_multipart_upload_read_route)\(/ \
                 || $0 ~ /multipart_lookup_route\./) {
                 pending_multipart_lookup_route = 0
                 next
@@ -1340,13 +1340,13 @@ authorized_multipart_metadata_bypasses=$(
         next
     }
     {
-        if ($0 ~ /\.open_authorized_multipart_upload_metadata_route\(/ \
+        if ($0 ~ /\.(open_authorized_multipart_upload_metadata_route|open_authorized_multipart_upload_read_route)\(/ \
             || $0 ~ /authorized_multipart_route[[:space:]]*$/) {
             pending_authorized_multipart_route = 1
         }
         if ($0 ~ /\.(load_multipart_completion_snapshot|load_multipart_completion_preflight|list_multipart_parts|list_multipart_parts_for_authorized_upload)\(/) {
             if (pending_authorized_multipart_route \
-                || $0 ~ /\.open_authorized_multipart_upload_metadata_route\(/ \
+                || $0 ~ /\.(open_authorized_multipart_upload_metadata_route|open_authorized_multipart_upload_read_route)\(/ \
                 || $0 ~ /authorized_multipart_route\./) {
                 pending_authorized_multipart_route = 0
                 next

@@ -85,29 +85,28 @@ use crate::types::PlacedSegmentShardBackfillRecord;
 use crate::types::{
     AclGrants, AdmittedRouteEffectFence, AuthorizedMultipartUploadRecord, BucketAclSummary,
     BucketEncryptionConfig, BucketInfo, BucketName, BucketObjectLockConfig,
-    BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSubresourceKind, BucketVersioningState, BucketWriteDrainRecord,
-    BucketWriteReservationRecord, CanonicalUserId, ClusterEpoch, CommitDirectPutObjectReq,
-    CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateStreamUploadReq,
-    DeleteCurrentObjectOutcome, DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot,
-    DirectPutPayloadWrite, DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome,
-    FinalizeStreamPartOutcome, FinalizeStreamPutOutcome, GenerationId,
-    InsertCurrentDeleteMarkerOutcome, ListedBucketMultipartUploads, ListedBucketObjectVersions,
-    ListedBucketObjects, ListedMultipartParts, ObjectEncryption, ObjectKey, ObjectLayout,
-    ObjectPayloadSegment, ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome,
-    ObjectRetention, ObjectSegmentRecord, OwnerIdentity, PgId, PgState,
-    PlacedSegmentBackfillReferenceCursor, PlacedSegmentShardBackfillClaimAcquire,
-    PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
-    PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
-    PlacedSegmentShardRepairClaimAcquireParams, PlacedSegmentShardRepairClaimRecord,
-    PlacedSegmentShardRepairRecord, PlacedSegmentShardRepairWorkItem,
-    PrepareStreamUploadSegmentAppendReq, PreparedDirectPutObjectCommit, PreparedStreamPartCommit,
-    PreparedStreamPutCommit, PublicAccessBlockConfig, RouteMapValidity, SegmentStoredBytesRequest,
-    SerializedBucketTagSet, SerializedTagSet, SessionId, ShardIndex, ShardKey,
-    ShardScavengerObservation, ShardScavengerObservationKey, ShardScavengerObservationReason,
-    ShardScavengerObservationRecord, ShardScavengerPayloadReference,
-    ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus, StoredObject,
-    StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutFinalizeSnapshot,
+    BucketOwnershipControls, BucketSnapshot, BucketSnapshotRequest, BucketSubresourceKind,
+    BucketVersioningState, BucketWriteDrainRecord, BucketWriteReservationRecord, CanonicalUserId,
+    ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitOutcome,
+    CompleteMultipartCommitRequest, CreateStreamUploadReq, DeleteCurrentObjectOutcome,
+    DeleteSpecificObjectVersionOutcome, DirectPutCommitSnapshot, DirectPutPayloadWrite,
+    DirectPutWrittenSegment, EcShape, FinalizeDirectPutObjectOutcome, FinalizeStreamPartOutcome,
+    FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
+    ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
+    ListedMultipartParts, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPayloadSegment,
+    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
+    ObjectSegmentRecord, OwnerIdentity, PgId, PgState, PlacedSegmentBackfillReferenceCursor,
+    PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
+    PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillWorkItem,
+    PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,
+    PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairRecord,
+    PlacedSegmentShardRepairWorkItem, PrepareStreamUploadSegmentAppendReq,
+    PreparedDirectPutObjectCommit, PreparedStreamPartCommit, PreparedStreamPutCommit,
+    PublicAccessBlockConfig, RouteMapValidity, SegmentStoredBytesRequest, SerializedBucketTagSet,
+    SerializedTagSet, SessionId, ShardIndex, ShardKey, ShardScavengerObservation,
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
+    ShardScavengerPayloadReference, ShardScavengerPlacedShardSetReference, StoredLegalHoldStatus,
+    StoredObject, StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutFinalizeSnapshot,
     StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadCommandRecord,
     StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId,
     VersionId, WriteAck, WrittenShardAck, PLACED_SEGMENT_BACKFILL_REFERENCE_PAGE_LIMIT,
@@ -2320,23 +2319,6 @@ impl StorageClusterRouteAdmission {
         })
     }
 
-    /// Derive active bucket-metadata authority for a snapshot spanning two
-    /// buckets from this request's admitted runtime-map generation.
-    pub fn active_bucket_route_pair<'admission>(
-        &'admission self,
-        source: &BucketName,
-        destination: &BucketName,
-    ) -> Result<ActiveBucketRoutePair<'admission>, StoreError> {
-        self.require_valid_now()?;
-        Ok(ActiveBucketRoutePair {
-            admission: self,
-            source: source.clone(),
-            source_pg_id: self.cluster.bucket_metadata_pg(source),
-            destination: destination.clone(),
-            destination_pg_id: self.cluster.bucket_metadata_pg(destination),
-        })
-    }
-
     /// Derive active authority for an account-scoped scan across every bucket
     /// metadata PG in this request's admitted runtime-map generation.
     pub fn active_bucket_metadata_scan(
@@ -4036,136 +4018,6 @@ impl ActiveBucketRoute<'_> {
         self.admission
             .cluster
             .try_probe_bucket_pg_available(&self.bucket)
-    }
-}
-
-/// Non-cloneable active authority for a two-bucket metadata snapshot.
-///
-/// Both bucket identities and routed PGs are fixed at construction. Each node
-/// access rechecks the request admission's captured deadline.
-///
-/// ```compile_fail
-/// use storage::ActiveBucketRoutePair;
-///
-/// fn require_clone<T: Clone>(_: &T) {}
-/// fn cache_route(route: &ActiveBucketRoutePair<'_>) {
-///     require_clone(route);
-/// }
-/// ```
-pub struct ActiveBucketRoutePair<'admission> {
-    admission: &'admission StorageClusterRouteAdmission,
-    source: BucketName,
-    source_pg_id: BucketPgId,
-    destination: BucketName,
-    destination_pg_id: BucketPgId,
-}
-
-impl ActiveBucketRoutePair<'_> {
-    pub fn load_bucket_snapshot_pair(
-        &self,
-        source_request: BucketSnapshotRequest,
-        destination_request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        if self.source == self.destination {
-            let merged_request = source_request.union(destination_request);
-            self.admission.require_valid_now()?;
-            let cluster = &self.admission.cluster;
-            let node = cluster
-                .local_map
-                .metadata_pg_read_node(cluster.operation_epoch(), self.source_pg_id.pg_id())?;
-            let route = node
-                .bucket_metadata_client()
-                .open_bucket_metadata_read_route(
-                    cluster.operation_epoch(),
-                    self.source_pg_id,
-                    &self.source,
-                    node.authorization(),
-                )?;
-            let bucket = route.load_bucket_snapshot(merged_request)?;
-            return Ok(BucketSnapshotPair::Same {
-                bucket: Box::new(bucket),
-            });
-        }
-
-        let cluster = &self.admission.cluster;
-        self.admission.require_valid_now()?;
-        let source_node = cluster
-            .local_map
-            .metadata_pg_read_node(cluster.operation_epoch(), self.source_pg_id.pg_id())?;
-        self.admission.require_valid_now()?;
-        let destination_node = cluster
-            .local_map
-            .metadata_pg_read_node(cluster.operation_epoch(), self.destination_pg_id.pg_id())?;
-        if source_node.node_id() == destination_node.node_id()
-            && source_node.authorization().is_active()
-            && destination_node.authorization().is_active()
-        {
-            self.admission.require_valid_now()?;
-            let route = source_node
-                .bucket_metadata_client()
-                .open_bucket_metadata_route_pair(
-                    cluster.operation_epoch(),
-                    self.source_pg_id,
-                    &self.source,
-                    self.destination_pg_id,
-                    &self.destination,
-                )?;
-            return route.load_bucket_snapshot_pair(source_request, destination_request);
-        }
-
-        let (source_snapshot, destination_snapshot) =
-            if self.source_pg_id.pg_id().get() < self.destination_pg_id.pg_id().get() {
-                self.admission.require_valid_now()?;
-                let source_route = source_node
-                    .bucket_metadata_client()
-                    .open_bucket_metadata_read_route(
-                        cluster.operation_epoch(),
-                        self.source_pg_id,
-                        &self.source,
-                        source_node.authorization(),
-                    )?;
-                let source_snapshot = source_route.load_bucket_snapshot(source_request)?;
-                self.admission.require_valid_now()?;
-                let destination_route = destination_node
-                    .bucket_metadata_client()
-                    .open_bucket_metadata_read_route(
-                        cluster.operation_epoch(),
-                        self.destination_pg_id,
-                        &self.destination,
-                        destination_node.authorization(),
-                    )?;
-                let destination_snapshot =
-                    destination_route.load_bucket_snapshot(destination_request)?;
-                (source_snapshot, destination_snapshot)
-            } else {
-                self.admission.require_valid_now()?;
-                let destination_route = destination_node
-                    .bucket_metadata_client()
-                    .open_bucket_metadata_read_route(
-                        cluster.operation_epoch(),
-                        self.destination_pg_id,
-                        &self.destination,
-                        destination_node.authorization(),
-                    )?;
-                let destination_snapshot =
-                    destination_route.load_bucket_snapshot(destination_request)?;
-                self.admission.require_valid_now()?;
-                let source_route = source_node
-                    .bucket_metadata_client()
-                    .open_bucket_metadata_read_route(
-                        cluster.operation_epoch(),
-                        self.source_pg_id,
-                        &self.source,
-                        source_node.authorization(),
-                    )?;
-                let source_snapshot = source_route.load_bucket_snapshot(source_request)?;
-                (source_snapshot, destination_snapshot)
-            };
-
-        Ok(BucketSnapshotPair::Distinct {
-            source: Box::new(source_snapshot),
-            destination: Box::new(destination_snapshot),
-        })
     }
 }
 
@@ -6220,14 +6072,8 @@ mod runtime_map_refresh_invalidation_tests {
         let admission =
             crate::clock::with_time_override(1_000, || handle.admit_current_route().unwrap());
         let bucket = BucketName::try_from("capability-bucket").unwrap();
-        let destination = BucketName::try_from("capability-destination").unwrap();
         let route = crate::clock::with_time_override(1_000, || {
             admission.active_bucket_route(&bucket).unwrap()
-        });
-        let pair_route = crate::clock::with_time_override(1_000, || {
-            admission
-                .active_bucket_route_pair(&bucket, &destination)
-                .unwrap()
         });
 
         crate::clock::with_time_override(1_000, || {
@@ -6245,17 +6091,6 @@ mod runtime_map_refresh_invalidation_tests {
             ));
             assert!(matches!(
                 route.load_bucket_snapshot(BucketSnapshotRequest::default()),
-                Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
-                    cluster_epoch,
-                    valid_until_ms: 5_000,
-                    now_ms: 6_000,
-                })) if cluster_epoch == ClusterEpoch::INITIAL
-            ));
-            assert!(matches!(
-                pair_route.load_bucket_snapshot_pair(
-                    BucketSnapshotRequest::default(),
-                    BucketSnapshotRequest::default(),
-                ),
                 Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
                     cluster_epoch,
                     valid_until_ms: 5_000,

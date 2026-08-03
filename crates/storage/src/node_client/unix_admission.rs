@@ -489,7 +489,6 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::BucketHeadRaw
         | StorageRpcMessageKind::BucketHeadInfo
         | StorageRpcMessageKind::BucketSnapshotLoad
-        | StorageRpcMessageKind::BucketSnapshotPairLoad
         | StorageRpcMessageKind::BucketExecutionGenerations
         | StorageRpcMessageKind::BucketFastPathIdentities
         | StorageRpcMessageKind::BucketSubresourceGet

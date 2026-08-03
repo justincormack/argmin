@@ -3,8 +3,8 @@
 use s3_types::VersionId;
 use std::sync::Arc;
 use storage::{
-    BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, ObjectKey, StorageCluster, StorageClusterRouteAdmission,
+    BucketName, BucketSnapshot, BucketSnapshotRequest, BucketSnapshotTagsRequest, ObjectKey,
+    StorageCluster, StorageClusterRouteAdmission,
 };
 
 use super::{BucketSummary, Coordinator};
@@ -270,55 +270,9 @@ impl<'a> LoadedObjectHandle<'a> {
     }
 }
 
-/// Ordered source/destination bucket handles for two-bucket request paths.
-///
-/// Same-bucket source/destination flows deliberately collapse to one
-/// underlying bucket handle with the union of both roles' declared needs.
-#[derive(Debug)]
-pub(super) enum LoadedBucketPair {
-    Same {
-        bucket: Box<LoadedBucketHandle>,
-    },
-    Distinct {
-        source: Box<LoadedBucketHandle>,
-        destination: Box<LoadedBucketHandle>,
-    },
-}
-
-impl LoadedBucketPair {
-    fn same(bucket: LoadedBucketHandle) -> Self {
-        Self::Same {
-            bucket: Box::new(bucket),
-        }
-    }
-
-    fn distinct(source: LoadedBucketHandle, destination: LoadedBucketHandle) -> Self {
-        Self::Distinct {
-            source: Box::new(source),
-            destination: Box::new(destination),
-        }
-    }
-
-    pub(super) const fn source(&self) -> &LoadedBucketHandle {
-        match self {
-            Self::Same { bucket } => bucket,
-            Self::Distinct { source, .. } => source,
-        }
-    }
-
-    pub(super) const fn destination(&self) -> &LoadedBucketHandle {
-        match self {
-            Self::Same { bucket } => bucket,
-            Self::Distinct { destination, .. } => destination,
-        }
-    }
-}
-
 /// Loader for request-scoped bucket handles.
 ///
-/// Request paths are meant to talk to this loader, not to PGs. It is the
-/// place where same-bucket coalescing and dual-bucket acquisition ordering
-/// are centralized.
+/// Request paths are meant to talk to this loader, not to PGs.
 ///
 /// This is still transitional scaffolding: it centralizes bucket loading, but
 /// it is not yet the final single-use request-family entry point that will
@@ -370,56 +324,6 @@ impl<'a> BucketHandleLoader<'a> {
             .load_bucket_snapshot(request.resolve_to_storage_request())
             .map_err(Self::map_bucket_snapshot_error)?;
         self.load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
-    }
-
-    pub(super) fn load_bucket_pair(
-        self,
-        source: (&BucketName, Option<&str>, BucketHandleRequest),
-        destination: (&BucketName, Option<&str>, BucketHandleRequest),
-    ) -> Result<LoadedBucketPair, ServerError> {
-        if source.0 == destination.0 {
-            let merged_request = source.2.merge(destination.2);
-            let snapshot = self
-                .coordinator
-                .storage_node()
-                .load_bucket_snapshot(source.0, merged_request.resolve_to_storage_request())
-                .map_err(Self::map_bucket_snapshot_error)?;
-            let bucket =
-                self.load_bucket_handle_from_snapshot(snapshot, source.1, merged_request)?;
-            Coordinator::ensure_expected_bucket_owner(bucket.bucket(), destination.1)?;
-            return Ok(LoadedBucketPair::same(bucket));
-        }
-
-        let snapshots = self
-            .coordinator
-            .storage_node()
-            .load_bucket_snapshot_pair(
-                (source.0, source.2.resolve_to_storage_request()),
-                (destination.0, destination.2.resolve_to_storage_request()),
-            )
-            .map_err(Self::map_bucket_snapshot_error)?;
-        let (source_handle, destination_handle) = match snapshots {
-            BucketSnapshotPair::Same { bucket } => (
-                self.load_bucket_handle_from_snapshot((*bucket).clone(), source.1, source.2)?,
-                self.load_bucket_handle_from_snapshot(*bucket, destination.1, destination.2)?,
-            ),
-            BucketSnapshotPair::Distinct {
-                source: source_snapshot,
-                destination: destination_snapshot,
-            } => (
-                self.load_bucket_handle_from_snapshot(*source_snapshot, source.1, source.2)?,
-                self.load_bucket_handle_from_snapshot(
-                    *destination_snapshot,
-                    destination.1,
-                    destination.2,
-                )?,
-            ),
-        };
-
-        Ok(LoadedBucketPair::distinct(
-            source_handle,
-            destination_handle,
-        ))
     }
 
     pub(super) fn load_bucket_handle_from_snapshot(
@@ -509,7 +413,7 @@ mod tests {
     use super::*;
     use crate::coordinator::test_support::{
         bucket_request_with_expected_owner, bucket_tag_set, put_bucket_lifecycle_test,
-        put_bucket_policy_test, setup_coordinator, setup_coordinator_with_pg_count, test_requester,
+        put_bucket_policy_test, setup_coordinator, test_requester,
     };
     use crate::coordinator::{
         CreateBucketAcl, CreateBucketRequest, PutBucketAbacRequest, PutBucketTagsRequest,
@@ -655,136 +559,6 @@ mod tests {
         assert!(matches!(loaded.lifecycle(), LoadedBucketValue::Missing));
         assert!(matches!(loaded.cors(), LoadedBucketValue::Missing));
         assert!(matches!(loaded.tags(), LoadedBucketValue::NotRequested));
-    }
-
-    #[test]
-    fn load_bucket_pair_handles_preserves_source_destination_roles() {
-        let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
-        create_bucket(&coord, "source");
-        create_bucket(&coord, "destination");
-        put_bucket_policy_test(
-            &coord,
-            "source",
-            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::source/*\"}]}",
-            test_requester(),
-            None,
-        )
-        .unwrap();
-        coord
-            .put_bucket_tags(&PutBucketTagsRequest {
-                bucket: bucket_request_with_expected_owner("destination", test_requester(), None),
-                tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>"),
-            })
-            .unwrap();
-
-        let loaded = coord
-            .bucket_handle_loader()
-            .load_bucket_pair(
-                (
-                    &BucketName::try_from("source").unwrap(),
-                    None,
-                    BucketHandleRequest::new().requiring_policy_view(),
-                ),
-                (
-                    &BucketName::try_from("destination").unwrap(),
-                    None,
-                    BucketHandleRequest::new().requiring_bucket_tags(),
-                ),
-            )
-            .unwrap();
-
-        assert_eq!(loaded.source().bucket().name.as_str(), "source");
-        assert_eq!(loaded.destination().bucket().name.as_str(), "destination");
-        assert!(matches!(
-            loaded.source().policy(),
-            LoadedBucketValue::Loaded(_)
-        ));
-        assert!(matches!(
-            loaded.source().tags(),
-            LoadedBucketValue::NotRequested
-        ));
-        assert!(matches!(
-            loaded.destination().tags(),
-            LoadedBucketValue::Loaded(_)
-        ));
-        assert!(matches!(
-            loaded.destination().policy(),
-            LoadedBucketValue::NotRequested
-        ));
-    }
-
-    #[test]
-    fn load_bucket_pair_same_bucket_uses_one_underlying_handle() {
-        let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
-        create_bucket(&coord, "bucket");
-        put_bucket_policy_test(
-            &coord,
-            "bucket",
-            "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Deny\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::bucket/*\"}]}",
-            test_requester(),
-            None,
-        )
-        .unwrap();
-        coord
-            .put_bucket_tags(&PutBucketTagsRequest {
-                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
-                tags: bucket_tag_set("<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>"),
-            })
-            .unwrap();
-
-        let loaded = coord
-            .bucket_handle_loader()
-            .load_bucket_pair(
-                (
-                    &BucketName::try_from("bucket").unwrap(),
-                    None,
-                    BucketHandleRequest::new().requiring_policy_view(),
-                ),
-                (
-                    &BucketName::try_from("bucket").unwrap(),
-                    None,
-                    BucketHandleRequest::new().requiring_bucket_tags(),
-                ),
-            )
-            .unwrap();
-
-        assert!(matches!(loaded, LoadedBucketPair::Same { .. }));
-        assert!(std::ptr::eq(loaded.source(), loaded.destination()));
-        assert!(matches!(
-            loaded.source().policy(),
-            LoadedBucketValue::Loaded(_)
-        ));
-        assert!(matches!(
-            loaded.source().tags(),
-            LoadedBucketValue::Loaded(_)
-        ));
-    }
-
-    #[test]
-    fn load_bucket_pair_same_bucket_validates_both_expected_owners() {
-        let tmp = tempdir();
-        let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
-        create_bucket(&coord, "bucket");
-
-        let err = coord
-            .bucket_handle_loader()
-            .load_bucket_pair(
-                (
-                    &BucketName::try_from("bucket").unwrap(),
-                    Some(test_requester().configured_principal().unwrap()),
-                    BucketHandleRequest::new(),
-                ),
-                (
-                    &BucketName::try_from("bucket").unwrap(),
-                    Some("999988887777"),
-                    BucketHandleRequest::new(),
-                ),
-            )
-            .unwrap_err();
-
-        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]

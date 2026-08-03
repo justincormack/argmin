@@ -30,15 +30,6 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError>;
 
-    fn open_bucket_metadata_route_pair(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        source_pg_id: BucketPgId,
-        source_bucket: &BucketName,
-        destination_pg_id: BucketPgId,
-        destination_bucket: &BucketName,
-    ) -> Result<Box<dyn BucketMetadataRoutePair + '_>, BucketSnapshotLoadError>;
-
     fn open_bucket_delete_replica_metadata_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -154,14 +145,6 @@ pub(crate) trait BucketMetadataRoute: Send {
                 .into()
             })
     }
-}
-
-pub(crate) trait BucketMetadataRoutePair: Send {
-    fn load_bucket_snapshot_pair(
-        &self,
-        source_request: BucketSnapshotRequest,
-        destination_request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>;
 }
 
 pub(crate) trait BucketDeleteReplicaMetadataRoute: Send {

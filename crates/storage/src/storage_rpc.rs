@@ -22,17 +22,16 @@ use crate::{
         BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord, BucketDeleteAttemptPhase,
         BucketDeleteFinalizeClaimRecord, BucketDeleteFinalizeRoot, BucketEncryptionConfig,
         BucketFastPathIdentity, BucketInfo, BucketObjectOwnership, BucketOwnershipControls,
-        BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest,
-        BucketState, BucketSubresourceAux, BucketSubresourceKind, BucketWriteDrainRecord,
-        BucketWriteDrainState, BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes,
-        ChecksumType, ClusterEpoch, CommitDirectPutObjectReq, CompleteMultipartCommitCleanup,
-        CompleteMultipartCommitRequest, CreateBucketConfig, CreateMultipartUploadReq,
-        CreateStreamUploadReq, DeleteMarkerRecord, DirectPutCommitStorageSnapshot, EcShape,
-        EffectiveBucketEncryptionConfig, EtagKind, GenerationId, LifecycleSweepClaimRecord,
-        LifecycleSweepRoot, LifecycleSweepRootSource, ListMultipartUploadsPageStart,
-        ListMultipartUploadsReq, ListMultipartUploadsResp, ListObjectVersionsReq,
-        ListObjectVersionsResp, ListObjectsReq, ListObjectsResp, ListPartsResp,
-        ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
+        BucketSnapshot, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
+        BucketSubresourceAux, BucketSubresourceKind, BucketWriteDrainRecord, BucketWriteDrainState,
+        BucketWriteReservationRecord, ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch,
+        CommitDirectPutObjectReq, CompleteMultipartCommitCleanup, CompleteMultipartCommitRequest,
+        CreateBucketConfig, CreateMultipartUploadReq, CreateStreamUploadReq, DeleteMarkerRecord,
+        DirectPutCommitStorageSnapshot, EcShape, EffectiveBucketEncryptionConfig, EtagKind,
+        GenerationId, LifecycleSweepClaimRecord, LifecycleSweepRoot, LifecycleSweepRootSource,
+        ListMultipartUploadsPageStart, ListMultipartUploadsReq, ListMultipartUploadsResp,
+        ListObjectVersionsReq, ListObjectVersionsResp, ListObjectsReq, ListObjectsResp,
+        ListPartsResp, ListedMultipartParts, LiveObjectRecord, LoadedBucketSubresource,
         ManagedEncryptionAlgorithm, MultipartChecksumConfig, MultipartCompletionFingerprint,
         MultipartCompletionPreflight, MultipartCompletionReplay, MultipartCompletionSnapshot,
         MultipartCompletionSubject, MultipartObjectIdentity, MultipartPartRecord,
@@ -336,8 +335,6 @@ const STORAGE_RPC_MAX_BUCKET_BATCH_REQUEST_PAYLOAD_LEN: usize =
         + STORAGE_RPC_MAX_BUCKET_BATCH_ITEMS as usize * STORAGE_RPC_MAX_BUCKET_NAME_FIELD_LEN;
 const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 4;
-const STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN * 2;
 const STORAGE_RPC_MAX_OBJECT_KEY_LEN: usize = 1024;
 const STORAGE_RPC_MAX_LIST_PAGE_ITEMS: u32 = 100_000;
 const STORAGE_RPC_MAX_CLEANUP_LIST_PAGE_ITEMS: u32 = 1024;
@@ -722,7 +719,6 @@ pub(crate) enum StorageRpcMessageKind {
     BucketWriteReservationRelease = 40,
     BucketWriteReservationHeartbeat = 123,
     BucketSnapshotLoad = 41,
-    BucketSnapshotPairLoad = 42,
     DirectPutCommitSnapshotLoad = 43,
     DirectPutCommitCommandBuild = 44,
     MultipartCompletionBarrierCommandBuild = 45,
@@ -1070,7 +1066,6 @@ impl StorageRpcMessageKind {
             Self::BucketWriteReservationRelease => "bucket write reservation release",
             Self::BucketWriteReservationHeartbeat => "bucket write reservation heartbeat",
             Self::BucketSnapshotLoad => "bucket snapshot load",
-            Self::BucketSnapshotPairLoad => "bucket snapshot pair load",
             Self::DirectPutCommitSnapshotLoad => "direct PUT commit snapshot load",
             Self::DirectPutCommitCommandBuild => "direct PUT commit command build",
             Self::MultipartCompletionBarrierCommandBuild => {
@@ -1263,7 +1258,6 @@ impl StorageRpcMessageKind {
             40 => Ok(Self::BucketWriteReservationRelease),
             123 => Ok(Self::BucketWriteReservationHeartbeat),
             41 => Ok(Self::BucketSnapshotLoad),
-            42 => Ok(Self::BucketSnapshotPairLoad),
             43 => Ok(Self::DirectPutCommitSnapshotLoad),
             44 => Ok(Self::DirectPutCommitCommandBuild),
             45 => Ok(Self::MultipartCompletionBarrierCommandBuild),
@@ -3526,12 +3520,6 @@ pub(crate) struct StorageRpcBucketSnapshotRequest {
     pub(crate) request: BucketSnapshotRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcBucketSnapshotPairRequest {
-    pub(crate) source: StorageRpcBucketSnapshotRequest,
-    pub(crate) destination: StorageRpcBucketSnapshotRequest,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) enum StorageRpcBucketSnapshotOutcome {
     Loaded(Box<BucketSnapshot>),
@@ -3541,17 +3529,6 @@ pub(crate) enum StorageRpcBucketSnapshotOutcome {
 #[derive(Debug, Clone)]
 pub(crate) struct StorageRpcBucketSnapshotResponse {
     pub(crate) outcome: StorageRpcBucketSnapshotOutcome,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum StorageRpcBucketSnapshotPairOutcome {
-    Loaded(Box<BucketSnapshotPair>),
-    BucketNotFound { name: BucketName },
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct StorageRpcBucketSnapshotPairResponse {
-    pub(crate) outcome: StorageRpcBucketSnapshotPairOutcome,
 }
 
 pub(crate) fn encode_storage_rpc_frame(
@@ -3923,9 +3900,6 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::BucketHeadInfo => STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
         StorageRpcMessageKind::BucketSnapshotLoad => {
             STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN
-        }
-        StorageRpcMessageKind::BucketSnapshotPairLoad => {
-            STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::BucketCreateCommandBuild => {
             STORAGE_RPC_MAX_CREATE_BUCKET_COMMAND_BUILD_PAYLOAD_LEN
@@ -4744,27 +4718,6 @@ pub(crate) fn decode_bucket_snapshot_request(
     let request = decoder.read_rpc_bucket_snapshot_request()?;
     decoder.finish()?;
     Ok(request)
-}
-
-pub(crate) fn encode_bucket_snapshot_pair_request(
-    request: &StorageRpcBucketSnapshotPairRequest,
-) -> Vec<u8> {
-    let mut out = encode_bucket_snapshot_request(&request.source);
-    out.extend_from_slice(&encode_bucket_snapshot_request(&request.destination));
-    out
-}
-
-pub(crate) fn decode_bucket_snapshot_pair_request(
-    bytes: &[u8],
-) -> Result<StorageRpcBucketSnapshotPairRequest, StorageRpcPayloadError> {
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let source = decoder.read_rpc_bucket_snapshot_request()?;
-    let destination = decoder.read_rpc_bucket_snapshot_request()?;
-    decoder.finish()?;
-    Ok(StorageRpcBucketSnapshotPairRequest {
-        source,
-        destination,
-    })
 }
 
 pub(crate) fn encode_object_request(request: &StorageRpcObjectRequest) -> Vec<u8> {
@@ -7616,44 +7569,6 @@ pub(crate) fn decode_bucket_snapshot_response(
     };
     decoder.finish()?;
     Ok(StorageRpcBucketSnapshotResponse { outcome })
-}
-
-pub(crate) fn encode_bucket_snapshot_pair_response(
-    response: &StorageRpcBucketSnapshotPairResponse,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    match &response.outcome {
-        StorageRpcBucketSnapshotPairOutcome::Loaded(pair) => {
-            put_u8(&mut out, 0);
-            put_bucket_snapshot_pair(&mut out, pair);
-        }
-        StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name } => {
-            put_u8(&mut out, 1);
-            put_string(&mut out, name.as_str());
-        }
-    }
-    out
-}
-
-pub(crate) fn decode_bucket_snapshot_pair_response(
-    bytes: &[u8],
-) -> Result<StorageRpcBucketSnapshotPairResponse, StorageRpcPayloadError> {
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let outcome = match decoder.read_u8()? {
-        0 => StorageRpcBucketSnapshotPairOutcome::Loaded(Box::new(
-            decoder.read_bucket_snapshot_pair()?,
-        )),
-        1 => StorageRpcBucketSnapshotPairOutcome::BucketNotFound {
-            name: decoder.read_bucket_name()?,
-        },
-        _ => {
-            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
-                "invalid bucket snapshot pair outcome tag",
-            ));
-        }
-    };
-    decoder.finish()?;
-    Ok(StorageRpcBucketSnapshotPairResponse { outcome })
 }
 
 pub(crate) fn encode_create_bucket_command_build_response(
@@ -14346,21 +14261,6 @@ impl<'a> StorageRpcDecoder<'a> {
         })
     }
 
-    fn read_bucket_snapshot_pair(&mut self) -> Result<BucketSnapshotPair, StorageRpcPayloadError> {
-        match self.read_u8()? {
-            0 => Ok(BucketSnapshotPair::Same {
-                bucket: Box::new(self.read_bucket_snapshot()?),
-            }),
-            1 => Ok(BucketSnapshotPair::Distinct {
-                source: Box::new(self.read_bucket_snapshot()?),
-                destination: Box::new(self.read_bucket_snapshot()?),
-            }),
-            _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
-                "invalid bucket snapshot pair tag",
-            )),
-        }
-    }
-
     fn read_loaded_bucket_subresource(
         &mut self,
     ) -> Result<LoadedBucketSubresource<String>, StorageRpcPayloadError> {
@@ -16738,23 +16638,6 @@ fn put_bucket_snapshot(out: &mut Vec<u8>, snapshot: &BucketSnapshot) {
     put_loaded_bucket_subresource(out, &snapshot.cors);
 }
 
-fn put_bucket_snapshot_pair(out: &mut Vec<u8>, pair: &BucketSnapshotPair) {
-    match pair {
-        BucketSnapshotPair::Same { bucket } => {
-            put_u8(out, 0);
-            put_bucket_snapshot(out, bucket);
-        }
-        BucketSnapshotPair::Distinct {
-            source,
-            destination,
-        } => {
-            put_u8(out, 1);
-            put_bucket_snapshot(out, source);
-            put_bucket_snapshot(out, destination);
-        }
-    }
-}
-
 fn put_bucket_metadata_control_mutation(
     out: &mut Vec<u8>,
     mutation: &StorageRpcBucketMetadataControlMutation,
@@ -18529,30 +18412,41 @@ mod tests {
     }
 
     #[test]
+    fn storage_rpc_frame_rejects_retired_bucket_snapshot_pair_message_kind() {
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_kind(42)),
+            Err(StorageRpcFrameError::UnknownMessageKind(42))
+        );
+    }
+
+    #[test]
     fn storage_rpc_frame_rejects_unknown_message_kind() {
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_kind(999)),
+            Err(StorageRpcFrameError::UnknownMessageKind(999))
+        );
+    }
+
+    fn raw_storage_rpc_frame_with_kind(kind: u16) -> Vec<u8> {
         let payload = b"ok";
         let mut bytes = Vec::new();
         put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
         put_u16(&mut bytes, STORAGE_RPC_FRAME_ENCODING_VERSION);
         put_u64(&mut bytes, 1);
-        put_u16(&mut bytes, 999);
+        put_u16(&mut bytes, kind);
         put_u32(&mut bytes, payload.len() as u32);
         put_u64(
             &mut bytes,
             storage_rpc_frame_checksum(
                 STORAGE_RPC_FRAME_ENCODING_VERSION,
                 1,
-                999,
+                kind,
                 payload.len() as u32,
                 payload,
             ),
         );
         bytes.extend_from_slice(payload);
-
-        assert_eq!(
-            decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnknownMessageKind(999))
-        );
+        bytes
     }
 
     #[test]
@@ -21316,11 +21210,6 @@ mod tests {
                 STORAGE_RPC_MAX_BUCKET_SNAPSHOT_REQUEST_PAYLOAD_LEN,
             ),
             (
-                StorageRpcMessageKind::BucketSnapshotPairLoad,
-                STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN + 1,
-                STORAGE_RPC_MAX_BUCKET_SNAPSHOT_PAIR_REQUEST_PAYLOAD_LEN,
-            ),
-            (
                 StorageRpcMessageKind::BucketWriteDrainExists,
                 STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_BUCKET_REQUEST_PAYLOAD_LEN,
@@ -22377,103 +22266,6 @@ mod tests {
             }
             StorageRpcBucketSnapshotOutcome::Loaded(_) => {
                 panic!("expected bucket-not-found snapshot response")
-            }
-        }
-    }
-
-    #[test]
-    fn bucket_snapshot_pair_request_and_response_round_trip() {
-        let source = StorageRpcBucketSnapshotRequest {
-            bucket: StorageRpcBucketRequest {
-                node_id: NodeId::new(7),
-                cluster_epoch: ClusterEpoch::INITIAL,
-                pg_id: PgId::new(3),
-                bucket: BucketName::try_from("source-bucket").unwrap(),
-            },
-            request: BucketSnapshotRequest {
-                tags: BucketSnapshotTagsRequest::Always,
-                ..Default::default()
-            },
-        };
-        let destination = StorageRpcBucketSnapshotRequest {
-            bucket: StorageRpcBucketRequest {
-                node_id: NodeId::new(7),
-                cluster_epoch: ClusterEpoch::INITIAL,
-                pg_id: PgId::new(4),
-                bucket: BucketName::try_from("destination-bucket").unwrap(),
-            },
-            request: BucketSnapshotRequest {
-                cors: true,
-                ..Default::default()
-            },
-        };
-        let request = StorageRpcBucketSnapshotPairRequest {
-            source: source.clone(),
-            destination: destination.clone(),
-        };
-        let bytes = encode_bucket_snapshot_pair_request(&request);
-        let decoded = decode_bucket_snapshot_pair_request(&bytes).unwrap();
-        assert_eq!(decoded, request);
-
-        let pair = BucketSnapshotPair::Distinct {
-            source: Box::new(BucketSnapshot {
-                bucket: test_bucket_info("source-bucket"),
-                request: source.request,
-                policy: LoadedBucketSubresource::NotRequested,
-                tags: LoadedBucketSubresource::Loaded(SerializedBucketTagSet::new(
-                    "<Tagging><TagSet></TagSet></Tagging>".to_string(),
-                )),
-                lifecycle: LoadedBucketSubresource::NotRequested,
-                cors: LoadedBucketSubresource::NotRequested,
-            }),
-            destination: Box::new(BucketSnapshot {
-                bucket: test_bucket_info("destination-bucket"),
-                request: destination.request,
-                policy: LoadedBucketSubresource::NotRequested,
-                tags: LoadedBucketSubresource::NotRequested,
-                lifecycle: LoadedBucketSubresource::NotRequested,
-                cors: LoadedBucketSubresource::Loaded("<CORSConfiguration/>".to_string()),
-            }),
-        };
-        let response = StorageRpcBucketSnapshotPairResponse {
-            outcome: StorageRpcBucketSnapshotPairOutcome::Loaded(Box::new(pair)),
-        };
-        let bytes = encode_bucket_snapshot_pair_response(&response);
-        let decoded = decode_bucket_snapshot_pair_response(&bytes).unwrap();
-        match decoded.outcome {
-            StorageRpcBucketSnapshotPairOutcome::Loaded(pair) => {
-                assert_eq!(pair.source().bucket.name.as_str(), "source-bucket");
-                assert_eq!(
-                    pair.destination().bucket.name.as_str(),
-                    "destination-bucket"
-                );
-                assert!(matches!(
-                    pair.source().tags,
-                    LoadedBucketSubresource::Loaded(ref tags) if tags.is_empty()
-                ));
-                assert!(matches!(
-                    pair.destination().cors,
-                    LoadedBucketSubresource::Loaded(ref body) if body == "<CORSConfiguration/>"
-                ));
-            }
-            StorageRpcBucketSnapshotPairOutcome::BucketNotFound { .. } => {
-                panic!("expected loaded bucket snapshot pair response")
-            }
-        }
-
-        let response = StorageRpcBucketSnapshotPairResponse {
-            outcome: StorageRpcBucketSnapshotPairOutcome::BucketNotFound {
-                name: BucketName::try_from("missing-bucket").unwrap(),
-            },
-        };
-        let bytes = encode_bucket_snapshot_pair_response(&response);
-        let decoded = decode_bucket_snapshot_pair_response(&bytes).unwrap();
-        match decoded.outcome {
-            StorageRpcBucketSnapshotPairOutcome::BucketNotFound { name } => {
-                assert_eq!(name.as_str(), "missing-bucket");
-            }
-            StorageRpcBucketSnapshotPairOutcome::Loaded(_) => {
-                panic!("expected bucket-not-found snapshot pair response")
             }
         }
     }

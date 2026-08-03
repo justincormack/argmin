@@ -647,7 +647,7 @@ Node-client role classification (2026-07-19):
 
 | Interface | PG role | Capability direction |
 | --- | --- | --- |
-| `BucketMetadataNodeClient` | bucket metadata | exact reads/mutations use an active route bound to one epoch, bucket PG, and bucket; paired snapshots and delete-replica inspection use separate narrower routes; owner listing and batch generation/fast-path reads open an active scan route bound to one epoch and bucket PG |
+| `BucketMetadataNodeClient` | bucket metadata | exact reads/mutations use an active route bound to one epoch, bucket PG, and bucket; delete-replica inspection uses a separate narrower route; owner listing and batch generation/fast-path reads open an active scan route bound to one epoch and bucket PG |
 | `BucketWriteReservationNodeClient` | bucket metadata | exact reservation/drain/claim operations open an active route bound to one epoch, bucket PG, and bucket; PG-wide delete/lifecycle discovery opens a separate active scan route bound to one epoch and bucket PG |
 | `RetainedBucketWriteReservationNodeClient` | bucket metadata | opens a retained cleanup route bound to one bucket metadata PG and exact bucket; the returned interface releases exact reservation proofs, drains, and worker claims without accepting a replacement PG or bucket |
 | `ObjectGenerationMetadataNodeClient` | object metadata | opens an active route bound to one epoch, exact object PG, bucket, and key; reservation lookup and next-generation inspection cannot replace that subject |
@@ -1334,6 +1334,11 @@ Twenty-first Phase 3 slice:
   parallel workspace suite (7,326 tests).
 
 Twenty-second Phase 3 slice:
+
+This historical slice's dormant two-bucket snapshot capability and pair RPC
+were removed in the eighth Phase 4 slice. Production CopyObject and
+UploadPartCopy use their narrower source-read and destination-write
+capabilities instead.
 
 - `ActiveBucketRoute` now covers a full single-bucket authorization snapshot,
   while the new non-`Clone` `ActiveBucketRoutePair` fixes both bucket subjects
@@ -4983,6 +4988,9 @@ One-hundred-and-twenty-fifth Phase 3 slice:
 
 One-hundred-and-twenty-sixth Phase 3 slice:
 
+This historical slice's pair-shaped snapshot route was removed in the eighth
+Phase 4 slice after confirming that it had no production request-path caller.
+
 - exact bucket metadata operations now open a `BucketMetadataRoute` bound to
   one route epoch, installed bucket-metadata PG, and bucket. Bucket heads,
   snapshots, subresources, tags, create/barrier construction, and bucket
@@ -5426,6 +5434,29 @@ Seventh Phase 4 slice (2026-08-02):
   contention/finalization matrix, the storage boundary checker, formatting,
   workspace-wide strict Clippy, and the full parallel 7,967-test workspace
   suite.
+
+Eighth Phase 4 slice (2026-08-03):
+
+- removed the dormant generic two-bucket snapshot stack: the coordinator
+  `LoadedBucketPair` scaffold, raw and admitted cluster pair loaders,
+  pair-shaped node-client route, and `BucketSnapshotPairLoad` RPC. None had a
+  production S3 request-path caller.
+- the pair operation was not an atomic cross-bucket snapshot; its local
+  implementation performed two sequential reads and its dedicated RPC only
+  batched the same-node active-primary case. Keeping that optimization would
+  require a parallel Peering authorization implementation without adding a
+  correctness property.
+- CopyObject and UploadPartCopy continue to use their operation-specific
+  source object-read and destination PutObject/multipart capabilities. If an
+  oracle-backed operation later needs coordinated bucket authorization, it
+  should receive a role-specific capability rather than restoring a generic
+  pair of read authorities.
+- removed pair-only tests and the obsolete raw-pair boundary-check inventory;
+  existing single-bucket active and Peering route tests retain the underlying
+  read-authority coverage.
+- validation passed the storage RPC wire-kind authorization inventory, the
+  storage boundary checker, formatting, workspace compilation, workspace-wide
+  strict Clippy, and the full parallel 7,970-test workspace suite.
 
 ### Phase 5 — isolate test support
 

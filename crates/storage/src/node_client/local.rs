@@ -252,15 +252,6 @@ struct LocalBucketMetadataRoute<'a> {
     authorization: MetadataReadAuthorization,
 }
 
-struct LocalBucketMetadataRoutePair<'a> {
-    client: &'a LocalStorageNodeClient,
-    _route_cluster_epoch: ClusterEpoch,
-    source_pg_id: BucketPgId,
-    source_bucket: BucketName,
-    destination_pg_id: BucketPgId,
-    destination_bucket: BucketName,
-}
-
 struct LocalBucketDeleteReplicaMetadataRoute<'a> {
     client: &'a LocalStorageNodeClient,
     _route_cluster_epoch: ClusterEpoch,
@@ -1119,42 +1110,6 @@ impl LocalStorageNodeClient {
         Ok(PgMetadataStore::head_bucket_raw(&*pg, bucket)?)
     }
 
-    fn load_bucket_snapshot(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        let snapshot = SharedStorageNode::load_bucket_snapshot_from_pg(&pg, bucket, request)?;
-        drop(pg);
-        Ok(snapshot)
-    }
-
-    fn load_bucket_snapshot_pair(
-        &self,
-        source_pg_id: BucketPgId,
-        source: (&BucketName, BucketSnapshotRequest),
-        destination_pg_id: BucketPgId,
-        destination: (&BucketName, BucketSnapshotRequest),
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        if source.0 == destination.0 {
-            let merged_request = source.1.union(destination.1);
-            let bucket = self.load_bucket_snapshot(source_pg_id, source.0, merged_request)?;
-            return Ok(BucketSnapshotPair::Same {
-                bucket: Box::new(bucket),
-            });
-        }
-
-        let source_snapshot = self.load_bucket_snapshot(source_pg_id, source.0, source.1)?;
-        let destination_snapshot =
-            self.load_bucket_snapshot(destination_pg_id, destination.0, destination.1)?;
-        Ok(BucketSnapshotPair::Distinct {
-            source: Box::new(source_snapshot),
-            destination: Box::new(destination_snapshot),
-        })
-    }
-
     fn build_create_bucket_command(
         &self,
         pg_id: BucketPgId,
@@ -1487,34 +1442,6 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         }))
     }
 
-    fn open_bucket_metadata_route_pair(
-        &self,
-        route_cluster_epoch: ClusterEpoch,
-        source_pg_id: BucketPgId,
-        source_bucket: &BucketName,
-        destination_pg_id: BucketPgId,
-        destination_bucket: &BucketName,
-    ) -> Result<Box<dyn BucketMetadataRoutePair + '_>, BucketSnapshotLoadError> {
-        self.storage_node.require_open_pg(source_pg_id.get())?;
-        self.storage_node.require_open_pg(destination_pg_id.get())?;
-        if self.storage_node.bucket_metadata_pg_for(source_bucket) != source_pg_id
-            || self.storage_node.bucket_metadata_pg_for(destination_bucket) != destination_pg_id
-        {
-            return Err(StoreError::RouteCapabilitySubjectMismatch {
-                operation: "open bucket metadata route pair",
-            }
-            .into());
-        }
-        Ok(Box::new(LocalBucketMetadataRoutePair {
-            client: self,
-            _route_cluster_epoch: route_cluster_epoch,
-            source_pg_id,
-            source_bucket: source_bucket.clone(),
-            destination_pg_id,
-            destination_bucket: destination_bucket.clone(),
-        }))
-    }
-
     fn open_bucket_delete_replica_metadata_route(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -1802,21 +1729,6 @@ impl BucketMetadataRoute for LocalBucketMetadataRoute<'_> {
         Ok(
             PgMetadataStore::get_bucket_subresource(&*pg, &self.bucket, kind)?
                 .map(|stored| stored.body),
-        )
-    }
-}
-
-impl BucketMetadataRoutePair for LocalBucketMetadataRoutePair<'_> {
-    fn load_bucket_snapshot_pair(
-        &self,
-        source_request: BucketSnapshotRequest,
-        destination_request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
-        self.client.load_bucket_snapshot_pair(
-            self.source_pg_id,
-            (&self.source_bucket, source_request),
-            self.destination_pg_id,
-            (&self.destination_bucket, destination_request),
         )
     }
 }

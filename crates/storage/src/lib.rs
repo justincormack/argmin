@@ -77,7 +77,7 @@ mod traits {
 #[cfg(test)]
 pub(crate) use cluster::DurableReclaimScanOutcome;
 pub use cluster::{
-    ActiveBucketMetadataScan, ActiveBucketRoute, ActiveBucketRoutePair, ActiveMultipartObjectRoute,
+    ActiveBucketMetadataScan, ActiveBucketRoute, ActiveMultipartObjectRoute,
     ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectReadRoute,
     ActivePutObjectRoute, BucketWriteSnapshotAction, LeasedObjectReadSnapshot,
     LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
@@ -653,10 +653,10 @@ pub use types::{
     BeginUploadPartStreamSessionReq, BucketAclSummary, BucketDeleteDiagnostic,
     BucketEncryptionConfig, BucketFastPathIdentity, BucketFastPathInfo, BucketFastPathPolicy,
     BucketFastPathTags, BucketInfo, BucketName, BucketNameError, BucketObjectLockConfig,
-    BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotPair,
-    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketVersioningState,
-    BucketWriteDrainRecord, BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId,
-    ChecksumAlgorithm, ChecksumBytes, ChecksumType, ClusterEpoch, CompleteMultipartCommitInput,
+    BucketObjectOwnership, BucketOwnershipControls, BucketSnapshot, BucketSnapshotRequest,
+    BucketSnapshotTagsRequest, BucketState, BucketVersioningState, BucketWriteDrainRecord,
+    BucketWriteDrainState, BucketWriteReservationRecord, CanonicalUserId, ChecksumAlgorithm,
+    ChecksumBytes, ChecksumType, ClusterEpoch, CompleteMultipartCommitInput,
     CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CreateBucketConfig,
     CreateMultipartUploadInput, CreateMultipartUploadOutcome, CreateStreamUploadReq, DataLayout,
     DeleteCurrentObjectOutcome, DeleteMarkerRecord, DeleteSpecificObjectVersionOutcome,
