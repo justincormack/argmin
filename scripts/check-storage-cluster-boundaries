@@ -3097,6 +3097,83 @@ fail_with_matches \
     "Static initial topology certificates, certified bootstrap submission, snapshot validation, and concurrent-result classification must remain owned by storage" \
     "$argmin_static_initial_topology_representation_leaks"
 
+argmin_control_plane_admin_bootstrap_leaks=$(
+    rg -n --color=never \
+        '\bAdminControlPlaneClient\b|ControlPlane(Pg|Raft|AuthorityClock)AdminClient::new\(|LivePgMetadataTransferControlPlaneClient::new\(|^fn control_plane_clock_recovery_socket_path\(' \
+        crates/argmin-s3/src/main.rs \
+        || true
+)
+fail_with_matches \
+    "Operator control-plane transports, scoped credentials, recovery namespaces, and raw operation clients must be assembled by storage" \
+    "$argmin_control_plane_admin_bootstrap_leaks"
+
+public_raw_control_plane_admin_constructors=$(
+    {
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+new\(' \
+            crates/storage/src/control_plane_operator_admin.rs \
+            crates/storage/src/live_pg_transfer.rs \
+            || true
+        awk '
+        /impl ControlPlanePgAdminClient[[:space:]]*\{/ {
+            in_admin = 1
+            depth = 0
+        }
+        in_admin {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+fn[[:space:]]+new\(/) {
+                print FILENAME ":" FNR ":" $0
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_admin = 0
+            }
+        }
+        ' crates/storage/src/control_plane_pg_admin.rs
+    }
+)
+fail_with_matches \
+    "Raw operator control-plane client constructors must remain private to storage" \
+    "$public_raw_control_plane_admin_constructors"
+
+control_plane_admin_bootstrap_surface_leaks=$(
+    {
+        rg -n -U --color=never \
+            'pub struct (ControlPlaneAdminClientBootstrap|ControlPlaneAdminCredentialBinding)[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:|#\[derive\([^]]*(Debug|PartialEq|Eq|Hash)[^]]*\)\][[:space:]]*pub struct (ControlPlaneAdminClientBootstrap|ControlPlaneAdminCredentialBinding)' \
+            crates/storage/src/control_plane_client_bootstrap.rs \
+            || true
+        awk '
+        /impl (ControlPlaneAdminClientBootstrap|ControlPlaneAdminCredentialBinding)[[:space:]]*\{/ {
+            in_bootstrap = 1
+            bootstrap_impl = $0
+            sub(/^.*impl /, "", bootstrap_impl)
+            sub(/[[:space:]]*\{.*/, "", bootstrap_impl)
+            depth = 0
+        }
+        in_bootstrap {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if ((bootstrap_impl == "ControlPlaneAdminClientBootstrap" && method != "with_endpoints" && method != "with_socket_paths" && method != "with_derived_clock_recovery_socket_paths" && method != "is_authenticated") || (bootstrap_impl == "ControlPlaneAdminCredentialBinding" && method != "new")) {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_bootstrap = 0
+            }
+        }
+        ' crates/storage/src/control_plane_client_bootstrap.rs
+    }
+)
+fail_with_matches \
+    "Control-plane admin bootstrap capabilities must retain transport and scoped credentials opaquely and expose only bounded assembly operations" \
+    "$control_plane_admin_bootstrap_surface_leaks"
+
 public_static_initial_topology_bypass_apis=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+(submit_static_initial_topology|validate_snapshot)[[:space:]]*\(' \
@@ -4431,7 +4508,7 @@ manual_pg_admin_opaque_surface_leaks=$(
                 method = $0
                 sub(/^.*fn[[:space:]]+/, "", method)
                 sub(/\(.*/, "", method)
-                if ((pg_admin_impl == "ControlPlanePgAdminClient" && method != "new" && method != "set_acting_set" && method != "fence_for_metadata_transfer" && method != "install_metadata_transfer") || (pg_admin_impl == "ControlPlanePgStatusClient" && method != "new" && method != "serving_epochs") || (pg_admin_impl == "ControlPlanePgMetadataTransferInstall" && method != "new") || pg_admin_impl == "ControlPlanePgAdminInputError" || pg_admin_impl == "ControlPlanePgAdminError") {
+                if ((pg_admin_impl == "ControlPlanePgAdminClient" && method != "from_bootstrap" && method != "set_acting_set" && method != "fence_for_metadata_transfer" && method != "install_metadata_transfer") || (pg_admin_impl == "ControlPlanePgStatusClient" && method != "new" && method != "serving_epochs") || (pg_admin_impl == "ControlPlanePgMetadataTransferInstall" && method != "new") || pg_admin_impl == "ControlPlanePgAdminInputError" || pg_admin_impl == "ControlPlanePgAdminError") {
                     print FILENAME ":" FNR ":" $0
                 }
             }
@@ -4496,7 +4573,7 @@ operator_admin_opaque_surface_leaks=$(
                 method = $0
                 sub(/^.*fn[[:space:]]+/, "", method)
                 sub(/\(.*/, "", method)
-                if ((operator_admin_impl == "ControlPlaneRaftAdminClient" && method != "new" && method != "transfer_leadership_to" && method != "trigger_snapshot_and_purge" && method != "trigger_election") || (operator_admin_impl == "ControlPlaneAuthorityClockAdminClient" && method != "new" && method != "status" && method != "reestablish") || operator_admin_impl == "ControlPlaneAuthorityClockAdminStatus" || operator_admin_impl == "ControlPlaneOperatorAdminError") {
+                if ((operator_admin_impl == "ControlPlaneRaftAdminClient" && method != "from_bootstrap" && method != "transfer_leadership_to" && method != "trigger_snapshot_and_purge" && method != "trigger_election") || (operator_admin_impl == "ControlPlaneAuthorityClockAdminClient" && method != "from_bootstrap" && method != "status" && method != "reestablish") || operator_admin_impl == "ControlPlaneAuthorityClockAdminStatus" || operator_admin_impl == "ControlPlaneOperatorAdminError") {
                     print FILENAME ":" FNR ":" $0
                 }
             }

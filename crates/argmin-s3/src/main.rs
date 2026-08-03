@@ -9,7 +9,8 @@ use std::future::Future;
 use std::io;
 use std::net::TcpListener as StdTcpListener;
 use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
+#[cfg(test)]
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -1054,18 +1055,6 @@ fn reestablish_control_plane_authority_clock(
         .map_err(|error| error.to_string())
 }
 
-fn control_plane_clock_recovery_socket_path(control_plane_socket_path: &Path) -> PathBuf {
-    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in control_plane_socket_path.as_os_str().as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    control_plane_socket_path.with_file_name(format!(".c-{hash:016x}"))
-}
-
 fn fence_control_plane_pg_for_metadata_transfer_live(
     socket_path: &Path,
     pg_id: u32,
@@ -1118,21 +1107,15 @@ fn transfer_control_plane_pg_metadata_live(
                 (client.inner().clone(), Some(client.credential().clone()))
             }
         };
-    let admin_credential = {
-        let admin = if static_cluster_command_configured() {
-            build_admin_control_plane_client_from_config(&config, read_client.clone())?
-        } else {
-            build_admin_control_plane_client_with_command_auth_env(read_client.clone())?
-        };
-        match admin {
-            AdminControlPlaneClient::Plain(_) => None,
-            AdminControlPlaneClient::Authenticated(client) => Some(client.credential().clone()),
-        }
+    let admin_credential = if static_cluster_command_configured() {
+        build_admin_credential_binding_from_config(&config)?
+    } else {
+        build_admin_credential_binding_from_command_auth_env()?
     };
-    let control_plane = storage::LivePgMetadataTransferControlPlaneClient::new(
+    let control_plane = storage::LivePgMetadataTransferControlPlaneClient::with_admin_credential(
         read_client,
         read_credential,
-        admin_credential,
+        &admin_credential,
     )
     .map_err(|error| error.to_string())?;
     let ec_shape = EcShape {
@@ -1502,7 +1485,9 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         .control_plane_clock_recovery_socket_path
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| control_plane_clock_recovery_socket_path(Path::new(socket_path)));
+        .unwrap_or_else(|| {
+            storage::control_plane_clock_recovery_socket_path(Path::new(socket_path))
+        });
     let (
         (authority, authority_clock, authority_clock_checkpoint_target, auth_verifier),
         (listeners, recovery_listeners),
@@ -3237,7 +3222,9 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .control_plane_clock_recovery_socket_path
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| control_plane_clock_recovery_socket_path(Path::new(socket_path)));
+        .unwrap_or_else(|| {
+            storage::control_plane_clock_recovery_socket_path(Path::new(socket_path))
+        });
 
     let runtime = Handle::current();
     let cluster_name = config
@@ -3969,11 +3956,6 @@ enum FrontendControlPlaneClient {
     Authenticated(AuthenticatedUnixControlPlaneClient),
 }
 
-enum AdminControlPlaneClient {
-    Plain(UnixControlPlaneClient),
-    Authenticated(AuthenticatedUnixControlPlaneClient),
-}
-
 impl ControlPlaneHeartbeatRuntimeMapSource for StorageNodeControlPlaneClient {
     fn refresh_node_heartbeat(
         &mut self,
@@ -4292,81 +4274,59 @@ fn build_pg_status_control_plane_client_from_runtime_map_auth_env(
 fn build_command_unix_control_plane_client(
     primary_socket_path: &Path,
 ) -> Result<UnixControlPlaneClient, String> {
+    UnixControlPlaneClient::with_socket_paths(command_control_plane_socket_paths(
+        primary_socket_path,
+    )?)
+    .map_err(|error| format!("invalid control-plane client socket paths: {error}"))
+}
+
+fn command_control_plane_socket_paths(primary_socket_path: &Path) -> Result<Vec<PathBuf>, String> {
     let configured = std::env::var("ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS").ok();
     let Some(configured) = configured else {
-        return Ok(UnixControlPlaneClient::new(primary_socket_path));
+        return Ok(vec![primary_socket_path.to_path_buf()]);
     };
     let primary_socket_path = primary_socket_path.to_str().ok_or_else(|| {
         "control-plane command socket path must be UTF-8 when ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS is set"
             .to_owned()
     })?;
-    let socket_paths = config::parse_control_plane_client_socket_paths(
-        Some(configured),
-        Some(primary_socket_path),
-    )?;
-    UnixControlPlaneClient::with_socket_paths(socket_paths.into_iter().map(PathBuf::from))
-        .map_err(|error| format!("invalid control-plane client socket paths: {error}"))
+    config::parse_control_plane_client_socket_paths(Some(configured), Some(primary_socket_path))
+        .map(|paths| paths.into_iter().map(PathBuf::from).collect())
 }
 
 fn build_admin_control_plane_client_from_command_auth_env(
     control_plane_socket_path: &Path,
-) -> Result<AdminControlPlaneClient, String> {
+) -> Result<storage::ControlPlaneAdminClientBootstrap, String> {
     if static_cluster_command_configured() {
         let config = static_cluster_config::load_server_config_from_environment()
             .map_err(|error| format!("configuration error: {error}"))?;
-        let fallback = control_plane_socket_path.to_str().ok_or_else(|| {
-            "control-plane command socket path must contain valid UTF-8".to_string()
-        })?;
-        let client = build_configured_unix_control_plane_client(&config, fallback)?;
-        return build_admin_control_plane_client_from_config(&config, client);
+        return build_admin_control_plane_client_from_config(&config, control_plane_socket_path);
     }
-    let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
-    build_admin_control_plane_client_with_command_auth_env(client)
+    storage::ControlPlaneAdminClientBootstrap::with_socket_paths(
+        command_control_plane_socket_paths(control_plane_socket_path)?,
+        build_admin_credential_binding_from_command_auth_env()?,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn build_pg_admin_control_plane_client_from_command_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<storage::ControlPlanePgAdminClient, String> {
     let admin = build_admin_control_plane_client_from_command_auth_env(control_plane_socket_path)?;
-    Ok(match admin {
-        AdminControlPlaneClient::Plain(client) => {
-            storage::ControlPlanePgAdminClient::new(client, None)
-        }
-        AdminControlPlaneClient::Authenticated(client) => storage::ControlPlanePgAdminClient::new(
-            client.inner().clone(),
-            Some(client.credential().clone()),
-        ),
-    })
+    Ok(storage::ControlPlanePgAdminClient::from_bootstrap(&admin))
 }
 
 fn build_raft_admin_control_plane_client_from_command_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<storage::ControlPlaneRaftAdminClient, String> {
     let admin = build_admin_control_plane_client_from_command_auth_env(control_plane_socket_path)?;
-    Ok(match admin {
-        AdminControlPlaneClient::Plain(client) => {
-            storage::ControlPlaneRaftAdminClient::new(client, None)
-        }
-        AdminControlPlaneClient::Authenticated(client) => {
-            storage::ControlPlaneRaftAdminClient::new(
-                client.inner().clone(),
-                Some(client.credential().clone()),
-            )
-        }
-    })
+    Ok(storage::ControlPlaneRaftAdminClient::from_bootstrap(&admin))
 }
 
 fn build_authority_clock_admin_client_from_command_auth_env(
     control_plane_socket_path: &Path,
 ) -> Result<storage::ControlPlaneAuthorityClockAdminClient, String> {
     let admin = build_admin_clock_recovery_client_from_command_auth_env(control_plane_socket_path)?;
-    let (client, credential) = match admin {
-        AdminControlPlaneClient::Plain(client) => (client, None),
-        AdminControlPlaneClient::Authenticated(client) => {
-            (client.inner().clone(), Some(client.credential().clone()))
-        }
-    };
-    storage::ControlPlaneAuthorityClockAdminClient::new(client, credential)
+    storage::ControlPlaneAuthorityClockAdminClient::from_bootstrap(&admin)
         .map_err(|error| error.to_string())
 }
 
@@ -4377,112 +4337,106 @@ fn static_cluster_command_configured() -> bool {
 
 fn build_admin_clock_recovery_client_from_command_auth_env(
     control_plane_socket_path: &Path,
-) -> Result<AdminControlPlaneClient, String> {
+) -> Result<storage::ControlPlaneAdminClientBootstrap, String> {
     if static_cluster_command_configured() {
         let config = static_cluster_config::load_server_config_from_environment()
             .map_err(|error| format!("configuration error: {error}"))?;
         return build_admin_clock_recovery_client_from_config(&config, control_plane_socket_path);
     }
-    let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
-    let client = UnixControlPlaneClient::with_socket_paths(
-        client
-            .socket_paths()
-            .iter()
-            .map(|path| control_plane_clock_recovery_socket_path(path)),
+    storage::ControlPlaneAdminClientBootstrap::with_derived_clock_recovery_socket_paths(
+        command_control_plane_socket_paths(control_plane_socket_path)?,
+        build_admin_credential_binding_from_command_auth_env()?,
     )
-    .map_err(|error| format!("invalid control-plane clock recovery socket paths: {error}"))?;
-    build_admin_control_plane_client_with_command_auth_env(client)
+    .map_err(|error| error.to_string())
 }
 
 fn build_admin_clock_recovery_client_from_config(
     config: &ServerConfig,
     fallback_control_plane_socket_path: &Path,
-) -> Result<AdminControlPlaneClient, String> {
-    let client = if !config
+) -> Result<storage::ControlPlaneAdminClientBootstrap, String> {
+    let credential = build_admin_credential_binding_from_config(config)?;
+    if !config
         .control_plane_clock_recovery_rpc_client_endpoints
         .is_empty()
     {
-        UnixControlPlaneClient::with_endpoints(
+        return storage::ControlPlaneAdminClientBootstrap::with_endpoints(
             config
                 .control_plane_clock_recovery_rpc_client_endpoints
                 .clone(),
+            credential,
         )
-        .map_err(|error| {
-            format!("invalid configured authority-clock recovery endpoints: {error}")
-        })?
-    } else {
-        let control_client =
-            build_command_unix_control_plane_client(fallback_control_plane_socket_path)?;
-        UnixControlPlaneClient::with_socket_paths(
-            control_client
-                .socket_paths()
-                .iter()
-                .map(|path| control_plane_clock_recovery_socket_path(path)),
-        )
-        .map_err(|error| format!("invalid control-plane clock recovery socket paths: {error}"))?
-    };
-    build_admin_control_plane_client_from_config(config, client)
+        .map_err(|error| error.to_string());
+    }
+    storage::ControlPlaneAdminClientBootstrap::with_derived_clock_recovery_socket_paths(
+        command_control_plane_socket_paths(fallback_control_plane_socket_path)?,
+        credential,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn build_admin_control_plane_client_from_config(
     config: &ServerConfig,
-    client: UnixControlPlaneClient,
-) -> Result<AdminControlPlaneClient, String> {
-    if config.control_plane_admin_auth_credentials.is_empty() {
-        return Ok(AdminControlPlaneClient::Plain(client));
+    fallback_control_plane_socket_path: &Path,
+) -> Result<storage::ControlPlaneAdminClientBootstrap, String> {
+    let credential = build_admin_credential_binding_from_config(config)?;
+    if !config.control_plane_rpc_client_endpoints.is_empty() {
+        return storage::ControlPlaneAdminClientBootstrap::with_endpoints(
+            config.control_plane_rpc_client_endpoints.clone(),
+            credential,
+        )
+        .map_err(|error| error.to_string());
     }
-    let cluster_id = config
-        .control_plane_auth_cluster_id
-        .as_deref()
-        .ok_or_else(|| {
-            "configured admin control-plane auth requires a cluster identity".to_string()
-        })?;
-    let instance_id = config
-        .control_plane_admin_auth_instance_id
-        .as_deref()
-        .ok_or_else(|| {
-            "configured admin control-plane auth requires a local admin instance id".to_string()
-        })?;
-    let configured = latest_admin_auth_credential_for_instance(
-        &config.control_plane_admin_auth_credentials,
-        instance_id,
-    )?;
-    let credential = configured_admin_auth_credential(configured)?
-        .scoped_for_cluster(cluster_id)
-        .map_err(|error| {
-            format!(
-                "invalid configured admin scoped credential for instance {instance_id}: {error}"
-            )
-        })?;
-    Ok(AdminControlPlaneClient::Authenticated(
-        AuthenticatedUnixControlPlaneClient::new(client, credential),
-    ))
+    let socket_paths = if config.control_plane_client_socket_paths.is_empty() {
+        vec![fallback_control_plane_socket_path.to_path_buf()]
+    } else {
+        config
+            .control_plane_client_socket_paths
+            .iter()
+            .map(PathBuf::from)
+            .collect()
+    };
+    storage::ControlPlaneAdminClientBootstrap::with_socket_paths(socket_paths, credential)
+        .map_err(|error| error.to_string())
 }
 
-fn build_admin_control_plane_client_with_command_auth_env(
-    client: UnixControlPlaneClient,
-) -> Result<AdminControlPlaneClient, String> {
+fn build_admin_credential_binding_from_command_auth_env(
+) -> Result<storage::ControlPlaneAdminCredentialBinding, String> {
     match ConfiguredControlPlaneAdminCommandAuth::from_env()? {
-        Some(auth_config) => {
-            let configured = latest_admin_auth_credential_for_instance(
-                &auth_config.credentials,
-                &auth_config.instance_id,
-            )
-            .expect("auth-only admin config validates local instance credential");
-            let credential = configured_admin_auth_credential(configured)?
-                .scoped_for_cluster(&auth_config.cluster_id)
-                .map_err(|error| {
-                    format!(
-                        "invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS scoped credential for instance {}: {error}",
-                        auth_config.instance_id
-                    )
-                })?;
-            Ok(AdminControlPlaneClient::Authenticated(
-                AuthenticatedUnixControlPlaneClient::new(client, credential),
-            ))
-        }
-        None => Ok(AdminControlPlaneClient::Plain(client)),
+        Some(auth_config) => build_admin_credential_binding(
+            Some(&auth_config.cluster_id),
+            Some(&auth_config.instance_id),
+            &auth_config.credentials,
+        ),
+        None => build_admin_credential_binding(None, None, &[]),
     }
+}
+
+fn build_admin_credential_binding_from_config(
+    config: &ServerConfig,
+) -> Result<storage::ControlPlaneAdminCredentialBinding, String> {
+    build_admin_credential_binding(
+        config.control_plane_auth_cluster_id.as_deref(),
+        config.control_plane_admin_auth_instance_id.as_deref(),
+        &config.control_plane_admin_auth_credentials,
+    )
+}
+
+fn build_admin_credential_binding(
+    cluster_id: Option<&str>,
+    instance_id: Option<&str>,
+    configured: &[ConfiguredControlPlaneAdminAuthCredential],
+) -> Result<storage::ControlPlaneAdminCredentialBinding, String> {
+    let credentials = configured
+        .iter()
+        .map(|credential| ControlPlaneAdminAuthCredentialInput {
+            instance_id: credential.instance_id.clone(),
+            credential_id: credential.credential_id.clone(),
+            credential_version: credential.credential_version,
+            secret: credential.secret.as_bytes().to_vec(),
+        })
+        .collect();
+    storage::ControlPlaneAdminCredentialBinding::new(cluster_id, instance_id, credentials)
+        .map_err(|error| error.to_string())
 }
 
 fn build_authenticated_frontend_control_plane_client_with_inner(
@@ -4613,24 +4567,6 @@ fn select_frontend_auth_credential_for_instance<'a>(
         .ok_or_else(|| {
             format!(
                 "configured frontend signing credential {credential_id}:{credential_version} is unavailable for instance {instance_id}"
-            )
-        })
-}
-
-fn latest_admin_auth_credential_for_instance<'a>(
-    credentials: &'a [ConfiguredControlPlaneAdminAuthCredential],
-    instance_id: &str,
-) -> Result<&'a ConfiguredControlPlaneAdminAuthCredential, String> {
-    latest_auth_credential_by_version_then_id(
-        credentials
-            .iter()
-            .filter(|credential| credential.instance_id == instance_id),
-        |credential| credential.credential_id.as_str(),
-        |credential| credential.credential_version,
-    )
-    .ok_or_else(|| {
-            format!(
-                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
             )
         })
 }
@@ -6153,7 +6089,7 @@ mod tests {
     #[test]
     fn clock_recovery_socket_is_distinct_and_shorter_than_standard_process_socket() {
         let socket = Path::new("/tmp/private/control-plane-101.sock");
-        let recovery = control_plane_clock_recovery_socket_path(socket);
+        let recovery = storage::control_plane_clock_recovery_socket_path(socket);
 
         assert_eq!(recovery.parent(), socket.parent());
         assert_ne!(recovery, socket);
@@ -6856,29 +6792,6 @@ mod tests {
     }
 
     #[test]
-    fn admin_control_plane_client_selects_latest_local_auth_credential() {
-        let credentials = vec![
-            ConfiguredControlPlaneAdminAuthCredential {
-                instance_id: "admin-1".to_string(),
-                credential_id: "admin".to_string(),
-                credential_version: 7,
-                secret: BinarySecretConfigValue::from_utf8("admin-1-secret".to_string()),
-            },
-            ConfiguredControlPlaneAdminAuthCredential {
-                instance_id: "admin-1".to_string(),
-                credential_id: "admin".to_string(),
-                credential_version: 8,
-                secret: BinarySecretConfigValue::from_utf8("admin-1-new-secret".to_string()),
-            },
-        ];
-
-        let configured = latest_admin_auth_credential_for_instance(&credentials, "admin-1")
-            .expect("admin auth credential should be selected");
-
-        assert_eq!(configured.credential_version, 8);
-    }
-
-    #[test]
     fn configured_authority_clock_command_client_uses_recovery_endpoints() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("static-topology-cluster".to_string());
@@ -6911,15 +6824,12 @@ mod tests {
             Path::new("/tmp/unused-control.sock"),
         )
         .unwrap();
-        let AdminControlPlaneClient::Authenticated(client) = client else {
-            panic!("configured recovery command client must use admin authentication")
-        };
-
-        assert_eq!(client.credential().credential_version(), 9);
-        let debug = format!("{:?}", client.inner());
-        assert!(debug.contains("tcp://control-1.internal:7601"));
-        assert!(debug.contains("tcp://control-2.internal:7602"));
-        assert!(debug.contains("ControlPlaneRpcClientEndpoint::TlsTcp"));
+        assert!(client.is_authenticated());
+        let debug = format!("{client:?}");
+        assert!(debug.contains("authenticated: true"));
+        assert!(debug.contains("transport: \"<opaque>\""));
+        assert!(!debug.contains("control-1.internal"));
+        assert!(!debug.contains("admin-secret"));
         assert!(!debug.contains("unused-control.sock"));
     }
 

@@ -1510,6 +1510,22 @@ either process wrapper. Recovery endpoint and credential/transport assembly, con
 bootstrap, and the remaining process-hosted control-plane authority implementation remain item 12
 work.
 
+The thirty-fifth bounded slice contains operator control-plane client bootstrap. The process now
+supplies only resolved ordinary or recovery endpoints, logical cluster/admin-instance identity,
+and unscoped credential inputs to `ControlPlaneAdminClientBootstrap`. Storage validates the
+endpoint set, selects the latest local credential, constructs and scopes the admin principal, and
+retains both transport and credential opaquely before constructing PG, Raft, or authority-clock
+operation clients. Authority-clock recovery Unix socket derivation is storage-owned with exact
+owner-local fixtures; the process can request the semantic derived namespace but no longer owns
+its hash or filename representation. Live PG metadata transfer receives a separate opaque admin
+credential binding and combines it with the already retained read transport inside storage, so
+the process cannot supply independent read/admin transports. Raw operation-client constructors
+are crate-private, diagnostics redact endpoint and credential material, and a repository check
+rejects the former process dispatch enum, raw constructors, local recovery derivation, or public
+re-exposure of the raw client seams. Frontend/storage-node service-client bootstrap, server
+listener/auth-verifier bootstrap, Raft-peer bootstrap, and the process-hosted authority
+implementation remain item 12 work.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1808,9 +1824,10 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     bootstrap, snapshot validation, and rejection classification are removed; certified startup
     now uses only the authority-owned establishment operation. Uncertified submission, durable
     checkpoint publication, leader retry, and resolution are likewise one storage-owned operation
-    using the authority's single opaque response-publication and poison domain. The remaining work
-    is recovery endpoint and credential/transport assembly, transport bootstrap, and the
-    process-hosted control-plane authority implementation.
+    using the authority's single opaque response-publication and poison domain. Operator recovery
+    endpoint and credential/transport assembly are now storage-owned. The remaining work is
+    frontend/storage-node service-client bootstrap, server listener/auth-verifier and Raft-peer
+    transport bootstrap, and the process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

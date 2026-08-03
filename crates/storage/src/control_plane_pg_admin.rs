@@ -7,6 +7,7 @@ use crate::control_plane::{
     PgMetadataTransferProof, SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use crate::control_plane_auth::ControlPlaneScopedCredential;
+use crate::control_plane_client_bootstrap::ControlPlaneAdminClientBootstrap;
 use crate::{ClusterEpoch, NodeId, PgId};
 
 enum ControlPlanePgAdminDispatch {
@@ -100,7 +101,7 @@ pub struct ControlPlanePgAdminClient {
 }
 
 impl ControlPlanePgAdminClient {
-    pub fn new(
+    pub(crate) fn new(
         client: UnixControlPlaneClient,
         credential: Option<ControlPlaneScopedCredential>,
     ) -> Self {
@@ -111,6 +112,11 @@ impl ControlPlanePgAdminClient {
             None => ControlPlanePgAdminDispatch::Plain(client),
         };
         Self { dispatch }
+    }
+
+    #[must_use]
+    pub fn from_bootstrap(bootstrap: &ControlPlaneAdminClientBootstrap) -> Self {
+        Self::new(bootstrap.client.clone(), bootstrap.credential.clone())
     }
 
     pub fn set_acting_set(

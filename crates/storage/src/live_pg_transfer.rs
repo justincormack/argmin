@@ -9,6 +9,7 @@ use crate::control_plane::{
     UnixControlPlaneClient,
 };
 use crate::control_plane_auth::ControlPlaneScopedCredential;
+use crate::control_plane_client_bootstrap::ControlPlaneAdminCredentialBinding;
 use crate::peering::PgMetadataTransferArtifact;
 use crate::storage_rpc_transport::StorageRpcClientEndpoint;
 use crate::{
@@ -37,7 +38,7 @@ pub struct LivePgMetadataTransferControlPlaneClient {
 }
 
 impl LivePgMetadataTransferControlPlaneClient {
-    pub fn new(
+    pub(crate) fn new(
         client: UnixControlPlaneClient,
         read_credential: Option<ControlPlaneScopedCredential>,
         admin_credential: Option<ControlPlaneScopedCredential>,
@@ -71,6 +72,14 @@ impl LivePgMetadataTransferControlPlaneClient {
             None => LivePgMetadataTransferAdminDispatch::Plain(client),
         };
         Ok(Self { read, admin })
+    }
+
+    pub fn with_admin_credential(
+        client: UnixControlPlaneClient,
+        read_credential: Option<ControlPlaneScopedCredential>,
+        admin: &ControlPlaneAdminCredentialBinding,
+    ) -> Result<Self, LivePgMetadataTransferError> {
+        Self::new(client, read_credential, admin.credential.clone())
     }
 
     fn pg_runtime_map_snapshot(

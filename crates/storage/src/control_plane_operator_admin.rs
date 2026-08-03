@@ -5,6 +5,9 @@ use crate::control_plane::{
     ControlPlaneAuthorityClockStatus, ControlPlaneError, UnixControlPlaneClient,
 };
 use crate::control_plane_auth::{ControlPlaneAuthPrincipal, ControlPlaneScopedCredential};
+use crate::control_plane_client_bootstrap::ControlPlaneAdminClientBootstrap;
+#[cfg(test)]
+use crate::control_plane_client_bootstrap::ControlPlaneAdminCredentialBinding;
 
 enum ControlPlaneRaftAdminDispatch {
     Plain(UnixControlPlaneClient),
@@ -21,7 +24,7 @@ pub struct ControlPlaneRaftAdminClient {
 }
 
 impl ControlPlaneRaftAdminClient {
-    pub fn new(
+    pub(crate) fn new(
         client: UnixControlPlaneClient,
         credential: Option<ControlPlaneScopedCredential>,
     ) -> Self {
@@ -32,6 +35,11 @@ impl ControlPlaneRaftAdminClient {
             None => ControlPlaneRaftAdminDispatch::Plain(client),
         };
         Self { dispatch }
+    }
+
+    #[must_use]
+    pub fn from_bootstrap(bootstrap: &ControlPlaneAdminClientBootstrap) -> Self {
+        Self::new(bootstrap.client.clone(), bootstrap.credential.clone())
     }
 
     pub fn transfer_leadership_to(
@@ -100,7 +108,7 @@ pub struct ControlPlaneAuthorityClockAdminClient {
 }
 
 impl ControlPlaneAuthorityClockAdminClient {
-    pub fn new(
+    pub(crate) fn new(
         client: UnixControlPlaneClient,
         credential: Option<ControlPlaneScopedCredential>,
     ) -> Result<Self, ControlPlaneOperatorAdminError> {
@@ -120,6 +128,12 @@ impl ControlPlaneAuthorityClockAdminClient {
         Ok(Self {
             client: AuthenticatedUnixControlPlaneClient::new(client, credential),
         })
+    }
+
+    pub fn from_bootstrap(
+        bootstrap: &ControlPlaneAdminClientBootstrap,
+    ) -> Result<Self, ControlPlaneOperatorAdminError> {
+        Self::new(bootstrap.client.clone(), bootstrap.credential.clone())
     }
 
     pub fn status(
@@ -414,6 +428,22 @@ mod tests {
         (credential, verifier)
     }
 
+    fn admin_credential_binding(cluster_id: Option<&str>) -> ControlPlaneAdminCredentialBinding {
+        let (instance_id, credentials) = match cluster_id {
+            Some(_) => (
+                Some("operator-1"),
+                vec![ControlPlaneAdminAuthCredentialInput {
+                    instance_id: "operator-1".to_owned(),
+                    credential_id: "operator-key".to_owned(),
+                    credential_version: 1,
+                    secret: b"operator-secret".to_vec(),
+                }],
+            ),
+            None => (None, Vec::new()),
+        };
+        ControlPlaneAdminCredentialBinding::new(cluster_id, instance_id, credentials).unwrap()
+    }
+
     fn exercise_raft_admin_dispatch(authenticated: bool) {
         let directory = test_util::tempdir();
         let socket_path = directory.path().join("control-plane.sock");
@@ -427,13 +457,10 @@ mod tests {
         let mut policy =
             ControlPlaneRpcServerPolicy::new(ControlPlaneRpcServerRole::Ordinary, 1, 1024 * 1024)
                 .unwrap();
-        let credential = if authenticated {
-            let (credential, verifier) = admin_auth("operator-cluster");
+        if authenticated {
+            let (_credential, verifier) = admin_auth("operator-cluster");
             policy = policy.with_auth_verifier(verifier);
-            Some(credential)
-        } else {
-            None
-        };
+        }
         let authority = Arc::new(Mutex::new(RaftAdminTestAuthority::default()));
         let server_authority = Arc::clone(&authority);
         let now_ms = crate::clock::current_time_millis();
@@ -448,8 +475,12 @@ mod tests {
                 .unwrap();
         });
 
-        let client =
-            ControlPlaneRaftAdminClient::new(UnixControlPlaneClient::new(&socket_path), credential);
+        let bootstrap = ControlPlaneAdminClientBootstrap::with_socket_paths(
+            [socket_path],
+            admin_credential_binding(authenticated.then_some("operator-cluster")),
+        )
+        .unwrap();
+        let client = ControlPlaneRaftAdminClient::from_bootstrap(&bootstrap);
         client.transfer_leadership_to(91).unwrap();
         assert_eq!(client.trigger_snapshot_and_purge().unwrap(), Some(47));
         client.trigger_election().unwrap();

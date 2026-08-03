@@ -29,6 +29,7 @@ pub mod clock;
 pub mod cluster;
 pub mod control_plane;
 pub mod control_plane_auth;
+mod control_plane_client_bootstrap;
 pub mod control_plane_command;
 pub(crate) mod control_plane_lease;
 mod control_plane_operator_admin;
@@ -97,6 +98,10 @@ pub use cluster::{
 pub use cluster::{
     MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
     MetadataCommandApplyTestContext, MetadataCommandApplyTestKind, TestDirectPutWrittenSegment,
+};
+pub use control_plane_client_bootstrap::{
+    control_plane_clock_recovery_socket_path, ControlPlaneAdminClientBootstrap,
+    ControlPlaneAdminClientBootstrapError, ControlPlaneAdminCredentialBinding,
 };
 pub use control_plane_operator_admin::{
     ControlPlaneAuthorityClockAdminClient, ControlPlaneAuthorityClockAdminStatus,
