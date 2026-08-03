@@ -4300,6 +4300,45 @@ impl ControlPlaneRaftAuthorityStatus {
     }
 }
 
+fn validate_static_initial_raft_membership(
+    policy: &ControlPlaneRaftPeerTransportPolicy,
+    status: &ControlPlaneRaftAuthorityStatus,
+) -> Result<(), ControlPlaneError> {
+    if status.applied() != status.committed() {
+        return Err(ControlPlaneError::static_topology_failure(format!(
+            "static control-plane identity cannot be established before applied state {:?} catches up to committed state {:?}",
+            status.applied(),
+            status.committed()
+        )));
+    }
+    let expected_voters = policy.peers().keys().copied().collect::<BTreeSet<_>>();
+    let effective_log_id = status.effective_membership_log_id().ok_or_else(|| {
+        ControlPlaneError::static_topology_failure(
+            "static control-plane identity cannot be established before effective Raft membership",
+        )
+    })?;
+    let applied_log_id = status.applied_membership_log_id().ok_or_else(|| {
+        ControlPlaneError::static_topology_failure(
+            "static control-plane identity cannot be established before applied Raft membership",
+        )
+    })?;
+    if status.effective_voters() != &expected_voters
+        || !status.effective_learners().is_empty()
+        || status.applied_voters() != &expected_voters
+        || !status.applied_learners().is_empty()
+        || applied_log_id != effective_log_id
+    {
+        return Err(ControlPlaneError::static_topology_failure(format!(
+            "static control-plane identity membership does not match configured topology; expected_voters={expected_voters:?} effective_voters={:?} effective_learners={:?} applied_voters={:?} applied_learners={:?} effective_log_id={effective_log_id} applied_log_id={applied_log_id}",
+            status.effective_voters(),
+            status.effective_learners(),
+            status.applied_voters(),
+            status.applied_learners(),
+        )));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct ExperimentalSingleNodeRaftNetworkFactory;
 
@@ -5369,6 +5408,80 @@ impl ControlPlaneRaftAuthority {
         &self,
         topology: &StaticInitialControlPlaneTopology,
     ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        self.validate_static_initial_topology_binding(topology)?;
+        self.submit_control_plane_command(topology.bootstrap_command())
+            .await
+    }
+
+    /// Wait until the applied Raft membership exactly matches the static peer
+    /// policy retained by this authority.
+    ///
+    /// The caller cannot supply a second policy or interpret raw Raft
+    /// membership state. This keeps the membership certified for static
+    /// identity publication bound to the authority that will publish it.
+    pub async fn wait_for_static_initial_membership(&self) -> Result<(), ControlPlaneError> {
+        let peer_policy = self.static_peer_policy.as_ref().ok_or_else(|| {
+            ControlPlaneError::static_topology_failure(
+                "static membership convergence requires a configured static peer policy",
+            )
+        })?;
+        loop {
+            let status = self.status().await?;
+            if validate_static_initial_raft_membership(peer_policy, &status).is_ok() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Establish or validate the certified initial topology retained by this
+    /// static authority.
+    ///
+    /// Membership convergence, topology validation, command submission, and
+    /// retry classification remain storage-owned. `allow_bootstrap` is false
+    /// after an outer static identity has already been durably published, so a
+    /// missing certified topology then fails closed rather than being replaced.
+    pub async fn establish_static_initial_topology(
+        &self,
+        topology: &StaticInitialControlPlaneTopology,
+        allow_bootstrap: bool,
+    ) -> Result<(), ControlPlaneError> {
+        self.validate_static_initial_topology_binding(topology)?;
+        self.wait_for_static_initial_membership().await?;
+        loop {
+            let snapshot = self.current_control_plane_snapshot().await?;
+            if topology
+                .validate_snapshot(&snapshot)
+                .map_err(|error| ControlPlaneError::static_topology_failure(error.to_string()))?
+            {
+                return Ok(());
+            }
+            if !allow_bootstrap {
+                return Err(ControlPlaneError::static_topology_failure(
+                    "established static control-plane state is missing its certified initial topology",
+                ));
+            }
+            if self.status().await?.linearized_authority_serving() {
+                match self.submit_static_initial_topology(topology).await {
+                    Ok(submitted) => match submitted.into_outcome() {
+                        ControlPlaneRaftCommandOutcome::Applied(_) => {}
+                        ControlPlaneRaftCommandOutcome::Rejected(
+                            ControlPlaneError::BootstrapRequiresEmptyState,
+                        ) => {}
+                        ControlPlaneRaftCommandOutcome::Rejected(error) => return Err(error),
+                    },
+                    Err(error) if error.is_control_plane_leader_routing_rejection() => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn validate_static_initial_topology_binding(
+        &self,
+        topology: &StaticInitialControlPlaneTopology,
+    ) -> Result<(), ControlPlaneError> {
         let peer_policy = self.static_peer_policy.as_ref().ok_or_else(|| {
             ControlPlaneError::static_topology_failure(
                 "static initial topology submission requires a configured static peer policy",
@@ -5384,8 +5497,7 @@ impl ControlPlaneRaftAuthority {
                 "static initial topology submission does not match the authority's configured topology",
             ));
         }
-        self.submit_control_plane_command(topology.bootstrap_command())
-            .await
+        Ok(())
     }
 
     /// Returns local serving status only after a ReadIndex round confirms that
@@ -5860,6 +5972,41 @@ impl ControlPlaneRaftAuthority {
             artifact: self.capture_durable_restart_artifact().await?,
             authority_instance: Arc::clone(&self.checkpoint_instance),
         })
+    }
+
+    /// Capture and durably publish a restart checkpoint only when it is
+    /// certified against this authority's retained static peer policy.
+    ///
+    /// `Ok(None)` means the captured effective membership or applied state has
+    /// not yet converged. The caller receives no checkpoint or policy details
+    /// and cannot publish the outer static identity until storage returns the
+    /// opaque publication proof.
+    pub async fn publish_static_identity_restart_checkpoint(
+        &self,
+    ) -> Result<Option<ControlPlaneRaftStaticIdentityCheckpointPublication>, ControlPlaneError>
+    {
+        let peer_policy = self.static_peer_policy.as_ref().ok_or_else(|| {
+            ControlPlaneError::static_topology_failure(
+                "static identity checkpoint publication requires a configured static peer policy",
+            )
+        })?;
+        let checkpoint = self.capture_durable_restart_checkpoint().await?;
+        match checkpoint.established_peer_policy_convergence(peer_policy)? {
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged => {
+                let committed_timestamp_high_water_ms =
+                    self.persist_durable_restart_checkpoint(checkpoint)?;
+                Ok(Some(ControlPlaneRaftStaticIdentityCheckpointPublication {
+                    authority_clock_binding: self.authority_clock_checkpoint_binding(),
+                    committed_timestamp_high_water_ms,
+                }))
+            }
+            ControlPlaneRaftEstablishedPeerPolicyConvergence::EffectiveMembershipPending {
+                ..
+            }
+            | ControlPlaneRaftEstablishedPeerPolicyConvergence::AppliedStatePending { .. } => {
+                Ok(None)
+            }
+        }
     }
 
     pub fn persist_durable_restart_checkpoint(
@@ -6901,8 +7048,35 @@ pub struct ControlPlaneRaftCapturedRestartCheckpoint {
     authority_instance: Arc<()>,
 }
 
+/// Opaque proof that this authority captured, certified, and durably published
+/// a restart checkpoint against its retained static peer policy.
+pub struct ControlPlaneRaftStaticIdentityCheckpointPublication {
+    authority_clock_binding: ControlPlaneAuthorityClockCheckpointBinding,
+    committed_timestamp_high_water_ms: Option<u64>,
+}
+
+impl ControlPlaneRaftStaticIdentityCheckpointPublication {
+    #[must_use]
+    pub fn authority_clock_binding(&self) -> ControlPlaneAuthorityClockCheckpointBinding {
+        self.authority_clock_binding
+    }
+
+    #[must_use]
+    pub fn committed_timestamp_high_water_ms(&self) -> Option<u64> {
+        self.committed_timestamp_high_water_ms
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftStaticIdentityCheckpointPublication {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRaftStaticIdentityCheckpointPublication")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlPlaneRaftEstablishedPeerPolicyConvergence {
+enum ControlPlaneRaftEstablishedPeerPolicyConvergence {
     Converged,
     EffectiveMembershipPending {
         applied: ControlPlaneRaftLogId,
@@ -6915,7 +7089,7 @@ pub enum ControlPlaneRaftEstablishedPeerPolicyConvergence {
 }
 
 impl ControlPlaneRaftCapturedRestartCheckpoint {
-    pub fn established_peer_policy_convergence(
+    fn established_peer_policy_convergence(
         &self,
         peer_policy: &ControlPlaneRaftPeerTransportPolicy,
     ) -> Result<ControlPlaneRaftEstablishedPeerPolicyConvergence, ControlPlaneError> {
@@ -6976,27 +7150,6 @@ impl ControlPlaneRaftCapturedRestartCheckpoint {
             )));
         }
         Ok(ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged)
-    }
-
-    pub fn validate_established_peer_policy(
-        &self,
-        peer_policy: &ControlPlaneRaftPeerTransportPolicy,
-    ) -> Result<(), ControlPlaneError> {
-        match self.established_peer_policy_convergence(peer_policy)? {
-            ControlPlaneRaftEstablishedPeerPolicyConvergence::Converged => Ok(()),
-            ControlPlaneRaftEstablishedPeerPolicyConvergence::EffectiveMembershipPending {
-                applied,
-                effective,
-            } => Err(raft_artifact_protocol_error(format!(
-                "captured OpenRaft restart checkpoint effective membership {effective} is not applied membership {applied}"
-            ))),
-            ControlPlaneRaftEstablishedPeerPolicyConvergence::AppliedStatePending {
-                applied,
-                committed,
-            } => Err(raft_artifact_protocol_error(format!(
-                "captured OpenRaft restart checkpoint applied position {applied:?} has not caught up to committed position {committed:?}"
-            ))),
-        }
     }
 
     #[cfg(test)]
@@ -19873,10 +20026,6 @@ mod tests {
                 committed: Some(raft_log_id(1, 1, 2)),
             }
         );
-        assert!(checkpoint
-            .validate_established_peer_policy(&policy)
-            .is_err());
-
         checkpoint.artifact.log_store.committed = Some(applied_entry.log_id);
         assert_eq!(
             checkpoint
@@ -20005,6 +20154,8 @@ mod tests {
     #[test]
     fn static_topology_submission_rejects_crossed_authority_before_log_append() {
         ControlPlaneRaftTypeConfig::run(async {
+            let directory = test_util::tempdir();
+            let artifact_path = directory.path().join("static-authority.state");
             let configured = static_initial_topology_for_submission_test("node-11");
             let crossed = static_initial_topology_for_submission_test("crossed-node-11");
             let cluster_name = "control-plane-raft-static-submission-binding-test";
@@ -20029,7 +20180,8 @@ mod tests {
                 log_store,
                 cluster_name,
                 peer_policy,
-            );
+            )
+            .with_durable_artifact_path(&artifact_path);
             authority
                 .initialize_membership(BTreeMap::from([(1, BasicNode::new("raft-node-1"))]))
                 .await
@@ -20048,6 +20200,61 @@ mod tests {
             .await;
 
             let before = authority.status().await.unwrap();
+            validate_static_initial_raft_membership(
+                authority
+                    .static_peer_policy
+                    .as_ref()
+                    .expect("static authority should retain its peer policy"),
+                &before,
+            )
+            .expect("applied membership should match the retained static policy");
+            authority
+                .wait_for_static_initial_membership()
+                .await
+                .expect("retained static membership should already be converged");
+
+            let mut applied_pending = before.clone();
+            applied_pending.applied = None;
+            let error = validate_static_initial_raft_membership(
+                authority.static_peer_policy.as_ref().unwrap(),
+                &applied_pending,
+            )
+            .expect_err("unapplied committed state must not certify static membership");
+            assert!(error.retained_diagnostic_contains("catches up to committed state"));
+
+            let mut no_effective_membership = before.clone();
+            no_effective_membership.effective_membership_log_id = None;
+            let error = validate_static_initial_raft_membership(
+                authority.static_peer_policy.as_ref().unwrap(),
+                &no_effective_membership,
+            )
+            .expect_err("missing effective membership must not certify static membership");
+            assert!(error.retained_diagnostic_contains("before effective Raft membership"));
+
+            let mut no_applied_membership = before.clone();
+            no_applied_membership.applied_membership_log_id = None;
+            let error = validate_static_initial_raft_membership(
+                authority.static_peer_policy.as_ref().unwrap(),
+                &no_applied_membership,
+            )
+            .expect_err("missing applied membership must not certify static membership");
+            assert!(error.retained_diagnostic_contains("before applied Raft membership"));
+
+            let mut mismatched_membership = before.clone();
+            mismatched_membership.effective_voters.insert(2);
+            mismatched_membership.effective_learners.insert(3);
+            mismatched_membership.applied_voters.insert(4);
+            mismatched_membership.applied_learners.insert(5);
+            mismatched_membership.applied_membership_log_id = Some(raft_log_id(2, 1, 99));
+            let error = validate_static_initial_raft_membership(
+                authority.static_peer_policy.as_ref().unwrap(),
+                &mismatched_membership,
+            )
+            .expect_err("any membership identity mismatch must fail closed");
+            assert!(
+                error.retained_diagnostic_contains("membership does not match configured topology")
+            );
+
             let error = authority
                 .submit_static_initial_topology(&crossed)
                 .await
@@ -20068,14 +20275,36 @@ mod tests {
             assert!(snapshot.pgs().next().is_none());
             assert!(snapshot.initial_topology().is_none());
 
-            let submitted = authority
-                .submit_static_initial_topology(&configured)
+            let error = authority
+                .establish_static_initial_topology(&configured, false)
                 .await
-                .unwrap();
-            assert!(matches!(
-                submitted.into_outcome(),
-                ControlPlaneRaftCommandOutcome::Applied(_)
+                .expect_err("published outer identity must forbid a missing topology");
+            assert!(error.retained_diagnostic_contains(
+                "established static control-plane state is missing its certified initial topology"
             ));
+            let after_rejection = authority.status().await.unwrap();
+            assert_eq!(after_rejection.last_log_id(), before.last_log_id());
+
+            authority
+                .establish_static_initial_topology(&configured, true)
+                .await
+                .expect("the bound authority should establish its retained topology");
+            let established = authority.current_control_plane_snapshot().await.unwrap();
+            assert!(configured.validate_snapshot(&established).unwrap());
+            let publication = authority
+                .publish_static_identity_restart_checkpoint()
+                .await
+                .expect("the authority should certify and publish its converged checkpoint")
+                .expect("a converged checkpoint should return an opaque publication proof");
+            assert_eq!(
+                publication.authority_clock_binding(),
+                authority.authority_clock_checkpoint_binding()
+            );
+            assert!(artifact_path.is_file());
+            assert_eq!(
+                format!("{publication:?}"),
+                "ControlPlaneRaftStaticIdentityCheckpointPublication { .. }"
+            );
             authority.shutdown().await.unwrap();
         });
     }

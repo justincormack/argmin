@@ -3027,6 +3027,17 @@ fail_with_matches \
     "Static initial topology certificates, certified bootstrap commands, and applied-certificate inspection must remain owned by storage" \
     "$argmin_static_initial_topology_representation_leaks"
 
+argmin_static_raft_membership_representation_leaks=$(
+    rg -n --color=never \
+        '\.(effective|applied)_(membership_log_id|voters|learners)\(|\bestablished_peer_policy_convergence\b|\bvalidate_established_peer_policy\b|\bControlPlaneRaftEstablishedPeerPolicyConvergence\b' \
+        crates/argmin-s3/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Static Raft membership convergence, checkpoint certification, and voter/learner/log interpretation must remain owned by storage" \
+    "$argmin_static_raft_membership_representation_leaks"
+
 static_initial_topology_opaque_surface_leaks=$(
     awk '
     /pub struct StaticInitialControlPlaneTopology[[:space:]]*\{/ {
@@ -3049,6 +3060,41 @@ static_initial_topology_opaque_surface_leaks=$(
 fail_with_matches \
     "The storage-owned static initial topology must not expose its retained certificate, nodes, or PG acting sets as public fields" \
     "$static_initial_topology_opaque_surface_leaks"
+
+static_identity_checkpoint_publication_surface_leaks=$(
+    awk '
+    /#\[derive\(/ {
+        derive = $0
+        next
+    }
+    /pub struct ControlPlaneRaftStaticIdentityCheckpointPublication[[:space:]]*\{/ {
+        if (derive ~ /Debug|PartialEq|Eq/) {
+            print FILENAME ":" FNR ":" derive
+        }
+        in_publication = 1
+        depth = 0
+    }
+    in_publication {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_publication = 0
+        }
+    }
+    {
+        if ($0 !~ /^[[:space:]]*$/ && $0 !~ /^#\[derive\(/) {
+            derive = ""
+        }
+    }
+    ' crates/storage/src/control_plane_raft.rs
+)
+fail_with_matches \
+    "Static identity checkpoint publication proofs must keep certification state opaque and use a redacted owner-defined Debug implementation" \
+    "$static_identity_checkpoint_publication_surface_leaks"
 
 multipart_upload_id_authority_derived_equality=$(
     awk '

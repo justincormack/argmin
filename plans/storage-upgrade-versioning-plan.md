@@ -1385,6 +1385,28 @@ transport-bootstrap slice; the authority clock and Raft authority implementation
 with the process-hosted control-plane authority slice. Residual static control-plane bootstrap and
 administration likewise remain pending parts of item 4.
 
+The thirtieth bounded slice contains certified static Raft membership convergence and initial
+topology establishment. `ControlPlaneRaftAuthority` now validates live effective and applied
+membership against the exact static peer policy retained when that authority was constructed; the
+process cannot supply an independent policy, inspect raw voter/learner sets, or decide when the
+membership is safe to certify. Static outer-identity publication likewise asks the authority to
+capture, validate, and durably publish its checkpoint against that same retained policy. The
+process receives only an opaque successful-publication proof containing the logical clock-sidecar
+binding; pending effective membership or apply convergence exposes no checkpoint or policy state.
+The topology authority operation binds the opaque initial topology to its retained certificate,
+validates established state, enforces the published-identity fail-closed gate, submits the
+certified bootstrap command only from a serving authority, and owns the exact
+leader/concurrent-bootstrap retry classification. Owner-local regressions pin applied versus
+committed convergence, missing effective and applied membership, complete voter/learner/log
+identity matching, crossed-topology rejection before log append, bootstrap prohibition after an
+outer identity is published, successful establishment, and certified checkpoint publication
+through the bound authority. The process-level regression now covers only opaque checkpoint-proof,
+clock-sidecar, and outer-identity publication composition. The environment-only uncertified
+initial-map path, the older process-hosted
+`ExperimentalRaftControlPlane` bootstrap wrapper, recovery endpoint and credential/transport
+assembly, transport bootstrap, and the process-hosted authority implementation remain pending
+parts of item 4.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1667,6 +1689,10 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     assertions, while impossible physical-state tests are owner-local.
 12. **In progress:** deterministic static storage-placement interpretation and certified initial
     topology/bootstrap assembly are storage-owned without transferring outer manifest ownership.
+    Certified live Raft membership convergence and initial-topology establishment are now bound to
+    the authority's retained static peer policy and topology certificate; the process neither
+    supplies a second policy nor interprets membership/status or captured checkpoints to decide
+    bootstrap and outer-identity publication safety.
     The automatic live PG metadata-transfer state machine, including route/proof inspection,
     runtime-map reconstruction, artifact movement, and retry classification, is contained behind
     an opaque storage-owned administration operation. Manual operator PG acting-set, fence,
@@ -1674,9 +1700,10 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     also storage-owned and accept only logical integers or opaque inputs from the process.
     Authority-clock and Raft operator commands are now contained behind separate opaque
     storage-owned capabilities, with storage-rendered status and redacted retained diagnostics. The
-    remaining work is to contain residual static control-plane bootstrap and administration,
-    recovery endpoint and credential/transport assembly, transport bootstrap, and the
-    process-hosted control-plane authority implementation.
+    remaining work is to contain the environment-only uncertified initial-map path, the older
+    process-hosted bootstrap wrapper and residual static administration, recovery endpoint and
+    credential/transport assembly, transport bootstrap, and the process-hosted control-plane
+    authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move
