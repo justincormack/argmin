@@ -2263,6 +2263,10 @@ print_slowdown_summary() {
 
 cleanup_server() {
     local status=$?
+    # INT/TERM cleanup exits through the EXIT trap unless all cleanup traps are
+    # disarmed first. A second pass can block on diagnostics after the server
+    # processes have already stopped.
+    trap - EXIT INT TERM
     if [[ -n "${metrics_sampler_pid:-}" ]] && kill -0 "$metrics_sampler_pid" 2>/dev/null; then
         kill "$metrics_sampler_pid" 2>/dev/null || true
         wait "$metrics_sampler_pid" 2>/dev/null || true
@@ -2334,7 +2338,9 @@ cleanup_server() {
     print_final_result "$status"
     exit "$status"
 }
-trap cleanup_server EXIT INT TERM
+trap cleanup_server EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ -n "$server_binary" ]]; then
     server_cmd=("$server_binary")
