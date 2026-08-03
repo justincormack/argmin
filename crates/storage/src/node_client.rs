@@ -13,6 +13,7 @@ use super::BucketPgId;
 use super::ObjectMetadataPgId;
 use super::ObjectMetadataScanPgId;
 use super::PreparedRetainedStreamUploadAbort;
+use crate::control_plane::PgMetadataReadRoute;
 use crate::error::{BucketSnapshotLoadError, MetadataError, ObjectPgActionError, StoreError};
 use crate::metadata_command::{
     AbortMultipartUploadCommand, AdvanceMultipartCompletionBarrierCommand, BucketPropertyMutation,
@@ -51,8 +52,8 @@ use crate::storage_rpc::{
     decode_bucket_write_reservation_record_response,
     decode_cluster_map_history_reference_summary_response,
     decode_create_bucket_command_build_response, decode_direct_put_command_build_response,
-    decode_direct_put_commit_snapshot_response, decode_lifecycle_sweep_buckets_response,
-    decode_lifecycle_sweep_claim_optional_record_response,
+    decode_direct_put_commit_snapshot_response, decode_historical_shard_read_response,
+    decode_lifecycle_sweep_buckets_response, decode_lifecycle_sweep_claim_optional_record_response,
     decode_lifecycle_sweep_claim_record_response, decode_lifecycle_sweep_roots_response,
     decode_list_multipart_uploads_response, decode_list_object_versions_response,
     decode_list_objects_response, decode_metadata_command_acceptance_response,
@@ -115,7 +116,8 @@ use crate::storage_rpc::{
     encode_create_stream_upload_command_build_request,
     encode_delete_current_object_command_build_request,
     encode_delete_specific_object_command_build_request, encode_direct_put_command_build_request,
-    encode_direct_put_commit_snapshot_request, encode_insert_delete_marker_command_build_request,
+    encode_direct_put_commit_snapshot_request, encode_historical_shard_read_request,
+    encode_insert_delete_marker_command_build_request,
     encode_lifecycle_sweep_claim_acquire_request, encode_lifecycle_sweep_claim_error_request,
     encode_lifecycle_sweep_claim_heartbeat_request, encode_lifecycle_sweep_claim_record_request,
     encode_lifecycle_sweep_roots_request, encode_list_multipart_uploads_request,
@@ -192,11 +194,12 @@ use crate::storage_rpc::{
     StorageRpcDeleteSpecificObjectCommandBuildRequest, StorageRpcDirectPutCommandBuildOutcome,
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommitSnapshotRequest,
     StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame,
-    StorageRpcInsertDeleteMarkerCommandBuildRequest, StorageRpcInsertDeleteMarkerStalePayload,
-    StorageRpcLifecycleSweepClaimAcquireRequest, StorageRpcLifecycleSweepClaimErrorRequest,
-    StorageRpcLifecycleSweepClaimHeartbeatRequest, StorageRpcLifecycleSweepClaimRecordRequest,
-    StorageRpcLifecycleSweepRootsRequest, StorageRpcListMultipartUploadsRequest,
-    StorageRpcListObjectVersionsRequest, StorageRpcListObjectsRequest, StorageRpcMessageKind,
+    StorageRpcHistoricalShardReadRequest, StorageRpcInsertDeleteMarkerCommandBuildRequest,
+    StorageRpcInsertDeleteMarkerStalePayload, StorageRpcLifecycleSweepClaimAcquireRequest,
+    StorageRpcLifecycleSweepClaimErrorRequest, StorageRpcLifecycleSweepClaimHeartbeatRequest,
+    StorageRpcLifecycleSweepClaimRecordRequest, StorageRpcLifecycleSweepRootsRequest,
+    StorageRpcListMultipartUploadsRequest, StorageRpcListObjectVersionsRequest,
+    StorageRpcListObjectsRequest, StorageRpcMessageKind,
     StorageRpcMetadataCommandAcceptanceOutcome, StorageRpcMetadataCommandAppliedHashesOutcome,
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandCheckpointCandidatesRequest,
     StorageRpcMetadataCommandLogHashRangeRequest, StorageRpcMetadataCommandMatchingAppliedRequest,
@@ -1294,6 +1297,54 @@ fn bucket_property_command_matches_mutation(
 pub(in crate::node_runtime) struct LocalStorageNodeClient {
     node_id: NodeId,
     storage_node: Arc<SharedStorageNode>,
+}
+
+/// Storage-local authority carried by a metadata read route.
+///
+/// Active reads rely on the current primary route selected by the cluster
+/// map. Peering reads additionally bind every local store access to the exact
+/// replica proof certified by that map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MetadataReadAuthorization {
+    pg_id: PgId,
+    kind: MetadataReadAuthorizationKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataReadAuthorizationKind {
+    Active,
+    Peering(PgMetadataReadRoute),
+}
+
+impl MetadataReadAuthorization {
+    pub(crate) const fn active(pg_id: PgId) -> Self {
+        Self {
+            pg_id,
+            kind: MetadataReadAuthorizationKind::Active,
+        }
+    }
+
+    pub(crate) const fn peering(pg_id: PgId, read_route: PgMetadataReadRoute) -> Self {
+        Self {
+            pg_id,
+            kind: MetadataReadAuthorizationKind::Peering(read_route),
+        }
+    }
+
+    pub(crate) const fn pg_id(self) -> PgId {
+        self.pg_id
+    }
+
+    pub(crate) const fn peering_route(self) -> Option<PgMetadataReadRoute> {
+        match self.kind {
+            MetadataReadAuthorizationKind::Active => None,
+            MetadataReadAuthorizationKind::Peering(read_route) => Some(read_route),
+        }
+    }
+
+    pub(crate) const fn is_active(self) -> bool {
+        matches!(self.kind, MetadataReadAuthorizationKind::Active)
+    }
 }
 
 #[allow(dead_code)]

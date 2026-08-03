@@ -1,6 +1,188 @@
 use super::*;
 use crate::node_client::{ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute};
-use crate::StorageClusterRouteHandle;
+use crate::{BucketSnapshotLoadError, ObjectPgActionError, StorageClusterRouteHandle};
+
+#[test]
+fn embedded_peering_metadata_read_rechecks_certified_proof_under_pg_lock() {
+    let tmp = test_util::tempdir();
+    let node_ids = trace_node_ids();
+    let certified_node = node_ids[0];
+    let pg_id = PgId::new(0);
+    let mut map = LocalClusterMap::open(
+        tmp.path(),
+        &node_ids,
+        &[pg_id.get()],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let proof = map
+        .node(certified_node)
+        .unwrap()
+        .test_node()
+        .pg_heartbeat_observation(certified_node, pg_id, PgState::Peering)
+        .unwrap()
+        .metadata_proof;
+    let peering_epoch = ClusterEpoch::new(2).unwrap();
+    map.epoch = peering_epoch;
+    map.pg_routes.insert(
+        pg_id,
+        LocalPgRoute {
+            cluster_epoch: peering_epoch,
+            pg_id,
+            primary_node_id: certified_node,
+            acting_set: Arc::from(node_ids),
+            state: PgState::Peering,
+            metadata_read_route: Some(crate::control_plane::PgMetadataReadRoute::new(
+                certified_node,
+                proof,
+            )),
+        },
+    );
+    let map = Arc::new(map);
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("embedded-peering-proof-bucket");
+    let key = crate::tests::object_key("embedded-peering-proof-key");
+
+    assert!(cluster
+        .load_existing_live_object(&bucket, &key)
+        .unwrap()
+        .is_none());
+
+    {
+        let pg = map
+            .node(certified_node)
+            .unwrap()
+            .test_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        pg.test_replace_pending_metadata_command_slot(
+            &create_bucket_metadata_command(pg_id, 1, bucket.clone()),
+            Some(&bucket),
+        )
+        .unwrap();
+    }
+    assert!(matches!(
+        cluster
+            .load_existing_live_object(&bucket, &key)
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::StaleMetadataReadProof {
+            node_id: 0,
+            pg_id: 0,
+        })
+    ));
+    map.node(certified_node)
+        .unwrap()
+        .test_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .test_clear_pending_metadata_command_slot()
+        .unwrap();
+
+    {
+        let pg = map
+            .node(certified_node)
+            .unwrap()
+            .test_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        crate::PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &crate::CanonicalUserId::from_principal("owner"),
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+
+    assert!(matches!(
+        cluster
+            .load_existing_live_object(&bucket, &key)
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::StaleMetadataReadProof {
+            node_id: 0,
+            pg_id: 0,
+        })
+    ));
+}
+
+#[test]
+fn embedded_peering_metadata_read_authorization_rejects_equal_proof_from_another_pg() {
+    let tmp = test_util::tempdir();
+    let node_ids = trace_node_ids();
+    let certified_node = node_ids[0];
+    let first_pg_id = PgId::new(0);
+    let second_pg_id = PgId::new(1);
+    let mut map = LocalClusterMap::open(
+        tmp.path(),
+        &node_ids,
+        &[first_pg_id.get(), second_pg_id.get()],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let first_proof = map
+        .node(certified_node)
+        .unwrap()
+        .test_node()
+        .pg_heartbeat_observation(certified_node, first_pg_id, PgState::Peering)
+        .unwrap()
+        .metadata_proof;
+    let second_proof = map
+        .node(certified_node)
+        .unwrap()
+        .test_node()
+        .pg_heartbeat_observation(certified_node, second_pg_id, PgState::Peering)
+        .unwrap()
+        .metadata_proof;
+    assert_eq!(
+        first_proof, second_proof,
+        "empty replicas should exercise equal-proof authorization substitution"
+    );
+
+    let peering_epoch = ClusterEpoch::new(2).unwrap();
+    map.epoch = peering_epoch;
+    for (pg_id, proof) in [(first_pg_id, first_proof), (second_pg_id, second_proof)] {
+        map.pg_routes.insert(
+            pg_id,
+            LocalPgRoute {
+                cluster_epoch: peering_epoch,
+                pg_id,
+                primary_node_id: certified_node,
+                acting_set: Arc::from(node_ids),
+                state: PgState::Peering,
+                metadata_read_route: Some(crate::control_plane::PgMetadataReadRoute::new(
+                    certified_node,
+                    proof,
+                )),
+            },
+        );
+    }
+
+    let first_node = map
+        .metadata_pg_read_node(peering_epoch, first_pg_id)
+        .unwrap();
+    let second_node = map
+        .metadata_pg_read_node(peering_epoch, second_pg_id)
+        .unwrap();
+    assert_eq!(first_node.node_id(), second_node.node_id());
+    let route = second_node
+        .bucket_metadata_client()
+        .open_bucket_metadata_read_scan_route(
+            peering_epoch,
+            BucketPgId::new_for_test(second_pg_id),
+            first_node.authorization(),
+        )
+        .unwrap();
+    assert!(matches!(
+        route.list_buckets("owner").unwrap_err(),
+        BucketSnapshotLoadError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "use metadata read authorization for PG",
+        })
+    ));
+}
 
 struct PayloadLeaseUnavailableClient {
     inner: Arc<dyn ObjectPayloadLeaseNodeClient>,

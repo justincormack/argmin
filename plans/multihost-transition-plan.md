@@ -7547,6 +7547,11 @@ PG peering reconstruction design:
 - Extended the point-read coverage to bucket metadata snapshots. Single-bucket
   snapshots and two-bucket snapshot pairs now fail closed with `PgNotActive`
   when any participating bucket metadata PG is `Peering`.
+- The fail-closed read rule above recorded the pre-degraded-read boundary and
+  is superseded by the later certified metadata-read route described in the
+  current implementation status. Peering still fails closed unless the control
+  plane certifies one clean replica whose actual proof satisfies the committed
+  recovery floor and which has no pending command.
 
 Shard repair design:
 
@@ -8798,7 +8803,9 @@ Metadata PG migration and backfill design notes:
   object data or a partial listing. Version-list pagination, including
   delimiter/common-prefix continuation, now also has retained-route coverage
   across a runtime-map epoch change, matching the object-list pagination
-  coverage. Object tag updates now
+  coverage. This fail-closed read behavior was the safe boundary before the
+  exact-proof Peering metadata-read certificate; it remains the required result
+  whenever that certificate is absent or invalid. Object tag updates now
   have the same local pre-metadata-apply
   gate over the shared `PutObjectMetadata` command path: PutObjectTagging pauses
   before the object-PG metadata command is applied, crosses to a newer
@@ -12510,13 +12517,31 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   store, and 21-223 ms for control-plane RPC operations. The run completed 41
   full GET/HEAD/List rounds over 12 one-MiB objects with no checkpoint, WAL,
   response-write, or authentication error increase.
-- Closing the complete quantitative gate still requires composing repeated
-  real storage-host outage/rejoin windows and the certified degraded-read
-  assertions into the same measured interval. Storage RPC
-  connection/admission pressure needs a bounded runtime counter before it can
-  become a quantitative assertion rather than a log heuristic. The existing
-  functional degraded-read smoke remains the correctness gate while those
-  workload and observability additions proceed.
+- The multihost gate now provisions one independently authenticated frontend
+  on every host instead of relying on a sole frontend on the first host. The
+  seed workload distributes PUTs across all three frontends and verifies the
+  complete object set with GET, HEAD, and List through every frontend. Each
+  failover cycle transfers leadership to the selected host, simultaneously
+  stops that host's frontend, storage node, and authority units, recovers the
+  authority clock through a surviving host, and verifies retained reads and
+  listing through both surviving frontends. Rejoin requires the authority and
+  storage listener to return, a strictly newer fully serving runtime-map epoch,
+  the frontend listener to return, and a new PUT through that frontend to be
+  visible through all three. Quantitative runs take their counter baseline
+  before these outage windows, so outage, degraded reads, catch-up, and rejoin
+  I/O are included in the minimum sustained interval. This is an
+  SSH-supervised whole Argmin service outage on a still-manageable host; power,
+  kernel, switch-port, and complete network-partition testing remain distinct
+  gates and become easier to automate with a fourth supervision/client host.
+- The first reference-host functional pass of that composed gate completed on
+  three persistent-storage hosts with 116 PGs, 256 retained-route advances,
+  eight one-MiB objects, and three outage/rejoin cycles. Every host was stopped
+  in turn and both surviving frontends completed GET, HEAD, and List before
+  rejoin; the final map served all 116 PGs at epoch 510. Closing the complete
+  quantitative gate still requires running the same composed interval with the
+  sustained release thresholds enabled. Storage RPC connection/admission
+  pressure also needs a bounded runtime counter before it can become a
+  quantitative assertion rather than a log heuristic.
 - Frontend process availability is now independent of full-cluster PG
   convergence. Dynamic startup constructs route handles, starts refresh and
   background workers, and binds the S3 listener from the current committed map
@@ -12525,6 +12550,43 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   degraded-read capability described above. This preserves healthy-PG and
   reconstructible-read availability while recovery proceeds and removes the
   former indefinite all-PG startup wait.
+- Peering metadata reads now have a control-plane-certified serving route that
+  is independent of primary identity. The authority selects a healthy Peering
+  replica only when its complete metadata proof satisfies the committed floor
+  under the existing provenance-aware Peering recovery rules and it reports no
+  pending command. This permits a clean survivor to expose acknowledged
+  metadata commands newer than a stale control-plane heartbeat floor without
+  weakening imported-transfer validation. The certificate's node and actual
+  proof are carried in the runtime map and durable storage-node route
+  configuration. Storage rechecks the current certificate, exact local proof,
+  and empty pending slot under the same PG lock as each read. Bucket and object
+  point reads, bucket/object/version/multipart listings, multipart
+  classification, and ListParts may use this route. All metadata mutations
+  continue to require the Active primary. Composed Unix coverage proves GET,
+  ListBuckets, object List, ListParts, and payload reconstruction while Peering,
+  plus rejection of a generation reservation through the same frontend map.
+  Direct embedded coverage additionally proves that pending-command insertion
+  and replica-proof advancement after map publication invalidate the certified
+  route before the local SQLite read, and that an opaque PG-bound authorization
+  cannot be substituted onto another PG even when both replicas have identical
+  metadata proofs.
+- The whole-host multihost outage gate must exercise this contract without
+  selecting a convenient non-primary failure. Each cycle stops the chosen
+  host's frontend, storage node, and authority together; surviving frontends
+  must continue user-visible GET, HEAD, and List whenever the object remains EC
+  reconstructible, regardless of which host held metadata-primary authority.
+- Retained payload reconstruction likewise does not contact the unavailable
+  historical data-PG primary for its acknowledgement catalogue. The exact
+  historical shard owner returns one authenticated, self-validating
+  payload/size/checksum response; the frontend validates expected shard size,
+  reconstructs from any `k` valid survivors, and verifies the complete segment
+  checksum. A checksum mismatch triggers a bounded single-shard-exclusion pass
+  so one corrupt survivor remains recoverable and is identified for repair;
+  optional repair-publication failure cannot turn checksum-validated bytes into
+  a failed user read. The composed Unix regression deliberately makes the
+  stopped node the historical data-PG primary, proves reconstruction through
+  the other owners, and proves that transport unavailability alone does not
+  enqueue a repair row.
 - Authenticated storage RPC connection reuse now reserves stateful capacity at
   the server rather than relying on independent client pool limits. At most
   `max_connections - 1` ordinary connections may remain retained; a response

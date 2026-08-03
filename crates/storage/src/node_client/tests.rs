@@ -52,6 +52,7 @@ fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         }],
         pending_metadata_command_recoveries: Vec::new(),
@@ -649,10 +650,8 @@ fn local_retained_placed_shard_route_is_bound_to_exact_placement() {
         .open_retained_placed_shard_route(location, &bound_key)
         .unwrap();
     assert_eq!(
-        route
-            .read_placed_shard_for_historical_inspection(bound_ack)
-            .unwrap(),
-        bound_data
+        route.read_placed_shard_for_historical_inspection().unwrap(),
+        (bound_data.to_vec(), bound_ack)
     );
     route.delete_placed_shard_for_historical_cleanup().unwrap();
     assert!(storage_node.read_shard_file(0, &bound_key).is_err());
@@ -1839,6 +1838,7 @@ fn local_object_listing_metadata_route_binds_scan_pg() {
             .open_object_listing_metadata_route(
                 ClusterEpoch::INITIAL,
                 ObjectMetadataScanPgId::new_for_test(PgId::new(1)),
+                MetadataReadAuthorization::active(PgId::new(1)),
             )
             .err()
             .expect("unavailable object-listing PG must fail before storage"),
@@ -1849,6 +1849,7 @@ fn local_object_listing_metadata_route_binds_scan_pg() {
         .open_object_listing_metadata_route(
             ClusterEpoch::INITIAL,
             ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+            MetadataReadAuthorization::active(PgId::new(0)),
         )
         .unwrap();
     assert!(route
@@ -1953,6 +1954,7 @@ fn local_object_listing_metadata_route_rejects_foreign_scan_pg_rows() {
         .open_object_listing_metadata_route(
             ClusterEpoch::INITIAL,
             ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+            MetadataReadAuthorization::active(PgId::new(0)),
         )
         .unwrap();
     let Err(object_error) = route.list_objects_page(&ListObjectsReq {
@@ -2012,6 +2014,7 @@ fn unix_object_listing_metadata_route_rejects_foreign_epoch_before_rpc() {
             .open_object_listing_metadata_route(
                 future_epoch,
                 ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+                MetadataReadAuthorization::active(PgId::new(0)),
             )
             .err()
             .expect("future object-listing route must fail before RPC"),
@@ -2042,7 +2045,13 @@ fn local_object_read_metadata_route_binds_exact_object_subject() {
 
     assert!(matches!(
         client
-            .open_object_read_metadata_route(ClusterEpoch::INITIAL, wrong_pg, &bucket, &key,)
+            .open_object_read_metadata_route(
+                ClusterEpoch::INITIAL,
+                wrong_pg,
+                &bucket,
+                &key,
+                MetadataReadAuthorization::active(wrong_pg.pg_id()),
+            )
             .err()
             .expect("crossed object-read PG must fail before storage"),
         ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
@@ -2051,7 +2060,13 @@ fn local_object_read_metadata_route_binds_exact_object_subject() {
     ));
 
     let route = client
-        .open_object_read_metadata_route(ClusterEpoch::INITIAL, correct_pg, &bucket, &key)
+        .open_object_read_metadata_route(
+            ClusterEpoch::INITIAL,
+            correct_pg,
+            &bucket,
+            &key,
+            MetadataReadAuthorization::active(correct_pg.pg_id()),
+        )
         .unwrap();
     assert!(matches!(
         route.load_object_read_auth_subject(None).unwrap_err(),
@@ -2989,6 +3004,7 @@ fn unix_object_read_metadata_route_rejects_foreign_epoch_before_rpc() {
                 ObjectMetadataPgId::new_for_test(PgId::new(0)),
                 &bucket,
                 &key,
+                MetadataReadAuthorization::active(PgId::new(0)),
             )
             .err()
             .expect("future object-read route must fail before RPC"),

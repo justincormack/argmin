@@ -222,6 +222,8 @@ const STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN: usize =
     STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN: usize =
     STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN + STORAGE_RPC_WRITE_ACK_LEN;
+const STORAGE_RPC_MAX_HISTORICAL_SHARD_READ_PAYLOAD_LEN: usize =
+    STORAGE_RPC_SHARD_LOCATION_LEN + STORAGE_RPC_SHARD_KEY_FIELD_LEN;
 const STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN + 8 + 8;
 const STORAGE_RPC_MAX_READ_HANDLE_ACQUIRE_PAYLOAD_LEN: usize = 4
@@ -3249,6 +3251,12 @@ pub(crate) struct StorageRpcShardReadRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcHistoricalShardReadRequest {
+    pub(crate) location: StorageRpcShardLocation,
+    pub(crate) shard_key: ShardKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcShardReadRangeRequest {
     pub(crate) location: StorageRpcShardLocation,
     pub(crate) shard_key: ShardKey,
@@ -3762,8 +3770,9 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectPayloadLeaseControl => {
             STORAGE_RPC_MAX_OBJECT_PAYLOAD_LEASE_CONTROL_REQUEST_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::ShardRead | StorageRpcMessageKind::ShardHistoricalRead => {
-            STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN
+        StorageRpcMessageKind::ShardRead => STORAGE_RPC_MAX_SHARD_READ_PAYLOAD_LEN,
+        StorageRpcMessageKind::ShardHistoricalRead => {
+            STORAGE_RPC_MAX_HISTORICAL_SHARD_READ_PAYLOAD_LEN
         }
         StorageRpcMessageKind::ShardReadRange => STORAGE_RPC_MAX_SHARD_READ_RANGE_PAYLOAD_LEN,
         StorageRpcMessageKind::ShardDelete => STORAGE_RPC_MAX_SHARD_DELETE_PAYLOAD_LEN,
@@ -10513,6 +10522,30 @@ pub(crate) fn decode_shard_read_request(
     })
 }
 
+pub(crate) fn encode_historical_shard_read_request(
+    request: &StorageRpcHistoricalShardReadRequest,
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    validate_shard_location_matches_key(&request.location, &request.shard_key)?;
+    let mut out = Vec::new();
+    put_shard_location(&mut out, request.location);
+    put_bytes(&mut out, request.shard_key.as_bytes());
+    Ok(out)
+}
+
+pub(crate) fn decode_historical_shard_read_request(
+    bytes: &[u8],
+) -> Result<StorageRpcHistoricalShardReadRequest, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let location = decoder.read_shard_location()?;
+    let shard_key = decoder.read_shard_key()?;
+    decoder.finish()?;
+    validate_shard_location_matches_key(&location, &shard_key)?;
+    Ok(StorageRpcHistoricalShardReadRequest {
+        location,
+        shard_key,
+    })
+}
+
 pub(crate) fn encode_shard_read_range_request(
     request: &StorageRpcShardReadRangeRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -10575,6 +10608,34 @@ pub(crate) fn decode_shard_read_response(
     decoder.finish()?;
     validate_shard_payload_matches_ack(&payload, expected_ack)?;
     Ok(payload)
+}
+
+pub(crate) fn encode_historical_shard_read_response(
+    payload: &[u8],
+) -> Result<Vec<u8>, StorageRpcPayloadError> {
+    let ack = WriteAck {
+        stored_size: payload.len() as u64,
+        crc64: checksum::crc64::checksum(payload),
+    };
+    let mut out = Vec::new();
+    put_u64(&mut out, ack.stored_size);
+    put_u64(&mut out, ack.crc64);
+    put_bytes(&mut out, payload);
+    Ok(out)
+}
+
+pub(crate) fn decode_historical_shard_read_response(
+    bytes: &[u8],
+) -> Result<(Vec<u8>, WriteAck), StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let ack = WriteAck {
+        stored_size: decoder.read_u64()?,
+        crc64: decoder.read_u64()?,
+    };
+    let payload = decoder.read_bytes()?.to_vec();
+    decoder.finish()?;
+    validate_shard_payload_matches_ack(&payload, ack)?;
+    Ok((payload, ack))
 }
 
 pub(crate) fn encode_shard_read_range_response(payload: &[u8]) -> Vec<u8> {
@@ -19913,6 +19974,33 @@ mod tests {
                     crc64: expected_ack.crc64 ^ 1,
                 },
             ),
+            Err(StorageRpcPayloadError::ShardWriteChecksumMismatch)
+        ));
+    }
+
+    #[test]
+    fn historical_shard_read_response_carries_self_validating_ack() {
+        let payload = b"historical payload";
+        let request = StorageRpcHistoricalShardReadRequest {
+            location: test_shard_location(4),
+            shard_key: test_shard_key(4),
+        };
+        let request_bytes = encode_historical_shard_read_request(&request).unwrap();
+        assert_eq!(
+            decode_historical_shard_read_request(&request_bytes).unwrap(),
+            request
+        );
+
+        let response = encode_historical_shard_read_response(payload).unwrap();
+        let (decoded, ack) = decode_historical_shard_read_response(&response).unwrap();
+        assert_eq!(decoded, payload);
+        assert_eq!(ack.stored_size, payload.len() as u64);
+        assert_eq!(ack.crc64, checksum::crc64::checksum(payload));
+
+        let mut corrupted = response;
+        *corrupted.last_mut().unwrap() ^= 0x80;
+        assert!(matches!(
+            decode_historical_shard_read_response(&corrupted),
             Err(StorageRpcPayloadError::ShardWriteChecksumMismatch)
         ));
     }

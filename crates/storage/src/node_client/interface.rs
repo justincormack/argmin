@@ -22,6 +22,14 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         bucket: &BucketName,
     ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError>;
 
+    fn open_bucket_metadata_read_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError>;
+
     fn open_bucket_metadata_route_pair(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -42,6 +50,13 @@ pub(crate) trait BucketMetadataNodeClient: Send + Sync {
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError>;
+
+    fn open_bucket_metadata_read_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError>;
 }
 
@@ -445,6 +460,7 @@ pub(crate) trait ObjectListingMetadataNodeClient: Send + Sync {
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataScanPgId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn ObjectListingMetadataRoute + '_>, BucketSnapshotLoadError>;
 }
 
@@ -831,7 +847,25 @@ pub(crate) trait ObjectReadMetadataNodeClient: Send + Sync {
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+        authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn ObjectReadMetadataRoute + '_>, ObjectPgActionError>;
+
+    fn open_multipart_upload_read_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn MultipartUploadLookupMetadataRoute + '_>, ObjectPgActionError>;
+
+    fn open_authorized_multipart_upload_read_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn AuthorizedMultipartUploadMetadataRoute + '_>, ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectReadMetadataRoute: Send {
@@ -1193,8 +1227,7 @@ pub(crate) trait RetainedPlacedShardNodeClient: Send + Sync {
 pub(crate) trait RetainedPlacedShardRoute: Send {
     fn read_placed_shard_for_historical_inspection(
         &self,
-        expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError>;
+    ) -> Result<(Vec<u8>, WriteAck), StoreError>;
 
     fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError>;
 }

@@ -80,10 +80,12 @@ struct LocalShardScavengerObjectScanRoute {
 
 struct LocalObjectReadMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
+    node_id: NodeId,
     _route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
     bucket: BucketName,
     key: ObjectKey,
+    authorization: MetadataReadAuthorization,
 }
 
 struct LocalObjectGenerationMetadataRoute {
@@ -140,6 +142,7 @@ struct LocalMultipartUploadLookupMetadataRoute<'a> {
     pg_id: ObjectMetadataPgId,
     bucket: BucketName,
     key: ObjectKey,
+    authorization: MetadataReadAuthorization,
 }
 
 struct LocalAuthorizedMultipartUploadMetadataRoute<'a> {
@@ -147,6 +150,7 @@ struct LocalAuthorizedMultipartUploadMetadataRoute<'a> {
     _route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataPgId,
     authorized_upload: AuthorizedMultipartUploadRecord,
+    authorization: MetadataReadAuthorization,
 }
 
 struct LocalMultipartCompletionMutationMetadataRoute<'a> {
@@ -214,8 +218,10 @@ struct LocalStreamPartFinalizationMetadataRoute<'a> {
 
 struct LocalObjectListingMetadataRoute {
     storage_node: Arc<SharedStorageNode>,
+    node_id: NodeId,
     _route_cluster_epoch: ClusterEpoch,
     pg_id: ObjectMetadataScanPgId,
+    authorization: MetadataReadAuthorization,
 }
 
 struct LocalObjectMutationScanMetadataRoute<'a> {
@@ -226,8 +232,10 @@ struct LocalObjectMutationScanMetadataRoute<'a> {
 
 struct LocalBucketMetadataScanRoute {
     storage_node: Arc<SharedStorageNode>,
+    node_id: NodeId,
     _route_cluster_epoch: ClusterEpoch,
     pg_id: BucketPgId,
+    authorization: MetadataReadAuthorization,
 }
 
 struct LocalBucketWriteReservationScanRoute<'a> {
@@ -241,6 +249,7 @@ struct LocalBucketMetadataRoute<'a> {
     route_cluster_epoch: ClusterEpoch,
     pg_id: BucketPgId,
     bucket: BucketName,
+    authorization: MetadataReadAuthorization,
 }
 
 struct LocalBucketMetadataRoutePair<'a> {
@@ -525,10 +534,15 @@ impl RetainedPlacedShardNodeClient for LocalStorageNodeClient {
 impl RetainedPlacedShardRoute for LocalRetainedPlacedShardRoute {
     fn read_placed_shard_for_historical_inspection(
         &self,
-        _expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
-        self.storage_node
-            .read_shard_file(self.location.data_pg_id().get(), &self.key)
+    ) -> Result<(Vec<u8>, WriteAck), StoreError> {
+        let payload = self
+            .storage_node
+            .read_shard_file(self.location.data_pg_id().get(), &self.key)?;
+        let ack = WriteAck {
+            stored_size: payload.len() as u64,
+            crc64: checksum::crc64::checksum(&payload),
+        };
+        Ok((payload, ack))
     }
 
     fn delete_placed_shard_for_historical_cleanup(&self) -> Result<(), StoreError> {
@@ -1105,15 +1119,6 @@ impl LocalStorageNodeClient {
         Ok(PgMetadataStore::head_bucket_raw(&*pg, bucket)?)
     }
 
-    fn head_bucket_info(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::head_bucket(&*pg, bucket)?)
-    }
-
     fn load_bucket_snapshot(
         &self,
         pg_id: BucketPgId,
@@ -1419,26 +1424,19 @@ impl LocalStorageNodeClient {
         ))
     }
 
-    fn get_bucket_subresource(
-        &self,
-        pg_id: BucketPgId,
-        bucket: &BucketName,
-        kind: BucketSubresourceKind,
-    ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
-        Ok(PgMetadataStore::get_bucket_subresource(&*pg, bucket, kind)?.map(|stored| stored.body))
-    }
-
     fn open_bucket_metadata_scan_route_impl(
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
         self.storage_node.require_open_pg(pg_id.get())?;
         Ok(Box::new(LocalBucketMetadataScanRoute {
             storage_node: Arc::clone(&self.storage_node),
+            node_id: self.node_id,
             _route_cluster_epoch: route_cluster_epoch,
             pg_id,
+            authorization,
         }))
     }
 }
@@ -1462,6 +1460,30 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
             route_cluster_epoch,
             pg_id,
             bucket: bucket.clone(),
+            authorization: MetadataReadAuthorization::active(pg_id.pg_id()),
+        }))
+    }
+
+    fn open_bucket_metadata_read_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError> {
+        self.storage_node.require_open_pg(pg_id.get())?;
+        if self.storage_node.bucket_metadata_pg_for(bucket) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open bucket metadata read route",
+            }
+            .into());
+        }
+        Ok(Box::new(LocalBucketMetadataRoute {
+            client: self,
+            route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            authorization,
         }))
     }
 
@@ -1519,16 +1541,40 @@ impl BucketMetadataNodeClient for LocalStorageNodeClient {
         route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
     ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
-        self.open_bucket_metadata_scan_route_impl(route_cluster_epoch, pg_id)
+        self.open_bucket_metadata_scan_route_impl(
+            route_cluster_epoch,
+            pg_id,
+            MetadataReadAuthorization::active(pg_id.pg_id()),
+        )
+    }
+
+    fn open_bucket_metadata_read_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
+        self.open_bucket_metadata_scan_route_impl(route_cluster_epoch, pg_id, authorization)
     }
 }
 
 impl LocalBucketMetadataRoute<'_> {
+    fn require_mutation_authority(
+        &self,
+        operation: &'static str,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if self.authorization.is_active() {
+            return Ok(());
+        }
+        Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into())
+    }
+
     fn require_command_id(
         &self,
         command_id: MetadataCommandId,
         operation: &'static str,
     ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_mutation_authority(operation)?;
         if command_id.cluster_epoch() != self.route_cluster_epoch
             || command_id.pg_id() != self.pg_id.pg_id()
         {
@@ -1542,6 +1588,7 @@ impl LocalBucketMetadataRoute<'_> {
         bucket: &BucketName,
         operation: &'static str,
     ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_mutation_authority(operation)?;
         if bucket != &self.bucket {
             return Err(StoreError::RouteCapabilitySubjectMismatch { operation }.into());
         }
@@ -1551,19 +1598,33 @@ impl LocalBucketMetadataRoute<'_> {
 
 impl BucketMetadataRoute for LocalBucketMetadataRoute<'_> {
     fn head_bucket_raw(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.client.head_bucket_raw(self.pg_id, &self.bucket)
+        let pg = self.client.storage_node.get_pg_for_metadata_read(
+            self.client.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
+        Ok(PgMetadataStore::head_bucket_raw(&*pg, &self.bucket)?)
     }
 
     fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.client.head_bucket_info(self.pg_id, &self.bucket)
+        let pg = self.client.storage_node.get_pg_for_metadata_read(
+            self.client.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
+        Ok(PgMetadataStore::head_bucket(&*pg, &self.bucket)?)
     }
 
     fn load_bucket_snapshot(
         &self,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        self.client
-            .load_bucket_snapshot(self.pg_id, &self.bucket, request)
+        let pg = self.client.storage_node.get_pg_for_metadata_read(
+            self.client.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
+        SharedStorageNode::load_bucket_snapshot_from_pg(&pg, &self.bucket, request)
     }
 
     fn build_create_bucket_command(
@@ -1733,8 +1794,15 @@ impl BucketMetadataRoute for LocalBucketMetadataRoute<'_> {
         &self,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
-        self.client
-            .get_bucket_subresource(self.pg_id, &self.bucket, kind)
+        let pg = self.client.storage_node.get_pg_for_metadata_read(
+            self.client.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
+        Ok(
+            PgMetadataStore::get_bucket_subresource(&*pg, &self.bucket, kind)?
+                .map(|stored| stored.body),
+        )
     }
 }
 
@@ -1778,7 +1846,11 @@ impl BucketMetadataScanRoute for LocalBucketMetadataScanRoute {
         &self,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         let buckets = PgMetadataStore::list_buckets(&*pg, owner_canonical_id)?;
         for bucket in &buckets {
             if bucket.owner_canonical_id.as_str() != owner_canonical_id {
@@ -1799,7 +1871,11 @@ impl BucketMetadataScanRoute for LocalBucketMetadataScanRoute {
         for bucket in buckets {
             self.require_bucket(bucket, "load bucket execution generations")?;
         }
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         let generations = pg.load_bucket_execution_generations(buckets)?;
         for bucket in generations.keys() {
             if !buckets.iter().any(|requested| requested == bucket) {
@@ -1820,7 +1896,11 @@ impl BucketMetadataScanRoute for LocalBucketMetadataScanRoute {
         for bucket in buckets {
             self.require_bucket(bucket, "load bucket fast-path identities")?;
         }
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         let identities = pg.load_bucket_fast_path_identities(buckets)?;
         for bucket in identities.keys() {
             if !buckets.iter().any(|requested| requested == bucket) {
@@ -3794,8 +3874,13 @@ impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRo
         &self,
         upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        self.client
-            .load_multipart_upload(self.pg_id, &self.bucket, &self.key, upload_id)
+        self.client.load_multipart_upload(
+            self.pg_id,
+            &self.bucket,
+            &self.key,
+            upload_id,
+            self.authorization,
+        )
     }
 
     fn load_in_progress_multipart_upload(
@@ -3807,6 +3892,7 @@ impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRo
             &self.bucket,
             &self.key,
             upload_id,
+            self.authorization,
         )
     }
 
@@ -3819,6 +3905,7 @@ impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRo
             &self.bucket,
             &self.key,
             upload_id,
+            self.authorization,
         )
     }
 
@@ -3831,6 +3918,7 @@ impl MultipartUploadLookupMetadataRoute for LocalMultipartUploadLookupMetadataRo
             &self.bucket,
             &self.key,
             upload_id,
+            self.authorization,
         )
     }
 }
@@ -3844,14 +3932,18 @@ impl AuthorizedMultipartUploadMetadataRoute for LocalAuthorizedMultipartUploadMe
             self.pg_id,
             &self.authorized_upload,
             requested_part_numbers,
+            self.authorization,
         )
     }
 
     fn load_multipart_completion_preflight(
         &self,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
-        self.client
-            .load_multipart_completion_preflight(self.pg_id, &self.authorized_upload)
+        self.client.load_multipart_completion_preflight(
+            self.pg_id,
+            &self.authorized_upload,
+            self.authorization,
+        )
     }
 
     fn list_multipart_parts(
@@ -3864,6 +3956,7 @@ impl AuthorizedMultipartUploadMetadataRoute for LocalAuthorizedMultipartUploadMe
             &self.authorized_upload,
             part_number_marker,
             max_parts,
+            self.authorization,
         )
     }
 }
@@ -4210,6 +4303,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             pg_id,
             bucket: bucket.clone(),
             key: key.clone(),
+            authorization: MetadataReadAuthorization::active(pg_id.pg_id()),
         }))
     }
 
@@ -4236,6 +4330,7 @@ impl ObjectMutationMetadataNodeClient for LocalStorageNodeClient {
             _route_cluster_epoch: route_cluster_epoch,
             pg_id,
             authorized_upload: authorized_upload.clone(),
+            authorization: MetadataReadAuthorization::active(pg_id.pg_id()),
         }))
     }
 
@@ -4435,6 +4530,7 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
         pg_id: ObjectMetadataPgId,
         bucket: &BucketName,
         key: &ObjectKey,
+        authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn ObjectReadMetadataRoute + '_>, ObjectPgActionError> {
         if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
             return Err(StoreError::RouteCapabilitySubjectMismatch {
@@ -4445,10 +4541,65 @@ impl ObjectReadMetadataNodeClient for LocalStorageNodeClient {
         self.storage_node.require_open_pg(pg_id.get())?;
         Ok(Box::new(LocalObjectReadMetadataRoute {
             storage_node: Arc::clone(&self.storage_node),
+            node_id: self.node_id,
             _route_cluster_epoch: route_cluster_epoch,
             pg_id,
             bucket: bucket.clone(),
             key: key.clone(),
+            authorization,
+        }))
+    }
+
+    fn open_multipart_upload_read_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn MultipartUploadLookupMetadataRoute + '_>, ObjectPgActionError> {
+        if self.storage_node.object_metadata_pg_for(bucket, key) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open multipart upload read route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalMultipartUploadLookupMetadataRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            authorization,
+        }))
+    }
+
+    fn open_authorized_multipart_upload_read_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: ObjectMetadataPgId,
+        authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn AuthorizedMultipartUploadMetadataRoute + '_>, ObjectPgActionError> {
+        let upload = authorized_upload.record();
+        if self
+            .storage_node
+            .object_metadata_pg_for(&upload.bucket, &upload.key)
+            != pg_id
+        {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open authorized multipart upload read route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        Ok(Box::new(LocalAuthorizedMultipartUploadMetadataRoute {
+            client: self,
+            _route_cluster_epoch: route_cluster_epoch,
+            pg_id,
+            authorized_upload: authorized_upload.clone(),
+            authorization,
         }))
     }
 }
@@ -4458,7 +4609,11 @@ impl ObjectReadMetadataRoute for LocalObjectReadMetadataRoute {
         &self,
         version_id: Option<VersionId>,
     ) -> Result<ObjectReadAuthSubject, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         SharedStorageNode::load_object_read_auth_subject_from_object_pg(
             &pg,
             &self.bucket,
@@ -4473,7 +4628,11 @@ impl ObjectReadMetadataRoute for LocalObjectReadMetadataRoute {
         expected_identity: &ObjectReadAuthSubjectIdentity,
         snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         SharedStorageNode::load_object_read_snapshot_for_subject_from_object_pg(
             &pg,
             &self.bucket,
@@ -4490,7 +4649,11 @@ impl ObjectReadMetadataRoute for LocalObjectReadMetadataRoute {
         expected_identity: &ObjectReadAuthSubjectIdentity,
         authorized_version_id: VersionId,
     ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         SharedStorageNode::get_object_tags_for_subject_from_object_pg(
             &pg,
             &self.bucket,
@@ -4507,12 +4670,15 @@ impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: ObjectMetadataScanPgId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn ObjectListingMetadataRoute + '_>, BucketSnapshotLoadError> {
         self.storage_node.require_open_pg(pg_id.get())?;
         Ok(Box::new(LocalObjectListingMetadataRoute {
             storage_node: Arc::clone(&self.storage_node),
+            node_id: self.node_id,
             _route_cluster_epoch: route_cluster_epoch,
             pg_id,
+            authorization,
         }))
     }
 }
@@ -4522,7 +4688,11 @@ impl ObjectListingMetadataRoute for LocalObjectListingMetadataRoute {
         &self,
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         let response = pg.list_objects(req)?;
         for object in &response.objects {
             self.validate_listing_subject(
@@ -4538,7 +4708,11 @@ impl ObjectListingMetadataRoute for LocalObjectListingMetadataRoute {
         &self,
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         let response = pg.list_object_versions(req)?;
         for object in &response.versions {
             self.validate_listing_subject(
@@ -4554,7 +4728,11 @@ impl ObjectListingMetadataRoute for LocalObjectListingMetadataRoute {
         &self,
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(self.pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            self.pg_id.pg_id(),
+            self.authorization,
+        )?;
         let response = pg.list_multipart_uploads(req)?;
         for upload in &response.uploads {
             self.validate_listing_subject(
@@ -4726,8 +4904,13 @@ impl LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            pg_id.pg_id(),
+            authorization,
+        )?;
         Ok(load_multipart_upload_from_pg(&pg, bucket, key, upload_id)?)
     }
 
@@ -4737,8 +4920,13 @@ impl LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            pg_id.pg_id(),
+            authorization,
+        )?;
         Ok(load_in_progress_multipart_upload_from_pg(
             &pg, bucket, key, upload_id,
         )?)
@@ -4750,8 +4938,9 @@ impl LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
-        Self::load_in_progress_multipart_upload(self, pg_id, bucket, key, upload_id)
+        Self::load_in_progress_multipart_upload(self, pg_id, bucket, key, upload_id, authorization)
     }
 
     fn load_multipart_completion_snapshot(
@@ -4759,11 +4948,16 @@ impl LocalStorageNodeClient {
         pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
         requested_part_numbers: &[u32],
+        authorization: MetadataReadAuthorization,
     ) -> Result<MultipartCompletionSnapshot, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            pg_id.pg_id(),
+            authorization,
+        )?;
         let upload = load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
         if upload != *authorized_upload.record() {
             return Err(MetadataError::NoSuchUpload {
@@ -4810,11 +5004,16 @@ impl LocalStorageNodeClient {
         &self,
         pg_id: ObjectMetadataPgId,
         authorized_upload: &AuthorizedMultipartUploadRecord,
+        authorization: MetadataReadAuthorization,
     ) -> Result<MultipartCompletionPreflight, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            pg_id.pg_id(),
+            authorization,
+        )?;
         let upload = load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
         if upload != *authorized_upload.record() {
             return Err(MetadataError::NoSuchUpload {
@@ -4836,11 +5035,16 @@ impl LocalStorageNodeClient {
         authorized_upload: &AuthorizedMultipartUploadRecord,
         part_number_marker: Option<u32>,
         max_parts: u32,
+        authorization: MetadataReadAuthorization,
     ) -> Result<ListedMultipartParts, ObjectPgActionError> {
         let bucket = &authorized_upload.record().bucket;
         let key = &authorized_upload.record().key;
         let upload_id = &authorized_upload.record().upload_id;
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            pg_id.pg_id(),
+            authorization,
+        )?;
         let upload = load_in_progress_multipart_upload_from_pg(&pg, bucket, key, upload_id)?;
         if upload != *authorized_upload.record() {
             return Err(MetadataError::NoSuchUpload {
@@ -4868,8 +5072,13 @@ impl LocalStorageNodeClient {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
+        authorization: MetadataReadAuthorization,
     ) -> Result<MultipartUploadManagementLookup, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg(pg_id.get())?;
+        let pg = self.storage_node.get_pg_for_metadata_read(
+            self.node_id,
+            pg_id.pg_id(),
+            authorization,
+        )?;
         match load_multipart_upload_from_pg(&pg, bucket, key, upload_id) {
             Ok(upload) if upload.state == UploadState::InProgress => {
                 return Ok(MultipartUploadManagementLookup::InProgress(Box::new(

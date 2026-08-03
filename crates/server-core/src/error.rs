@@ -916,6 +916,7 @@ fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
         StoreError::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
         StoreError::StaleMetadataOperation { .. } => "stale_metadata_operation",
         StoreError::StaleMetadataRoute { .. } => "stale_metadata_route",
+        StoreError::StaleMetadataReadProof { .. } => "stale_metadata_read_proof",
         StoreError::StaleMetadataCommand { .. } => "stale_metadata_command",
         StoreError::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
         StoreError::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",

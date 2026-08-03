@@ -35,7 +35,7 @@ use crate::node_client::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandInspectionNodeClient,
     MetadataCommandNodeClient, MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
-    ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
+    MetadataReadAuthorization, ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectPayloadLeaseNodeLease,
     ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
     PlacedShardRoute, RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
@@ -613,6 +613,35 @@ pub struct LocalNodeStore {
     shard_scavenger_observation_client: Arc<dyn ShardScavengerObservationNodeClient>,
 }
 
+pub(crate) struct MetadataPgReadNode<'a> {
+    node: &'a LocalNodeStore,
+    authorization: MetadataReadAuthorization,
+}
+
+impl<'a> MetadataPgReadNode<'a> {
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.node.node_id()
+    }
+
+    pub(crate) fn authorization(&self) -> MetadataReadAuthorization {
+        self.authorization
+    }
+
+    pub(crate) fn bucket_metadata_client(&self) -> &'a Arc<dyn BucketMetadataNodeClient> {
+        self.node.bucket_metadata_client()
+    }
+
+    pub(crate) fn object_read_metadata_client(&self) -> &'a Arc<dyn ObjectReadMetadataNodeClient> {
+        self.node.object_read_metadata_client()
+    }
+
+    pub(crate) fn object_listing_metadata_client(
+        &self,
+    ) -> &'a Arc<dyn ObjectListingMetadataNodeClient> {
+        self.node.object_listing_metadata_client()
+    }
+}
+
 impl LocalNodeStore {
     fn new(node_id: NodeId, data_dir: PathBuf, runtime: LocalNodeRuntime) -> Self {
         let clients = runtime.clients();
@@ -1032,6 +1061,7 @@ pub struct LocalPgRoute {
     primary_node_id: NodeId,
     acting_set: Arc<[NodeId]>,
     state: PgState,
+    metadata_read_route: Option<crate::control_plane::PgMetadataReadRoute>,
 }
 
 impl LocalPgRoute {
@@ -1047,6 +1077,7 @@ impl LocalPgRoute {
             primary_node_id,
             acting_set,
             state: PgState::Active,
+            metadata_read_route: None,
         }
     }
 
@@ -1077,6 +1108,10 @@ impl LocalPgRoute {
     fn contains_node(&self, node_id: NodeId) -> bool {
         self.acting_set.contains(&node_id)
     }
+
+    fn metadata_read_route(&self) -> Option<crate::control_plane::PgMetadataReadRoute> {
+        self.metadata_read_route
+    }
 }
 
 impl From<&PgRouteSnapshot> for LocalPgRoute {
@@ -1087,6 +1122,7 @@ impl From<&PgRouteSnapshot> for LocalPgRoute {
             primary_node_id: route.primary_node_id(),
             acting_set: Arc::from(route.acting_set()),
             state: route.state(),
+            metadata_read_route: route.metadata_read_route(),
         }
     }
 }
@@ -4068,6 +4104,76 @@ impl LocalClusterMap {
         })
     }
 
+    pub(crate) fn metadata_pg_read_node(
+        &self,
+        operation_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<MetadataPgReadNode<'_>, StoreError> {
+        if operation_epoch != self.epoch {
+            return Err(StoreError::StaleMetadataOperation {
+                pg_id: pg_id.get(),
+                operation_epoch,
+                current_epoch: self.epoch,
+            });
+        }
+        self.require_route_map_valid_now()?;
+
+        let route = self
+            .pg_routes
+            .get(&pg_id)
+            .ok_or(StoreError::ClusterPgNotFound {
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            })?;
+        if route.cluster_epoch() != self.epoch {
+            return Err(StoreError::StaleMetadataRoute {
+                pg_id: pg_id.get(),
+                route_epoch: route.cluster_epoch(),
+                current_epoch: self.epoch,
+            });
+        }
+        let (node_id, authorization) = match route.state() {
+            PgState::Active => (
+                route.primary_node_id(),
+                MetadataReadAuthorization::active(pg_id),
+            ),
+            PgState::Peering => {
+                let read_route = route.metadata_read_route().ok_or(StoreError::PgNotActive {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.epoch,
+                    state: route.state(),
+                })?;
+                (
+                    read_route.node_id(),
+                    MetadataReadAuthorization::peering(pg_id, read_route),
+                )
+            }
+            state => {
+                return Err(StoreError::PgNotActive {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: self.epoch,
+                    state,
+                });
+            }
+        };
+        if !route.contains_node(node_id) {
+            return Err(StoreError::NodeNotInActingSet {
+                node_id: node_id.as_u32(),
+                pg_id: pg_id.get(),
+                cluster_epoch: self.epoch,
+            });
+        }
+        let node = self.nodes.get(&node_id).ok_or(StoreError::NodeNotFound {
+            node_id: node_id.as_u32(),
+            pg_id: pg_id.get(),
+            cluster_epoch: self.epoch,
+        })?;
+        Ok(MetadataPgReadNode {
+            node,
+            authorization,
+        })
+    }
+
     pub(crate) fn metadata_pg_primary_node_for_metadata_command_recovery(
         &self,
         operation_epoch: ClusterEpoch,
@@ -4608,8 +4714,7 @@ impl LocalClusterMap {
         &self,
         location: ShardLocation,
         key: &ShardKey,
-        expected: WriteAck,
-    ) -> Result<Vec<u8>, ShardIoError> {
+    ) -> Result<(Vec<u8>, WriteAck), ShardIoError> {
         if location.shard_index() != key.shard_index() {
             return Err(ShardIoError::ShardIndexMismatch {
                 node_id: location.node_id().as_u32(),
@@ -4671,14 +4776,15 @@ impl LocalClusterMap {
         let data = node
             .retained_shard_client()
             .open_retained_placed_shard_route(location, key)
-            .and_then(|route| route.read_placed_shard_for_historical_inspection(expected))
+            .and_then(|route| route.read_placed_shard_for_historical_inspection())
             .map_err(|source| ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),
                 cluster_epoch: location.cluster_epoch(),
                 source,
             })?;
-        if data.len() as u64 != expected.stored_size {
+        let (data, ack) = data;
+        if data.len() as u64 != ack.stored_size {
             return Err(ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),
@@ -4690,18 +4796,18 @@ impl LocalClusterMap {
             });
         }
         let actual = checksum::crc64::checksum(&data);
-        if actual != expected.crc64 {
+        if actual != ack.crc64 {
             return Err(ShardIoError::Store {
                 node_id: location.node_id().as_u32(),
                 pg_id: location.data_pg_id().get(),
                 cluster_epoch: location.cluster_epoch(),
                 source: StoreError::IntegrityError {
-                    expected: expected.crc64,
+                    expected: ack.crc64,
                     actual,
                 },
             });
         }
-        Ok(data)
+        Ok((data, ack))
     }
 
     #[cfg(test)]

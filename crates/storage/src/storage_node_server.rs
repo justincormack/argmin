@@ -18,7 +18,8 @@ use super::PreparedRetainedStreamUploadAbort;
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PendingMetadataCommandObservation,
-    PendingMetadataCommandRecovery, PgRouteSnapshot, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    PendingMetadataCommandRecovery, PgMetadataReadRoute, PgRouteSnapshot,
+    CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
 use crate::control_plane_lease::{
     validate_process_lease_clock, BoundRouteMapLease, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
@@ -45,8 +46,8 @@ use crate::metadata_command::{
 use crate::node_client::MetadataCommandNodeClient;
 use crate::node_client::{
     complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
-    BucketMetadataNodeClient, BucketMetadataRoute, BucketMetadataScanRoute,
-    BucketWriteReservationNodeClient, BucketWriteReservationRoute, BucketWriteReservationScanRoute,
+    BucketMetadataNodeClient, BucketMetadataScanRoute, BucketWriteReservationNodeClient,
+    BucketWriteReservationRoute, BucketWriteReservationScanRoute,
     BuildAbortMultipartUploadCommandReq, BuildAuthorizedAbortMultipartUploadCommandReq,
     BuildCompleteMultipartObjectCommandReq, BuildCreateMultipartUploadCommandReq,
     BuildCreateStreamUploadCommandReq, BuildDeleteCurrentObjectCommandReq,
@@ -55,9 +56,8 @@ use crate::node_client::{
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
     DirectPutMetadataNodeClient, InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
-    ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
-    ObjectListingMetadataNodeClient, ObjectMutationMetadataNodeClient,
-    ObjectReadMetadataNodeClient, ObjectVersionMetadataNodeClient,
+    MetadataReadAuthorization, ObjectDeleteStorageSnapshot, ObjectGenerationMetadataNodeClient,
+    ObjectMutationMetadataNodeClient, ObjectVersionMetadataNodeClient,
     RetainedBucketWriteReservationNodeClient, RetainedMetadataCommandNodeClient,
     RetainedObjectMutationMetadataNodeClient, ShardAckNodeClient, ShardScavengerNodeClient,
     ShardScavengerObservationNodeClient,
@@ -66,8 +66,9 @@ use crate::node_runtime::pg_store::{
     initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
     verify_pg_durable_identity, MetadataCommandCheckpoint, PgStore,
 };
-use crate::node_runtime::traits::DurableBucketWriteReservationAcquire;
-use crate::node_runtime::traits::ShardStore;
+use crate::node_runtime::traits::{
+    DurableBucketWriteReservationAcquire, PgMetadataStore, ShardStore,
+};
 #[cfg(test)]
 use crate::storage_rpc::encode_placed_segment_backfill_reference_page_request;
 use crate::storage_rpc::{
@@ -92,7 +93,8 @@ use crate::storage_rpc::{
     decode_create_stream_upload_command_build_request,
     decode_delete_current_object_command_build_request,
     decode_delete_specific_object_command_build_request, decode_direct_put_command_build_request,
-    decode_direct_put_commit_snapshot_request, decode_insert_delete_marker_command_build_request,
+    decode_direct_put_commit_snapshot_request, decode_historical_shard_read_request,
+    decode_insert_delete_marker_command_build_request,
     decode_lifecycle_sweep_claim_acquire_request, decode_lifecycle_sweep_claim_error_request,
     decode_lifecycle_sweep_claim_heartbeat_request, decode_lifecycle_sweep_claim_record_request,
     decode_lifecycle_sweep_roots_request, decode_list_multipart_uploads_request,
@@ -157,7 +159,8 @@ use crate::storage_rpc::{
     encode_cluster_map_history_reference_summary_response,
     encode_create_bucket_command_build_response, encode_direct_put_command_build_response,
     encode_direct_put_commit_snapshot_response, encode_health_response,
-    encode_lifecycle_sweep_buckets_response, encode_lifecycle_sweep_claim_optional_record_response,
+    encode_historical_shard_read_response, encode_lifecycle_sweep_buckets_response,
+    encode_lifecycle_sweep_claim_optional_record_response,
     encode_lifecycle_sweep_claim_record_response, encode_lifecycle_sweep_roots_response,
     encode_list_multipart_uploads_response, encode_list_object_versions_response,
     encode_list_objects_response, encode_metadata_command_acceptance_response,
@@ -239,9 +242,9 @@ use crate::storage_rpc::{
     StorageRpcDirectPutCommandBuildRequest, StorageRpcDirectPutCommandBuildResponse,
     StorageRpcDirectPutCommitSnapshotRequest, StorageRpcDirectPutCommitSnapshotResponse,
     StorageRpcErrorCode, StorageRpcErrorResponse, StorageRpcFrame, StorageRpcHealthResponse,
-    StorageRpcInsertDeleteMarkerCommandBuildRequest, StorageRpcLifecycleSweepBucketsResponse,
-    StorageRpcLifecycleSweepClaimAcquireRequest, StorageRpcLifecycleSweepClaimErrorRequest,
-    StorageRpcLifecycleSweepClaimHeartbeatRequest,
+    StorageRpcHistoricalShardReadRequest, StorageRpcInsertDeleteMarkerCommandBuildRequest,
+    StorageRpcLifecycleSweepBucketsResponse, StorageRpcLifecycleSweepClaimAcquireRequest,
+    StorageRpcLifecycleSweepClaimErrorRequest, StorageRpcLifecycleSweepClaimHeartbeatRequest,
     StorageRpcLifecycleSweepClaimOptionalRecordResponse,
     StorageRpcLifecycleSweepClaimRecordRequest, StorageRpcLifecycleSweepClaimRecordResponse,
     StorageRpcLifecycleSweepRootsRequest, StorageRpcLifecycleSweepRootsResponse,
@@ -1151,7 +1154,7 @@ fn validate_process_config_matches_persisted_runtime_config(
 
 fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> String {
     let mut out = String::new();
-    out.push_str("argmin-storage-node-runtime-config-v3\n");
+    out.push_str("argmin-storage-node-runtime-config-v4\n");
     out.push_str(&format!("node_id {}\n", config.node_id.as_u32()));
     out.push_str(&format!("cluster_epoch {}\n", config.cluster_epoch.get()));
     match config.route_map_validity {
@@ -1202,7 +1205,7 @@ fn encode_storage_node_routes(out: &mut String, label: &str, routes: &[StorageNo
     out.push_str(&format!("{label} {}\n", routes.len()));
     for route in routes {
         out.push_str(&format!(
-            "{} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {}",
             route.pg_id,
             route.cluster_epoch.get(),
             pg_state_code(route.state),
@@ -1210,6 +1213,22 @@ fn encode_storage_node_routes(out: &mut String, label: &str, routes: &[StorageNo
             route
                 .metadata_transfer_destination_epoch
                 .map_or_else(|| "-".to_owned(), |epoch| epoch.get().to_string()),
+            route.metadata_read_route.map_or_else(
+                || "-".to_owned(),
+                |read| read.node_id().as_u32().to_string()
+            ),
+            route.metadata_read_route.map_or_else(
+                || "-".to_owned(),
+                |read| read.proof().applied_log_index.to_string()
+            ),
+            route.metadata_read_route.map_or_else(
+                || "-".to_owned(),
+                |read| read.proof().applied_log_hash.to_string()
+            ),
+            route.metadata_read_route.map_or_else(
+                || "-".to_owned(),
+                |read| read.proof().state_digest.to_string()
+            ),
             route.acting_set.len()
         ));
         for node_id in &route.acting_set {
@@ -1229,7 +1248,7 @@ fn decode_control_plane_runtime_config(
     let magic = lines
         .next()
         .ok_or_else(|| runtime_config_invalid(path, "empty config"))?;
-    if magic != "argmin-storage-node-runtime-config-v3" {
+    if magic != "argmin-storage-node-runtime-config-v4" {
         return Err(runtime_config_invalid(path, "invalid magic"));
     }
     let node_id = NodeId::new(parse_labeled_u32(path, lines.next(), "node_id")?);
@@ -1344,6 +1363,10 @@ fn decode_storage_node_routes<'a>(
         let primary_node_id = next_runtime_config_field(path, &mut fields, &too_few)?;
         let metadata_transfer_destination_epoch =
             next_runtime_config_field(path, &mut fields, &too_few)?;
+        let metadata_read_node_id = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let metadata_read_log_index = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let metadata_read_log_hash = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let metadata_read_state_digest = next_runtime_config_field(path, &mut fields, &too_few)?;
         let acting_len = next_runtime_config_field(path, &mut fields, &too_few)?;
         let acting_len = parse_usize_field(path, acting_len, "acting set length")?;
         let mut acting_set = Vec::new();
@@ -1380,6 +1403,40 @@ fn decode_storage_node_routes<'a>(
                     metadata_transfer_destination_epoch,
                     "metadata transfer destination epoch",
                 )?)
+            },
+            metadata_read_route: match (
+                metadata_read_node_id,
+                metadata_read_log_index,
+                metadata_read_log_hash,
+                metadata_read_state_digest,
+            ) {
+                ("-", "-", "-", "-") => None,
+                ("-", _, _, _) | (_, "-", _, _) | (_, _, "-", _) | (_, _, _, "-") => {
+                    return Err(runtime_config_invalid(
+                        path,
+                        format!("{label} route has an incomplete metadata read route"),
+                    ));
+                }
+                (node_id, log_index, log_hash, state_digest) => Some(PgMetadataReadRoute::new(
+                    NodeId::new(parse_u32_field(path, node_id, "metadata read node")?),
+                    crate::control_plane::PgMetadataProof {
+                        applied_log_index: parse_u64_field(
+                            path,
+                            log_index,
+                            "metadata read log index",
+                        )?,
+                        applied_log_hash: parse_u64_field(
+                            path,
+                            log_hash,
+                            "metadata read log hash",
+                        )?,
+                        state_digest: parse_u64_field(
+                            path,
+                            state_digest,
+                            "metadata read state digest",
+                        )?,
+                    },
+                )),
             },
             acting_set,
         });
@@ -1638,6 +1695,7 @@ pub struct StorageNodePgRoute {
     pub state: PgState,
     pub primary_node_id: NodeId,
     pub metadata_transfer_destination_epoch: Option<ClusterEpoch>,
+    pub metadata_read_route: Option<PgMetadataReadRoute>,
     pub acting_set: Vec<NodeId>,
 }
 
@@ -1650,6 +1708,7 @@ impl From<&PgRouteSnapshot> for StorageNodePgRoute {
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: route
                 .peering_metadata_transfer_destination_epoch(),
+            metadata_read_route: route.metadata_read_route(),
             acting_set: route.acting_set().to_vec(),
         }
     }
@@ -3955,7 +4014,22 @@ struct StorageNodeActiveBucketRoute<'a> {
     bucket: &'a BucketName,
 }
 
+struct StorageNodeMetadataReadBucketRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: BucketPgId,
+    bucket: &'a BucketName,
+}
+
 struct StorageNodeActiveBucketScanRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: BucketPgId,
+}
+
+struct StorageNodeMetadataReadBucketScanRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
     fence: StorageNodeRouteFence,
@@ -3988,7 +4062,23 @@ struct StorageNodeActivePrimaryObjectRoute<'a> {
     route: StorageNodeActiveObjectRoute<'a>,
 }
 
+struct StorageNodeMetadataReadObjectRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: ObjectMetadataPgId,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+}
+
 struct StorageNodeActivePrimaryObjectScanRoute<'a> {
+    handler: &'a StorageNodeConnectionHandler,
+    _route_permit: &'a StorageNodeRouteAdmissionPermit,
+    fence: StorageNodeRouteFence,
+    pg_id: ObjectMetadataScanPgId,
+}
+
+struct StorageNodeMetadataReadObjectScanRoute<'a> {
     handler: &'a StorageNodeConnectionHandler,
     _route_permit: &'a StorageNodeRouteAdmissionPermit,
     fence: StorageNodeRouteFence,
@@ -4183,6 +4273,64 @@ struct StorageNodeRetainedPrimaryStreamAbortCommandRoute<'a> {
     prepared: PreparedRetainedStreamUploadAbort,
 }
 
+impl StorageNodeMetadataReadBucketRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
+        self.fence
+            .validate_rpc_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(StorageNodeBucketRouteError::Route)
+    }
+
+    fn with_local_route<T>(
+        &self,
+        action: impl FnOnce(&PgStore) -> Result<T, BucketSnapshotLoadError>,
+    ) -> Result<T, StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        self.handler
+            .with_metadata_read_pg(
+                self.handler.config.node_id,
+                self.fence.cluster_epoch,
+                self.pg_id.pg_id(),
+                action,
+            )
+            .map_err(StorageNodeBucketRouteError::Route)?
+            .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+
+    fn head_bucket(&self, filtered: bool) -> Result<BucketInfo, StorageNodeBucketRouteError> {
+        self.with_local_route(|pg| {
+            Ok(if filtered {
+                PgMetadataStore::head_bucket(pg, self.bucket)?
+            } else {
+                PgMetadataStore::head_bucket_raw(pg, self.bucket)?
+            })
+        })
+    }
+
+    fn get_subresource(
+        &self,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, StorageNodeBucketRouteError> {
+        self.with_local_route(|pg| {
+            Ok(
+                PgMetadataStore::get_bucket_subresource(pg, self.bucket, kind)?
+                    .map(|stored| stored.body),
+            )
+        })
+    }
+
+    fn load_snapshot(
+        &self,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, StorageNodeBucketRouteError> {
+        self.with_local_route(|pg| {
+            SharedStorageNode::load_bucket_snapshot_from_pg(pg, self.bucket, request)
+        })
+    }
+}
+
 impl StorageNodeActiveBucketRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageNodeBucketRouteError> {
         self.fence
@@ -4193,19 +4341,6 @@ impl StorageNodeActiveBucketRoute<'_> {
             .map_err(StorageNodeBucketRouteError::Route)
     }
 
-    fn open_local_metadata_route<'a>(
-        &self,
-        client: &'a LocalStorageNodeClient,
-    ) -> Result<Box<dyn BucketMetadataRoute + 'a>, StorageNodeBucketRouteError> {
-        BucketMetadataNodeClient::open_bucket_metadata_route(
-            client,
-            self.fence.cluster_epoch,
-            self.pg_id,
-            self.bucket,
-        )
-        .map_err(StorageNodeBucketRouteError::Bucket)
-    }
-
     fn open_local_bucket_write_reservation_route<'a>(
         &self,
         client: &'a LocalStorageNodeClient,
@@ -4213,53 +4348,6 @@ impl StorageNodeActiveBucketRoute<'_> {
         client
             .open_bucket_write_reservation_route(self.fence.cluster_epoch, self.pg_id, self.bucket)
             .map_err(StorageNodeBucketRouteError::Bucket)
-    }
-
-    fn head_bucket(&self, filtered: bool) -> Result<BucketInfo, StorageNodeBucketRouteError> {
-        self.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.handler.config.node_id,
-            Arc::clone(&self.handler.node),
-        );
-        let route = self.open_local_metadata_route(&local_client)?;
-        let result = if filtered {
-            route.head_bucket_info()
-        } else {
-            route.head_bucket_raw()
-        };
-        result.map_err(StorageNodeBucketRouteError::Bucket)
-    }
-
-    fn get_subresource(
-        &self,
-        kind: BucketSubresourceKind,
-    ) -> Result<Option<String>, StorageNodeBucketRouteError> {
-        self.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.handler.config.node_id,
-            Arc::clone(&self.handler.node),
-        );
-        let result = self
-            .open_local_metadata_route(&local_client)?
-            .get_bucket_subresource(kind)
-            .map_err(StorageNodeBucketRouteError::Bucket);
-        result
-    }
-
-    fn load_snapshot(
-        &self,
-        request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshot, StorageNodeBucketRouteError> {
-        self.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.handler.config.node_id,
-            Arc::clone(&self.handler.node),
-        );
-        let result = self
-            .open_local_metadata_route(&local_client)?
-            .load_bucket_snapshot(request)
-            .map_err(StorageNodeBucketRouteError::Bucket);
-        result
     }
 
     fn acquire_write_reservation(
@@ -4633,21 +4721,6 @@ impl StorageNodeActiveBucketScanRoute<'_> {
             .map_err(Self::map_scan_error)
     }
 
-    fn list_buckets(
-        &self,
-        owner_canonical_id: &str,
-    ) -> Result<Vec<BucketInfo>, StorageNodeBucketRouteError> {
-        self.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.handler.config.node_id,
-            Arc::clone(&self.handler.node),
-        );
-        let route = self.open_local_bucket_metadata_scan_route(&local_client)?;
-        route
-            .list_buckets(owner_canonical_id)
-            .map_err(Self::map_scan_error)
-    }
-
     fn load_bucket_execution_generations(
         &self,
         buckets: &[BucketName],
@@ -4740,6 +4813,29 @@ impl StorageNodeActiveBucketScanRoute<'_> {
     }
 }
 
+impl StorageNodeMetadataReadBucketScanRoute<'_> {
+    fn list_buckets(
+        &self,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, StorageNodeBucketRouteError> {
+        self.fence
+            .validate_rpc_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(StorageNodeBucketRouteError::Route)?;
+        self.handler
+            .with_metadata_read_pg(
+                self.handler.config.node_id,
+                self.fence.cluster_epoch,
+                self.pg_id.pg_id(),
+                |pg| Ok(PgMetadataStore::list_buckets(pg, owner_canonical_id)?),
+            )
+            .map_err(StorageNodeBucketRouteError::Route)?
+            .map_err(StorageNodeBucketRouteError::Bucket)
+    }
+}
+
 impl StorageNodeBucketDeleteReplicaHeadRoute<'_> {
     fn head_bucket(&self) -> Result<BucketInfo, StorageNodeBucketRouteError> {
         self.fence
@@ -4820,6 +4916,168 @@ impl StorageNodeActiveObjectRoute<'_> {
         )
         .and_then(|route| route.next_object_version_id())
         .map_err(StorageNodeObjectRouteError::Object)
+    }
+}
+
+impl StorageNodeMetadataReadObjectRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageNodeObjectRouteError> {
+        self.fence
+            .validate_rpc_at(
+                crate::clock::current_time_millis(),
+                crate::clock::monotonic_time_millis(),
+            )
+            .map_err(StorageNodeObjectRouteError::Route)
+    }
+
+    fn with_local_route<T>(
+        &self,
+        action: impl FnOnce(&PgStore) -> Result<T, ObjectPgActionError>,
+    ) -> Result<T, StorageNodeObjectRouteError> {
+        self.require_valid_now()?;
+        self.handler
+            .with_metadata_read_pg(
+                self.handler.config.node_id,
+                self.fence.cluster_epoch,
+                self.pg_id.pg_id(),
+                action,
+            )
+            .map_err(StorageNodeObjectRouteError::Route)?
+            .map_err(StorageNodeObjectRouteError::Object)
+    }
+
+    fn load_object_read_auth_subject(
+        &self,
+        version_id: Option<s3_types::VersionId>,
+    ) -> Result<crate::ObjectReadAuthSubject, StorageNodeObjectRouteError> {
+        self.with_local_route(|pg| {
+            SharedStorageNode::load_object_read_auth_subject_from_object_pg(
+                pg,
+                self.bucket,
+                self.key,
+                version_id,
+            )
+        })
+    }
+
+    fn load_object_read_snapshot_for_subject(
+        &self,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &crate::ObjectReadAuthSubjectIdentity,
+        snapshot_mode: crate::ObjectReadSnapshotMode,
+    ) -> Result<crate::ObjectReadSnapshot, StorageNodeObjectRouteError> {
+        self.with_local_route(|pg| {
+            SharedStorageNode::load_object_read_snapshot_for_subject_from_object_pg(
+                pg,
+                self.bucket,
+                self.key,
+                version_id,
+                expected_identity,
+                snapshot_mode,
+            )
+        })
+    }
+
+    fn get_object_tags_for_subject(
+        &self,
+        version_id: Option<s3_types::VersionId>,
+        expected_identity: &crate::ObjectReadAuthSubjectIdentity,
+        authorized_version_id: s3_types::VersionId,
+    ) -> Result<Option<crate::SerializedTagSet>, StorageNodeObjectRouteError> {
+        self.with_local_route(|pg| {
+            SharedStorageNode::get_object_tags_for_subject_from_object_pg(
+                pg,
+                self.bucket,
+                self.key,
+                version_id,
+                expected_identity,
+                authorized_version_id,
+            )
+        })
+    }
+
+    fn load_bound_multipart_upload(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        let upload = PgMetadataStore::get_multipart_upload(pg, upload_id)?;
+        if upload.bucket != *bucket || upload.key != *key {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }
+            .into());
+        }
+        Ok(upload)
+    }
+
+    fn lookup_multipart_upload_management(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<crate::MultipartUploadManagementLookup, StorageNodeObjectRouteError> {
+        self.with_local_route(|pg| {
+            match Self::load_bound_multipart_upload(pg, self.bucket, self.key, upload_id) {
+                Ok(upload) if upload.state == crate::UploadState::InProgress => {
+                    return Ok(crate::MultipartUploadManagementLookup::InProgress(
+                        Box::new(upload),
+                    ));
+                }
+                Ok(upload) => {
+                    return Ok(crate::MultipartUploadManagementLookup::NonInProgress(
+                        Box::new(upload),
+                    ));
+                }
+                Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {}
+                Err(error) => return Err(error),
+            }
+            if let Some(completed) =
+                pg.get_multipart_completion_replay(self.bucket, self.key, upload_id)?
+            {
+                return Ok(crate::MultipartUploadManagementLookup::Replay(Box::new(
+                    completed,
+                )));
+            }
+            Ok(crate::MultipartUploadManagementLookup::Missing)
+        })
+    }
+
+    fn list_multipart_parts_for_authorized_upload(
+        &self,
+        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<crate::ListedMultipartParts, StorageNodeObjectRouteError> {
+        self.with_local_route(|pg| {
+            let upload = Self::load_bound_multipart_upload(
+                pg,
+                self.bucket,
+                self.key,
+                &authorized_upload.upload_id,
+            )?;
+            if upload.state != crate::UploadState::InProgress
+                || upload != *authorized_upload.record()
+            {
+                return Err(MetadataError::NoSuchUpload {
+                    upload_id: authorized_upload.upload_id.to_string(),
+                }
+                .into());
+            }
+            let response = PgMetadataStore::list_multipart_parts(
+                pg,
+                &crate::types::ListPartsReq {
+                    upload_id: authorized_upload.upload_id.clone(),
+                    part_number_marker,
+                    max_parts,
+                },
+            )?;
+            crate::ListedMultipartParts::from_storage(upload, response).map_err(|reason| {
+                MetadataError::InvariantViolation {
+                    context: "project multipart parts listing",
+                    reason: reason.to_string(),
+                }
+                .into()
+            })
+        })
     }
 }
 
@@ -5793,50 +6051,6 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
-    fn list_multipart_parts_for_authorized_upload(
-        &self,
-        authorized_upload: &crate::types::AuthorizedMultipartUploadRecord,
-        part_number_marker: Option<u32>,
-        max_parts: u32,
-    ) -> Result<crate::ListedMultipartParts, StorageNodeObjectRouteError> {
-        self.require_authorized_multipart_upload_subject(
-            authorized_upload.record(),
-            "multipart parts list",
-        )?;
-        let local_client = LocalStorageNodeClient::new(
-            self.route.handler.config.node_id,
-            Arc::clone(&self.route.handler.node),
-        );
-        ObjectMutationMetadataNodeClient::open_authorized_multipart_upload_metadata_route(
-            &local_client,
-            self.route.fence.cluster_epoch,
-            self.route.pg_id,
-            authorized_upload,
-        )
-        .and_then(|route| route.list_multipart_parts(part_number_marker, max_parts))
-        .map_err(StorageNodeObjectRouteError::Object)
-    }
-
-    fn lookup_multipart_upload_management(
-        &self,
-        upload_id: &UploadId,
-    ) -> Result<crate::MultipartUploadManagementLookup, StorageNodeObjectRouteError> {
-        self.route.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.route.handler.config.node_id,
-            Arc::clone(&self.route.handler.node),
-        );
-        ObjectMutationMetadataNodeClient::open_multipart_upload_lookup_metadata_route(
-            &local_client,
-            self.route.fence.cluster_epoch,
-            self.route.pg_id,
-            self.route.bucket,
-            self.route.key,
-        )
-        .and_then(|route| route.lookup_multipart_upload_management(upload_id))
-        .map_err(StorageNodeObjectRouteError::Object)
-    }
-
     fn load_multipart_completion_stale_payload_source(
         &self,
     ) -> Result<Option<crate::StoredObject>, StorageNodeObjectRouteError> {
@@ -6232,78 +6446,6 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
         .map_err(StorageNodeObjectRouteError::Object)
     }
 
-    fn load_object_read_auth_subject(
-        &self,
-        version_id: Option<s3_types::VersionId>,
-    ) -> Result<crate::ObjectReadAuthSubject, StorageNodeObjectRouteError> {
-        self.route.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.route.handler.config.node_id,
-            Arc::clone(&self.route.handler.node),
-        );
-        ObjectReadMetadataNodeClient::open_object_read_metadata_route(
-            &local_client,
-            self.route.handler.config.cluster_epoch,
-            self.route.pg_id,
-            self.route.bucket,
-            self.route.key,
-        )
-        .and_then(|route| route.load_object_read_auth_subject(version_id))
-        .map_err(StorageNodeObjectRouteError::Object)
-    }
-
-    fn load_object_read_snapshot_for_subject(
-        &self,
-        version_id: Option<s3_types::VersionId>,
-        expected_identity: &crate::ObjectReadAuthSubjectIdentity,
-        snapshot_mode: crate::ObjectReadSnapshotMode,
-    ) -> Result<crate::ObjectReadSnapshot, StorageNodeObjectRouteError> {
-        self.route.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.route.handler.config.node_id,
-            Arc::clone(&self.route.handler.node),
-        );
-        ObjectReadMetadataNodeClient::open_object_read_metadata_route(
-            &local_client,
-            self.route.handler.config.cluster_epoch,
-            self.route.pg_id,
-            self.route.bucket,
-            self.route.key,
-        )
-        .and_then(|route| {
-            route.load_object_read_snapshot_for_subject(
-                version_id,
-                expected_identity,
-                snapshot_mode,
-            )
-        })
-        .map_err(StorageNodeObjectRouteError::Object)
-    }
-
-    fn get_object_tags_for_subject(
-        &self,
-        version_id: Option<s3_types::VersionId>,
-        expected_identity: &crate::ObjectReadAuthSubjectIdentity,
-        authorized_version_id: s3_types::VersionId,
-    ) -> Result<Option<crate::SerializedTagSet>, StorageNodeObjectRouteError> {
-        self.route.require_valid_now()?;
-        let local_client = LocalStorageNodeClient::new(
-            self.route.handler.config.node_id,
-            Arc::clone(&self.route.handler.node),
-        );
-        ObjectReadMetadataNodeClient::open_object_read_metadata_route(
-            &local_client,
-            self.route.handler.config.cluster_epoch,
-            self.route.pg_id,
-            self.route.bucket,
-            self.route.key,
-        )
-        .and_then(|route| {
-            route.get_object_tags_for_subject(version_id, expected_identity, authorized_version_id)
-        })
-        .map_err(StorageNodeObjectRouteError::Object)
-    }
-
     fn load_put_object_metadata_snapshot(
         &self,
         version_id: Option<s3_types::VersionId>,
@@ -6626,7 +6768,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
     }
 }
 
-impl StorageNodeActivePrimaryObjectScanRoute<'_> {
+impl StorageNodeMetadataReadObjectScanRoute<'_> {
     fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
         self.fence.validate_rpc_at(
             crate::clock::current_time_millis(),
@@ -6655,6 +6797,77 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
             }),
             error => StorageNodeBucketRouteError::Bucket(error),
         }
+    }
+
+    fn with_local_route<T>(
+        &self,
+        action: impl FnOnce(&PgStore) -> Result<T, BucketSnapshotLoadError>,
+    ) -> Result<T, StorageNodeBucketRouteError> {
+        self.require_valid_now()
+            .map_err(StorageNodeBucketRouteError::Route)?;
+        self.handler
+            .with_metadata_read_pg(
+                self.handler.config.node_id,
+                self.fence.cluster_epoch,
+                self.pg_id.pg_id(),
+                action,
+            )
+            .map_err(StorageNodeBucketRouteError::Route)?
+            .map_err(Self::map_listing_error)
+    }
+
+    fn list_objects_page(
+        &self,
+        request: &crate::ListObjectsReq,
+    ) -> Result<crate::ListObjectsResp, StorageNodeBucketRouteError> {
+        let response = self.with_local_route(|pg| Ok(pg.list_objects(request)?))?;
+        for object in &response.objects {
+            self.validate_listing_subject(
+                object.bucket(),
+                object.key(),
+                "object listing response scan PG",
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn list_object_versions_page(
+        &self,
+        request: &crate::ListObjectVersionsReq,
+    ) -> Result<crate::ListObjectVersionsResp, StorageNodeBucketRouteError> {
+        let response = self.with_local_route(|pg| Ok(pg.list_object_versions(request)?))?;
+        for object in &response.versions {
+            self.validate_listing_subject(
+                object.bucket(),
+                object.key(),
+                "object version listing response scan PG",
+            )?;
+        }
+        Ok(response)
+    }
+
+    fn list_multipart_uploads_page(
+        &self,
+        request: &crate::ListMultipartUploadsReq,
+    ) -> Result<crate::ListMultipartUploadsResp, StorageNodeBucketRouteError> {
+        let response = self.with_local_route(|pg| Ok(pg.list_multipart_uploads(request)?))?;
+        for upload in &response.uploads {
+            self.validate_listing_subject(
+                &upload.bucket,
+                &upload.key,
+                "multipart upload listing response scan PG",
+            )?;
+        }
+        Ok(response)
+    }
+}
+
+impl StorageNodeActivePrimaryObjectScanRoute<'_> {
+    fn require_valid_now(&self) -> Result<(), StorageRpcErrorResponse> {
+        self.fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )
     }
 
     fn map_reclaim_scan_error(
@@ -6786,87 +6999,6 @@ impl StorageNodeActivePrimaryObjectScanRoute<'_> {
                 .map_err(StorageNodeObjectPayloadReclaimRouteError::Route)?;
         }
         Ok(claim)
-    }
-
-    fn list_objects_page(
-        &self,
-        request: &crate::ListObjectsReq,
-    ) -> Result<crate::ListObjectsResp, StorageNodeBucketRouteError> {
-        self.require_valid_now()
-            .map_err(StorageNodeBucketRouteError::Route)?;
-        let local_client = LocalStorageNodeClient::new(
-            self.handler.config.node_id,
-            Arc::clone(&self.handler.node),
-        );
-        let response = ObjectListingMetadataNodeClient::open_object_listing_metadata_route(
-            &local_client,
-            self.fence.cluster_epoch,
-            self.pg_id,
-        )
-        .and_then(|route| route.list_objects_page(request))
-        .map_err(Self::map_listing_error)?;
-        for object in &response.objects {
-            self.validate_listing_subject(
-                object.bucket(),
-                object.key(),
-                "object listing response scan PG",
-            )?;
-        }
-        Ok(response)
-    }
-
-    fn list_object_versions_page(
-        &self,
-        request: &crate::ListObjectVersionsReq,
-    ) -> Result<crate::ListObjectVersionsResp, StorageNodeBucketRouteError> {
-        self.require_valid_now()
-            .map_err(StorageNodeBucketRouteError::Route)?;
-        let local_client = LocalStorageNodeClient::new(
-            self.handler.config.node_id,
-            Arc::clone(&self.handler.node),
-        );
-        let response = ObjectListingMetadataNodeClient::open_object_listing_metadata_route(
-            &local_client,
-            self.fence.cluster_epoch,
-            self.pg_id,
-        )
-        .and_then(|route| route.list_object_versions_page(request))
-        .map_err(Self::map_listing_error)?;
-        for object in &response.versions {
-            self.validate_listing_subject(
-                object.bucket(),
-                object.key(),
-                "object version listing response scan PG",
-            )?;
-        }
-        Ok(response)
-    }
-
-    fn list_multipart_uploads_page(
-        &self,
-        request: &crate::ListMultipartUploadsReq,
-    ) -> Result<crate::ListMultipartUploadsResp, StorageNodeBucketRouteError> {
-        self.require_valid_now()
-            .map_err(StorageNodeBucketRouteError::Route)?;
-        let local_client = LocalStorageNodeClient::new(
-            self.handler.config.node_id,
-            Arc::clone(&self.handler.node),
-        );
-        let response = ObjectListingMetadataNodeClient::open_object_listing_metadata_route(
-            &local_client,
-            self.fence.cluster_epoch,
-            self.pg_id,
-        )
-        .and_then(|route| route.list_multipart_uploads_page(request))
-        .map_err(Self::map_listing_error)?;
-        for upload in &response.uploads {
-            self.validate_listing_subject(
-                &upload.bucket,
-                &upload.key,
-                "multipart upload listing response scan PG",
-            )?;
-        }
-        Ok(response)
     }
 
     fn list_aborting_multipart_upload_bucket_witnesses(
@@ -8917,7 +9049,7 @@ impl StorageNodeConnectionHandler {
                 }),
             },
             StorageRpcMessageKind::ShardHistoricalRead => {
-                match decode_shard_read_request(&frame.payload) {
+                match decode_historical_shard_read_request(&frame.payload) {
                     Ok(request) => self.shard_historical_read_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -10798,7 +10930,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcListObjectsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_scan_route(
+        let route = match self.metadata_read_object_scan_route(
             route_permit,
             request.node_id,
             request.cluster_epoch,
@@ -10828,7 +10960,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcListObjectVersionsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_scan_route(
+        let route = match self.metadata_read_object_scan_route(
             route_permit,
             request.node_id,
             request.cluster_epoch,
@@ -10860,7 +10992,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcListMultipartUploadsRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_scan_route(
+        let route = match self.metadata_read_object_scan_route(
             route_permit,
             request.node_id,
             request.cluster_epoch,
@@ -12071,7 +12203,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMultipartPartsListRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_route(
+        let route = match self.metadata_read_object_route(
             route_permit,
             &request.object,
             "multipart parts list",
@@ -12112,7 +12244,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcMultipartUploadLoadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_route(
+        let route = match self.metadata_read_object_route(
             route_permit,
             &request.object,
             "multipart management lookup",
@@ -12638,7 +12770,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectReadAuthSubjectRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_route(
+        let route = match self.metadata_read_object_route(
             route_permit,
             &request.object,
             "object read auth subject load",
@@ -12679,7 +12811,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectReadSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_route(
+        let route = match self.metadata_read_object_route(
             route_permit,
             &request.object,
             "object read snapshot load",
@@ -12722,7 +12854,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcObjectTagsForSubjectRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_primary_object_route(
+        let route = match self.metadata_read_object_route(
             route_permit,
             &request.object,
             "object tags for subject load",
@@ -12768,7 +12900,7 @@ impl StorageNodeConnectionHandler {
         request: StorageRpcBucketRequest,
         filtered: bool,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_bucket_route(route_permit, &request, "bucket head") {
+        let route = match self.metadata_read_bucket_route(route_permit, &request, "bucket head") {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
@@ -12842,11 +12974,14 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketSnapshotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route =
-            match self.active_bucket_route(route_permit, &request.bucket, "bucket snapshot load") {
-                Ok(route) => route,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            };
+        let route = match self.metadata_read_bucket_route(
+            route_permit,
+            &request.bucket,
+            "bucket snapshot load",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         match route.load_snapshot(request.request) {
             Ok(snapshot) => {
                 let payload = encode_bucket_snapshot_response(&StorageRpcBucketSnapshotResponse {
@@ -13200,12 +13335,14 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketSubresourceGetRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route =
-            match self.active_bucket_route(route_permit, &request.bucket, "bucket subresource get")
-            {
-                Ok(route) => route,
-                Err(error) => return encode_storage_rpc_error_response(&error),
-            };
+        let route = match self.metadata_read_bucket_route(
+            route_permit,
+            &request.bucket,
+            "bucket subresource get",
+        ) {
+            Ok(route) => route,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         match route.get_subresource(request.kind) {
             Ok(body) => {
                 let payload = encode_bucket_subresource_get_response(
@@ -13227,7 +13364,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         request: StorageRpcBucketListRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.active_bucket_scan_route(
+        let route = match self.metadata_read_bucket_scan_route(
             route_permit,
             request.node_id,
             request.cluster_epoch,
@@ -13400,7 +13537,7 @@ impl StorageNodeConnectionHandler {
     fn shard_historical_read_response(
         &self,
         route_permit: &StorageNodeRouteAdmissionPermit,
-        request: StorageRpcShardReadRequest,
+        request: StorageRpcHistoricalShardReadRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         let route = match self.retained_shard_inspection_route(
             route_permit,
@@ -13410,7 +13547,18 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        self.shard_read_file_response(route.read(), request)
+        let response = match route.read() {
+            Ok(payload) => encode_storage_rpc_success_response(
+                &encode_historical_shard_read_response(&payload)?,
+            ),
+            Err(StorageNodeDataRouteError::Route(error)) => {
+                encode_storage_rpc_error_response(&error)?
+            }
+            Err(StorageNodeDataRouteError::Store(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
+        };
+        Ok(response)
     }
 
     fn shard_read_file_response(
@@ -16562,6 +16710,77 @@ impl StorageNodeConnectionHandler {
         )
     }
 
+    fn validate_metadata_read_pg_route(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+    ) -> Result<(), StorageRpcErrorResponse> {
+        self.with_metadata_read_pg(node_id, cluster_epoch, pg_id, |_| ())
+    }
+
+    fn with_metadata_read_pg<T>(
+        &self,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        action: impl FnOnce(&PgStore) -> T,
+    ) -> Result<T, StorageRpcErrorResponse> {
+        self.validate_pg_route_with_allowed_states(
+            node_id,
+            cluster_epoch,
+            pg_id,
+            &[PgState::Active, PgState::Peering],
+        )?;
+        let route = self
+            .config
+            .pg_routes
+            .iter()
+            .find(|route| route.pg_id == pg_id.get())
+            .expect("validated metadata read PG route must exist");
+        if route.state == PgState::Active {
+            self.validate_primary_pg(pg_id, "metadata read")?;
+            let pg = self
+                .node
+                .get_pg_for_metadata_read(
+                    self.config.node_id,
+                    pg_id,
+                    MetadataReadAuthorization::active(pg_id),
+                )
+                .map_err(store_error_response)?;
+            return Ok(action(&pg));
+        }
+
+        let Some(read_route) = route.metadata_read_route else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::InactivePgRoute,
+                message: format!(
+                    "Peering PG {} has no certified metadata read replica",
+                    pg_id.get()
+                ),
+            });
+        };
+        if read_route.node_id() != self.config.node_id {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::NonActingSetAccess,
+                message: format!(
+                    "storage node {} is not the certified metadata read replica for PG {}",
+                    self.config.node_id.as_u32(),
+                    pg_id.get()
+                ),
+            });
+        }
+        let pg = self
+            .node
+            .get_pg_for_metadata_read(
+                self.config.node_id,
+                pg_id,
+                MetadataReadAuthorization::peering(pg_id, read_route),
+            )
+            .map_err(store_error_response)?;
+        Ok(action(&pg))
+    }
+
     fn validate_pg_route_for_metadata_command_recovery(
         &self,
         node_id: NodeId,
@@ -17442,6 +17661,33 @@ impl StorageNodeConnectionHandler {
         )
     }
 
+    fn metadata_read_bucket_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcBucketRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeMetadataReadBucketRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_active_admission(route_permit, operation)?;
+        self.validate_metadata_read_pg_route(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        )?;
+        self.validate_pg_for_bucket(request.pg_id, &request.bucket, operation)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeMetadataReadBucketRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self.node.bucket_metadata_pg_for(&request.bucket),
+            bucket: &request.bucket,
+        })
+    }
+
     fn active_bucket_scan_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -17479,6 +17725,33 @@ impl StorageNodeConnectionHandler {
             .bucket_metadata_pg(pg_id)
             .expect("validated bucket scan PG must belong to the installed topology");
         Ok(StorageNodeActiveBucketScanRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id,
+        })
+    }
+
+    fn metadata_read_bucket_scan_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        operation: &'static str,
+    ) -> Result<StorageNodeMetadataReadBucketScanRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_active_admission(route_permit, operation)?;
+        self.validate_metadata_read_pg_route(node_id, cluster_epoch, pg_id)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        let pg_id = self
+            .node
+            .bucket_metadata_pg(pg_id)
+            .expect("validated bucket scan PG must belong to the installed topology");
+        Ok(StorageNodeMetadataReadBucketScanRoute {
             handler: self,
             _route_permit: route_permit,
             fence,
@@ -17602,6 +17875,36 @@ impl StorageNodeConnectionHandler {
         })
     }
 
+    fn metadata_read_object_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        request: &'a StorageRpcObjectRequest,
+        operation: &'static str,
+    ) -> Result<StorageNodeMetadataReadObjectRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_active_admission(route_permit, operation)?;
+        self.validate_metadata_read_pg_route(
+            request.node_id,
+            request.cluster_epoch,
+            request.pg_id,
+        )?;
+        self.validate_pg_for_object(request.pg_id, &request.bucket, &request.key, operation)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeMetadataReadObjectRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self
+                .node
+                .object_metadata_pg_for(&request.bucket, &request.key),
+            bucket: &request.bucket,
+            key: &request.key,
+        })
+    }
+
     fn active_primary_object_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
@@ -17683,6 +17986,32 @@ impl StorageNodeConnectionHandler {
             crate::clock::monotonic_time_millis(),
         )?;
         Ok(StorageNodeActivePrimaryObjectScanRoute {
+            handler: self,
+            _route_permit: route_permit,
+            fence,
+            pg_id: self
+                .node
+                .object_metadata_scan_pg(pg_id)
+                .expect("validated object metadata scan PG must belong to installed topology"),
+        })
+    }
+
+    fn metadata_read_object_scan_route<'a>(
+        &'a self,
+        route_permit: &'a StorageNodeRouteAdmissionPermit,
+        node_id: NodeId,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        operation: &'static str,
+    ) -> Result<StorageNodeMetadataReadObjectScanRoute<'a>, StorageRpcErrorResponse> {
+        self.validate_active_admission(route_permit, operation)?;
+        self.validate_metadata_read_pg_route(node_id, cluster_epoch, pg_id)?;
+        let fence = StorageNodeRouteFence::current(&self.config, self.current_route_map_lease());
+        fence.validate_rpc_at(
+            crate::clock::current_time_millis(),
+            crate::clock::monotonic_time_millis(),
+        )?;
+        Ok(StorageNodeMetadataReadObjectScanRoute {
             handler: self,
             _route_permit: route_permit,
             fence,
@@ -18032,7 +18361,7 @@ impl StorageNodeConnectionHandler {
     fn retained_shard_inspection_route<'a>(
         &'a self,
         route_permit: &'a StorageNodeRouteAdmissionPermit,
-        request: &'a StorageRpcShardReadRequest,
+        request: &'a StorageRpcHistoricalShardReadRequest,
         operation: &'static str,
     ) -> Result<StorageNodeRetainedShardInspectionRoute<'a>, StorageRpcErrorResponse> {
         let pg_id = self.validate_retained_shard_route(
@@ -19487,6 +19816,10 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
                 message: error.to_string(),
             }
         }
+        error @ StoreError::StaleMetadataReadProof { .. } => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::StaleShardLocation,
+            message: error.to_string(),
+        },
         error @ (StoreError::IntegrityError { .. } | StoreError::ShardAckMismatch { .. }) => {
             StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::ShardIntegrity,
@@ -20296,6 +20629,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(7)],
             }],
             historical_pg_routes: Vec::new(),
@@ -20319,6 +20653,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(7)],
             }],
             historical_pg_routes: Vec::new(),
@@ -20501,6 +20836,7 @@ mod tests {
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         }
     }
@@ -20576,6 +20912,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(7), NodeId::new(8)],
             },
             StorageNodePgRoute {
@@ -20584,6 +20921,7 @@ mod tests {
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(8),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(8), NodeId::new(7)],
             },
         ];
@@ -20594,6 +20932,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(7), NodeId::new(8)],
             },
             StorageNodePgRoute {
@@ -20602,6 +20941,7 @@ mod tests {
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(8),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(8), NodeId::new(7)],
             },
         ];
@@ -20674,7 +21014,7 @@ mod tests {
         let raw = encode_control_plane_runtime_config(&config);
         let mut lines: Vec<_> = raw.lines().map(str::to_owned).collect();
         let route_header = lines.iter().position(|line| line == "pg_routes 1").unwrap();
-        lines[route_header + 1] = format!("0 1 1 7 {} 7", usize::MAX);
+        lines[route_header + 1] = format!("0 1 1 7 - - - - - {} 7", usize::MAX);
         lines.push(String::new());
         let malformed = lines.join("\n");
 
@@ -20866,6 +21206,7 @@ mod tests {
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         });
 
@@ -22171,6 +22512,7 @@ mod tests {
             state: PgState::Peering,
             primary_node_id: candidate.node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![candidate.node_id],
         });
         candidate.pg_routes[0].cluster_epoch = candidate.cluster_epoch;
@@ -22408,6 +22750,7 @@ mod tests {
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(7),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(7)],
             },
             StorageNodePgRoute {
@@ -22416,6 +22759,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![NodeId::new(7)],
             },
         ];
@@ -22651,7 +22995,7 @@ mod tests {
         let retained_permit = server
             .route_admission
             .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
-        let request = StorageRpcShardReadRequest {
+        let request = StorageRpcHistoricalShardReadRequest {
             location: ShardLocation::new(
                 runtime_map.cluster_epoch(),
                 DataPgId::new_for_test(pg_id),
@@ -22660,10 +23004,6 @@ mod tests {
             )
             .into(),
             shard_key: test_shard_key(0),
-            expected_ack: WriteAck {
-                stored_size: 1,
-                crc64: 1,
-            },
         };
         let error = match server.connection_handler().retained_shard_inspection_route(
             &retained_permit,
@@ -23275,6 +23615,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![node_id],
             });
         }
@@ -23698,6 +24039,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![node_id],
             }],
 
@@ -25760,8 +26102,19 @@ mod tests {
                 )
                 .unwrap()
         });
+        let read_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .metadata_read_bucket_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test bucket metadata read scan",
+                )
+                .unwrap()
+        });
         crate::clock::with_time_override(1_000, || {
-            assert_eq!(route.list_buckets(owner.as_str()).unwrap().len(), 1);
+            assert_eq!(read_route.list_buckets(owner.as_str()).unwrap().len(), 1);
             assert!(route
                 .load_bucket_execution_generations(std::slice::from_ref(&bucket))
                 .unwrap()
@@ -25825,7 +26178,7 @@ mod tests {
                 }
             }
 
-            assert_expired(route.list_buckets(owner.as_str()));
+            assert_expired(read_route.list_buckets(owner.as_str()));
             assert_expired(route.load_bucket_execution_generations(std::slice::from_ref(&bucket)));
             assert_expired(route.load_bucket_fast_path_identities(std::slice::from_ref(&bucket)));
         });
@@ -25911,6 +26264,17 @@ mod tests {
                 )
                 .unwrap()
         });
+        let read_scan_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .metadata_read_object_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test object metadata read scan",
+                )
+                .unwrap()
+        });
         crate::clock::with_time_override(1_000, || {
             let expected_root = PayloadReclaimRoot {
                 bucket: bucket.clone(),
@@ -25929,7 +26293,7 @@ mod tests {
                 scan_route.object_payload_reclaim_claim().unwrap(),
                 Some(claim.clone())
             );
-            assert!(scan_route
+            assert!(read_scan_route
                 .list_objects_page(&crate::ListObjectsReq {
                     bucket: bucket.clone(),
                     prefix: None,
@@ -25940,7 +26304,7 @@ mod tests {
                 .unwrap()
                 .objects
                 .is_empty());
-            assert!(scan_route
+            assert!(read_scan_route
                 .list_object_versions_page(&crate::ListObjectVersionsReq {
                     bucket: bucket.clone(),
                     prefix: None,
@@ -25952,7 +26316,7 @@ mod tests {
                 .unwrap()
                 .versions
                 .is_empty());
-            assert!(scan_route
+            assert!(read_scan_route
                 .list_multipart_uploads_page(&crate::ListMultipartUploadsReq {
                     bucket: bucket.clone(),
                     prefix: None,
@@ -26101,7 +26465,7 @@ mod tests {
             assert_scan_route_expired(scan_route.bucket_payload_reclaim_root(&bucket));
             assert_scan_route_expired(scan_route.payload_reclaim_root());
             assert_scan_route_expired(scan_route.object_payload_reclaim_claim());
-            assert_bucket_scan_route_expired(scan_route.list_objects_page(
+            assert_bucket_scan_route_expired(read_scan_route.list_objects_page(
                 &crate::ListObjectsReq {
                     bucket: bucket.clone(),
                     prefix: None,
@@ -26110,7 +26474,7 @@ mod tests {
                     max_keys: 1,
                 },
             ));
-            assert_bucket_scan_route_expired(scan_route.list_object_versions_page(
+            assert_bucket_scan_route_expired(read_scan_route.list_object_versions_page(
                 &crate::ListObjectVersionsReq {
                     bucket: bucket.clone(),
                     prefix: None,
@@ -26120,7 +26484,7 @@ mod tests {
                     max_keys: 1,
                 },
             ));
-            assert_bucket_scan_route_expired(scan_route.list_multipart_uploads_page(
+            assert_bucket_scan_route_expired(read_scan_route.list_multipart_uploads_page(
                 &crate::ListMultipartUploadsReq {
                     bucket: bucket.clone(),
                     prefix: None,
@@ -26518,6 +26882,11 @@ mod tests {
                 .active_primary_object_route(&active_permit, &request, "test primary object route")
                 .unwrap()
         });
+        let read_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .metadata_read_object_route(&active_permit, &request, "test object read route")
+                .unwrap()
+        });
         let acting_set_route = crate::clock::with_time_override(1_000, || {
             handler
                 .active_object_route(&active_permit, &request, "test acting-set object route")
@@ -26648,9 +27017,9 @@ mod tests {
         assert!(mismatch_error.message.contains("key does not match"));
 
         let read_subject = crate::clock::with_time_override(1_000, || {
-            let subject = primary_route.load_object_read_auth_subject(None).unwrap();
+            let subject = read_route.load_object_read_auth_subject(None).unwrap();
             let expected_tags = crate::tests::object_tags(serialized_tags);
-            let snapshot = primary_route
+            let snapshot = read_route
                 .load_object_read_snapshot_for_subject(
                     None,
                     &subject.identity,
@@ -26660,7 +27029,7 @@ mod tests {
             assert_eq!(snapshot.stored, subject.stored);
             assert!(snapshot.object_segments.is_empty());
             assert_eq!(
-                primary_route
+                read_route
                     .get_object_tags_for_subject(None, &subject.identity, VersionId::Null,)
                     .unwrap()
                     .as_ref()
@@ -27497,13 +27866,13 @@ mod tests {
                     .as_deref(),
                 Some("\"0000000000000063\"")
             );
-            let listed = primary_route
+            let listed = read_route
                 .list_multipart_parts_for_authorized_upload(&authorized_upload, None, 10)
                 .unwrap();
             assert_eq!(listed.upload, multipart_upload);
             assert_eq!(listed.response.parts, vec![terminal_multipart_part.clone()]);
             assert!(matches!(
-                primary_route
+                read_route
                     .lookup_multipart_upload_management(&upload_id)
                     .unwrap(),
                 crate::MultipartUploadManagementLookup::InProgress(upload)
@@ -28047,13 +28416,11 @@ mod tests {
                 ),
                 (
                     "object read authorization subject load",
-                    primary_route
-                        .load_object_read_auth_subject(None)
-                        .map(|_| ()),
+                    read_route.load_object_read_auth_subject(None).map(|_| ()),
                 ),
                 (
                     "object read snapshot load",
-                    primary_route
+                    read_route
                         .load_object_read_snapshot_for_subject(
                             None,
                             &read_subject.identity,
@@ -28063,7 +28430,7 @@ mod tests {
                 ),
                 (
                     "object tags load",
-                    primary_route
+                    read_route
                         .get_object_tags_for_subject(None, &read_subject.identity, VersionId::Null)
                         .map(|_| ()),
                 ),
@@ -28237,13 +28604,13 @@ mod tests {
                 ),
                 (
                     "multipart parts list",
-                    primary_route
+                    read_route
                         .list_multipart_parts_for_authorized_upload(&authorized_upload, None, 10)
                         .map(|_| ()),
                 ),
                 (
                     "multipart management lookup",
-                    primary_route
+                    read_route
                         .lookup_multipart_upload_management(&upload_id)
                         .map(|_| ()),
                 ),
@@ -28397,6 +28764,84 @@ mod tests {
     }
 
     #[test]
+    fn peering_metadata_read_route_is_exact_and_does_not_grant_write_authority() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("peering-readable-bucket");
+        let changed_bucket = crate::tests::bucket_name("peering-proof-change-bucket");
+        let proof = {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            pg.refresh_metadata_command_state_digest().unwrap();
+            SharedStorageNode::pg_heartbeat_observation_from_pg(
+                &pg,
+                config.node_id,
+                PgId::new(0),
+                PgState::Peering,
+            )
+            .unwrap()
+            .metadata_proof
+        };
+
+        let mut peering = config.clone();
+        peering.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        peering.pg_routes[0].cluster_epoch = peering.cluster_epoch;
+        peering.pg_routes[0].state = PgState::Peering;
+        peering.pg_routes[0].primary_node_id = NodeId::new(8);
+        peering.pg_routes[0].acting_set = vec![NodeId::new(8), config.node_id];
+        peering.pg_routes[0].metadata_read_route =
+            Some(PgMetadataReadRoute::new(config.node_id, proof));
+        let peering_epoch = peering.cluster_epoch;
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(peering)
+                .unwrap();
+        });
+
+        let handler = server.connection_handler();
+        let permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: peering_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+        };
+        let read_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .metadata_read_bucket_route(&permit, &request, "Peering bucket read")
+                .unwrap()
+        });
+        crate::clock::with_time_override(1_000, || {
+            assert_eq!(read_route.head_bucket(true).unwrap().name, bucket);
+            match handler.active_bucket_route(&permit, &request, "Peering bucket mutation") {
+                Err(error) => assert_eq!(error.code, StorageRpcErrorCode::InactivePgRoute),
+                Ok(_) => panic!("Peering metadata read certificate granted mutation authority"),
+            }
+        });
+
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &changed_bucket);
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+        crate::clock::with_time_override(1_000, || match read_route.head_bucket(true) {
+            Err(StorageNodeBucketRouteError::Route(error)) => {
+                assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                assert!(error.message.contains("certified metadata read proof"));
+            }
+            Err(error) => panic!("changed Peering proof returned wrong error: {error:?}"),
+            Ok(info) => panic!("changed Peering proof served stale certificate: {info:?}"),
+        });
+    }
+
+    #[test]
     fn active_bucket_route_atomically_captures_deadline_during_validity_extension() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
@@ -28507,6 +28952,11 @@ mod tests {
                 .active_bucket_route(&route_permit, &request, "test bucket read")
                 .unwrap()
         });
+        let read_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .metadata_read_bucket_route(&route_permit, &request, "test bucket read")
+                .unwrap()
+        });
         let pair_route = crate::clock::with_time_override(1_000, || {
             handler
                 .active_bucket_route_pair(
@@ -28535,13 +28985,15 @@ mod tests {
                 .unwrap()
         });
         crate::clock::with_time_override(1_000, || {
-            assert_eq!(route.head_bucket(true).unwrap().name, bucket);
+            assert_eq!(read_route.head_bucket(true).unwrap().name, bucket);
             assert_eq!(
-                route.get_subresource(BucketSubresourceKind::Cors).unwrap(),
+                read_route
+                    .get_subresource(BucketSubresourceKind::Cors)
+                    .unwrap(),
                 None
             );
             assert_eq!(
-                route
+                read_route
                     .load_snapshot(BucketSnapshotRequest::default())
                     .unwrap()
                     .bucket
@@ -28602,7 +29054,7 @@ mod tests {
             );
         });
 
-        crate::clock::with_time_override(6_000, || match route.head_bucket(true) {
+        crate::clock::with_time_override(6_000, || match read_route.head_bucket(true) {
             Err(StorageNodeBucketRouteError::Route(error)) => {
                 assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
                 assert!(error.message.contains("expired at 5000ms, now 6000ms"));
@@ -30040,13 +30492,9 @@ mod tests {
         let config = test_config(&tmp);
         private_socket_dir(config.socket_path.parent().unwrap());
         let location = test_location(1, 0, 7);
-        let request = StorageRpcShardReadRequest {
+        let request = StorageRpcHistoricalShardReadRequest {
             location: location.into(),
             shard_key: test_shard_key(0),
-            expected_ack: WriteAck {
-                stored_size: 9,
-                crc64: 0x1234,
-            },
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();
@@ -30057,7 +30505,7 @@ mod tests {
             &mut client,
             1,
             StorageRpcMessageKind::ShardHistoricalRead,
-            encode_shard_read_request(&request).unwrap(),
+            crate::storage_rpc::encode_historical_shard_read_request(&request).unwrap(),
         );
         drop(client);
         join.join().unwrap();
@@ -30582,7 +31030,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_data_inspection_capabilities_bind_exact_route_primary_and_subject() {
+    fn retained_data_inspection_capabilities_bind_exact_route_and_subject() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
         config.cluster_epoch = ClusterEpoch::new(4).unwrap();
@@ -30595,6 +31043,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: config.node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![config.node_id],
             },
             StorageNodePgRoute {
@@ -30603,6 +31052,7 @@ mod tests {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(8),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![config.node_id, NodeId::new(8)],
             },
         ];
@@ -30633,10 +31083,9 @@ mod tests {
         let foreign_permit = StorageNodeRouteAdmissionGate::default()
             .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
         let location = test_location(3, 0, config.node_id.as_u32());
-        let payload_request = StorageRpcShardReadRequest {
+        let payload_request = StorageRpcHistoricalShardReadRequest {
             location: location.into(),
             shard_key: shard_key.clone(),
-            expected_ack: ack,
         };
         let ack_request = StorageRpcShardAckItemRequest {
             node_id: config.node_id,
@@ -30706,7 +31155,7 @@ mod tests {
                 Ok(_) => panic!("invalid admission created historical shard-ack authority"),
             }
         }
-        let crossed_payload_request = StorageRpcShardReadRequest {
+        let crossed_payload_request = StorageRpcHistoricalShardReadRequest {
             location: test_location_with_shard(3, 0, config.node_id.as_u32(), 1).into(),
             ..payload_request.clone()
         };
@@ -30720,7 +31169,7 @@ mod tests {
         };
         assert_eq!(crossed.code, StorageRpcErrorCode::PayloadDecode);
 
-        let unretained_payload_request = StorageRpcShardReadRequest {
+        let unretained_payload_request = StorageRpcHistoricalShardReadRequest {
             location: test_location(2, 0, config.node_id.as_u32()).into(),
             ..payload_request.clone()
         };
@@ -31467,6 +31916,7 @@ mod tests {
             state: PgState::Active,
             primary_node_id: NodeId::new(8),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7), NodeId::new(8)],
         }];
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -33074,6 +33524,7 @@ mod tests {
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         });
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -33119,6 +33570,7 @@ mod tests {
             state: PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         });
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -33872,6 +34324,7 @@ mod tests {
             state: PgState::Peering,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         });
         private_socket_dir(config.socket_path.parent().unwrap());

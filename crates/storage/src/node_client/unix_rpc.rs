@@ -180,18 +180,16 @@ impl UnixStorageNodeClient {
         &self,
         location: crate::cluster::ShardLocation,
         key: &ShardKey,
-        expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
-        let request = StorageRpcShardReadRequest {
+    ) -> Result<(Vec<u8>, WriteAck), StoreError> {
+        let request = StorageRpcHistoricalShardReadRequest {
             location: location.into(),
             shard_key: key.clone(),
-            expected_ack,
         };
-        let payload = encode_shard_read_request(&request).map_err(|error| {
+        let payload = encode_historical_shard_read_request(&request).map_err(|error| {
             self.rpc_payload_error("encode historical shard read request", error.to_string())
         })?;
         let response = self.rpc_request(StorageRpcMessageKind::ShardHistoricalRead, payload)?;
-        decode_shard_read_response(&response, expected_ack).map_err(|error| {
+        decode_historical_shard_read_response(&response).map_err(|error| {
             self.rpc_payload_error("decode historical shard read response", error.to_string())
         })
     }
@@ -1147,13 +1145,11 @@ impl RetainedPlacedShardNodeClient for UnixStorageNodeClient {
 impl RetainedPlacedShardRoute for UnixRetainedPlacedShardRoute<'_> {
     fn read_placed_shard_for_historical_inspection(
         &self,
-        expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
+    ) -> Result<(Vec<u8>, WriteAck), StoreError> {
         UnixStorageNodeClient::read_placed_shard_for_historical_inspection(
             self.client,
             self.location,
             &self.key,
-            expected_ack,
         )
     }
 
@@ -4643,6 +4639,16 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         }))
     }
 
+    fn open_bucket_metadata_read_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        _authorization: MetadataReadAuthorization,
+    ) -> Result<Box<dyn BucketMetadataRoute + '_>, BucketSnapshotLoadError> {
+        self.open_bucket_metadata_route(route_cluster_epoch, pg_id, bucket)
+    }
+
     fn open_bucket_metadata_route_pair(
         &self,
         route_cluster_epoch: ClusterEpoch,
@@ -4697,6 +4703,15 @@ impl BucketMetadataNodeClient for UnixStorageNodeClient {
         &self,
         route_cluster_epoch: ClusterEpoch,
         pg_id: BucketPgId,
+    ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
+        self.open_bucket_metadata_scan_route_impl(route_cluster_epoch, pg_id)
+    }
+
+    fn open_bucket_metadata_read_scan_route(
+        &self,
+        route_cluster_epoch: ClusterEpoch,
+        pg_id: BucketPgId,
+        _authorization: MetadataReadAuthorization,
     ) -> Result<Box<dyn BucketMetadataScanRoute + '_>, BucketSnapshotLoadError> {
         self.open_bucket_metadata_scan_route_impl(route_cluster_epoch, pg_id)
     }

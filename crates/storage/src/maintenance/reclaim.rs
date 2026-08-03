@@ -266,6 +266,7 @@ fn store_error_is_retryable(error: &StoreError) -> bool {
         | StoreError::StaleMetadataPrimaryBridge { .. }
         | StoreError::StaleMetadataOperation { .. }
         | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleMetadataReadProof { .. }
         | StoreError::RouteMapExpired { .. }
         | StoreError::RouteAdmissionClusterMismatch { .. }
         | StoreError::StaleShardOperation { .. }

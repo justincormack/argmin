@@ -5476,6 +5476,7 @@ fn standalone_storage_node_process_config(
             state: PgState::Active,
             primary_node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: acting_set.clone(),
         })
         .collect();

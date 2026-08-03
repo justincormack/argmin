@@ -429,6 +429,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![config.node_id],
         },
         StorageNodePgRoute {
@@ -437,6 +438,7 @@ fn unix_retained_stream_abort_cleans_expired_route_session() {
             state: crate::types::PgState::Active,
             primary_node_id: config.node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![config.node_id],
         },
     ];
@@ -846,6 +848,7 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         state: crate::types::PgState::Active,
         primary_node_id: NodeId::new(7),
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: vec![NodeId::new(7)],
     });
     private_socket_dir(config.socket_path.parent().unwrap());
@@ -878,7 +881,11 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
         }) if operation_epoch == future_epoch && current_epoch == client.cluster_epoch
     ));
     let installed_route = client
-        .open_object_listing_metadata_route(ClusterEpoch::INITIAL, installed_scan_pg)
+        .open_object_listing_metadata_route(
+            ClusterEpoch::INITIAL,
+            installed_scan_pg,
+            MetadataReadAuthorization::active(installed_scan_pg.pg_id()),
+        )
         .unwrap();
 
     let objects = installed_route
@@ -923,7 +930,11 @@ fn unix_object_metadata_scans_accept_installed_scan_pg_and_reject_unknown_pg() {
     assert!(uploads.next_upload_id_marker.is_none());
 
     let unknown_route = client
-        .open_object_listing_metadata_route(ClusterEpoch::INITIAL, unknown_scan_pg)
+        .open_object_listing_metadata_route(
+            ClusterEpoch::INITIAL,
+            unknown_scan_pg,
+            MetadataReadAuthorization::active(unknown_scan_pg.pg_id()),
+        )
         .unwrap();
     let Err(object_error) = unknown_route.list_objects_page(&ListObjectsReq {
         bucket: bucket.clone(),
@@ -1343,6 +1354,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -1351,6 +1363,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -1558,6 +1571,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         correct_object_pg,
         &bucket,
         &key,
+        MetadataReadAuthorization::active(correct_object_pg.pg_id()),
     )
     .unwrap();
     let read_subject = correct_read_route
@@ -1569,6 +1583,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         wrong_object_pg,
         &bucket,
         &key,
+        MetadataReadAuthorization::active(wrong_object_pg.pg_id()),
     )
     .unwrap();
     let read_subject_error = wrong_read_route
@@ -2168,6 +2183,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -2176,6 +2192,7 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -2791,6 +2808,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -2799,6 +2817,7 @@ fn unix_multipart_metadata_rejects_wrong_object_pg_before_node_access() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -3271,6 +3290,7 @@ fn installed_unix_object_scan_routes_reject_misplaced_durable_rows_as_payload_de
         state: crate::types::PgState::Active,
         primary_node_id: config.node_id,
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: vec![config.node_id],
     });
     let pg_topology = Arc::new(PgTopology::new(&config.pg_ids).unwrap());
@@ -3352,6 +3372,7 @@ fn installed_unix_object_scan_routes_reject_misplaced_durable_rows_as_payload_de
         .open_object_listing_metadata_route(
             config.cluster_epoch,
             ObjectMetadataScanPgId::new_for_test(PgId::new(0)),
+            MetadataReadAuthorization::active(PgId::new(0)),
         )
         .unwrap();
 
@@ -3501,6 +3522,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
         ObjectMetadataPgId::new_for_test(PgId::new(0)),
         &bucket,
         &key,
+        MetadataReadAuthorization::active(PgId::new(0)),
     )
     .unwrap();
     let subject = read_route.load_object_read_auth_subject(None).unwrap();
@@ -4199,6 +4221,7 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
         StorageNodePgRoute {
@@ -4207,6 +4230,7 @@ fn unix_stream_uploads_list_rejects_wrong_pg_rows() {
             state: crate::types::PgState::Active,
             primary_node_id: NodeId::new(7),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![NodeId::new(7)],
         },
     ];
@@ -4523,6 +4547,7 @@ fn unix_object_payload_reclaim_roles_reject_equivalent_wrong_pg_state() {
         state: crate::types::PgState::Active,
         primary_node_id: NodeId::new(7),
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: vec![NodeId::new(7)],
     });
     let bucket = crate::tests::bucket_name("object-reclaim-role-rpc-bucket");

@@ -85,7 +85,7 @@ const CONTROL_PLANE_RPC_AUTH_FUTURE_SKEW_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDG
 const CONTROL_PLANE_RPC_HEARTBEAT_OBSERVATION_MIN_LEN: usize = 4 + 1 + 8 + 8 + 8 + 1;
 const CONTROL_PLANE_RPC_HISTORY_ROUTE_REFERENCE_MIN_LEN: usize = 1 + 8 + 4;
 const CONTROL_PLANE_RPC_RUNTIME_NODE_MIN_LEN: usize = 4 + 8 + 4 + 1;
-const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 1 + 4 + 1;
+const CONTROL_PLANE_RPC_PG_ROUTE_MIN_LEN: usize = 8 + 4 + 4 + 1 + 1 + 1 + 1 + 4 + 1;
 const CONTROL_PLANE_RPC_ACTING_SET_NODE_MIN_LEN: usize = 4;
 const CONTROL_PLANE_RPC_PENDING_RECOVERY_TASK_MIN_LEN: usize = 4 + 4 + 8 + 8 + 8;
 const CONTROL_PLANE_RPC_PENDING_RECOVERY_FAILURE_MIN_LEN: usize = 4 + 1 + 4;
@@ -1581,6 +1581,7 @@ impl ClusterControlSnapshot {
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
             active_metadata_proof: record.active_metadata_proof,
+            metadata_read_route: None,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -1632,6 +1633,7 @@ impl ClusterControlSnapshot {
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
             active_metadata_proof: record.active_metadata_proof,
+            metadata_read_route: None,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -1671,6 +1673,7 @@ impl ClusterControlSnapshot {
             acting_set: record.acting_set.clone(),
             state: PgState::Active,
             active_metadata_proof: record.active_metadata_proof,
+            metadata_read_route: None,
             primary_lease_deadline_ms: Some(primary_lease_deadline_ms),
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -1695,6 +1698,7 @@ impl ClusterControlSnapshot {
         if record.state == PgState::Active {
             return self.active_pg_route(pg_id, now_ms);
         }
+        let metadata_read_route = peering_metadata_read_route_for_snapshot(self, record, now_ms);
         let primary = record
             .acting_set
             .first()
@@ -1717,6 +1721,7 @@ impl ClusterControlSnapshot {
             acting_set: record.acting_set.clone(),
             state: record.state,
             active_metadata_proof: None,
+            metadata_read_route,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: record.peering_metadata_transfer,
             peering_metadata_transfer_destination_epoch:
@@ -4730,6 +4735,40 @@ fn peering_pg_primary_for_snapshot(
     deterministic_pg_primary_for_snapshot(snapshot, record.acting_set(), now_ms)
 }
 
+fn peering_metadata_read_route_for_snapshot(
+    snapshot: &ClusterControlSnapshot,
+    record: &PgControlRecord,
+    now_ms: u64,
+) -> Option<PgMetadataReadRoute> {
+    let committed_floor = record.peering_metadata_proof_floor_context()?;
+    record.acting_set.iter().copied().find_map(|node_id| {
+        let node = snapshot.node(node_id)?;
+        if !node.can_serve_primary(snapshot.cluster_epoch, now_ms) {
+            return None;
+        }
+        let observation = node.pg_observation(record.pg_id)?;
+        if observation.observed_epoch != snapshot.cluster_epoch
+            || observation.state != PgState::Peering
+            || observation.has_pending_metadata_command()
+            || validate_peering_metadata_proof_floor(
+                snapshot.cluster_epoch,
+                record.pg_id,
+                node_id,
+                Some(committed_floor),
+                record.peering_metadata_transfer,
+                observation.metadata_proof,
+            )
+            .is_err()
+        {
+            return None;
+        }
+        Some(PgMetadataReadRoute::new(
+            node_id,
+            observation.metadata_proof,
+        ))
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PgRouteSnapshot {
     cluster_epoch: ClusterEpoch,
@@ -4738,6 +4777,7 @@ pub struct PgRouteSnapshot {
     acting_set: Vec<NodeId>,
     state: PgState,
     active_metadata_proof: Option<PgMetadataProof>,
+    metadata_read_route: Option<PgMetadataReadRoute>,
     primary_lease_deadline_ms: Option<u64>,
     peering_metadata_transfer: Option<PgMetadataTransferProof>,
     peering_metadata_transfer_destination_epoch: Option<ClusterEpoch>,
@@ -4761,6 +4801,7 @@ impl PgRouteSnapshot {
             acting_set,
             state,
             active_metadata_proof: None,
+            metadata_read_route: None,
             primary_lease_deadline_ms: None,
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -4801,6 +4842,11 @@ impl PgRouteSnapshot {
     }
 
     #[must_use]
+    pub fn metadata_read_route(&self) -> Option<PgMetadataReadRoute> {
+        self.metadata_read_route
+    }
+
+    #[must_use]
     pub fn primary_lease_deadline_ms(&self) -> Option<u64> {
         self.primary_lease_deadline_ms
     }
@@ -4834,6 +4880,7 @@ impl PgRouteSnapshot {
     pub fn without_serving_authority(&self) -> Self {
         let mut route = self.clone();
         route.primary_lease_deadline_ms = None;
+        route.metadata_read_route = None;
         route
     }
 
@@ -5486,6 +5533,14 @@ pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSna
             }
             None => digest_u8(hasher, 0),
         }
+        match route.metadata_read_route() {
+            Some(read_route) => {
+                digest_u8(hasher, 1);
+                digest_u32(hasher, read_route.node_id().as_u32());
+                digest_pg_metadata_proof(hasher, read_route.proof());
+            }
+            None => digest_u8(hasher, 0),
+        }
         match route.peering_metadata_transfer() {
             Some(transfer) => {
                 digest_u8(hasher, 1);
@@ -5756,6 +5811,7 @@ fn reconstruct_historical_pg_route(
         acting_set: record.acting_set.clone(),
         state: record.state,
         active_metadata_proof: None,
+        metadata_read_route: None,
         primary_lease_deadline_ms: None,
         peering_metadata_transfer: record.peering_metadata_transfer,
         peering_metadata_transfer_destination_epoch: record
@@ -5988,6 +6044,7 @@ fn reconstruct_pg_route_from_record(
         active_metadata_proof: (record.state == PgState::Active)
             .then_some(record.active_metadata_proof)
             .flatten(),
+        metadata_read_route: None,
         primary_lease_deadline_ms: None,
         peering_metadata_transfer: record.peering_metadata_transfer,
         peering_metadata_transfer_destination_epoch: peering_metadata_transfer_destination_epoch(
@@ -6420,6 +6477,31 @@ pub struct PgMetadataProof {
     pub applied_log_index: u64,
     pub applied_log_hash: u64,
     pub state_digest: u64,
+}
+
+/// Read-only metadata authority for one node whose durable replica state is
+/// exactly equal to a control-plane-certified committed proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PgMetadataReadRoute {
+    node_id: NodeId,
+    proof: PgMetadataProof,
+}
+
+impl PgMetadataReadRoute {
+    #[must_use]
+    pub const fn new(node_id: NodeId, proof: PgMetadataProof) -> Self {
+        Self { node_id, proof }
+    }
+
+    #[must_use]
+    pub const fn node_id(self) -> NodeId {
+        self.node_id
+    }
+
+    #[must_use]
+    pub const fn proof(self) -> PgMetadataProof {
+        self.proof
+    }
 }
 
 impl PgMetadataProof {
@@ -18464,6 +18546,14 @@ fn write_pg_route_snapshots(
             }
             None => write_u8(out, 0),
         }
+        match route.metadata_read_route() {
+            Some(read_route) => {
+                write_u8(out, 1);
+                write_u32(out, read_route.node_id().as_u32());
+                write_pg_metadata_proof(out, read_route.proof());
+            }
+            None => write_u8(out, 0),
+        }
         write_option_u64(out, route.primary_lease_deadline_ms());
         match route.peering_metadata_transfer() {
             Some(transfer) => {
@@ -18797,6 +18887,28 @@ fn validate_runtime_map_routes(
                 route.state()
             )));
         }
+        if let Some(read_route) = route.metadata_read_route() {
+            if !is_current_route_set {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} grants metadata read authority on a historical route",
+                    route.pg_id().get()
+                )));
+            }
+            if !acting_set.contains(&read_route.node_id()) {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} metadata read node {} is outside the acting set",
+                    route.pg_id().get(),
+                    read_route.node_id().as_u32()
+                )));
+            }
+            if route.state() != PgState::Peering {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "{label} route for PG {} grants metadata read authority while {:?}",
+                    route.pg_id().get(),
+                    route.state()
+                )));
+            }
+        }
         if route.peering_metadata_transfer().is_some()
             && (route
                 .peering_metadata_transfer_destination_epoch()
@@ -18932,6 +19044,18 @@ fn read_pg_route_snapshots(
                 )));
             }
         };
+        let metadata_read_route = match reader.read_u8()? {
+            0 => None,
+            1 => Some(PgMetadataReadRoute::new(
+                NodeId::new(reader.read_u32()?),
+                read_pg_metadata_proof(reader)?,
+            )),
+            tag => {
+                return Err(ControlPlaneError::rpc_protocol(format!(
+                    "invalid PG metadata read route tag {tag}"
+                )));
+            }
+        };
         let primary_lease_deadline_ms = reader.read_option_u64()?;
         let (
             peering_metadata_transfer,
@@ -19047,6 +19171,7 @@ fn read_pg_route_snapshots(
             acting_set,
             state,
             active_metadata_proof,
+            metadata_read_route,
             primary_lease_deadline_ms,
             peering_metadata_transfer,
             peering_metadata_transfer_destination_epoch,
@@ -35903,6 +36028,7 @@ mod tests {
         write_u32(&mut payload, 1);
         write_pg_state(&mut payload, PgState::Active);
         write_u8(&mut payload, 0);
+        write_u8(&mut payload, 0);
         write_option_u64(&mut payload, None);
         write_u8(&mut payload, 0);
         write_u8(&mut payload, 0);
@@ -36398,6 +36524,7 @@ mod tests {
                 peering_metadata_transfer_source_route_epoch: None,
                 peering_metadata_transfer_source_node_id: None,
                 pending_metadata_command_recovery: None,
+                metadata_read_route: None,
             }],
             historical_pg_routes: Vec::new(),
             historical_cluster_epochs: Vec::new(),
@@ -43475,6 +43602,170 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn pg_route_certifies_clean_peering_metadata_descendant() {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(24), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap();
+
+        let committed_proof = PgMetadataProof {
+            applied_log_index: 7,
+            applied_log_hash: 0xabc,
+            state_digest: 0xdef,
+        };
+        for node_id in [1, 2] {
+            heartbeat_with_pg_proof(
+                &mut authority,
+                node_id,
+                24,
+                PgState::Peering,
+                committed_proof,
+                false,
+                2_000 + u64::from(node_id),
+            );
+        }
+        authority
+            .complete_pg_peering(
+                PgId::new(24),
+                NodeId::new(1),
+                node_incarnation(&authority, 1),
+                2_010,
+            )
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            1,
+            24,
+            PgState::Active,
+            committed_proof,
+            false,
+            2_011,
+        );
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            24,
+            PgState::Active,
+            committed_proof,
+            false,
+            2_012,
+        );
+
+        authority
+            .set_pg_acting_set(PgId::new(24), vec![NodeId::new(2)])
+            .unwrap();
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            24,
+            PgState::Peering,
+            committed_proof,
+            false,
+            2_020,
+        );
+        let route = authority.snapshot().pg_route(PgId::new(24), 2_021).unwrap();
+        assert_eq!(route.state(), PgState::Peering);
+        assert_eq!(
+            route.metadata_read_route(),
+            Some(PgMetadataReadRoute::new(NodeId::new(2), committed_proof))
+        );
+        let local_route = crate::cluster::LocalPgRoute::from(&route);
+        let local_map =
+            crate::cluster::LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+                NodeId::new(1),
+                [NodeId::new(1), NodeId::new(2)],
+                &[24],
+                crate::EcShape { k: 1, m: 1 },
+                authority.snapshot().cluster_epoch(),
+                vec![local_route],
+            )
+            .unwrap();
+        assert_eq!(
+            local_map
+                .metadata_pg_read_node(authority.snapshot().cluster_epoch(), PgId::new(24))
+                .unwrap()
+                .node_id(),
+            NodeId::new(2)
+        );
+        assert!(local_map
+            .metadata_pg_primary_node(authority.snapshot().cluster_epoch(), PgId::new(24))
+            .is_err());
+
+        let ahead_proof = PgMetadataProof {
+            applied_log_index: committed_proof.applied_log_index + 1,
+            applied_log_hash: committed_proof.applied_log_hash + 1,
+            state_digest: committed_proof.state_digest + 1,
+        };
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            24,
+            PgState::Peering,
+            ahead_proof,
+            false,
+            2_022,
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .pg_route(PgId::new(24), 2_023)
+                .unwrap()
+                .metadata_read_route(),
+            Some(PgMetadataReadRoute::new(NodeId::new(2), ahead_proof)),
+            "a clean replica that satisfies the committed floor remains readable"
+        );
+
+        heartbeat_with_pg_proof(
+            &mut authority,
+            2,
+            24,
+            PgState::Peering,
+            PgMetadataProof::empty(),
+            false,
+            2_024,
+        );
+        assert_eq!(
+            authority
+                .snapshot()
+                .pg_route(PgId::new(24), 2_025)
+                .unwrap()
+                .metadata_read_route(),
+            None,
+            "a replica below the committed floor must not be certified"
+        );
+
+        let mut pending_snapshot = authority.snapshot().clone();
+        let pending_epoch = pending_snapshot.cluster_epoch();
+        let pending_observation = pending_snapshot
+            .nodes
+            .get_mut(&NodeId::new(2))
+            .unwrap()
+            .pg_observations
+            .get_mut(&PgId::new(24))
+            .unwrap();
+        pending_observation.metadata_proof = committed_proof;
+        pending_observation.pending_metadata_command =
+            Some(test_pending_metadata_command(pending_epoch));
+        assert_eq!(
+            peering_metadata_read_route_for_snapshot(
+                &pending_snapshot,
+                pending_snapshot.pg(PgId::new(24)).unwrap(),
+                2_027,
+            ),
+            None,
+            "a pending command makes the replica's visible state ambiguous"
+        );
     }
 
     #[test]

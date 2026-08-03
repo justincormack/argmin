@@ -13,7 +13,8 @@ Every public `StorageCluster` operation must fit one of these classes:
 |---|---|
 | Construction | Creates a handle for the current local map epoch, except explicit test hooks that can create stale handles. |
 | Read-only topology/config | May read local map or static topology/config without an epoch fence. It must not read object metadata, payload bytes, or worker queues. |
-| Epoch-fenced routed metadata PG | Must route through the PG primary selected by the cluster map. Stale handles fail with `StoreError::StaleMetadataOperation`; inactive or missing routes fail with typed route errors before metadata is read or mutated. |
+| Epoch-fenced routed metadata read | Routes through the active PG primary or, while Peering, through the exact replica named by the control-plane metadata-read certificate. Stale handles and uncertified routes fail with typed route errors before metadata is read. |
+| Epoch-fenced routed metadata mutation | Must route through the Active PG primary selected by the cluster map. Stale handles, inactive routes, and non-primary nodes fail with typed route errors before metadata is mutated. |
 | Epoch-fenced metadata bridge test hook | Test-only bridge helpers must fail with `StoreError::StaleMetadataPrimaryBridge` when the handle epoch is stale. Production metadata paths must not use this class. |
 | Payload placement/read/write/delete | Must use `StorageCluster` placed payload APIs. Stale placement becomes `StalePayloadOperation`; stale shard IO becomes `StaleShardOperation` or `StaleShardLocation`. |
 | Best-effort cleanup/worker queue | May suppress stale-handle and cleanup failures only where the API is explicitly best effort. Suppressed payload cleanup failures must emit typed trace context when tracing is active. |
@@ -22,13 +23,33 @@ Every public `StorageCluster` operation must fit one of these classes:
 
 ## Invariants
 
-- Single-PG metadata reads and writes must route through the cluster map PG
-  primary. They must not fall back to the process-wide metadata-primary node.
-- `PgState::Active` is the only serving PG state in the local Phase 6
-  implementation. `Peering`, `Degraded`, `Backfilling`, and `Inconsistent` are
-  placeholders for later failure/repair work and must fail closed with typed
-  route/control-plane errors before metadata or payload state is read or
-  mutated.
+- Single-PG metadata mutations must route through the cluster map's Active PG
+  primary. They must not fall back to the process-wide metadata-primary node or
+  to a read-certified replica.
+- Single-PG metadata reads route through the Active primary in the ordinary
+  case. While a PG is `Peering`, they may instead use the exact node and
+  metadata proof in the current control-plane `PgMetadataReadRoute`. The
+  authority may issue that certificate only when the replica is healthy,
+  reports `Peering`, has no pending metadata command, and its complete metadata
+  proof satisfies the committed Peering floor under the same provenance-aware
+  progression rules used by Peering recovery. The certificate binds the
+  replica's actual proof, including any acknowledged metadata commands beyond
+  a stale heartbeat floor; imported-transfer floors retain their stricter
+  transfer-proof validation.
+- Storage-node handlers and embedded read routes bind each read authorization
+  to its exact PG, then recheck the current route, certificate, exact metadata
+  proof, and empty pending slot while holding that PG's lock used for the
+  SQLite read. A certificate cannot be substituted between PGs with equal
+  proofs, and a runtime-map or local metadata change cannot race certificate
+  validation and read publication.
+  The capability exposes bucket/object point reads, read-only listings,
+  multipart classification and ListParts only; it cannot construct a metadata
+  mutation route.
+- `PgState::Active` remains the only state that accepts new mutations.
+  `Peering` without a valid metadata-read certificate, and all metadata reads
+  in `Degraded`, `Backfilling`, or `Inconsistent`, fail closed with typed route
+  errors. Payload reads may separately use their retained-route EC
+  reconstruction capability when at least `k` valid shards are reachable.
 - Phase 6 writes are strict. A successful write must apply to every required
   metadata acting-set replica and write every required payload shard. The local
   implementation must not acknowledge quorum writes, degraded writes, or
@@ -172,6 +193,31 @@ lease and disappears when the authority no longer reports the pending command.
 The route-admission permit means a newer runtime config cannot publish between
 the check and commit; expiry or guard failure rolls the transaction back,
 including command-log, pending, and materialized metadata changes.
+
+Read-only metadata access uses a separate capability. In `Active`, it resolves
+to the current primary. In `Peering`, it resolves only to the replica selected
+by the current `PgMetadataReadRoute`; storage atomically verifies the certified
+proof and absence of a pending command before reading. Route admission still
+drains across runtime-config replacement, so neither the control-plane
+certificate nor its lease can change between validation and response
+construction. This availability path does not weaken the mutation fence.
+
+Retained-route payload reads do not depend on the historical data-PG primary
+remaining available. Each exact historical shard owner returns the stored
+payload together with a size and checksum derived from that same read; the
+authenticated response codec verifies that binding before exposing either
+value. The frontend accepts only the expected shard size, reconstructs from any
+`k` valid surviving shards, and verifies the complete segment checksum before
+returning bytes. If that checksum fails and another shard is available, it
+performs at most `k` single-shard-exclusion reconstructions to retain the
+existing one-corrupt-shard recovery contract and identify the suspect repair
+target without an unbounded combination search. Failure to record that optional
+repair while the PG has no Active mutation route does not invalidate bytes that
+passed the segment checksum. A connection failure to one owner is temporary
+unavailability, not proof that its shard needs repair, and must not enqueue
+destructive repair work. Maintenance and backfill paths may still compare a
+shard against the historical primary's durable acknowledgement catalogue when
+that catalogue is part of their stronger repair proof.
 
 The control plane independently fences successor activation. Whenever a PG
 leaves `Active`, it persists the previous primary's node ID, incarnation,

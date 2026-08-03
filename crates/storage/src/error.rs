@@ -236,6 +236,11 @@ pub enum StoreError {
     },
 
     #[error(
+        "local node {node_id} no longer matches the certified metadata read proof for PG {pg_id}"
+    )]
+    StaleMetadataReadProof { node_id: u32, pg_id: u32 },
+
+    #[error(
         "runtime route map for cluster epoch {cluster_epoch} expired at {valid_until_ms}; current time is {now_ms}"
     )]
     RouteMapExpired {
@@ -561,6 +566,9 @@ impl StoreError {
     pub fn storage_node_failure_class(&self) -> Option<StorageNodeFailureClass> {
         match self {
             Self::ShardStore { source, .. } => source.storage_node_failure_class(),
+            Self::StaleMetadataReadProof { .. } => {
+                Some(StorageNodeFailureClass::ShardLocationStale)
+            }
             Self::StorageRpc { failure, .. } => match failure.wire_code() {
                 StorageRpcWireErrorCode::StaleShardLocation => {
                     Some(StorageNodeFailureClass::ShardLocationStale)
@@ -653,6 +661,7 @@ impl StoreError {
             Self::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
             Self::StaleMetadataOperation { .. } => "stale_metadata_operation",
             Self::StaleMetadataRoute { .. } => "stale_metadata_route",
+            Self::StaleMetadataReadProof { .. } => "stale_metadata_read_proof",
             Self::RouteMapExpired { .. } => "route_map_expired",
             Self::RouteAdmissionClusterMismatch { .. } => "route_admission_cluster_mismatch",
             Self::RouteCapabilitySubjectMismatch { .. } => "route_capability_subject_mismatch",
@@ -1314,6 +1323,7 @@ fn store_error_requires_metadata_transfer_route_refresh(error: &StoreError) -> b
         StoreError::RouteMapExpired { .. }
         | StoreError::StaleMetadataOperation { .. }
         | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleMetadataReadProof { .. }
         | StoreError::StaleShardLocation { .. } => true,
         StoreError::ShardStore { source, .. } => {
             store_error_requires_metadata_transfer_route_refresh(source)

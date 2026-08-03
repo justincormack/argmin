@@ -964,6 +964,7 @@ fn shard_backfill_error_is_stale_retry(error: &StoreError) -> bool {
         | StoreError::StaleMetadataPrimaryBridge { .. }
         | StoreError::StaleMetadataOperation { .. }
         | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleMetadataReadProof { .. }
         | StoreError::RouteMapExpired { .. }
         | StoreError::StaleShardOperation { .. }
         | StoreError::StaleShardLocation { .. }

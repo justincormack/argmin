@@ -41,7 +41,7 @@ use crate::node_client::{
     BuildDeleteSpecificObjectVersionCommandReq, BuildInsertDeleteMarkerCommandReq,
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
-    InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild,
+    InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild, MetadataReadAuthorization,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::traits::DurableBucketWriteReservationAcquire;
@@ -153,6 +153,7 @@ fn durable_reclaim_scan_requires_route_refresh(error: &StoreError) -> bool {
         | StoreError::StaleMetadataPrimaryBridge { .. }
         | StoreError::StaleMetadataOperation { .. }
         | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleMetadataReadProof { .. }
         | StoreError::RouteMapExpired { .. }
         | StoreError::StaleShardOperation { .. }
         | StoreError::StaleShardLocation { .. } => true,
@@ -1688,7 +1689,7 @@ impl super::StorageCluster {
         req: &ListObjectsReq,
     ) -> Result<ListObjectsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
-        self.metadata_pg_primary_object_listing_route(pg_id)
+        self.metadata_pg_read_object_listing_route(pg_id)
             .and_then(|listing_route| listing_route.list_objects_page(req))
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
@@ -1699,7 +1700,7 @@ impl super::StorageCluster {
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
-        self.metadata_pg_primary_object_listing_route(pg_id)
+        self.metadata_pg_read_object_listing_route(pg_id)
             .and_then(|listing_route| listing_route.list_object_versions_page(req))
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
@@ -1710,7 +1711,7 @@ impl super::StorageCluster {
         req: &ListMultipartUploadsReq,
     ) -> Result<ListMultipartUploadsResp, ObjectPgActionError> {
         let pg_id = PgId::new(pg_id);
-        self.metadata_pg_primary_object_listing_route(pg_id)
+        self.metadata_pg_read_object_listing_route(pg_id)
             .and_then(|listing_route| listing_route.list_multipart_uploads_page(req))
             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)
     }
@@ -3496,12 +3497,15 @@ impl super::StorageCluster {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
-        let route = node.bucket_metadata_client().open_bucket_metadata_route(
-            self.operation_epoch(),
-            self.validated_bucket_metadata_pg(pg_id),
-            bucket,
-        )?;
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        let route = node
+            .bucket_metadata_client()
+            .open_bucket_metadata_read_route(
+                self.operation_epoch(),
+                self.validated_bucket_metadata_pg(pg_id),
+                bucket,
+                node.authorization(),
+            )?;
         route.load_bucket_snapshot(request)
     }
 
@@ -7214,7 +7218,8 @@ impl super::StorageCluster {
                 StoreError::MetadataCommandContention { .. }
                 | StoreError::RouteMapExpired { .. }
                 | StoreError::StaleMetadataOperation { .. }
-                | StoreError::StaleMetadataRoute { .. },
+                | StoreError::StaleMetadataRoute { .. }
+                | StoreError::StaleMetadataReadProof { .. },
             ) => false,
             BucketWriteDrainError::Store(StoreError::StorageRpc { failure: code, .. })
                 if super::storage_rpc_code_is_retryable_pg_route_error(*code) =>
@@ -8846,12 +8851,13 @@ impl super::StorageCluster {
             let pg_id = PgId::new(pg_id);
             let node = self
                 .local_map
-                .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+                .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
             let client = node.bucket_metadata_client();
             let route = client
-                .open_bucket_metadata_scan_route(
+                .open_bucket_metadata_read_scan_route(
                     self.operation_epoch(),
                     self.validated_bucket_metadata_pg(pg_id),
+                    node.authorization(),
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
             let mut page = route
@@ -9722,16 +9728,17 @@ impl super::StorageCluster {
     ) -> Result<Result<T, E>, ObjectPgActionError> {
         let pg_id = route.pg_id.pg_id();
         require_valid_route()?;
-        let object_read_client = self
+        let read_node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client();
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        let object_read_client = read_node.object_read_metadata_client();
         require_valid_route()?;
         let object_read_route = object_read_client.open_object_read_metadata_route(
             self.operation_epoch(),
             route.pg_id,
             route.bucket,
             route.key,
+            read_node.authorization(),
         )?;
         let subject = object_read_route.load_object_read_auth_subject(route.version_id)?;
         Ok(action(&subject.stored))
@@ -9744,15 +9751,16 @@ impl super::StorageCluster {
     ) -> Result<Option<StoredObject>, ObjectPgActionError> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        let object_read_client = self
+        let read_node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client();
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        let object_read_client = read_node.object_read_metadata_client();
         let object_read_route = object_read_client.open_object_read_metadata_route(
             self.operation_epoch(),
             object_pg_id,
             bucket,
             key,
+            read_node.authorization(),
         )?;
         match object_read_route.load_object_read_auth_subject(None) {
             Ok(subject) => match subject.stored {
@@ -9790,15 +9798,16 @@ impl super::StorageCluster {
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
         let pg_id = route.pg_id.pg_id();
         require_valid_route()?;
-        let object_read_client = self
+        let read_node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client();
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        let object_read_client = read_node.object_read_metadata_client();
         let object_read_route = object_read_client.open_object_read_metadata_route(
             self.operation_epoch(),
             route.pg_id,
             route.bucket,
             route.key,
+            read_node.authorization(),
         )?;
 
         let mut work_budget =
@@ -9862,15 +9871,16 @@ impl super::StorageCluster {
         let object_pg_id = route.pg_id;
         let pg_id = object_pg_id.pg_id();
         require_valid_route()?;
-        let object_read_client = self
+        let read_node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client();
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        let object_read_client = read_node.object_read_metadata_client();
         let object_read_route = object_read_client.open_object_read_metadata_route(
             self.operation_epoch(),
             object_pg_id,
             route.bucket,
             route.key,
+            read_node.authorization(),
         )?;
 
         let mut work_budget =
@@ -9976,15 +9986,16 @@ impl super::StorageCluster {
     ) -> Result<Result<Option<SerializedTagSet>, E>, ObjectPgActionError> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
-        let object_read_client = self
+        let read_node = self
             .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client();
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        let object_read_client = read_node.object_read_metadata_client();
         let object_read_route = object_read_client.open_object_read_metadata_route(
             self.operation_epoch(),
             object_pg_id,
             bucket,
             key,
+            read_node.authorization(),
         )?;
 
         let mut work_budget =
@@ -10364,6 +10375,7 @@ impl super::StorageCluster {
             object_pg_id,
             bucket,
             key,
+            MetadataReadAuthorization::active(pg_id),
         )?;
         let subject = object_read_route.load_object_read_auth_subject(version_id)?;
         Ok(action(&subject.stored))
@@ -10387,6 +10399,7 @@ impl super::StorageCluster {
             object_pg_id,
             bucket,
             key,
+            MetadataReadAuthorization::active(pg_id),
         )?;
         let subject = object_read_route.load_object_read_auth_subject(version_id)?;
         Ok(action(&subject.stored))
@@ -12161,17 +12174,23 @@ impl super::StorageCluster {
     ) -> Result<std::sync::Arc<LocalClusterRuntimeState>, StoreError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
         let runtime_state = self.local_map.runtime_state();
-        if self
-            .pending_metadata_command_for_bucket(pg_id, bucket)?
-            .is_some_and(|command| {
-                matches!(
-                    command.payload(),
-                    MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
-                        if delete.matches_request(bucket, key, generation_id)
-                )
-            })
+        let route_state = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated metadata read route must exist")
+            .state();
+        if route_state == PgState::Active
+            && self
+                .pending_metadata_command_for_bucket(pg_id, bucket)?
+                .is_some_and(|command| {
+                    matches!(
+                        command.payload(),
+                        MetadataCommandPayload::DeleteObjectPayloadReclaim(delete)
+                            if delete.matches_request(bucket, key, generation_id)
+                    )
+                })
         {
             return Err(StoreError::NotFound);
         }
@@ -16040,11 +16059,16 @@ impl super::StorageCluster {
         require_valid_route().map_err(ObjectPgActionError::Store)?;
         let internal_authorized_upload =
             AuthorizedMultipartUploadRecord::assume_authorized(authorized_upload.record().clone());
-        self.object_mutation_metadata_primary_client(bucket, key)?
-            .open_authorized_multipart_upload_metadata_route(
+        let read_node = self
+            .local_map
+            .metadata_pg_read_node(self.operation_epoch(), pg_id.pg_id())?;
+        read_node
+            .object_read_metadata_client()
+            .open_authorized_multipart_upload_read_route(
                 self.operation_epoch(),
                 pg_id,
                 &internal_authorized_upload,
+                read_node.authorization(),
             )?
             .list_multipart_parts(part_number_marker, max_parts)
     }
@@ -16067,15 +16091,26 @@ impl super::StorageCluster {
         // part of the acting set before its object-scoped completion replay is
         // visible everywhere. Finish the durable command before classifying
         // the upload for CompleteMultipartUpload or AbortMultipartUpload.
-        self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+        let route_state = self
+            .local_map
+            .pg_route(pg_id)
+            .expect("validated multipart metadata read route must exist")
+            .state();
+        if route_state == PgState::Active {
+            self.drain_pending_object_metadata_commands_for_bucket(pg_id, bucket)?;
+        }
         require_valid_route().map_err(ObjectPgActionError::Store)?;
-        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        mutation_client
-            .open_multipart_upload_lookup_metadata_route(
+        let read_node = self
+            .local_map
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+        read_node
+            .object_read_metadata_client()
+            .open_multipart_upload_read_route(
                 self.operation_epoch(),
                 object_pg_id,
                 bucket,
                 key,
+                read_node.authorization(),
             )?
             .lookup_multipart_upload_management(upload_id)
     }
@@ -16727,7 +16762,11 @@ impl super::StorageCluster {
             };
             match node
                 .object_listing_metadata_client()
-                .open_object_listing_metadata_route(self.operation_epoch(), scan_pg_id)
+                .open_object_listing_metadata_route(
+                    self.operation_epoch(),
+                    scan_pg_id,
+                    MetadataReadAuthorization::active(scan_pg_id.pg_id()),
+                )
                 .and_then(|route| {
                     route.list_object_versions_page(&ListObjectVersionsReq {
                         bucket: bucket.clone(),

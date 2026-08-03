@@ -127,8 +127,7 @@ impl RetainedPlacedShardNodeClient for RecordingPlacedShardClient {
 impl RetainedPlacedShardRoute for RecordingRetainedPlacedShardRoute {
     fn read_placed_shard_for_historical_inspection(
         &self,
-        _expected_ack: WriteAck,
-    ) -> Result<Vec<u8>, StoreError> {
+    ) -> Result<(Vec<u8>, WriteAck), StoreError> {
         Err(StoreError::Io {
             context: "recording shard client historical read",
             source: std::io::Error::from(std::io::ErrorKind::Unsupported),
@@ -150,30 +149,6 @@ struct StorageNodeServerPoolGuard {
     stop: Arc<std::sync::atomic::AtomicBool>,
     socket_path: std::path::PathBuf,
     threads: Vec<std::thread::JoinHandle<()>>,
-}
-
-struct ParkedUnixSocket {
-    original: std::path::PathBuf,
-    parked: std::path::PathBuf,
-}
-
-impl ParkedUnixSocket {
-    fn park(original: &std::path::Path) -> Self {
-        let parked = original.with_extension("parked");
-        std::fs::rename(original, &parked).unwrap();
-        Self {
-            original: original.to_path_buf(),
-            parked,
-        }
-    }
-}
-
-impl Drop for ParkedUnixSocket {
-    fn drop(&mut self) {
-        if self.parked.exists() {
-            std::fs::rename(&self.parked, &self.original).unwrap();
-        }
-    }
 }
 
 impl Drop for StorageNodeServerPoolGuard {
@@ -270,6 +245,220 @@ fn unix_client_tempdir() -> (std::sync::MutexGuard<'static, ()>, test_util::Temp
 }
 
 #[test]
+fn unix_peering_metadata_certificate_preserves_get_and_list_without_write_authority() {
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_id = NodeId::new(0);
+    let node_ids = [node_id];
+    let pg_id = PgId::new(0);
+    let ec_shape = EcShape { k: 1, m: 0 };
+    let active_epoch = ClusterEpoch::INITIAL;
+    let socket_path = tmp.path().join("sockets").join("peering-read.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let valid_until_ms = crate::clock::current_time_millis().saturating_add(60_000);
+    let active_route = StorageNodePgRoute {
+        pg_id: pg_id.get(),
+        cluster_epoch: active_epoch,
+        state: PgState::Active,
+        primary_node_id: node_id,
+        metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
+        acting_set: node_ids.to_vec(),
+    };
+    let active_config = StorageNodeProcessConfig {
+        node_id,
+        cluster_epoch: active_epoch,
+        route_map_validity: RouteMapValidity::until_ms(valid_until_ms).unwrap(),
+        data_dir: tmp.path().join("peering-read-node"),
+        default_ec_shape: ec_shape,
+        pg_ids: vec![pg_id.get()],
+        socket_path: socket_path.clone(),
+        pg_routes: vec![active_route.clone()],
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    };
+    let server = Arc::new(StorageNodeServer::bind(active_config.clone()).unwrap());
+    let _server = spawn_shared_storage_node_server_pool(Arc::clone(&server), 4);
+
+    let mut active_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        node_id,
+        node_ids,
+        &[pg_id.get()],
+        ec_shape,
+        active_epoch,
+    )
+    .unwrap();
+    active_map
+        .install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+            node_id,
+            socket_path.clone(),
+        )])
+        .unwrap();
+    let active_cluster = StorageCluster::from_static_local_map(Arc::new(active_map)).unwrap();
+    let bucket = BucketName::new("peering-read-bucket").unwrap();
+    let key = ObjectKey::new("object").unwrap();
+    let payload = b"certified Peering metadata read";
+    let committed = write_committed_direct_segment_for(&active_cluster, &bucket, &key, payload);
+    let multipart_key = ObjectKey::new("multipart-object").unwrap();
+    let upload_id = upload_id_from_label("peeringread");
+    let create_upload = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: multipart_key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    active_cluster
+        .create_multipart_upload(
+            &bucket,
+            &multipart_key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create_upload.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let upload = active_cluster
+        .load_in_progress_multipart_upload(&bucket, &multipart_key, &upload_id)
+        .unwrap();
+    let heartbeat = server.control_plane_heartbeat(1, 1_000).unwrap();
+    let proof = heartbeat
+        .pg_observations
+        .iter()
+        .find(|observation| observation.pg_id == pg_id)
+        .unwrap()
+        .metadata_proof;
+
+    let peering_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
+    let read_certificate = crate::control_plane::PgMetadataReadRoute::new(node_id, proof);
+    let mut peering_config = active_config;
+    peering_config.cluster_epoch = peering_epoch;
+    peering_config.route_map_validity = RouteMapValidity::until_ms(valid_until_ms).unwrap();
+    peering_config.pg_routes = vec![StorageNodePgRoute {
+        pg_id: pg_id.get(),
+        cluster_epoch: peering_epoch,
+        state: PgState::Peering,
+        primary_node_id: node_id,
+        metadata_transfer_destination_epoch: None,
+        metadata_read_route: Some(read_certificate),
+        acting_set: node_ids.to_vec(),
+    }];
+    peering_config.historical_pg_routes = vec![active_route];
+    server
+        .install_control_plane_runtime_config(peering_config)
+        .unwrap();
+
+    let peering_route = LocalPgRoute {
+        cluster_epoch: peering_epoch,
+        pg_id,
+        primary_node_id: node_id,
+        acting_set: Arc::from(node_ids),
+        state: PgState::Peering,
+        metadata_read_route: Some(read_certificate),
+    };
+    let mut peering_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+        node_id,
+        node_ids,
+        &[pg_id.get()],
+        ec_shape,
+        peering_epoch,
+        [peering_route],
+    )
+    .unwrap();
+    peering_map.test_install_historical_pg_routes([PgRouteSnapshot::reconstructed(
+        active_epoch,
+        pg_id,
+        node_id,
+        node_ids.to_vec(),
+        PgState::Active,
+    )]);
+    peering_map
+        .install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+            node_id,
+            socket_path,
+        )])
+        .unwrap();
+    let peering_cluster =
+        Arc::new(StorageCluster::from_static_local_map(Arc::new(peering_map)).unwrap());
+
+    assert!(peering_cluster
+        .load_existing_live_object(&bucket, &key)
+        .unwrap()
+        .is_some());
+    let owned_buckets = peering_cluster
+        .list_buckets_for_owner(crate::CanonicalUserId::from_principal("owner").as_str())
+        .unwrap();
+    assert_eq!(owned_buckets.len(), 1);
+    assert_eq!(owned_buckets[0].name, bucket);
+    let listed = peering_cluster
+        .list_objects_for_bucket(&bucket, None, None, None, 100)
+        .unwrap();
+    assert_eq!(listed.objects.len(), 1);
+    assert_eq!(listed.objects[0].key(), &key);
+
+    let handle =
+        crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&peering_cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let multipart_route = admission
+        .active_multipart_object_route(&bucket, &multipart_key)
+        .unwrap();
+    let authorized_list_parts = match multipart_route
+        .lookup_multipart_upload_for_list_parts(&upload_id)
+        .unwrap()
+    {
+        crate::MultipartUploadListPartsLookup::InProgress(candidate) => {
+            candidate.into_authorized_list_parts()
+        }
+        other => panic!("expected in-progress multipart upload during Peering, got {other:?}"),
+    };
+    let parts = multipart_route
+        .list_parts_for_authorized_upload(&authorized_list_parts, None, 100)
+        .unwrap();
+    assert!(parts.parts().is_empty());
+    assert_eq!(upload.upload_id, upload_id);
+
+    let outcome = peering_cluster
+        .load_leased_object_read_snapshot_if(
+            &bucket,
+            &key,
+            Some(committed.version_id),
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let segment = outcome.snapshot().object_segments[0].clone();
+    let (_, _, leased_snapshot) = outcome.into_parts();
+    let retained = peering_cluster
+        .retain_object_payload_read(leased_snapshot)
+        .unwrap()
+        .unwrap();
+    let mut bytes = Vec::new();
+    retained
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, payload);
+
+    let reservation_id = crate::tests::stream_session_id("peering-write");
+    assert!(matches!(
+        peering_cluster.reserve_put_object_generation(&bucket, &key, &reservation_id),
+        Err(crate::ObjectPgActionError::Store(StoreError::PgNotActive {
+            state: PgState::Peering,
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_id = NodeId::new(0);
@@ -285,6 +474,7 @@ fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
         state: PgState::Active,
         primary_node_id: node_id,
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: node_ids.to_vec(),
     };
     let _server = spawn_storage_node_server(
@@ -354,45 +544,99 @@ fn unix_broad_payload_lease_survives_frontend_runtime_map_refresh() {
 }
 
 #[test]
-fn unix_retained_read_reconstructs_when_one_shard_node_is_unavailable() {
+fn unix_retained_read_reconstructs_with_historical_primary_down_and_corrupt_survivor() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = trace_node_ids();
-    let pg_id = PgId::new(0);
+    let pg_ids = [0, 1, 2, 3];
     let ec_shape = SharedStorageNode::DEFAULT_EC_SHAPE;
-    let epoch = ClusterEpoch::INITIAL;
-    let route = StorageNodePgRoute {
-        pg_id: pg_id.get(),
-        cluster_epoch: epoch,
-        state: PgState::Active,
-        primary_node_id: node_ids[0],
-        metadata_transfer_destination_epoch: None,
-        acting_set: node_ids.to_vec(),
-    };
+    let source_epoch = ClusterEpoch::INITIAL;
+    let current_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let unavailable_node = node_ids[0];
+    let certified_node = node_ids[1];
+    let topology_map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+        certified_node,
+        node_ids,
+        &pg_ids,
+        ec_shape,
+        source_epoch,
+    )
+    .unwrap();
+    let (bucket, key, _object_pg, data_pg) = bucket_key_with_distinct_object_and_data_pg(
+        topology_map
+            .node(certified_node)
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+    );
+    drop(topology_map);
+
+    let source_routes = pg_ids
+        .iter()
+        .map(|pg_id| StorageNodePgRoute {
+            pg_id: *pg_id,
+            cluster_epoch: source_epoch,
+            state: PgState::Active,
+            primary_node_id: if *pg_id == data_pg {
+                unavailable_node
+            } else {
+                certified_node
+            },
+            metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
+            acting_set: node_ids.to_vec(),
+        })
+        .collect::<Vec<_>>();
+    let source_local_routes = source_routes.iter().map(|route| LocalPgRoute {
+        cluster_epoch: route.cluster_epoch,
+        pg_id: PgId::new(route.pg_id),
+        primary_node_id: route.primary_node_id,
+        acting_set: Arc::from(route.acting_set.as_slice()),
+        state: route.state,
+        metadata_read_route: None,
+    });
+    let source_history = source_routes
+        .iter()
+        .map(|route| {
+            PgRouteSnapshot::reconstructed(
+                route.cluster_epoch,
+                PgId::new(route.pg_id),
+                route.primary_node_id,
+                route.acting_set.clone(),
+                route.state,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let socket_dir = tmp.path().join("retained-read-sockets");
     private_socket_dir(&socket_dir);
+    let mut servers = Vec::new();
     let mut server_guards = Vec::new();
+    let mut server_configs = Vec::new();
     let mut client_configs = Vec::new();
     let mut socket_paths = BTreeMap::new();
     for node_id in node_ids {
         let socket_path = socket_dir.join(format!("node-{}.sock", node_id.as_u32()));
-        let server = Arc::new(
-            StorageNodeServer::bind(StorageNodeProcessConfig {
-                node_id,
-                cluster_epoch: epoch,
-                route_map_validity: RouteMapValidity::Forever,
-                data_dir: tmp
-                    .path()
-                    .join(format!("retained-read-node-{}", node_id.as_u32())),
-                default_ec_shape: ec_shape,
-                pg_ids: vec![pg_id.get()],
-                socket_path: socket_path.clone(),
-                pg_routes: vec![route.clone()],
-                pending_metadata_command_recoveries: Vec::new(),
-                historical_pg_routes: Vec::new(),
-            })
-            .unwrap(),
-        );
-        server_guards.push(spawn_shared_storage_node_server_pool(server, 4));
+        let config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: source_epoch,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp
+                .path()
+                .join(format!("retained-read-node-{}", node_id.as_u32())),
+            default_ec_shape: ec_shape,
+            pg_ids: pg_ids.to_vec(),
+            socket_path: socket_path.clone(),
+            pg_routes: source_routes.clone(),
+            pending_metadata_command_recoveries: Vec::new(),
+            historical_pg_routes: Vec::new(),
+        };
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        server_guards.push(spawn_shared_storage_node_server_pool(
+            Arc::clone(&server),
+            4,
+        ));
+        servers.push(server);
+        server_configs.push(config);
         client_configs.push(LocalUnixStorageNodeClientConfig::new(
             node_id,
             socket_path.clone(),
@@ -400,29 +644,124 @@ fn unix_retained_read_reconstructs_when_one_shard_node_is_unavailable() {
         socket_paths.insert(node_id, socket_path);
     }
 
-    let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
-        node_ids[0],
+    let mut source_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+        certified_node,
         node_ids,
-        &[pg_id.get()],
+        &pg_ids,
         ec_shape,
-        epoch,
+        source_epoch,
+        source_local_routes,
     )
     .unwrap();
-    map.install_unix_storage_node_clients(client_configs)
+    source_map
+        .install_unix_storage_node_clients(client_configs.clone())
         .unwrap();
-    let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
-    let bucket = BucketName::new("retained-read-bucket").unwrap();
-    let key = ObjectKey::new("object").unwrap();
-    let payload = b"retained Unix EC read survives one unavailable shard node";
-    let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, payload);
-    let unavailable_node = committed
+    let source_cluster = StorageCluster::from_static_local_map(Arc::new(source_map)).unwrap();
+    let payload = b"retained Unix EC read survives its historical primary being unavailable";
+    let committed = write_committed_direct_segment_for(&source_cluster, &bucket, &key, payload);
+    assert_eq!(committed.written.data_pg_id, data_pg);
+    assert!(
+        committed
+            .locations
+            .iter()
+            .any(|location| location.node_id() == unavailable_node),
+        "the unavailable historical primary must own a payload shard"
+    );
+    let unavailable_shard_index = committed
         .locations
         .iter()
-        .map(ShardLocation::node_id)
-        .find(|node_id| *node_id != route.primary_node_id)
-        .expect("EC placement must include a non-primary shard node");
-    let unavailable_socket = &socket_paths[&unavailable_node];
-    let parked_socket = ParkedUnixSocket::park(unavailable_socket);
+        .position(|location| location.node_id() == unavailable_node)
+        .unwrap();
+    let corrupt_shard_index = committed
+        .locations
+        .iter()
+        .take(usize::from(ec_shape.k))
+        .position(|location| location.node_id() != unavailable_node)
+        .expect("a surviving data shard must be available for corruption");
+    let corrupt_location = committed.locations[corrupt_shard_index];
+    let corrupt_owner_index = node_ids
+        .iter()
+        .position(|&node_id| node_id == corrupt_location.node_id())
+        .unwrap();
+    let corrupt_key = &committed.written.written_shards[corrupt_shard_index].key;
+    let corrupt_path = server_configs[corrupt_owner_index]
+        .data_dir
+        .join(format!("pg-{data_pg:04}"))
+        .join("shards")
+        .join(corrupt_key.hex_prefix())
+        .join(corrupt_key.hex());
+    drop(source_cluster);
+
+    let certified_heartbeat = servers[1].control_plane_heartbeat(1, 1_000).unwrap();
+    let proofs = certified_heartbeat
+        .pg_observations
+        .iter()
+        .map(|observation| (observation.pg_id, observation.metadata_proof))
+        .collect::<BTreeMap<_, _>>();
+    let current_routes = pg_ids
+        .iter()
+        .map(|pg_id| {
+            let read_route = crate::control_plane::PgMetadataReadRoute::new(
+                certified_node,
+                proofs[&PgId::new(*pg_id)],
+            );
+            StorageNodePgRoute {
+                pg_id: *pg_id,
+                cluster_epoch: current_epoch,
+                state: PgState::Peering,
+                primary_node_id: certified_node,
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: Some(read_route),
+                acting_set: node_ids[1..].to_vec(),
+            }
+        })
+        .collect::<Vec<_>>();
+    for (server, source_config) in servers.iter().zip(&server_configs) {
+        let mut current_config = source_config.clone();
+        current_config.cluster_epoch = current_epoch;
+        current_config.route_map_validity =
+            RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_add(60_000))
+                .unwrap();
+        current_config.pg_routes = current_routes.clone();
+        current_config.historical_pg_routes = source_routes.clone();
+        server
+            .install_control_plane_runtime_config(current_config)
+            .unwrap();
+    }
+
+    let current_local_routes = current_routes.iter().map(|route| LocalPgRoute {
+        cluster_epoch: route.cluster_epoch,
+        pg_id: PgId::new(route.pg_id),
+        primary_node_id: route.primary_node_id,
+        acting_set: Arc::from(route.acting_set.as_slice()),
+        state: route.state,
+        metadata_read_route: route.metadata_read_route,
+    });
+    let mut current_map = LocalClusterMap::open_frontend_topology_only_with_pg_routes(
+        certified_node,
+        node_ids,
+        &pg_ids,
+        ec_shape,
+        current_epoch,
+        current_local_routes,
+    )
+    .unwrap();
+    current_map.test_install_historical_pg_routes(source_history);
+    current_map
+        .install_unix_storage_node_clients(client_configs)
+        .unwrap();
+    let cluster = StorageCluster::from_static_local_map(Arc::new(current_map)).unwrap();
+
+    drop(server_guards.remove(0));
+    drop(servers.remove(0));
+    assert!(
+        std::os::unix::net::UnixStream::connect(&socket_paths[&unavailable_node]).is_err(),
+        "the historical primary must be stopped before the retained read"
+    );
+    let mut corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+    assert!(!corrupt_bytes.is_empty());
+    corrupt_bytes[0] ^= 0xFF;
+    std::fs::write(&corrupt_path, corrupt_bytes).unwrap();
 
     let outcome = cluster
         .load_leased_object_read_snapshot_if(
@@ -436,6 +775,24 @@ fn unix_retained_read_reconstructs_when_one_shard_node_is_unavailable() {
         .unwrap();
     let segment = outcome.snapshot().object_segments[0].clone();
     let (_, _, leased_snapshot) = outcome.into_parts();
+    for (location, written) in committed
+        .locations
+        .iter()
+        .zip(&committed.written.written_shards)
+    {
+        if location.node_id() == unavailable_node {
+            continue;
+        }
+        let (shard, ack) = cluster
+            .read_payload_shard_for_historical_inspection_self_validating(*location, &written.key)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "surviving historical shard {:?} self-validating read failed: {error:?}",
+                    location
+                )
+            });
+        assert_eq!(shard.len() as u64, ack.stored_size);
+    }
     let retained = cluster
         .retain_object_payload_read(leased_snapshot)
         .unwrap()
@@ -445,9 +802,33 @@ fn unix_retained_read_reconstructs_when_one_shard_node_is_unavailable() {
         .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
         .unwrap();
     assert_eq!(bytes, payload);
+
     drop(retained);
-    drop(parked_socket);
+    drop(cluster);
     drop(server_guards);
+    drop(servers);
+    for config in server_configs
+        .iter()
+        .filter(|config| config.node_id != unavailable_node)
+    {
+        let surviving_store = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let repairs = surviving_store
+            .get_pg(data_pg)
+            .unwrap()
+            .list_placed_segment_shard_repairs()
+            .unwrap();
+        assert!(
+            repairs.iter().all(|repair| {
+                usize::from(repair.work_item.shard_index.get()) != unavailable_shard_index
+            }),
+            "transport unavailability is not evidence that a shard requires repair"
+        );
+    }
 }
 
 #[test]
@@ -474,6 +855,7 @@ fn unix_broad_payload_lease_saturation_preserves_read_handle_handoff_capacity() 
                 state: PgState::Active,
                 primary_node_id: node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![node_id],
             }],
             pending_metadata_command_recoveries: Vec::new(),
@@ -634,6 +1016,7 @@ fn unix_object_payload_reclaim_fence_rejects_crossed_claim_authority() {
                 state: PgState::Active,
                 primary_node_id: node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![node_id],
             }],
             pending_metadata_command_recoveries: Vec::new(),
@@ -769,6 +1152,7 @@ fn assert_historical_pending_command_recovery_over_unix(
         state: PgState::Active,
         primary_node_id: NodeId::new(0),
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: node_ids.to_vec(),
     };
     let current_route = StorageNodePgRoute {
@@ -777,6 +1161,7 @@ fn assert_historical_pending_command_recovery_over_unix(
         state: PgState::Peering,
         primary_node_id: NodeId::new(0),
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: node_ids.to_vec(),
     };
 
@@ -963,6 +1348,7 @@ fn assert_current_pending_command_abandonment_fans_out_over_unix() {
         state: PgState::Active,
         primary_node_id: NodeId::new(0),
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: node_ids.to_vec(),
     };
 
@@ -1185,6 +1571,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
         state: PgState::Active,
         primary_node_id: node_id,
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: node_ids.to_vec(),
     });
     let current_routes = pg_ids.map(|raw_pg_id| StorageNodePgRoute {
@@ -1197,6 +1584,7 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
         },
         primary_node_id: node_id,
         metadata_transfer_destination_epoch: None,
+        metadata_read_route: None,
         acting_set: node_ids.to_vec(),
     });
     let data_dir = tmp.path().join("reissued-stream-cleanup-node");
@@ -1836,6 +2224,7 @@ fn unix_shard_clients_route_payload_io_and_ack_rows_to_storage_node() {
             state: PgState::Active,
             primary_node_id: NodeId::new(1),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: node_ids.to_vec(),
         }],
 
@@ -2026,6 +2415,7 @@ fn frontend_unix_shard_mode_uses_storage_node_owned_data_dir() {
             state: PgState::Active,
             primary_node_id: NodeId::new(1),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: node_ids.to_vec(),
         }],
 
@@ -2097,6 +2487,7 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -2205,6 +2596,7 @@ fn peering_replay_catches_up_replicas_through_unix_storage_clients() {
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -2279,6 +2671,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -2446,6 +2839,7 @@ fn frontend_unix_reclaim_and_bucket_finalize_resume_from_storage_node_owned_rows
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -2593,6 +2987,7 @@ fn frontend_unix_durable_reclaim_scan_stops_after_first_stale_route() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         })
         .collect();
@@ -2705,6 +3100,7 @@ fn frontend_unix_delete_bucket_reaps_expired_reservation_from_older_epoch() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
         pending_metadata_command_recoveries: Vec::new(),
@@ -2821,6 +3217,7 @@ fn frontend_unix_delete_bucket_adopts_live_drain_from_older_epoch() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
         pending_metadata_command_recoveries: Vec::new(),
@@ -2904,6 +3301,7 @@ fn frontend_unix_lifecycle_claims_resume_from_storage_node_owned_rows() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -3040,6 +3438,7 @@ fn frontend_unix_stream_session_scavenger_lists_storage_node_owned_rows() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -3156,6 +3555,7 @@ fn frontend_unix_cluster_map_history_reference_summary_reads_storage_node_owned_
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -3274,6 +3674,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
                 state: PgState::Active,
                 primary_node_id: node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![node_id],
             },
             StorageNodePgRoute {
@@ -3282,6 +3683,7 @@ fn frontend_unix_stream_session_scavenger_rejects_wrong_pg_rows() {
                 state: PgState::Active,
                 primary_node_id: node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![node_id],
             },
         ],
@@ -3369,6 +3771,7 @@ fn frontend_unix_bucket_metadata_mode_reads_bucket_batches_from_storage_node() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -3563,6 +3966,7 @@ fn frontend_unix_object_generation_mode_reserves_on_storage_node() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -3661,6 +4065,7 @@ fn frontend_unix_object_version_mode_reserves_on_storage_node() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -3748,6 +4153,7 @@ fn frontend_unix_bucket_write_reservation_mode_uses_storage_node() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -4020,6 +4426,7 @@ fn frontend_unix_stream_heartbeat_renews_old_epoch_proof_and_session_row() {
                 state: PgState::Active,
                 primary_node_id: node_id,
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: vec![node_id],
             })
             .collect(),
@@ -4096,6 +4503,7 @@ fn frontend_unix_bucket_snapshot_pair_mode_uses_storage_node() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -4256,6 +4664,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -4355,6 +4764,7 @@ fn frontend_unix_object_generation_loser_retries_stale_generation() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -4489,6 +4899,7 @@ fn frontend_unix_object_generation_loser_retries_rpc_reservation_conflict() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
 
@@ -4962,6 +5373,7 @@ fn unix_object_mutation_client_repeats_suspended_null_delete_marker() {
             state: PgState::Active,
             primary_node_id: node_id,
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: vec![node_id],
         }],
         pending_metadata_command_recoveries: Vec::new(),
@@ -5148,6 +5560,7 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -5269,6 +5682,7 @@ fn non_current_epoch_unix_direct_put_commit_fails_closed_and_cleans_remote_state
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -5608,6 +6022,7 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -5619,6 +6034,7 @@ fn control_plane_peering_unix_direct_put_old_primary_fails_closed_and_cleans_rem
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -5997,6 +6413,7 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6008,6 +6425,7 @@ fn control_plane_peering_unix_copy_object_destination_old_primary_cleans_remote_
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6359,6 +6777,7 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6370,6 +6789,7 @@ fn control_plane_peering_unix_object_delete_old_primary_fails_closed_without_rem
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6660,6 +7080,7 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6671,6 +7092,7 @@ fn control_plane_peering_unix_object_metadata_old_primary_fails_closed_without_r
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6964,6 +7386,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -6975,6 +7398,7 @@ fn control_plane_peering_unix_multipart_completion_old_primary_fails_closed_with
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7283,6 +7707,7 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7294,6 +7719,7 @@ fn control_plane_peering_unix_multipart_abort_old_primary_fails_closed_without_r
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7618,6 +8044,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -7629,6 +8056,7 @@ fn control_plane_peering_unix_upload_part_session_old_primary_fails_closed_witho
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8035,6 +8463,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8046,6 +8475,7 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8483,6 +8913,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8494,6 +8925,7 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8964,6 +9396,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -8975,6 +9408,7 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
             state: route.state(),
             primary_node_id: route.primary_node_id(),
             metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
             acting_set: route.acting_set().to_vec(),
         })
         .collect::<Vec<_>>();
@@ -9251,6 +9685,7 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9455,6 +9890,7 @@ fn non_current_epoch_unix_upload_part_stream_session_create_fails_closed_without
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9645,6 +10081,7 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -9922,6 +10359,7 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -10217,6 +10655,7 @@ fn non_current_epoch_unix_multipart_completion_fails_closed_without_remote_mutat
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -10380,6 +10819,7 @@ fn non_current_epoch_unix_object_metadata_update_fails_closed_without_remote_mut
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -10538,6 +10978,7 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             })
             .collect();
@@ -10714,6 +11155,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -10724,6 +11166,7 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
                 state: historical_route.state(),
                 primary_node_id: historical_route.primary_node_id(),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: historical_route.acting_set().to_vec(),
             }],
         })
@@ -10743,11 +11186,12 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     )])
     .unwrap();
 
-    let observed = map
-        .read_payload_shard_for_historical_inspection(location, &shard_key, ack)
+    let (observed, observed_ack) = map
+        .read_payload_shard_for_historical_inspection(location, &shard_key)
         .unwrap();
 
     assert_eq!(observed, payload);
+    assert_eq!(observed_ack, ack);
     let shard_ack_route = map
         .metadata_pg_primary_node_for_retained_cleanup(historical_epoch, data_pg_id.pg_id())
         .unwrap()
@@ -10989,6 +11433,7 @@ fn remote_shard_files_without_ack_rows_are_not_publishable() {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             }],
 
@@ -11138,6 +11583,7 @@ fn remote_shard_ack_rows_on_wrong_node_are_not_publishable() {
                 state: PgState::Active,
                 primary_node_id: NodeId::new(0),
                 metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
                 acting_set: node_ids.to_vec(),
             }],
 

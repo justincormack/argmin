@@ -19,7 +19,7 @@ use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, Canonic
 use super::clients::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
     LocalStorageNodeClient, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
-    MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient,
+    MetadataCommandPeeringNodeClient, MetadataCommandRecoveryNodeClient, MetadataReadAuthorization,
     ObjectGenerationMetadataNodeClient, ObjectListingMetadataNodeClient,
     ObjectMutationMetadataNodeClient, ObjectPayloadLeaseNodeClient, ObjectReadMetadataNodeClient,
     ObjectVersionMetadataNodeClient, PlacedShardNodeClient,
@@ -1430,6 +1430,39 @@ impl SharedStorageNode {
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    pub(crate) fn get_pg_for_metadata_read(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        authorization: MetadataReadAuthorization,
+    ) -> Result<MutexGuard<'_, PgStore>, StoreError> {
+        let pg = self.get_pg(pg_id.get())?;
+        if authorization.pg_id() != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "use metadata read authorization for PG",
+            });
+        }
+        let Some(read_route) = authorization.peering_route() else {
+            return Ok(pg);
+        };
+        if read_route.node_id() != node_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open certified metadata read route",
+            });
+        }
+        let observation =
+            Self::pg_heartbeat_observation_from_pg(&pg, node_id, pg_id, crate::PgState::Peering)?;
+        if observation.has_pending_metadata_command()
+            || observation.metadata_proof != read_route.proof()
+        {
+            return Err(StoreError::StaleMetadataReadProof {
+                node_id: node_id.as_u32(),
+                pg_id: pg_id.get(),
+            });
+        }
+        Ok(pg)
+    }
+
     /// Require that this node has an opened store for the PG without taking
     /// the store mutex.
     pub(crate) fn require_open_pg(&self, pg_id: u32) -> Result<(), StoreError> {
@@ -1447,6 +1480,15 @@ impl SharedStorageNode {
         state: PgState,
     ) -> Result<NodePgHeartbeatObservation, StoreError> {
         let pg = self.get_pg(pg_id.get())?;
+        Self::pg_heartbeat_observation_from_pg(&pg, node_id, pg_id, state)
+    }
+
+    pub(crate) fn pg_heartbeat_observation_from_pg(
+        pg: &PgStore,
+        node_id: NodeId,
+        pg_id: PgId,
+        state: PgState,
+    ) -> Result<NodePgHeartbeatObservation, StoreError> {
         let metadata_epoch = pg.metadata_command_replica_state()?.cluster_epoch;
         let metadata_state =
             pg.metadata_command_replica_state_for_heartbeat(node_id.as_u32(), metadata_epoch)?;

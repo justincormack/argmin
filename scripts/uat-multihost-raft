@@ -9,9 +9,10 @@ usage() {
     cat <<'EOF'
 Usage: ./scripts/uat-multihost-raft [options]
 
-Run the authenticated static-manifest Raft authority soak across three real
-hosts. SSH is used only for deployment and process supervision; all Argmin
-traffic uses the configured TLS/TCP endpoints directly.
+Run the authenticated static-manifest Raft authority and data-plane soak across
+three real hosts. Each host runs an authority, storage node, and independently
+authenticated frontend. SSH is used only for deployment and process
+supervision; all Argmin traffic uses the configured TLS/TCP endpoints directly.
 
 Options:
   --hosts H0,H1,H2       SSH host aliases (or ARGMIN_MULTIHOST_RAFT_HOSTS)
@@ -27,7 +28,7 @@ Options:
   --retained-epochs N    Committed route epoch advances before failover (default: 256)
   --data-objects N       Persistent S3 objects checked across failures (default: 8)
   --heartbeat-lease-ms N Storage-node heartbeat lease (default: 5000)
-  --repeat N             Leader transfer/loss/restart cycles (default: 3)
+  --repeat N             Whole-host service outage/rejoin cycles (default: 3)
   --quantitative         Enforce the sustained persistent-storage release gate
   --sustained-seconds N  Quantitative steady interval (default: 300)
   --no-cleanup           Preserve remote and local state after every run
@@ -322,8 +323,9 @@ declare -a current_units=("" "" "")
 declare -a unit_generations=(0 0 0)
 declare -a storage_units=("" "" "")
 declare -a storage_unit_generations=(0 0 0)
-frontend_unit=""
-frontend_unit_generation=0
+declare -a frontend_units=("" "" "")
+declare -a frontend_unit_generations=(0 0 0)
+command_process_number=1
 cleanup_started=0
 metrics_dir="$local_run/metrics"
 mkdir -p "$metrics_dir"
@@ -345,30 +347,24 @@ collect_artifacts() {
         scp "${scp_options[@]}" -q -r "$host:$remote_run/logs/." "$host_dir/logs" 2>/dev/null || true
         remote_exec_quiet "$host" find "$remote_run" -maxdepth 3 -type f -printf '%P %s bytes\n' \
             >"$host_dir/files.txt" 2>&1 || true
-        for unit in "${current_units[$index]}" "${storage_units[$index]}"; do
+        for unit in "${current_units[$index]}" "${storage_units[$index]}" "${frontend_units[$index]}"; do
             [[ -n "$unit" ]] || continue
             remote_exec_quiet "$host" systemctl --user status "$unit" --no-pager \
                 >"$host_dir/$unit-status.txt" 2>&1 || true
             remote_exec_quiet "$host" journalctl --user-unit "$unit" --no-pager \
                 >"$host_dir/$unit-journal.txt" 2>&1 || true
         done
-        if ((index == 0)) && [[ -n "$frontend_unit" ]]; then
-            remote_exec_quiet "$host" systemctl --user status "$frontend_unit" --no-pager \
-                >"$host_dir/$frontend_unit-status.txt" 2>&1 || true
-            remote_exec_quiet "$host" journalctl --user-unit "$frontend_unit" --no-pager \
-                >"$host_dir/$frontend_unit-journal.txt" 2>&1 || true
-        fi
         remote_exec_quiet "$host" chronyc tracking >"$host_dir/chronyc-tracking.txt" 2>&1 || true
     done
 }
 
 stop_processes() {
     local index
-    if [[ -n "$frontend_unit" ]]; then
-        remote_exec_quiet "${hosts[0]}" systemctl --user stop "$frontend_unit" \
-            >/dev/null 2>&1 || true
-    fi
     for index in 0 1 2; do
+        if [[ -n "${frontend_units[$index]}" ]]; then
+            remote_exec_quiet "${hosts[$index]}" systemctl --user stop "${frontend_units[$index]}" \
+                >/dev/null 2>&1 || true
+        fi
         if [[ -n "${storage_units[$index]}" ]]; then
             remote_exec_quiet "${hosts[$index]}" systemctl --user stop "${storage_units[$index]}" \
                 >/dev/null 2>&1 || true
@@ -447,15 +443,21 @@ for role in raft storage admin; do
         generated_auth_secrets["$secret"]="$role-$number"
     done
 done
-for credential in frontend-1 frontend-1-admin frontend-1-maintenance; do
-    secret_path="$material_dir/$credential.key"
-    (umask 077 && openssl rand -hex 32 >"$secret_path")
-    secret="$(<"$secret_path")"
-    [[ "$secret" =~ ^[0-9a-f]{64}$ ]] ||
-        die "openssl generated malformed $credential credential material"
-    [[ -z "${generated_auth_secrets[$secret]:-}" ]] ||
-        die "openssl generated duplicate credential material for ${generated_auth_secrets[$secret]} and $credential"
-    generated_auth_secrets["$secret"]="$credential"
+for number in 1 2 3; do
+    for role in frontend admin maintenance; do
+        credential="frontend-$number"
+        if [[ "$role" != "frontend" ]]; then
+            credential+="-$role"
+        fi
+        secret_path="$material_dir/$credential.key"
+        (umask 077 && openssl rand -hex 32 >"$secret_path")
+        secret="$(<"$secret_path")"
+        [[ "$secret" =~ ^[0-9a-f]{64}$ ]] ||
+            die "openssl generated malformed $credential credential material"
+        [[ -z "${generated_auth_secrets[$secret]:-}" ]] ||
+            die "openssl generated duplicate credential material for ${generated_auth_secrets[$secret]} and $credential"
+        generated_auth_secrets["$secret"]="$credential"
+    done
 done
 
 declare -a mount_paths
@@ -647,43 +649,45 @@ secret_ref = "file:$remote_run/material/admin-$number.key"
 EOF
 done
 
-cat >>"$manifest_path" <<EOF
+for number in 1 2 3; do
+    cat >>"$manifest_path" <<EOF
 
 [[processes]]
-id = "frontend-1"
-host_id = "host-1"
+id = "frontend-$number"
+host_id = "host-$number"
 kind = "frontend"
-frontend_instance_id = "frontend-1"
-admin_instance_id = "frontend-1-admin"
-maintenance_instance_id = "frontend-1-maintenance"
+frontend_instance_id = "frontend-$number"
+admin_instance_id = "frontend-$number-admin"
+maintenance_instance_id = "frontend-$number-maintenance"
 
 [[auth_credentials]]
 principal = "frontend"
-instance_id = "frontend-1"
-credential_id = "frontend-1"
+instance_id = "frontend-$number"
+credential_id = "frontend-$number"
 credential_version = 1
 use_for_signing = true
 accept_from_ms = 0
-secret_ref = "file:$remote_run/material/frontend-1.key"
+secret_ref = "file:$remote_run/material/frontend-$number.key"
 
 [[auth_credentials]]
 principal = "admin"
-instance_id = "frontend-1-admin"
-credential_id = "frontend-1-admin"
+instance_id = "frontend-$number-admin"
+credential_id = "frontend-$number-admin"
 credential_version = 1
 use_for_signing = true
 accept_from_ms = 0
-secret_ref = "file:$remote_run/material/frontend-1-admin.key"
+secret_ref = "file:$remote_run/material/frontend-$number-admin.key"
 
 [[auth_credentials]]
 principal = "maintenance"
-instance_id = "frontend-1-maintenance"
-credential_id = "frontend-1-maintenance"
+instance_id = "frontend-$number-maintenance"
+credential_id = "frontend-$number-maintenance"
 credential_version = 1
 use_for_signing = true
 accept_from_ms = 0
-secret_ref = "file:$remote_run/material/frontend-1-maintenance.key"
+secret_ref = "file:$remote_run/material/frontend-$number-maintenance.key"
 EOF
+done
 chmod 600 "$manifest_path"
 
 binary_digest="$(sha256sum "$binary" | awk '{print $1}')"
@@ -700,11 +704,13 @@ for role in raft storage admin; do
         deploy_material+=("$material_dir/$role-$number.key")
     done
 done
-deploy_material+=(
-    "$material_dir/frontend-1.key"
-    "$material_dir/frontend-1-admin.key"
-    "$material_dir/frontend-1-maintenance.key"
-)
+for number in 1 2 3; do
+    deploy_material+=(
+        "$material_dir/frontend-$number.key"
+        "$material_dir/frontend-$number-admin.key"
+        "$material_dir/frontend-$number-maintenance.key"
+    )
+done
 
 for index in 0 1 2; do
     host="${hosts[$index]}"
@@ -726,11 +732,13 @@ for index in 0 1 2; do
             sensitive_paths+=("$remote_run/material/$role-$number.key")
         done
     done
-    sensitive_paths+=(
-        "$remote_run/material/frontend-1.key"
-        "$remote_run/material/frontend-1-admin.key"
-        "$remote_run/material/frontend-1-maintenance.key"
-    )
+    for number in 1 2 3; do
+        sensitive_paths+=(
+            "$remote_run/material/frontend-$number.key"
+            "$remote_run/material/frontend-$number-admin.key"
+            "$remote_run/material/frontend-$number-maintenance.key"
+        )
+    done
     remote_exec "$host" chmod 600 "${sensitive_paths[@]}"
     remote_digest="$(remote_exec_quiet "$host" sha256sum "$remote_run/argmin-s3" | awk '{print $1}')"
     [[ "$remote_digest" == "$binary_digest" ]] || die "deployed binary checksum mismatch on $host"
@@ -743,8 +751,8 @@ for index in 0 1 2; do
     remote_exec "$host" "$remote_run/argmin-s3" initialize-cluster-state "$remote_run/cluster.toml" "control-$number"
     remote_exec "$host" "$remote_run/argmin-s3" validate-cluster-config "$remote_run/cluster.toml" "storage-$number"
     remote_exec "$host" "$remote_run/argmin-s3" initialize-cluster-state "$remote_run/cluster.toml" "storage-$number"
+    remote_exec "$host" "$remote_run/argmin-s3" validate-cluster-config "$remote_run/cluster.toml" "frontend-$number"
 done
-remote_exec "${hosts[0]}" "$remote_run/argmin-s3" validate-cluster-config "$remote_run/cluster.toml" frontend-1
 
 start_authority() {
     local number="$1"
@@ -879,53 +887,112 @@ wait_for_storage_network() {
 }
 
 start_frontend() {
-    frontend_unit_generation=$((frontend_unit_generation + 1))
-    frontend_unit="$run_name-frontend-1-$frontend_unit_generation"
-    remote_exec "${hosts[0]}" systemd-run --user --collect --unit "$frontend_unit" \
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    frontend_unit_generations[index]=$((frontend_unit_generations[index] + 1))
+    local unit="$run_name-frontend-$number-${frontend_unit_generations[$index]}"
+    frontend_units[index]="$unit"
+    remote_exec "$host" systemd-run --user --collect --unit "$unit" \
         --property "WorkingDirectory=$remote_run" \
-        --property "StandardOutput=append:$remote_run/logs/frontend-1.log" \
-        --property "StandardError=append:$remote_run/logs/frontend-1.log" \
+        --property "StandardOutput=append:$remote_run/logs/frontend-$number.log" \
+        --property "StandardError=append:$remote_run/logs/frontend-$number.log" \
         --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
-        --setenv "ARGMIN_PROCESS_ID=frontend-1" \
+        --setenv "ARGMIN_PROCESS_ID=frontend-$number" \
         --setenv "ARGMIN_ACCOUNT_ID=111122223333" \
         --setenv "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
         --setenv "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
         --setenv "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
-        --setenv "ARGMIN_LISTEN_ADDR=${addresses[0]}:$frontend_port" \
+        --setenv "ARGMIN_LISTEN_ADDR=${addresses[$index]}:$frontend_port" \
         --setenv "ARGMIN_TRACE=1" \
         --setenv "ARGMIN_TRACE_FILTER=server_http,server_core,storage" \
-        --setenv "ARGMIN_TRACE_FILE=$remote_run/logs/frontend-1.trace" \
+        --setenv "ARGMIN_TRACE_FILE=$remote_run/logs/frontend-$number.trace" \
         "$remote_run/argmin-s3"
 }
 
+stop_frontend() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local unit="${frontend_units[$index]}"
+    [[ -n "$unit" ]] || return 0
+    remote_exec "$host" systemctl --user stop "$unit"
+    frontend_units[index]=""
+}
+
+stop_host_services() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local frontend_unit="${frontend_units[$index]}"
+    local storage_unit="${storage_units[$index]}"
+    local authority_unit="${current_units[$index]}"
+    [[ -n "$frontend_unit" && -n "$storage_unit" && -n "$authority_unit" ]] ||
+        die "host $number does not have all three Argmin services running"
+    remote_exec "$host" systemctl --user stop \
+        "$frontend_unit" "$storage_unit" "$authority_unit"
+    frontend_units[index]=""
+    storage_units[index]=""
+    current_units[index]=""
+}
+
 wait_frontend_listener() {
+    local number="$1"
+    local index=$((number - 1))
+    local host="${hosts[$index]}"
+    local unit="${frontend_units[$index]}"
     local attempt
     for ((attempt = 0; attempt < 600; attempt++)); do
-        if ! remote_exec_quiet "${hosts[0]}" systemctl --user is-active --quiet "$frontend_unit"; then
-            remote_exec_quiet "${hosts[0]}" systemctl --user status "$frontend_unit" --no-pager >&2 || true
-            remote_exec_quiet "${hosts[0]}" tail -n 200 "$remote_run/logs/frontend-1.log" >&2 || true
-            die "frontend-1 exited before binding its S3 listener"
+        if ! remote_exec_quiet "$host" systemctl --user is-active --quiet "$unit"; then
+            remote_exec_quiet "$host" systemctl --user status "$unit" --no-pager >&2 || true
+            remote_exec_quiet "$host" tail -n 200 "$remote_run/logs/frontend-$number.log" >&2 || true
+            die "frontend-$number exited before binding its S3 listener"
         fi
-        if timeout 1 bash -c "echo >/dev/tcp/${addresses[0]}/$frontend_port" >/dev/null 2>&1; then
+        if timeout 1 bash -c "echo >/dev/tcp/${addresses[$index]}/$frontend_port" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
     done
-    remote_exec_quiet "${hosts[0]}" tail -n 200 "$remote_run/logs/frontend-1.log" >&2 || true
-    die "frontend-1 did not bind ${addresses[0]}:$frontend_port"
+    remote_exec_quiet "$host" tail -n 200 "$remote_run/logs/frontend-$number.log" >&2 || true
+    die "frontend-$number did not bind ${addresses[$index]}:$frontend_port"
+}
+
+assert_all_service_units_active() {
+    local number index host unit label
+    for number in 1 2 3; do
+        index=$((number - 1))
+        host="${hosts[$index]}"
+        for label in authority storage frontend; do
+            case "$label" in
+                authority) unit="${current_units[$index]}" ;;
+                storage) unit="${storage_units[$index]}" ;;
+                frontend) unit="${frontend_units[$index]}" ;;
+            esac
+            [[ -n "$unit" ]] || die "host $number has no tracked $label unit"
+            remote_exec_quiet "$host" systemctl --user is-active --quiet "$unit" ||
+                die "host $number $label unit $unit is not active"
+        done
+        wait_authority_listener "$number"
+        wait_storage_listener "$number"
+        wait_frontend_listener "$number"
+    done
 }
 
 admin_command() {
-    remote_exec_quiet "${hosts[0]}" env \
+    local number="$command_process_number"
+    local index=$((number - 1))
+    remote_exec_quiet "${hosts[$index]}" env \
         "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
-        "ARGMIN_PROCESS_ID=control-1" \
+        "ARGMIN_PROCESS_ID=control-$number" \
         "$remote_run/argmin-s3" "$@"
 }
 
 frontend_read_command() {
-    remote_exec_quiet "${hosts[0]}" env \
+    local number="$command_process_number"
+    local index=$((number - 1))
+    remote_exec_quiet "${hosts[$index]}" env \
         "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
-        "ARGMIN_PROCESS_ID=frontend-1" \
+        "ARGMIN_PROCESS_ID=frontend-$number" \
         "ARGMIN_ACCOUNT_ID=111122223333" \
         "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
         "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
@@ -959,12 +1026,15 @@ wait_runtime_map_ready() {
     die "control-plane runtime map did not become ready"
 }
 
-data_plane_endpoint="http://${addresses[0]}:$frontend_port"
 data_plane_bucket_file="$local_run/data-plane-bucket"
 data_plane_body_file="$local_run/data-plane-body"
 data_plane_keys=()
 
-run_data_client() {
+run_data_client_on() {
+    local number="$1"
+    shift
+    local index=$((number - 1))
+    local data_plane_endpoint="http://${addresses[$index]}:$frontend_port"
     print_command env \
         "S3_TEST_ENDPOINT=$data_plane_endpoint" \
         "S3_TEST_BUCKET_PREFIX=argmin-multihost-" \
@@ -983,19 +1053,33 @@ run_data_client() {
         "$client_binary" "$@"
 }
 
-put_data_plane_object() {
+put_data_plane_object_on() {
+    local number="$1"
+    shift
     local key="$1"
-    run_data_client put "$data_plane_bucket_file" "$key" "$data_plane_body_file"
+    run_data_client_on "$number" put "$data_plane_bucket_file" "$key" "$data_plane_body_file"
     data_plane_keys+=("$key")
 }
 
-verify_data_plane_objects() {
+verify_data_plane_objects_on() {
+    local number="$1"
     local key
     for key in "${data_plane_keys[@]}"; do
-        run_data_client get "$data_plane_bucket_file" "$key" "$data_plane_body_file"
+        run_data_client_on "$number" get "$data_plane_bucket_file" "$key" "$data_plane_body_file"
     done
-    run_data_client head "$data_plane_bucket_file" "${data_plane_keys[0]}" "$data_plane_body_file"
-    run_data_client list-contains "$data_plane_bucket_file" "${data_plane_keys[@]}"
+    run_data_client_on "$number" head "$data_plane_bucket_file" "${data_plane_keys[0]}" "$data_plane_body_file"
+    run_data_client_on "$number" list-contains "$data_plane_bucket_file" "${data_plane_keys[@]}"
+}
+
+verify_data_plane_objects_across_running_frontends() {
+    local number index verified=0
+    for number in 1 2 3; do
+        index=$((number - 1))
+        [[ -n "${frontend_units[$index]}" ]] || continue
+        verify_data_plane_objects_on "$number"
+        verified=$((verified + 1))
+    done
+    ((verified > 0)) || die "no running frontend was available for data verification"
 }
 
 status_field() {
@@ -1289,7 +1373,8 @@ assert_no_quantitative_auth_failures() {
         host="${hosts[$index]}"
         if output="$(remote_exec_quiet "$host" grep -nE "$pattern" \
             "$remote_run/logs/control-$number.log" \
-            "$remote_run/logs/storage-$number.log" 2>/dev/null)"; then
+            "$remote_run/logs/storage-$number.log" \
+            "$remote_run/logs/frontend-$number.log" 2>/dev/null)"; then
             printf '%s\n' "$output" >"$metrics_dir/host-$number-auth-failures.txt"
             die "host $number logged an internal RPC authentication failure"
         else
@@ -1298,15 +1383,6 @@ assert_no_quantitative_auth_failures() {
                 die "could not inspect host $number internal RPC authentication logs"
         fi
     done
-    if output="$(remote_exec_quiet "${hosts[0]}" grep -nE "$pattern" \
-        "$remote_run/logs/frontend-1.log" 2>/dev/null)"; then
-        printf '%s\n' "$output" >"$metrics_dir/frontend-auth-failures.txt"
-        die "frontend logged an internal RPC authentication failure"
-    else
-        grep_status=$?
-        ((grep_status == 1)) ||
-            die "could not inspect frontend internal RPC authentication logs"
-    fi
 }
 
 echo "== start static authenticated TCP authorities =="
@@ -1373,59 +1449,27 @@ echo "retained_route_history advances=$route_advances attempts=$route_attempts f
 admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
 wait_runtime_map_ready
 
-echo "== start split-role frontend and seed persistent S3 workload =="
-start_frontend
-wait_frontend_listener
+echo "== start split-role frontends and seed cross-frontend S3 workload =="
+for number in 1 2 3; do
+    start_frontend "$number"
+done
+for number in 1 2 3; do
+    wait_frontend_listener "$number"
+done
 openssl rand -out "$data_plane_body_file" 1048576
-run_data_client create-put "$data_plane_bucket_file" object-000 "$data_plane_body_file"
+run_data_client_on 1 create-put "$data_plane_bucket_file" object-000 "$data_plane_body_file"
 data_plane_keys+=(object-000)
 for ((object_index = 1; object_index < data_object_count; object_index++)); do
     printf -v object_key 'object-%03d' "$object_index"
-    put_data_plane_object "$object_key"
+    frontend_number=$(((object_index % 3) + 1))
+    put_data_plane_object_on "$frontend_number" "$object_key"
 done
-verify_data_plane_objects
-run_data_client cleanup-versioned-stress 1 2 2 multihost-versioned "$data_plane_body_file"
-echo "data_plane_seed objects=${#data_plane_keys[@]} body_bytes=$(wc -c <"$data_plane_body_file")"
-
-for ((iteration = 1; iteration <= repeat_count; iteration++)); do
-    target_number=$((((iteration - 1) % 3) + 1))
-    target_raft_node=$((100 + target_number))
-    echo "== failover iteration $iteration: transfer to and stop Raft node $target_raft_node =="
-    transfer_leadership_to "$target_number"
-
-    stop_authority "$target_number"
-    wait_clock_status false "$((transferred_term + 1))"
-    [[ "$(status_field "$last_status" blocked_reason)" == "Some(RaftLeadershipChanged)" ]] ||
-        die "leader loss produced an unexpected authority-clock state: $last_status"
-    admin_command control-plane-reestablish-authority-clock "$remote_run/unused.sock"
-    wait_clock_status true "$((transferred_term + 1))"
-
-    failover_key="control-failover-$iteration"
-    put_data_plane_object "$failover_key"
-    verify_data_plane_objects
-
-    start_authority "$target_number"
-    wait_authority_listener "$target_number"
-    stabilize_rejoined_clock "$((transferred_term + 1))"
-    admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
-done
-
-echo "== restart storage node 1 and verify persistent S3 data =="
-wait_runtime_map_ready
-pre_storage_restart_epoch="$last_runtime_epoch"
-stop_storage 1
-start_storage 1
-wait_storage_listener 1
-wait_for_storage_network
-wait_runtime_map_ready "$pre_storage_restart_epoch"
-echo "storage_restart_converged previous_epoch=$pre_storage_restart_epoch current_epoch=$last_runtime_epoch"
-verify_data_plane_objects
-put_data_plane_object storage-restart-1
-verify_data_plane_objects
-echo "data_plane_restart_verified objects=${#data_plane_keys[@]}"
+verify_data_plane_objects_across_running_frontends
+run_data_client_on 2 cleanup-versioned-stress 1 2 2 multihost-versioned "$data_plane_body_file"
+echo "data_plane_cross_frontend_seed objects=${#data_plane_keys[@]} frontends=3 body_bytes=$(wc -c <"$data_plane_body_file")"
 
 if ((quantitative)); then
-    echo "== quantitative sustained multihost release interval =="
+    echo "== begin quantitative outage and sustained interval =="
     admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
     wait_runtime_map_ready
     for number in 1 2 3; do
@@ -1433,11 +1477,52 @@ if ((quantitative)); then
         wait_runtime_map_ready
         capture_quantitative_baseline "$number"
     done
-
     quantitative_deadline=$((SECONDS + sustained_seconds))
+fi
+
+for ((iteration = 1; iteration <= repeat_count; iteration++)); do
+    target_number=$((((iteration - 1) % 3) + 1))
+    target_raft_node=$((100 + target_number))
+    survivor_number=$((target_number % 3 + 1))
+    wait_runtime_map_ready
+    pre_host_outage_epoch="$last_runtime_epoch"
+    echo "== host-service outage iteration $iteration: stop frontend, storage, and Raft node $target_raft_node =="
+    transfer_leadership_to "$target_number"
+
+    stop_host_services "$target_number"
+    command_process_number="$survivor_number"
+    wait_clock_status false "$((transferred_term + 1))"
+    [[ "$(status_field "$last_status" blocked_reason)" == "Some(RaftLeadershipChanged)" ]] ||
+        die "host outage produced an unexpected authority-clock state: $last_status"
+    admin_command control-plane-reestablish-authority-clock "$remote_run/unused.sock"
+    wait_clock_status true "$((transferred_term + 1))"
+
+    verify_data_plane_objects_across_running_frontends
+    echo "host_outage_reads_verified host=$target_number surviving_frontends=2 objects=${#data_plane_keys[@]}"
+
+    start_authority "$target_number"
+    wait_authority_listener "$target_number"
+    stabilize_rejoined_clock "$((transferred_term + 1))"
+    start_storage "$target_number"
+    wait_storage_listener "$target_number"
+    wait_for_storage_network
+    wait_runtime_map_ready "$pre_host_outage_epoch"
+    start_frontend "$target_number"
+    wait_frontend_listener "$target_number"
+
+    rejoin_key="host-rejoin-$iteration"
+    put_data_plane_object_on "$target_number" "$rejoin_key"
+    verify_data_plane_objects_across_running_frontends
+    echo "host_rejoin_verified host=$target_number epoch=$last_runtime_epoch objects=${#data_plane_keys[@]}"
+    admin_command control-plane-trigger-raft-snapshot-purge "$remote_run/unused.sock"
+done
+
+if ((quantitative)); then
+    echo "== complete quantitative sustained multihost release interval =="
     quantitative_read_rounds=0
     while ((SECONDS < quantitative_deadline)); do
-        verify_data_plane_objects
+        frontend_number=$(((quantitative_read_rounds % 3) + 1))
+        verify_data_plane_objects_on "$frontend_number"
         quantitative_read_rounds=$((quantitative_read_rounds + 1))
         remaining_seconds=$((quantitative_deadline - SECONDS))
         if ((remaining_seconds > 5)); then
@@ -1455,13 +1540,13 @@ if ((quantitative)); then
         capture_quantitative_result "$number"
     done
     assert_no_quantitative_auth_failures
-    for number in 1 2 3; do
-        wait_authority_listener "$number"
-    done
-    echo "control_plane_multihost_quantitative_complete read_rounds=$quantitative_read_rounds sustained_seconds=$sustained_seconds"
+    assert_all_service_units_active
+    echo "control_plane_multihost_quantitative_complete host_outages=$repeat_count read_rounds=$quantitative_read_rounds sustained_seconds=$sustained_seconds"
 fi
 
-run_data_client cleanup "$data_plane_bucket_file" "${data_plane_keys[@]}"
+command_process_number=1
+assert_all_service_units_active
+run_data_client_on 1 cleanup "$data_plane_bucket_file" "${data_plane_keys[@]}"
 
 echo "== final durable state =="
 for index in 0 1 2; do
