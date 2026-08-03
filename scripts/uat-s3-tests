@@ -622,7 +622,10 @@ wait_for_storage_node_socket() {
     local log_path="${storage_node_logs[$node_id]}"
     local socket_path
     socket_path="$sockets_dir/node-$(printf '%04d' "$node_id").sock"
-    for ((attempt = 0; attempt < 200; attempt++)); do
+    # Storage-node startup permits 30 seconds of control-plane convergence
+    # after local PG open and recovery. Keep the harness deadline outside that
+    # product boundary so a healthy process is not killed while still starting.
+    for ((attempt = 0; attempt < 600; attempt++)); do
         wait_for_process "$pid" "$log_path" "storage-node-$node_id"
         if [[ -S "$socket_path" ]] && grep -q "storage-node $node_id listening" "$log_path"; then
             return 0
