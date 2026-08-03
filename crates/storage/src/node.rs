@@ -78,6 +78,7 @@ use crate::{ClusterEpoch, PgId, PgState};
 
 const TRACE_TARGET: &str = "storage";
 const RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
+const PG_STARTUP_MAX_PARALLELISM: usize = 8;
 pub(crate) const OBJECT_PAYLOAD_RECLAIM_MAX_OUTSTANDING_PER_PG: usize = 2;
 #[path = "node/bucket_ops.rs"]
 mod bucket_ops;
@@ -93,6 +94,59 @@ mod stream_ops;
 struct PgDataPaths {
     shards_dir: PathBuf,
     tmp_dir: PathBuf,
+}
+
+fn bounded_pg_startup_map<T, E, F>(
+    pg_ids: &[u32],
+    max_parallelism: usize,
+    operation: &F,
+) -> Result<Vec<(u32, T)>, E>
+where
+    T: Send,
+    E: Send,
+    F: Fn(u32) -> Result<T, E> + Sync,
+{
+    if pg_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = max_parallelism.max(1).min(pg_ids.len());
+    let chunk_size = pg_ids.len().div_ceil(worker_count);
+    std::thread::scope(|scope| {
+        let handles = pg_ids
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|&pg_id| operation(pg_id).map(|value| (pg_id, value)))
+                        .collect::<Result<Vec<_>, E>>()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut output = Vec::with_capacity(pg_ids.len());
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(mut chunk)) => output.append(&mut chunk),
+                Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+                Ok(Err(_)) => {}
+                Err(payload) => std::panic::resume_unwind(payload),
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(output),
+        }
+    })
+}
+
+fn pg_startup_parallelism(pg_count: usize) -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(PG_STARTUP_MAX_PARALLELISM)
+        .min(pg_count.max(1))
 }
 
 struct EncodeScratchPool {
@@ -728,36 +782,40 @@ impl SharedStorageNode {
                 reason: error.to_string(),
             }
         })?;
+        let pg_topology =
+            PgTopology::new(pg_ids).map_err(|source| StoreError::InvalidPgTopology { source })?;
+        let mut pg_id_list = pg_ids.to_vec();
+        pg_id_list.sort_unstable();
+        pg_id_list.dedup();
+
         prepare_private_data_dir(data_dir).map_err(|e| StoreError::Io {
             context: "prepare private data dir",
             source: e,
         })?;
 
-        let mut stores = HashMap::with_capacity(pg_ids.len());
-        let mut pg_paths = HashMap::with_capacity(pg_ids.len());
-        let mut pg_id_list = Vec::with_capacity(pg_ids.len());
-
-        for &pg_id in pg_ids {
-            let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
-            let store =
-                PgStore::open_with_initial_cluster_epoch(&pg_dir, pg_id, initial_cluster_epoch)?;
-            let shards_dir = pg_dir.join("shards");
-            let tmp_dir = pg_dir.join("tmp");
+        let opened = bounded_pg_startup_map(
+            &pg_id_list,
+            pg_startup_parallelism(pg_id_list.len()),
+            &|pg_id| {
+                let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
+                let store = PgStore::open_with_initial_cluster_epoch(
+                    &pg_dir,
+                    pg_id,
+                    initial_cluster_epoch,
+                )?;
+                let paths = PgDataPaths {
+                    shards_dir: pg_dir.join("shards"),
+                    tmp_dir: pg_dir.join("tmp"),
+                };
+                Ok::<_, StoreError>((store, paths))
+            },
+        )?;
+        let mut stores = HashMap::with_capacity(opened.len());
+        let mut pg_paths = HashMap::with_capacity(opened.len());
+        for (pg_id, (store, paths)) in opened {
             stores.insert(pg_id, Mutex::new(store));
-            pg_paths.insert(
-                pg_id,
-                PgDataPaths {
-                    shards_dir,
-                    tmp_dir,
-                },
-            );
-            pg_id_list.push(pg_id);
+            pg_paths.insert(pg_id, paths);
         }
-
-        pg_id_list.sort_unstable();
-
-        let pg_topology =
-            PgTopology::new(pg_ids).map_err(|source| StoreError::InvalidPgTopology { source })?;
 
         Ok(Self {
             process_local_registry_key: allocate_process_local_registry_key()?,
@@ -862,9 +920,11 @@ impl SharedStorageNode {
     /// recovery epoch is read from each store's own replica state.
     pub fn recover_pg_metadata_command_state(&self, node_id: NodeId) -> Result<(), StoreError> {
         let ctx = PgStoreRecoveryContext::for_node(node_id);
-        for &pg_id in self.pg_id_list.iter() {
-            self.get_pg(pg_id)?.recover(ctx)?;
-        }
+        bounded_pg_startup_map(
+            &self.pg_id_list,
+            pg_startup_parallelism(self.pg_id_list.len()),
+            &|pg_id| self.get_pg(pg_id)?.recover(ctx),
+        )?;
         Ok(())
     }
 
@@ -878,10 +938,14 @@ impl SharedStorageNode {
         node_id: NodeId,
     ) -> Result<(), StoreError> {
         let ctx = PgStoreRecoveryContext::for_node(node_id);
-        for &pg_id in self.pg_id_list.iter() {
-            self.get_pg(pg_id)?
-                .recover_clean_orphan_pending_command_slots(ctx)?;
-        }
+        bounded_pg_startup_map(
+            &self.pg_id_list,
+            pg_startup_parallelism(self.pg_id_list.len()),
+            &|pg_id| {
+                self.get_pg(pg_id)?
+                    .recover_clean_orphan_pending_command_slots(ctx)
+            },
+        )?;
         Ok(())
     }
 
@@ -2275,6 +2339,47 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[5, 2, 8, 1]).unwrap();
         assert_eq!(node.pg_ids(), &[1, 2, 5, 8]);
+    }
+
+    #[test]
+    fn bounded_pg_startup_map_runs_in_parallel_and_preserves_order() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Barrier;
+
+        let barrier = Barrier::new(4);
+        let active = AtomicUsize::new(0);
+        let max_active = AtomicUsize::new(0);
+        let pg_ids = (0..8).collect::<Vec<_>>();
+        let opened = bounded_pg_startup_map(&pg_ids, 4, &|pg_id| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            max_active.fetch_max(current, Ordering::SeqCst);
+            barrier.wait();
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok::<_, ()>(pg_id * 2)
+        })
+        .unwrap();
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            opened,
+            pg_ids
+                .iter()
+                .map(|&pg_id| (pg_id, pg_id * 2))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn bounded_pg_startup_map_returns_first_input_order_error() {
+        let pg_ids = (0..8).collect::<Vec<_>>();
+        let error = bounded_pg_startup_map(&pg_ids, 4, &|pg_id| match pg_id {
+            1 => Err("first"),
+            4 => Err("second"),
+            _ => Ok(pg_id),
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "first");
     }
 
     #[test]
