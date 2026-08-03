@@ -1447,6 +1447,21 @@ process-hosted `ExperimentalRaftControlPlane` wrapper, residual certified-static
 recovery endpoint and credential/transport assembly, transport bootstrap, and the process-hosted
 authority implementation remain pending parts of item 4.
 
+The thirty-second bounded slice completes the storage-node TLS-profile containment gate.
+`argmin-s3` retains manifest/file ownership and supplies only resolved socket addresses, TLS
+server names, trust roots, and certified server identities. Storage now constructs the fixed
+TLS 1.3 client and server profiles, installs the private `argmin-storage-rpc/1` ALPN identifier,
+and retains the resulting Rustls configurations inside opaque `StorageRpcClientEndpoint` and
+`StorageNodeRpcListenerConfig` values. Their raw enum variants, connection pool, TLS
+configurations, and profile-building entry points no longer form a public cross-crate surface;
+the process uses only logical Unix or TLS-TCP constructors and a transport-kind observation.
+Owner-local tests pin the exact ALPN profile, reject TLS 1.2-only peers in both directions, and
+retain the authenticated real-server boundary coverage. The repository boundary check rejects
+storage ALPN use, raw endpoint/listener construction, and Rustls profile construction in the
+static manifest mapper, and rejects making the private profile constant or raw constructors
+public. Storage-node TLS profile ownership is complete; control-plane/Raft transport bootstrap
+and the process-hosted control-plane authority remain separate item 12 work.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1701,7 +1716,7 @@ Raft peer client and server transports are storage-owned and boundary-checked.
 8. **Complete:** trigger SQL body verification is explicitly moved out of Phase 11 stabilisation
    tracking and retained only in Phase 4 of this plan. Trigger hashing/recreation remains deferred
    until the upgrade framework is deliberately started; it is not current-format recovery work.
-9. **Pending:** move storage-node TLS 1.3 and ALPN profile construction out of `argmin-s3` and
+9. **Complete:** move storage-node TLS 1.3 and ALPN profile construction out of `argmin-s3` and
    behind storage-owned endpoint/listener constructors. Process configuration supplies trust
    roots, certificate identities, endpoint names, addresses, and bindings; `storage` supplies and
    validates the protocol profile. Make `STORAGE_RPC_TLS_ALPN` owner-private and extend the

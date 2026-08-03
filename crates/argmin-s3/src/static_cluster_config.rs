@@ -10,9 +10,8 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::pem::{PemObject, SectionKind};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
-use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
+use rustls::RootCertStore;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -36,7 +35,7 @@ use storage::control_plane_raft::{
     ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::StorageNodeRpcListenerConfig;
-use storage::storage_rpc_transport::{StorageRpcClientEndpoint, STORAGE_RPC_TLS_ALPN};
+use storage::storage_rpc_transport::StorageRpcClientEndpoint;
 use storage::{
     FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability,
     StaticInitialControlPlaneTopology, StaticInitialPgPlacement, StaticStorageFailureDomain,
@@ -412,26 +411,6 @@ pub(crate) struct ResolvedStaticClusterMaterial {
     auth_credentials: Vec<ResolvedStaticAuthCredential>,
     tls_identities: BTreeMap<String, ResolvedStaticTlsIdentity>,
     tls_trust_bundles: BTreeMap<String, ResolvedStaticTlsTrustBundle>,
-}
-
-#[derive(Clone)]
-struct StaticSingleCertificateResolver {
-    certified_key: Arc<CertifiedKey>,
-}
-
-impl fmt::Debug for StaticSingleCertificateResolver {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("StaticSingleCertificateResolver")
-            .field("certificate_count", &self.certified_key.cert.len())
-            .field("private_key", &"<redacted>")
-            .finish()
-    }
-}
-
-impl ResolvesServerCert for StaticSingleCertificateResolver {
-    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        Some(Arc::clone(&self.certified_key))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1928,7 +1907,6 @@ impl ValidatedStaticClusterManifest {
             .map(storage::control_plane::ControlPlaneRpcClientEndpoint::advertised_endpoint)
             .ok_or_else(|| "replicated data process has no control-plane route".to_string())?;
 
-        let provider = rustls::crypto::ring::default_provider();
         let mut storage_node_sockets = Vec::with_capacity(self.manifest.storage_nodes.len());
         let mut storage_rpc_client_endpoints =
             Vec::with_capacity(self.manifest.storage_nodes.len());
@@ -1971,16 +1949,6 @@ impl ValidatedStaticClusterManifest {
                             .tls_server_name
                             .clone()
                             .expect("validated storage TCP endpoint has a TLS server name");
-                        let mut tls_client_config =
-                            RustlsClientConfig::builder_with_provider(Arc::new(provider.clone()))
-                                .with_protocol_versions(&[&rustls::version::TLS13])
-                                .map_err(|_| {
-                                    "failed to select the static storage RPC TLS protocol"
-                                        .to_string()
-                                })?
-                                .with_root_certificates((*roots.roots).clone())
-                                .with_no_client_auth();
-                        tls_client_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
                         let mut addresses = (host.as_str(), port)
                             .to_socket_addrs()
                             .map_err(|error| {
@@ -1996,11 +1964,11 @@ impl ValidatedStaticClusterManifest {
                             node_id: storage_node.node_id,
                             socket_path: canonical_endpoint.advertise.clone(),
                         });
-                        StorageRpcClientEndpoint::tcp(
+                        StorageRpcClientEndpoint::tls_tcp(
                             canonical_endpoint.advertise.clone(),
                             addresses,
                             server_name,
-                            Arc::new(tls_client_config),
+                            Arc::clone(&roots.roots),
                         )
                         .map_err(|error| {
                             format!("invalid storage endpoint {}: {error}", endpoint.id)
@@ -2029,8 +1997,7 @@ impl ValidatedStaticClusterManifest {
             for endpoint in endpoints {
                 match parse_endpoint_address(&endpoint.listen, true)? {
                     EndpointAddress::Unix(socket_path) => {
-                        storage_rpc_listeners
-                            .push(StorageNodeRpcListenerConfig::Unix { socket_path });
+                        storage_rpc_listeners.push(StorageNodeRpcListenerConfig::unix(socket_path));
                     }
                     EndpointAddress::Tcp { host, port } => {
                         let bind_ip = host.parse().map_err(|_| {
@@ -2050,23 +2017,15 @@ impl ValidatedStaticClusterManifest {
                                 endpoint.id
                             )
                             })?;
-                        let resolver = StaticSingleCertificateResolver {
-                            certified_key: Arc::clone(&identity.certified_key),
-                        };
-                        let mut tls_server_config =
-                            rustls::ServerConfig::builder_with_provider(Arc::new(provider.clone()))
-                                .with_protocol_versions(&[&rustls::version::TLS13])
-                                .map_err(|_| {
-                                    "failed to select the static storage RPC TLS protocol"
-                                        .to_string()
-                                })?
-                                .with_no_client_auth()
-                                .with_cert_resolver(Arc::new(resolver));
-                        tls_server_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
-                        storage_rpc_listeners.push(StorageNodeRpcListenerConfig::Tcp {
-                            bind_addr: SocketAddr::new(bind_ip, port),
-                            tls_server_config: Arc::new(tls_server_config),
-                        });
+                        storage_rpc_listeners.push(
+                            StorageNodeRpcListenerConfig::tls_tcp(
+                                SocketAddr::new(bind_ip, port),
+                                Arc::clone(&identity.certified_key),
+                            )
+                            .map_err(|error| {
+                                format!("invalid storage TCP listener {}: {error}", endpoint.id)
+                            })?,
+                        );
                     }
                 }
             }
@@ -8816,15 +8775,12 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             .unwrap();
 
         assert_eq!(storage_config.storage_rpc_listeners.len(), 1);
-        assert!(matches!(
-            storage_config.storage_rpc_listeners[0],
-            StorageNodeRpcListenerConfig::Tcp { .. }
-        ));
+        assert!(storage_config.storage_rpc_listeners[0].is_tls_tcp());
         assert_eq!(storage_config.storage_rpc_client_endpoints.len(), 3);
         assert!(storage_config
             .storage_rpc_client_endpoints
             .iter()
-            .all(|(_, endpoint)| matches!(endpoint, StorageRpcClientEndpoint::Tcp { .. })));
+            .all(|(_, endpoint)| endpoint.is_tls_tcp()));
         assert_eq!(
             storage_config.storage_node_socket_path.as_deref(),
             Some("tcp://localhost:7701")

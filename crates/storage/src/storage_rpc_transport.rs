@@ -7,10 +7,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustls::pki_types::ServerName;
+use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
 
 use crate::deadline_io::DeadlineStream;
 
-pub const STORAGE_RPC_TLS_ALPN: &[u8] = b"argmin-storage-rpc/1";
+pub(crate) const STORAGE_RPC_TLS_ALPN: &[u8] = b"argmin-storage-rpc/1";
 const STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT: usize = 8;
 
 pub trait StorageRpcStream: Read + Write + Send {
@@ -21,7 +23,12 @@ pub trait StorageRpcStream: Read + Write + Send {
 pub type BoxStorageRpcStream = Box<dyn StorageRpcStream>;
 
 #[derive(Clone)]
-pub enum StorageRpcClientEndpoint {
+pub struct StorageRpcClientEndpoint {
+    inner: StorageRpcClientEndpointInner,
+}
+
+#[derive(Clone)]
+enum StorageRpcClientEndpointInner {
     Unix {
         socket_path: PathBuf,
     },
@@ -34,8 +41,7 @@ pub enum StorageRpcClientEndpoint {
     },
 }
 
-#[doc(hidden)]
-pub struct StorageRpcClientConnectionPool {
+struct StorageRpcClientConnectionPool {
     state: Mutex<StorageRpcClientConnectionPoolState>,
     available: Condvar,
 }
@@ -65,12 +71,29 @@ pub(crate) enum StorageRpcEndpointAuthorityIdentity<'a> {
 impl StorageRpcClientEndpoint {
     #[must_use]
     pub fn unix(socket_path: impl Into<PathBuf>) -> Self {
-        Self::Unix {
-            socket_path: socket_path.into(),
+        Self {
+            inner: StorageRpcClientEndpointInner::Unix {
+                socket_path: socket_path.into(),
+            },
         }
     }
 
-    pub fn tcp(
+    pub fn tls_tcp(
+        advertised_endpoint: impl Into<String>,
+        addresses: Vec<SocketAddr>,
+        server_name: impl Into<String>,
+        trust_roots: Arc<rustls::RootCertStore>,
+    ) -> io::Result<Self> {
+        let tls_client_config = storage_rpc_tls_client_config(trust_roots)?;
+        Self::tcp_with_config(
+            advertised_endpoint,
+            addresses,
+            server_name,
+            tls_client_config,
+        )
+    }
+
+    pub(crate) fn tcp_with_config(
         advertised_endpoint: impl Into<String>,
         addresses: Vec<SocketAddr>,
         server_name: impl Into<String>,
@@ -102,23 +125,27 @@ impl StorageRpcClientEndpoint {
                 "storage RPC TLS client must offer only argmin-storage-rpc/1 ALPN",
             ));
         }
-        Ok(Self::Tcp {
-            advertised_endpoint,
-            addresses,
-            server_name,
-            tls_client_config,
-            request_pool: Arc::new(StorageRpcClientConnectionPool {
-                state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
-                available: Condvar::new(),
-            }),
+        Ok(Self {
+            inner: StorageRpcClientEndpointInner::Tcp {
+                advertised_endpoint,
+                addresses,
+                server_name,
+                tls_client_config,
+                request_pool: Arc::new(StorageRpcClientConnectionPool {
+                    state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
+                    available: Condvar::new(),
+                }),
+            },
         })
     }
 
     #[must_use]
     pub fn advertised_endpoint(&self) -> String {
-        match self {
-            Self::Unix { socket_path } => socket_path.to_string_lossy().into_owned(),
-            Self::Tcp {
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix { socket_path } => {
+                socket_path.to_string_lossy().into_owned()
+            }
+            StorageRpcClientEndpointInner::Tcp {
                 advertised_endpoint,
                 ..
             } => advertised_endpoint.clone(),
@@ -126,11 +153,11 @@ impl StorageRpcClientEndpoint {
     }
 
     pub(crate) fn authority_identity(&self) -> StorageRpcEndpointAuthorityIdentity<'_> {
-        match self {
-            Self::Unix { socket_path } => {
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix { socket_path } => {
                 StorageRpcEndpointAuthorityIdentity::Unix(socket_path.as_path())
             }
-            Self::Tcp {
+            StorageRpcClientEndpointInner::Tcp {
                 advertised_endpoint,
                 ..
             } => StorageRpcEndpointAuthorityIdentity::Tcp(advertised_endpoint),
@@ -139,15 +166,20 @@ impl StorageRpcClientEndpoint {
 
     #[must_use]
     pub fn unix_socket_path(&self) -> Option<&Path> {
-        match self {
-            Self::Unix { socket_path } => Some(socket_path),
-            Self::Tcp { .. } => None,
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix { socket_path } => Some(socket_path),
+            StorageRpcClientEndpointInner::Tcp { .. } => None,
         }
     }
 
+    #[must_use]
+    pub fn is_tls_tcp(&self) -> bool {
+        matches!(&self.inner, StorageRpcClientEndpointInner::Tcp { .. })
+    }
+
     pub(crate) fn connect(&self, deadline: Instant) -> io::Result<BoxStorageRpcStream> {
-        match self {
-            Self::Unix { socket_path } => {
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix { socket_path } => {
                 let stream = UnixStream::connect(socket_path)?;
                 let stream = DeadlineStream::new(
                     stream,
@@ -156,7 +188,7 @@ impl StorageRpcClientEndpoint {
                 )?;
                 Ok(Box::new(stream))
             }
-            Self::Tcp {
+            StorageRpcClientEndpointInner::Tcp {
                 addresses,
                 server_name,
                 tls_client_config,
@@ -171,15 +203,16 @@ impl StorageRpcClientEndpoint {
         io_timeout: Duration,
         max_connections: usize,
     ) -> io::Result<StorageRpcRequestConnection> {
-        match self {
-            Self::Unix { .. } => self
-                .connect(deadline)
-                .map(|stream| StorageRpcRequestConnection {
-                    stream: Some(stream),
-                    pool: None,
-                    reusable: false,
-                }),
-            Self::Tcp {
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix { .. } => {
+                self.connect(deadline)
+                    .map(|stream| StorageRpcRequestConnection {
+                        stream: Some(stream),
+                        pool: None,
+                        reusable: false,
+                    })
+            }
+            StorageRpcClientEndpointInner::Tcp {
                 addresses,
                 server_name,
                 tls_client_config,
@@ -190,6 +223,78 @@ impl StorageRpcClientEndpoint {
             }),
         }
     }
+}
+
+pub(crate) fn storage_rpc_tls_client_config(
+    trust_roots: Arc<rustls::RootCertStore>,
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "failed to select the storage RPC TLS protocol profile",
+        )
+    })?
+    .with_root_certificates((*trust_roots).clone())
+    .with_no_client_auth();
+    config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+    Ok(Arc::new(config))
+}
+
+#[derive(Clone)]
+struct StorageRpcSingleCertificateResolver {
+    certified_key: Arc<CertifiedKey>,
+}
+
+impl fmt::Debug for StorageRpcSingleCertificateResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StorageRpcSingleCertificateResolver")
+            .field("certificate_count", &self.certified_key.cert.len())
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ResolvesServerCert for StorageRpcSingleCertificateResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.certified_key))
+    }
+}
+
+pub(crate) fn storage_rpc_tls_server_config(
+    certified_key: Arc<CertifiedKey>,
+) -> io::Result<Arc<rustls::ServerConfig>> {
+    let resolver = StorageRpcSingleCertificateResolver { certified_key };
+    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[&rustls::version::TLS13])
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "failed to select the storage RPC TLS protocol profile",
+        )
+    })?
+    .with_no_client_auth()
+    .with_cert_resolver(Arc::new(resolver));
+    config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+    Ok(Arc::new(config))
+}
+
+pub(crate) fn validate_storage_rpc_tls_server_config(
+    config: &rustls::ServerConfig,
+) -> io::Result<()> {
+    if config.alpn_protocols != [STORAGE_RPC_TLS_ALPN] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "storage RPC TLS server must offer only argmin-storage-rpc/1 ALPN",
+        ));
+    }
+    Ok(())
 }
 
 impl StorageRpcClientConnectionPool {
@@ -316,12 +421,12 @@ impl Drop for StorageRpcRequestConnection {
 
 impl fmt::Debug for StorageRpcClientEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unix { socket_path } => f
+        match &self.inner {
+            StorageRpcClientEndpointInner::Unix { socket_path } => f
                 .debug_struct("StorageRpcClientEndpoint::Unix")
                 .field("socket_path", socket_path)
                 .finish(),
-            Self::Tcp {
+            StorageRpcClientEndpointInner::Tcp {
                 advertised_endpoint,
                 addresses,
                 server_name,
@@ -492,12 +597,7 @@ pub(crate) fn accepted_tls_tcp_stream(
     tls_server_config: Arc<rustls::ServerConfig>,
     deadline: Instant,
 ) -> io::Result<BoxStorageRpcStream> {
-    if tls_server_config.alpn_protocols != [STORAGE_RPC_TLS_ALPN] {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "storage RPC TLS server must offer only argmin-storage-rpc/1 ALPN",
-        ));
-    }
+    validate_storage_rpc_tls_server_config(&tls_server_config)?;
     stream.set_nodelay(true)?;
     let connection = rustls::ServerConnection::new(tls_server_config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
@@ -524,8 +624,47 @@ pub(crate) fn accepted_tls_tcp_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::net::TcpListener;
     use std::thread;
+
+    fn test_certificates() -> Vec<CertificateDer<'static>> {
+        CertificateDer::pem_slice_iter(include_bytes!("../../s3-tests/testdata/localhost-cert.pem"))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn test_private_key() -> PrivateKeyDer<'static> {
+        PrivateKeyDer::from_pem_slice(include_bytes!("../../s3-tests/testdata/localhost-key.pem"))
+            .unwrap()
+    }
+
+    fn test_certified_key() -> Arc<CertifiedKey> {
+        Arc::new(
+            CertifiedKey::from_der(
+                test_certificates(),
+                test_private_key(),
+                &rustls::crypto::ring::default_provider(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn test_trust_roots() -> Arc<rustls::RootCertStore> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::pem_slice_iter(include_bytes!(
+                    "../../s3-tests/testdata/ca-cert.pem"
+                ))
+                .next()
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        Arc::new(roots)
+    }
 
     fn client_config(alpn: Vec<Vec<u8>>) -> Arc<rustls::ClientConfig> {
         let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -541,7 +680,7 @@ mod tests {
 
     #[test]
     fn tcp_endpoint_requires_exact_storage_rpc_alpn() {
-        let error = StorageRpcClientEndpoint::tcp(
+        let error = StorageRpcClientEndpoint::tcp_with_config(
             "tcp://localhost:7701",
             vec!["127.0.0.1:7701".parse().unwrap()],
             "localhost",
@@ -551,6 +690,109 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("argmin-storage-rpc/1 ALPN"));
+    }
+
+    #[test]
+    fn tls_tcp_endpoint_constructs_the_storage_owned_profile() {
+        let endpoint = StorageRpcClientEndpoint::tls_tcp(
+            "tcp://localhost:7701",
+            vec!["127.0.0.1:7701".parse().unwrap()],
+            "localhost",
+            Arc::new(rustls::RootCertStore::empty()),
+        )
+        .unwrap();
+
+        let StorageRpcClientEndpointInner::Tcp {
+            tls_client_config, ..
+        } = &endpoint.inner
+        else {
+            panic!("TLS constructor returned a Unix endpoint");
+        };
+        assert_eq!(tls_client_config.alpn_protocols, [STORAGE_RPC_TLS_ALPN]);
+        assert!(endpoint.is_tls_tcp());
+    }
+
+    #[test]
+    fn storage_owned_client_profile_rejects_tls_1_2_only_server() {
+        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(test_certificates(), test_private_key())
+        .unwrap();
+        server_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accepted_tls_tcp_stream(
+                stream,
+                server_config,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .err()
+            .expect("TLS 1.3 storage client must not negotiate with a TLS 1.2-only server")
+        });
+        let endpoint = StorageRpcClientEndpoint::tls_tcp(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            test_trust_roots(),
+        )
+        .unwrap();
+
+        let client_error = endpoint
+            .connect(Instant::now() + Duration::from_secs(1))
+            .err()
+            .expect("TLS 1.3 storage client must reject a TLS 1.2-only server");
+        let server_error = server.join().unwrap();
+
+        assert_ne!(client_error.kind(), io::ErrorKind::TimedOut);
+        assert_ne!(server_error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn storage_owned_server_profile_rejects_tls_1_2_only_client() {
+        let server_config = storage_rpc_tls_server_config(test_certified_key()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            accepted_tls_tcp_stream(
+                stream,
+                server_config,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .err()
+            .expect("TLS 1.3 storage server must not negotiate with a TLS 1.2-only client")
+        });
+        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS12])
+        .unwrap()
+        .with_root_certificates((*test_trust_roots()).clone())
+        .with_no_client_auth();
+        client_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            Arc::new(client_config),
+        )
+        .unwrap();
+
+        let client_error = endpoint
+            .connect(Instant::now() + Duration::from_secs(1))
+            .err()
+            .expect("TLS 1.2-only client must reject the TLS 1.3 storage server");
+        let server_error = server.join().unwrap();
+
+        assert_ne!(client_error.kind(), io::ErrorKind::TimedOut);
+        assert_ne!(server_error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

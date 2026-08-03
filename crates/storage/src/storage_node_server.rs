@@ -340,7 +340,8 @@ use crate::storage_rpc_auth::{
     StorageRpcServerAuthConfig,
 };
 use crate::storage_rpc_transport::{
-    accepted_tls_tcp_stream, accepted_unix_stream, BoxStorageRpcStream, STORAGE_RPC_TLS_ALPN,
+    accepted_tls_tcp_stream, accepted_unix_stream, storage_rpc_tls_server_config,
+    validate_storage_rpc_tls_server_config, BoxStorageRpcStream,
 };
 use crate::types::{
     AdmittedRouteEffectFence, BucketState, ClusterEpoch, GenerationId, PgId, PgState, SessionId,
@@ -2181,7 +2182,12 @@ struct StorageNodeRuntimeRouteState {
 }
 
 #[derive(Clone)]
-pub enum StorageNodeRpcListenerConfig {
+pub struct StorageNodeRpcListenerConfig {
+    inner: StorageNodeRpcListenerConfigInner,
+}
+
+#[derive(Clone)]
+enum StorageNodeRpcListenerConfigInner {
     Unix {
         socket_path: PathBuf,
     },
@@ -2191,14 +2197,52 @@ pub enum StorageNodeRpcListenerConfig {
     },
 }
 
+impl StorageNodeRpcListenerConfig {
+    #[must_use]
+    pub fn unix(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: StorageNodeRpcListenerConfigInner::Unix {
+                socket_path: socket_path.into(),
+            },
+        }
+    }
+
+    pub fn tls_tcp(
+        bind_addr: SocketAddr,
+        certified_key: Arc<rustls::sign::CertifiedKey>,
+    ) -> io::Result<Self> {
+        Ok(Self::tls_tcp_with_config(
+            bind_addr,
+            storage_rpc_tls_server_config(certified_key)?,
+        ))
+    }
+
+    fn tls_tcp_with_config(
+        bind_addr: SocketAddr,
+        tls_server_config: Arc<rustls::ServerConfig>,
+    ) -> Self {
+        Self {
+            inner: StorageNodeRpcListenerConfigInner::Tcp {
+                bind_addr,
+                tls_server_config,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn is_tls_tcp(&self) -> bool {
+        matches!(&self.inner, StorageNodeRpcListenerConfigInner::Tcp { .. })
+    }
+}
+
 impl std::fmt::Debug for StorageNodeRpcListenerConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unix { socket_path } => formatter
+        match &self.inner {
+            StorageNodeRpcListenerConfigInner::Unix { socket_path } => formatter
                 .debug_struct("StorageNodeRpcListenerConfig::Unix")
                 .field("socket_path", socket_path)
                 .finish(),
-            Self::Tcp { bind_addr, .. } => formatter
+            StorageNodeRpcListenerConfigInner::Tcp { bind_addr, .. } => formatter
                 .debug_struct("StorageNodeRpcListenerConfig::Tcp")
                 .field("bind_addr", bind_addr)
                 .field("tls", &true)
@@ -2813,8 +2857,8 @@ fn bind_storage_node_rpc_listeners(
     }
     let mut listeners = Vec::with_capacity(configs.len());
     for config in configs {
-        match config {
-            StorageNodeRpcListenerConfig::Unix { socket_path } => {
+        match config.inner {
+            StorageNodeRpcListenerConfigInner::Unix { socket_path } => {
                 validate_socket_directory(&socket_path)?;
                 cleanup_stale_socket_path(&socket_path)?;
                 let listener = UnixListener::bind(&socket_path).map_err(|source| {
@@ -2829,7 +2873,7 @@ fn bind_storage_node_rpc_listeners(
                     socket_path,
                 });
             }
-            StorageNodeRpcListenerConfig::Tcp {
+            StorageNodeRpcListenerConfigInner::Tcp {
                 bind_addr,
                 tls_server_config,
             } => {
@@ -2838,14 +2882,11 @@ fn bind_storage_node_rpc_listeners(
                         StorageNodeServerError::TcpRpcListenerRequiresAuthentication { bind_addr },
                     );
                 }
-                if tls_server_config.alpn_protocols != [STORAGE_RPC_TLS_ALPN] {
+                if let Err(source) = validate_storage_rpc_tls_server_config(&tls_server_config) {
                     return Err(StorageNodeServerError::RpcListenerIo {
                         context: "validate TLS storage-node RPC listener",
                         endpoint: bind_addr.to_string(),
-                        source: io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "storage-node RPC TLS server must offer only argmin-storage-rpc/1 ALPN",
-                        ),
+                        source,
                     });
                 }
                 let listener = TcpListener::bind(bind_addr).map_err(|source| {
@@ -2902,11 +2943,8 @@ impl StorageNodeServer {
             config.default_ec_shape,
         )?;
         node.recover_pg_metadata_command_state(config.node_id)?;
-        let rpc_listeners = rpc_listeners.unwrap_or_else(|| {
-            vec![StorageNodeRpcListenerConfig::Unix {
-                socket_path: config.socket_path.clone(),
-            }]
-        });
+        let rpc_listeners = rpc_listeners
+            .unwrap_or_else(|| vec![StorageNodeRpcListenerConfig::unix(&config.socket_path)]);
         let listeners = bind_storage_node_rpc_listeners(rpc_listeners, rpc_auth.as_deref())?;
         let route_map_lease = bind_storage_node_route_map_lease(config.route_map_validity)?;
         Ok(Self {
@@ -20678,7 +20716,7 @@ mod tests {
         )
     }
 
-    fn storage_rpc_tls_server_config() -> Arc<rustls::ServerConfig> {
+    fn storage_rpc_tls_certified_key() -> Arc<rustls::sign::CertifiedKey> {
         let certificates = CertificateDer::pem_slice_iter(include_bytes!(
             "../../s3-tests/testdata/localhost-cert.pem"
         ))
@@ -20688,19 +20726,17 @@ mod tests {
             "../../s3-tests/testdata/localhost-key.pem"
         ))
         .unwrap();
-        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certificates, private_key)
-        .unwrap();
-        config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
-        Arc::new(config)
+        Arc::new(
+            rustls::sign::CertifiedKey::from_der(
+                certificates,
+                private_key,
+                &rustls::crypto::ring::default_provider(),
+            )
+            .unwrap(),
+        )
     }
 
-    fn storage_rpc_tls_client_config() -> Arc<rustls::ClientConfig> {
+    fn storage_rpc_tls_trust_roots() -> Arc<rustls::RootCertStore> {
         let mut roots = rustls::RootCertStore::empty();
         roots
             .add(
@@ -20712,15 +20748,38 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-        config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
-        Arc::new(config)
+        Arc::new(roots)
+    }
+
+    fn storage_rpc_tls_server_config() -> Arc<rustls::ServerConfig> {
+        crate::storage_rpc_transport::storage_rpc_tls_server_config(storage_rpc_tls_certified_key())
+            .unwrap()
+    }
+
+    fn storage_rpc_tls_client_config() -> Arc<rustls::ClientConfig> {
+        crate::storage_rpc_transport::storage_rpc_tls_client_config(storage_rpc_tls_trust_roots())
+            .unwrap()
+    }
+
+    #[test]
+    fn tls_tcp_listener_constructs_the_storage_owned_profile() {
+        let listener = StorageNodeRpcListenerConfig::tls_tcp(
+            "127.0.0.1:7701".parse().unwrap(),
+            storage_rpc_tls_certified_key(),
+        )
+        .unwrap();
+
+        let StorageNodeRpcListenerConfigInner::Tcp {
+            tls_server_config, ..
+        } = &listener.inner
+        else {
+            panic!("TLS constructor returned a Unix listener");
+        };
+        assert_eq!(
+            tls_server_config.alpn_protocols,
+            [crate::storage_rpc_transport::STORAGE_RPC_TLS_ALPN]
+        );
+        assert!(listener.is_tls_tcp());
     }
 
     fn bounded_runtime_refresh_config(
@@ -24582,15 +24641,15 @@ mod tests {
         });
         let server = PreparedStorageNodeServer::new(config.clone())
             .with_rpc_auth(storage_rpc_server_auth(&credential))
-            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                tls_server_config: storage_rpc_tls_server_config(),
-            }])
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
             .bind()
             .unwrap();
         let address = server.tcp_listener_addr_for_test();
         let join = thread::spawn(move || server.accept_one());
-        let endpoint = StorageRpcClientEndpoint::tcp(
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
             format!("tcp://localhost:{}", address.port()),
             vec![address],
             "localhost",
@@ -24627,10 +24686,10 @@ mod tests {
         });
         let server = PreparedStorageNodeServer::new(config.clone())
             .with_rpc_auth(storage_rpc_server_auth_with_max_connections(&credential, 1))
-            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                tls_server_config: storage_rpc_tls_server_config(),
-            }])
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
             .bind()
             .unwrap();
         let address = server.tcp_listener_addr_for_test();
@@ -24638,7 +24697,7 @@ mod tests {
             server.accept_one().unwrap();
             server.accept_one().unwrap();
         });
-        let endpoint = StorageRpcClientEndpoint::tcp(
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
             format!("tcp://localhost:{}", address.port()),
             vec![address],
             "localhost",
@@ -24684,16 +24743,16 @@ mod tests {
         let server = Arc::new(
             PreparedStorageNodeServer::new(config.clone())
                 .with_rpc_auth(storage_rpc_server_auth_with_max_connections(&credential, 2))
-                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
-                    bind_addr: "127.0.0.1:0".parse().unwrap(),
-                    tls_server_config: storage_rpc_tls_server_config(),
-                }])
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
                 .bind()
                 .unwrap(),
         );
         let address = server.tcp_listener_addr_for_test();
         let new_client = || {
-            let endpoint = StorageRpcClientEndpoint::tcp(
+            let endpoint = StorageRpcClientEndpoint::tcp_with_config(
                 format!("tcp://localhost:{}", address.port()),
                 vec![address],
                 "localhost",
@@ -24762,10 +24821,10 @@ mod tests {
         let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
             PreparedStorageNodeServer::new(config.clone())
                 .with_rpc_auth(storage_rpc_server_auth(&credential))
-                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
-                    bind_addr: "127.0.0.1:0".parse().unwrap(),
-                    tls_server_config: storage_rpc_tls_server_config(),
-                }])
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
                 .bind()
                 .unwrap()
         });
@@ -24803,7 +24862,7 @@ mod tests {
             });
         });
         let new_client = || {
-            let endpoint = StorageRpcClientEndpoint::tcp(
+            let endpoint = StorageRpcClientEndpoint::tcp_with_config(
                 format!("tcp://localhost:{}", address.port()),
                 vec![address],
                 "localhost",
@@ -25417,10 +25476,10 @@ mod tests {
         let server = Arc::new(
             PreparedStorageNodeServer::new(config.clone())
                 .with_rpc_auth(storage_rpc_server_auth(&credential))
-                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
-                    bind_addr: "127.0.0.1:0".parse().unwrap(),
-                    tls_server_config: storage_rpc_tls_server_config(),
-                }])
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
                 .bind()
                 .unwrap(),
         );
@@ -25431,7 +25490,7 @@ mod tests {
 
         let serving = Arc::clone(&server);
         let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
-        let endpoint = StorageRpcClientEndpoint::tcp(
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
             format!("tcp://localhost:{}", address.port()),
             vec![address],
             "localhost",
@@ -25466,10 +25525,10 @@ mod tests {
         let server = Arc::new(
             PreparedStorageNodeServer::new(config.clone())
                 .with_rpc_auth(storage_rpc_server_auth(&credential))
-                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
-                    bind_addr: "127.0.0.1:0".parse().unwrap(),
-                    tls_server_config: storage_rpc_tls_server_config(),
-                }])
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
                 .bind()
                 .unwrap(),
         );
@@ -25482,7 +25541,7 @@ mod tests {
 
         let serving = Arc::clone(&server);
         let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
-        let endpoint = StorageRpcClientEndpoint::tcp(
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
             format!("tcp://localhost:{}", address.port()),
             vec![address],
             "localhost",
@@ -25511,10 +25570,10 @@ mod tests {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
         let result = PreparedStorageNodeServer::new(config)
-            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::Tcp {
-                bind_addr: "127.0.0.1:0".parse().unwrap(),
-                tls_server_config: storage_rpc_tls_server_config(),
-            }])
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
             .bind();
 
         assert!(matches!(
@@ -25530,13 +25589,11 @@ mod tests {
         let socket_path = tmp.path().join("partial-bind.sock");
         let result = bind_storage_node_rpc_listeners(
             vec![
-                StorageNodeRpcListenerConfig::Unix {
-                    socket_path: socket_path.clone(),
-                },
-                StorageNodeRpcListenerConfig::Tcp {
-                    bind_addr: "127.0.0.1:0".parse().unwrap(),
-                    tls_server_config: storage_rpc_tls_server_config(),
-                },
+                StorageNodeRpcListenerConfig::unix(&socket_path),
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
             ],
             None,
         );

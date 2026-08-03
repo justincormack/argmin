@@ -6002,7 +6002,7 @@ mod runtime_map_refresh_invalidation_tests {
         .with_root_certificates(rustls::RootCertStore::empty())
         .with_no_client_auth();
         tls.alpn_protocols = vec![crate::storage_rpc_transport::STORAGE_RPC_TLS_ALPN.to_vec()];
-        let endpoint = crate::storage_rpc_transport::StorageRpcClientEndpoint::tcp(
+        let endpoint = crate::storage_rpc_transport::StorageRpcClientEndpoint::tcp_with_config(
             "tcp://localhost:7701",
             vec!["127.0.0.1:7701".parse().unwrap()],
             "localhost",
@@ -6034,14 +6034,12 @@ mod runtime_map_refresh_invalidation_tests {
             )
             .unwrap();
 
-        assert!(matches!(
-            refreshed
-                .rpc_endpoints
-                .as_ref()
-                .unwrap()
-                .get(&NodeId::new(1)),
-            Some(crate::storage_rpc_transport::StorageRpcClientEndpoint::Tcp { .. })
-        ));
+        assert!(refreshed
+            .rpc_endpoints
+            .as_ref()
+            .unwrap()
+            .get(&NodeId::new(1))
+            .is_some_and(crate::storage_rpc_transport::StorageRpcClientEndpoint::is_tls_tcp));
     }
 
     #[test]
@@ -6082,7 +6080,7 @@ mod runtime_map_refresh_invalidation_tests {
         let endpoints = [(1_u32, 7701_u16), (2, 7702)].map(|(node_id, port)| {
             (
                 NodeId::new(node_id),
-                crate::storage_rpc_transport::StorageRpcClientEndpoint::tcp(
+                crate::storage_rpc_transport::StorageRpcClientEndpoint::tcp_with_config(
                     format!("tcp://localhost:{port}"),
                     vec![format!("127.0.0.1:{port}").parse().unwrap()],
                     "localhost",
@@ -6118,10 +6116,7 @@ mod runtime_map_refresh_invalidation_tests {
             .as_ref()
             .unwrap()
             .values()
-            .all(|endpoint| matches!(
-                endpoint,
-                crate::storage_rpc_transport::StorageRpcClientEndpoint::Tcp { .. }
-            )));
+            .all(crate::storage_rpc_transport::StorageRpcClientEndpoint::is_tls_tcp));
     }
 
     #[test]
