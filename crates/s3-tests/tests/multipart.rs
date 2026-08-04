@@ -7317,75 +7317,82 @@ fn test_conditional_completion_racing_object_replacement_is_serializable() {
                 b"replacement object"
             );
 
-            if attempt % 2 == 0 {
-                completion.unwrap_or_else(|err| {
-                    panic!("completion-first attempt {attempt} failed: {err:?}")
-                });
-                assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
-                let replay =
-                    send_single_part_completion(client, &bucket, key, &upload_id, 1, &part_etag)
-                        .await;
-                assert_eq!(err_status(&replay), 404);
-                assert_s3_err_code(&replay, "NoSuchUpload");
-            } else {
-                assert_eq!(err_status(&completion), 412);
-                assert_s3_err_code(&completion, "PreconditionFailed");
-                let listed = client
-                    .list_parts()
-                    .bucket(&bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(listed.parts().len(), 1);
-                assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
-
-                let corrected = client
-                    .complete_multipart_upload()
-                    .bucket(&bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .if_match(&replacement_etag)
-                    .multipart_upload(single_part_completion(&part_etag, 1))
-                    .send()
-                    .await;
-                assert_eq!(err_status(&corrected), 409);
-                assert_s3_err_code(&corrected, "ConditionalRequestConflict");
-                let listed = client
-                    .list_parts()
-                    .bucket(&bucket)
-                    .key(key)
-                    .upload_id(&upload_id)
-                    .send()
-                    .await
-                    .unwrap();
-                assert_eq!(listed.parts().len(), 1);
-                assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
-                abort_multipart_upload_retrying_operation_aborted(client, &bucket, key, &upload_id)
-                    .await;
-
-                let (new_upload_id, new_part_etag) =
-                    create_single_part_upload(client, &bucket, key, 1, b"multipart object").await;
-                let corrected = client
-                    .complete_multipart_upload()
-                    .bucket(&bucket)
-                    .key(key)
-                    .upload_id(&new_upload_id)
-                    .if_match(&replacement_etag)
-                    .multipart_upload(single_part_completion(&new_part_etag, 1))
-                    .send_retrying_operation_aborted(
-                        "complete newly initiated upload after raced conditional conflict",
+            // The alternating sleeps bias the race but do not establish which
+            // request reaches its storage commit first. Classify the observed
+            // serialization from the completion result instead.
+            match &completion {
+                Ok(_) => {
+                    assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+                    let replay = send_single_part_completion(
+                        client, &bucket, key, &upload_id, 1, &part_etag,
                     )
-                    .await
-                    .unwrap();
-                assert_object_contents_and_etag(
-                    &bucket,
-                    key,
-                    corrected.e_tag().unwrap(),
-                    b"multipart object",
-                )
-                .await;
+                    .await;
+                    assert_eq!(err_status(&replay), 404);
+                    assert_s3_err_code(&replay, "NoSuchUpload");
+                }
+                Err(_) => {
+                    assert_eq!(err_status(&completion), 412);
+                    assert_s3_err_code(&completion, "PreconditionFailed");
+                    let listed = client
+                        .list_parts()
+                        .bucket(&bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(listed.parts().len(), 1);
+                    assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
+
+                    let corrected = client
+                        .complete_multipart_upload()
+                        .bucket(&bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .if_match(&replacement_etag)
+                        .multipart_upload(single_part_completion(&part_etag, 1))
+                        .send()
+                        .await;
+                    assert_eq!(err_status(&corrected), 409);
+                    assert_s3_err_code(&corrected, "ConditionalRequestConflict");
+                    let listed = client
+                        .list_parts()
+                        .bucket(&bucket)
+                        .key(key)
+                        .upload_id(&upload_id)
+                        .send()
+                        .await
+                        .unwrap();
+                    assert_eq!(listed.parts().len(), 1);
+                    assert_eq!(listed.parts()[0].e_tag(), Some(part_etag.as_str()));
+                    abort_multipart_upload_retrying_operation_aborted(
+                        client, &bucket, key, &upload_id,
+                    )
+                    .await;
+
+                    let (new_upload_id, new_part_etag) =
+                        create_single_part_upload(client, &bucket, key, 1, b"multipart object")
+                            .await;
+                    let corrected = client
+                        .complete_multipart_upload()
+                        .bucket(&bucket)
+                        .key(key)
+                        .upload_id(&new_upload_id)
+                        .if_match(&replacement_etag)
+                        .multipart_upload(single_part_completion(&new_part_etag, 1))
+                        .send_retrying_operation_aborted(
+                            "complete newly initiated upload after raced conditional conflict",
+                        )
+                        .await
+                        .unwrap();
+                    assert_object_contents_and_etag(
+                        &bucket,
+                        key,
+                        corrected.e_tag().unwrap(),
+                        b"multipart object",
+                    )
+                    .await;
+                }
             }
 
             cleanup(&bucket, &[key]).await;
