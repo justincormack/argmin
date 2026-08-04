@@ -10445,7 +10445,7 @@ impl std::fmt::Debug for ControlPlaneRpcClientEndpoint {
 
 /// The operation class accepted by a control-plane RPC server endpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ControlPlaneRpcServerRole {
+pub(crate) enum ControlPlaneRpcServerRole {
     Ordinary,
     AuthorityClockRecovery,
 }
@@ -10592,7 +10592,7 @@ struct ControlPlaneRpcServerResources {
 /// Clones share the worker and pre-authentication memory budgets, allowing a
 /// group of listeners to enforce one aggregate resource limit.
 #[derive(Clone)]
-pub struct ControlPlaneRpcServerPolicy {
+pub(crate) struct ControlPlaneRpcServerPolicy {
     role: ControlPlaneRpcServerRole,
     resources: ControlPlaneRpcServerResources,
     gate_request_time_with_authority_clock: bool,
@@ -10607,7 +10607,7 @@ pub struct ControlPlaneRpcServerPolicy {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum ControlPlaneRpcServerConfigError {
+pub(crate) enum ControlPlaneRpcServerConfigError {
     #[error("control-plane RPC worker limit must be positive")]
     ZeroWorkerLimit,
     #[error("control-plane RPC pre-authentication byte budget must be positive")]
@@ -10625,7 +10625,7 @@ pub enum ControlPlaneRpcServerConfigError {
 }
 
 impl ControlPlaneRpcServerPolicy {
-    pub fn new(
+    pub(crate) fn new(
         role: ControlPlaneRpcServerRole,
         worker_limit: usize,
         pre_auth_byte_budget: usize,
@@ -10668,13 +10668,22 @@ impl ControlPlaneRpcServerPolicy {
     }
 
     #[must_use]
-    pub fn with_server_auth(mut self, auth: &crate::ControlPlaneRpcServerAuth) -> Self {
+    pub(crate) fn with_server_auth(mut self, auth: &crate::ControlPlaneRpcServerAuth) -> Self {
         self.auth_verifier.clone_from(&auth.verifier);
         self
     }
 
+    pub(crate) fn authentication_required(&self) -> bool {
+        self.auth_verifier.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn role(&self) -> ControlPlaneRpcServerRole {
+        self.role
+    }
+
     #[must_use]
-    pub fn with_authority_clock(
+    pub(crate) fn with_authority_clock(
         mut self,
         authority_clock: Arc<Mutex<ControlPlaneAuthorityClock>>,
         checkpoint_target: Arc<ControlPlaneAuthorityClockCheckpointTarget>,
@@ -10687,7 +10696,7 @@ impl ControlPlaneRpcServerPolicy {
     }
 
     #[must_use]
-    pub fn with_authority_confirmation(
+    pub(crate) fn with_authority_confirmation(
         mut self,
         authority_confirmation: Arc<dyn Fn() -> Result<(), ControlPlaneError> + Send + Sync>,
     ) -> Self {
@@ -10696,7 +10705,7 @@ impl ControlPlaneRpcServerPolicy {
     }
 
     #[must_use]
-    pub fn with_response_publication(
+    pub(crate) fn with_response_publication(
         mut self,
         response_publication: Arc<dyn ControlPlaneRpcResponsePublication>,
     ) -> Self {
@@ -10707,7 +10716,7 @@ impl ControlPlaneRpcServerPolicy {
     /// Installs the process-lifecycle action used after a fatal durable
     /// checkpoint failure has been diagnosed and logged by storage.
     #[must_use]
-    pub fn with_fatal_error_handler(
+    pub(crate) fn with_fatal_error_handler(
         mut self,
         fatal_error_handler: Arc<dyn Fn() + Send + Sync>,
     ) -> Self {
@@ -10716,7 +10725,8 @@ impl ControlPlaneRpcServerPolicy {
     }
 
     #[must_use]
-    pub fn active_workers(&self) -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn active_workers(&self) -> usize {
         self.resources.active_workers.load(Ordering::Acquire)
     }
 
@@ -10809,7 +10819,7 @@ enum ControlPlaneRpcServerListenerKind {
 }
 
 /// Opaque bound listener for the storage-owned control-plane RPC server.
-pub struct ControlPlaneRpcServerListener {
+pub(crate) struct ControlPlaneRpcServerListener {
     kind: ControlPlaneRpcServerListenerKind,
     max_connections: usize,
     max_frame_bytes: usize,
@@ -10853,7 +10863,7 @@ fn validate_control_plane_rpc_server_listener_limits(
 }
 
 impl ControlPlaneRpcServerListener {
-    pub fn unix(
+    pub(crate) fn unix(
         listener: UnixListener,
         max_connections: usize,
         max_frame_bytes: usize,
@@ -10872,7 +10882,7 @@ impl ControlPlaneRpcServerListener {
         })
     }
 
-    pub fn tls_tcp(
+    pub(crate) fn tls_tcp(
         listener: TcpListener,
         certified_key: Arc<CertifiedKey>,
         max_connections: usize,
@@ -16642,7 +16652,7 @@ where
 
 /// Opaque failure returned when a control-plane server can no longer accept
 /// connections. The concrete transport diagnostic is logged inside storage.
-pub struct ControlPlaneRpcServerError;
+pub(crate) struct ControlPlaneRpcServerError;
 
 impl std::fmt::Debug for ControlPlaneRpcServerError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -16782,7 +16792,7 @@ impl ControlPlaneRpcServerListener {
     /// This method blocks until the listener encounters an unrecoverable
     /// accept error. Individual connection failures remain isolated to their
     /// worker.
-    pub fn serve_shared<T>(
+    pub(crate) fn serve_shared<T>(
         self,
         authority: Arc<Mutex<T>>,
         policy: ControlPlaneRpcServerPolicy,
@@ -16801,7 +16811,7 @@ impl ControlPlaneRpcServerListener {
     }
 
     /// Serves this listener with an independently cloned authority per worker.
-    pub fn serve_cloned<T>(
+    pub(crate) fn serve_cloned<T>(
         self,
         authority: T,
         policy: ControlPlaneRpcServerPolicy,
@@ -16825,7 +16835,7 @@ impl ControlPlaneRpcServerListener {
     /// This test-only facility retains the complete production facade while
     /// allowing deterministic authority timestamps and a joinable server.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn serve_shared_requests_for_test<T>(
+    pub(crate) fn serve_shared_requests_for_test<T>(
         self,
         authority: Arc<Mutex<T>>,
         mut policy: ControlPlaneRpcServerPolicy,
@@ -16867,8 +16877,8 @@ impl ControlPlaneRpcServerListener {
     }
 
     /// Injects one pre-dispatch connection loss, then serves bounded requests.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn serve_shared_requests_after_dropped_connection_for_test<T>(
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn serve_shared_requests_after_dropped_connection_for_test<T>(
         self,
         authority: Arc<Mutex<T>>,
         policy: ControlPlaneRpcServerPolicy,

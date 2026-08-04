@@ -1564,6 +1564,26 @@ the capability to construction, authentication-state observation, and redacted d
 Server listener/resource-policy bootstrap, Raft-peer transport bootstrap, and the process-hosted
 authority implementation remain item 12 work.
 
+The thirty-eighth bounded slice contains control-plane RPC server listener and resource-policy
+bootstrap. The process retains OS-owned concerns by binding configured Unix or TCP sockets and
+loading the selected certificate identity, then hands those inputs and logical resource limits to
+`ControlPlaneRpcServerBootstrap`. Storage constructs the fixed TLS 1.3/ALPN protocol profile,
+validates listener limits, requires both ordinary and authority-clock-recovery endpoint groups,
+rejects duplicated kernel socket identities across those roles, pairs each group with its fixed
+operation role and shared worker/pre-authentication budgets, attaches the opaque server-auth
+capability, and owns the listener threads. Separate single-
+authority and Raft serving operations fix authority-clock request gating and the required
+confirmation/publication hooks inside storage rather than allowing the process to compose those
+policies. Raw listeners, resource policies, endpoint roles, and serving methods are crate-private;
+cross-crate process tests use one feature-gated bounded ordinary-listener facility rather than the
+production primitives. Diagnostics expose only transport kind, counts, limits, and authentication
+state. Owner-local tests pin mandatory role pairing, invalid listener/resource configuration,
+cloned Unix/TCP rejection across roles, and redaction, while the existing process tests retain
+replay-before-bind, authenticated request, and storage-node startup behavior. A repository check
+rejects process construction or composition of the raw server surface and constrains the opaque
+production facade. Raft-peer transport bootstrap and the process-hosted control-plane authority
+implementation remain item 12 work.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1864,8 +1884,8 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     checkpoint publication, leader retry, and resolution are likewise one storage-owned operation
     using the authority's single opaque response-publication and poison domain. Operator recovery
     endpoint and credential/transport assembly plus frontend/storage-node service-client
-    bootstrap and server-side authentication bootstrap are now storage-owned. The remaining work
-    is server listener/resource-policy bootstrap, Raft-peer transport bootstrap, and the
+    bootstrap, server-side authentication bootstrap, and server listener/resource-policy
+    bootstrap are now storage-owned. The remaining work is Raft-peer transport bootstrap and the
     process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.

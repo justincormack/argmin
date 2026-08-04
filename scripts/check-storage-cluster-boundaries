@@ -3277,6 +3277,63 @@ fail_with_matches \
     "The control-plane server authentication capability must remain opaque and raw verifier or credential types must remain storage-private" \
     "$control_plane_server_auth_surface_leaks"
 
+argmin_control_plane_server_listener_bootstrap_leaks=$(
+    awk '
+    /^mod tests[[:space:]]*\{/ {
+        exit
+    }
+    /(^|[^A-Za-z0-9_])ControlPlaneRpcServer(Listener|Policy|Role)([^A-Za-z0-9_]|$)|spawn_(cloned_)?control_plane_rpc_listener_loop/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    ' crates/argmin-s3/src/main.rs
+)
+fail_with_matches \
+    "Control-plane protocol listeners, endpoint roles, resource policies, authentication attachment, authority hooks, and listener loops must be assembled by storage" \
+    "$argmin_control_plane_server_listener_bootstrap_leaks"
+
+control_plane_server_listener_bootstrap_surface_leaks=$(
+    {
+        rg -n -U --color=never \
+            'pub struct (ControlPlaneRpcServerBootstrap|ControlPlaneRpcServerLoops)[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:|#\[derive\([^]]*(Debug|PartialEq|Eq|Hash)[^]]*\)\][[:space:]]*pub struct (ControlPlaneRpcServerBootstrap|ControlPlaneRpcServerLoops)' \
+            crates/storage/src/control_plane_server_bootstrap.rs \
+            || true
+        awk '
+        /impl (ControlPlaneRpcServerBootstrap|ControlPlaneRpcServerLoops)[[:space:]]*\{/ {
+            in_server = 1
+            server = $0
+            sub(/^.*impl /, "", server)
+            sub(/[[:space:]]*\{.*/, "", server)
+            depth = 0
+        }
+        in_server {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/[<(].*/, "", method)
+                if (server == "ControlPlaneRpcServerBootstrap" && method != "new" && method != "serve_shared_single_authority" && method != "serve_cloned_raft_authority") {
+                    print FILENAME ":" FNR ":" $0
+                } else if (server == "ControlPlaneRpcServerLoops") {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_server = 0
+            }
+        }
+        ' crates/storage/src/control_plane_server_bootstrap.rs
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+ControlPlaneRpcServer(Listener|Policy|Error)|enum[[:space:]]+ControlPlaneRpcServer(Role|ConfigError))' \
+            crates/storage/src/control_plane.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "The control-plane server bootstrap must remain opaque and raw protocol listener, policy, role, and dispatch surfaces must remain storage-private" \
+    "$control_plane_server_listener_bootstrap_surface_leaks"
+
 public_static_initial_topology_bypass_apis=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+(submit_static_initial_topology|validate_snapshot)[[:space:]]*\(' \
