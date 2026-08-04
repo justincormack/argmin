@@ -1,4 +1,3 @@
-use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
@@ -7,7 +6,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header,
     delete_bucket_retrying_operation_aborted, err_status, eventually_raw_alt_object_status,
-    raw_bucket, raw_response_header, send_signed_request,
+    is_retryable_operation_contention, raw_bucket, raw_response_header, send_signed_request,
     shape::{assert_body_with_unordered_blocks, assert_shape, id_headers, shape},
     unique_bucket, RawAltObjectRequest, SendRetryingOperationAborted, CTX,
 };
@@ -19,10 +18,6 @@ use std::time::Duration;
 static BUCKET_POLICY_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 const CONCURRENT_TAGGING_OPERATION_ATTEMPTS: usize = 20;
-
-fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
 
 async fn put_object_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
@@ -43,7 +38,7 @@ async fn put_object_retrying_operation_aborted(
         match request.send().await {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -75,7 +70,7 @@ async fn put_object_result_retrying_operation_aborted(
         }
         match request.send().await {
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -107,7 +102,7 @@ async fn upload_part_retrying_operation_aborted(
         {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -191,7 +186,7 @@ async fn complete_multipart_upload_retrying_operation_aborted(
         {
             Ok(_) => return,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -225,7 +220,7 @@ async fn copy_object_without_metadata_directive_retrying_operation_aborted(
             .await;
         match result {
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;

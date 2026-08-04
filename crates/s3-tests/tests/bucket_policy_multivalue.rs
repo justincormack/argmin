@@ -33,7 +33,9 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
                     return;
                 }
                 let raw = format!("{err:?}");
-                if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
+                if s3_tests::is_retryable_operation_contention(&err)
+                    || raw.contains("BucketNotEmpty")
+                {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     continue;
                 }

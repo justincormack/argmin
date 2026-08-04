@@ -100,12 +100,9 @@ async fn cleanup(bucket: &str) {
                     assert_sdk_err_code(&err, "NoSuchBucket");
                     return;
                 }
-                if sdk_err_status(&err) == 409 {
-                    assert_sdk_err_code(&err, "OperationAborted");
-                    if attempt < 19 {
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        continue;
-                    }
+                if s3_tests::is_retryable_operation_contention(&err) && attempt < 19 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
                 }
                 panic!("delete bucket cleanup failed: {err:?}");
             }

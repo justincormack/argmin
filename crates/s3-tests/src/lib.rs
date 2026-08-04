@@ -18,8 +18,8 @@ pub use helpers::{
     delete_objects_retrying_operation_aborted, delete_objects_with_md5,
     disable_bucket_public_access_block, enable_bucket_sse_c, enable_bucket_versioning, err_status,
     eventually_raw_alt_object_status, expected_raw_bucket_location_constraint,
-    get_object_body_retrying_operation_aborted, is_sdk_stream_disconnect,
-    is_sdk_stream_disconnect_or_status, object_url, presign_url,
+    get_object_body_retrying_operation_aborted, is_retryable_operation_contention,
+    is_sdk_stream_disconnect, is_sdk_stream_disconnect_or_status, object_url, presign_url,
     presign_url_for_service_with_aws_signer_credentials, presign_url_for_service_with_credentials,
     presign_url_with_credentials, presign_url_without_host_signed_header,
     put_bucket_lifecycle_with_md5, put_object_retrying_operation_aborted, raw_alt_credentials,
@@ -677,7 +677,9 @@ async fn create_bucket_in_region_accepting_verified_lost_success(
     loop {
         match create_bucket_in_region(client, bucket, region).await {
             Ok(()) => return Ok(()),
-            Err(err) if is_create_bucket_operation_aborted(&err) && Instant::now() < deadline => {
+            Err(err)
+                if is_create_bucket_retryable_contention(&err) && Instant::now() < deadline =>
+            {
                 tokio::time::sleep(RETRY_DELAY).await;
             }
             Err(err) if is_create_bucket_lost_success_retry(&err) => {
@@ -721,7 +723,7 @@ fn is_retryable_bucket_reuse_error(
 ) -> bool {
     matches!(
         err.as_service_error().and_then(ProvideErrorMetadata::code),
-        Some("BucketAlreadyExists" | "BucketAlreadyOwnedByYou" | "OperationAborted")
+        Some("BucketAlreadyExists" | "BucketAlreadyOwnedByYou" | "OperationAborted" | "SlowDown")
     )
 }
 
@@ -731,10 +733,13 @@ fn is_create_bucket_lost_success_retry(
     err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("BucketAlreadyOwnedByYou")
 }
 
-fn is_create_bucket_operation_aborted(
+fn is_create_bucket_retryable_contention(
     err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
 ) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
+    matches!(
+        err.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("OperationAborted" | "SlowDown")
+    )
 }
 
 fn is_delete_bucket_retryable_backpressure(

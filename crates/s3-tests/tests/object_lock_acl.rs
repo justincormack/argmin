@@ -104,7 +104,9 @@ async fn cleanup_object_lock_bucket(bucket: &str) {
                     if raw.contains("NoSuchBucket") {
                         return;
                     }
-                    if raw.contains("BucketNotEmpty") || raw.contains("OperationAborted") {
+                    if s3_tests::is_retryable_operation_contention(&err)
+                        || raw.contains("BucketNotEmpty")
+                    {
                         tokio::time::sleep(Duration::from_millis(200)).await;
                         continue;
                     }

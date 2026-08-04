@@ -8,7 +8,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, content_md5_header, create_acl_enabled_bucket, err_status,
-    send_signed_request, SendRetryingOperationAborted, CTX,
+    is_retryable_operation_contention, send_signed_request, SendRetryingOperationAborted, CTX,
 };
 use s3_types::ANONYMOUS_UPLOAD_CANONICAL_USER_ID;
 use std::future::Future;
@@ -17,10 +17,6 @@ const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUse
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
 const SETUP_OPERATION_ATTEMPTS: usize = 20;
-
-fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
 
 async fn retrying_operation_aborted<T, E, F, Fut>(description: &str, mut op: F) -> T
 where
@@ -31,7 +27,10 @@ where
     for attempt in 0..SETUP_OPERATION_ATTEMPTS {
         match op().await {
             Ok(output) => return output,
-            Err(err) if is_operation_aborted(&err) && attempt + 1 < SETUP_OPERATION_ATTEMPTS => {
+            Err(err)
+                if is_retryable_operation_contention(&err)
+                    && attempt + 1 < SETUP_OPERATION_ATTEMPTS =>
+            {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
             }
             Err(err) => panic!("{description}: {err:?}"),

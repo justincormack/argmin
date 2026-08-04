@@ -1,16 +1,13 @@
-use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, MetadataDirective, ObjectOwnership,
 };
-use s3_tests::{create_acl_enabled_bucket, SendRetryingOperationAborted, CTX};
+use s3_tests::{
+    create_acl_enabled_bucket, is_retryable_operation_contention, SendRetryingOperationAborted, CTX,
+};
 use std::time::Duration;
 
 const WEBSITE_REDIRECT_ACL_OPERATION_ATTEMPTS: usize = 20;
-
-fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
 
 async fn put_object_retrying_operation_aborted(
     bucket: &str,
@@ -31,7 +28,7 @@ async fn put_object_retrying_operation_aborted(
         match put.send().await {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < WEBSITE_REDIRECT_ACL_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -63,7 +60,7 @@ async fn upload_part_retrying_operation_aborted(
         {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < WEBSITE_REDIRECT_ACL_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;

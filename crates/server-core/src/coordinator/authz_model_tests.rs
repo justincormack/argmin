@@ -10,7 +10,8 @@ use super::test_hooks::{
 };
 use super::test_support::{
     bucket_tag_set, object_tag_set, open_test_storage_cluster, put_bucket_ownership_controls_test,
-    put_bucket_policy_test, NO_DELETE, NO_PUT_OBJECT_ACL,
+    put_bucket_policy_test, server_error_is_retryable_operation_contention, NO_DELETE,
+    NO_PUT_OBJECT_ACL,
 };
 use super::*;
 use crate::conditional::{ReadCondition, WriteCondition};
@@ -12053,7 +12054,10 @@ mod phase14_harness {
         for attempt in 0..MAX_ATTEMPTS {
             match operation() {
                 Ok(result) => return result,
-                Err(ServerError::OperationAborted) if attempt + 1 < MAX_ATTEMPTS => {
+                Err(error)
+                    if server_error_is_retryable_operation_contention(&error)
+                        && attempt + 1 < MAX_ATTEMPTS =>
+                {
                     thread::sleep(Duration::from_millis(1));
                 }
                 Err(err) => panic!("{}: {err:?}", context.as_ref()),

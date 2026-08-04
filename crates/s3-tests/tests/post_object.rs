@@ -503,8 +503,8 @@ fn post_object_to_endpoint(
 
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
-        if status == 409
-            && body_str.contains("<Code>OperationAborted</Code>")
+        if ((status == 409 && body_str.contains("<Code>OperationAborted</Code>"))
+            || (status == 503 && body_str.contains("<Code>SlowDown</Code>")))
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(100));

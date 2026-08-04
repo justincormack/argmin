@@ -5948,7 +5948,7 @@ fn versioned_put_is_safe_across_concurrent_frontends() {
 
         let t1 = thread::spawn(move || {
             b1.wait();
-            put_object_retrying_operation_aborted(
+            put_object_retrying_operation_contention(
                 &coord_a,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -5972,7 +5972,7 @@ fn versioned_put_is_safe_across_concurrent_frontends() {
         });
         let t2 = thread::spawn(move || {
             b2.wait();
-            put_object_retrying_operation_aborted(
+            put_object_retrying_operation_contention(
                 &coord_b,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -6009,7 +6009,7 @@ fn versioned_put_is_safe_across_concurrent_frontends() {
     }
 }
 
-fn put_object_retrying_operation_aborted(
+fn put_object_retrying_operation_contention(
     coord: &Coordinator,
     req: &PutObjectRequest<'_>,
 ) -> Result<PutObjectResult, ServerError> {
@@ -6018,7 +6018,10 @@ fn put_object_retrying_operation_aborted(
     loop {
         match test_helpers::put_object(coord, req) {
             Ok(result) => return Ok(result),
-            Err(ServerError::OperationAborted) if Instant::now() < deadline => {
+            Err(error)
+                if server_error_is_retryable_operation_contention(&error)
+                    && Instant::now() < deadline =>
+            {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) => return Err(error),
@@ -6026,7 +6029,7 @@ fn put_object_retrying_operation_aborted(
     }
 }
 
-fn delete_object_retrying_operation_aborted(
+fn delete_object_retrying_operation_contention(
     coord: &Coordinator,
     req: &DeleteObjectRequest<'_>,
 ) -> Result<DeleteObjectResult, ServerError> {
@@ -6035,7 +6038,10 @@ fn delete_object_retrying_operation_aborted(
     loop {
         match coord.delete_object(req) {
             Ok(result) => return Ok(result),
-            Err(ServerError::OperationAborted) if Instant::now() < deadline => {
+            Err(error)
+                if server_error_is_retryable_operation_contention(&error)
+                    && Instant::now() < deadline =>
+            {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) => return Err(error),
@@ -6088,7 +6094,7 @@ fn get_object_is_consistent_during_concurrent_overwrite() {
 
         let t_write = thread::spawn(move || {
             b1.wait();
-            put_object_retrying_operation_aborted(
+            put_object_retrying_operation_contention(
                 &writer,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -6197,7 +6203,7 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
 
         let t_write = thread::spawn(move || {
             b1.wait();
-            put_object_retrying_operation_aborted(
+            put_object_retrying_operation_contention(
                 &writer,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -6646,7 +6652,7 @@ fn upload_part_copy_is_consistent_during_concurrent_overwrite() {
 
         let t_write = thread::spawn(move || {
             b1.wait();
-            put_object_retrying_operation_aborted(
+            put_object_retrying_operation_contention(
                 &writer,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -6790,7 +6796,7 @@ fn delete_object_is_consistent_during_concurrent_overwrite() {
 
         let t_write = thread::spawn(move || {
             b1.wait();
-            put_object_retrying_operation_aborted(
+            put_object_retrying_operation_contention(
                 &writer,
                 &PutObjectRequest {
                     encryption: WriteEncryptionRequest::none(),
@@ -6814,7 +6820,7 @@ fn delete_object_is_consistent_during_concurrent_overwrite() {
         });
         let t_delete = thread::spawn(move || {
             b2.wait();
-            delete_object_retrying_operation_aborted(
+            delete_object_retrying_operation_contention(
                 &deleter,
                 &DeleteObjectRequest {
                     object: object_version_request_with_expected_owner(

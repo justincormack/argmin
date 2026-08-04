@@ -116,7 +116,7 @@ async fn cleanup_plain_bucket(
                 }
                 Err(err) => {
                     let raw = format!("{err:?}");
-                    saw_retryable |= raw.contains("OperationAborted")
+                    saw_retryable |= s3_tests::is_retryable_operation_contention(&err)
                         || raw.contains("BucketNotEmpty")
                         || raw.contains("NoSuchBucket");
                     last_error = Some(raw);

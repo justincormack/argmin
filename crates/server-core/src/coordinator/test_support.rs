@@ -33,6 +33,23 @@ pub(crate) const NO_WRITE: &WriteCondition = &WriteCondition::None;
 pub(crate) const NO_DELETE: &DeleteCondition = &DeleteCondition::None;
 pub(crate) const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 
+pub(crate) fn server_error_is_retryable_operation_contention(error: &ServerError) -> bool {
+    matches!(error, ServerError::OperationAborted | ServerError::SlowDown)
+}
+
+#[test]
+fn operation_contention_test_retries_include_slow_down_without_broadening_conflicts() {
+    assert!(server_error_is_retryable_operation_contention(
+        &ServerError::OperationAborted
+    ));
+    assert!(server_error_is_retryable_operation_contention(
+        &ServerError::SlowDown
+    ));
+    assert!(!server_error_is_retryable_operation_contention(
+        &ServerError::InvalidBucketState
+    ));
+}
+
 pub(crate) fn test_requester() -> Requester {
     test_helpers::requester("default-owner")
 }
@@ -681,7 +698,10 @@ pub(crate) fn delete_bucket_eventually_test(
     loop {
         match delete_bucket_test(coord, name) {
             Ok(()) => return Ok(()),
-            Err(ServerError::OperationAborted) if Instant::now() < deadline => {
+            Err(error)
+                if server_error_is_retryable_operation_contention(&error)
+                    && Instant::now() < deadline =>
+            {
                 let _ = coord
                     .read_runtime()
                     .try_finalize_bucket_delete_for(&trusted_bucket_name(name));

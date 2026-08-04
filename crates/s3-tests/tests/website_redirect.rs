@@ -1,12 +1,11 @@
-use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, MetadataDirective,
     VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, object_url, post_object_raw_to_test_endpoint_with_headers, raw_object,
-    raw_object_with,
+    assert_s3_err_code, is_retryable_operation_contention, object_url,
+    post_object_raw_to_test_endpoint_with_headers, raw_object, raw_object_with,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     sigv4_post_fields_for_credentials, unique_bucket, SendRetryingOperationAborted, CTX,
 };
@@ -15,10 +14,6 @@ use std::time::Duration;
 const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 const WEBSITE_REDIRECT_HEADER_NAME: &str = "x-amz-website-redirect-location";
 const WEBSITE_REDIRECT_OPERATION_ATTEMPTS: usize = 20;
-
-fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
 
 async fn put_object_retrying_operation_aborted(
     bucket: &str,
@@ -39,7 +34,7 @@ async fn put_object_retrying_operation_aborted(
         match put.send().await {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -71,7 +66,7 @@ async fn put_object_result_retrying_operation_aborted(
         }
         match put.send().await {
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -103,7 +98,7 @@ async fn upload_part_retrying_operation_aborted(
         {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < WEBSITE_REDIRECT_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;

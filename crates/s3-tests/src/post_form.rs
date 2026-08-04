@@ -6,8 +6,9 @@ use ring::hmac;
 use crate::helpers::SignedRequestCredentials;
 use crate::{build_test_agent, sse_c_header_values, RawResponse};
 
-fn is_operation_aborted_response(status: u16, body: &str) -> bool {
-    status == 409 && body.contains("<Code>OperationAborted</Code>")
+fn is_retryable_operation_contention_response(status: u16, body: &str) -> bool {
+    (status == 409 && body.contains("<Code>OperationAborted</Code>"))
+        || (status == 503 && body.contains("<Code>SlowDown</Code>"))
 }
 
 fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
@@ -339,7 +340,9 @@ pub fn post_object_to_test_endpoint_with_headers(
         let mut resp = req.send(&body[..]).expect("HTTP transport error");
         let status = resp.status().as_u16();
         let response_body = resp.body_mut().read_to_string().unwrap_or_default();
-        if is_operation_aborted_response(status, &response_body) && Instant::now() < deadline {
+        if is_retryable_operation_contention_response(status, &response_body)
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -387,7 +390,9 @@ pub fn post_object_raw_to_test_endpoint_with_headers(
             })
             .collect();
         let response_body = resp.body_mut().read_to_string().unwrap_or_default();
-        if is_operation_aborted_response(status, &response_body) && Instant::now() < deadline {
+        if is_retryable_operation_contention_response(status, &response_body)
+            && Instant::now() < deadline
+        {
             thread::sleep(Duration::from_millis(100));
             continue;
         }
@@ -422,6 +427,26 @@ pub fn post_object_to_test_endpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn post_contention_retry_classification_preserves_status_and_code_pairing() {
+        assert!(is_retryable_operation_contention_response(
+            409,
+            "<Error><Code>OperationAborted</Code></Error>"
+        ));
+        assert!(is_retryable_operation_contention_response(
+            503,
+            "<Error><Code>SlowDown</Code></Error>"
+        ));
+        assert!(!is_retryable_operation_contention_response(
+            503,
+            "<Error><Code>OperationAborted</Code></Error>"
+        ));
+        assert!(!is_retryable_operation_contention_response(
+            409,
+            "<Error><Code>SlowDown</Code></Error>"
+        ));
+    }
 
     #[test]
     fn post_fields_for_service_use_requested_credential_scope() {

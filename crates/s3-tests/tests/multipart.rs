@@ -21,9 +21,9 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
-    assert_s3_err_code, copy_source_with_version, err_status, is_sdk_stream_disconnect_or_status,
-    object_url, presign_url, raw_bucket, raw_object_query, send_signed_request,
-    send_signed_request_with_credentials,
+    assert_s3_err_code, copy_source_with_version, err_status, is_retryable_operation_contention,
+    is_sdk_stream_disconnect_or_status, object_url, presign_url, raw_bucket, raw_object_query,
+    send_signed_request, send_signed_request_with_credentials,
     shape::{
         assert_shape, error_response_headers, expected_error, shape, xml_response_headers,
         xml_tag_text,
@@ -134,10 +134,6 @@ async fn wait_for_slow_body_to_start(first_frame_sent: &AtomicBool) {
     panic!("slow UploadPart body did not start sending");
 }
 
-fn is_operation_aborted<E: ProvideErrorMetadata>(err: &aws_sdk_s3::error::SdkError<E>) -> bool {
-    err.as_service_error().and_then(ProvideErrorMetadata::code) == Some("OperationAborted")
-}
-
 async fn put_bucket_versioning_retrying_operation_aborted(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -173,7 +169,7 @@ async fn put_object_retrying_operation_aborted(
         {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -233,7 +229,7 @@ async fn upload_part_retrying_operation_aborted(
         {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -268,7 +264,7 @@ async fn upload_part_result_retrying_operation_aborted(
         match result {
             Ok(output) => return Ok(output),
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -303,7 +299,7 @@ async fn upload_part_with_crc32_retrying_operation_aborted(
         {
             Ok(output) => return output,
             Err(err)
-                if is_operation_aborted(&err)
+                if is_retryable_operation_contention(&err)
                     && attempt + 1 < CONCURRENT_MULTIPART_OPERATION_ATTEMPTS =>
             {
                 tokio::time::sleep(Duration::from_millis(10 * (attempt as u64 + 1))).await;
@@ -727,7 +723,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
                 if raw.contains("NoSuchBucket") {
                     return;
                 }
-                if raw.contains("OperationAborted") || raw.contains("BucketNotEmpty") {
+                if is_retryable_operation_contention(&err) || raw.contains("BucketNotEmpty") {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     continue;
                 }

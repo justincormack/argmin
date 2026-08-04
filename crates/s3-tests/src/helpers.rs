@@ -172,7 +172,7 @@ pub async fn disable_bucket_public_access_block(client: &Client, bucket: &str) {
         {
             Ok(_) => break,
             Err(err)
-                if s3_error_code(&err) == Some("OperationAborted")
+                if is_retryable_operation_contention(&err)
                     && std::time::Instant::now() < deadline =>
             {
                 tokio::time::sleep(RETRY_DELAY).await;
@@ -309,7 +309,7 @@ impl OperationContentionRetryScope {
     }
 }
 
-fn is_retryable_operation_contention<E: ProvideErrorMetadata>(
+pub fn is_retryable_operation_contention<E: ProvideErrorMetadata>(
     err: &aws_sdk_s3::error::SdkError<E>,
 ) -> bool {
     OperationContentionRetryScope::OperationAbortedOrSlowDown.includes(s3_error_code(err))
