@@ -6317,11 +6317,10 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
-    let root = storage::test_support::TestBucketDeleteFinalizeRoot {
-        bucket: trusted_bucket_name("reclaim-refresh-after-dequeue"),
-        bucket_incarnation_generation: 1,
-    };
-    initial.test_enqueue_bucket_delete_finalize(&root);
+    let bucket = trusted_bucket_name("reclaim-refresh-after-dequeue");
+    initial
+        .test_enqueue_missing_bucket_delete_finalize(&bucket)
+        .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
     let gate_for_hook = Arc::clone(&gate);
@@ -6373,17 +6372,14 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
-    let bucket_info = initial.test_head_bucket_raw(&bucket).unwrap();
     drop(direct_coord);
     initial
         .test_begin_bucket_delete_if_current(&bucket)
         .unwrap();
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
-    let root = storage::test_support::TestBucketDeleteFinalizeRoot {
-        bucket,
-        bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
-    };
-    initial.test_enqueue_bucket_delete_finalize(&root);
+    let root = initial
+        .test_enqueue_current_bucket_delete_finalize(&bucket)
+        .unwrap();
 
     assert_ne!(
         initial.process_local_registry_key(),
@@ -6403,7 +6399,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
                 runtime_handle_for_hook
                     .install(Arc::clone(&replacement_for_hook))
                     .unwrap();
-                replacement_for_hook.test_enqueue_bucket_delete_finalize(&duplicate_root);
+                replacement_for_hook.test_reenqueue_bucket_delete_finalize(&duplicate_root);
             }
         })),
         ..ReclamationTestHooks::default()

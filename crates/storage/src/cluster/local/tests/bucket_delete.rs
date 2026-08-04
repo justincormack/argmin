@@ -462,6 +462,54 @@ fn durable_bucket_finalize_scan_recovers_lost_local_queue_after_reopen() {
 }
 
 #[test]
+fn missing_bucket_finalize_scenario_rejects_existing_deleting_bucket() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "missing-finalize-reject-existing-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+
+    let deleting = cluster.test_head_bucket_raw(&bucket).unwrap();
+    assert_eq!(deleting.state, crate::BucketState::Deleting);
+    assert_eq!(
+        deleting.bucket_incarnation_generation, 1,
+        "the adversarial bucket must have the generation previously forged by the helper"
+    );
+    let outstanding_before = cluster.test_bucket_delete_finalize_outstanding_depth();
+
+    let error = cluster
+        .test_enqueue_missing_bucket_delete_finalize(&bucket)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::BucketWriteDrainError::Metadata(crate::MetadataError::BucketNotFinalizedForDelete {
+            state: crate::BucketState::Deleting,
+        })
+    ));
+    assert_eq!(
+        cluster.test_bucket_delete_finalize_outstanding_depth(),
+        outstanding_before,
+        "rejected synthetic work must not alter finalize queue ownership"
+    );
+    assert_eq!(cluster.try_take_reclaim_work(), None);
+}
+
+#[test]
 fn durable_reclaim_discovery_scans_bounded_pg_batches() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

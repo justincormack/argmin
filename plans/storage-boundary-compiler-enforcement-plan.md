@@ -5625,16 +5625,14 @@ The audit found four remaining classes of work:
    must never depend on weaker route, deadline, or subject validation than
    production.
 
-2. **Owner-local impossible-state fixtures.** `server-core` still directly
-   asks storage test hooks to corrupt or remove durable multipart parts,
-   replace physical segment layouts, manufacture reclaim roots and deleting
-   buckets, insert lifecycle claims, alter upload/session state and timestamps,
-   and drive raw reclaim queues. Move tests whose assertion is about storage
-   corruption, recovery, physical layout, claims, or queue invariants into
-   `storage`. Where an S3/coordinator response to a storage failure genuinely
-   requires a cross-crate test, expose an opaque scenario-level fault or
-   logical observation rather than physical PG, shard, row, claim, or command
-   records. This work is the test-fixture portion of pending item 14 in
+2. **Owner-local impossible-state fixtures.** The remaining cross-crate
+   exceptions are object segment-layout observations and raw reclaim-queue
+   controls. Move tests whose assertion is about storage corruption, recovery,
+   physical layout, claims, or queue invariants into `storage`. Where an
+   S3/coordinator response to a storage failure genuinely requires a
+   cross-crate test, expose an opaque scenario-level fault or logical
+   observation rather than physical PG, shard, row, claim, or command records.
+   This work is the test-fixture portion of pending item 14 in
    `storage-upgrade-versioning-plan.md`; that plan retains ownership of its
    separate debug-PG containment work.
 
@@ -5759,10 +5757,15 @@ Implementation update (2026-08-03):
   physical file at each captured historical shard placement, while callers
   cannot inspect PG IDs, shard hashes, EC layout, placement epochs, or payload
   generations; and
-- retained object segment-layout observations, deleting-bucket construction,
-  and raw reclaim-queue controls remain explicit transitional exceptions owned
-  by implementation slice 3. They do not satisfy the final curated-boundary
-  completion criterion merely because they now live under
+- made bucket-delete finalization roots opaque to downstream crates. Storage
+  now selects the durable bucket incarnation for current and newly deleting
+  buckets, admits the deliberately missing-bucket scenario only after proving
+  acting-set-wide absence and uses its reserved non-production incarnation,
+  and permits queue replay only with a root previously issued by storage; and
+- retained object segment-layout observations and raw reclaim-queue controls
+  remain explicit transitional exceptions owned by implementation slice 3.
+  They do not satisfy the final curated-boundary completion criterion merely
+  because they now live under
   `storage::test_support` or on a feature-gated `StorageCluster`
   implementation.
 

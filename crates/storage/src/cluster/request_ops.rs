@@ -72,6 +72,8 @@ use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
+#[cfg(any(test, feature = "test-hooks"))]
+const MISSING_BUCKET_DELETE_FINALIZE_INCARNATION: u64 = 0;
 const BUCKET_DELETE_FINALIZE_SCAN_LIMIT_PER_PG: usize = 16;
 const BUCKET_DELETE_FINALIZE_SCAN_PG_BATCH: usize = 8;
 const BUCKET_DELETE_BEGIN_SCAN_LIMIT_PER_PG: usize = 16;
@@ -12398,8 +12400,48 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_enqueue_bucket_delete_finalize(&self, root: &crate::TestBucketDeleteFinalizeRoot) {
+    pub fn test_reenqueue_bucket_delete_finalize(
+        &self,
+        root: &crate::TestBucketDeleteFinalizeRoot,
+    ) {
         self.enqueue_bucket_delete_finalize(root.into());
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_enqueue_current_bucket_delete_finalize(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<crate::TestBucketDeleteFinalizeRoot, BucketWriteDrainError> {
+        let info = self
+            .test_head_bucket_raw(bucket)
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        let root = BucketDeleteFinalizeRoot {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: info.bucket_incarnation_generation,
+        };
+        self.enqueue_bucket_delete_finalize(root.clone());
+        Ok(root.into())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_enqueue_missing_bucket_delete_finalize(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketWriteDrainError> {
+        let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
+        if !self.bucket_name_absent_on_acting_set(pg_id, bucket)? {
+            return Err(BucketWriteDrainError::Metadata(
+                MetadataError::BucketNotFinalizedForDelete {
+                    state: BucketState::Deleting,
+                },
+            ));
+        }
+        let root = BucketDeleteFinalizeRoot {
+            bucket: bucket.clone(),
+            bucket_incarnation_generation: MISSING_BUCKET_DELETE_FINALIZE_INCARNATION,
+        };
+        self.enqueue_bucket_delete_finalize(root);
+        Ok(())
     }
 
     pub(crate) fn enqueue_bucket_delete_begin(
@@ -17477,7 +17519,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_create_deleting_bucket(
+    pub fn test_create_and_enqueue_deleting_bucket_finalize(
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
@@ -17499,7 +17541,9 @@ impl super::StorageCluster {
         let _ = self
             .create_bucket_with_config_and_load_info(&create)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
-        self.test_begin_bucket_delete_if_current(bucket)
+        self.test_begin_bucket_delete_if_current(bucket)?;
+        self.test_enqueue_current_bucket_delete_finalize(bucket)?;
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

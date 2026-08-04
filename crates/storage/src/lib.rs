@@ -187,8 +187,15 @@ pub mod test_support {
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct TestBucketDeleteFinalizeRoot {
-        pub bucket: BucketName,
-        pub bucket_incarnation_generation: u64,
+        bucket: BucketName,
+        bucket_incarnation_generation: u64,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl TestBucketDeleteFinalizeRoot {
+        pub fn bucket(&self) -> &BucketName {
+            &self.bucket
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
