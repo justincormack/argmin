@@ -333,20 +333,13 @@ impl<'a> InvariantHarness<'a> {
             .unwrap()
     }
 
-    fn force_stream_session_created_at(
-        &self,
-        bucket: &str,
-        key: &str,
-        session_id: &SessionId,
-        created_at: u64,
-    ) {
+    fn mark_stream_session_stale(&self, bucket: &str, key: &str, session_id: &SessionId) {
         self.coord
             .storage_node()
-            .test_force_stream_upload_created_at(
+            .test_mark_stream_upload_stale(
                 &trusted_bucket_name(bucket),
                 &trusted_object_key(key),
                 session_id,
-                created_at,
             )
             .unwrap();
     }
@@ -1045,7 +1038,7 @@ fn scavenging_stale_sessions_removes_abandoned_streaming_state() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"data")
         .unwrap();
 
-    state.force_stream_session_created_at("bucket", "key", &session_id, 0);
+    state.mark_stream_session_stale("bucket", "key", &session_id);
     let scavenge_time = storage::clock::current_time_millis().saturating_add(61_000);
     let count =
         storage::clock::with_time_override(scavenge_time, || coord.scavenge_stale_sessions(1));
@@ -1906,7 +1899,7 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
     );
     state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
 
-    state.force_stream_session_created_at("bucket", "key", &session_id, 0);
+    state.mark_stream_session_stale("bucket", "key", &session_id);
     let scavenge_time = storage::clock::current_time_millis().saturating_add(61_000);
     let count =
         storage::clock::with_time_override(scavenge_time, || coord.scavenge_stale_sessions(1));

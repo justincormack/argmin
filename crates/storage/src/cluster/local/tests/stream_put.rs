@@ -1088,7 +1088,7 @@ fn old_empty_put_object_stream_with_live_proof_blocks_bucket_delete() {
         )
         .unwrap();
     cluster
-        .test_force_stream_upload_created_at(&bucket, &key, &session_id, 0)
+        .test_mark_stream_upload_stale(&bucket, &key, &session_id)
         .unwrap();
 
     let err = cluster

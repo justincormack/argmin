@@ -17303,15 +17303,17 @@ impl super::StorageCluster {
             .test_inject_first_object_segment_checksum_mismatch(bucket, key, version_id)
     }
 
+    /// Returns the logical part numbers in one committed multipart manifest.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_parts(
+    pub fn test_get_object_part_numbers(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Vec<crate::TestObjectPartRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<u32>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_object_parts(bucket, key, version_id)
+            .map(|parts| parts.into_iter().map(|part| part.part_number).collect())
     }
 
     /// Injects a storage-owned payload-checksum mismatch for one logical part.
@@ -17655,12 +17657,13 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_force_stream_upload_created_at(
+    /// Marks one logical stream upload stale without exposing its durable
+    /// timestamp representation across the storage boundary.
+    pub fn test_mark_stream_upload_stale(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-        created_at: u64,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         for node in self
@@ -17668,7 +17671,7 @@ impl super::StorageCluster {
             .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
         {
             node.test_node()
-                .test_force_stream_upload_created_at(bucket, key, session_id, created_at)?;
+                .test_mark_stream_upload_stale(bucket, key, session_id)?;
             let pg = node.test_node().get_pg(pg_id.get())?;
             pg.refresh_metadata_command_state_digest()?;
         }

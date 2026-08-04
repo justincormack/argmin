@@ -389,33 +389,6 @@ pub mod test_support {
         }
     }
 
-    /// Test-only observation of one committed multipart-manifest part.
-    ///
-    /// Production object reads receive `ObjectReadMultipartPart`, which omits all
-    /// physical placement details. This projection keeps the few fields needed by
-    /// cross-crate placement and manifest-observation regressions behind
-    /// `test-hooks`.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct TestObjectPartRecord {
-        pub part_number: u32,
-        pub size: u64,
-        pub payload_crc64: u64,
-        pub data_pg_id: u32,
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl From<types::ObjectPartRecord> for TestObjectPartRecord {
-        fn from(part: types::ObjectPartRecord) -> Self {
-            Self {
-                part_number: part.part_number,
-                size: part.size,
-                payload_crc64: part.payload_crc64,
-                data_pg_id: part.data_pg_id,
-            }
-        }
-    }
-
     /// Test-only logical observation of accepted bucket-deletion progress.
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -558,7 +531,7 @@ pub use storage_rpc_auth::{
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartRecord, TestMultipartPartSegmentRecord,
-    TestMultipartUploadRecord, TestObjectPartRecord, TestPayloadReclaimRoot, TestReclaimWorkItem,
+    TestMultipartUploadRecord, TestPayloadReclaimRoot, TestReclaimWorkItem,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

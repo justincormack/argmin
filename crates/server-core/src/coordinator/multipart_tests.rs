@@ -2364,25 +2364,9 @@ fn complete_multipart_upload_happy_path() {
     // object_parts should be committed.
     let committed = coord
         .storage_node()
-        .test_get_object_parts(&bucket, &key, result.version_id)
+        .test_get_object_part_numbers(&bucket, &key, result.version_id)
         .unwrap();
-    assert_eq!(committed.len(), 2);
-    assert_eq!(committed[0].part_number, 1);
-    assert_eq!(committed[1].part_number, 2);
-    let topology = storage::PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
-    for part in &committed {
-        assert_eq!(
-            part.data_pg_id,
-            topology
-                .object_generation_multipart_part_data_pg(
-                    &bucket,
-                    &key,
-                    upload.object_generation_id,
-                    part.part_number,
-                )
-                .get()
-        );
-    }
+    assert_eq!(committed, [1, 2]);
 
     // Upload should be deleted.
     let err = coord
@@ -2899,13 +2883,13 @@ fn complete_multipart_upload_overwrite_unversioned() {
     // Old manifest parts (from first upload) should be replaced.
     let committed = coord
         .storage_node()
-        .test_get_object_parts(
+        .test_get_object_part_numbers(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             VersionId::Null,
         )
         .unwrap();
-    assert_eq!(committed.len(), 2);
+    assert_eq!(committed, [1, 2]);
 }
 
 #[test]

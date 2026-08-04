@@ -1228,14 +1228,10 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<Vec<crate::TestObjectPartRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<crate::types::ObjectPartRecord>, ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        Ok(pg
-            .get_object_parts(bucket, key, version_id)?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+        Ok(pg.get_object_parts(bucket, key, version_id)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1426,16 +1422,15 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_force_stream_upload_created_at(
+    pub fn test_mark_stream_upload_stale(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-        created_at: u64,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        pg.test_force_stream_upload_created_at(session_id, created_at)?;
+        pg.test_force_stream_upload_created_at(session_id, 0)?;
         Ok(())
     }
 

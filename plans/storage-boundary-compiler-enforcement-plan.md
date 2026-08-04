@@ -5614,17 +5614,16 @@ mutation methods acceptable final APIs.
 
 The audit found four remaining classes of work:
 
-1. **Raw or semantically different test execution paths.** Some coordinator
-   test adapters still bypass the admitted production route. In particular,
-   `RawStreamSegmentMutationRoute` uses the raw storage append path under
-   `test-utils`; `RawStreamPutFinalizationRoute` and the unbounded
-   `StorageCluster::finalize_put_object_stream` path remain production-visible;
-   and the public `begin_stream_put*` storage-node adapters have only test
-   callers. Cross-crate behavioral tests must exercise the admitted production
-   operation unless the test explicitly targets a lower storage boundary.
-   Remove, feature-gate, or replace these adapters with the same capability
-   path used by live HTTP requests. Do not retain a test helper whose success
-   depends on weaker route, deadline, or subject validation than production.
+1. **Completed — raw or semantically different test execution paths.** The
+   coordinator's raw stream segment/finalization adapters and storage-node-only
+   begin-stream adapters were removed. Cross-crate streamed PUT and UploadPart
+   helpers now use admitted production capabilities, including retained cleanup
+   authority captured before the first durable mutation. The unbounded storage
+   entry points are test-hook gated and remain only for storage-owner tests
+   which explicitly target the lower storage boundary. Cross-crate behavioral
+   tests must continue to use the admitted production operation; a test helper
+   must never depend on weaker route, deadline, or subject validation than
+   production.
 
 2. **Owner-local impossible-state fixtures.** `server-core` still directly
    asks storage test hooks to corrupt or remove durable multipart parts,
@@ -5744,12 +5743,19 @@ Implementation update (2026-08-03):
   aborting/completing scenarios, and replaced caller-authored lifecycle claim
   generation, owner, and deadline fields with one stale-incarnation claim
   scenario. Cross-crate tests still exercise the coordinator recovery and
-  response behavior without constructing durable storage records; and
-- retained physical multipart segment/part observations, segment-layout
-  observations, stream-session timestamp mutation, deleting-bucket
-  construction, and raw reclaim-queue controls remain explicit transitional
-  exceptions owned by implementation slice 3. They do not satisfy the final
-  curated-boundary completion criterion merely because they now live under
+  response behavior without constructing durable storage records;
+- replaced the cross-crate stream-session timestamp mutation with an opaque
+  stale-session scenario. Storage now owns the durable timestamp used to stage
+  that state; only storage-owner tests which explicitly exercise timestamp
+  handling retain access to the lower mutation primitive;
+- replaced the exported committed multipart-part record with a logical ordered
+  part-number observation. Physical placement is a storage-owned invariant and
+  is no longer reconstructed or asserted by coordinator tests; and
+- retained physical in-progress multipart part/segment observations,
+  segment-layout observations, deleting-bucket construction, and raw
+  reclaim-queue controls remain explicit transitional exceptions owned by
+  implementation slice 3. They do not satisfy the final curated-boundary
+  completion criterion merely because they now live under
   `storage::test_support` or on a feature-gated `StorageCluster`
   implementation.
 
