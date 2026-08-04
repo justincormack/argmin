@@ -5625,16 +5625,18 @@ The audit found four remaining classes of work:
    must never depend on weaker route, deadline, or subject validation than
    production.
 
-2. **Owner-local impossible-state fixtures.** The remaining cross-crate
-   exceptions are object segment-layout observations and raw reclaim-queue
-   controls. Move tests whose assertion is about storage corruption, recovery,
-   physical layout, claims, or queue invariants into `storage`. Where an
-   S3/coordinator response to a storage failure genuinely requires a
-   cross-crate test, expose an opaque scenario-level fault or logical
-   observation rather than physical PG, shard, row, claim, or command records.
-   This work is the test-fixture portion of pending item 14 in
-   `storage-upgrade-versioning-plan.md`; that plan retains ownership of its
-   separate debug-PG containment work.
+2. **Owner-local impossible-state fixtures.** Logical committed-object segment
+   layout, storage identity, placement distribution, and exact payload
+   presence/reclamation assertions now use an opaque storage-owned payload
+   snapshot. The remaining cross-crate exceptions are raw object-payload
+   corruption/repair controls and raw reclaim-queue controls. Move tests whose
+   assertion is about storage corruption, recovery, physical layout, claims,
+   or queue invariants into `storage`. Where an S3/coordinator response to a
+   storage failure genuinely requires a cross-crate test, expose an opaque
+   scenario-level fault or logical observation rather than physical PG, shard,
+   row, claim, or command records. This work is the test-fixture portion of
+   pending item 14 in `storage-upgrade-versioning-plan.md`; that plan retains
+   ownership of its separate debug-PG containment work.
 
 3. **Consolidated dev-only support.** Move retained cross-crate test DTOs,
    observations, and hook installers out of the `storage` crate root and off
@@ -5762,12 +5764,20 @@ Implementation update (2026-08-03):
   buckets, admits the deliberately missing-bucket scenario only after proving
   acting-set-wide absence and uses its reserved non-production incarnation,
   and permits queue replay only with a root previously issued by storage; and
-- retained object segment-layout observations and raw reclaim-queue controls
-  remain explicit transitional exceptions owned by implementation slice 3.
-  They do not satisfy the final curated-boundary completion criterion merely
-  because they now live under
-  `storage::test_support` or on a feature-gated `StorageCluster`
-  implementation.
+- replaced committed-object layout and ordinary payload-presence assertions
+  with an opaque storage-owned payload snapshot. Downstream tests see only
+  logical segment index, size, and whether the mandatory stored CRC64 value is
+  nonzero; storage
+  verifies generation-derived versus transient direct-PUT identity, data-PG
+  selection, distinct shard-node placement, and both durable shard rows and
+  files for exact pre-mutation evidence. The raw record seam has been renamed
+  explicitly as transitional and is retained only by the not-yet-migrated
+  corruption, repair, retained-placement, and shard-selection tests; and
+- retained raw object-payload corruption/repair controls and raw reclaim-queue
+  controls remain explicit transitional exceptions owned by implementation
+  slice 3. They do not satisfy the final curated-boundary completion criterion
+  merely because they live under `storage::test_support` or on a
+  feature-gated `StorageCluster` implementation.
 
 Completion:
 

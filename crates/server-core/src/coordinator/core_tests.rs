@@ -10002,7 +10002,7 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
     let bucket_name = trusted_bucket_name(&bucket);
     let object_key = trusted_object_key(&key);
     let segment = current_cluster
-        .test_get_object_segments(&bucket_name, &object_key, put.version_id)
+        .test_get_object_segments_physical(&bucket_name, &object_key, put.version_id)
         .unwrap()
         .pop()
         .expect("direct PUT should record one segment");
@@ -19413,16 +19413,22 @@ fn empty_object() {
         },
     )
     .unwrap();
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("empty"),
             put.version_id,
         )
         .unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].size, 0);
+    assert_eq!(
+        payload.layout(),
+        vec![storage::test_support::TestObjectSegmentObservation {
+            segment_index: 0,
+            size: 0,
+            has_nonzero_stored_checksum: true,
+        }]
+    );
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -19523,31 +19529,23 @@ fn delete_object_eventually_reclaims_simple_shards() {
     )
     .unwrap();
 
-    let (generation_id, ec, data_pg_id, okh, segment_vid) = {
+    let (generation_id, payload) = {
         match coord
             .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
         {
             StoredObject::Live(record) => {
-                let segments = coord
+                let payload = coord
                     .storage_node()
-                    .test_get_object_segments(
+                    .test_capture_object_payload(
                         &trusted_bucket_name("bucket"),
                         &trusted_object_key("key"),
                         record.version_id,
                     )
                     .unwrap();
-                let segment = segments
-                    .first()
-                    .expect("direct put should store one segment");
-                (
-                    record.generation_id,
-                    record.ec,
-                    segment.data_pg_id,
-                    segment.segment_okh,
-                    segment.segment_vid,
-                )
+                assert_eq!(payload.segment_count(), 1);
+                (record.generation_id, payload)
             }
             other @ StoredObject::DeleteMarker(_) => {
                 panic!("expected live object, got {other:?}")
@@ -19567,7 +19565,10 @@ fn delete_object_eventually_reclaims_simple_shards() {
         .unwrap();
 
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
-    assert_shard_set_deleted(&coord, data_pg_id, &okh, segment_vid, ec);
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_is_fully_absent(&payload)
+        .unwrap());
 }
 
 #[test]
@@ -19603,7 +19604,7 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
     let key = trusted_object_key("key");
     let segment = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
         .unwrap()
         .pop()
         .expect("put object should create one segment");
@@ -19687,7 +19688,7 @@ fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
     let source_key = trusted_object_key("src");
     let segment = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &source_key, VersionId::Null)
+        .test_get_object_segments_physical(&bucket, &source_key, VersionId::Null)
         .unwrap()
         .pop()
         .expect("source object should create one segment");
@@ -19789,7 +19790,7 @@ fn upload_part_copy_discovered_corrupt_source_shard_queues_background_repair() {
     let source_key = trusted_object_key("src");
     let segment = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &source_key, VersionId::Null)
+        .test_get_object_segments_physical(&bucket, &source_key, VersionId::Null)
         .unwrap()
         .pop()
         .expect("source object should create one segment");
@@ -19919,7 +19920,7 @@ fn retained_read_skips_repair_record_after_admitted_route_expiry_without_publica
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
     let segment = cluster
-        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
         .unwrap()
         .pop()
         .expect("put object should create one segment");
@@ -19986,7 +19987,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
     let key = trusted_object_key("key");
     let segment = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
         .unwrap()
         .pop()
         .expect("put object should create one segment");
@@ -20106,7 +20107,7 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
     let key = trusted_object_key("key");
     let segment = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
         .unwrap()
         .pop()
         .expect("put object should create one segment");
@@ -20205,7 +20206,7 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
     let key = trusted_object_key("key");
     let segment = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
         .unwrap()
         .pop()
         .expect("put object should create one segment");
@@ -20294,7 +20295,7 @@ fn reclaim_object_payload_delete_failure_keeps_retryable_reclaim_record() {
             StoredObject::Live(record) => {
                 let segments = coord
                     .storage_node()
-                    .test_get_object_segments(
+                    .test_get_object_segments_physical(
                         &trusted_bucket_name("bucket"),
                         &trusted_object_key("key"),
                         record.version_id,
@@ -21036,7 +21037,7 @@ fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8
             .unwrap();
         let segments = coord
             .storage_node()
-            .test_get_object_segments(&bucket_name, &object_key, record.version_id())
+            .test_get_object_segments_physical(&bucket_name, &object_key, record.version_id())
             .unwrap();
         if let Some(segment) = segments.first() {
             (
@@ -21475,7 +21476,7 @@ fn ec_range_get_with_missing_shard() {
         .generation_id;
     let segment = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &key, put.version_id)
+        .test_get_object_segments_physical(&bucket, &key, put.version_id)
         .unwrap()
         .pop()
         .expect("put object should create one object segment");
@@ -21614,7 +21615,7 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
     let segment = {
         let segments = coord
             .storage_node()
-            .test_get_object_segments(
+            .test_get_object_segments_physical(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("obj7"),
                 put.version_id,
@@ -21684,7 +21685,7 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
     let segment = {
         let segments = coord
             .storage_node()
-            .test_get_object_segments(
+            .test_get_object_segments_physical(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("obj8"),
                 put.version_id,
@@ -23095,7 +23096,7 @@ fn get_object_range_holds_payload_lease_on_selected_shard_nodes() {
         .expect("put object should create a live object")
         .generation_id;
     let segment = storage_cluster
-        .test_get_object_segments(&bucket, &key, put.version_id)
+        .test_get_object_segments_physical(&bucket, &key, put.version_id)
         .unwrap()
         .pop()
         .expect("direct put should create one object segment");

@@ -2234,7 +2234,7 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
         .is_some());
     assert!(coord
         .storage_node()
-        .test_get_object_segments(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             VersionId::Null

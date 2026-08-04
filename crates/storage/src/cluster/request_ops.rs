@@ -17294,7 +17294,21 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_segments(
+    pub fn test_capture_object_payload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<crate::TestObjectPayloadSnapshot, ObjectPgActionError> {
+        self.metadata_primary_bridge_node()?
+            .test_get_object_segments(bucket, key, version_id)
+            .map(crate::TestObjectPayloadSnapshot::new)
+    }
+
+    /// Transitional owner-private representation seam. New cross-crate tests
+    /// must use `test_capture_object_payload` and storage-owned assertions.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_get_object_segments_physical(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17302,6 +17316,155 @@ impl super::StorageCluster {
     ) -> Result<Vec<ObjectSegmentRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_object_segments(bucket, key, version_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_snapshot_is_fully_present(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        self.test_object_payload_snapshot_matches_presence(snapshot, true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_snapshot_is_fully_absent(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        self.test_object_payload_snapshot_matches_presence(snapshot, false)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_object_payload_snapshot_matches_presence(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        expected: bool,
+    ) -> Result<bool, StoreError> {
+        for segment in snapshot.segments() {
+            let ec = EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            };
+            let request = SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: 0,
+                segment_crc64: segment.segment_crc64,
+                ec,
+            };
+            let locations = self.segment_payload_shard_locations_at_placement_epoch(
+                segment.placement_cluster_epoch,
+                &request,
+            )?;
+            for location in locations {
+                let shard_key = ShardKey::new(
+                    &segment.segment_okh,
+                    segment.segment_vid.get(),
+                    location.shard_index().get(),
+                );
+                if self.test_placed_payload_shard_row_exists(location, &shard_key)? != expected
+                    || self.test_placed_payload_shard_file_exists(location, &shard_key)? != expected
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        for segment in snapshot.segments() {
+            let request = SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: 0,
+                segment_crc64: segment.segment_crc64,
+                ec: EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            };
+            let locations = self.segment_payload_shard_locations_at_placement_epoch(
+                segment.placement_cluster_epoch,
+                &request,
+            )?;
+            let node_count = locations
+                .iter()
+                .map(|location| location.node_id())
+                .collect::<HashSet<_>>()
+                .len();
+            if node_count != locations.len() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_snapshot_uses_generation_layout(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        generation_id: GenerationId,
+    ) -> Result<bool, StoreError> {
+        for segment in snapshot.segments() {
+            let expected_hash = segment_key_hash(
+                segment.bucket.as_str(),
+                segment.key.as_str(),
+                generation_id,
+                segment.segment_index,
+            );
+            let expected_pg = self
+                .local_map
+                .object_generation_segment_data_pg(
+                    &segment.bucket,
+                    &segment.key,
+                    generation_id,
+                    segment.segment_index,
+                )
+                .get();
+            if segment.segment_okh != expected_hash || segment.data_pg_id != expected_pg {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_snapshot_uses_transient_direct_put_layout(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        generation_id: GenerationId,
+    ) -> Result<bool, StoreError> {
+        for segment in snapshot.segments() {
+            let generation_hash = segment_key_hash(
+                segment.bucket.as_str(),
+                segment.key.as_str(),
+                generation_id,
+                segment.segment_index,
+            );
+            let expected_pg = self
+                .local_map
+                .object_generation_segment_data_pg(
+                    &segment.bucket,
+                    &segment.key,
+                    generation_id,
+                    segment.segment_index,
+                )
+                .get();
+            if segment.segment_okh == generation_hash
+                || segment.segment_vid != generation_id
+                || segment.data_pg_id != expected_pg
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Injects a storage-owned read-route failure into the first segment.

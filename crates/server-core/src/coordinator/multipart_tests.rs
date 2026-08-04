@@ -7481,16 +7481,16 @@ fn stream_put_multiple_segments_correct_manifest() {
         .unwrap();
     assert_eq!(result.etag, format_etag(crc));
 
-    // Verify the committed object segments exist in the metadata PG.
+    // Verify the logical segment layout and storage-owned stream identity.
     let committed = coord
         .storage_node()
-        .test_get_object_segments(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
         )
         .unwrap();
-    assert_eq!(committed.len(), 3);
+    assert_eq!(committed.segment_count(), 3);
     let live = coord
         .storage_node()
         .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
@@ -7498,27 +7498,14 @@ fn stream_put_multiple_segments_correct_manifest() {
         .as_live()
         .expect("stream put should create a live object")
         .clone();
-    let topology = storage::PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
-    for (i, segment) in committed.iter().enumerate() {
-        let segment_index = i as u32;
-        assert_eq!(segment.segment_index, segment_index);
+    for (i, segment) in committed.layout().iter().enumerate() {
+        assert_eq!(segment.segment_index, i as u32);
         assert_eq!(segment.size, 3); // "aaa", "bbb", "ccc" are all 3 bytes
-        assert_eq!(
-            segment.segment_okh,
-            storage::segment_key_hash("bucket", "key", live.generation_id, segment_index)
-        );
-        assert_eq!(
-            segment.data_pg_id,
-            topology
-                .object_generation_segment_data_pg(
-                    &trusted_bucket_name("bucket"),
-                    &trusted_object_key("key"),
-                    live.generation_id,
-                    segment_index,
-                )
-                .get()
-        );
     }
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_uses_generation_layout(&committed, live.generation_id)
+        .unwrap());
 }
 
 #[test]
@@ -7781,7 +7768,7 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         })
         .unwrap();
 
-    let (generation_id, segments) = {
+    let (generation_id, payload) = {
         let generation_id = match coord
             .storage_node()
             .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
@@ -7792,15 +7779,15 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
                 panic!("expected live streamed object, got {other:?}")
             }
         };
-        let segments = coord
+        let payload = coord
             .storage_node()
-            .test_get_object_segments(
+            .test_capture_object_payload(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 result.version_id,
             )
             .unwrap();
-        (generation_id, segments)
+        (generation_id, payload)
     };
 
     coord
@@ -7815,18 +7802,10 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         .unwrap();
 
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
-    for segment in segments {
-        assert_shard_set_deleted(
-            &coord,
-            segment.data_pg_id,
-            &segment.segment_okh,
-            segment.segment_vid,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-        );
-    }
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_is_fully_absent(&payload)
+        .unwrap());
 }
 
 #[test]
@@ -8089,7 +8068,7 @@ fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
 
     let source_segments = coord
         .storage_node()
-        .test_get_object_segments(
+        .test_get_object_segments_physical(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("src"),
             VersionId::Null,
@@ -9202,22 +9181,23 @@ fn object_segments_integrity_readback() {
             &trusted_object_key("verify"),
         )
         .unwrap();
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("verify"),
             record.version_id(),
         )
         .unwrap();
 
-    assert_eq!(segments.len(), 2);
-    assert_eq!(segments[0].segment_index, 0);
-    assert_eq!(segments[0].size, 8);
-    assert_ne!(segments[0].segment_crc64, 0);
-    assert_eq!(segments[1].segment_index, 1);
-    assert_eq!(segments[1].size, 8);
-    assert_ne!(segments[1].segment_crc64, 0);
+    let layout = payload.layout();
+    assert_eq!(layout.len(), 2);
+    assert_eq!(layout[0].segment_index, 0);
+    assert_eq!(layout[0].size, 8);
+    assert!(layout[0].has_nonzero_stored_checksum);
+    assert_eq!(layout[1].segment_index, 1);
+    assert_eq!(layout[1].size, 8);
+    assert!(layout[1].has_nonzero_stored_checksum);
 
     // Verify full readback via coordinator.
     let result = coord

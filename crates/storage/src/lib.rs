@@ -428,6 +428,68 @@ pub mod test_support {
         }
     }
 
+    /// Logical layout of one committed object segment.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TestObjectSegmentObservation {
+        pub segment_index: u32,
+        pub size: u64,
+        /// Whether the mandatory stored CRC64 value is nonzero.
+        pub has_nonzero_stored_checksum: bool,
+    }
+
+    /// Opaque evidence for the exact committed object payload selected by a test.
+    ///
+    /// Segment hashes, generations, PG placement, EC geometry, and placement
+    /// epochs remain owned by storage. Cross-crate tests may inspect the logical
+    /// segment layout and pass this evidence back to storage-owned assertions or
+    /// fault scenarios.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Clone)]
+    pub struct TestObjectPayloadSnapshot {
+        segments: Vec<types::ObjectSegmentRecord>,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl std::fmt::Debug for TestObjectPayloadSnapshot {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestObjectPayloadSnapshot")
+                .field("segment_count", &self.segments.len())
+                .finish()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl TestObjectPayloadSnapshot {
+        pub(crate) fn new(segments: Vec<types::ObjectSegmentRecord>) -> Self {
+            Self { segments }
+        }
+
+        pub(crate) fn segments(&self) -> &[types::ObjectSegmentRecord] {
+            &self.segments
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.segments.is_empty()
+        }
+
+        pub fn segment_count(&self) -> usize {
+            self.segments.len()
+        }
+
+        pub fn layout(&self) -> Vec<TestObjectSegmentObservation> {
+            self.segments
+                .iter()
+                .map(|segment| TestObjectSegmentObservation {
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                    has_nonzero_stored_checksum: segment.segment_crc64 != 0,
+                })
+                .collect()
+        }
+    }
+
     /// Test-only logical observation of accepted bucket-deletion progress.
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -570,7 +632,8 @@ pub use storage_rpc_auth::{
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
-    TestMultipartUploadRecord, TestPayloadReclaimRoot, TestReclaimWorkItem,
+    TestMultipartUploadRecord, TestObjectPayloadSnapshot, TestPayloadReclaimRoot,
+    TestReclaimWorkItem,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

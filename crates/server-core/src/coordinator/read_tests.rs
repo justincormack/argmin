@@ -2,10 +2,9 @@ use super::test_helpers;
 use super::test_support::*;
 use super::*;
 use ec::EcConfig;
-use std::collections::BTreeSet;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use storage::{segment_key_hash, EcShape, GenerationId, PgTopology, ShardKey, StoreError};
+use storage::{segment_key_hash, GenerationId, PgTopology, ShardKey, StoreError};
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -40,47 +39,23 @@ fn stream_put_get_object_readable() {
         })
         .unwrap();
 
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             VersionId::Null,
         )
         .unwrap();
-    assert_eq!(segments.len(), 1);
-    let segment = &segments[0];
-    let ec = EcShape {
-        k: segment.ec_k,
-        m: segment.ec_m,
-    };
-    let mut placed_node_dirs = BTreeSet::new();
-    for shard_index in 0..ec.k + ec.m {
-        let path = coord
-            .storage_node()
-            .test_payload_shard_file_path(
-                segment.data_pg_id,
-                ec,
-                &segment.segment_okh,
-                segment.segment_vid,
-                shard_index,
-            )
-            .unwrap();
-        assert!(
-            path.exists(),
-            "stream PUT shard {shard_index} should exist at {}",
-            path.display()
-        );
-        let node_dir = path
-            .ancestors()
-            .nth(4)
-            .expect("payload shard path should include a node directory")
-            .file_name()
-            .unwrap()
-            .to_owned();
-        placed_node_dirs.insert(node_dir);
-    }
-    assert_eq!(placed_node_dirs.len(), usize::from(ec.k + ec.m));
+    assert_eq!(payload.segment_count(), 1);
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_is_fully_present(&payload)
+        .unwrap());
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_places_each_shard_on_a_distinct_node(&payload)
+        .unwrap());
 
     let head = coord
         .head_object(&GetObjectRequest {
@@ -833,15 +808,15 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
     )
     .unwrap();
 
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
         )
         .unwrap();
-    assert_eq!(segments.len(), 1);
+    assert_eq!(payload.segment_count(), 1);
     let live = coord
         .storage_node()
         .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
@@ -849,57 +824,23 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         .as_live()
         .expect("buffered put should create a live object")
         .clone();
-    let topology = PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
-    assert_ne!(
-        segments[0].segment_okh,
-        segment_key_hash("bucket", "key", live.generation_id, 0),
-        "direct PUT shards should use transient staging keys, not generation-derived stream keys"
-    );
-    assert_eq!(segments[0].segment_vid, live.generation_id);
-    assert_eq!(
-        segments[0].data_pg_id,
-        topology
-            .object_generation_segment_data_pg(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                live.generation_id,
-                0,
-            )
-            .get()
-    );
-
-    let segment = &segments[0];
-    let ec = EcShape {
-        k: segment.ec_k,
-        m: segment.ec_m,
-    };
-    let mut placed_node_dirs = BTreeSet::new();
-    for shard_index in 0..ec.k + ec.m {
-        let path = coord
+    assert!(
+        coord
             .storage_node()
-            .test_payload_shard_file_path(
-                segment.data_pg_id,
-                ec,
-                &segment.segment_okh,
-                segment.segment_vid,
-                shard_index,
+            .test_object_payload_snapshot_uses_transient_direct_put_layout(
+                &payload,
+                live.generation_id,
             )
-            .unwrap();
-        assert!(
-            path.exists(),
-            "direct PUT shard {shard_index} should exist at {}",
-            path.display()
-        );
-        let node_dir = path
-            .ancestors()
-            .nth(4)
-            .expect("payload shard path should include a node directory")
-            .file_name()
             .unwrap()
-            .to_owned();
-        placed_node_dirs.insert(node_dir);
-    }
-    assert_eq!(placed_node_dirs.len(), usize::from(ec.k + ec.m));
+    );
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_is_fully_present(&payload)
+        .unwrap());
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_places_each_shard_on_a_distinct_node(&payload)
+        .unwrap());
     assert!(coord
         .storage_node()
         .test_list_all_stream_uploads()
@@ -1066,39 +1007,15 @@ fn buffered_put_post_publish_error_keeps_committed_shards() {
         .clone();
     assert_eq!(live.generation_id, GenerationId::MIN);
 
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments(&bucket, &key, VersionId::Null)
+        .test_capture_object_payload(&bucket, &key, VersionId::Null)
         .unwrap();
-    assert_eq!(segments.len(), 1);
-    let segment = &segments[0];
-    let ec = EcShape {
-        k: segment.ec_k,
-        m: segment.ec_m,
-    };
-    for shard_index in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index);
-        assert!(
-            coord
-                .storage_node()
-                .test_shard_exists(segment.data_pg_id, &shard_key)
-                .unwrap(),
-            "post-publish failure must keep shard metadata {shard_index}"
-        );
-        assert!(
-            coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    segment.data_pg_id,
-                    ec,
-                    &segment.segment_okh,
-                    segment.segment_vid,
-                    shard_index,
-                )
-                .unwrap(),
-            "post-publish failure must keep placed shard file {shard_index}"
-        );
-    }
+    assert_eq!(payload.segment_count(), 1);
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_is_fully_present(&payload)
+        .unwrap());
 
     let get = coord
         .get_object(&GetObjectRequest {
@@ -1142,16 +1059,17 @@ fn buffered_put_exact_segment_skips_stream_session_rows() {
     )
     .unwrap();
 
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("exact"),
             result.version_id,
         )
         .unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].size, INTERNAL_SEGMENT_SIZE as u64);
+    let layout = payload.layout();
+    assert_eq!(layout.len(), 1);
+    assert_eq!(layout[0].size, INTERNAL_SEGMENT_SIZE as u64);
     assert!(coord
         .storage_node()
         .test_list_all_stream_uploads()
@@ -1202,21 +1120,22 @@ fn buffered_put_writes_object_segments() {
     .unwrap();
 
     {
-        let segments = coord
+        let payload = coord
             .storage_node()
-            .test_get_object_segments(
+            .test_capture_object_payload(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("key"),
                 result.version_id,
             )
             .unwrap();
-        assert_eq!(segments.len(), 3);
-        assert_eq!(segments[0].segment_index, 0);
-        assert_eq!(segments[0].size, INTERNAL_SEGMENT_SIZE as u64);
-        assert_eq!(segments[1].segment_index, 1);
-        assert_eq!(segments[1].size, INTERNAL_SEGMENT_SIZE as u64);
-        assert_eq!(segments[2].segment_index, 2);
-        assert_eq!(segments[2].size, 123);
+        let layout = payload.layout();
+        assert_eq!(layout.len(), 3);
+        assert_eq!(layout[0].segment_index, 0);
+        assert_eq!(layout[0].size, INTERNAL_SEGMENT_SIZE as u64);
+        assert_eq!(layout[1].segment_index, 1);
+        assert_eq!(layout[1].size, INTERNAL_SEGMENT_SIZE as u64);
+        assert_eq!(layout[2].segment_index, 2);
+        assert_eq!(layout[2].size, 123);
         assert!(coord
             .storage_node()
             .test_list_all_stream_uploads()
