@@ -200,6 +200,33 @@ pub mod test_support {
         pub desired_cluster_epoch: ClusterEpoch,
     }
 
+    /// Removes every placed shard file for one logical segment of a captured
+    /// committed object payload.
+    ///
+    /// Durable acknowledgements are intentionally retained so the subsequent
+    /// read traverses the production missing-payload path. Storage owns the EC
+    /// geometry, placement, and physical shard identities used by this fault.
+    pub fn inject_object_payload_segment_loss(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+        segment_index: u32,
+    ) -> Result<(), StoreError> {
+        let segment = snapshot
+            .segments()
+            .iter()
+            .find(|segment| segment.segment_index == segment_index)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload segment for fault injection",
+                source: std::io::Error::other(format!(
+                    "captured payload has no segment {segment_index}"
+                )),
+            })?;
+        for shard_index in 0..segment.ec_k + segment.ec_m {
+            cluster.test_inject_object_payload_shard_loss(snapshot, segment_index, shard_index)?;
+        }
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct TestBucketDeleteFinalizeRoot {

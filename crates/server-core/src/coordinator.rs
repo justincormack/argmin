@@ -23,7 +23,6 @@ use storage::ObjectEncryption;
 #[cfg(test)]
 use storage::ObjectLockState;
 #[cfg(test)]
-use storage::ShardKey;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
 use storage::{

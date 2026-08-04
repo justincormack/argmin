@@ -218,6 +218,10 @@ impl Coordinator {
             return result;
         }
 
+        // Request-owned metadata cannot depend on the reserved bucket snapshot.
+        // Serialize it before acquiring durable bucket-write authority so an
+        // invalid metadata value cannot create even a transient reservation.
+        let metadata_blob = storage::SerializedMetadataBlob::from(req.metadata.serialize()?);
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
         let expected_bucket_owner = authorized.expected_bucket_owner();
         put_route
@@ -267,9 +271,6 @@ impl Coordinator {
                                 &system_metadata,
                                 write_encryption,
                             )?;
-                        let metadata_blob =
-                            storage::SerializedMetadataBlob::from(req.metadata.serialize()?);
-
                         let transient_segment_id =
                             Self::random_session_id("failed to generate direct put segment ID")?;
 

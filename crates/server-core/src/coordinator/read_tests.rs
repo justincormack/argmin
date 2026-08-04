@@ -4,7 +4,7 @@ use super::*;
 use ec::EcConfig;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use storage::{segment_key_hash, GenerationId, PgTopology, ShardKey, StoreError};
+use storage::{GenerationId, StoreError};
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -162,17 +162,6 @@ fn failed_stream_put_append_commit_cleans_placed_shards() {
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let generation_id = coord
-        .storage_node()
-        .test_object_generation_reservation_for(&bucket, &key, &session_id)
-        .unwrap();
-    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
-    let segment_vid = GenerationId::new(1).unwrap();
-    let ec = coord.storage_node().default_payload_ec_shape();
-    let data_pg_id = PgTopology::new(coord.storage_node().test_pg_ids())
-        .unwrap()
-        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
-        .get();
     let hook_storage = Arc::clone(&coord.storage_node());
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
@@ -193,30 +182,6 @@ fn failed_stream_put_append_commit_cleans_placed_shards() {
         matches!(err, ServerError::Metadata(_)),
         "expected missing stream session after hook abort, got {err:?}"
     );
-
-    for shard_index in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
-        assert!(
-            !coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap(),
-            "failed stream append must remove shard metadata {shard_index}"
-        );
-        assert!(
-            !coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    data_pg_id,
-                    ec,
-                    &segment_okh,
-                    segment_vid,
-                    shard_index,
-                )
-                .unwrap(),
-            "failed stream append must remove placed shard file {shard_index}"
-        );
-    }
 }
 
 #[test]
@@ -238,18 +203,6 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let generation_id = coord
-        .storage_node()
-        .test_object_generation_reservation_for(&bucket, &key, &session_id)
-        .unwrap();
-    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
-    let segment_vid = GenerationId::new(1).unwrap();
-    let ec = coord.storage_node().default_payload_ec_shape();
-    let data_pg_id = PgTopology::new(coord.storage_node().test_pg_ids())
-        .unwrap()
-        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
-        .get();
-
     let observed_cleanup_errors = Arc::new(Mutex::new(Vec::new()));
     let observed_cleanup_errors_for_hook = Arc::clone(&observed_cleanup_errors);
     let _cleanup_error_guard = coord
@@ -295,40 +248,14 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
     );
 
     let observed_cleanup_errors = observed_cleanup_errors.lock().unwrap();
-    assert_eq!(
-        observed_cleanup_errors.len(),
-        usize::from(ec.k + ec.m),
-        "each placed shard cleanup failure should emit typed cleanup context"
+    assert!(
+        !observed_cleanup_errors.is_empty(),
+        "placed shard cleanup failure should emit typed cleanup context"
     );
     assert!(observed_cleanup_errors.iter().all(|(operation, context)| {
         *operation == "delete placed payload shard"
             && *context == "injected placed cleanup delete failure"
     }));
-    drop(observed_cleanup_errors);
-
-    let mut remaining_placed_files = 0usize;
-    for shard_index in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
-        assert!(
-            !coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap(),
-            "best-effort failure should still remove ack metadata {shard_index}"
-        );
-        if coord
-            .storage_node()
-            .test_payload_shard_file_exists(data_pg_id, ec, &segment_okh, segment_vid, shard_index)
-            .unwrap()
-        {
-            remaining_placed_files += 1;
-        }
-    }
-    assert_eq!(
-        remaining_placed_files,
-        usize::from(ec.k + ec.m),
-        "injected best-effort failure should leave every placed shard as orphan state"
-    );
 }
 
 #[test]
@@ -344,46 +271,9 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
         .unwrap();
 
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
-    let bucket = trusted_bucket_name("bucket");
-    let key = trusted_object_key("key");
-    let generation_id = coord
-        .storage_node()
-        .test_object_generation_reservation_for(&bucket, &key, &session_id)
-        .unwrap();
-    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
-    let segment_vid = GenerationId::new(1).unwrap();
-    let ec = coord.storage_node().default_payload_ec_shape();
-    let data_pg_id = PgTopology::new(coord.storage_node().test_pg_ids())
-        .unwrap()
-        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
-        .get();
-
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"cleanup-me")
         .unwrap();
-    for shard_index in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
-        assert!(
-            coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap(),
-            "staged stream append should publish ack row {shard_index}"
-        );
-        assert!(
-            coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    data_pg_id,
-                    ec,
-                    &segment_okh,
-                    segment_vid,
-                    shard_index,
-                )
-                .unwrap(),
-            "staged stream append should publish placed file {shard_index}"
-        );
-    }
 
     let observed_cleanup_errors = Arc::new(Mutex::new(Vec::new()));
     let observed_cleanup_errors_for_hook = Arc::clone(&observed_cleanup_errors);
@@ -414,39 +304,13 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
         .unwrap();
 
     let observed_cleanup_errors = observed_cleanup_errors.lock().unwrap();
-    assert_eq!(
-        observed_cleanup_errors.len(),
-        usize::from(ec.k + ec.m),
-        "each ack cleanup failure should emit typed cleanup context"
+    assert!(
+        !observed_cleanup_errors.is_empty(),
+        "ack cleanup failure should emit typed cleanup context"
     );
     assert!(observed_cleanup_errors.iter().all(|(operation, context)| {
         *operation == "delete payload ack" && *context == "injected ack cleanup delete failure"
     }));
-    drop(observed_cleanup_errors);
-
-    for shard_index in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
-        assert!(
-            coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap(),
-            "ack cleanup failure should leave payload ack row {shard_index}"
-        );
-        assert!(
-            !coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    data_pg_id,
-                    ec,
-                    &segment_okh,
-                    segment_vid,
-                    shard_index,
-                )
-                .unwrap(),
-            "ack cleanup failure should not prevent placed cleanup for shard {shard_index}"
-        );
-    }
 }
 
 #[test]
@@ -468,18 +332,7 @@ fn stream_put_abort_cleans_segment_committed_during_abort_window() {
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let generation_id = coord
-        .storage_node()
-        .test_object_generation_reservation_for(&bucket, &key, &session_id)
-        .unwrap();
     let segment_index = 0;
-    let segment_okh = segment_key_hash("bucket", "key", generation_id, segment_index);
-    let segment_vid = GenerationId::MIN;
-    let ec = coord.storage_node().default_payload_ec_shape();
-    let data_pg_id = PgTopology::new(coord.storage_node().test_pg_ids())
-        .unwrap()
-        .object_generation_segment_data_pg(&bucket, &key, generation_id, segment_index)
-        .get();
     let abort_reached_storage = Arc::new(Barrier::new(2));
     let allow_abort_storage = Arc::new(Barrier::new(2));
     let abort_reached_storage_hook = Arc::clone(&abort_reached_storage);
@@ -491,7 +344,7 @@ fn stream_put_abort_cleans_segment_committed_during_abort_window() {
             allow_abort_storage_hook.wait();
         }));
 
-    thread::scope(|scope| {
+    let staged_payload = thread::scope(|scope| {
         let abort = scope.spawn(|| coord.abort_stream_put("bucket", "key", &session_id));
         abort_reached_storage.wait();
         coord
@@ -503,33 +356,23 @@ fn stream_put_abort_cleans_segment_committed_during_abort_window() {
                 b"race-data",
             )
             .unwrap();
+        let staged_payload = coord
+            .storage_node()
+            .test_capture_stream_upload_payload(&bucket, &key, &session_id)
+            .unwrap();
+        assert_eq!(staged_payload.segment_count(), 1);
+        assert!(coord
+            .storage_node()
+            .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+            .unwrap());
         allow_abort_storage.wait();
         abort.join().unwrap().unwrap();
+        staged_payload
     });
-
-    for shard_index in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
-        assert!(
-            !coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap(),
-            "abort must remove shard metadata committed during abort window {shard_index}"
-        );
-        assert!(
-            !coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    data_pg_id,
-                    ec,
-                    &segment_okh,
-                    segment_vid,
-                    shard_index,
-                )
-                .unwrap(),
-            "abort must remove placed shard file committed during abort window {shard_index}"
-        );
-    }
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+        .unwrap());
 }
 
 #[test]
@@ -864,7 +707,7 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
 }
 
 #[test]
-fn failed_buffered_put_before_commit_leaves_no_generation_reservation_or_shards() {
+fn failed_buffered_put_before_storage_mutation_allows_followup_put() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
     coord
@@ -874,85 +717,77 @@ fn failed_buffered_put_before_commit_leaves_no_generation_reservation_or_shards(
     let oversized_value = "x".repeat(u16::MAX as usize + 1);
     let oversized_metadata =
         MetadataBlob::from_headers(&[("x-amz-meta-too-large", oversized_value.as_str())]).unwrap();
-    let err = test_helpers::put_object(
-        &coord,
-        &PutObjectRequest {
-            encryption: WriteEncryptionRequest::none(),
+    let authorized = coord
+        .authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            acl: NO_PUT_OBJECT_ACL.into(),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
-            data: b"tiny-data",
-            metadata: &oversized_metadata,
-            system_metadata: &SystemMetadata::EMPTY,
             tags: None,
-            cond: &WriteCondition::default(),
-            acl: NO_PUT_OBJECT_ACL.into(),
-        },
-    )
-    .unwrap_err();
+            encryption: WriteEncryptionRequest::none(),
+        })
+        .unwrap();
+    let reserved_snapshot_loads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reserved_snapshot_loads_for_hook = Arc::clone(&reserved_snapshot_loads);
+    let _reservation_guard =
+        coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
+            bucket: Some("bucket".to_string()),
+            after_loaded: Some(Arc::new(move || {
+                reserved_snapshot_loads_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })),
+            ..BucketWriteHandleTestHooks::default()
+        });
+    let err = coord
+        .put_object_from_authorized_write(
+            &AuthorizedPutObjectCommitRequest {
+                data: b"tiny-data",
+                metadata: &oversized_metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                cond: &WriteCondition::default(),
+            },
+            &authorized,
+        )
+        .unwrap_err();
     assert!(
         matches!(err, ServerError::MetadataBlobError { .. }),
         "expected metadata serialization failure, got {err:?}"
     );
+    assert_eq!(
+        reserved_snapshot_loads.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "metadata serialization failure must precede the first durable storage mutation"
+    );
 
-    let bucket = trusted_bucket_name("bucket");
-    let key = trusted_object_key("key");
-    let generation_id = GenerationId::MIN;
-    let segment_okh = segment_key_hash("bucket", "key", generation_id, 0);
-    let topology = PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
-    let data_pg_id = topology
-        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
-        .get();
-    let ec = coord.storage_node().default_payload_ec_shape();
-    for shard_index in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment_okh, generation_id.get(), shard_index);
-        assert!(
-            !coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap(),
-            "failed direct PUT must not leave shard {shard_index}"
-        );
-        assert!(
-            !coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    data_pg_id,
-                    ec,
-                    &segment_okh,
-                    generation_id,
-                    shard_index,
-                )
-                .unwrap(),
-            "failed direct PUT must not leave placed shard file {shard_index}"
-        );
-    }
-
-    let result = test_helpers::put_object(
-        &coord,
-        &PutObjectRequest {
-            encryption: WriteEncryptionRequest::none(),
-            policy_context: PutObjectPolicyContext::default(),
-            object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
-            data: b"tiny-data",
-            metadata: &MetadataBlob::new(),
-            system_metadata: &SystemMetadata::EMPTY,
-            tags: None,
-            cond: &WriteCondition::default(),
-            acl: NO_PUT_OBJECT_ACL.into(),
-        },
-    )
-    .unwrap();
-    let live = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .as_live()
-        .expect("second put should create a live object")
-        .clone();
-    assert_eq!(live.version_id, result.version_id);
-    assert_eq!(live.generation_id, GenerationId::MIN);
+    let result = coord
+        .put_object_from_authorized_write(
+            &AuthorizedPutObjectCommitRequest {
+                data: b"tiny-data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                cond: &WriteCondition::default(),
+            },
+            &authorized,
+        )
+        .unwrap();
+    assert_eq!(
+        reserved_snapshot_loads.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "successful buffered PUT must traverse the reserved bucket-write snapshot path"
+    );
+    let get = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                Some(result.version_id),
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(get.body.read_all().unwrap(), b"tiny-data");
 }
 
 #[test]

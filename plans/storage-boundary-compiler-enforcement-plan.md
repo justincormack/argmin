@@ -5635,13 +5635,19 @@ The audit found four remaining classes of work:
    observe only logical queue depth and opaque reclaim-root presence.
 
    The final audit found older residual cases which predate those migrations,
-   so this item is not yet complete. `server-core` stream append/abort cleanup
-   tests still derive data PGs and shard keys and inspect durable shard rows and
-   files directly. One UploadPartCopy failure test removes source shard files
-   by path instead of using the storage-owned shard-loss scenario. Backfill
-   tests still construct physical work items, routes, shard acknowledgements,
-   and placed files outside `storage`. Those physical-invariant tests must move
-   to `storage`; any retained coordinator test should invoke an opaque owner
+   so this item is not yet complete. The stream append/abort cleanup physical
+   assertions are now storage-owner-local; retained coordinator cases assert
+   only the selected error, cleanup trace, or opaque staged-payload outcome.
+   UploadPartCopy source loss now uses a storage-owned whole-segment-loss
+   scenario rather than caller-reconstructed shard paths. The direct-PUT
+   pre-storage failure path now serializes request-owned metadata before
+   entering the reserved bucket-write snapshot operation; a deterministic
+   snapshot-load hook has a successful-PUT canary and remains untouched by the
+   rejected request. The reclaim cleanup/retry physical invariant is
+   storage-owner-local. Backfill tests still construct or inspect
+   physical work items, routes, shard acknowledgements, and placed files
+   outside `storage`. Those remaining physical-invariant tests must move to
+   `storage`; any retained coordinator test should invoke an opaque owner
    scenario and assert only the coordinator-visible error, trace, or cleanup
    outcome.
 
@@ -5823,7 +5829,25 @@ Implementation update (2026-08-03):
   dequeue, finish, wake, and outcome adapters were removed. The security
   suite's stateful and all groups now select the storage-owner module, and the
   15 historical Proptest regressions moved with their property tests so the
-  source-relative replay corpus remains active.
+  source-relative replay corpus remains active; and
+- moved stream append/abort physical cleanup invariants into storage-owner
+  tests. Storage now pins complete cleanup after a post-prepare session abort,
+  placed-file deletion failure leaving only orphan files, and acknowledgement
+  deletion failure leaving only durable rows. Coordinator tests retain the
+  operation error and typed cleanup-trace contracts, while the concurrent
+  append/abort test uses opaque staged-payload evidence. UploadPartCopy source
+  failure now invokes a storage-owned whole-segment-loss scenario and retains
+  only its coordinator-visible failure and destination-session cleanup checks;
+  and
+- completed the direct-PUT/reclaim cleanup slice. Request-owned metadata is
+  serialized before the reserved bucket-write snapshot operation. A
+  deterministic snapshot-load hook proves that the rejected request does not
+  enter that operation and a successful PUT canary proves the hook is live,
+  followed by an ordinary GET.
+  The reclaim placed-file deletion failure and retry test is now
+  storage-owner-local, where it verifies the exact acknowledgement-row and
+  shard-file state before and after convergence; the duplicate raw coordinator
+  assertion and shard-set helper were removed.
 
 Final Phase 5 audit (2026-08-04):
 
@@ -5839,15 +5863,8 @@ Final Phase 5 audit (2026-08-04):
   expose or reconstruct raw PG IDs, route snapshots, generation identities,
   EC shapes, shard keys, physical shard paths, shard acknowledgement rows,
   durable object/upload records, and backfill work records;
-- the stream append/abort cleanup and direct-PUT cleanup regressions assert
-  physical shard-row/file state from `server-core`. Their storage invariants
-  belong in storage-owner tests. Retain cross-crate cases only where they pin a
-  coordinator error or trace, and drive those cases through an opaque
-  storage-owned cleanup-failure scenario and logical outcome;
-- the UploadPartCopy source-read failure regression manually deletes every
-  source shard by a caller-reconstructed path. Replace that mutation with the
-  existing storage-owned payload-loss scenario while retaining the
-  coordinator-visible abort/no-leak assertion;
+- the stream append/abort cleanup, direct-PUT/reclaim cleanup, and
+  UploadPartCopy source-loss migrations are complete;
 - shard-backfill and retained-placement regressions construct
   `StorageShardBackfillTestWorkItem`, `PgRouteSnapshot`, physical segment
   writes, acknowledgement rows, and historical routes. Their placement,
@@ -5891,9 +5908,9 @@ The audited cross-crate support families are:
 
 Remaining implementation order after this audit:
 
-1. migrate the stream/direct-PUT cleanup and UploadPartCopy source-loss cases,
-   moving physical assertions into `storage` and retaining only opaque
-   coordinator-facing scenarios;
+1. **Completed:** stream cleanup, direct-PUT/reclaim cleanup, and UploadPartCopy
+   source loss have owner-local physical assertions and only logical or opaque
+   coordinator-facing coverage;
 2. move the backfill, retained-placement, and shard-selection physical
    regressions into `storage`, replacing any genuinely cross-crate runtime-map
    case with one opaque topology scenario;

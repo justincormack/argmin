@@ -1375,6 +1375,112 @@ fn payload_reclaim_in_progress_blocks_new_payload_leases() {
 }
 
 #[test]
+fn reclaim_placed_payload_delete_failure_preserves_payload_until_retry() {
+    let _serial = lock_payload_cleanup_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let (bucket, key, _, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let committed =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"retryable payload");
+    cluster
+        .delete_current_object_if(&bucket, &key, |stored| {
+            assert!(matches!(stored, Some(crate::StoredObject::Live(_))));
+            Ok::<(), ()>(())
+        })
+        .unwrap()
+        .unwrap();
+
+    let failing_key = ShardKey::new(&committed.segment_okh, committed.generation_id.get(), 0);
+    let hook_guard =
+        cluster.test_install_before_placed_payload_shard_delete_hook(Arc::new(move |shard_key| {
+            if shard_key == &failing_key {
+                return Err(crate::StoreError::Io {
+                    context: "injected reclaim placed delete failure",
+                    source: std::io::Error::other("injected reclaim placed delete failure"),
+                });
+            }
+            Ok(())
+        }));
+    let error = cluster
+        .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(crate::StoreError::Io {
+            context: "injected reclaim placed delete failure",
+            ..
+        })
+    ));
+    assert!(cluster
+        .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+        .unwrap());
+    for shard_index in 0..committed.written.ec.k + committed.written.ec.m {
+        let shard_key = ShardKey::new(
+            &committed.segment_okh,
+            committed.generation_id.get(),
+            shard_index,
+        );
+        assert!(map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .test_shard_exists(committed.written.data_pg_id, &shard_key)
+            .unwrap());
+        assert!(cluster
+            .test_payload_shard_file_exists(
+                committed.written.data_pg_id,
+                committed.written.ec,
+                &committed.segment_okh,
+                committed.generation_id,
+                shard_index,
+            )
+            .unwrap());
+    }
+
+    drop(hook_guard);
+    assert!(cluster
+        .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
+        .unwrap());
+    assert!(!cluster
+        .payload_reclaim_exists(&bucket, &key, committed.generation_id)
+        .unwrap());
+    for shard_index in 0..committed.written.ec.k + committed.written.ec.m {
+        let shard_key = ShardKey::new(
+            &committed.segment_okh,
+            committed.generation_id.get(),
+            shard_index,
+        );
+        assert!(!map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .test_shard_exists(committed.written.data_pg_id, &shard_key)
+            .unwrap());
+        assert!(!cluster
+            .test_payload_shard_file_exists(
+                committed.written.data_pg_id,
+                committed.written.ec,
+                &committed.segment_okh,
+                committed.generation_id,
+                shard_index,
+            )
+            .unwrap());
+    }
+}
+
+#[test]
 fn reclaim_payload_cleanup_failure_keeps_payload_lease_fence_until_retry() {
     let _serial = lock_payload_cleanup_hook_test();
     let tmp = test_util::tempdir();

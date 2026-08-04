@@ -8007,38 +8007,21 @@ fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
         })
         .unwrap();
 
-    let source_segments = coord
+    let source_payload = coord
         .storage_node()
-        .test_get_object_segments_physical(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("src"),
             VersionId::Null,
         )
         .unwrap();
-    assert_eq!(source_segments.len(), 2);
-    let broken_segment = &source_segments[1];
-    let broken_ec = EcShape {
-        k: broken_segment.ec_k,
-        m: broken_segment.ec_m,
-    };
-    for shard_index in 0..(broken_segment.ec_k + broken_segment.ec_m) {
-        let shard_path = coord
-            .storage_node()
-            .test_payload_shard_file_path(
-                broken_segment.data_pg_id,
-                broken_ec,
-                &broken_segment.segment_okh,
-                broken_segment.segment_vid,
-                shard_index,
-            )
-            .unwrap();
-        std::fs::remove_file(&shard_path).unwrap_or_else(|error| {
-            panic!(
-                "failed to delete source shard {shard_index} at {}: {error}",
-                shard_path.display()
-            )
-        });
-    }
+    assert_eq!(source_payload.segment_count(), 2);
+    storage::test_support::inject_object_payload_segment_loss(
+        coord.storage_node().as_ref(),
+        &source_payload,
+        1,
+    )
+    .unwrap();
 
     let upload = coord
         .create_multipart_upload(&CreateMultipartUploadRequest {

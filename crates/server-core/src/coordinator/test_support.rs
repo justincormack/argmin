@@ -519,29 +519,6 @@ pub(crate) fn reclaim_object_payload(
         .unwrap();
 }
 
-pub(crate) fn assert_shard_set_deleted(
-    coord: &Coordinator,
-    data_pg_id: u32,
-    okh: &[u8; 16],
-    generation_id: GenerationId,
-    ec: EcShape,
-) {
-    assert!(
-        (0..(ec.k as usize + ec.m as usize)).all(|i| {
-            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-            !coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap()
-                && !coord
-                    .storage_node()
-                    .test_payload_shard_file_exists(data_pg_id, ec, okh, generation_id, i as u8)
-                    .unwrap()
-        }),
-        "expected shard-set to be reclaimed for generation {generation_id:?}"
-    );
-}
-
 pub(crate) fn begin_stream_part_test<I: MultipartUploadIdArg>(
     coord: &Coordinator,
     bucket: &str,
