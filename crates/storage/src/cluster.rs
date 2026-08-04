@@ -74,13 +74,11 @@ use crate::storage_rpc::{
     StorageRpcErrorCode, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES, STORAGE_RPC_MAX_PAYLOAD_LEN,
 };
-#[cfg(any(test, feature = "test-hooks"))]
-use crate::test_support::StorageShardBackfillTestWorkItem;
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::MultipartUploadRecord;
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 use crate::types::PlacedSegmentShardBackfillRecord;
 use crate::types::{
     AclGrants, AdmittedRouteEffectFence, AuthorizedMultipartUploadRecord, BucketAclSummary,
@@ -448,54 +446,13 @@ pub(crate) struct DurablePlacedSegmentShardRepairEnqueueSummary {
     pub(crate) enqueued: usize,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct TestDirectPutWrittenSegment {
     pub data_pg_id: u32,
     pub ec: EcShape,
     pub written_shards: Vec<WrittenShardAck>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl StorageShardBackfillTestWorkItem {
-    fn into_internal(self) -> PlacedSegmentShardBackfillWorkItem {
-        PlacedSegmentShardBackfillWorkItem {
-            request: self.request,
-            source_cluster_epoch: self.source_cluster_epoch,
-            desired_cluster_epoch: self.desired_cluster_epoch,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StorageShardBackfillTestRecord {
-    pub work_item: StorageShardBackfillTestWorkItem,
-    pub remaining_tolerance: u8,
-    pub first_seen_at: u64,
-    pub last_seen_at: u64,
-    pub observation_count: u64,
-    pub last_error: Option<String>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<PlacedSegmentShardBackfillRecord> for StorageShardBackfillTestRecord {
-    fn from(record: PlacedSegmentShardBackfillRecord) -> Self {
-        Self {
-            work_item: StorageShardBackfillTestWorkItem {
-                request: record.work_item.request,
-                source_cluster_epoch: record.work_item.source_cluster_epoch,
-                desired_cluster_epoch: record.work_item.desired_cluster_epoch,
-            },
-            remaining_tolerance: record.remaining_tolerance,
-            first_seen_at: record.first_seen_at,
-            last_seen_at: record.last_seen_at,
-            observation_count: record.observation_count,
-            last_error: record.last_error,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -12235,7 +12192,7 @@ impl StorageCluster {
             .delete_payload_shard(self.operation_epoch(), location, key)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(crate) fn write_direct_put_segment_payload_shards(
         &self,
         bucket: &BucketName,
@@ -12261,7 +12218,7 @@ impl StorageCluster {
         )
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     #[doc(hidden)]
     pub fn test_write_direct_put_segment_payload_shards(
         &self,
@@ -16375,7 +16332,7 @@ impl StorageCluster {
         Ok(())
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub fn test_register_payload_shard_acks(
         &self,
         data_pg_id: u32,
@@ -17443,50 +17400,6 @@ impl StorageCluster {
             .record_placed_segment_shard_repair_claim_error(claim, last_error, next_attempt_after)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_record_placed_segment_shard_backfill(
-        &self,
-        work_item: StorageShardBackfillTestWorkItem,
-        remaining_tolerance: Option<u8>,
-        last_error: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let work_item = work_item.into_internal();
-        self.record_placed_segment_shard_backfill_with_remaining_tolerance(
-            &work_item,
-            remaining_tolerance.unwrap_or(work_item.request.ec.m),
-            last_error,
-        )
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_list_placed_segment_shard_backfills(
-        &self,
-        data_pg_id: u32,
-    ) -> Result<Vec<StorageShardBackfillTestRecord>, StoreError> {
-        self.list_placed_segment_shard_backfills(data_pg_id)
-            .map(|records| records.into_iter().map(Into::into).collect())
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_backfill_placed_segment_payload_shards_for_work_item(
-        &self,
-        work_item: StorageShardBackfillTestWorkItem,
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
-        self.backfill_placed_segment_payload_shards_for_work_item(&work_item.into_internal())
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_placed_segment_shard_backfill_source_is_referenced(
-        &self,
-        work_item: StorageShardBackfillTestWorkItem,
-    ) -> Result<bool, StoreError> {
-        self.placed_segment_shard_backfill_source_is_referenced(&work_item.into_internal())
-    }
-
     #[cfg(test)]
     pub(crate) fn record_placed_segment_shard_backfill(
         &self,
@@ -17511,7 +17424,7 @@ impl StorageCluster {
             .record_placed_segment_shard_backfill(work_item, remaining_tolerance, last_error)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(crate) fn list_placed_segment_shard_backfills(
         &self,
         data_pg_id: u32,
@@ -19947,7 +19860,7 @@ impl StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub fn test_payload_shard_file_path(
         &self,
         data_pg_id: u32,
@@ -19989,7 +19902,7 @@ impl StorageCluster {
             .join(shard_key.hex()))
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub fn test_payload_shard_file_exists(
         &self,
         data_pg_id: u32,

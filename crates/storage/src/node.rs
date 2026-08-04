@@ -1160,16 +1160,19 @@ impl SharedStorageNode {
         let segments = pg.get_object_segments(bucket, key, version_id)?;
         after_segments();
         if segments.is_empty() {
-            return Ok(crate::TestObjectPayloadSnapshot::new(segments, 0));
+            return Ok(crate::TestObjectPayloadSnapshot::new(segments, 0, None));
         }
         let stored = pg.get_object_version(bucket, key, version_id)?;
-        let stored_size_extra = stored
-            .as_live()
-            .map(|live| live.encryption.segment_ciphertext_extra_len())
-            .unwrap_or_default();
+        let live = stored.as_live().ok_or(ObjectPgActionError::Store(
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "capture object payload generation",
+            },
+        ))?;
+        let stored_size_extra = live.encryption.segment_ciphertext_extra_len();
         Ok(crate::TestObjectPayloadSnapshot::new(
             segments,
             stored_size_extra,
+            Some(live.generation_id),
         ))
     }
 

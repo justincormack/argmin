@@ -5644,12 +5644,13 @@ The audit found four remaining classes of work:
    entering the reserved bucket-write snapshot operation; a deterministic
    snapshot-load hook has a successful-PUT canary and remains untouched by the
    rejected request. The reclaim cleanup/retry physical invariant is
-   storage-owner-local. Backfill tests still construct or inspect
-   physical work items, routes, shard acknowledgements, and placed files
-   outside `storage`. Those remaining physical-invariant tests must move to
-   `storage`; any retained coordinator test should invoke an opaque owner
-   scenario and assert only the coordinator-visible error, trace, or cleanup
-   outcome.
+   storage-owner-local. Backfill worker tests are now storage-owner-local and
+   use the private work-item, route, shard-acknowledgement, health, and
+   placed-file model directly. Retained-placement and shard-selection tests
+   still reconstruct physical routes or shard identities outside `storage`;
+   those remaining physical invariants must move to `storage`, while any
+   retained coordinator test should invoke an opaque owner scenario and
+   assert only the coordinator-visible error, trace, or cleanup outcome.
 
    Tests whose assertion is about storage corruption, recovery, physical
    layout, claims, or queue invariants belong in `storage`. Where an
@@ -5847,7 +5848,22 @@ Implementation update (2026-08-03):
   The reclaim placed-file deletion failure and retry test is now
   storage-owner-local, where it verifies the exact acknowledgement-row and
   shard-file state before and after convergence; the duplicate raw coordinator
-  assertion and shard-set helper were removed.
+  assertion and shard-set helper were removed; and
+- moved the four shard-backfill worker regressions into storage-owner tests,
+  including the installed-Unix remote-node case and the refreshed runtime-map
+  case. The cross-crate backfill work-item/record DTOs and generic test methods
+  were removed; storage tests use the private durable work item, route-health,
+  acknowledgement, and queue APIs owned by the implementation; and
+- narrowed the retained-read and range-read shard-selection regressions to
+  opaque payload evidence. Storage now owns corruption injection, placement
+  selection, generation identity, placement-provenance validation, and
+  lease-holder lookup. The retained-route regression has a storage-owned
+  canary proving that every captured segment uses the key's derived data PG and
+  the capturing cluster's epoch before moving that PG; coordinator tests then
+  assert only that a body created before publication remains readable and that
+  its range body holds leases on exactly the selected-node count. The raw
+  committed-segment accessor was removed, and raw shard construction,
+  acknowledgement, and file-path helpers are now storage-unit-test-only.
 
 Final Phase 5 audit (2026-08-04):
 
@@ -5865,12 +5881,13 @@ Final Phase 5 audit (2026-08-04):
   durable object/upload records, and backfill work records;
 - the stream append/abort cleanup, direct-PUT/reclaim cleanup, and
   UploadPartCopy source-loss migrations are complete;
-- shard-backfill and retained-placement regressions construct
-  `StorageShardBackfillTestWorkItem`, `PgRouteSnapshot`, physical segment
-  writes, acknowledgement rows, and historical routes. Their placement,
-  recovery, and durable-row assertions belong in `storage`; any coordinator
+- shard-backfill regressions have moved to `storage`, including refreshed-map,
+  obsolete-source/payload, and installed-Unix execution. Retained-placement
+  and shard-selection regressions still construct `PgRouteSnapshot`, physical
+  segment writes, acknowledgement rows, and historical routes. Their
+  placement and durable-row assertions belong in `storage`; any coordinator
   runtime-map behavior which remains relevant should consume an opaque
-  storage-owned topology/backfill scenario;
+  storage-owned topology scenario;
 - lifecycle and multipart cleanup tests still discover private generation IDs
   through raw object records before checking reclaim-root state. Replace those
   reads with opaque payload evidence or a logical object-scoped reclaim
@@ -5902,7 +5919,7 @@ The audited cross-crate support families are:
 | raw object/version/upload/session/bucket observations | `server-core` | no | replace with narrow logical observations or owner-local assertions |
 | raw PG IDs, metadata proofs, route snapshots, and route-map mutation | `server-core` | sometimes | move owner invariants to `storage`; retain only opaque topology/publication scenarios |
 | shard keys, EC layouts, acknowledgement rows, shard paths/files, and physical segment records | `server-core` | yes and no | move to `storage`; expose only opaque fault/evidence scenarios for coordinator response tests |
-| backfill work records and direct shard/ack construction | `server-core` | yes | move the tests and helpers to `storage` |
+| backfill work records and direct shard/ack construction | storage-owner tests | yes | completed; no cross-crate DTO remains |
 | raw bucket-delete/reclaim roots and durable-state mutation | `server-core` | yes and no | use opaque storage-issued roots and logical progress/outcome observations |
 | process-level authenticated Raft/control-plane test servers | `argmin-s3`, storage integration tests | controlled process lifecycle | retain as the sanctioned process-boundary exception |
 
@@ -5911,9 +5928,9 @@ Remaining implementation order after this audit:
 1. **Completed:** stream cleanup, direct-PUT/reclaim cleanup, and UploadPartCopy
    source loss have owner-local physical assertions and only logical or opaque
    coordinator-facing coverage;
-2. move the backfill, retained-placement, and shard-selection physical
-   regressions into `storage`, replacing any genuinely cross-crate runtime-map
-   case with one opaque topology scenario;
+2. move the retained-placement and shard-selection physical regressions into
+   `storage`, replacing any genuinely cross-crate runtime-map case with one
+   opaque topology scenario; the backfill migration is complete;
 3. narrow lifecycle/reclaim and multipart state-machine observations to
    logical owner-defined values, and remove raw generation/record access from
    the coordinator harnesses;

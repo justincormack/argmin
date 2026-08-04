@@ -722,13 +722,13 @@ impl StorageShardBackfillSweeper {
         !self.stop.load(Ordering::SeqCst)
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
         Arc::ptr_eq(&self.storage_handle.current(), expected)
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn test_backfill_one_pending(&self, owner_token: &str) {
         let admission = StorageMaintenanceAdmission::acquire_shared(&self.storage_handle);

@@ -2644,6 +2644,265 @@ fn placed_segment_payload_backfill_work_item_targets_current_pg_route() {
 }
 
 #[test]
+fn shard_backfill_worker_uses_refreshed_runtime_map_handle() {
+    let tmp = test_util::tempdir();
+    let initial = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &[
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ],
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap()
+    .test_clone_with_dynamic_route_map_validity(RouteMapValidity::until_ms(u64::MAX - 1).unwrap())
+    .unwrap();
+    let runtime_handle = crate::StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)).unwrap();
+    let sweeper = crate::StorageShardBackfillSweeper::disabled(runtime_handle.route_handle());
+
+    let bucket = BucketName::try_from("bucket").unwrap();
+    let key = ObjectKey::try_from("key").unwrap();
+    let segment_okh = [0xBF; 16];
+    let segment_vid = GenerationId::MIN;
+    let payload = b"backfill worker must use refreshed runtime map";
+    let written_segment = initial
+        .test_write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            segment_vid,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    initial
+        .test_register_payload_shard_acks(
+            written_segment.data_pg_id,
+            &written_segment.written_shards,
+        )
+        .unwrap();
+
+    let source_epoch = initial.cluster_epoch();
+    let desired_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let source_route = initial
+        .local_pg_route(PgId::new(written_segment.data_pg_id))
+        .expect("test PG should have a local route");
+    let historical_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        source_epoch,
+        source_route.pg_id(),
+        source_route.primary_node_id(),
+        source_route.acting_set().to_vec(),
+        source_route.state(),
+    );
+    let ec_shape = initial.default_payload_ec_shape();
+    let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
+    let configs = (0..node_count)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                tmp.path().join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut refreshed_map = LocalClusterMap::open_frontend_placeholder_with_configs_and_epoch(
+        NodeId::new(0),
+        configs,
+        &[0],
+        ec_shape,
+        desired_epoch,
+    )
+    .unwrap();
+    refreshed_map.test_install_historical_pg_routes([historical_route]);
+    refreshed_map.test_set_route_map_validity(RouteMapValidity::until_ms(u64::MAX - 1).unwrap());
+    let refreshed = crate::StorageCluster::test_from_local_map_with_epoch(
+        Arc::new(refreshed_map),
+        desired_epoch,
+    )
+    .unwrap();
+    runtime_handle.install(Arc::clone(&refreshed)).unwrap();
+
+    let work_item = crate::PlacedSegmentShardBackfillWorkItem {
+        request: crate::SegmentStoredBytesRequest {
+            data_pg_id: written_segment.data_pg_id,
+            segment_okh,
+            segment_vid,
+            stored_size: payload.len(),
+            segment_crc64: checksum::crc64::checksum(payload),
+            ec: written_segment.ec,
+        },
+        source_cluster_epoch: source_epoch,
+        desired_cluster_epoch: desired_epoch,
+    };
+    assert!(
+        initial
+            .backfill_placed_segment_payload_shards_for_work_item(&work_item)
+            .is_err(),
+        "the stale initial cluster must not be able to reconstruct the desired epoch"
+    );
+    refreshed
+        .record_placed_segment_shard_backfill(&work_item, None)
+        .unwrap();
+    sweeper.test_backfill_one_pending("runtime-map-refresh-test");
+    let rows = refreshed
+        .list_placed_segment_shard_backfills(written_segment.data_pg_id)
+        .unwrap();
+    assert!(rows.is_empty(), "backfill row should complete: {rows:?}");
+}
+
+#[test]
+fn shard_backfill_worker_resolves_missing_history_after_source_metadata_is_gone() {
+    let tmp = test_util::tempdir();
+    let initial = crate::StorageCluster::open_static_local_nodes(
+        tmp.path(),
+        &[
+            NodeId::new(0),
+            NodeId::new(1),
+            NodeId::new(2),
+            NodeId::new(3),
+            NodeId::new(4),
+            NodeId::new(5),
+        ],
+        &[0],
+        SharedStorageNode::DEFAULT_EC_SHAPE,
+    )
+    .unwrap();
+    let source_epoch = initial.cluster_epoch();
+    let desired_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let initial_route = initial.local_pg_route(PgId::new(0)).unwrap();
+    let current_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        desired_epoch,
+        initial_route.pg_id(),
+        initial_route.primary_node_id(),
+        initial_route.acting_set().to_vec(),
+        PgState::Active,
+    );
+    let current = initial
+        .test_clone_with_pg_routes(desired_epoch, [current_route], [])
+        .unwrap();
+    let work_item = crate::PlacedSegmentShardBackfillWorkItem {
+        request: crate::SegmentStoredBytesRequest {
+            data_pg_id: 0,
+            segment_okh: [0xA5; 16],
+            segment_vid: GenerationId::MIN,
+            stored_size: 32,
+            segment_crc64: 0x1234,
+            ec: current.default_payload_ec_shape(),
+        },
+        source_cluster_epoch: source_epoch,
+        desired_cluster_epoch: desired_epoch,
+    };
+    assert!(matches!(
+        current.backfill_placed_segment_payload_shards_for_work_item(&work_item),
+        Err(StoreError::HistoricalPgRouteNotRetained {
+            pg_id: 0,
+            cluster_epoch,
+        }) if cluster_epoch == source_epoch
+    ));
+    assert!(!current
+        .placed_segment_shard_backfill_source_is_referenced(&work_item)
+        .unwrap());
+    current
+        .record_placed_segment_shard_backfill(&work_item, None)
+        .unwrap();
+
+    crate::StorageShardBackfillSweeper::disabled(
+        crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&current)).unwrap(),
+    )
+    .test_backfill_one_pending("obsolete-source-test");
+
+    assert!(current
+        .list_placed_segment_shard_backfills(0)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn shard_backfill_worker_resolves_missing_payload_after_source_metadata_is_gone() {
+    let tmp = test_util::tempdir();
+    let source_epoch = ClusterEpoch::INITIAL;
+    let desired_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+    let pg_id = PgId::new(0);
+    let ec_shape = EcShape { k: 4, m: 2 };
+    let source_nodes = [1, 0, 2, 3, 4, 5]
+        .into_iter()
+        .map(NodeId::new)
+        .collect::<Vec<_>>();
+    let desired_nodes = [0, 2, 3, 4, 5, 6]
+        .into_iter()
+        .map(NodeId::new)
+        .collect::<Vec<_>>();
+    let source_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        source_epoch,
+        pg_id,
+        source_nodes[0],
+        source_nodes,
+        PgState::Active,
+    );
+    let desired_route = crate::control_plane::PgRouteSnapshot::reconstructed(
+        desired_epoch,
+        pg_id,
+        desired_nodes[0],
+        desired_nodes,
+        PgState::Active,
+    );
+    let configs = (0..7)
+        .map(|node_id| {
+            LocalNodeStoreConfig::new(
+                NodeId::new(node_id),
+                tmp.path().join(format!("node-{node_id:04}")),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
+        NodeId::new(0),
+        configs,
+        &[pg_id.get()],
+        ec_shape,
+        desired_epoch,
+        [LocalPgRoute::from(&desired_route)],
+    )
+    .unwrap();
+    map.test_install_historical_pg_routes([source_route]);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+    let work_item = crate::PlacedSegmentShardBackfillWorkItem {
+        request: crate::SegmentStoredBytesRequest {
+            data_pg_id: pg_id.get(),
+            segment_okh: [0xA6; 16],
+            segment_vid: GenerationId::MIN,
+            stored_size: 32,
+            segment_crc64: 0x5678,
+            ec: ec_shape,
+        },
+        source_cluster_epoch: source_epoch,
+        desired_cluster_epoch: desired_epoch,
+    };
+    assert!(cluster
+        .backfill_placed_segment_payload_shards_for_work_item(&work_item)
+        .is_err());
+    assert!(!cluster
+        .placed_segment_shard_backfill_source_is_referenced(&work_item)
+        .unwrap());
+    cluster
+        .record_placed_segment_shard_backfill(&work_item, None)
+        .unwrap();
+
+    crate::StorageShardBackfillSweeper::disabled(
+        crate::StorageClusterRouteHandle::from_static_cluster(Arc::clone(&cluster)).unwrap(),
+    )
+    .test_backfill_one_pending("obsolete-payload-test");
+
+    assert!(cluster
+        .list_placed_segment_shard_backfills(pg_id.get())
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
 fn local_cluster_map_history_reference_summary_merges_node_pg_references() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

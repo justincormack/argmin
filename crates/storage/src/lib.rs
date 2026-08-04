@@ -206,7 +206,7 @@ pub mod test_support {
     #[cfg(feature = "test-hooks")]
     pub use super::cluster::{
         MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
-        MetadataCommandApplyTestContext, MetadataCommandApplyTestKind, TestDirectPutWrittenSegment,
+        MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
     };
     #[cfg(feature = "test-hooks")]
     pub use super::maintenance::{
@@ -217,14 +217,6 @@ pub mod test_support {
     pub use super::node::{
         install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
     };
-
-    /// Logical input used to drive one shard-backfill worker attempt.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub struct StorageShardBackfillTestWorkItem {
-        pub request: SegmentStoredBytesRequest,
-        pub source_cluster_epoch: ClusterEpoch,
-        pub desired_cluster_epoch: ClusterEpoch,
-    }
 
     /// Removes every placed shard file for one logical segment of a captured
     /// committed object payload.
@@ -548,6 +540,7 @@ pub mod test_support {
     pub struct TestObjectPayloadSnapshot {
         segments: Vec<types::ObjectSegmentRecord>,
         stored_size_extra: usize,
+        generation_id: Option<GenerationId>,
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -565,10 +558,12 @@ pub mod test_support {
         pub(crate) fn new(
             segments: Vec<types::ObjectSegmentRecord>,
             stored_size_extra: usize,
+            generation_id: Option<GenerationId>,
         ) -> Self {
             Self {
                 segments,
                 stored_size_extra,
+                generation_id,
             }
         }
 
@@ -583,6 +578,10 @@ pub mod test_support {
             usize::try_from(segment.size)
                 .ok()?
                 .checked_add(self.stored_size_extra)
+        }
+
+        pub(crate) fn generation_id(&self) -> Option<GenerationId> {
+            self.generation_id
         }
 
         pub fn is_empty(&self) -> bool {

@@ -17274,19 +17274,6 @@ impl super::StorageCluster {
             .test_capture_object_payload(bucket, key, version_id)
     }
 
-    /// Transitional owner-private representation seam. New cross-crate tests
-    /// must use `test_capture_object_payload` and storage-owned assertions.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_segments_physical(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-    ) -> Result<Vec<ObjectSegmentRecord>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .test_get_object_segments(bucket, key, version_id)
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_object_payload_snapshot_is_fully_present(
         &self,
@@ -17455,6 +17442,63 @@ impl super::StorageCluster {
                 .collect::<HashSet<_>>()
                 .len()
         })
+    }
+
+    /// Verifies that opaque payload evidence was written using the data-PG
+    /// derivation and placement epoch of this cluster generation.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_snapshot_uses_current_placement(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select object payload generation for placement observation",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
+        Ok(!snapshot.segments().is_empty()
+            && snapshot.segments().iter().all(|segment| {
+                segment.placement_cluster_epoch == self.operation_epoch()
+                    && segment.data_pg_id
+                        == self
+                            .local_map
+                            .object_generation_segment_data_pg(
+                                &segment.bucket,
+                                &segment.key,
+                                generation_id,
+                                segment.segment_index,
+                            )
+                            .get()
+            }))
+    }
+
+    /// Returns the number of nodes currently holding payload leases for the
+    /// exact object generation captured by opaque test evidence.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_snapshot_lease_holder_node_count(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<usize, StoreError> {
+        let first = snapshot.segments().first().ok_or_else(|| StoreError::Io {
+            context: "select object payload for lease observation",
+            source: std::io::Error::other("captured object payload has no segments"),
+        })?;
+        if snapshot
+            .segments()
+            .iter()
+            .any(|segment| segment.bucket != first.bucket || segment.key != first.key)
+        {
+            return Err(StoreError::Io {
+                context: "validate object payload lease observation",
+                source: std::io::Error::other(
+                    "captured object payload contains multiple object generations",
+                ),
+            });
+        }
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select object payload generation for lease observation",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
+        Ok(self.object_payload_lease_holder_node_count(&first.bucket, &first.key, generation_id))
     }
 
     /// Returns logical repair observations belonging to a captured payload.
