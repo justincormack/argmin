@@ -7331,8 +7331,19 @@ fn test_conditional_completion_racing_object_replacement_is_serializable() {
                     assert_s3_err_code(&replay, "NoSuchUpload");
                 }
                 Err(_) => {
-                    assert_eq!(err_status(&completion), 412);
-                    assert_s3_err_code(&completion, "PreconditionFailed");
+                    // AWS documents both conditional failure modes for
+                    // CompleteMultipartUpload: 412 when the ETag does not
+                    // match, and 409 when a conflicting operation wins while
+                    // completion is in progress.
+                    match err_status(&completion) {
+                        409 => {
+                            assert_s3_err_code(&completion, "ConditionalRequestConflict");
+                        }
+                        412 => assert_s3_err_code(&completion, "PreconditionFailed"),
+                        status => {
+                            panic!("raced conditional completion returned {status}: {completion:?}")
+                        }
+                    }
                     let listed = client
                         .list_parts()
                         .bucket(&bucket)
