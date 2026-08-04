@@ -31,13 +31,10 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
-#[cfg(test)]
-use storage::control_plane::UnixControlPlaneClient;
 use storage::control_plane::{
     ensure_control_plane_state_parent_directory, invalidate_authority_clock_restart_checkpoint,
-    load_authority_clock_restart_checkpoint, store_authority_clock_restart_checkpoint,
-    ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneAdmin,
-    ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
+    load_authority_clock_restart_checkpoint, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
+    ControlPlaneAdmin, ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
     ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneAuthorityClockCheckpointTarget,
     ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneFrontendAuthCredentialInput,
     ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
@@ -46,27 +43,33 @@ use storage::control_plane::{
     FileControlPlaneStore, LeaseHorizonAuthorityBinding, PgMetadataTransferProof,
     SingleAuthorityControlPlane, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
+#[cfg(test)]
+use storage::control_plane::{store_authority_clock_restart_checkpoint, UnixControlPlaneClient};
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerServerCheckpoint,
-    SubmittedControlPlaneRaftCommand,
+    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, SubmittedControlPlaneRaftCommand,
 };
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
 };
 use storage::{
-    CanonicalUserId, ClusterEpoch, ControlPlaneRaftPeerAuthCredentialInput,
-    ControlPlaneRaftPeerBootstrap, ControlPlaneRaftPeerServerBootstrap,
-    ControlPlaneRaftPeerServerListenerInput, ControlPlaneRaftPeerTopologyBinding,
-    ControlPlaneRpcServerBootstrap, ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
+    CanonicalUserId, ClusterEpoch, ControlPlaneRaftAuthorityDurability,
+    ControlPlaneRaftOuterIdentityPublicationError, ControlPlaneRaftOuterIdentityPublisher,
+    ControlPlaneRaftPeerAuthCredentialInput, ControlPlaneRaftPeerBootstrap,
+    ControlPlaneRaftPeerServerBootstrap, ControlPlaneRaftPeerServerListenerInput,
+    ControlPlaneRaftPeerTopologyBinding, ControlPlaneRpcServerBootstrap,
+    ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
     PgState, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
     StorageClusterRuntimeMapHandle,
 };
 #[cfg(test)]
-use storage::{ControlPlaneRaftPeerTestServer, ControlPlaneRpcOrdinaryTestServer};
+use storage::{
+    ControlPlaneRaftCheckpointMonitorForTest, ControlPlaneRaftPeerTestServer,
+    ControlPlaneRpcOrdinaryTestServer,
+};
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
@@ -89,11 +92,7 @@ const CONTROL_PLANE_CLOCK_RECOVERY_RPC_PRE_AUTH_BYTE_BUDGET: usize = 16 * 1024 *
 const CONTROL_PLANE_RPC_IO_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const CONTROL_PLANE_RAFT_PEER_RPC_WORKER_LIMIT: usize = 64;
-const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_WAL_SUFFIX_BYTES: u64 = 64 * 1024 * 1024;
 const CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET: usize = 64 * 1024 * 1024;
-const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_MUTATIONS: u64 = 4_096;
-const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(60);
-const CONTROL_PLANE_RAFT_PEER_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONTROL_PLANE_STANDALONE_CHECKPOINT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 macro_rules! process_info {
@@ -1655,10 +1654,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
 struct ExperimentalRaftControlPlane {
     runtime: Handle,
     authority: Arc<ControlPlaneRaftAuthority>,
-    durable_artifact_path: Option<Arc<PathBuf>>,
-    durable_checkpoint_lock: Option<Arc<Mutex<()>>>,
-    durable_serving_checkpoint: Arc<Mutex<Option<ExperimentalRaftCheckpointMarker>>>,
-    checkpoint_serving_reads: bool,
+    durability: Option<ControlPlaneRaftAuthorityDurability>,
     resample_authority_time: bool,
     authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
     #[cfg(test)]
@@ -1671,65 +1667,6 @@ type ExperimentalRaftAfterHeartbeatCommitHook = Box<
         + Send
         + 'static,
 >;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExperimentalRaftCheckpointMarker {
-    current_leader: Option<ControlPlaneRaftNodeId>,
-    persisted_vote: Option<(u64, ControlPlaneRaftNodeId, bool)>,
-    current_term: Option<u64>,
-    last_log: Option<(u64, ControlPlaneRaftNodeId, u64)>,
-    last_purged: Option<(u64, ControlPlaneRaftNodeId, u64)>,
-    committed: Option<(u64, ControlPlaneRaftNodeId, u64)>,
-    applied: Option<(u64, ControlPlaneRaftNodeId, u64)>,
-    current_snapshot: Option<(u64, ControlPlaneRaftNodeId, u64)>,
-}
-
-impl ExperimentalRaftCheckpointMarker {
-    fn from_status(status: &ControlPlaneRaftAuthorityStatus) -> Self {
-        Self {
-            current_leader: status.current_leader(),
-            persisted_vote: status
-                .persisted_vote()
-                .map(|vote| (vote.leader_id.term, vote.leader_id.node_id, vote.committed)),
-            current_term: status.current_term(),
-            last_log: status.last_log_id().map(|log_id| {
-                (
-                    log_id.leader_id.term,
-                    log_id.leader_id.node_id,
-                    log_id.index(),
-                )
-            }),
-            last_purged: status.last_purged_log_id().map(|log_id| {
-                (
-                    log_id.leader_id.term,
-                    log_id.leader_id.node_id,
-                    log_id.index(),
-                )
-            }),
-            committed: status.committed().map(|log_id| {
-                (
-                    log_id.leader_id.term,
-                    log_id.leader_id.node_id,
-                    log_id.index(),
-                )
-            }),
-            applied: status.applied().map(|log_id| {
-                (
-                    log_id.leader_id.term,
-                    log_id.leader_id.node_id,
-                    log_id.index(),
-                )
-            }),
-            current_snapshot: status.current_snapshot().map(|log_id| {
-                (
-                    log_id.leader_id.term,
-                    log_id.leader_id.node_id,
-                    log_id.index(),
-                )
-            }),
-        }
-    }
-}
 
 impl ExperimentalRaftControlPlane {
     fn block_on<F: Future>(&self, future: F) -> F::Output {
@@ -1834,61 +1771,17 @@ impl ExperimentalRaftControlPlane {
     }
 
     fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError> {
-        let Some(path) = &self.durable_artifact_path else {
+        let Some(durability) = &self.durability else {
             return Ok(());
         };
-        store_experimental_raft_durable_restart_artifact(
-            &self.runtime,
-            &self.authority,
-            path,
-            self.durable_checkpoint_lock.as_ref(),
-        )
+        durability.store_restart_artifact()
     }
 
     fn checkpoint_successful_linearized_read(&self) -> Result<(), ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        if !self.checkpoint_serving_reads {
-            return Ok(());
-        }
-        if self.authority.durability_metric_snapshots().wal.is_some() {
-            let wal_status = self.authority.durable_wal_monitor_snapshot()?;
-            if let Some(reason) = wal_status.poisoned() {
-                return Err(ControlPlaneError::durability_failure(format!(
-                    "durable OpenRaft serving read observed poisoned WAL state: {reason}"
-                )));
-            }
-            return Ok(());
-        }
-
-        let status = self.block_on(self.authority.status()).ok();
-        let marker = status
-            .as_ref()
-            .filter(|status| status.linearized_authority_serving())
-            .map(ExperimentalRaftCheckpointMarker::from_status);
-        if let Some(marker) = marker {
-            {
-                let checkpointed = self
-                    .durable_serving_checkpoint
-                    .lock()
-                    .expect("experimental OpenRaft serving checkpoint mutex poisoned");
-                if *checkpointed == Some(marker) {
-                    return Ok(());
-                }
-            }
-            self.store_durable_restart_artifact()?;
-            *self
-                .durable_serving_checkpoint
-                .lock()
-                .expect("experimental OpenRaft serving checkpoint mutex poisoned") = Some(marker);
-            return Ok(());
-        }
-
-        self.store_durable_restart_artifact()?;
-        *self
-            .durable_serving_checkpoint
-            .lock()
-            .expect("experimental OpenRaft serving checkpoint mutex poisoned") = None;
-        Ok(())
+        let Some(durability) = &self.durability else {
+            return self.ensure_not_durably_poisoned();
+        };
+        durability.checkpoint_successful_linearized_read()
     }
 
     fn submit_raft_command(
@@ -2548,348 +2441,36 @@ fn bind_experimental_raft_peer_listener_inputs(
         .collect()
 }
 
-#[derive(Clone)]
-struct ExperimentalRaftPeerDurabilityContext {
-    artifact_path: Option<Arc<PathBuf>>,
-    checkpoint_lock: Arc<Mutex<()>>,
-}
-
-#[derive(Clone)]
-struct ExperimentalRaftPeerServerCheckpoint {
-    runtime: Handle,
-    context: ExperimentalRaftPeerDurabilityContext,
-}
-
-impl ControlPlaneRaftPeerServerCheckpoint for ExperimentalRaftPeerServerCheckpoint {
-    fn checkpoint_before_snapshot_response(
-        &self,
-        authority: &ControlPlaneRaftAuthority,
-    ) -> Result<(), ControlPlaneError> {
-        let path = self
-            .context
-            .artifact_path
-            .as_deref()
-            .ok_or_else(|| {
-                ControlPlaneError::durability_failure(
-                    "experimental OpenRaft snapshot peer RPC requires durable checkpoint path before response",
-                )
-            })?;
-        store_experimental_raft_durable_restart_artifact(
-            &self.runtime,
-            authority,
-            path,
-            Some(&self.context.checkpoint_lock),
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ExperimentalRaftPeerCheckpointPolicy {
-    max_wal_suffix_bytes: u64,
-    max_mutations: u64,
-    max_delay: Duration,
-    poll_interval: Duration,
-}
-
-impl Default for ExperimentalRaftPeerCheckpointPolicy {
-    fn default() -> Self {
-        Self {
-            max_wal_suffix_bytes: CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_WAL_SUFFIX_BYTES,
-            max_mutations: CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_MUTATIONS,
-            max_delay: CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY,
-            poll_interval: CONTROL_PLANE_RAFT_PEER_CHECKPOINT_POLL_INTERVAL,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ExperimentalRaftPeerCheckpointObservation {
-    wal_suffix_bytes: u64,
-    successful_append_total: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ExperimentalRaftPeerCheckpointWork {
-    pending_mutations: u64,
-    elapsed: Duration,
-    wal_suffix_bytes: u64,
-}
-
-#[derive(Debug)]
-struct ExperimentalRaftPeerCheckpointTracker {
-    policy: ExperimentalRaftPeerCheckpointPolicy,
-    checkpoint_append_total: u64,
-    first_pending_observed_at: Option<Instant>,
-}
-
-impl ExperimentalRaftPeerCheckpointTracker {
-    fn new(policy: ExperimentalRaftPeerCheckpointPolicy) -> Self {
-        assert!(policy.max_wal_suffix_bytes > 0);
-        assert!(policy.max_mutations > 0);
-        assert!(!policy.max_delay.is_zero());
-        assert!(!policy.poll_interval.is_zero());
-        assert!(policy.poll_interval < policy.max_delay);
-        Self {
-            policy,
-            checkpoint_append_total: 0,
-            first_pending_observed_at: None,
-        }
-    }
-
-    fn observe(
-        &mut self,
-        now: Instant,
-        observation: ExperimentalRaftPeerCheckpointObservation,
-    ) -> Option<ExperimentalRaftPeerCheckpointWork> {
-        if observation.wal_suffix_bytes == 0 {
-            self.checkpoint_append_total = observation.successful_append_total;
-            self.first_pending_observed_at = None;
-            return None;
-        }
-        let first_pending_at = self.first_pending_observed_at.get_or_insert(now);
-        let work = ExperimentalRaftPeerCheckpointWork {
-            pending_mutations: observation
-                .successful_append_total
-                .saturating_sub(self.checkpoint_append_total),
-            elapsed: now.saturating_duration_since(*first_pending_at),
-            wal_suffix_bytes: observation.wal_suffix_bytes,
-        };
-        (work.wal_suffix_bytes >= self.policy.max_wal_suffix_bytes
-            || work.pending_mutations >= self.policy.max_mutations
-            || work.elapsed
-                >= self
-                    .policy
-                    .max_delay
-                    .saturating_sub(self.policy.poll_interval))
-        .then_some(work)
-    }
-
-    fn complete_checkpoint(&mut self, successful_append_total: u64) {
-        self.checkpoint_append_total = successful_append_total;
-        self.first_pending_observed_at = None;
-    }
-}
-
-impl Default for ExperimentalRaftPeerCheckpointTracker {
-    fn default() -> Self {
-        Self::new(ExperimentalRaftPeerCheckpointPolicy::default())
-    }
-}
-
-fn checkpoint_experimental_raft_peer_wal_if_due(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    durability: &ExperimentalRaftPeerDurabilityContext,
-    tracker: &mut ExperimentalRaftPeerCheckpointTracker,
-    now: Instant,
-) -> Result<bool, ControlPlaneError> {
-    let wal_status = authority.durable_wal_monitor_snapshot()?;
-    if let Some(reason) = wal_status.poisoned() {
-        return Err(ControlPlaneError::durability_failure(format!(
-            "durable OpenRaft peer checkpoint scheduler observed poisoned WAL state: {reason}"
-        )));
-    }
-    let wal_metrics = wal_status.metrics();
-    let successful_append_total = wal_metrics
-        .append_total
-        .saturating_sub(wal_metrics.append_error_total);
-    let offsets = wal_status.offsets();
-    let wal_suffix_bytes = offsets
-        .clean_len()
-        .checked_sub(offsets.base_offset())
-        .ok_or_else(|| {
-            ControlPlaneError::invariant_failure(format!(
-                "durable OpenRaft WAL clean offset {} precedes base offset {}",
-                offsets.clean_len(),
-                offsets.base_offset()
-            ))
-        })?;
-    let observation = ExperimentalRaftPeerCheckpointObservation {
-        wal_suffix_bytes,
-        successful_append_total,
-    };
-    if tracker.observe(now, observation).is_none() {
-        return Ok(false);
-    }
-    let path = durability.artifact_path.as_deref().ok_or_else(|| {
-        ControlPlaneError::durability_failure(
-            "durable OpenRaft peer checkpoint scheduler requires an artifact path",
-        )
-    })?;
-    snapshot_purge_and_checkpoint_experimental_raft_peer_wal(
-        runtime,
-        authority,
-        path,
-        &durability.checkpoint_lock,
-    )?;
-    let completed_wal_metrics = authority.durable_wal_monitor_snapshot()?.metrics();
-    tracker.complete_checkpoint(
-        completed_wal_metrics
-            .append_total
-            .saturating_sub(completed_wal_metrics.append_error_total),
-    );
-    Ok(true)
-}
-
-fn spawn_experimental_raft_peer_checkpoint_loop(
-    runtime: Handle,
-    authority: Arc<ControlPlaneRaftAuthority>,
-    durability: ExperimentalRaftPeerDurabilityContext,
-    policy: ExperimentalRaftPeerCheckpointPolicy,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut tracker = ExperimentalRaftPeerCheckpointTracker::new(policy);
-        loop {
-            if authority
-                .durability_publication()
-                .expect("Raft durability publication should already be initialized")
-                .is_poisoned()
-            {
-                return;
-            }
-            if let Err(error) = checkpoint_experimental_raft_peer_wal_if_due(
-                &runtime,
-                &authority,
-                &durability,
-                &mut tracker,
-                Instant::now(),
-            ) {
-                publish_experimental_raft_checkpoint_monitor_poison(&authority);
-                eprintln!(
-                    "experimental OpenRaft control-plane bounded peer WAL checkpoint failed; exiting to avoid serving after durability failure: {error}"
-                );
-                std::process::exit(1);
-            }
-            thread::sleep(tracker.policy.poll_interval);
-        }
-    })
-}
-
-fn publish_experimental_raft_checkpoint_monitor_poison(authority: &ControlPlaneRaftAuthority) {
-    authority
-        .durability_publication()
-        .expect("Raft durability publication should already be initialized")
-        .poison("control-plane Raft checkpoint monitor observed a durability failure");
-}
-
-fn store_experimental_raft_durable_restart_artifact(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    path: &Path,
-    durable_checkpoint_lock: Option<&Arc<Mutex<()>>>,
-) -> Result<(), ControlPlaneError> {
-    let _guard = durable_checkpoint_lock.map(|lock| {
-        lock.lock()
-            .expect("experimental OpenRaft durable checkpoint mutex poisoned")
-    });
-    store_experimental_raft_durable_restart_artifact_while_locked(runtime, authority, path)
-}
-
-fn store_experimental_raft_durable_restart_artifact_while_locked(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    path: &Path,
-) -> Result<(), ControlPlaneError> {
-    (|| {
-        let artifact_existed = path.exists();
-        let checkpoint =
-            block_on_control_plane_raft(runtime, authority.capture_durable_restart_checkpoint())?;
-        let committed_timestamp_high_water_ms =
-            authority.persist_durable_restart_checkpoint(checkpoint)?;
-        let binding = authority.authority_clock_checkpoint_binding();
-        if !artifact_existed && load_authority_clock_restart_checkpoint(path, binding)?.is_none() {
-            store_authority_clock_restart_checkpoint(
-                path,
-                binding,
-                1,
-                committed_timestamp_high_water_ms,
-            )?;
-        }
-        Ok(())
-    })()
-    .map_err(|error: ControlPlaneError| {
-        error.into_durability_failure("experimental OpenRaft durable restart checkpoint failed")
-    })
-}
-
-fn establish_static_raft_control_plane_identity(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    identity: &ConfiguredStaticClusterIdentity,
+struct StaticRaftOuterIdentityPublisher<'a> {
+    identity: &'a ConfiguredStaticClusterIdentity,
     node_id: ControlPlaneRaftNodeId,
-    path: &Path,
-    durable_checkpoint_lock: &Arc<Mutex<()>>,
-) -> Result<(), ControlPlaneError> {
-    loop {
-        let guard = durable_checkpoint_lock
-            .lock()
-            .expect("experimental OpenRaft durable checkpoint mutex poisoned");
-        let publication = block_on_control_plane_raft(
-            runtime,
-            authority.publish_static_identity_restart_checkpoint(),
-        )?;
-        if let Some(publication) = publication {
-            store_authority_clock_restart_checkpoint(
-                path,
-                publication.authority_clock_binding(),
-                1,
-                publication.committed_timestamp_high_water_ms(),
-            )?;
-            static_cluster_state::mark_static_control_plane_identity_established(
-                identity, node_id, path,
-            )
-            .map_err(classify_static_control_plane_identity_establishment_error)?;
-            return Ok(());
-        }
-        drop(guard);
-        process_info!(
-            "static control-plane identity checkpoint is not converged; waiting for Raft apply"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-        block_on_control_plane_raft(runtime, authority.wait_for_static_initial_membership())?;
+}
+
+impl ControlPlaneRaftOuterIdentityPublisher for StaticRaftOuterIdentityPublisher<'_> {
+    fn publish(
+        &self,
+        authority_artifact_path: &Path,
+    ) -> Result<(), ControlPlaneRaftOuterIdentityPublicationError> {
+        static_cluster_state::mark_static_control_plane_identity_established(
+            self.identity,
+            self.node_id,
+            authority_artifact_path,
+        )
+        .map_err(classify_static_control_plane_identity_establishment_error)
     }
 }
 
 fn classify_static_control_plane_identity_establishment_error(
     error: static_cluster_state::StaticControlPlaneIdentityEstablishmentError,
-) -> ControlPlaneError {
-    use static_cluster_state::StaticControlPlaneIdentityEstablishmentError;
-
+) -> ControlPlaneRaftOuterIdentityPublicationError {
     match error {
-        StaticControlPlaneIdentityEstablishmentError::Validation(message) => {
-            ControlPlaneError::static_topology_failure(format!(
-                "failed to establish static control-plane identity: {message}"
-            ))
+        static_cluster_state::StaticControlPlaneIdentityEstablishmentError::Validation(_) => {
+            ControlPlaneRaftOuterIdentityPublicationError::InvalidIdentity
         }
-        StaticControlPlaneIdentityEstablishmentError::Persistence(message) => {
-            ControlPlaneError::durability_failure(format!(
-                "failed to persist established static control-plane identity: {message}"
-            ))
+        static_cluster_state::StaticControlPlaneIdentityEstablishmentError::Persistence(_) => {
+            ControlPlaneRaftOuterIdentityPublicationError::PersistenceFailure
         }
     }
-}
-
-fn snapshot_purge_and_checkpoint_experimental_raft_peer_wal(
-    runtime: &Handle,
-    authority: &ControlPlaneRaftAuthority,
-    path: &Path,
-    durable_checkpoint_lock: &Arc<Mutex<()>>,
-) -> Result<(), ControlPlaneError> {
-    let _guard = durable_checkpoint_lock
-        .lock()
-        .expect("experimental OpenRaft durable checkpoint mutex poisoned");
-    let snapshot_log_id =
-        block_on_control_plane_raft(runtime, authority.trigger_local_snapshot_applied())?;
-    store_experimental_raft_durable_restart_artifact_while_locked(runtime, authority, path)?;
-    let Some(snapshot_log_id) = snapshot_log_id else {
-        return Ok(());
-    };
-    let purge_result = block_on_control_plane_raft(
-        runtime,
-        authority.purge_log_through_snapshot(snapshot_log_id),
-    );
-    store_experimental_raft_durable_restart_artifact_while_locked(runtime, authority, path)?;
-    purge_result
 }
 
 fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
@@ -2943,10 +2524,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         );
     let multi_node_raft_peer_mode = raft_peer_bootstrap.is_multi_node();
     let raft_peer_auth_diagnostics = raft_peer_bootstrap.auth_diagnostics();
-    let durable_checkpoint_lock = Arc::new(Mutex::new(()));
-    let durable_artifact_path = Arc::new(PathBuf::from(state_path));
-    let authority_clock_checkpoint_binding =
-        ControlPlaneAuthorityClockCheckpointBinding::for_raft(&cluster_name, node_id);
     let authority = block_on_control_plane_raft(
         &runtime,
         raft_peer_bootstrap
@@ -2957,25 +2534,20 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
+    let durability = authority
+        .durability_lifecycle(runtime.clone())
+        .unwrap_or_else(|error| {
+            eprintln!("failed to initialize control-plane Raft durability host: {error}");
+            std::process::exit(1);
+        });
     let durable_publication = authority.durability_publication().unwrap_or_else(|error| {
         eprintln!("failed to initialize control-plane Raft durability publication: {error}");
         std::process::exit(1);
     });
-    let raft_peer_durability = ExperimentalRaftPeerDurabilityContext {
-        artifact_path: Some(Arc::clone(&durable_artifact_path)),
-        checkpoint_lock: Arc::clone(&durable_checkpoint_lock),
-    };
-    let raft_peer_server_checkpoint: Arc<dyn ControlPlaneRaftPeerServerCheckpoint> =
-        Arc::new(ExperimentalRaftPeerServerCheckpoint {
-            runtime: runtime.clone(),
-            context: raft_peer_durability.clone(),
-        });
-    let raft_peer_server_durability = authority
-        .bind_peer_server_durability(raft_peer_server_checkpoint)
-        .unwrap_or_else(|error| {
-            eprintln!("failed to bind control-plane OpenRaft peer durability: {error}");
-            std::process::exit(1);
-        });
+    let raft_peer_server_durability = durability.peer_server_durability().unwrap_or_else(|error| {
+        eprintln!("failed to bind control-plane OpenRaft peer durability: {error}");
+        std::process::exit(1);
+    });
     // Durable replay and authority validation must finish before the process
     // publishes any inbound peer endpoint.
     let raft_peer_listener_inputs = bind_experimental_raft_peer_listener_inputs(config)
@@ -2992,12 +2564,12 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to configure control-plane OpenRaft peer server: {error}");
         std::process::exit(1);
     });
-    let _raft_checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
-        runtime.clone(),
-        Arc::clone(&authority),
-        raft_peer_durability.clone(),
-        ExperimentalRaftPeerCheckpointPolicy::default(),
-    );
+    let _raft_checkpoint_loop = durability
+        .spawn_checkpoint_monitor(Arc::new(|| std::process::exit(1)))
+        .unwrap_or_else(|error| {
+            eprintln!("failed to start control-plane Raft checkpoint monitor: {error}");
+            std::process::exit(1);
+        });
     let _raft_peer_listener_loops = raft_peer_server.map(|server| {
         server
             .serve(
@@ -3019,13 +2591,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         std::process::exit(1);
     });
     if initialized_membership {
-        store_experimental_raft_durable_restart_artifact(
-            &runtime,
-            &authority,
-            Path::new(state_path),
-            Some(&durable_checkpoint_lock),
-        )
-        .unwrap_or_else(|error| {
+        durability.store_restart_artifact().unwrap_or_else(|error| {
             eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
             std::process::exit(1);
         });
@@ -3079,50 +2645,33 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     }
     if let Some(identity) = &config.static_cluster_identity {
         if static_cluster_identity_established {
-            store_experimental_raft_durable_restart_artifact(
-                &runtime,
-                &authority,
-                Path::new(state_path),
-                Some(&durable_checkpoint_lock),
-            )
-            .unwrap_or_else(|error| {
+            durability.store_restart_artifact().unwrap_or_else(|error| {
                 eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
                 std::process::exit(1);
             });
         } else {
-            establish_static_raft_control_plane_identity(
-                &runtime,
-                &authority,
-                identity,
-                node_id,
-                Path::new(state_path),
-                &durable_checkpoint_lock,
-            )
-            .unwrap_or_else(|error| {
-                eprintln!("failed to establish static control-plane state: {error}");
-                std::process::exit(1);
-            });
+            durability
+                .establish_static_outer_identity(&StaticRaftOuterIdentityPublisher {
+                    identity,
+                    node_id,
+                })
+                .unwrap_or_else(|error| {
+                    eprintln!("failed to establish static control-plane state: {error}");
+                    std::process::exit(1);
+                });
         }
     } else {
-        store_experimental_raft_durable_restart_artifact(
-            &runtime,
-            &authority,
-            Path::new(state_path),
-            Some(&durable_checkpoint_lock),
-        )
-        .unwrap_or_else(|error| {
+        durability.store_restart_artifact().unwrap_or_else(|error| {
             eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
             std::process::exit(1);
         });
     }
-    let restart_clock_checkpoint = load_process_authority_clock_restart_checkpoint(
-        &durable_artifact_path,
-        authority_clock_checkpoint_binding,
-    )
-    .unwrap_or_else(|error| {
-        eprintln!("failed to load experimental OpenRaft authority clock checkpoint: {error}");
-        std::process::exit(1);
-    });
+    let restart_clock_checkpoint = durability
+        .load_authority_clock_restart_checkpoint_for_startup()
+        .unwrap_or_else(|error| {
+            eprintln!("failed to load experimental OpenRaft authority clock checkpoint: {error}");
+            std::process::exit(1);
+        });
     let initial_clock_snapshot =
         block_on_control_plane_raft(&runtime, authority.current_control_plane_snapshot())
             .unwrap_or_else(|error| {
@@ -3146,14 +2695,14 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             std::process::exit(1);
         });
     if !initial_authority_clock.is_established() {
-        invalidate_authority_clock_restart_checkpoint(Path::new(state_path)).unwrap_or_else(
-            |error| {
+        durability
+            .invalidate_authority_clock_restart_checkpoint()
+            .unwrap_or_else(|error| {
                 eprintln!(
                     "failed to invalidate blocked experimental OpenRaft authority clock checkpoint: {error}"
                 );
                 std::process::exit(1);
-            },
-        );
+            });
     }
     if let Some(previous_authority) = initial_clock_snapshot.lease_grant_horizon_authority() {
         initial_authority_clock
@@ -3178,10 +2727,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     let mut control_plane = ExperimentalRaftControlPlane {
         runtime: runtime.clone(),
         authority: Arc::clone(&authority),
-        durable_artifact_path: Some(Arc::clone(&durable_artifact_path)),
-        durable_checkpoint_lock: Some(Arc::clone(&durable_checkpoint_lock)),
-        durable_serving_checkpoint: Arc::new(Mutex::new(None)),
-        checkpoint_serving_reads: multi_node_raft_peer_mode,
+        durability: Some(durability.clone()),
         resample_authority_time: true,
         authority_clock: Some(Arc::clone(&authority_clock)),
         #[cfg(test)]
@@ -3217,11 +2763,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     });
     let raft_authority = Arc::clone(&authority);
     let mut authority = control_plane;
-    let authority_clock_checkpoint_target =
-        Arc::new(ControlPlaneAuthorityClockCheckpointTarget::new(
-            durable_artifact_path.as_ref().clone(),
-            authority_clock_checkpoint_binding,
-        ));
+    let authority_clock_checkpoint_target = durability.authority_clock_checkpoint_target();
     let server_auth = build_control_plane_rpc_server_auth(config).unwrap_or_else(|error| {
         eprintln!("failed to configure control-plane auth verifier: {error}");
         std::process::exit(1);
@@ -5787,20 +5329,20 @@ mod tests {
                 "synthetic identity mismatch".to_owned(),
             ),
         );
-        assert!(matches!(
+        assert_eq!(
             validation,
-            ControlPlaneError::StaticTopologyFailure { .. }
-        ));
+            ControlPlaneRaftOuterIdentityPublicationError::InvalidIdentity
+        );
 
         let persistence = classify_static_control_plane_identity_establishment_error(
             StaticControlPlaneIdentityEstablishmentError::Persistence(
                 "synthetic directory sync failure".to_owned(),
             ),
         );
-        assert!(matches!(
+        assert_eq!(
             persistence,
-            ControlPlaneError::DurabilityFailure { .. }
-        ));
+            ControlPlaneRaftOuterIdentityPublicationError::PersistenceFailure
+        );
     }
 
     #[test]
@@ -5895,16 +5437,15 @@ mod tests {
                 .expect("absent authority-clock checkpoint should inspect"),
             None
         );
-        let checkpoint_lock = Arc::new(Mutex::new(()));
-        establish_static_raft_control_plane_identity(
-            runtime.handle(),
-            &authority,
-            &static_identity,
-            1,
-            &state_path,
-            &checkpoint_lock,
-        )
-        .expect("static establishment should publish artifact, clock checkpoint, and identity");
+        let durability = authority
+            .durability_lifecycle(runtime.handle().clone())
+            .expect("test authority durability runtime should build");
+        durability
+            .establish_static_outer_identity(&StaticRaftOuterIdentityPublisher {
+                identity: &static_identity,
+                node_id: 1,
+            })
+            .expect("static establishment should publish artifact, clock checkpoint, and identity");
         assert!(
             load_authority_clock_restart_checkpoint(&state_path, checkpoint_binding)
                 .expect("authority-clock checkpoint should load after establishment")
@@ -6523,10 +6064,7 @@ mod tests {
         let control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
-            durable_artifact_path: None,
-            durable_checkpoint_lock: None,
-            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
-            checkpoint_serving_reads: false,
+            durability: None,
             resample_authority_time: false,
             authority_clock: None,
             after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
@@ -6658,13 +6196,13 @@ mod tests {
                 .expect("single-node durable raft startup should checkpoint");
             Arc::new(authority)
         });
+        let durability = authority
+            .durability_lifecycle(handle.clone())
+            .expect("durable test authority should create its durability runtime");
         let control_plane = ExperimentalRaftControlPlane {
             runtime: handle,
             authority: Arc::clone(&authority),
-            durable_artifact_path: Some(Arc::new(state_path.to_path_buf())),
-            durable_checkpoint_lock: Some(Arc::new(Mutex::new(()))),
-            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
-            checkpoint_serving_reads: false,
+            durability: Some(durability),
             resample_authority_time: false,
             authority_clock: None,
             after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
@@ -6695,10 +6233,7 @@ mod tests {
         let control_plane = ExperimentalRaftControlPlane {
             runtime: harness.runtime.handle().clone(),
             authority: Arc::clone(&harness.authority),
-            durable_artifact_path: None,
-            durable_checkpoint_lock: None,
-            durable_serving_checkpoint: Arc::new(Mutex::new(None)),
-            checkpoint_serving_reads: false,
+            durability: None,
             resample_authority_time: false,
             authority_clock: None,
             after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
@@ -7282,8 +6817,6 @@ mod tests {
             .current_snapshot()
             .expect("peering snapshot should read")
             .cluster_epoch();
-        harness.control_plane.checkpoint_serving_reads = true;
-
         // Reproduce the retained-log artifact size from the soak failure
         // without changing control-plane state. These deterministic
         // rejections still advance the applied Raft cursor and are
@@ -7337,25 +6870,17 @@ mod tests {
             "release workload restart artifact {large_artifact_bytes} bytes does not reproduce the production-sized checkpoint"
         );
 
-        let monitor_durability = ExperimentalRaftPeerDurabilityContext {
-            artifact_path: harness.control_plane.durable_artifact_path.clone(),
-            checkpoint_lock: harness
-                .control_plane
-                .durable_checkpoint_lock
-                .clone()
-                .expect("durable test authority should retain a checkpoint lock"),
-        };
-        let mut monitor_tracker = ExperimentalRaftPeerCheckpointTracker::default();
+        let monitor_durability = harness
+            .control_plane
+            .durability
+            .clone()
+            .expect("durable test authority should retain its durability runtime");
+        let mut monitor_tracker = ControlPlaneRaftCheckpointMonitorForTest::default();
         let peering_monitor_started_at = Instant::now();
         assert!(
-            !checkpoint_experimental_raft_peer_wal_if_due(
-                &harness.control_plane.runtime,
-                &harness.authority,
-                &monitor_durability,
-                &mut monitor_tracker,
-                peering_monitor_started_at,
-            )
-            .expect("clean large-artifact WAL observation should succeed"),
+            !monitor_durability
+                .checkpoint_wal_for_test(&mut monitor_tracker, peering_monitor_started_at,)
+                .expect("clean large-artifact WAL observation should succeed"),
             "clean WAL must only initialize the checkpoint tracker"
         );
         let sustained_metrics_before = harness.authority.durability_metric_snapshots();
@@ -7414,14 +6939,9 @@ mod tests {
                 }
                 let monitor_now = peering_monitor_started_at
                     + Duration::from_millis(round.saturating_mul(SUSTAINED_PEERING_ROUND_MS));
-                if checkpoint_experimental_raft_peer_wal_if_due(
-                    &harness.control_plane.runtime,
-                    &harness.authority,
-                    &monitor_durability,
-                    &mut monitor_tracker,
-                    monitor_now,
-                )
-                .expect("sustained Peering WAL monitor poll should succeed")
+                if monitor_durability
+                    .checkpoint_wal_for_test(&mut monitor_tracker, monitor_now)
+                    .expect("sustained Peering WAL monitor poll should succeed")
                 {
                     peering_monitor_checkpoint_total += 1;
                 }
@@ -7712,14 +7232,9 @@ mod tests {
             now_ms += 1;
             let monitor_started = Instant::now();
             assert!(
-                !checkpoint_experimental_raft_peer_wal_if_due(
-                    &harness.control_plane.runtime,
-                    &harness.authority,
-                    &monitor_durability,
-                    &mut monitor_tracker,
-                    monitor_started,
-                )
-                .expect("production-shaped WAL monitor poll should succeed"),
+                !monitor_durability
+                    .checkpoint_wal_for_test(&mut monitor_tracker, monitor_started,)
+                    .expect("production-shaped WAL monitor poll should succeed"),
                 "steady covered traffic must not require a WAL checkpoint"
             );
             let monitor_poll_us =
@@ -7785,23 +7300,16 @@ mod tests {
         let horizon_probe_heartbeats = heartbeat_requests - horizon_probe_heartbeats_before;
         let extension_checkpoint_observed_at = Instant::now();
         assert!(
-            !checkpoint_experimental_raft_peer_wal_if_due(
-                &harness.control_plane.runtime,
-                &harness.authority,
-                &monitor_durability,
-                &mut monitor_tracker,
-                extension_checkpoint_observed_at,
-            )
-            .expect("horizon-extension WAL observation should succeed"),
+            !monitor_durability
+                .checkpoint_wal_for_test(&mut monitor_tracker, extension_checkpoint_observed_at,)
+                .expect("horizon-extension WAL observation should succeed"),
             "a new WAL suffix should start the bounded checkpoint delay"
         );
         assert!(
-            checkpoint_experimental_raft_peer_wal_if_due(
-                &harness.control_plane.runtime,
-                &harness.authority,
-                &monitor_durability,
+            monitor_durability.checkpoint_wal_for_test(
                 &mut monitor_tracker,
-                extension_checkpoint_observed_at + CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY,
+                extension_checkpoint_observed_at
+                    + ControlPlaneRaftAuthorityDurability::default_checkpoint_max_delay_for_test(),
             )
             .expect("horizon-extension WAL checkpoint should succeed"),
             "the WAL monitor must checkpoint a liveness suffix within its delay bound"
@@ -7908,8 +7416,11 @@ mod tests {
             .expect("horizon extension must follow the previous durable timestamp");
         assert!(extension_interval_ms > 0);
         let checkpoint_amortization_interval_ms = extension_interval_ms.max(
-            u64::try_from(CONTROL_PLANE_RAFT_PEER_CHECKPOINT_MAX_DELAY.as_millis())
-                .expect("checkpoint delay should fit u64 milliseconds"),
+            u64::try_from(
+                ControlPlaneRaftAuthorityDurability::default_checkpoint_max_delay_for_test()
+                    .as_millis(),
+            )
+            .expect("checkpoint delay should fit u64 milliseconds"),
         );
         let logical_durable_bytes = checkpoint_bytes
             .checked_add(wal_bytes_appended)
@@ -7953,18 +7464,11 @@ mod tests {
         let concurrent_metrics_before = harness.authority.durability_metric_snapshots();
         let concurrent_start = Arc::new(std::sync::Barrier::new(2));
         let checkpoint_start = Arc::clone(&concurrent_start);
-        let checkpoint_runtime = harness.runtime.handle().clone();
-        let checkpoint_authority = Arc::clone(&harness.authority);
-        let checkpoint_path = harness
+        let checkpoint_durability = harness
             .control_plane
-            .durable_artifact_path
+            .durability
             .clone()
-            .expect("durable release harness should retain an artifact path");
-        let checkpoint_lock = harness
-            .control_plane
-            .durable_checkpoint_lock
-            .clone()
-            .expect("durable release harness should retain a checkpoint lock");
+            .expect("durable release harness should retain its durability runtime");
         let checkpoint_thread = thread::spawn(move || {
             checkpoint_start.wait();
             let started = Instant::now();
@@ -7972,13 +7476,9 @@ mod tests {
             let mut checkpoint_us_max = 0_u64;
             for _ in 0..CONCURRENT_CHECKPOINT_COUNT {
                 let checkpoint_started = Instant::now();
-                store_experimental_raft_durable_restart_artifact(
-                    &checkpoint_runtime,
-                    &checkpoint_authority,
-                    &checkpoint_path,
-                    Some(&checkpoint_lock),
-                )
-                .expect("concurrent production-shaped checkpoint should persist");
+                checkpoint_durability
+                    .store_restart_artifact()
+                    .expect("concurrent production-shaped checkpoint should persist");
                 let checkpoint_us =
                     u64::try_from(checkpoint_started.elapsed().as_micros()).unwrap_or(u64::MAX);
                 checkpoint_call_us_total = checkpoint_call_us_total.saturating_add(checkpoint_us);
@@ -8720,81 +8220,6 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_wal_checkpoint_observer_enforces_each_bound() {
-        let mut tracker =
-            ExperimentalRaftPeerCheckpointTracker::new(ExperimentalRaftPeerCheckpointPolicy {
-                max_wal_suffix_bytes: 100,
-                max_mutations: 2,
-                max_delay: Duration::from_secs(1),
-                poll_interval: Duration::from_millis(100),
-            });
-        let started = Instant::now();
-        assert!(tracker
-            .observe(
-                started,
-                ExperimentalRaftPeerCheckpointObservation {
-                    wal_suffix_bytes: 0,
-                    successful_append_total: 10,
-                },
-            )
-            .is_none());
-        assert!(tracker
-            .observe(
-                started,
-                ExperimentalRaftPeerCheckpointObservation {
-                    wal_suffix_bytes: 99,
-                    successful_append_total: 11,
-                },
-            )
-            .is_none());
-        assert_eq!(
-            tracker.observe(
-                started,
-                ExperimentalRaftPeerCheckpointObservation {
-                    wal_suffix_bytes: 100,
-                    successful_append_total: 11,
-                },
-            ),
-            Some(ExperimentalRaftPeerCheckpointWork {
-                pending_mutations: 1,
-                elapsed: Duration::ZERO,
-                wal_suffix_bytes: 100,
-            })
-        );
-
-        tracker.complete_checkpoint(11);
-        assert!(tracker
-            .observe(
-                started,
-                ExperimentalRaftPeerCheckpointObservation {
-                    wal_suffix_bytes: 1,
-                    successful_append_total: 13,
-                },
-            )
-            .is_some_and(|work| work.pending_mutations == 2));
-
-        tracker.complete_checkpoint(13);
-        assert!(tracker
-            .observe(
-                started,
-                ExperimentalRaftPeerCheckpointObservation {
-                    wal_suffix_bytes: 1,
-                    successful_append_total: 14,
-                },
-            )
-            .is_none());
-        assert!(tracker
-            .observe(
-                started + Duration::from_millis(900),
-                ExperimentalRaftPeerCheckpointObservation {
-                    wal_suffix_bytes: 1,
-                    successful_append_total: 14,
-                },
-            )
-            .is_some_and(|work| work.elapsed == Duration::from_millis(900)));
-    }
-
-    #[test]
     fn experimental_raft_peer_vote_acks_from_wal_then_bounded_checkpoint_compacts() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -8845,16 +8270,11 @@ mod tests {
             "initial checkpoint should compact the WAL suffix"
         );
 
-        let checkpoint_lock = Arc::new(Mutex::new(()));
-        let durability_context = ExperimentalRaftPeerDurabilityContext {
-            artifact_path: Some(Arc::new(state_path.clone())),
-            checkpoint_lock,
-        };
-        let server_durability = authority
-            .bind_peer_server_durability(Arc::new(ExperimentalRaftPeerServerCheckpoint {
-                runtime: runtime.handle().clone(),
-                context: durability_context.clone(),
-            }))
+        let durability = authority
+            .durability_lifecycle(runtime.handle().clone())
+            .expect("test authority durability runtime should build");
+        let server_durability = durability
+            .peer_server_durability()
             .expect("test peer durability should bind to its authority");
         let server = Arc::new(
             ControlPlaneRaftPeerTestServer::unix(
@@ -8901,25 +8321,17 @@ mod tests {
             granted
         };
 
-        let mut checkpoint_tracker =
-            ExperimentalRaftPeerCheckpointTracker::new(ExperimentalRaftPeerCheckpointPolicy {
-                max_wal_suffix_bytes: u64::MAX,
-                max_mutations: 1,
-                max_delay: Duration::from_secs(60),
-                poll_interval: Duration::from_secs(1),
-            });
-        assert!(!checkpoint_experimental_raft_peer_wal_if_due(
-            runtime.handle(),
-            &authority,
-            &durability_context,
-            &mut checkpoint_tracker,
-            Instant::now(),
+        let mut checkpoint_monitor = ControlPlaneRaftCheckpointMonitorForTest::new(
+            u64::MAX,
+            1,
+            Duration::from_secs(60),
+            Duration::from_secs(1),
         )
-        .expect("clean WAL checkpoint observation should succeed"));
-        let checkpoint_guard = durability_context
-            .checkpoint_lock
-            .lock()
-            .expect("checkpoint lock should acquire");
+        .expect("test checkpoint monitor should build");
+        assert!(!durability
+            .checkpoint_wal_for_test(&mut checkpoint_monitor, Instant::now(),)
+            .expect("clean WAL checkpoint observation should succeed"));
+        let checkpoint_guard = durability.block_checkpoints_for_test();
 
         let expected_vote = Vote::<ControlPlaneRaftLeaderId>::new(3, 1);
         assert!(
@@ -8943,14 +8355,9 @@ mod tests {
             "acknowledged vote should remain in the fsynced WAL suffix before compaction"
         );
         assert!(
-            checkpoint_experimental_raft_peer_wal_if_due(
-                runtime.handle(),
-                &authority,
-                &durability_context,
-                &mut checkpoint_tracker,
-                Instant::now(),
-            )
-            .expect("bounded peer checkpoint should succeed"),
+            durability
+                .checkpoint_wal_for_test(&mut checkpoint_monitor, Instant::now(),)
+                .expect("bounded peer checkpoint should succeed"),
             "WAL append count should reach the test checkpoint bound"
         );
         assert_eq!(
@@ -9016,14 +8423,9 @@ mod tests {
             "no-op peer vote must not extend the WAL suffix"
         );
         assert!(
-            !checkpoint_experimental_raft_peer_wal_if_due(
-                runtime.handle(),
-                &authority,
-                &durability_context,
-                &mut checkpoint_tracker,
-                Instant::now(),
-            )
-            .expect("no-op checkpoint observation should succeed"),
+            !durability
+                .checkpoint_wal_for_test(&mut checkpoint_monitor, Instant::now(),)
+                .expect("no-op checkpoint observation should succeed"),
             "no-op peer vote must not cause another checkpoint"
         );
 
@@ -9093,20 +8495,18 @@ mod tests {
                 .expect("stepped-down authority should have a persisted vote");
             (Arc::new(authority), initial_vote)
         });
-        let checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
-            runtime.handle().clone(),
-            Arc::clone(&authority),
-            ExperimentalRaftPeerDurabilityContext {
-                artifact_path: Some(Arc::new(state_path.clone())),
-                checkpoint_lock: Arc::new(Mutex::new(())),
-            },
-            ExperimentalRaftPeerCheckpointPolicy {
-                max_wal_suffix_bytes: u64::MAX,
-                max_mutations: u64::MAX,
-                max_delay: Duration::from_millis(100),
-                poll_interval: Duration::from_millis(10),
-            },
-        );
+        let durability = authority
+            .durability_lifecycle(runtime.handle().clone())
+            .expect("test authority durability runtime should build");
+        let checkpoint_loop = durability
+            .spawn_checkpoint_monitor_for_test(
+                u64::MAX,
+                u64::MAX,
+                Duration::from_millis(100),
+                Duration::from_millis(10),
+                Arc::new(|| {}),
+            )
+            .expect("test checkpoint monitor should start");
 
         let elected_vote = runtime.block_on(async {
             authority
@@ -9161,7 +8561,7 @@ mod tests {
             .expect("test authority durability publication should initialize")
             .poison("test checkpoint observer shutdown");
         checkpoint_loop
-            .join()
+            .join_for_test()
             .expect("checkpoint observer should stop after poison gate closes");
         runtime
             .block_on(authority.shutdown())
@@ -9421,7 +8821,6 @@ mod tests {
                 20_000,
             )
             .expect("WAL-backed heartbeat should be acknowledged");
-        harness.control_plane.checkpoint_serving_reads = true;
         harness
             .control_plane
             .runtime_map_status(20_000)

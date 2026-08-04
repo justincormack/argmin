@@ -1618,6 +1618,33 @@ repository check rejects raw peer-policy composition or replicated-authority con
 `storage`. The process-hosted control-plane authority implementation is the only remaining item 12
 work.
 
+The fortieth bounded slice begins the final process-hosted authority work by containing the Raft
+durability lifecycle. Each authority issues and retains one shared
+`ControlPlaneRaftAuthorityDurability`, bound to the artifact path derived from that authority;
+callers cannot construct a second lifecycle or supply a second path, publication domain, or
+serving-read policy. Repeated issuance returns the same lock/marker/registration domain, serving
+reads derive WAL poison validation versus artifact checkpointing from the authority's actual
+durability configuration, and only one checkpoint monitor may register. Storage owns the shared
+checkpoint lock, serving-read checkpoint marker, initial and
+periodic checkpoint policy and tracker, WAL observation, periodic snapshot/checkpoint/purge ordering,
+authority-clock sidecar load/invalidation/target derivation, static outer-identity certification
+ordering, peer response checkpoint capability, checkpoint monitor thread, and monitor failure
+poisoning. The process supplies its Tokio handle, fatal-process callback, and the narrow outer
+manifest publisher required because the deployment manifest remains process-owned. Existing
+process regressions continue to pin WAL-before-ack behavior, bounded election checkpointing,
+static identity publication after a pre-existing artifact, serving-read behavior, concurrent
+checkpoint serialization, and production-shaped write amplification; owner-local tests pin
+checkpoint bounds, authority-derived path ownership, clock-sidecar initialization, redaction, and
+rejection of an authority without configured durable state. A repository check rejects the former
+process-owned path/lock/marker/policy/monitor machinery and public fields on the new opaque
+capability.
+
+This slice does not complete item 12. `ExperimentalRaftControlPlane` still lives in the process
+and composes logical command submission, authority-clock/lease-horizon sampling, operation-level
+checkpoint/poison handling, and the control-plane trait implementations. Those operations and
+their remaining low-level authority calls must move behind a storage-owned authority host before
+the raw durability and OpenRaft operation APIs can become crate-private.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1919,8 +1946,12 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     using the authority's single opaque response-publication and poison domain. Operator recovery
     endpoint and credential/transport assembly plus frontend/storage-node service-client
     bootstrap, server-side authentication bootstrap, and server listener/resource-policy
-    bootstrap and Raft-peer transport bootstrap are now storage-owned. The remaining work is the
-    process-hosted control-plane authority implementation.
+    bootstrap and Raft-peer transport bootstrap are now storage-owned. Raft checkpoint-path
+    derivation, checkpoint/sidecar coordination, serving-read checkpoint state, WAL checkpoint
+    policy and monitor execution, and peer checkpoint callbacks are now contained by one
+    authority-bound storage capability. The remaining work is moving the process-hosted logical
+    command, clock/lease-horizon, and control-plane trait implementation behind the storage-owned
+    authority host, then privatizing the low-level authority operations it replaces.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

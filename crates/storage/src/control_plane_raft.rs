@@ -2796,6 +2796,7 @@ pub struct ControlPlaneRaftAuthority {
     >,
     authority_instance_id: OnceLock<ControlPlaneRaftAuthorityInstanceId>,
     durability_publication: OnceLock<ControlPlaneRaftDurabilityPublication>,
+    durability_lifecycle: OnceLock<Arc<crate::control_plane_raft_durability::DurabilityInner>>,
     uncertified_initial_topology_checkpoint_published: OnceLock<()>,
     checkpoint_publication: Arc<Mutex<Option<ControlPlaneRaftCheckpointPosition>>>,
     durable_artifact_path: Option<Arc<PathBuf>>,
@@ -5115,6 +5116,7 @@ impl ControlPlaneRaftAuthority {
             runtime_map_overlay_content_certificate: Mutex::new(None),
             authority_instance_id: OnceLock::new(),
             durability_publication: OnceLock::new(),
+            durability_lifecycle: OnceLock::new(),
             uncertified_initial_topology_checkpoint_published: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
@@ -5143,6 +5145,7 @@ impl ControlPlaneRaftAuthority {
             runtime_map_overlay_content_certificate: Mutex::new(None),
             authority_instance_id: OnceLock::new(),
             durability_publication: OnceLock::new(),
+            durability_lifecycle: OnceLock::new(),
             uncertified_initial_topology_checkpoint_published: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
@@ -5179,6 +5182,27 @@ impl ControlPlaneRaftAuthority {
             .durability_publication
             .get_or_init(|| publication)
             .clone())
+    }
+
+    /// Issue the one shared durability lifecycle bound to this authority.
+    ///
+    /// Repeated calls while the authority is hosted return clones of the same
+    /// lifecycle, including its checkpoint lock, serving marker, and monitor
+    /// registration state.
+    pub fn durability_lifecycle(
+        self: &Arc<Self>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<crate::ControlPlaneRaftAuthorityDurability, ControlPlaneError> {
+        crate::control_plane_raft_durability::ControlPlaneRaftAuthorityDurability::issue(
+            runtime,
+            Arc::clone(self),
+        )
+    }
+
+    pub(crate) fn durability_lifecycle_slot(
+        &self,
+    ) -> &OnceLock<Arc<crate::control_plane_raft_durability::DurabilityInner>> {
+        &self.durability_lifecycle
     }
 
     /// Bind process-hosted peer checkpoint work to this authority's durability
@@ -6494,7 +6518,9 @@ impl ControlPlaneRaftAuthority {
         )
     }
 
-    fn configured_durable_artifact_path(&self) -> Result<Arc<PathBuf>, ControlPlaneError> {
+    pub(crate) fn configured_durable_artifact_path(
+        &self,
+    ) -> Result<Arc<PathBuf>, ControlPlaneError> {
         self.durable_artifact_path
             .as_ref()
             .cloned()

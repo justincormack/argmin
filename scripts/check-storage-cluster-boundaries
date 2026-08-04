@@ -3533,6 +3533,48 @@ fail_with_matches \
     "The authority-bound Raft durability publication must remain opaque and expose only admission and poison operations" \
     "$raft_durability_publication_surface_leaks"
 
+argmin_raft_durability_lifecycle_leaks=$(
+    {
+        rg -n --color=never \
+            '\bExperimentalRaftPeer(DurabilityContext|ServerCheckpoint|CheckpointPolicy|CheckpointObservation|CheckpointWork|CheckpointTracker)\b|\b(CONTROL_PLANE_RAFT_PEER_CHECKPOINT_(MAX_WAL_SUFFIX_BYTES|MAX_MUTATIONS|MAX_DELAY|POLL_INTERVAL)|checkpoint_experimental_raft_peer_wal_if_due|spawn_experimental_raft_peer_checkpoint_loop|store_experimental_raft_durable_restart_artifact)\b|^[[:space:]]*(durable_artifact_path|durable_checkpoint_lock|durable_serving_checkpoint|checkpoint_serving_reads)[[:space:]]*:' \
+            crates/argmin-s3/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
+            'ControlPlaneRaftAuthorityDurability::(new|issue)\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+    }
+)
+fail_with_matches \
+    "Raft checkpoint paths, locks, serving markers, WAL checkpoint policy, and monitor lifecycle must remain authority-issued and owned by storage" \
+    "$argmin_raft_durability_lifecycle_leaks"
+
+raft_authority_durability_surface_leaks=$(
+    awk '
+    /pub struct ControlPlaneRaftAuthorityDurability[[:space:]]*\{/ {
+        in_durability = 1
+        depth = 0
+    }
+    in_durability {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_durability = 0
+        }
+    }
+    ' crates/storage/src/control_plane_raft_durability.rs
+)
+fail_with_matches \
+    "The storage-owned Raft authority durability capability must not expose its retained authority, path, locks, or checkpoint state" \
+    "$raft_authority_durability_surface_leaks"
+
 argmin_raft_publication_authority_bypass=$(
     awk '
     /struct (ExperimentalRaftControlPlane|ExperimentalRaftPeerDurabilityContext)[[:space:]]*\{/ {
