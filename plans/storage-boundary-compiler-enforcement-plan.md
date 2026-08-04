@@ -5625,26 +5625,39 @@ The audit found four remaining classes of work:
    must never depend on weaker route, deadline, or subject validation than
    production.
 
-2. **Completed — owner-local impossible-state fixtures.** Logical committed-object segment
-   layout, storage identity, placement distribution, and exact payload
-   presence/reclamation assertions now use an opaque storage-owned payload
-   snapshot. Object-payload corruption and repair tests now use that snapshot
-   through storage-owned fault scenarios and logical repair observations. The
-   reclaim-queue state-machine and ordering tests are now storage-owner-local;
-   the remaining coordinator lease-drop regressions observe only logical queue
-   depth and opaque reclaim-root presence. Tests whose assertion is about
-   storage corruption, recovery, physical layout, claims, or queue invariants
-   belong in `storage`. Where an S3/coordinator response to a
-   storage failure genuinely requires a cross-crate test, expose an opaque
-   scenario-level fault or logical observation rather than physical PG, shard,
-   row, claim, or command records. This work is the test-fixture portion of
-   pending item 14 in `storage-upgrade-versioning-plan.md`; that plan retains
-   ownership of its separate debug-PG containment work.
+2. **Substantially completed — owner-local impossible-state fixtures.** Logical
+   committed-object segment layout, storage identity, placement distribution,
+   and exact payload presence/reclamation assertions now use an opaque
+   storage-owned payload snapshot. Object-payload corruption and repair tests
+   now use that snapshot through storage-owned fault scenarios and logical
+   repair observations. The reclaim-queue state-machine and ordering tests are
+   now storage-owner-local; the remaining coordinator lease-drop regressions
+   observe only logical queue depth and opaque reclaim-root presence.
 
-3. **Consolidated dev-only support.** Move retained cross-crate test DTOs,
-   observations, and hook installers out of the `storage` crate root and off
-   production types where practical, into `storage::test_support`. Classify
-   every exported item as one of:
+   The final audit found older residual cases which predate those migrations,
+   so this item is not yet complete. `server-core` stream append/abort cleanup
+   tests still derive data PGs and shard keys and inspect durable shard rows and
+   files directly. One UploadPartCopy failure test removes source shard files
+   by path instead of using the storage-owned shard-loss scenario. Backfill
+   tests still construct physical work items, routes, shard acknowledgements,
+   and placed files outside `storage`. Those physical-invariant tests must move
+   to `storage`; any retained coordinator test should invoke an opaque owner
+   scenario and assert only the coordinator-visible error, trace, or cleanup
+   outcome.
+
+   Tests whose assertion is about storage corruption, recovery, physical
+   layout, claims, or queue invariants belong in `storage`. Where an
+   S3/coordinator response to a storage failure genuinely requires a
+   cross-crate test, expose an opaque scenario-level fault or logical
+   observation rather than physical PG, shard, row, claim, or command records.
+   This work is the test-fixture portion of pending item 14 in
+   `storage-upgrade-versioning-plan.md`; that plan retains ownership of its
+   separate debug-PG containment work.
+
+3. **In progress — consolidated dev-only support.** Move retained cross-crate
+   test DTOs, observations, and hook installers out of the `storage` crate root
+   and off production types where practical, into `storage::test_support`.
+   Classify every exported item as one of:
 
    - a logical read-only observation;
    - an opaque semantic fixture/scenario;
@@ -5660,12 +5673,13 @@ The audit found four remaining classes of work:
    hooks; local physical-invariant tests belong with the storage owner rather
    than behind an S3 harness abstraction.
 
-4. **Feature-graph enforcement and cleanup.** Add a stable CI/boundary check
-   which obtains the complete workspace-member set from Cargo metadata and
-   examines every member's normal/build feature graph. The classification is
-   fail closed: maintain one explicit, reviewed allowlist of test-only packages
-   which may enable test support, reject an unclassified workspace member, and
-   reject a stale allowlist entry. The initial normal/build allowlist is empty:
+4. **Feature-graph enforcement complete; feature cleanup remains.** The stable
+   CI/boundary check obtains the complete workspace-member set from Cargo
+   metadata and examines every member's normal/build feature graph. The
+   classification is fail closed: maintain one explicit, reviewed allowlist of
+   test-only packages which may enable test support, reject an unclassified
+   workspace member, and reject a stale allowlist entry. The initial
+   normal/build allowlist is empty:
    even non-published AWS-facing harness packages must not inherit private
    storage support. Adding an exception requires documenting why it is
    test-only and why it needs storage-private support. Every non-allowlisted
@@ -5810,6 +5824,88 @@ Implementation update (2026-08-03):
   suite's stateful and all groups now select the storage-owner module, and the
   15 historical Proptest regressions moved with their property tests so the
   source-relative replay corpus remains active.
+
+Final Phase 5 audit (2026-08-04):
+
+- the fail-closed feature-graph check and the complete storage boundary checker
+  pass. Every workspace member's normal/build graph is classified, the
+  hook-enabled allowlist remains empty, and neither `storage/test-hooks` nor
+  `server-core/test-utils` leaks into an ordinary package graph. The
+  AWS-facing harnesses remain clean;
+- Phase 5 cannot yet be marked complete. `server-core` still has residual raw
+  storage test seams in `coordinator/read_tests.rs`,
+  `coordinator/multipart_tests.rs`, `coordinator/bucket_tests.rs`,
+  `coordinator/core_tests.rs`, and `coordinator/test_support.rs`. These seams
+  expose or reconstruct raw PG IDs, route snapshots, generation identities,
+  EC shapes, shard keys, physical shard paths, shard acknowledgement rows,
+  durable object/upload records, and backfill work records;
+- the stream append/abort cleanup and direct-PUT cleanup regressions assert
+  physical shard-row/file state from `server-core`. Their storage invariants
+  belong in storage-owner tests. Retain cross-crate cases only where they pin a
+  coordinator error or trace, and drive those cases through an opaque
+  storage-owned cleanup-failure scenario and logical outcome;
+- the UploadPartCopy source-read failure regression manually deletes every
+  source shard by a caller-reconstructed path. Replace that mutation with the
+  existing storage-owned payload-loss scenario while retaining the
+  coordinator-visible abort/no-leak assertion;
+- shard-backfill and retained-placement regressions construct
+  `StorageShardBackfillTestWorkItem`, `PgRouteSnapshot`, physical segment
+  writes, acknowledgement rows, and historical routes. Their placement,
+  recovery, and durable-row assertions belong in `storage`; any coordinator
+  runtime-map behavior which remains relevant should consume an opaque
+  storage-owned topology/backfill scenario;
+- lifecycle and multipart cleanup tests still discover private generation IDs
+  through raw object records before checking reclaim-root state. Replace those
+  reads with opaque payload evidence or a logical object-scoped reclaim
+  observation. The multipart state-machine harness also reads
+  `StreamUploadRecord` and the broad `TestMultipartUploadRecord` projection;
+  narrow these to the exact logical session/upload facts used by the model so
+  metadata blobs, encryption state, storage generation IDs, and other durable
+  record fields do not cross the owner boundary;
+- the runtime-map validity, admission barriers, fault scheduling hooks, opaque
+  payload snapshots, worker wake/drain controls, and process-level Raft test
+  servers fit the allowed support categories. They should be consolidated
+  under `storage::test_support`, but they should not be moved owner-local when
+  the test's actual assertion is HTTP/coordinator behavior across the
+  publication boundary; and
+- `server-core/test-utils` still forwards `storage/test-hooks`. Its public
+  `put_object`, `upload_part`, and requester helpers use production admitted
+  paths, but enabling the feature also compiles older in-crate raw convenience
+  methods. Split or retire those methods, then remove the forwarding edge.
+  `server-core` unit tests may continue to enable `storage/test-hooks` through
+  their dev-dependency while the remaining migrations are performed.
+
+The audited cross-crate support families are:
+
+| Surface family | Principal consumers | Durable mutation | Final disposition |
+| --- | --- | --- | --- |
+| admitted `put_object`/`upload_part` test helpers | `server-http` | production operation | retain; remove unnecessary feature forwarding |
+| opaque object, multipart-part, and stream payload snapshots | `server-core`, `server-http` | no | retain under `storage::test_support` |
+| scheduling/deadline/publication hooks and worker lifecycle controls | `server-core`, `server-http`, `argmin-s3` | controlled fault/lifecycle action | retain under `storage::test_support` |
+| raw object/version/upload/session/bucket observations | `server-core` | no | replace with narrow logical observations or owner-local assertions |
+| raw PG IDs, metadata proofs, route snapshots, and route-map mutation | `server-core` | sometimes | move owner invariants to `storage`; retain only opaque topology/publication scenarios |
+| shard keys, EC layouts, acknowledgement rows, shard paths/files, and physical segment records | `server-core` | yes and no | move to `storage`; expose only opaque fault/evidence scenarios for coordinator response tests |
+| backfill work records and direct shard/ack construction | `server-core` | yes | move the tests and helpers to `storage` |
+| raw bucket-delete/reclaim roots and durable-state mutation | `server-core` | yes and no | use opaque storage-issued roots and logical progress/outcome observations |
+| process-level authenticated Raft/control-plane test servers | `argmin-s3`, storage integration tests | controlled process lifecycle | retain as the sanctioned process-boundary exception |
+
+Remaining implementation order after this audit:
+
+1. migrate the stream/direct-PUT cleanup and UploadPartCopy source-loss cases,
+   moving physical assertions into `storage` and retaining only opaque
+   coordinator-facing scenarios;
+2. move the backfill, retained-placement, and shard-selection physical
+   regressions into `storage`, replacing any genuinely cross-crate runtime-map
+   case with one opaque topology scenario;
+3. narrow lifecycle/reclaim and multipart state-machine observations to
+   logical owner-defined values, and remove raw generation/record access from
+   the coordinator harnesses;
+4. consolidate the surviving guards, observations, and lifecycle controls
+   under `storage::test_support`, remove obsolete inherent `StorageCluster`
+   test methods, and remove `server-core/test-utils` forwarding of
+   `storage/test-hooks`; and
+5. rerun the public-export/feature audit and mark Phase 5 complete only when
+   the transitional raw-record seam and its plan exception are gone.
 
 Completion:
 
