@@ -64,7 +64,10 @@ use crate::types::{
     BucketDeleteDebugPendingCommand, BucketDeleteDebugSnapshot,
 };
 #[cfg(any(test, feature = "test-hooks"))]
-use crate::types::{MultipartReclaimRecord, ObjectSegmentsReclaimRecord};
+use crate::types::{
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+};
 use crate::*;
 
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
@@ -12593,7 +12596,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<super::TestObjectPayloadReclaimAttempt, ObjectPgActionError> {
+    ) -> Result<crate::test_support::TestObjectPayloadReclaimAttempt, ObjectPgActionError> {
         self.reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)
             .map(Into::into)
     }
@@ -17334,26 +17337,45 @@ impl super::StorageCluster {
             .test_get_object_version(bucket, key, version_id)
     }
 
+    /// Observes only whether the durable segmented-payload reclaim root exists.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_object_segments_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<Option<crate::TestObjectSegmentsReclaimRecord>, ObjectPgActionError> {
+    ) -> Result<Option<()>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_object_segments_reclaim(bucket, key, generation_id)
-            .map(|reclaim| reclaim.map(Into::into))
+            .map(|reclaim| reclaim.map(|_| ()))
     }
 
+    /// Seeds the canonical storage-owned reclaim scenario for one orphaned
+    /// segmented-object generation.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_put_object_segments_reclaim(
+    pub fn test_seed_segmented_payload_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        reclaim: &crate::TestObjectSegmentsReclaimRecord,
+        generation_id: GenerationId,
+        created_at: u64,
     ) -> Result<(), ObjectPgActionError> {
-        let reclaim = ObjectSegmentsReclaimRecord::from(reclaim);
+        let reclaim = ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at,
+            segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 0,
+                segment_okh: crate::object_key_hash(bucket.as_str(), key.as_str()),
+                segment_vid: generation_id,
+                data_pg_id: self
+                    .local_map
+                    .object_generation_segment_data_pg(bucket, key, generation_id, 0)
+                    .get(),
+                ec: self.default_payload_ec_shape(),
+            }],
+        };
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         for node in self
             .local_map
@@ -17366,14 +17388,36 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    /// Seeds the canonical storage-owned reclaim scenario for one orphaned
+    /// multipart-object generation.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_put_multipart_reclaim(
+    pub fn test_seed_multipart_payload_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        reclaim: &crate::TestMultipartReclaimRecord,
+        generation_id: GenerationId,
+        created_at: u64,
     ) -> Result<(), ObjectPgActionError> {
-        let reclaim = MultipartReclaimRecord::from(reclaim);
+        let reclaim = MultipartReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at,
+            parts: vec![MultipartReclaimPartRecord {
+                part_number: 1,
+                segments: vec![MultipartReclaimPartSegmentRecord {
+                    part_number: 1,
+                    segment_index: 0,
+                    segment_okh: crate::object_key_hash(bucket.as_str(), key.as_str()),
+                    segment_vid: generation_id,
+                    data_pg_id: self
+                        .local_map
+                        .object_generation_multipart_part_data_pg(bucket, key, generation_id, 1)
+                        .get(),
+                    ec: self.default_payload_ec_shape(),
+                }],
+            }],
+        };
         let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
         for node in self
             .local_map

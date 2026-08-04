@@ -8,11 +8,10 @@ use crate::system_metadata::SystemMetadata;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
-use storage::{
-    EcShape, PgTopology, StreamUploadRecord, StreamUploadSegmentRecord,
-    TestMultipartPartSegmentRecord, TestMultipartUploadRecord, TestObjectSegmentsReclaimRecord,
-    TestObjectSegmentsReclaimSegmentRecord, TestPayloadReclaimRoot,
+use storage::test_support::{
+    TestMultipartPartSegmentRecord, TestMultipartUploadRecord, TestPayloadReclaimRoot,
 };
+use storage::{EcShape, StreamUploadRecord, StreamUploadSegmentRecord};
 
 const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -219,8 +218,6 @@ fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
     let ec_shape = storage_cluster.default_payload_ec_shape();
     ReadRuntime {
         storage: super::read_core::ReadStorage::Cluster(storage_cluster),
-        #[cfg(test)]
-        pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(ec_shape),
         sse_c_validator: None,
         managed_key_provider: None,
@@ -2046,31 +2043,10 @@ fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
     let generation_id = GenerationId::new(1).unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let data_pg_id = runtime
-        .pg_topology
-        .object_generation_segment_data_pg(&bucket, &key, generation_id, 0)
-        .get();
-
     {
         runtime
             .storage_node()
-            .test_put_object_segments_reclaim(
-                &bucket,
-                &key,
-                &TestObjectSegmentsReclaimRecord {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
-                    generation_id,
-                    created_at: 1,
-                    segments: vec![TestObjectSegmentsReclaimSegmentRecord {
-                        segment_index: 0,
-                        segment_okh: object_key_hash("bucket", "key"),
-                        segment_vid: generation_id,
-                        data_pg_id,
-                        ec: EcShape { k: 4, m: 2 },
-                    }],
-                },
-            )
+            .test_seed_segmented_payload_reclaim(&bucket, &key, generation_id, 1)
             .unwrap();
     }
 

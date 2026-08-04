@@ -15,14 +15,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use storage::cluster::StorageShardBackfillTestWorkItem;
 use storage::storage_node_server::{
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
 };
+use storage::test_support::{
+    install_bucket_scoped_test_hooks, BucketScopedTestHooks, MetadataCommandApplyTestKind,
+    StorageShardBackfillTestWorkItem,
+};
 use storage::{
-    install_bucket_scoped_test_hooks, BucketScopedTestHooks, ClusterEpoch, LocalClusterMap,
-    LocalNodeStoreConfig, LocalPgRoute, LocalUnixStorageNodeClientConfig,
-    MetadataCommandApplyTestKind, NodeId, PgId, PgState, RouteMapValidity,
+    ClusterEpoch, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
+    LocalUnixStorageNodeClientConfig, NodeId, PgId, PgState, RouteMapValidity,
     SegmentStoredBytesRequest, StorageCluster, StorageClusterRouteHandle,
     StorageClusterRuntimeMapHandle,
 };
@@ -6315,7 +6317,7 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     let tmp = test_util::tempdir();
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
-    let root = storage::TestBucketDeleteFinalizeRoot {
+    let root = storage::test_support::TestBucketDeleteFinalizeRoot {
         bucket: trusted_bucket_name("reclaim-refresh-after-dequeue"),
         bucket_incarnation_generation: 1,
     };
@@ -6377,7 +6379,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
         .test_begin_bucket_delete_if_current(&bucket)
         .unwrap();
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
-    let root = storage::TestBucketDeleteFinalizeRoot {
+    let root = storage::test_support::TestBucketDeleteFinalizeRoot {
         bucket,
         bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
     };
@@ -7050,8 +7052,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
-            storage::TestBucketDeleteAttemptPhase::StreamCleanup,
+            storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::test_support::TestBucketDeleteAttemptPhase::StreamCleanup,
             "seeded stream-cleanup retryable attempt".to_string(),
             None,
         )
@@ -7142,8 +7144,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
-            storage::TestBucketDeleteAttemptPhase::ReservationWait,
+            storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::test_support::TestBucketDeleteAttemptPhase::ReservationWait,
             "seeded reservation-wait retryable attempt".to_string(),
             None,
         )
@@ -7235,8 +7237,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
-            storage::TestBucketDeleteAttemptPhase::FinalVisibilityCheck,
+            storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::test_support::TestBucketDeleteAttemptPhase::FinalVisibilityCheck,
             "seeded final-visibility retryable attempt".to_string(),
             Some(0),
         )
@@ -7313,8 +7315,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
     initial
         .test_seed_bucket_delete_attempt_outcome(
             &bucket,
-            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
-            storage::TestBucketDeleteAttemptPhase::FinalVisibilityProven,
+            storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::test_support::TestBucketDeleteAttemptPhase::FinalVisibilityProven,
             "seeded final-visibility-proven retryable attempt".to_string(),
             Some(0),
         )
@@ -11279,7 +11281,7 @@ fn install_bucket_command_log_conflict_hook(
     storage_cluster: &Arc<StorageCluster>,
     bucket: &BucketName,
     kind: MetadataCommandApplyTestKind,
-) -> storage::MetadataCommandApplyContextTestHookGuard {
+) -> storage::test_support::MetadataCommandApplyContextTestHookGuard {
     let bucket_pg = storage_cluster.test_bucket_pg_id_for(bucket);
     let primary_node = storage_cluster
         .local_pg_route(PgId::new(bucket_pg))
@@ -11310,7 +11312,7 @@ fn install_object_command_log_conflict_hook(
     bucket: &BucketName,
     key: &ObjectKey,
     kind: MetadataCommandApplyTestKind,
-) -> storage::MetadataCommandApplyContextTestHookGuard {
+) -> storage::test_support::MetadataCommandApplyContextTestHookGuard {
     let object_pg = storage_cluster.test_object_pg_id_for(bucket, key);
     let primary_node = storage_cluster
         .local_pg_route(PgId::new(object_pg))
@@ -16431,8 +16433,8 @@ fn delete_bucket_authorization_adopts_active_preserved_attempt_without_drain_wai
     storage_cluster
         .test_seed_bucket_delete_attempt_outcome(
             &bucket_name,
-            storage::TestBucketDeleteAttemptOutcomeKind::Retryable,
-            storage::TestBucketDeleteAttemptPhase::ReservationWait,
+            storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            storage::test_support::TestBucketDeleteAttemptPhase::ReservationWait,
             "seeded reservation-wait attempt for auth adoption".to_string(),
             None,
         )
@@ -16599,7 +16601,7 @@ fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
     let err = storage_cluster
         .begin_bucket_delete_if_current(
             &stale_authorized.name,
-            storage::cluster::BucketIdentityGenerations {
+            storage::BucketIdentityGenerations {
                 bucket_execution_generation: stale_authorized.bucket_execution_generation,
                 bucket_incarnation_generation: stale_authorized.bucket_incarnation_generation,
             },

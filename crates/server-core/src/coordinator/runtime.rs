@@ -6,9 +6,7 @@ use std::time::Duration;
 
 use s3_types::BucketLifecycleConfiguration;
 #[cfg(test)]
-use storage::PgTopology;
-#[cfg(test)]
-use storage::TestBucketDeleteFinalizeRoot as BucketDeleteFinalizeRoot;
+use storage::test_support::TestBucketDeleteFinalizeRoot as BucketDeleteFinalizeRoot;
 use storage::{
     BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, ProcessLocalRegistryKey,
     StorageCluster, StorageClusterRouteHandle, StorageMaintenanceAdmission, UploadId, UploadState,
@@ -208,9 +206,6 @@ impl ReadRuntime {
     fn with_storage_node(&self, storage_node: Arc<StorageCluster>) -> Self {
         Self {
             storage: ReadStorage::Cluster(Arc::clone(&storage_node)),
-            #[cfg(test)]
-            pg_topology: PgTopology::new(storage_node.test_pg_ids())
-                .expect("coordinator storage node should expose a valid PG topology"),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
             managed_key_provider: self.managed_key_provider.clone(),
@@ -1023,7 +1018,7 @@ impl ReadRuntime {
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
-    ) -> Result<storage::cluster::TestObjectPayloadReclaimAttempt, ServerError> {
+    ) -> Result<storage::test_support::TestObjectPayloadReclaimAttempt, ServerError> {
         self.storage_node()
             .test_reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)
             .map_err(Coordinator::map_object_pg_action_error)
@@ -1035,7 +1030,7 @@ impl ReadRuntime {
         bucket: &str,
         key: &str,
         generation_id: GenerationId,
-    ) -> Result<storage::cluster::TestObjectPayloadReclaimAttempt, ServerError> {
+    ) -> Result<storage::test_support::TestObjectPayloadReclaimAttempt, ServerError> {
         self.try_reclaim_object_payload_for_with_outcome(
             &trusted_bucket_name(bucket),
             &trusted_object_key(key),

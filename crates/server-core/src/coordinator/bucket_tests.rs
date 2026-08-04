@@ -10,7 +10,8 @@ use s3_types::{
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use storage::{install_bucket_scoped_test_hooks, BucketScopedTestHooks, PutBucketSubresource};
+use storage::test_support::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
+use storage::PutBucketSubresource;
 
 fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
     coord.delete_bucket(&bucket_request_with_expected_owner(

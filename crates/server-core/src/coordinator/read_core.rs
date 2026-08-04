@@ -12,8 +12,6 @@ use super::test_hooks::maybe_run_object_segments_first_segment_hook;
 use super::TRACE_TARGET;
 use crate::error::ServerError;
 use crate::sse::{SseCustomerRequest, SseCustomerValidatorConfig, StaticManagedKeyProvider};
-#[cfg(test)]
-use storage::PgTopology;
 
 #[derive(Debug, Clone)]
 pub struct ReadChunk {
@@ -31,8 +29,6 @@ pub(super) enum ReadStorage {
 #[derive(Clone)]
 pub(super) struct ReadRuntime {
     pub(super) storage: ReadStorage,
-    #[cfg(test)]
-    pub(super) pg_topology: PgTopology,
     pub(super) payload_buffer_pool: Arc<PayloadBufferPool>,
     pub(super) sse_c_validator: Option<SseCustomerValidatorConfig>,
     pub(super) managed_key_provider: Option<StaticManagedKeyProvider>,

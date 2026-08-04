@@ -4,11 +4,7 @@ use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
 use std::path::Path;
-use storage::{
-    PgTopology, TestMultipartReclaimPartRecord, TestMultipartReclaimRecord,
-    TestObjectSegmentsReclaimRecord, TestObjectSegmentsReclaimSegmentRecord,
-    TestReclaimWorkItem as ReclaimWorkItem,
-};
+use storage::test_support::TestReclaimWorkItem as ReclaimWorkItem;
 
 const TRACE_BUCKET: &str = "bucket";
 const TRACE_KEY: &str = "key";
@@ -29,77 +25,15 @@ fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
     let ec_shape = storage_cluster.default_payload_ec_shape();
     ReadRuntime {
         storage: super::read_core::ReadStorage::Cluster(storage_cluster),
-        #[cfg(test)]
-        pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(ec_shape),
         sse_c_validator: None,
         managed_key_provider: None,
     }
 }
 
-fn trace_object_segments_reclaim(
+fn seed_deleting_bucket(
     runtime: &ReadRuntime,
-    bucket: &str,
-    key: &str,
-    generation_id: GenerationId,
-    created_at: u64,
-) -> TestObjectSegmentsReclaimRecord {
-    let bucket_name = trusted_bucket_name(bucket);
-    let object_key = trusted_object_key(key);
-    let data_pg_id = runtime
-        .pg_topology
-        .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
-        .get();
-
-    TestObjectSegmentsReclaimRecord {
-        bucket: bucket_name,
-        key: object_key,
-        generation_id,
-        created_at,
-        segments: vec![TestObjectSegmentsReclaimSegmentRecord {
-            segment_index: 0,
-            segment_okh: object_key_hash(bucket, key),
-            segment_vid: generation_id,
-            data_pg_id,
-            ec: EcShape { k: 4, m: 2 },
-        }],
-    }
-}
-
-fn trace_multipart_reclaim(
-    runtime: &ReadRuntime,
-    bucket: &str,
-    key: &str,
-    generation_id: GenerationId,
-    created_at: u64,
-) -> TestMultipartReclaimRecord {
-    let bucket_name = trusted_bucket_name(bucket);
-    let object_key = trusted_object_key(key);
-    let data_pg_id = runtime
-        .pg_topology
-        .object_generation_multipart_part_data_pg(&bucket_name, &object_key, generation_id, 1)
-        .get();
-
-    TestMultipartReclaimRecord {
-        bucket: bucket_name,
-        key: object_key,
-        generation_id,
-        created_at,
-        parts: vec![TestMultipartReclaimPartRecord {
-            part_number: 1,
-            segments: vec![storage::TestMultipartReclaimPartSegmentRecord {
-                part_number: 1,
-                segment_index: 0,
-                segment_okh: object_key_hash(bucket, key),
-                segment_vid: generation_id,
-                data_pg_id,
-                ec: EcShape { k: 4, m: 2 },
-            }],
-        }],
-    }
-}
-
-fn seed_deleting_bucket(runtime: &ReadRuntime) -> storage::TestBucketDeleteFinalizeRoot {
+) -> storage::test_support::TestBucketDeleteFinalizeRoot {
     let bucket = trusted_bucket_name(TRACE_BUCKET);
     runtime
         .storage_node()
@@ -109,7 +43,7 @@ fn seed_deleting_bucket(runtime: &ReadRuntime) -> storage::TestBucketDeleteFinal
         .storage_node()
         .test_head_bucket_raw(&bucket)
         .unwrap();
-    storage::TestBucketDeleteFinalizeRoot {
+    storage::test_support::TestBucketDeleteFinalizeRoot {
         bucket,
         bucket_incarnation_generation: info.bucket_incarnation_generation,
     }
@@ -123,8 +57,10 @@ fn execute_object_payload_reclaim_worker_step(
     let result = runtime.try_reclaim_object_payload_with_outcome(TRACE_BUCKET, key, generation_id);
     let finished = matches!(
         result,
-        Ok(storage::cluster::TestObjectPayloadReclaimAttempt::Completed
-            | storage::cluster::TestObjectPayloadReclaimAttempt::MissingRoot)
+        Ok(
+            storage::test_support::TestObjectPayloadReclaimAttempt::Completed
+                | storage::test_support::TestObjectPayloadReclaimAttempt::MissingRoot
+        )
     );
     result.map_err(|err| {
         TestCaseError::fail(format!(
@@ -1074,19 +1010,16 @@ impl ReclaimTraceHarness {
     fn seed_segments_metadata(&self) -> TestCaseResult {
         self.runtime
             .storage_node()
-            .test_put_object_segments_reclaim(
+            .test_seed_segmented_payload_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(TRACE_KEY),
-                &trace_object_segments_reclaim(
-                    &self.runtime,
-                    TRACE_BUCKET,
-                    TRACE_KEY,
-                    trace_generation_id(),
-                    1,
-                ),
+                trace_generation_id(),
+                1,
             )
             .map_err(|err| {
-                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!(
+                    "test_seed_segmented_payload_reclaim failed: {err:?}"
+                ))
             })?;
         Ok(())
     }
@@ -1234,19 +1167,16 @@ impl ReclaimKindTraceHarness {
     fn seed_segments_metadata(&self) -> TestCaseResult {
         self.runtime
             .storage_node()
-            .test_put_object_segments_reclaim(
+            .test_seed_segmented_payload_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(TRACE_KEY),
-                &trace_object_segments_reclaim(
-                    &self.runtime,
-                    TRACE_BUCKET,
-                    TRACE_KEY,
-                    trace_generation_id(),
-                    1,
-                ),
+                trace_generation_id(),
+                1,
             )
             .map_err(|err| {
-                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!(
+                    "test_seed_segmented_payload_reclaim failed: {err:?}"
+                ))
             })?;
         Ok(())
     }
@@ -1254,19 +1184,16 @@ impl ReclaimKindTraceHarness {
     fn seed_multipart_metadata(&self) -> TestCaseResult {
         self.runtime
             .storage_node()
-            .test_put_multipart_reclaim(
+            .test_seed_multipart_payload_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(TRACE_KEY),
-                &trace_multipart_reclaim(
-                    &self.runtime,
-                    TRACE_BUCKET,
-                    TRACE_KEY,
-                    trace_generation_id(),
-                    1,
-                ),
+                trace_generation_id(),
+                1,
             )
             .map_err(|err| {
-                TestCaseError::fail(format!("test_put_multipart_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!(
+                    "test_seed_multipart_payload_reclaim failed: {err:?}"
+                ))
             })?;
         Ok(())
     }
@@ -1465,19 +1392,16 @@ impl TwoGenerationReclaimTraceHarness {
         };
         self.runtime
             .storage_node()
-            .test_put_object_segments_reclaim(
+            .test_seed_segmented_payload_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(TRACE_KEY),
-                &trace_object_segments_reclaim(
-                    &self.runtime,
-                    TRACE_BUCKET,
-                    TRACE_KEY,
-                    generation.generation_id(),
-                    created_at,
-                ),
+                generation.generation_id(),
+                created_at,
             )
             .map_err(|err| {
-                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!(
+                    "test_seed_segmented_payload_reclaim failed: {err:?}"
+                ))
             })?;
         Ok(())
     }
@@ -1692,19 +1616,16 @@ impl TwoKeyReclaimTraceHarness {
         };
         self.runtime
             .storage_node()
-            .test_put_object_segments_reclaim(
+            .test_seed_segmented_payload_reclaim(
                 &trusted_bucket_name(TRACE_BUCKET),
                 &trusted_object_key(key.key()),
-                &trace_object_segments_reclaim(
-                    &self.runtime,
-                    TRACE_BUCKET,
-                    key.key(),
-                    trace_generation_id(),
-                    created_at,
-                ),
+                trace_generation_id(),
+                created_at,
             )
             .map_err(|err| {
-                TestCaseError::fail(format!("test_put_object_segments_reclaim failed: {err:?}"))
+                TestCaseError::fail(format!(
+                    "test_seed_segmented_payload_reclaim failed: {err:?}"
+                ))
             })?;
         Ok(())
     }

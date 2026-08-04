@@ -163,7 +163,7 @@ pub(super) struct StreamAppendTestHooks {
 pub(super) static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
 pub(super) struct ReclamationTestHookGuard {
-    _storage_reclaim_guard: storage::StorageReclaimWorkerTestHookGuard,
+    _storage_reclaim_guard: storage::test_support::StorageReclaimWorkerTestHookGuard,
 }
 
 impl Drop for ReclamationTestHookGuard {
@@ -227,14 +227,15 @@ impl Drop for BucketFastPathIdentityLoadErrorTestHookGuard {
 pub(super) fn install_reclamation_test_hooks(
     hooks: ReclamationTestHooks,
 ) -> ReclamationTestHookGuard {
-    let storage_reclaim_guard =
-        storage::install_reclaim_worker_test_hooks(storage::StorageReclaimWorkerTestHooks {
+    let storage_reclaim_guard = storage::test_support::install_reclaim_worker_test_hooks(
+        storage::test_support::StorageReclaimWorkerTestHooks {
             target_registry_key: hooks.target_reclaim_worker_registry_key,
             durable_scan_delay_override: hooks.reclaim_worker_durable_scan_delay_override,
             after_idle_return: hooks.after_reclaim_worker_idle_return.clone(),
             after_work_dequeued: hooks.after_reclaim_work_dequeued.clone(),
             before_work_execute: hooks.before_reclaim_work_execute.clone(),
-        });
+        },
+    );
     let slot = RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
     *slot.lock().unwrap() = hooks;
     ReclamationTestHookGuard {

@@ -626,8 +626,6 @@ fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
     let ec_shape = storage_cluster.default_payload_ec_shape();
     let runtime = ReadRuntime {
         storage: super::read_core::ReadStorage::Cluster(storage_cluster),
-        #[cfg(test)]
-        pg_topology: PgTopology::new(&[0]).unwrap(),
         payload_buffer_pool: PayloadBufferPool::new(ec_shape),
         sse_c_validator: None,
         managed_key_provider: None,

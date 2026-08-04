@@ -20,8 +20,6 @@ use super::{
 };
 use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
-#[cfg(test)]
-use storage::PgTopology;
 use storage::{
     BucketFastPathInfo, BucketInfo, BucketName, BucketState, SessionId, StorageCluster,
     StorageClusterRouteAdmission, StorageClusterRouteHandle,
@@ -603,21 +601,12 @@ impl Coordinator {
             foreground_cluster: storage_cluster,
             background_cluster: background_storage_cluster,
         } = storage_context;
-        #[cfg(test)]
-        let pg_topology =
-            PgTopology::new(background_storage_cluster.test_pg_ids()).map_err(|reason| {
-                ServerError::InternalError {
-                    reason: reason.to_string(),
-                }
-            })?;
         let payload_buffer_pool =
             PayloadBufferPool::new(storage_cluster.default_payload_ec_shape());
         let read_runtime = ReadRuntime {
             storage: super::read_core::ReadStorage::Cluster(Arc::clone(
                 &background_storage_cluster,
             )),
-            #[cfg(test)]
-            pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
             sse_c_validator: sse_c_validator.clone(),
             managed_key_provider: managed_key_provider.clone(),
@@ -672,9 +661,6 @@ impl Coordinator {
     ) -> ReadRuntime {
         ReadRuntime {
             storage: super::read_core::ReadStorage::Cluster(Arc::clone(&storage_node)),
-            #[cfg(test)]
-            pg_topology: PgTopology::new(storage_node.test_pg_ids())
-                .expect("coordinator storage node should expose a valid PG topology"),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
             managed_key_provider: self.managed_key_provider.clone(),
@@ -705,9 +691,6 @@ impl Coordinator {
         }
         Ok(ReadRuntime {
             storage: super::read_core::ReadStorage::Retained(Arc::new(retained_payload_read)),
-            #[cfg(test)]
-            pg_topology: PgTopology::new(self.storage_node().test_pg_ids())
-                .expect("coordinator storage node should expose a valid PG topology"),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
             managed_key_provider: self.managed_key_provider.clone(),

@@ -26,7 +26,7 @@
 /// [`storage_node_server`]. Raw node, PG-store, and shard-store
 /// implementations are private engine details.
 pub mod clock;
-pub mod cluster;
+mod cluster;
 pub mod control_plane;
 pub mod control_plane_auth;
 mod control_plane_client_bootstrap;
@@ -82,23 +82,18 @@ pub(crate) use cluster::DurableReclaimScanOutcome;
 pub use cluster::{
     ActiveBucketMetadataScan, ActiveBucketRoute, ActiveMultipartObjectRoute,
     ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectReadRoute,
-    ActivePutObjectRoute, BucketWriteSnapshotAction, LeasedObjectReadSnapshot,
-    LeasedObjectReadSnapshotOutcome, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixMetadataCommandNodeClientConfig, LocalUnixShardNodeClientConfig,
-    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig,
-    ObjectPayloadLease, PlacedSegmentShardHealth, PlacedSegmentShardSetHealth,
-    PlacedSegmentShardSetRisk, PlacedSegmentShardValidation, PreparedStandaloneEmbeddedTopology,
-    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
-    RetainedStreamUploadCleanup, ShardLocation, StorageCluster, StorageClusterRouteAdmission,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    ActivePutObjectRoute, BucketIdentityGenerations, BucketWriteSnapshotAction,
+    LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
+    LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
+    LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
+    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PlacedSegmentShardHealth,
+    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
+    PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey, ReleasedObjectPayloadLease,
+    RetainedObjectPayloadRead, RetainedStreamUploadCleanup, ShardLocation, StorageCluster,
+    StorageClusterRouteAdmission, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
     StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
     StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
     StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
-};
-#[cfg(feature = "test-hooks")]
-pub use cluster::{
-    MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
-    MetadataCommandApplyTestContext, MetadataCommandApplyTestKind, TestDirectPutWrittenSegment,
 };
 pub use control_plane_client_bootstrap::{
     control_plane_clock_recovery_socket_path, ControlPlaneAdminClientBootstrap,
@@ -126,496 +121,403 @@ pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
     LivePgMetadataTransferError, LivePgMetadataTransferFailpoint, LivePgMetadataTransferSummary,
 };
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub use maintenance::StorageStreamSessionSweepTestSummary;
-#[cfg(feature = "test-hooks")]
-#[doc(hidden)]
-pub use maintenance::{
-    install_reclaim_worker_test_hooks, StorageReclaimWorkerTestHookGuard,
-    StorageReclaimWorkerTestHooks,
-};
 pub use maintenance::{
     StorageMaintenanceAdmission, StorageMaintenancePermit, StorageMaintenanceStartError,
     StorageReclaimSweeper, StorageShardBackfillSweeper, StorageShardRepairSweeper,
     StorageShardScavengerSweeper, StorageStreamSessionSweeper,
 };
 
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestBucketDeleteFinalizeRoot {
-    pub bucket: BucketName,
-    pub bucket_incarnation_generation: u64,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<BucketDeleteFinalizeRoot> for TestBucketDeleteFinalizeRoot {
-    fn from(root: BucketDeleteFinalizeRoot) -> Self {
-        Self {
-            bucket: root.bucket,
-            bucket_incarnation_generation: root.bucket_incarnation_generation,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<&TestBucketDeleteFinalizeRoot> for BucketDeleteFinalizeRoot {
-    fn from(root: &TestBucketDeleteFinalizeRoot) -> Self {
-        Self {
-            bucket: root.bucket.clone(),
-            bucket_incarnation_generation: root.bucket_incarnation_generation,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestBucketDeleteBeginRoot(BucketDeleteBeginRoot);
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl TestBucketDeleteBeginRoot {
-    pub fn bucket(&self) -> &BucketName {
-        self.0.bucket()
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TestReclaimWorkItem {
-    ObjectPayload((BucketName, ObjectKey, GenerationId)),
-    BucketDeleteBegin(TestBucketDeleteBeginRoot),
-    BucketDelete(TestBucketDeleteFinalizeRoot),
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<ReclaimWorkItem> for TestReclaimWorkItem {
-    fn from(work: ReclaimWorkItem) -> Self {
-        match work {
-            ReclaimWorkItem::ObjectPayload(root) => Self::ObjectPayload(root),
-            ReclaimWorkItem::BucketDeleteBegin(root) => {
-                Self::BucketDeleteBegin(TestBucketDeleteBeginRoot(root))
-            }
-            ReclaimWorkItem::BucketDelete(root) => Self::BucketDelete(root.into()),
-        }
-    }
-}
-
-/// Test-only input for one segment in an impossible durable reclaim fixture.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestObjectSegmentsReclaimSegmentRecord {
-    pub segment_index: u32,
-    pub segment_okh: [u8; 16],
-    pub segment_vid: GenerationId,
-    pub data_pg_id: u32,
-    pub ec: EcShape,
-}
-
-/// Test-only input for an impossible durable segmented-object reclaim fixture.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestObjectSegmentsReclaimRecord {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub generation_id: GenerationId,
-    pub created_at: u64,
-    pub segments: Vec<TestObjectSegmentsReclaimSegmentRecord>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<&TestObjectSegmentsReclaimRecord> for types::ObjectSegmentsReclaimRecord {
-    fn from(reclaim: &TestObjectSegmentsReclaimRecord) -> Self {
-        Self {
-            bucket: reclaim.bucket.clone(),
-            key: reclaim.key.clone(),
-            generation_id: reclaim.generation_id,
-            created_at: reclaim.created_at,
-            segments: reclaim
-                .segments
-                .iter()
-                .map(|segment| types::ObjectSegmentsReclaimSegmentRecord {
-                    segment_index: segment.segment_index,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    data_pg_id: segment.data_pg_id,
-                    ec: segment.ec,
-                })
-                .collect(),
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<types::ObjectSegmentsReclaimRecord> for TestObjectSegmentsReclaimRecord {
-    fn from(reclaim: types::ObjectSegmentsReclaimRecord) -> Self {
-        Self {
-            bucket: reclaim.bucket,
-            key: reclaim.key,
-            generation_id: reclaim.generation_id,
-            created_at: reclaim.created_at,
-            segments: reclaim
-                .segments
-                .into_iter()
-                .map(|segment| TestObjectSegmentsReclaimSegmentRecord {
-                    segment_index: segment.segment_index,
-                    segment_okh: segment.segment_okh,
-                    segment_vid: segment.segment_vid,
-                    data_pg_id: segment.data_pg_id,
-                    ec: segment.ec,
-                })
-                .collect(),
-        }
-    }
-}
-
-/// Test-only input for one segment in an impossible durable multipart reclaim fixture.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestMultipartReclaimPartSegmentRecord {
-    pub part_number: u32,
-    pub segment_index: u32,
-    pub segment_okh: [u8; 16],
-    pub segment_vid: GenerationId,
-    pub data_pg_id: u32,
-    pub ec: EcShape,
-}
-
-/// Test-only input for one multipart part in an impossible durable reclaim fixture.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestMultipartReclaimPartRecord {
-    pub part_number: u32,
-    pub segments: Vec<TestMultipartReclaimPartSegmentRecord>,
-}
-
-/// Test-only input for an impossible durable multipart reclaim fixture.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestMultipartReclaimRecord {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub generation_id: GenerationId,
-    pub created_at: u64,
-    pub parts: Vec<TestMultipartReclaimPartRecord>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<&TestMultipartReclaimRecord> for types::MultipartReclaimRecord {
-    fn from(reclaim: &TestMultipartReclaimRecord) -> Self {
-        Self {
-            bucket: reclaim.bucket.clone(),
-            key: reclaim.key.clone(),
-            generation_id: reclaim.generation_id,
-            created_at: reclaim.created_at,
-            parts: reclaim
-                .parts
-                .iter()
-                .map(|part| types::MultipartReclaimPartRecord {
-                    part_number: part.part_number,
-                    segments: part
-                        .segments
-                        .iter()
-                        .map(|segment| types::MultipartReclaimPartSegmentRecord {
-                            part_number: segment.part_number,
-                            segment_index: segment.segment_index,
-                            segment_okh: segment.segment_okh,
-                            segment_vid: segment.segment_vid,
-                            data_pg_id: segment.data_pg_id,
-                            ec: segment.ec,
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }
-    }
-}
-
-/// Test-only observation of a bucket-scoped durable reclaim root.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestPayloadReclaimRoot {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub generation_id: GenerationId,
-}
-
-/// Test-only logical observation of one durable multipart upload.
+/// Feature-gated support for tests which must cross the storage crate boundary.
 ///
-/// The production record remains storage-private. This projection lets
-/// cross-crate behavioral tests inspect the S3-visible state they established
-/// without depending on the database/RPC record type.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Clone, PartialEq, Eq)]
-pub struct TestMultipartUploadRecord {
-    pub upload_id: UploadId,
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub initiated_at: u64,
-    pub state: UploadState,
-    pub tags: Option<s3_types::TagSet>,
-    pub metadata_blob: SerializedMetadataBlob,
-    pub system_metadata_blob: SerializedSystemMetadataBlob,
-    pub initiator: OwnerIdentity,
-    pub owner: OwnerIdentity,
-    pub acl_grants: AclGrants,
-    pub public_read: bool,
-    pub object_generation_id: GenerationId,
-    pub object_lock: ObjectLockState,
-    pub checksum: Option<MultipartChecksumConfig>,
-    pub encryption: ObjectEncryption,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl std::fmt::Debug for TestMultipartUploadRecord {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("TestMultipartUploadRecord")
-            .field("upload_id", &self.upload_id)
-            .field("bucket", &self.bucket)
-            .field("key", &self.key)
-            .field("initiated_at", &self.initiated_at)
-            .field("state", &self.state)
-            .field("tag_count", &self.tags.as_ref().map(s3_types::TagSet::len))
-            .field("object_generation_id", &self.object_generation_id)
-            .finish_non_exhaustive()
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<types::MultipartUploadRecord> for TestMultipartUploadRecord {
-    fn from(upload: types::MultipartUploadRecord) -> Self {
-        Self {
-            upload_id: upload.upload_id,
-            bucket: upload.bucket,
-            key: upload.key,
-            initiated_at: upload.initiated_at,
-            state: upload.state,
-            tags: upload.tags.map(|tags| tags.tag_set().clone()),
-            metadata_blob: upload.metadata_blob,
-            system_metadata_blob: upload.system_metadata_blob,
-            initiator: upload.initiator,
-            owner: upload.owner,
-            acl_grants: upload.acl_grants,
-            public_read: upload.public_read,
-            object_generation_id: upload.object_generation_id,
-            object_lock: upload.object_lock,
-            checksum: upload.checksum,
-            encryption: upload.encryption,
-        }
-    }
-}
-
-/// Test-only observation of one in-progress multipart part.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestMultipartPartRecord {
-    pub upload_id: UploadId,
-    pub part_number: u32,
-    pub generation: u32,
-    pub size: u64,
-    pub payload_crc64: u64,
-    pub etag: Vec<u8>,
-    pub etag_kind: EtagKind,
-    pub part_vid: GenerationId,
-    pub placement_cluster_epoch: ClusterEpoch,
-    pub ec_k: u8,
-    pub ec_m: u8,
-    pub last_modified: u64,
-    pub checksum: Option<ChecksumBytes>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<types::MultipartPartRecord> for TestMultipartPartRecord {
-    fn from(part: types::MultipartPartRecord) -> Self {
-        Self {
-            upload_id: part.upload_id,
-            part_number: part.part_number,
-            generation: part.generation,
-            size: part.size,
-            payload_crc64: part.payload_crc64,
-            etag: part.etag,
-            etag_kind: part.etag_kind,
-            part_vid: part.part_vid,
-            placement_cluster_epoch: part.placement_cluster_epoch,
-            ec_k: part.ec_k,
-            ec_m: part.ec_m,
-            last_modified: part.last_modified,
-            checksum: part.checksum,
-        }
-    }
-}
-
-/// Test-only physical observation used to verify streamed UploadPart cleanup.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestMultipartPartSegmentRecord {
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub upload_id: UploadId,
-    pub version_id: u64,
-    pub part_number: u32,
-    pub segment_index: u32,
-    pub size: u64,
-    pub segment_crc64: u64,
-    pub segment_okh: [u8; 16],
-    pub segment_vid: GenerationId,
-    pub data_pg_id: u32,
-    pub placement_cluster_epoch: ClusterEpoch,
-    pub ec_k: u8,
-    pub ec_m: u8,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<types::MultipartPartSegmentRecord> for TestMultipartPartSegmentRecord {
-    fn from(segment: types::MultipartPartSegmentRecord) -> Self {
-        Self {
-            bucket: segment.bucket,
-            key: segment.key,
-            upload_id: segment.upload_id,
-            version_id: segment.version_id,
-            part_number: segment.part_number,
-            segment_index: segment.segment_index,
-            size: segment.size,
-            segment_crc64: segment.segment_crc64,
-            segment_okh: segment.segment_okh,
-            segment_vid: segment.segment_vid,
-            data_pg_id: segment.data_pg_id,
-            placement_cluster_epoch: segment.placement_cluster_epoch,
-            ec_k: segment.ec_k,
-            ec_m: segment.ec_m,
-        }
-    }
-}
-
-/// Test-only observation of one committed multipart-manifest part.
+/// The completed boundary is limited to logical observations, opaque semantic
+/// fixtures, deterministic fault guards, and test-runtime lifecycle controls.
+/// Phase 5 is moving the remaining physical test seams here temporarily so
+/// they are explicit and owner-scoped before replacing them with opaque
+/// scenarios or owner-local tests. Do not treat membership in this module as
+/// evidence that an item already satisfies the final boundary.
 ///
-/// Production object reads receive `ObjectReadMultipartPart`, which omits all
-/// physical placement details. This projection keeps the few fields needed by
-/// cross-crate placement and manifest-observation regressions behind
-/// `test-hooks`.
+/// AWS-facing tests must not enable this module.
 #[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TestObjectPartRecord {
-    pub part_number: u32,
-    pub size: u64,
-    pub payload_crc64: u64,
-    pub data_pg_id: u32,
-}
+#[doc(hidden)]
+pub mod test_support {
+    use super::*;
 
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<types::ObjectPartRecord> for TestObjectPartRecord {
-    fn from(part: types::ObjectPartRecord) -> Self {
-        Self {
-            part_number: part.part_number,
-            size: part.size,
-            payload_crc64: part.payload_crc64,
-            data_pg_id: part.data_pg_id,
-        }
+    #[cfg(feature = "test-hooks")]
+    pub use super::cluster::{
+        MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
+        MetadataCommandApplyTestContext, MetadataCommandApplyTestKind, TestDirectPutWrittenSegment,
+    };
+    #[cfg(feature = "test-hooks")]
+    pub use super::maintenance::{
+        install_reclaim_worker_test_hooks, StorageReclaimWorkerTestHookGuard,
+        StorageReclaimWorkerTestHooks, StorageStreamSessionSweepTestSummary,
+    };
+    #[cfg(feature = "test-hooks")]
+    pub use super::node::{
+        install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
+    };
+
+    /// Logical input used to drive one shard-backfill worker attempt.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct StorageShardBackfillTestWorkItem {
+        pub request: SegmentStoredBytesRequest,
+        pub source_cluster_epoch: ClusterEpoch,
+        pub desired_cluster_epoch: ClusterEpoch,
     }
-}
 
-/// Test-only logical observation of accepted bucket-deletion progress.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TestBucketDeleteProgress {
-    pub bucket_state: Option<BucketState>,
-    pub has_durable_write_drain: bool,
-    pub has_pending_metadata_command: bool,
-}
-
-/// Test-only durable bucket-deletion outcome fixture.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestBucketDeleteAttemptOutcomeKind {
-    Retryable,
-    NotEmpty,
-    StaleGeneration,
-    MarkDeleting,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<TestBucketDeleteAttemptOutcomeKind> for types::BucketDeleteAttemptOutcomeKind {
-    fn from(value: TestBucketDeleteAttemptOutcomeKind) -> Self {
-        match value {
-            TestBucketDeleteAttemptOutcomeKind::Retryable => Self::Retryable,
-            TestBucketDeleteAttemptOutcomeKind::NotEmpty => Self::NotEmpty,
-            TestBucketDeleteAttemptOutcomeKind::StaleGeneration => Self::StaleGeneration,
-            TestBucketDeleteAttemptOutcomeKind::MarkDeleting => Self::MarkDeleting,
-        }
+    /// Logical result of one deterministic object-payload reclaim attempt.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TestObjectPayloadReclaimAttempt {
+        Completed,
+        Deferred,
+        MissingRoot,
     }
-}
 
-/// Test-only durable bucket-deletion phase fixture.
-#[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestBucketDeleteAttemptPhase {
-    Initial,
-    ReservationWait,
-    PostReservationObjectDrain,
-    StreamCleanup,
-    FinalVisibilityCheck,
-    FinalVisibilityProven,
-    MarkDeleting,
-    PostReservationStreamCleanup,
-}
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TestBucketDeleteFinalizeRoot {
+        pub bucket: BucketName,
+        pub bucket_incarnation_generation: u64,
+    }
 
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<TestBucketDeleteAttemptPhase> for types::BucketDeleteAttemptPhase {
-    fn from(value: TestBucketDeleteAttemptPhase) -> Self {
-        match value {
-            TestBucketDeleteAttemptPhase::Initial => Self::Initial,
-            TestBucketDeleteAttemptPhase::ReservationWait => Self::ReservationWait,
-            TestBucketDeleteAttemptPhase::PostReservationObjectDrain => {
-                Self::PostReservationObjectDrain
-            }
-            TestBucketDeleteAttemptPhase::StreamCleanup => Self::StreamCleanup,
-            TestBucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
-            TestBucketDeleteAttemptPhase::FinalVisibilityProven => Self::FinalVisibilityProven,
-            TestBucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
-            TestBucketDeleteAttemptPhase::PostReservationStreamCleanup => {
-                Self::PostReservationStreamCleanup
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<BucketDeleteFinalizeRoot> for TestBucketDeleteFinalizeRoot {
+        fn from(root: BucketDeleteFinalizeRoot) -> Self {
+            Self {
+                bucket: root.bucket,
+                bucket_incarnation_generation: root.bucket_incarnation_generation,
             }
         }
     }
-}
 
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<types::BucketDeleteAttemptPhase> for TestBucketDeleteAttemptPhase {
-    fn from(value: types::BucketDeleteAttemptPhase) -> Self {
-        match value {
-            types::BucketDeleteAttemptPhase::Initial => Self::Initial,
-            types::BucketDeleteAttemptPhase::ReservationWait => Self::ReservationWait,
-            types::BucketDeleteAttemptPhase::PostReservationObjectDrain => {
-                Self::PostReservationObjectDrain
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<&TestBucketDeleteFinalizeRoot> for BucketDeleteFinalizeRoot {
+        fn from(root: &TestBucketDeleteFinalizeRoot) -> Self {
+            Self {
+                bucket: root.bucket.clone(),
+                bucket_incarnation_generation: root.bucket_incarnation_generation,
             }
-            types::BucketDeleteAttemptPhase::StreamCleanup => Self::StreamCleanup,
-            types::BucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
-            types::BucketDeleteAttemptPhase::FinalVisibilityProven => Self::FinalVisibilityProven,
-            types::BucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
-            types::BucketDeleteAttemptPhase::PostReservationStreamCleanup => {
-                Self::PostReservationStreamCleanup
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TestBucketDeleteBeginRoot(BucketDeleteBeginRoot);
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl TestBucketDeleteBeginRoot {
+        pub fn bucket(&self) -> &BucketName {
+            self.0.bucket()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum TestReclaimWorkItem {
+        ObjectPayload((BucketName, ObjectKey, GenerationId)),
+        BucketDeleteBegin(TestBucketDeleteBeginRoot),
+        BucketDelete(TestBucketDeleteFinalizeRoot),
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<ReclaimWorkItem> for TestReclaimWorkItem {
+        fn from(work: ReclaimWorkItem) -> Self {
+            match work {
+                ReclaimWorkItem::ObjectPayload(root) => Self::ObjectPayload(root),
+                ReclaimWorkItem::BucketDeleteBegin(root) => {
+                    Self::BucketDeleteBegin(TestBucketDeleteBeginRoot(root))
+                }
+                ReclaimWorkItem::BucketDelete(root) => Self::BucketDelete(root.into()),
+            }
+        }
+    }
+
+    /// Test-only observation of a bucket-scoped durable reclaim root.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TestPayloadReclaimRoot {
+        pub bucket: BucketName,
+        pub key: ObjectKey,
+        pub generation_id: GenerationId,
+    }
+
+    /// Test-only logical observation of one durable multipart upload.
+    ///
+    /// The production record remains storage-private. This projection lets
+    /// cross-crate behavioral tests inspect the S3-visible state they established
+    /// without depending on the database/RPC record type.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct TestMultipartUploadRecord {
+        pub upload_id: UploadId,
+        pub bucket: BucketName,
+        pub key: ObjectKey,
+        pub initiated_at: u64,
+        pub state: UploadState,
+        pub tags: Option<s3_types::TagSet>,
+        pub metadata_blob: SerializedMetadataBlob,
+        pub system_metadata_blob: SerializedSystemMetadataBlob,
+        pub initiator: OwnerIdentity,
+        pub owner: OwnerIdentity,
+        pub acl_grants: AclGrants,
+        pub public_read: bool,
+        pub object_generation_id: GenerationId,
+        pub object_lock: ObjectLockState,
+        pub checksum: Option<MultipartChecksumConfig>,
+        pub encryption: ObjectEncryption,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl std::fmt::Debug for TestMultipartUploadRecord {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestMultipartUploadRecord")
+                .field("upload_id", &self.upload_id)
+                .field("bucket", &self.bucket)
+                .field("key", &self.key)
+                .field("initiated_at", &self.initiated_at)
+                .field("state", &self.state)
+                .field("tag_count", &self.tags.as_ref().map(s3_types::TagSet::len))
+                .field("object_generation_id", &self.object_generation_id)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<types::MultipartUploadRecord> for TestMultipartUploadRecord {
+        fn from(upload: types::MultipartUploadRecord) -> Self {
+            Self {
+                upload_id: upload.upload_id,
+                bucket: upload.bucket,
+                key: upload.key,
+                initiated_at: upload.initiated_at,
+                state: upload.state,
+                tags: upload.tags.map(|tags| tags.tag_set().clone()),
+                metadata_blob: upload.metadata_blob,
+                system_metadata_blob: upload.system_metadata_blob,
+                initiator: upload.initiator,
+                owner: upload.owner,
+                acl_grants: upload.acl_grants,
+                public_read: upload.public_read,
+                object_generation_id: upload.object_generation_id,
+                object_lock: upload.object_lock,
+                checksum: upload.checksum,
+                encryption: upload.encryption,
+            }
+        }
+    }
+
+    /// Test-only observation of one in-progress multipart part.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TestMultipartPartRecord {
+        pub upload_id: UploadId,
+        pub part_number: u32,
+        pub generation: u32,
+        pub size: u64,
+        pub payload_crc64: u64,
+        pub etag: Vec<u8>,
+        pub etag_kind: EtagKind,
+        pub part_vid: GenerationId,
+        pub placement_cluster_epoch: ClusterEpoch,
+        pub ec_k: u8,
+        pub ec_m: u8,
+        pub last_modified: u64,
+        pub checksum: Option<ChecksumBytes>,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<types::MultipartPartRecord> for TestMultipartPartRecord {
+        fn from(part: types::MultipartPartRecord) -> Self {
+            Self {
+                upload_id: part.upload_id,
+                part_number: part.part_number,
+                generation: part.generation,
+                size: part.size,
+                payload_crc64: part.payload_crc64,
+                etag: part.etag,
+                etag_kind: part.etag_kind,
+                part_vid: part.part_vid,
+                placement_cluster_epoch: part.placement_cluster_epoch,
+                ec_k: part.ec_k,
+                ec_m: part.ec_m,
+                last_modified: part.last_modified,
+                checksum: part.checksum,
+            }
+        }
+    }
+
+    /// Test-only physical observation used to verify streamed UploadPart cleanup.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TestMultipartPartSegmentRecord {
+        pub bucket: BucketName,
+        pub key: ObjectKey,
+        pub upload_id: UploadId,
+        pub version_id: u64,
+        pub part_number: u32,
+        pub segment_index: u32,
+        pub size: u64,
+        pub segment_crc64: u64,
+        pub segment_okh: [u8; 16],
+        pub segment_vid: GenerationId,
+        pub data_pg_id: u32,
+        pub placement_cluster_epoch: ClusterEpoch,
+        pub ec_k: u8,
+        pub ec_m: u8,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<types::MultipartPartSegmentRecord> for TestMultipartPartSegmentRecord {
+        fn from(segment: types::MultipartPartSegmentRecord) -> Self {
+            Self {
+                bucket: segment.bucket,
+                key: segment.key,
+                upload_id: segment.upload_id,
+                version_id: segment.version_id,
+                part_number: segment.part_number,
+                segment_index: segment.segment_index,
+                size: segment.size,
+                segment_crc64: segment.segment_crc64,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                data_pg_id: segment.data_pg_id,
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                ec_k: segment.ec_k,
+                ec_m: segment.ec_m,
+            }
+        }
+    }
+
+    /// Test-only observation of one committed multipart-manifest part.
+    ///
+    /// Production object reads receive `ObjectReadMultipartPart`, which omits all
+    /// physical placement details. This projection keeps the few fields needed by
+    /// cross-crate placement and manifest-observation regressions behind
+    /// `test-hooks`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TestObjectPartRecord {
+        pub part_number: u32,
+        pub size: u64,
+        pub payload_crc64: u64,
+        pub data_pg_id: u32,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<types::ObjectPartRecord> for TestObjectPartRecord {
+        fn from(part: types::ObjectPartRecord) -> Self {
+            Self {
+                part_number: part.part_number,
+                size: part.size,
+                payload_crc64: part.payload_crc64,
+                data_pg_id: part.data_pg_id,
+            }
+        }
+    }
+
+    /// Test-only logical observation of accepted bucket-deletion progress.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TestBucketDeleteProgress {
+        pub bucket_state: Option<BucketState>,
+        pub has_durable_write_drain: bool,
+        pub has_pending_metadata_command: bool,
+    }
+
+    /// Test-only durable bucket-deletion outcome fixture.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TestBucketDeleteAttemptOutcomeKind {
+        Retryable,
+        NotEmpty,
+        StaleGeneration,
+        MarkDeleting,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<TestBucketDeleteAttemptOutcomeKind> for types::BucketDeleteAttemptOutcomeKind {
+        fn from(value: TestBucketDeleteAttemptOutcomeKind) -> Self {
+            match value {
+                TestBucketDeleteAttemptOutcomeKind::Retryable => Self::Retryable,
+                TestBucketDeleteAttemptOutcomeKind::NotEmpty => Self::NotEmpty,
+                TestBucketDeleteAttemptOutcomeKind::StaleGeneration => Self::StaleGeneration,
+                TestBucketDeleteAttemptOutcomeKind::MarkDeleting => Self::MarkDeleting,
+            }
+        }
+    }
+
+    /// Test-only durable bucket-deletion phase fixture.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TestBucketDeleteAttemptPhase {
+        Initial,
+        ReservationWait,
+        PostReservationObjectDrain,
+        StreamCleanup,
+        FinalVisibilityCheck,
+        FinalVisibilityProven,
+        MarkDeleting,
+        PostReservationStreamCleanup,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<TestBucketDeleteAttemptPhase> for types::BucketDeleteAttemptPhase {
+        fn from(value: TestBucketDeleteAttemptPhase) -> Self {
+            match value {
+                TestBucketDeleteAttemptPhase::Initial => Self::Initial,
+                TestBucketDeleteAttemptPhase::ReservationWait => Self::ReservationWait,
+                TestBucketDeleteAttemptPhase::PostReservationObjectDrain => {
+                    Self::PostReservationObjectDrain
+                }
+                TestBucketDeleteAttemptPhase::StreamCleanup => Self::StreamCleanup,
+                TestBucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
+                TestBucketDeleteAttemptPhase::FinalVisibilityProven => Self::FinalVisibilityProven,
+                TestBucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
+                TestBucketDeleteAttemptPhase::PostReservationStreamCleanup => {
+                    Self::PostReservationStreamCleanup
+                }
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<types::BucketDeleteAttemptPhase> for TestBucketDeleteAttemptPhase {
+        fn from(value: types::BucketDeleteAttemptPhase) -> Self {
+            match value {
+                types::BucketDeleteAttemptPhase::Initial => Self::Initial,
+                types::BucketDeleteAttemptPhase::ReservationWait => Self::ReservationWait,
+                types::BucketDeleteAttemptPhase::PostReservationObjectDrain => {
+                    Self::PostReservationObjectDrain
+                }
+                types::BucketDeleteAttemptPhase::StreamCleanup => Self::StreamCleanup,
+                types::BucketDeleteAttemptPhase::FinalVisibilityCheck => Self::FinalVisibilityCheck,
+                types::BucketDeleteAttemptPhase::FinalVisibilityProven => {
+                    Self::FinalVisibilityProven
+                }
+                types::BucketDeleteAttemptPhase::MarkDeleting => Self::MarkDeleting,
+                types::BucketDeleteAttemptPhase::PostReservationStreamCleanup => {
+                    Self::PostReservationStreamCleanup
+                }
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl From<types::PayloadReclaimRoot> for TestPayloadReclaimRoot {
+        fn from(root: types::PayloadReclaimRoot) -> Self {
+            Self {
+                bucket: root.bucket,
+                key: root.key,
+                generation_id: root.generation_id,
             }
         }
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<types::PayloadReclaimRoot> for TestPayloadReclaimRoot {
-    fn from(root: types::PayloadReclaimRoot) -> Self {
-        Self {
-            bucket: root.bucket,
-            key: root.key,
-            generation_id: root.generation_id,
-        }
-    }
-}
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;
-#[cfg(feature = "test-hooks")]
-pub use node::{
-    install_bucket_scoped_test_hooks, BucketScopedTestHookGuard, BucketScopedTestHooks,
-};
 pub use node::{BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome};
 pub(crate) use node::{BucketDeleteBeginRoot, ReclaimWorkItem};
 pub(crate) use node_runtime::role_facade::ObjectMetadataScanPgId;
@@ -651,6 +553,12 @@ pub use storage_rpc_auth::{
     AdminStorageRpcClientCapability, FrontendStorageRpcClientCapability,
     MaintenanceStorageRpcClientCapability, StorageNodeStorageRpcClientCapability,
     StorageRpcServerAuthConfig, StorageRpcTransportLimits, STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) use test_support::{
+    TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
+    TestBucketDeleteProgress, TestMultipartPartRecord, TestMultipartPartSegmentRecord,
+    TestMultipartUploadRecord, TestObjectPartRecord, TestPayloadReclaimRoot, TestReclaimWorkItem,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

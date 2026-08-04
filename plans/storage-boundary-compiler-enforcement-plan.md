@@ -5605,6 +5605,13 @@ logical observations, and deterministic fault guards. A separate crate is
 appropriate only for composition helpers implemented entirely through the
 normal public logical API.
 
+The namespace is a migration boundary, not an automatic certification of each
+item placed in it. Until slice 3 is complete, the remaining physical
+observations and mutation helpers must be treated as explicit transitional
+exceptions and inventoried here. Moving a symbol under `test_support` does not
+make raw PG IDs, shard identities, EC layouts, durable rows, or generic
+mutation methods acceptable final APIs.
+
 The audit found four remaining classes of work:
 
 1. **Raw or semantically different test execution paths.** Some coordinator
@@ -5712,7 +5719,28 @@ Implementation update (2026-08-03):
 - rewrote the UploadPart runtime-map regressions to prove that admitted
   creation/finalization holds publication until completion, instead of
   pinning an independently captured raw cluster pointer or synchronously
-  publishing while the admitted operation is paused.
+  publishing while the admitted operation is paused; and
+- introduced the owner-scoped `storage::test_support` namespace and moved the
+  existing cross-crate logical projections, reclaim/delete fixtures,
+  deterministic metadata/bucket hook types, and reclaim-worker lifecycle
+  controls off the storage crate root. Storage keeps only crate-private aliases
+  needed by its implementation, while downstream tests must explicitly name
+  the test-support boundary. The concrete `cluster` module is now private;
+  production capabilities remain available only through the curated storage
+  façade, and cluster-local test DTOs/guards cannot escape accidentally;
+- replaced the cross-crate segmented and multipart reclaim-record constructors
+  with storage-owned scenario methods. Callers can select only the logical
+  bucket, key, generation, and ordering timestamp; storage derives the hash,
+  data-PG placement, segment/part shape, and EC geometry. Reclaim observation
+  exposes presence only, rather than returning the physical durable record;
+  and
+- retained physical multipart segment/part observations, segment-layout
+  replacement, lifecycle-claim insertion, upload/session state and timestamp
+  mutation, deleting-bucket construction, and raw reclaim-queue controls are
+  explicit transitional exceptions still owned by implementation slice 3.
+  They do not satisfy the final curated-boundary completion criterion merely
+  because they now live under `storage::test_support` or on a feature-gated
+  `StorageCluster` implementation.
 
 Completion:
 

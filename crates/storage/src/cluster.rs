@@ -14,10 +14,7 @@ use ring::rand::SecureRandom;
 
 pub use crate::node_client::LocalUnixStorageNodeClientAdmissionSettings;
 pub use local::{
-    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixBucketWriteReservationNodeClientConfig, LocalUnixMetadataCommandNodeClientConfig,
-    LocalUnixObjectGenerationMetadataNodeClientConfig,
-    LocalUnixObjectListingMetadataNodeClientConfig, LocalUnixObjectVersionMetadataNodeClientConfig,
+    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
 use local::{
@@ -77,6 +74,8 @@ use crate::storage_rpc::{
     StorageRpcErrorCode, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES, STORAGE_RPC_MAX_PAYLOAD_LEN,
 };
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::test_support::StorageShardBackfillTestWorkItem;
 #[cfg(test)]
 use crate::traits::PgMetadataStore;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -512,15 +511,6 @@ impl From<PlacedSegmentShardRepairRecord> for StorageShardRepairTestRecord {
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StorageShardBackfillTestWorkItem {
-    pub request: SegmentStoredBytesRequest,
-    pub source_cluster_epoch: ClusterEpoch,
-    pub desired_cluster_epoch: ClusterEpoch,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct TestDirectPutWrittenSegment {
     pub data_pg_id: u32,
@@ -787,15 +777,7 @@ pub(crate) enum ObjectPayloadReclaimAttempt {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TestObjectPayloadReclaimAttempt {
-    Completed,
-    Deferred,
-    MissingRoot,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<ObjectPayloadReclaimAttempt> for TestObjectPayloadReclaimAttempt {
+impl From<ObjectPayloadReclaimAttempt> for crate::test_support::TestObjectPayloadReclaimAttempt {
     fn from(value: ObjectPayloadReclaimAttempt) -> Self {
         match value {
             ObjectPayloadReclaimAttempt::Completed => Self::Completed,

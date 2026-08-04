@@ -4,7 +4,6 @@ use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
 use std::sync::Arc;
-use storage::{EcShape, TestObjectSegmentsReclaimRecord, TestObjectSegmentsReclaimSegmentRecord};
 
 fn create_bucket_with_explicit_writer_grant(
     coord: &Coordinator,
@@ -1310,28 +1309,9 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
     let generation_id = GenerationId::new(1).unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("ghost");
-    let data_pg_id = coord
-        .storage_node()
-        .test_data_pg_id_for(&bucket, &key, generation_id);
     coord
         .storage_node()
-        .test_put_object_segments_reclaim(
-            &bucket,
-            &key,
-            &TestObjectSegmentsReclaimRecord {
-                bucket: bucket.clone(),
-                key: key.clone(),
-                generation_id,
-                created_at: 1,
-                segments: vec![TestObjectSegmentsReclaimSegmentRecord {
-                    segment_index: 0,
-                    segment_okh: object_key_hash("bucket", "ghost"),
-                    segment_vid: generation_id,
-                    data_pg_id,
-                    ec: EcShape { k: 4, m: 2 },
-                }],
-            },
-        )
+        .test_seed_segmented_payload_reclaim(&bucket, &key, generation_id, 1)
         .unwrap();
 
     delete_bucket_eventually_test(&coord, "bucket").unwrap();
@@ -1342,11 +1322,10 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
 
     wait_until_bucket_gone(&coord, "bucket");
 
-    assert!(coord
+    assert!(!coord
         .storage_node()
-        .test_get_object_segments_reclaim(&bucket, &key, generation_id)
-        .unwrap()
-        .is_none());
+        .test_payload_reclaim_exists(&bucket, &key, generation_id)
+        .unwrap());
 }
 
 #[test]

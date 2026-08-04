@@ -470,12 +470,10 @@ impl Coordinator {
                 request_started.elapsed().as_micros()
             ),
         );
-        if let Err(err) =
-            route.begin_bucket_delete_if_current(storage::cluster::BucketIdentityGenerations {
-                bucket_execution_generation,
-                bucket_incarnation_generation,
-            })
-        {
+        if let Err(err) = route.begin_bucket_delete_if_current(storage::BucketIdentityGenerations {
+            bucket_execution_generation,
+            bucket_incarnation_generation,
+        }) {
             let _ = observability::emit_flight_event(
                 TRACE_TARGET,
                 "bucket_delete_begin_failed",
