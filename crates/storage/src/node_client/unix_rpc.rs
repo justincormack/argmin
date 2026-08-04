@@ -1701,10 +1701,16 @@ impl UnixStorageNodeClient {
         rpc_admission: Arc<UnixStorageNodeRpcAdmission>,
         rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
     ) -> Self {
+        // Unit-test servers commonly serve one connection synchronously per
+        // `accept_one`; production listeners always use per-connection workers.
+        #[cfg(test)]
+        let endpoint = StorageRpcClientEndpoint::unpooled_unix_for_test(socket_path);
+        #[cfg(not(test))]
+        let endpoint = StorageRpcClientEndpoint::unix(socket_path);
         Self::with_endpoint_and_rpc_admission(
             node_id,
             cluster_epoch,
-            StorageRpcClientEndpoint::unix(socket_path),
+            endpoint,
             rpc_admission,
             rpc_auth,
         )

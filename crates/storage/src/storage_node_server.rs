@@ -3209,22 +3209,9 @@ impl StorageNodeServer {
             bind_storage_node_route_map_lease(next_config.route_map_validity)?;
         let current_config = self.config_snapshot_arc();
         validate_runtime_config_install(&current_config, &next_config)?;
-        #[cfg(test)]
-        let stage_test_hook = self
-            .runtime_config_stage_test_hook
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone();
-        #[cfg(test)]
-        let staged_config =
-            next_config.stage_control_plane_runtime_config_with_post_write(|| {
-                if let Some(hook) = stage_test_hook {
-                    hook();
-                }
-            })?;
-        #[cfg(not(test))]
-        let staged_config = next_config.stage_control_plane_runtime_config()?;
 
+        // Lease renewal is volatile serving authority. Keep the last complete
+        // topology as the restart checkpoint; bootstrap refreshes it before bind.
         if next_config.only_extends_route_map_validity_from(&current_config) {
             #[cfg(test)]
             if let Some(hook) = self
@@ -3241,7 +3228,6 @@ impl StorageNodeServer {
                 .unwrap_or_else(|e| e.into_inner());
             validate_runtime_config_install(&current_state.config, &next_config)?;
             if next_config.only_extends_route_map_validity_from(&current_state.config) {
-                staged_config.publish()?;
                 *current_state = StorageNodeRuntimeRouteState {
                     config: Arc::new(next_config),
                     route_map_lease: next_route_map_lease,
@@ -3249,6 +3235,22 @@ impl StorageNodeServer {
                 return Ok(());
             }
         }
+
+        #[cfg(test)]
+        let stage_test_hook = self
+            .runtime_config_stage_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        #[cfg(test)]
+        let staged_config =
+            next_config.stage_control_plane_runtime_config_with_post_write(|| {
+                if let Some(hook) = stage_test_hook {
+                    hook();
+                }
+            })?;
+        #[cfg(not(test))]
+        let staged_config = next_config.stage_control_plane_runtime_config()?;
 
         let _transition = self.route_admission.begin_transition();
         #[cfg(test)]
@@ -24601,7 +24603,7 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_unix_storage_rpc_crosses_real_server_boundary() {
+    fn authenticated_unix_storage_rpc_reuses_connection_across_real_server_boundary() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -24614,21 +24616,24 @@ mod tests {
             .unwrap();
         let socket_path = config.socket_path.clone();
         let join = thread::spawn(move || server.accept_one());
-        let client = UnixStorageNodeClient::with_rpc_admission_settings_and_auth(
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
             config.node_id,
             config.cluster_epoch,
-            socket_path,
+            StorageRpcClientEndpoint::unix(socket_path),
             LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
             Some(storage_rpc_client_auth(credential, 9)),
         );
 
-        let payload = client
-            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
-            .unwrap();
-        let health = decode_health_response(&payload).unwrap();
+        for _ in 0..2 {
+            let payload = client
+                .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+                .unwrap();
+            let health = decode_health_response(&payload).unwrap();
 
-        assert_eq!(health.node_id, config.node_id);
-        assert_eq!(health.cluster_epoch, config.cluster_epoch);
+            assert_eq!(health.node_id, config.node_id);
+            assert_eq!(health.cluster_epoch, config.cluster_epoch);
+        }
+        drop(client);
         assert!(join.join().unwrap().is_ok());
     }
 
@@ -25989,16 +25994,27 @@ mod tests {
     }
 
     #[test]
-    fn storage_node_runtime_config_validity_extension_does_not_drain_frames() {
+    fn storage_node_runtime_config_validity_extension_is_memory_only_and_does_not_drain_frames() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);
         config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
         private_socket_dir(config.socket_path.parent().unwrap());
         let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        config.persist_control_plane_runtime_config().unwrap();
+        let persisted_path = control_plane_runtime_config_path(&config.data_dir);
+        let persisted_before = fs::read(&persisted_path).unwrap();
+        let staged = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let staged_from_hook = Arc::clone(&staged);
+        *server
+            .runtime_config_stage_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            staged_from_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
         let admitted = server
             .route_admission
             .acquire(StorageNodeRouteAdmissionClass::Active);
-        let mut extended = config;
+        let mut extended = config.clone();
         extended.route_map_validity = RouteMapValidity::until_ms(6_000).unwrap();
 
         let (installed_tx, installed_rx) = mpsc::channel();
@@ -26016,6 +26032,25 @@ mod tests {
         assert_eq!(
             server.config_snapshot().route_map_valid_until_ms(),
             Some(6_000)
+        );
+        assert_eq!(
+            staged.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "validity-only extension must not stage the unchanged route map"
+        );
+        assert_eq!(fs::read(&persisted_path).unwrap(), persisted_before);
+        assert_eq!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            )
+            .unwrap()
+            .unwrap()
+            .route_map_valid_until_ms(),
+            Some(5_000),
+            "the durable route map remains a fail-closed restart checkpoint"
         );
         drop(admitted);
         installer.join().unwrap();

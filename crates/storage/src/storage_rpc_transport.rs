@@ -31,7 +31,10 @@ pub struct StorageRpcClientEndpoint {
 enum StorageRpcClientEndpointInner {
     Unix {
         socket_path: PathBuf,
+        request_pool: Arc<StorageRpcClientConnectionPool>,
     },
+    #[cfg(test)]
+    TestUnpooledUnix { socket_path: PathBuf },
     Tcp {
         advertised_endpoint: String,
         addresses: Vec<SocketAddr>,
@@ -73,6 +76,16 @@ impl StorageRpcClientEndpoint {
     pub fn unix(socket_path: impl Into<PathBuf>) -> Self {
         Self {
             inner: StorageRpcClientEndpointInner::Unix {
+                socket_path: socket_path.into(),
+                request_pool: Arc::new(StorageRpcClientConnectionPool::new()),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unpooled_unix_for_test(socket_path: impl Into<PathBuf>) -> Self {
+        Self {
+            inner: StorageRpcClientEndpointInner::TestUnpooledUnix {
                 socket_path: socket_path.into(),
             },
         }
@@ -131,10 +144,7 @@ impl StorageRpcClientEndpoint {
                 addresses,
                 server_name,
                 tls_client_config,
-                request_pool: Arc::new(StorageRpcClientConnectionPool {
-                    state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
-                    available: Condvar::new(),
-                }),
+                request_pool: Arc::new(StorageRpcClientConnectionPool::new()),
             },
         })
     }
@@ -142,7 +152,11 @@ impl StorageRpcClientEndpoint {
     #[must_use]
     pub fn advertised_endpoint(&self) -> String {
         match &self.inner {
-            StorageRpcClientEndpointInner::Unix { socket_path } => {
+            StorageRpcClientEndpointInner::Unix { socket_path, .. } => {
+                socket_path.to_string_lossy().into_owned()
+            }
+            #[cfg(test)]
+            StorageRpcClientEndpointInner::TestUnpooledUnix { socket_path } => {
                 socket_path.to_string_lossy().into_owned()
             }
             StorageRpcClientEndpointInner::Tcp {
@@ -154,7 +168,11 @@ impl StorageRpcClientEndpoint {
 
     pub(crate) fn authority_identity(&self) -> StorageRpcEndpointAuthorityIdentity<'_> {
         match &self.inner {
-            StorageRpcClientEndpointInner::Unix { socket_path } => {
+            StorageRpcClientEndpointInner::Unix { socket_path, .. } => {
+                StorageRpcEndpointAuthorityIdentity::Unix(socket_path.as_path())
+            }
+            #[cfg(test)]
+            StorageRpcClientEndpointInner::TestUnpooledUnix { socket_path } => {
                 StorageRpcEndpointAuthorityIdentity::Unix(socket_path.as_path())
             }
             StorageRpcClientEndpointInner::Tcp {
@@ -167,7 +185,9 @@ impl StorageRpcClientEndpoint {
     #[must_use]
     pub fn unix_socket_path(&self) -> Option<&Path> {
         match &self.inner {
-            StorageRpcClientEndpointInner::Unix { socket_path } => Some(socket_path),
+            StorageRpcClientEndpointInner::Unix { socket_path, .. } => Some(socket_path),
+            #[cfg(test)]
+            StorageRpcClientEndpointInner::TestUnpooledUnix { socket_path } => Some(socket_path),
             StorageRpcClientEndpointInner::Tcp { .. } => None,
         }
     }
@@ -179,7 +199,17 @@ impl StorageRpcClientEndpoint {
 
     pub(crate) fn connect(&self, deadline: Instant) -> io::Result<BoxStorageRpcStream> {
         match &self.inner {
-            StorageRpcClientEndpointInner::Unix { socket_path } => {
+            StorageRpcClientEndpointInner::Unix { socket_path, .. } => {
+                let stream = UnixStream::connect(socket_path)?;
+                let stream = DeadlineStream::new(
+                    stream,
+                    deadline,
+                    "storage RPC absolute operation deadline expired",
+                )?;
+                Ok(Box::new(stream))
+            }
+            #[cfg(test)]
+            StorageRpcClientEndpointInner::TestUnpooledUnix { socket_path } => {
                 let stream = UnixStream::connect(socket_path)?;
                 let stream = DeadlineStream::new(
                     stream,
@@ -204,7 +234,20 @@ impl StorageRpcClientEndpoint {
         max_connections: usize,
     ) -> io::Result<StorageRpcRequestConnection> {
         match &self.inner {
-            StorageRpcClientEndpointInner::Unix { .. } => {
+            StorageRpcClientEndpointInner::Unix {
+                socket_path,
+                request_pool,
+            } => request_pool.checkout(deadline, io_timeout, max_connections, || {
+                let stream = UnixStream::connect(socket_path)?;
+                let stream = DeadlineStream::new(
+                    stream,
+                    deadline,
+                    "storage RPC absolute operation deadline expired",
+                )?;
+                Ok(Box::new(stream))
+            }),
+            #[cfg(test)]
+            StorageRpcClientEndpointInner::TestUnpooledUnix { .. } => {
                 self.connect(deadline)
                     .map(|stream| StorageRpcRequestConnection {
                         stream: Some(stream),
@@ -298,6 +341,13 @@ pub(crate) fn validate_storage_rpc_tls_server_config(
 }
 
 impl StorageRpcClientConnectionPool {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
+            available: Condvar::new(),
+        }
+    }
+
     fn checkout(
         self: &Arc<Self>,
         deadline: Instant,
@@ -422,8 +472,13 @@ impl Drop for StorageRpcRequestConnection {
 impl fmt::Debug for StorageRpcClientEndpoint {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
-            StorageRpcClientEndpointInner::Unix { socket_path } => f
+            StorageRpcClientEndpointInner::Unix { socket_path, .. } => f
                 .debug_struct("StorageRpcClientEndpoint::Unix")
+                .field("socket_path", socket_path)
+                .finish(),
+            #[cfg(test)]
+            StorageRpcClientEndpointInner::TestUnpooledUnix { socket_path } => f
+                .debug_struct("StorageRpcClientEndpoint::TestUnpooledUnix")
                 .field("socket_path", socket_path)
                 .finish(),
             StorageRpcClientEndpointInner::Tcp {
@@ -851,10 +906,7 @@ mod tests {
 
     #[test]
     fn request_pool_reuses_only_successfully_completed_connections() {
-        let pool = Arc::new(StorageRpcClientConnectionPool {
-            state: Mutex::new(StorageRpcClientConnectionPoolState::default()),
-            available: Condvar::new(),
-        });
+        let pool = Arc::new(StorageRpcClientConnectionPool::new());
         let deadline = Instant::now() + Duration::from_secs(1);
         let (first_stream, _first_peer) = UnixStream::pair().unwrap();
         let mut first = pool
