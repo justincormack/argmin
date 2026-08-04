@@ -35,8 +35,8 @@ use server_core::sse::{
 use storage::control_plane::{
     ensure_control_plane_state_parent_directory, invalidate_authority_clock_restart_checkpoint,
     load_authority_clock_restart_checkpoint, store_authority_clock_restart_checkpoint,
-    AuthenticatedUnixControlPlaneClient, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAdmin, ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
+    ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneAdmin,
+    ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
     ControlPlaneAuthorityClock, ControlPlaneAuthorityClockCheckpointBinding,
     ControlPlaneAuthorityClockCheckpointTarget, ControlPlaneAuthorityClockContext,
     ControlPlaneError, ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
@@ -45,9 +45,10 @@ use storage::control_plane::{
     ControlPlaneRpcServerRole, ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
     ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
     FencedPgMetadataTransferSnapshot, FileControlPlaneStore, LeaseHorizonAuthorityBinding,
-    PgMetadataTransferProof, SingleAuthorityControlPlane, UnixControlPlaneClient,
-    CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    PgMetadataTransferProof, SingleAuthorityControlPlane, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
+#[cfg(test)]
+use storage::control_plane::{AuthenticatedUnixControlPlaneClient, UnixControlPlaneClient};
 #[cfg(test)]
 use storage::control_plane_auth::{ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason};
 use storage::control_plane_auth::{
@@ -1100,21 +1101,14 @@ fn transfer_control_plane_pg_metadata_live(
         .map_err(|error| format!("configuration error: {error}"))?;
     let ec_config = EcConfig::new(config.ec_k, config.ec_m)
         .map_err(|error| format!("invalid EC config: {error}"))?;
-    let (read_client, read_credential) =
-        match build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)? {
-            FrontendControlPlaneClient::Plain(client) => (client, None),
-            FrontendControlPlaneClient::Authenticated(client) => {
-                (client.inner().clone(), Some(client.credential().clone()))
-            }
-        };
+    let frontend = build_frontend_control_plane_client_from_runtime_map_auth_env(socket_path)?;
     let admin_credential = if static_cluster_command_configured() {
         build_admin_credential_binding_from_config(&config)?
     } else {
         build_admin_credential_binding_from_command_auth_env()?
     };
-    let control_plane = storage::LivePgMetadataTransferControlPlaneClient::with_admin_credential(
-        read_client,
-        read_credential,
+    let control_plane = storage::LivePgMetadataTransferControlPlaneClient::with_frontend_client(
+        &frontend,
         &admin_credential,
     )
     .map_err(|error| error.to_string())?;
@@ -3946,123 +3940,12 @@ fn load_process_authority_clock_restart_checkpoint(
     }
 }
 
-enum StorageNodeControlPlaneClient {
-    Plain(UnixControlPlaneClient),
-    Authenticated(AuthenticatedUnixControlPlaneClient),
-}
-
-enum FrontendControlPlaneClient {
-    Plain(UnixControlPlaneClient),
-    Authenticated(AuthenticatedUnixControlPlaneClient),
-}
-
-impl ControlPlaneHeartbeatRuntimeMapSource for StorageNodeControlPlaneClient {
-    fn refresh_node_heartbeat(
-        &mut self,
-        heartbeat: storage::control_plane::NodeHeartbeat,
-        authority_now_ms: u64,
-    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.refresh_node_heartbeat(heartbeat, authority_now_ms),
-            Self::Authenticated(client) => {
-                client.refresh_node_heartbeat(heartbeat, authority_now_ms)
-            }
-        }
-    }
-}
-
-impl ControlPlaneRuntimeMapSource for FrontendControlPlaneClient {
-    fn runtime_map_snapshot(
-        &self,
-        authority_now_ms: u64,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.runtime_map_snapshot(authority_now_ms),
-            Self::Authenticated(client) => client.runtime_map_snapshot(authority_now_ms),
-        }
-    }
-
-    fn runtime_map_status(
-        &self,
-        authority_now_ms: u64,
-    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.runtime_map_status(authority_now_ms),
-            Self::Authenticated(client) => client.runtime_map_status(authority_now_ms),
-        }
-    }
-
-    fn pending_metadata_command_recoveries(
-        &self,
-        authority_now_ms: u64,
-    ) -> Result<storage::control_plane::PendingMetadataCommandRecoveryListing, ControlPlaneError>
-    {
-        match self {
-            Self::Plain(client) => client.pending_metadata_command_recoveries(),
-            Self::Authenticated(client) => {
-                client.pending_metadata_command_recoveries(authority_now_ms)
-            }
-        }
-    }
-
-    fn pg_runtime_map_snapshot(
-        &self,
-        pg_id: PgId,
-        authority_now_ms: u64,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.pg_runtime_map_snapshot(pg_id, authority_now_ms),
-            Self::Authenticated(client) => client.pg_runtime_map_snapshot(pg_id, authority_now_ms),
-        }
-    }
-
-    fn serving_pg_runtime_map_snapshot(
-        &self,
-        pg_id: PgId,
-        authority_now_ms: u64,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.serving_pg_runtime_map_snapshot(pg_id, authority_now_ms),
-            Self::Authenticated(client) => {
-                client.serving_pg_runtime_map_snapshot(pg_id, authority_now_ms)
-            }
-        }
-    }
-}
-
-impl FrontendControlPlaneClient {
-    fn runtime_map_diagnostics(
-        &self,
-    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapDiagnostics, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.runtime_map_diagnostics(),
-            Self::Authenticated(client) => {
-                client.runtime_map_diagnostics(storage::clock::current_time_millis())
-            }
-        }
-    }
-
-    fn runtime_map_status_with_check_applied_timeout(
-        &self,
-    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        match self {
-            Self::Plain(client) => client.runtime_map_status_with_check_applied_timeout(),
-            Self::Authenticated(client) => client.runtime_map_status_with_check_applied_timeout(
-                storage::clock::current_time_millis(),
-            ),
-        }
-    }
-}
-
 fn configured_storage_node_auth_credential(
     configured: &ConfiguredControlPlaneStorageAuthCredential,
 ) -> Result<ControlPlaneStorageNodeAuthCredential, String> {
-    ControlPlaneStorageNodeAuthCredential::new(ControlPlaneStorageNodeAuthCredentialInput {
-        node_id: NodeId::new(configured.node_id),
-        credential_id: configured.credential_id.clone(),
-        credential_version: configured.credential_version,
-        secret: configured.secret.as_bytes().to_vec(),
-    })
+    ControlPlaneStorageNodeAuthCredential::new(configured_storage_node_auth_credential_input(
+        configured,
+    ))
     .map_err(|error| {
         format!(
             "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS credential for node {}: {error}",
@@ -4071,21 +3954,38 @@ fn configured_storage_node_auth_credential(
     })
 }
 
+fn configured_storage_node_auth_credential_input(
+    configured: &ConfiguredControlPlaneStorageAuthCredential,
+) -> ControlPlaneStorageNodeAuthCredentialInput {
+    ControlPlaneStorageNodeAuthCredentialInput {
+        node_id: NodeId::new(configured.node_id),
+        credential_id: configured.credential_id.clone(),
+        credential_version: configured.credential_version,
+        secret: configured.secret.as_bytes().to_vec(),
+    }
+}
+
 fn configured_frontend_auth_credential(
     configured: &ConfiguredControlPlaneFrontendAuthCredential,
 ) -> Result<ControlPlaneFrontendAuthCredential, String> {
-    ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
+    ControlPlaneFrontendAuthCredential::new(configured_frontend_auth_credential_input(configured))
+        .map_err(|error| {
+            format!(
+                "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential for instance {}: {error}",
+                configured.instance_id
+            )
+        })
+}
+
+fn configured_frontend_auth_credential_input(
+    configured: &ConfiguredControlPlaneFrontendAuthCredential,
+) -> ControlPlaneFrontendAuthCredentialInput {
+    ControlPlaneFrontendAuthCredentialInput {
         instance_id: configured.instance_id.clone(),
         credential_id: configured.credential_id.clone(),
         credential_version: configured.credential_version,
         secret: configured.secret.as_bytes().to_vec(),
-    })
-    .map_err(|error| {
-        format!(
-            "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential for instance {}: {error}",
-            configured.instance_id
-        )
-    })
+    }
 }
 
 fn configured_admin_auth_credential(
@@ -4171,46 +4071,26 @@ fn build_control_plane_unix_auth_verifier(
 fn build_frontend_control_plane_client(
     config: &ServerConfig,
     control_plane_socket_path: &str,
-) -> Result<FrontendControlPlaneClient, String> {
-    let client = build_configured_unix_control_plane_client(config, control_plane_socket_path)?;
-    if config.control_plane_frontend_auth_credentials.is_empty() {
-        return Ok(FrontendControlPlaneClient::Plain(client));
-    }
-    let cluster_id = config
-        .control_plane_auth_cluster_id
-        .as_deref()
-        .expect("frontend auth credentials require control-plane auth cluster id");
-    let instance_id = config
-        .control_plane_frontend_auth_instance_id
-        .as_deref()
-        .expect("frontend auth credentials require local frontend instance id");
-    let configured = select_frontend_auth_credential_for_instance(
-        &config.control_plane_frontend_auth_credentials,
-        instance_id,
-        config
-            .control_plane_frontend_auth_signing_credential
-            .as_ref(),
-    )?;
-    build_authenticated_frontend_control_plane_client_with_inner(
-        client,
-        cluster_id,
-        instance_id,
-        configured,
-    )
-}
-
-fn build_configured_unix_control_plane_client(
-    config: &ServerConfig,
-    primary_socket_path: &str,
-) -> Result<UnixControlPlaneClient, String> {
+) -> Result<storage::ControlPlaneFrontendClient, String> {
+    let credentials = config
+        .control_plane_frontend_auth_credentials
+        .iter()
+        .map(configured_frontend_auth_credential_input)
+        .collect();
     if !config.control_plane_rpc_client_endpoints.is_empty() {
-        return UnixControlPlaneClient::with_endpoints(
+        return storage::ControlPlaneFrontendClient::with_endpoints(
             config.control_plane_rpc_client_endpoints.clone(),
+            config.control_plane_auth_cluster_id.as_deref(),
+            config.control_plane_frontend_auth_instance_id.as_deref(),
+            credentials,
+            config
+                .control_plane_frontend_auth_signing_credential
+                .clone(),
         )
-        .map_err(|error| format!("invalid control-plane framed client endpoints: {error}"));
+        .map_err(|error| error.to_string());
     }
     let socket_paths = if config.control_plane_client_socket_paths.is_empty() {
-        vec![PathBuf::from(primary_socket_path)]
+        vec![PathBuf::from(control_plane_socket_path)]
     } else {
         config
             .control_plane_client_socket_paths
@@ -4218,13 +4098,21 @@ fn build_configured_unix_control_plane_client(
             .map(PathBuf::from)
             .collect()
     };
-    UnixControlPlaneClient::with_socket_paths(socket_paths)
-        .map_err(|error| format!("invalid control-plane client socket paths: {error}"))
+    storage::ControlPlaneFrontendClient::with_socket_paths(
+        socket_paths,
+        config.control_plane_auth_cluster_id.as_deref(),
+        config.control_plane_frontend_auth_instance_id.as_deref(),
+        credentials,
+        config
+            .control_plane_frontend_auth_signing_credential
+            .clone(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn build_frontend_control_plane_client_from_runtime_map_auth_env(
     control_plane_socket_path: &Path,
-) -> Result<FrontendControlPlaneClient, String> {
+) -> Result<storage::ControlPlaneFrontendClient, String> {
     if static_cluster_command_configured() {
         let config = static_cluster_config::load_server_config_from_environment()
             .map_err(|error| format!("configuration error: {error}"))?;
@@ -4233,24 +4121,27 @@ fn build_frontend_control_plane_client_from_runtime_map_auth_env(
         })?;
         return build_frontend_control_plane_client(&config, fallback);
     }
-    let client = build_command_unix_control_plane_client(control_plane_socket_path)?;
     let auth_config = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_env()?;
-    match auth_config {
-        Some(auth_config) => {
-            let configured = latest_frontend_auth_credential_for_instance(
-                &auth_config.credentials,
-                &auth_config.instance_id,
-            )
-            .expect("auth-only frontend config validates local instance credential");
-            build_authenticated_frontend_control_plane_client_with_inner(
-                client,
-                &auth_config.cluster_id,
-                &auth_config.instance_id,
-                configured,
-            )
-        }
-        None => Ok(FrontendControlPlaneClient::Plain(client)),
-    }
+    let (cluster_id, instance_id, credentials) = match &auth_config {
+        Some(auth_config) => (
+            Some(auth_config.cluster_id.as_str()),
+            Some(auth_config.instance_id.as_str()),
+            auth_config
+                .credentials
+                .iter()
+                .map(configured_frontend_auth_credential_input)
+                .collect(),
+        ),
+        None => (None, None, Vec::new()),
+    };
+    storage::ControlPlaneFrontendClient::with_socket_paths(
+        command_control_plane_socket_paths(control_plane_socket_path)?,
+        cluster_id,
+        instance_id,
+        credentials,
+        None,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn build_pg_status_control_plane_client_from_runtime_map_auth_env(
@@ -4258,26 +4149,9 @@ fn build_pg_status_control_plane_client_from_runtime_map_auth_env(
 ) -> Result<storage::ControlPlanePgStatusClient, String> {
     let frontend =
         build_frontend_control_plane_client_from_runtime_map_auth_env(control_plane_socket_path)?;
-    Ok(match frontend {
-        FrontendControlPlaneClient::Plain(client) => {
-            storage::ControlPlanePgStatusClient::new(client, None)
-        }
-        FrontendControlPlaneClient::Authenticated(client) => {
-            storage::ControlPlanePgStatusClient::new(
-                client.inner().clone(),
-                Some(client.credential().clone()),
-            )
-        }
-    })
-}
-
-fn build_command_unix_control_plane_client(
-    primary_socket_path: &Path,
-) -> Result<UnixControlPlaneClient, String> {
-    UnixControlPlaneClient::with_socket_paths(command_control_plane_socket_paths(
-        primary_socket_path,
-    )?)
-    .map_err(|error| format!("invalid control-plane client socket paths: {error}"))
+    Ok(storage::ControlPlanePgStatusClient::from_frontend_client(
+        &frontend,
+    ))
 }
 
 fn command_control_plane_socket_paths(primary_socket_path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -4439,136 +4313,46 @@ fn build_admin_credential_binding(
         .map_err(|error| error.to_string())
 }
 
-fn build_authenticated_frontend_control_plane_client_with_inner(
-    client: UnixControlPlaneClient,
-    cluster_id: &str,
-    instance_id: &str,
-    configured: &ConfiguredControlPlaneFrontendAuthCredential,
-) -> Result<FrontendControlPlaneClient, String> {
-    let credential = configured_frontend_auth_credential(configured)?
-        .scoped_for_cluster(cluster_id)
-        .map_err(|error| {
-            format!(
-                "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS scoped credential for instance {instance_id}: {error}"
-            )
-        })?;
-    Ok(FrontendControlPlaneClient::Authenticated(
-        AuthenticatedUnixControlPlaneClient::new(client, credential),
-    ))
-}
-
 fn build_storage_node_control_plane_client(
     config: &ServerConfig,
     control_plane_socket_path: &str,
     node_id: NodeId,
     node_incarnation: u64,
-) -> Result<StorageNodeControlPlaneClient, String> {
-    let client = build_configured_unix_control_plane_client(config, control_plane_socket_path)?;
-    if config.control_plane_storage_auth_credentials.is_empty() {
-        return Ok(StorageNodeControlPlaneClient::Plain(client));
+) -> Result<storage::ControlPlaneStorageNodeClient, String> {
+    let credentials = config
+        .control_plane_storage_auth_credentials
+        .iter()
+        .map(configured_storage_node_auth_credential_input)
+        .collect();
+    if !config.control_plane_rpc_client_endpoints.is_empty() {
+        return storage::ControlPlaneStorageNodeClient::with_endpoints(
+            config.control_plane_rpc_client_endpoints.clone(),
+            config.control_plane_auth_cluster_id.as_deref(),
+            node_id.as_u32(),
+            node_incarnation,
+            credentials,
+            config.control_plane_storage_auth_signing_credential.clone(),
+        )
+        .map_err(|error| error.to_string());
     }
-    let cluster_id = config
-        .control_plane_auth_cluster_id
-        .as_deref()
-        .expect("storage auth credentials require control-plane auth cluster id");
-    let configured = select_storage_node_auth_credential_for_node(
-        &config.control_plane_storage_auth_credentials,
-        node_id.as_u32(),
+    let socket_paths = if config.control_plane_client_socket_paths.is_empty() {
+        vec![PathBuf::from(control_plane_socket_path)]
+    } else {
         config
-            .control_plane_storage_auth_signing_credential
-            .as_ref(),
-    )?;
-    let credential = configured_storage_node_auth_credential(configured)?
-        .scoped_for_cluster_and_incarnation(cluster_id, node_incarnation)
-        .map_err(|error| {
-            format!(
-                "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS scoped credential for node {} incarnation {node_incarnation}: {error}",
-                node_id.as_u32()
-            )
-        })?;
-    Ok(StorageNodeControlPlaneClient::Authenticated(
-        AuthenticatedUnixControlPlaneClient::new(client, credential),
-    ))
-}
-
-fn latest_storage_node_auth_credential_for_node(
-    credentials: &[ConfiguredControlPlaneStorageAuthCredential],
-    node_id: u32,
-) -> Result<&ConfiguredControlPlaneStorageAuthCredential, String> {
-    latest_auth_credential_by_version_then_id(
-        credentials
+            .control_plane_client_socket_paths
             .iter()
-            .filter(|credential| credential.node_id == node_id),
-        |credential| credential.credential_id.as_str(),
-        |credential| credential.credential_version,
-    )
-    .ok_or_else(|| {
-            format!(
-                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS must include local storage node id {node_id}"
-            )
-        })
-}
-
-fn select_storage_node_auth_credential_for_node<'a>(
-    credentials: &'a [ConfiguredControlPlaneStorageAuthCredential],
-    node_id: u32,
-    selected: Option<&(String, u64)>,
-) -> Result<&'a ConfiguredControlPlaneStorageAuthCredential, String> {
-    let Some((credential_id, credential_version)) = selected else {
-        return latest_storage_node_auth_credential_for_node(credentials, node_id);
+            .map(PathBuf::from)
+            .collect()
     };
-    credentials
-        .iter()
-        .find(|credential| {
-            credential.node_id == node_id
-                && credential.credential_id == *credential_id
-                && credential.credential_version == *credential_version
-        })
-        .ok_or_else(|| {
-            format!(
-                "configured storage-node signing credential {credential_id}:{credential_version} is unavailable for node {node_id}"
-            )
-        })
-}
-
-fn latest_frontend_auth_credential_for_instance<'a>(
-    credentials: &'a [ConfiguredControlPlaneFrontendAuthCredential],
-    instance_id: &str,
-) -> Result<&'a ConfiguredControlPlaneFrontendAuthCredential, String> {
-    latest_auth_credential_by_version_then_id(
-        credentials
-            .iter()
-            .filter(|credential| credential.instance_id == instance_id),
-        |credential| credential.credential_id.as_str(),
-        |credential| credential.credential_version,
+    storage::ControlPlaneStorageNodeClient::with_socket_paths(
+        socket_paths,
+        config.control_plane_auth_cluster_id.as_deref(),
+        node_id.as_u32(),
+        node_incarnation,
+        credentials,
+        config.control_plane_storage_auth_signing_credential.clone(),
     )
-    .ok_or_else(|| {
-            format!(
-                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS must include local frontend instance id {instance_id}"
-            )
-        })
-}
-
-fn select_frontend_auth_credential_for_instance<'a>(
-    credentials: &'a [ConfiguredControlPlaneFrontendAuthCredential],
-    instance_id: &str,
-    selected: Option<&(String, u64)>,
-) -> Result<&'a ConfiguredControlPlaneFrontendAuthCredential, String> {
-    let Some((credential_id, credential_version)) = selected else {
-        return latest_frontend_auth_credential_for_instance(credentials, instance_id);
-    };
-    credentials
-        .iter()
-        .find(|credential| {
-            credential.instance_id == instance_id
-                && credential.credential_id == *credential_id
-                && credential.credential_version == *credential_version
-        })
-        .ok_or_else(|| {
-            format!(
-                "configured frontend signing credential {credential_id}:{credential_version} is unavailable for instance {instance_id}"
-            )
-        })
+    .map_err(|error| error.to_string())
 }
 
 fn latest_auth_credential_by_version_then_id<'a, T>(
@@ -6653,10 +6437,7 @@ mod tests {
         )
         .expect("storage-node auth client should build");
 
-        let StorageNodeControlPlaneClient::Authenticated(client) = client else {
-            panic!("storage-node auth client should be authenticated");
-        };
-        assert_eq!(client.credential().credential_version(), 8);
+        assert!(client.is_authenticated());
     }
 
     #[test]
@@ -6785,10 +6566,65 @@ mod tests {
         let client = build_frontend_control_plane_client(&config, "/tmp/argmin-control-plane.sock")
             .expect("frontend auth client should build");
 
-        let FrontendControlPlaneClient::Authenticated(client) = client else {
-            panic!("frontend auth client should be authenticated");
-        };
-        assert_eq!(client.credential().credential_version(), 8);
+        assert!(client.is_authenticated());
+    }
+
+    #[test]
+    fn frontend_control_plane_client_sends_authenticated_runtime_map_read_from_config() {
+        let tmp = short_unix_socket_test_dir("frontend-auth-runtime-map");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("control-plane.sock");
+        let state_path = tmp.join("control-plane.state");
+        let node_id = NodeId::new(1);
+        let mut config = test_server_config();
+        config.control_plane_auth_cluster_id = Some("control-auth".to_string());
+        config.control_plane_frontend_auth_instance_id = Some("frontend-1".to_string());
+        config.control_plane_frontend_auth_credentials =
+            vec![ConfiguredControlPlaneFrontendAuthCredential {
+                instance_id: "frontend-1".to_string(),
+                credential_id: "frontend".to_string(),
+                credential_version: 7,
+                secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
+            }];
+        let frontend_credential =
+            configured_frontend_auth_credential(&config.control_plane_frontend_auth_credentials[0])
+                .expect("test frontend credential should build");
+        let verifier = Arc::new(
+            ControlPlaneUnixAuthVerifier::new_empty("control-auth")
+                .unwrap()
+                .with_frontend_credentials(vec![frontend_credential])
+                .expect("test frontend verifier should build"),
+        );
+        let verifier_for_assert = Arc::clone(&verifier);
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let store = FileControlPlaneStore::new(state_path);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(node_id, storage::control_plane::NodeMembershipState::Active)
+            .unwrap();
+        let server = spawn_control_plane_test_rpc_server(
+            listener,
+            Arc::new(Mutex::new(authority)),
+            [2_000],
+            Some(verifier),
+        );
+
+        let client = build_frontend_control_plane_client(&config, socket_path.to_str().unwrap())
+            .expect("frontend auth client should build");
+        let _runtime_map =
+            storage::clock::with_time_override(2_000, || client.runtime_map_snapshot(2_000))
+                .expect("authenticated frontend runtime-map read should succeed");
+
+        server.join().unwrap();
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 1);
+        assert_eq!(
+            metrics.accepted_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
+            1
+        );
+        assert_eq!(metrics.rejected_total(), 0);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

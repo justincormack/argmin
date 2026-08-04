@@ -8,6 +8,7 @@ use crate::control_plane::{
 };
 use crate::control_plane_auth::ControlPlaneScopedCredential;
 use crate::control_plane_client_bootstrap::ControlPlaneAdminClientBootstrap;
+use crate::control_plane_service_client::ControlPlaneFrontendClient;
 use crate::{ClusterEpoch, NodeId, PgId};
 
 enum ControlPlanePgAdminDispatch {
@@ -26,7 +27,7 @@ pub struct ControlPlanePgStatusClient {
 }
 
 impl ControlPlanePgStatusClient {
-    pub fn new(
+    pub(crate) fn new(
         client: UnixControlPlaneClient,
         credential: Option<ControlPlaneScopedCredential>,
     ) -> Self {
@@ -37,6 +38,12 @@ impl ControlPlanePgStatusClient {
             None => ControlPlanePgStatusDispatch::Plain(client),
         };
         Self { dispatch }
+    }
+
+    #[must_use]
+    pub fn from_frontend_client(frontend: &ControlPlaneFrontendClient) -> Self {
+        let (client, credential) = frontend.retained_transport_and_credential();
+        Self::new(client, credential)
     }
 
     pub fn serving_epochs(

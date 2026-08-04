@@ -10,6 +10,7 @@ use crate::control_plane::{
 };
 use crate::control_plane_auth::ControlPlaneScopedCredential;
 use crate::control_plane_client_bootstrap::ControlPlaneAdminCredentialBinding;
+use crate::control_plane_service_client::ControlPlaneFrontendClient;
 use crate::peering::PgMetadataTransferArtifact;
 use crate::storage_rpc_transport::StorageRpcClientEndpoint;
 use crate::{
@@ -74,11 +75,11 @@ impl LivePgMetadataTransferControlPlaneClient {
         Ok(Self { read, admin })
     }
 
-    pub fn with_admin_credential(
-        client: UnixControlPlaneClient,
-        read_credential: Option<ControlPlaneScopedCredential>,
+    pub fn with_frontend_client(
+        frontend: &ControlPlaneFrontendClient,
         admin: &ControlPlaneAdminCredentialBinding,
     ) -> Result<Self, LivePgMetadataTransferError> {
+        let (client, read_credential) = frontend.retained_transport_and_credential();
         Self::new(client, read_credential, admin.credential.clone())
     }
 

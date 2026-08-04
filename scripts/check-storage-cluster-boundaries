@@ -3115,7 +3115,7 @@ public_raw_control_plane_admin_constructors=$(
             crates/storage/src/live_pg_transfer.rs \
             || true
         awk '
-        /impl ControlPlanePgAdminClient[[:space:]]*\{/ {
+        /impl (ControlPlanePgAdminClient|ControlPlanePgStatusClient)[[:space:]]*\{/ {
             in_admin = 1
             depth = 0
         }
@@ -3173,6 +3173,57 @@ control_plane_admin_bootstrap_surface_leaks=$(
 fail_with_matches \
     "Control-plane admin bootstrap capabilities must retain transport and scoped credentials opaquely and expose only bounded assembly operations" \
     "$control_plane_admin_bootstrap_surface_leaks"
+
+argmin_control_plane_service_client_bootstrap_leaks=$(
+    awk '
+    /^mod tests[[:space:]]*\{/ {
+        exit
+    }
+    /(FrontendControlPlaneClient|StorageNodeControlPlaneClient)|build_configured_unix_control_plane_client|build_authenticated_frontend_control_plane_client_with_inner|AuthenticatedUnixControlPlaneClient::new\(|ControlPlanePgStatusClient::new\(|LivePgMetadataTransferControlPlaneClient::(new|with_admin_credential)\(/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    ' crates/argmin-s3/src/main.rs
+)
+fail_with_matches \
+    "Frontend and storage-node control-plane transports, signing-credential selection, scoping, and dispatch must remain owned by storage" \
+    "$argmin_control_plane_service_client_bootstrap_leaks"
+
+control_plane_service_client_opaque_surface_leaks=$(
+    {
+        rg -n -U --color=never \
+            'pub struct (ControlPlaneFrontendClient|ControlPlaneStorageNodeClient)[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:|#\[derive\([^]]*(Debug|PartialEq|Eq|Hash)[^]]*\)\][[:space:]]*pub struct (ControlPlaneFrontendClient|ControlPlaneStorageNodeClient)' \
+            crates/storage/src/control_plane_service_client.rs \
+            || true
+        awk '
+        /impl (ControlPlaneFrontendClient|ControlPlaneStorageNodeClient)[[:space:]]*\{/ {
+            in_client = 1
+            client_impl = $0
+            sub(/^.*impl /, "", client_impl)
+            sub(/[[:space:]]*\{.*/, "", client_impl)
+            depth = 0
+        }
+        in_client {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if ((client_impl == "ControlPlaneFrontendClient" && method != "with_endpoints" && method != "with_socket_paths" && method != "is_authenticated" && method != "runtime_map_diagnostics" && method != "runtime_map_status_with_check_applied_timeout") || (client_impl == "ControlPlaneStorageNodeClient" && method != "with_endpoints" && method != "with_socket_paths" && method != "is_authenticated")) {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_client = 0
+            }
+        }
+        ' crates/storage/src/control_plane_service_client.rs
+    }
+)
+fail_with_matches \
+    "Frontend and storage-node control-plane capabilities must retain transport and scoped credentials opaquely and expose only bounded service operations" \
+    "$control_plane_service_client_opaque_surface_leaks"
 
 public_static_initial_topology_bypass_apis=$(
     rg -n --color=never \
@@ -4508,7 +4559,7 @@ manual_pg_admin_opaque_surface_leaks=$(
                 method = $0
                 sub(/^.*fn[[:space:]]+/, "", method)
                 sub(/\(.*/, "", method)
-                if ((pg_admin_impl == "ControlPlanePgAdminClient" && method != "from_bootstrap" && method != "set_acting_set" && method != "fence_for_metadata_transfer" && method != "install_metadata_transfer") || (pg_admin_impl == "ControlPlanePgStatusClient" && method != "new" && method != "serving_epochs") || (pg_admin_impl == "ControlPlanePgMetadataTransferInstall" && method != "new") || pg_admin_impl == "ControlPlanePgAdminInputError" || pg_admin_impl == "ControlPlanePgAdminError") {
+                if ((pg_admin_impl == "ControlPlanePgAdminClient" && method != "from_bootstrap" && method != "set_acting_set" && method != "fence_for_metadata_transfer" && method != "install_metadata_transfer") || (pg_admin_impl == "ControlPlanePgStatusClient" && method != "from_frontend_client" && method != "serving_epochs") || (pg_admin_impl == "ControlPlanePgMetadataTransferInstall" && method != "new") || pg_admin_impl == "ControlPlanePgAdminInputError" || pg_admin_impl == "ControlPlanePgAdminError") {
                     print FILENAME ":" FNR ":" $0
                 }
             }

@@ -1526,6 +1526,24 @@ re-exposure of the raw client seams. Frontend/storage-node service-client bootst
 listener/auth-verifier bootstrap, Raft-peer bootstrap, and the process-hosted authority
 implementation remain item 12 work.
 
+The thirty-sixth bounded slice contains frontend and storage-node control-plane service-client
+bootstrap. The process supplies resolved endpoint inputs, logical frontend or node identity,
+node incarnation, unscoped configured credentials, and an optional logical signing-credential
+selection. Storage validates the endpoint set, selects the default or explicitly configured local
+credential, constructs and scopes the exact frontend or storage-node principal, and retains plain
+versus authenticated dispatch behind `ControlPlaneFrontendClient` and
+`ControlPlaneStorageNodeClient`. The capabilities implement only the existing runtime-map or
+heartbeat service traits plus bounded diagnostic/readiness operations, and their debug views
+redact endpoint and credential material. PG status and live metadata transfer now derive their
+read transport and scoped credential from the opaque frontend capability inside storage; their raw
+client constructors are no longer available to the process. Owner-local tests pin default and
+explicit credential selection, node-incarnation binding, incomplete/crossed configuration, and
+redaction, while the existing process RPC test continues to prove an authenticated heartbeat is
+accepted. A repository check rejects the former process dispatch enums, authenticated-client
+construction, raw status/transfer composition, public fields, derived diagnostics, or expansion
+of the bounded service-client surface. Server listener/auth-verifier bootstrap, Raft-peer
+transport bootstrap, and the process-hosted authority implementation remain item 12 work.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1825,9 +1843,9 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     now uses only the authority-owned establishment operation. Uncertified submission, durable
     checkpoint publication, leader retry, and resolution are likewise one storage-owned operation
     using the authority's single opaque response-publication and poison domain. Operator recovery
-    endpoint and credential/transport assembly are now storage-owned. The remaining work is
-    frontend/storage-node service-client bootstrap, server listener/auth-verifier and Raft-peer
-    transport bootstrap, and the process-hosted control-plane authority implementation.
+    endpoint and credential/transport assembly plus frontend/storage-node service-client
+    bootstrap are now storage-owned. The remaining work is server listener/auth-verifier and
+    Raft-peer transport bootstrap, and the process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

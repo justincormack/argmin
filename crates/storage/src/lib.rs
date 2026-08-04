@@ -35,6 +35,7 @@ pub(crate) mod control_plane_lease;
 mod control_plane_operator_admin;
 mod control_plane_pg_admin;
 pub mod control_plane_raft;
+mod control_plane_service_client;
 pub(crate) mod data_dir;
 pub mod deadline_io;
 pub(crate) mod durable_journal;
@@ -111,6 +112,10 @@ pub use control_plane_pg_admin::{
     set_offline_control_plane_pg_acting_set, ControlPlanePgAdminClient, ControlPlanePgAdminError,
     ControlPlanePgAdminInputError, ControlPlanePgMetadataTransferInstall,
     ControlPlanePgStatusClient,
+};
+pub use control_plane_service_client::{
+    ControlPlaneFrontendClient, ControlPlaneServiceClientBootstrapError,
+    ControlPlaneStorageNodeClient,
 };
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
