@@ -128,13 +128,13 @@ impl Coordinator {
             Self::requester_can_bucket_owner_account_admin,
         ) {
             Ok(bucket) => bucket,
-            Err(ServerError::OperationAborted) => {
+            Err(ServerError::SlowDown) => {
                 if let Some(authorized) =
                     self.authorize_delete_bucket_from_active_attempt_snapshot(admission, req)?
                 {
                     return Ok(authorized);
                 }
-                return Err(ServerError::OperationAborted);
+                return Err(ServerError::SlowDown);
             }
             Err(ServerError::BucketNotFound { name }) => {
                 if let Some(authorized) =
@@ -169,7 +169,7 @@ impl Coordinator {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 let error = BucketHandleLoader::map_bucket_snapshot_error(error);
-                if matches!(error, ServerError::OperationAborted) {
+                if matches!(error, ServerError::SlowDown) {
                     return Err(error);
                 }
                 return Ok(None);

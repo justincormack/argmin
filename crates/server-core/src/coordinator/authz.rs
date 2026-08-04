@@ -1235,16 +1235,11 @@ impl Coordinator {
             .storage_node()
             .get_bucket_subresource(&bucket.name, storage::OpaqueBucketSubresourceKind::Policy)
             .map_err(|error| match error {
-                storage::BucketSnapshotLoadError::Store(
-                    storage::StoreError::MetadataCommandLogConflict { .. }
-                    | storage::StoreError::MetadataCommandLogGap { .. }
-                    | storage::StoreError::MetadataCommandPendingConflict { .. },
-                ) => ServerError::OperationAborted,
                 storage::BucketSnapshotLoadError::Store(other) => super::map_store_error(other),
                 storage::BucketSnapshotLoadError::Metadata(ref error)
                     if super::metadata_error_is_command_contention(error) =>
                 {
-                    ServerError::OperationAborted
+                    ServerError::SlowDown
                 }
                 storage::BucketSnapshotLoadError::Metadata(
                     storage::MetadataError::BucketNotFound { name },

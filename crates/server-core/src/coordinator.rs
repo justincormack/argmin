@@ -81,10 +81,40 @@ fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum MetadataContentionResponse {
+    /// The default for exhausted internal contention and convergence work.
+    SlowDown,
+    /// Reserved for operations where AWS defines this exact conflict response.
+    OperationAborted,
+}
+
+impl MetadataContentionResponse {
+    fn into_server_error(self) -> ServerError {
+        match self {
+            Self::SlowDown => ServerError::SlowDown,
+            Self::OperationAborted => ServerError::OperationAborted,
+        }
+    }
+}
+
 pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
-    if store_error_is_retryable_contention(&error) {
-        ServerError::OperationAborted
-    } else if store_error_is_resource_exhausted(&error) {
+    map_store_error_with_metadata_contention(error, MetadataContentionResponse::SlowDown)
+}
+
+/// Map storage failures without treating retryability as an S3 conflict.
+///
+/// `OperationAborted` describes an operation-specific resource conflict. It is
+/// not a generic retry signal, so callers must opt into it explicitly.
+pub(super) fn map_store_error_with_metadata_contention(
+    error: storage::StoreError,
+    metadata_contention: MetadataContentionResponse,
+) -> ServerError {
+    if store_error_is_resource_exhausted(&error) {
+        ServerError::SlowDown
+    } else if store_error_is_metadata_command_contention(&error) {
+        metadata_contention.into_server_error()
+    } else if store_error_is_retryable_convergence(&error) {
         ServerError::SlowDown
     } else {
         ServerError::Store(error)
@@ -149,10 +179,10 @@ pub(super) fn object_pg_action_error_is_metadata_command_contention(
     }
 }
 
-fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
+fn store_error_is_retryable_convergence(error: &storage::StoreError) -> bool {
     if error
         .storage_node_failure_class()
-        .is_some_and(storage_node_failure_is_retryable_contention)
+        .is_some_and(storage_node_failure_is_retryable_convergence)
     {
         return true;
     }
@@ -172,19 +202,21 @@ fn store_error_is_retryable_contention(error: &storage::StoreError) -> bool {
         | storage::StoreError::PgNotActive { .. }
         | storage::StoreError::ShardPgNotActive { .. } => true,
         storage::StoreError::ShardStore { source, .. } => {
-            store_error_is_retryable_contention(source)
+            store_error_is_retryable_convergence(source)
         }
         _ => false,
     }
 }
 
-fn storage_node_failure_is_retryable_contention(failure: storage::StorageNodeFailureClass) -> bool {
+fn storage_node_failure_is_retryable_convergence(
+    failure: storage::StorageNodeFailureClass,
+) -> bool {
     match failure {
         storage::StorageNodeFailureClass::ShardLocationStale
         | storage::StorageNodeFailureClass::PgRouteUnavailable
-        | storage::StorageNodeFailureClass::MetadataCommandContention
-        | storage::StorageNodeFailureClass::TransportInterrupted => true,
-        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive => false,
+        | storage::StorageNodeFailureClass::MetadataCommandContention => true,
+        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
+        | storage::StorageNodeFailureClass::TransportInterrupted => false,
     }
 }
 

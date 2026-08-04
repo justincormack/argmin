@@ -186,7 +186,7 @@ fn composite_checksum_value_from_complete_parts(
 impl Coordinator {
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         if super::object_pg_action_error_is_metadata_command_contention(&error) {
-            return ServerError::OperationAborted;
+            return ServerError::SlowDown;
         }
         match error {
             storage::ObjectPgActionError::Store(error) => super::map_store_error(error),
@@ -914,6 +914,11 @@ impl Coordinator {
                         key: key.as_str().to_string(),
                         condition,
                     });
+                }
+                Err(error)
+                    if super::object_pg_action_error_is_metadata_command_contention(&error) =>
+                {
+                    return Err(ServerError::OperationAborted);
                 }
                 Err(error) => return Err(Coordinator::map_object_pg_action_error(error)),
             };

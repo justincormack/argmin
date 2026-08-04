@@ -380,15 +380,10 @@ impl<'a> BucketHandleLoader<'a> {
         error: storage::BucketSnapshotLoadError,
     ) -> ServerError {
         match error {
-            storage::BucketSnapshotLoadError::Store(
-                storage::StoreError::MetadataCommandLogConflict { .. }
-                | storage::StoreError::MetadataCommandLogGap { .. }
-                | storage::StoreError::MetadataCommandPendingConflict { .. },
-            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => super::map_store_error(error),
             storage::BucketSnapshotLoadError::Metadata(error) => match error {
                 ref error if super::metadata_error_is_command_contention(error) => {
-                    ServerError::OperationAborted
+                    ServerError::SlowDown
                 }
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),

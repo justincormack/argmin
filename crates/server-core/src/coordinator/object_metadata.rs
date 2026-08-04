@@ -412,13 +412,17 @@ impl Coordinator {
                 Ok(stored.version_id())
             })
             .map_err(|error| {
-                Self::map_object_metadata_access_error(
-                    bucket,
-                    key,
-                    req.object.version_id,
-                    can_discover_missing,
-                    error,
-                )
+                if super::object_pg_action_error_is_metadata_command_contention(&error) {
+                    ServerError::OperationAborted
+                } else {
+                    Self::map_object_metadata_access_error(
+                        bucket,
+                        key,
+                        req.object.version_id,
+                        can_discover_missing,
+                        error,
+                    )
+                }
             })??;
         Ok(())
     }

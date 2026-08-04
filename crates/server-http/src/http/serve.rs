@@ -2567,7 +2567,7 @@ fn route_bounded_body_frame_timeout(
     };
     let remaining = admission
         .remaining_validity()
-        .map_err(|_| ServerError::OperationAborted)?;
+        .map_err(|_| ServerError::SlowDown)?;
     Ok(remaining.map_or(idle_timeout, |remaining| idle_timeout.min(remaining)))
 }
 
@@ -2632,7 +2632,7 @@ fn route_bounded_body_timeout_error(
     admission: Option<&storage::StorageClusterRouteAdmission>,
 ) -> ServerError {
     if admission.is_some_and(|admission| admission.require_valid_now().is_err()) {
-        ServerError::OperationAborted
+        ServerError::SlowDown
     } else {
         ServerError::InvalidRequest {
             reason: "request body read timed out".to_string(),
@@ -5288,7 +5288,7 @@ mod tests {
         storage::clock::with_time_override(5_000, || {
             assert!(matches!(
                 route_bounded_body_frame_timeout(Some(&admission), Duration::from_secs(30)),
-                Err(ServerError::OperationAborted)
+                Err(ServerError::SlowDown)
             ));
         });
     }
@@ -5736,7 +5736,7 @@ Connection: close\r\n\r\n\
         );
         assert!(matches!(
             frontend.coordinator.admit_storage_route_for_request(),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
 
         let signed = sign_headers("GET", "/mybucket/key", &addr, b"", &[]);
@@ -6022,15 +6022,12 @@ Content-Length: {}\r\n\
             .expect("expired streaming request should receive a response")
             .unwrap();
         let response = String::from_utf8_lossy(&response);
-        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
         assert!(
             response.to_ascii_lowercase().contains("connection: close"),
             "{response}"
         );
-        assert!(
-            response.contains("<Code>OperationAborted</Code>"),
-            "{response}"
-        );
+        assert!(response.contains("<Code>SlowDown</Code>"), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6147,7 +6144,7 @@ Connection: close\r\n\r\n",
                 &fields,
                 Some("upload.txt"),
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         drop(hook);
         assert!(initial.list_stream_upload_sessions_best_effort().is_empty());
@@ -6189,7 +6186,7 @@ Connection: close\r\n\r\n",
                 &upload_id,
                 "1",
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         drop(hook);
         assert!(initial.list_stream_upload_sessions_best_effort().is_empty());
@@ -6228,7 +6225,7 @@ Connection: close\r\n\r\n",
                 &fields,
                 Some("key"),
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(frontend
             .coordinator
@@ -6280,7 +6277,7 @@ Connection: close\r\n\r\n",
                 "key",
                 false,
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(frontend
             .coordinator
@@ -6328,7 +6325,7 @@ Connection: close\r\n\r\n",
                 &upload_id,
                 "1",
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(frontend
             .coordinator
@@ -9296,15 +9293,15 @@ Connection: close\r\n\r\n",
 
         assert!(matches!(
             frontend.heartbeat_streaming_put_object(&ctx, &session_id),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(matches!(
             frontend.streaming_append_segment(&ctx, &session_id, 1, b"late"),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(matches!(
             frontend.put_single_segment_object(&ctx, body, &[]),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(matches!(
             frontend.finalize_streaming_put(
@@ -9314,7 +9311,7 @@ Connection: close\r\n\r\n",
                 body.len() as u64,
                 &[],
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(storage_cluster
             .load_stream_upload_session(ctx.bucket(), ctx.key(), &session_id,)
@@ -9363,7 +9360,7 @@ Connection: close\r\n\r\n",
 
         assert!(matches!(
             frontend.streaming_append_post_segment(&post_ctx, 1, b"late"),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(matches!(
             frontend.finalize_streaming_post_object(
@@ -9372,7 +9369,7 @@ Connection: close\r\n\r\n",
                 post_body.len() as u64,
                 None,
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         frontend.abort_streaming_post_object(&post_ctx);
         drop(post_ctx);
@@ -9413,7 +9410,7 @@ Connection: close\r\n\r\n",
 
         assert!(matches!(
             frontend.streaming_append_part_segment(&part_ctx, 1, b"late"),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         assert!(matches!(
             frontend.finalize_streaming_part(
@@ -9423,7 +9420,7 @@ Connection: close\r\n\r\n",
                 &[],
                 None,
             ),
-            Err(ServerError::OperationAborted)
+            Err(ServerError::SlowDown)
         ));
         frontend.abort_streaming_part(&part_ctx);
     }

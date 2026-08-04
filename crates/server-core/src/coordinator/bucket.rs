@@ -29,11 +29,11 @@ pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) 
         Some(format_args!("error={err:?}")),
     );
     match err {
-        storage::BucketWriteDrainError::Store(
-            storage::StoreError::MetadataCommandLogConflict { .. }
-            | storage::StoreError::MetadataCommandLogGap { .. }
-            | storage::StoreError::MetadataCommandPendingConflict { .. },
-        ) => ServerError::OperationAborted,
+        storage::BucketWriteDrainError::Store(ref error)
+            if super::store_error_is_metadata_command_contention(error) =>
+        {
+            ServerError::OperationAborted
+        }
         storage::BucketWriteDrainError::Metadata(ref error)
             if super::metadata_error_is_command_contention(error) =>
         {
@@ -56,22 +56,29 @@ impl Coordinator {
     pub(super) fn map_bucket_snapshot_load_error(
         err: storage::BucketSnapshotLoadError,
     ) -> ServerError {
+        Self::map_bucket_snapshot_load_error_with_metadata_contention(
+            err,
+            super::MetadataContentionResponse::SlowDown,
+        )
+    }
+
+    fn map_bucket_snapshot_load_error_with_metadata_contention(
+        err: storage::BucketSnapshotLoadError,
+        metadata_contention: super::MetadataContentionResponse,
+    ) -> ServerError {
         let _ = observability::event(
             TRACE_TARGET,
             "bucket_snapshot_load_error",
             Some(format_args!("error={err:?}")),
         );
         match err {
-            storage::BucketSnapshotLoadError::Store(
-                storage::StoreError::MetadataCommandLogConflict { .. }
-                | storage::StoreError::MetadataCommandLogGap { .. }
-                | storage::StoreError::MetadataCommandPendingConflict { .. },
-            ) => ServerError::OperationAborted,
-            storage::BucketSnapshotLoadError::Store(other) => super::map_store_error(other),
+            storage::BucketSnapshotLoadError::Store(other) => {
+                super::map_store_error_with_metadata_contention(other, metadata_contention)
+            }
             storage::BucketSnapshotLoadError::Metadata(ref error)
                 if super::metadata_error_is_command_contention(error) =>
             {
-                ServerError::OperationAborted
+                metadata_contention.into_server_error()
             }
             storage::BucketSnapshotLoadError::Metadata(storage::MetadataError::BucketNotEmpty) => {
                 ServerError::BucketNotEmpty
@@ -955,10 +962,11 @@ impl Coordinator {
                     reason: format!("authorized bucket tags exceed the stored limit: {error}"),
                 }
             })?;
-        let info = self.store_bucket_subresource_on_admitted_route(
+        let info = self.store_bucket_subresource_with_metadata_contention_on_admitted_route(
             admission,
             &authorized.bucket,
             storage::PutBucketSubresource::tagging(&stored_tags),
+            super::MetadataContentionResponse::OperationAborted,
         )?;
         self.clear_bucket_fast_path(&info);
         Ok(())
@@ -1726,11 +1734,31 @@ impl Coordinator {
         name: &BucketName,
         req: storage::PutBucketSubresource<'_>,
     ) -> Result<storage::BucketInfo, ServerError> {
+        self.store_bucket_subresource_with_metadata_contention_on_admitted_route(
+            admission,
+            name,
+            req,
+            super::MetadataContentionResponse::SlowDown,
+        )
+    }
+
+    fn store_bucket_subresource_with_metadata_contention_on_admitted_route(
+        &self,
+        admission: &storage::StorageClusterRouteAdmission,
+        name: &BucketName,
+        req: storage::PutBucketSubresource<'_>,
+        metadata_contention: super::MetadataContentionResponse,
+    ) -> Result<storage::BucketInfo, ServerError> {
         self.require_storage_route_admission(admission)?;
         admission
             .active_bucket_route(name)
             .map_err(super::map_store_error)?
             .put_bucket_subresource_and_load_info(req)
-            .map_err(Self::map_bucket_snapshot_load_error)
+            .map_err(|error| {
+                Self::map_bucket_snapshot_load_error_with_metadata_contention(
+                    error,
+                    metadata_contention,
+                )
+            })
     }
 }

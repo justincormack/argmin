@@ -304,6 +304,8 @@ pub enum ServerError {
     #[error("bucket is in an invalid state for this operation")]
     InvalidBucketState,
 
+    /// An AWS-defined resource conflict, selected by an operation-specific
+    /// boundary rather than by generic storage retry classification.
     #[error("a conflicting conditional operation is currently in progress against this resource")]
     OperationAborted,
 

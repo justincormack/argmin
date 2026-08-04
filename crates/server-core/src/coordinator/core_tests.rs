@@ -884,7 +884,7 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
         ] {
             let error = result.expect_err(operation);
             assert!(
-                matches!(error, ServerError::OperationAborted),
+                matches!(error, ServerError::SlowDown),
                 "{operation}: {error:?}"
             );
         }
@@ -1058,7 +1058,7 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
     let error = coord
         .put_object_tags_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -1129,7 +1129,7 @@ fn direct_put_expires_at_generation_reservation_effect_boundary() {
     let error = coord
         .put_object_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -1212,7 +1212,7 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
     let error = coord
         .put_object_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -1300,7 +1300,7 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
     let error = coord
         .put_object_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -1378,7 +1378,7 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
         Ok(_) => panic!("expired stream creation unexpectedly succeeded"),
         Err(error) => error,
     };
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
     assert!(
@@ -1486,7 +1486,7 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
     let error = coord
         .put_object_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
     drop(shard_hook);
     drop(admission);
@@ -1606,7 +1606,7 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
             },
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
     drop(shard_hook);
     drop(admission);
@@ -1757,7 +1757,7 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
             },
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
     drop(shard_hook);
     drop(admission);
@@ -1898,7 +1898,7 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
             },
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
     drop(shard_hook);
 
@@ -2009,7 +2009,7 @@ fn stream_put_finalization_expires_inside_command_build() {
             None,
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     assert!(cluster
         .load_existing_live_object(
@@ -2080,7 +2080,7 @@ fn multipart_creation_expires_at_pending_install_effect_boundary() {
     let error = coord
         .create_multipart_upload_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
     assert!(cluster
@@ -2158,7 +2158,7 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
     let error = coord
         .abort_multipart_upload_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
     assert_eq!(
@@ -2245,7 +2245,7 @@ fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
     let error = coord
         .complete_multipart_upload_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert!(pending_install_count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     drop(hook);
     drop(admission);
@@ -2437,7 +2437,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
     let error = coord
         .list_parts_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
     assert_eq!(
@@ -2465,7 +2465,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
     let error = coord
         .list_parts_on_admitted_route(&lifecycle_admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(lifecycle_hook);
     drop(lifecycle_admission);
 
@@ -2527,11 +2527,11 @@ fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epo
     let error = coord
         .validate_complete_multipart_upload_target_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     let error = coord
         .validate_in_progress_multipart_upload_target_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(admission);
     assert_eq!(
         cluster
@@ -2753,7 +2753,7 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
     let error = coord
         .put_bucket_tags_on_admitted_route(&admission, &put_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -2790,7 +2790,7 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
     let error = coord
         .delete_bucket_tags_on_admitted_route(&admission, &bucket_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -2841,7 +2841,7 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
     let error = coord
         .put_bucket_public_access_block_on_admitted_route(&admission, &property_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -2881,7 +2881,7 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
     let error = coord
         .put_bucket_versioning_on_admitted_route(&admission, &versioning_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -2926,7 +2926,7 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
     let error = coord
         .put_bucket_acl_on_admitted_route(&admission, &acl_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -2976,7 +2976,7 @@ fn create_bucket_expires_at_pending_install_effect_boundary() {
     let error = coord
         .create_bucket_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
 
@@ -3021,7 +3021,7 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
     let error = coord
         .delete_bucket_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
     let progress = cluster
@@ -3045,7 +3045,7 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
     let error = coord
         .delete_bucket_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
     let progress = cluster
@@ -3153,7 +3153,7 @@ fn object_delete_mutations_expire_at_pending_install_effect_boundary() {
                 "{bucket} unexpectedly succeeded after {hook_call_count} hook calls; admission: {admission_error:?}"
             )
         });
-        assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+        assert!(matches!(error, ServerError::SlowDown), "{error:?}");
         drop(hook);
         drop(admission);
 
@@ -3233,10 +3233,7 @@ fn object_delete_mutations_expire_at_pending_install_effect_boundary() {
         .unwrap();
     assert!(result.deleted.is_empty());
     assert_eq!(result.errors.len(), 2);
-    assert!(result
-        .errors
-        .iter()
-        .all(|error| error.code == "OperationAborted"));
+    assert!(result.errors.iter().all(|error| error.code == "SlowDown"));
     drop(hook);
     drop(admission);
 
@@ -3328,7 +3325,7 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
             },
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted));
+    assert!(matches!(error, ServerError::SlowDown));
     drop(admission);
 
     time.set(1_000);
@@ -3346,7 +3343,7 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
             },
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted));
+    assert!(matches!(error, ServerError::SlowDown));
     drop(admission);
 
     time.set(1_000);
@@ -3364,7 +3361,7 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
             },
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted));
+    assert!(matches!(error, ServerError::SlowDown));
 }
 
 #[test]
@@ -3473,7 +3470,7 @@ fn head_bucket_warm_policy_cache_uses_loaded_identity_and_captured_deadline() {
                 &bucket_request_with_expected_owner(bucket, requester, None),
             )
             .unwrap_err();
-        assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+        assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     });
 }
 
@@ -3576,7 +3573,7 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
     let error = coord
         .head_object_on_admitted_route(&admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     cluster
         .head_bucket_info(&trusted_bucket_name(bucket))
         .expect("the renewed raw route should remain valid after admitted authority expires");
@@ -4222,7 +4219,7 @@ fn bucket_metadata_reads_reject_admission_from_an_unrelated_coordinator() {
     ] {
         let error = result.expect_err(operation);
         assert!(
-            matches!(error, ServerError::OperationAborted),
+            matches!(error, ServerError::SlowDown),
             "{operation}: {error:?}"
         );
     }
@@ -4373,7 +4370,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     let error = local
         .create_multipart_upload_on_admitted_route(&foreign_admission, &request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert!(cluster
         .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
         .unwrap()
@@ -4401,7 +4398,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
             &complete_preflight_request,
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     foreign
         .validate_complete_multipart_upload_target_on_admitted_route(
             &foreign_admission,
@@ -4414,7 +4411,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
             &complete_preflight_request,
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     foreign
         .validate_in_progress_multipart_upload_target_on_admitted_route(
             &foreign_admission,
@@ -4433,7 +4430,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     let error = local
         .complete_multipart_upload_on_admitted_route(&foreign_admission, &complete_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     let error = foreign
         .complete_multipart_upload_on_admitted_route(&foreign_admission, &complete_request)
         .unwrap_err();
@@ -4456,7 +4453,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     let error = local
         .list_parts_on_admitted_route(&foreign_admission, &list_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert!(foreign
         .list_parts_on_admitted_route(&foreign_admission, &list_request)
         .unwrap()
@@ -4478,7 +4475,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     let error = local
         .begin_stream_part_on_admitted_route(&foreign_admission, &streamed_part_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert!(cluster.list_stream_upload_sessions_best_effort().is_empty());
 
     let streamed_part = foreign
@@ -4498,7 +4495,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     let error = local
         .append_stream_part_data_on_admitted_route(&foreign_admission, &append_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert!(cluster
         .test_list_stream_segments(
             &append_request.bucket,
@@ -4528,7 +4525,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     let error = local
         .finalize_stream_part_with_storage_admission(&foreign_admission, finalize_request())
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     foreign
         .finalize_stream_part_with_storage_admission(&foreign_admission, finalize_request())
         .unwrap();
@@ -4573,7 +4570,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
             },
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     let parts = foreign
         .list_parts_on_admitted_route(&foreign_admission, &list_request)
         .unwrap()
@@ -4592,7 +4589,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
     let error = local
         .abort_multipart_upload_on_admitted_route(&foreign_admission, &abort_request)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert_eq!(
         cluster
             .test_load_in_progress_multipart_upload(
@@ -5011,7 +5008,7 @@ fn object_metadata_operations_reject_admission_from_an_unrelated_coordinator() {
     ] {
         let error = result.expect_err(operation);
         assert!(
-            matches!(error, ServerError::OperationAborted),
+            matches!(error, ServerError::SlowDown),
             "{operation}: {error:?}"
         );
     }
@@ -5112,7 +5109,7 @@ fn retained_stream_cleanup_rejects_admission_from_an_unrelated_coordinator() {
     let Err(error) = local.retained_stream_upload_cleanup(&foreign_admission, &bucket, &key) else {
         panic!("foreign admission unexpectedly minted retained cleanup authority");
     };
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     cluster
         .load_stream_upload_session(&bucket, &key, &session_id)
         .expect("foreign admission must not abort the durable stream session");
@@ -5166,7 +5163,7 @@ fn retained_stream_cleanup_does_not_retry_after_its_deadline() {
             Duration::from_millis(100),
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert_eq!(
         attempts.load(Ordering::SeqCst),
         1,
@@ -5234,7 +5231,7 @@ fn bucket_exists_rejects_stale_admission_from_an_unrelated_coordinator() {
     let error = local
         .bucket_exists_on_admitted_route(&foreign_admission, &bucket)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
 
     let local_admission = local.admit_storage_route_for_request().unwrap();
     assert!(!local
@@ -5303,7 +5300,7 @@ fn bucket_cors_read_rejects_stale_admission_from_an_unrelated_coordinator() {
     let error = local
         .load_bucket_cors_config(&foreign_admission, &bucket)
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
 
     let local_admission = local.admit_storage_route_for_request().unwrap();
     assert_eq!(
@@ -10697,7 +10694,7 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
 
     let assert_pg_not_active = |operation: &str, error: ServerError| {
         assert!(
-            matches!(error, ServerError::OperationAborted),
+            matches!(error, ServerError::SlowDown),
             "{operation} should fail closed with a retryable response on Peering object metadata PG {peering_pg} at epoch {current_epoch:?}, got {error:?}"
         );
     };
@@ -11385,30 +11382,30 @@ fn rwlock_helpers_recover_after_panic() {
 }
 
 #[test]
-fn object_pg_command_contention_maps_to_operation_aborted() {
+fn object_pg_command_contention_maps_to_slow_down() {
     let bucket = trusted_bucket_name("contention-bucket");
     let key = trusted_object_key("contention-key");
 
-    fn assert_maps_to_operation_aborted(error: storage::ObjectPgActionError) {
+    fn assert_maps_to_slow_down(error: storage::ObjectPgActionError) {
         assert!(matches!(
             Coordinator::map_object_pg_action_error(error),
-            ServerError::OperationAborted
+            ServerError::SlowDown
         ));
     }
 
-    fn assert_read_snapshot_maps_to_operation_aborted(
+    fn assert_read_snapshot_maps_to_slow_down(
         bucket: &BucketName,
         key: &ObjectKey,
         error: storage::ObjectPgActionError,
     ) {
         assert!(matches!(
             Coordinator::map_object_read_snapshot_error(bucket, key, None, true, error),
-            ServerError::OperationAborted
+            ServerError::SlowDown
         ));
     }
 
     let epoch = storage::ClusterEpoch::INITIAL;
-    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Store(
+    assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
         storage::StoreError::MetadataCommandLogConflict {
             node_id: 1,
             pg_id: 2,
@@ -11416,7 +11413,7 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             log_index: 3,
         },
     ));
-    assert_read_snapshot_maps_to_operation_aborted(
+    assert_read_snapshot_maps_to_slow_down(
         &bucket,
         &key,
         storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandLogConflict {
@@ -11426,7 +11423,7 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             log_index: 3,
         }),
     );
-    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Store(
+    assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
         storage::StoreError::MetadataCommandPendingConflict {
             pg_id: 2,
             cluster_epoch: epoch,
@@ -11434,7 +11431,7 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             candidate_log_index: 4,
         },
     ));
-    assert_read_snapshot_maps_to_operation_aborted(
+    assert_read_snapshot_maps_to_slow_down(
         &bucket,
         &key,
         storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandPendingConflict {
@@ -11444,25 +11441,25 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             candidate_log_index: 4,
         }),
     );
-    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Store(
+    assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
         storage::StoreError::MetadataCommandContention {
             context: "pending command displaced during cleanup",
         },
     ));
-    assert_read_snapshot_maps_to_operation_aborted(
+    assert_read_snapshot_maps_to_slow_down(
         &bucket,
         &key,
         storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandContention {
             context: "pending command displaced during cleanup",
         }),
     );
-    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Metadata(
+    assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
         storage::MetadataError::ObjectGenerationReservationConflict {
             reservation_id: "reservation".to_string(),
             generation_id: 5,
         },
     ));
-    assert_read_snapshot_maps_to_operation_aborted(
+    assert_read_snapshot_maps_to_slow_down(
         &bucket,
         &key,
         storage::ObjectPgActionError::Metadata(
@@ -11472,12 +11469,12 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             },
         ),
     );
-    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Metadata(
+    assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
         storage::MetadataError::ObjectVersionReservationConflict {
             version_id: storage::VersionId::from_u64(7),
         },
     ));
-    assert_read_snapshot_maps_to_operation_aborted(
+    assert_read_snapshot_maps_to_slow_down(
         &bucket,
         &key,
         storage::ObjectPgActionError::Metadata(
@@ -11486,7 +11483,7 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             },
         ),
     );
-    assert_maps_to_operation_aborted(storage::ObjectPgActionError::Metadata(
+    assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
         storage::MetadataError::StaleObjectWriteCommand {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -11494,7 +11491,7 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
             generation_id: None,
         },
     ));
-    assert_read_snapshot_maps_to_operation_aborted(
+    assert_read_snapshot_maps_to_slow_down(
         &bucket,
         &key,
         storage::ObjectPgActionError::Metadata(storage::MetadataError::StaleObjectWriteCommand {
@@ -11507,7 +11504,7 @@ fn object_pg_command_contention_maps_to_operation_aborted() {
 }
 
 #[test]
-fn stale_bucket_metadata_command_maps_to_operation_aborted() {
+fn stale_bucket_metadata_command_maps_to_slow_down() {
     let bucket = trusted_bucket_name("stale-bucket-command");
     let error = storage::BucketSnapshotLoadError::Metadata(
         storage::MetadataError::StaleBucketMetadataCommand {
@@ -11517,7 +11514,7 @@ fn stale_bucket_metadata_command_maps_to_operation_aborted() {
     );
     assert!(matches!(
         Coordinator::map_bucket_snapshot_load_error(error),
-        ServerError::OperationAborted
+        ServerError::SlowDown
     ));
 
     let bucket = trusted_bucket_name("stale-bucket-handle-command");
@@ -11529,12 +11526,12 @@ fn stale_bucket_metadata_command_maps_to_operation_aborted() {
     );
     assert!(matches!(
         BucketHandleLoader::map_bucket_snapshot_error(error),
-        ServerError::OperationAborted
+        ServerError::SlowDown
     ));
 }
 
 #[test]
-fn bucket_snapshot_object_reservation_conflicts_map_to_operation_aborted() {
+fn bucket_snapshot_object_reservation_conflicts_map_to_slow_down() {
     let version_conflict = storage::BucketSnapshotLoadError::Metadata(
         storage::MetadataError::ObjectVersionReservationConflict {
             version_id: storage::VersionId::from_u64(9),
@@ -11542,7 +11539,7 @@ fn bucket_snapshot_object_reservation_conflicts_map_to_operation_aborted() {
     );
     assert!(matches!(
         Coordinator::map_bucket_snapshot_load_error(version_conflict),
-        ServerError::OperationAborted
+        ServerError::SlowDown
     ));
 
     let generation_conflict = storage::BucketSnapshotLoadError::Metadata(
@@ -11553,7 +11550,7 @@ fn bucket_snapshot_object_reservation_conflicts_map_to_operation_aborted() {
     );
     assert!(matches!(
         BucketHandleLoader::map_bucket_snapshot_error(generation_conflict),
-        ServerError::OperationAborted
+        ServerError::SlowDown
     ));
 }
 
@@ -11611,18 +11608,24 @@ fn bucket_write_drain_contention_maps_to_operation_aborted() {
 }
 
 #[test]
-fn retryable_contention_selects_storage_node_failure_classes() {
+fn retryable_convergence_selects_storage_node_failure_classes() {
     for failure in [
         storage::StorageNodeFailureClass::ShardLocationStale,
         storage::StorageNodeFailureClass::PgRouteUnavailable,
         storage::StorageNodeFailureClass::MetadataCommandContention,
+    ] {
+        assert!(super::storage_node_failure_is_retryable_convergence(
+            failure
+        ));
+    }
+    for failure in [
+        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive,
         storage::StorageNodeFailureClass::TransportInterrupted,
     ] {
-        assert!(super::storage_node_failure_is_retryable_contention(failure));
+        assert!(!super::storage_node_failure_is_retryable_convergence(
+            failure
+        ));
     }
-    assert!(!super::storage_node_failure_is_retryable_contention(
-        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
-    ));
 }
 
 #[test]
@@ -11652,10 +11655,10 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         }
     }
 
-    fn assert_maps_to_operation_aborted(error: storage::StoreError) {
+    fn assert_maps_to_slow_down(error: storage::StoreError) {
         assert!(
-            matches!(super::map_store_error(error), ServerError::OperationAborted),
-            "expected stale/retryable storage error to map to OperationAborted"
+            matches!(super::map_store_error(error), ServerError::SlowDown),
+            "expected stale/retryable storage error to map to SlowDown"
         );
     }
 
@@ -11672,70 +11675,70 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
         super::map_store_error(storage::StoreError::MetadataCommandContention {
             context: "pending command displaced during cleanup",
         }),
-        ServerError::OperationAborted
+        ServerError::SlowDown
     ));
-    assert_maps_to_operation_aborted(storage::StoreError::MetadataCommandLogGap {
+    assert_maps_to_slow_down(storage::StoreError::MetadataCommandLogGap {
         node_id: 1,
         pg_id: 2,
         cluster_epoch: storage::ClusterEpoch::INITIAL,
         log_index: 5,
         expected_log_index: 4,
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StalePayloadOperation {
+    assert_maps_to_slow_down(storage::StoreError::StalePayloadOperation {
         pg_id: 2,
         operation_epoch: storage::ClusterEpoch::INITIAL,
         current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataPrimaryBridge {
+    assert_maps_to_slow_down(storage::StoreError::StaleMetadataPrimaryBridge {
         metadata_node_id: 1,
         operation_epoch: storage::ClusterEpoch::INITIAL,
         current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataOperation {
+    assert_maps_to_slow_down(storage::StoreError::StaleMetadataOperation {
         pg_id: 2,
         operation_epoch: storage::ClusterEpoch::INITIAL,
         current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataRoute {
+    assert_maps_to_slow_down(storage::StoreError::StaleMetadataRoute {
         pg_id: 2,
         route_epoch: storage::ClusterEpoch::INITIAL,
         current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::RouteMapExpired {
+    assert_maps_to_slow_down(storage::StoreError::RouteMapExpired {
         cluster_epoch: storage::ClusterEpoch::INITIAL,
         valid_until_ms: 1_000,
         now_ms: 1_001,
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StaleMetadataCommand {
+    assert_maps_to_slow_down(storage::StoreError::StaleMetadataCommand {
         node_id: 1,
         pg_id: 2,
         command_epoch: storage::ClusterEpoch::INITIAL,
         current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StaleShardOperation {
+    assert_maps_to_slow_down(storage::StoreError::StaleShardOperation {
         node_id: 1,
         pg_id: 2,
         operation_epoch: storage::ClusterEpoch::INITIAL,
         current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::StaleShardLocation {
+    assert_maps_to_slow_down(storage::StoreError::StaleShardLocation {
         node_id: 1,
         pg_id: 2,
         location_epoch: storage::ClusterEpoch::INITIAL,
         current_epoch: storage::ClusterEpoch::new(2).unwrap(),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::PgNotActive {
+    assert_maps_to_slow_down(storage::StoreError::PgNotActive {
         pg_id: 2,
         cluster_epoch: storage::ClusterEpoch::INITIAL,
         state: PgState::Peering,
     });
-    assert_maps_to_operation_aborted(storage::StoreError::ShardPgNotActive {
+    assert_maps_to_slow_down(storage::StoreError::ShardPgNotActive {
         node_id: 1,
         pg_id: 2,
         cluster_epoch: storage::ClusterEpoch::INITIAL,
         state: PgState::Peering,
     });
-    assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
+    assert_maps_to_slow_down(storage::StoreError::ShardStore {
         node_id: 1,
         pg_id: 2,
         cluster_epoch: storage::ClusterEpoch::INITIAL,
@@ -11743,7 +11746,7 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
             context: "pending command displaced during cleanup",
         }),
     });
-    assert_maps_to_operation_aborted(storage::StoreError::ShardStore {
+    assert_maps_to_slow_down(storage::StoreError::ShardStore {
         node_id: 1,
         pg_id: 2,
         cluster_epoch: storage::ClusterEpoch::INITIAL,
@@ -11795,7 +11798,7 @@ fn injected_stale_shard_location() -> storage::StoreError {
 }
 
 #[test]
-fn direct_put_payload_stale_shard_location_maps_to_operation_aborted() {
+fn direct_put_payload_stale_shard_location_maps_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -11823,11 +11826,11 @@ fn direct_put_payload_stale_shard_location_maps_to_operation_aborted() {
         },
     )
     .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
 }
 
 #[test]
-fn stream_put_payload_stale_shard_location_maps_to_operation_aborted() {
+fn stream_put_payload_stale_shard_location_maps_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -11849,7 +11852,7 @@ fn stream_put_payload_stale_shard_location_maps_to_operation_aborted() {
             b"stream payload",
         )
         .unwrap_err();
-    assert!(matches!(error, ServerError::OperationAborted), "{error:?}");
+    assert!(matches!(error, ServerError::SlowDown), "{error:?}");
 
     drop(hook);
     coord
@@ -12584,7 +12587,7 @@ fn put_object_persists_explicit_object_owner_identity() {
 }
 
 #[test]
-fn direct_put_request_maps_command_log_conflict_to_operation_aborted() {
+fn direct_put_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12641,14 +12644,14 @@ fn direct_put_request_maps_command_log_conflict_to_operation_aborted() {
     )
     .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected direct PUT command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected direct PUT command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn direct_put_generation_reservation_maps_command_log_conflict_to_operation_aborted() {
+fn direct_put_generation_reservation_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12687,14 +12690,14 @@ fn direct_put_generation_reservation_maps_command_log_conflict_to_operation_abor
     )
     .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected direct PUT generation reservation conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected direct PUT generation reservation conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn direct_put_version_reservation_maps_command_log_conflict_to_operation_aborted() {
+fn direct_put_version_reservation_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12739,14 +12742,14 @@ fn direct_put_version_reservation_maps_command_log_conflict_to_operation_aborted
     )
     .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected direct PUT version reservation conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected direct PUT version reservation conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn create_bucket_request_maps_command_log_conflict_to_operation_aborted() {
+fn create_bucket_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12773,14 +12776,14 @@ fn create_bucket_request_maps_command_log_conflict_to_operation_aborted() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected CreateBucket command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected CreateBucket command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn stream_put_begin_request_maps_command_log_conflict_to_operation_aborted() {
+fn stream_put_begin_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12821,14 +12824,14 @@ fn stream_put_begin_request_maps_command_log_conflict_to_operation_aborted() {
 
     let err = begin_stream_put_test(&coord, "bucket", "key").unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected stream PUT begin command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected stream PUT begin command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn stream_put_begin_generation_reservation_maps_command_log_conflict_to_operation_aborted() {
+fn stream_put_begin_generation_reservation_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12851,14 +12854,14 @@ fn stream_put_begin_generation_reservation_maps_command_log_conflict_to_operatio
 
     let err = begin_stream_put_test(&coord, "bucket", "key").unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected stream PUT begin generation reservation conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected stream PUT begin generation reservation conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn stream_put_finalize_request_maps_command_log_conflict_to_operation_aborted() {
+fn stream_put_finalize_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12919,14 +12922,14 @@ fn stream_put_finalize_request_maps_command_log_conflict_to_operation_aborted() 
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected stream PUT finalize command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected stream PUT finalize command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_operation_aborted() {
+fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12977,14 +12980,14 @@ fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_operatio
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected stream PUT finalize version reservation conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected stream PUT finalize version reservation conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn stream_put_finalize_stale_snapshot_budget_returns_operation_aborted_and_remains_cleanupable() {
+fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_cleanupable() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13052,7 +13055,7 @@ fn stream_put_finalize_stale_snapshot_budget_returns_operation_aborted_and_remai
         .unwrap_err();
     assert!(hook_ran.load(Ordering::SeqCst));
     assert!(
-        matches!(err, ServerError::OperationAborted),
+        matches!(err, ServerError::SlowDown),
         "stale stream finalization exhaustion must be retryable, got {err:?}"
     );
     drop(hook_guard);
@@ -13093,7 +13096,7 @@ fn stream_put_finalize_stale_snapshot_budget_returns_operation_aborted_and_remai
 }
 
 #[test]
-fn copy_object_destination_create_stream_maps_command_log_conflict_to_operation_aborted() {
+fn copy_object_destination_create_stream_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13153,8 +13156,8 @@ fn copy_object_destination_create_stream_maps_command_log_conflict_to_operation_
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected CopyObject destination stream create conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected CopyObject destination stream create conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
     let leaked_sessions = storage_cluster.list_stream_upload_sessions_best_effort();
@@ -13165,7 +13168,7 @@ fn copy_object_destination_create_stream_maps_command_log_conflict_to_operation_
 }
 
 #[test]
-fn copy_object_destination_finalize_maps_command_log_conflict_to_operation_aborted() {
+fn copy_object_destination_finalize_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13225,14 +13228,14 @@ fn copy_object_destination_finalize_maps_command_log_conflict_to_operation_abort
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected CopyObject destination finalize conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected CopyObject destination finalize conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn copy_object_stale_destination_budget_returns_operation_aborted_and_cleans_stream() {
+fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13313,7 +13316,7 @@ fn copy_object_stale_destination_budget_returns_operation_aborted_and_cleans_str
         .unwrap_err();
     assert!(hook_ran.load(Ordering::SeqCst));
     assert!(
-        matches!(err, ServerError::OperationAborted),
+        matches!(err, ServerError::SlowDown),
         "stale CopyObject destination exhaustion must be retryable, got {err:?}"
     );
     drop(hook_guard);
@@ -13454,8 +13457,8 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected CopyObject append conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected CopyObject append conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
     drop(retained_abort_guard);
@@ -13477,7 +13480,7 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
 }
 
 #[test]
-fn stream_append_request_maps_command_log_conflict_to_operation_aborted() {
+fn stream_append_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13503,14 +13506,14 @@ fn stream_append_request_maps_command_log_conflict_to_operation_aborted() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"chunk")
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected stream append command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected stream append command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn stream_abort_request_maps_command_log_conflict_to_operation_aborted() {
+fn stream_abort_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13536,14 +13539,14 @@ fn stream_abort_request_maps_command_log_conflict_to_operation_aborted() {
         .abort_stream_put("bucket", "key", &session_id)
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected stream abort command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected stream abort command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn put_bucket_versioning_request_maps_command_log_conflict_to_operation_aborted() {
+fn put_bucket_versioning_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13571,14 +13574,14 @@ fn put_bucket_versioning_request_maps_command_log_conflict_to_operation_aborted(
     )
     .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected PutBucketVersioning command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected PutBucketVersioning command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn put_bucket_acl_request_maps_command_log_conflict_to_operation_aborted() {
+fn put_bucket_acl_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13601,14 +13604,14 @@ fn put_bucket_acl_request_maps_command_log_conflict_to_operation_aborted() {
         put_bucket_canned_acl_test(&coord, "bucket", BucketAcl::Private, test_requester(), None)
             .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected PutBucketAcl command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected PutBucketAcl command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn put_bucket_property_request_maps_command_log_conflict_to_operation_aborted() {
+fn put_bucket_property_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13636,14 +13639,14 @@ fn put_bucket_property_request_maps_command_log_conflict_to_operation_aborted() 
     )
     .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected PutBucketProperty command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected PutBucketProperty command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn put_bucket_subresource_request_maps_command_log_conflict_to_operation_aborted() {
+fn put_bucket_subresource_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13672,14 +13675,49 @@ fn put_bucket_subresource_request_maps_command_log_conflict_to_operation_aborted
         ))
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected PutBucketSubresource command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected PutBucketSubresource command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn put_object_metadata_request_maps_command_log_conflict_to_operation_aborted() {
+fn put_bucket_tagging_command_log_conflict_maps_to_operation_aborted() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let bucket = trusted_bucket_name("bucket");
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let hook_guard = install_bucket_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        MetadataCommandApplyTestKind::PutBucketSubresource,
+    );
+
+    let err = coord
+        .put_bucket_tags(&PutBucketTagsRequest {
+            bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+            tags: bucket_tag_set(
+                "<Tagging><TagSet><Tag><Key>foo</Key><Value>bar</Value></Tag></TagSet></Tagging>",
+            ),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::OperationAborted),
+        "expected PutBucketTagging command conflict to map to OperationAborted, got {err:?}"
+    );
+    drop(hook_guard);
+}
+
+#[test]
+fn put_object_tagging_command_log_conflict_maps_to_operation_aborted() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13730,13 +13768,13 @@ fn put_object_metadata_request_maps_command_log_conflict_to_operation_aborted() 
     .unwrap_err();
     assert!(
         matches!(err, ServerError::OperationAborted),
-        "expected PutObjectMetadata command conflict to map to OperationAborted, got {err:?}"
+        "expected PutObjectTagging command conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn delete_object_version_request_maps_command_log_conflict_to_operation_aborted() {
+fn delete_object_version_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13804,14 +13842,14 @@ fn delete_object_version_request_maps_command_log_conflict_to_operation_aborted(
         ))
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected delete object command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected delete object command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn delete_objects_entry_maps_command_log_conflict_to_operation_aborted_error() {
+fn delete_objects_entry_maps_command_log_conflict_to_slow_down_error() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13868,12 +13906,12 @@ fn delete_objects_entry_maps_command_log_conflict_to_operation_aborted_error() {
     );
     assert_eq!(result.errors.len(), 1);
     assert_eq!(result.errors[0].key, "key");
-    assert_eq!(result.errors[0].code, "OperationAborted");
+    assert_eq!(result.errors[0].code, "SlowDown");
     drop(hook_guard);
 }
 
 #[test]
-fn delete_object_marker_insert_request_maps_command_log_conflict_to_operation_aborted() {
+fn delete_object_marker_insert_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13931,14 +13969,14 @@ fn delete_object_marker_insert_request_maps_command_log_conflict_to_operation_ab
         ))
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected delete marker command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected delete marker command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn delete_object_marker_version_reservation_maps_command_log_conflict_to_operation_aborted() {
+fn delete_object_marker_version_reservation_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13978,8 +14016,8 @@ fn delete_object_marker_version_reservation_maps_command_log_conflict_to_operati
         ))
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected delete marker version reservation conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected delete marker version reservation conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
@@ -14007,7 +14045,7 @@ fn conditional_delete_maps_metadata_command_budget_exhaustion_to_request_conflic
         &DeleteCondition::None,
         "key",
     );
-    assert!(matches!(error, ServerError::OperationAborted));
+    assert!(matches!(error, ServerError::SlowDown));
 
     let error = Coordinator::map_delete_object_pg_action_error(
         storage::ObjectPgActionError::Store(storage::StoreError::RouteMapExpired {
@@ -14018,7 +14056,7 @@ fn conditional_delete_maps_metadata_command_budget_exhaustion_to_request_conflic
         &cond,
         "key",
     );
-    assert!(matches!(error, ServerError::OperationAborted));
+    assert!(matches!(error, ServerError::SlowDown));
 }
 
 #[test]
@@ -14100,7 +14138,7 @@ fn conditional_delete_marker_version_reservation_conflict_is_request_conflict() 
 }
 
 #[test]
-fn create_multipart_upload_request_maps_command_log_conflict_to_operation_aborted() {
+fn create_multipart_upload_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -14136,8 +14174,8 @@ fn create_multipart_upload_request_maps_command_log_conflict_to_operation_aborte
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected CreateMultipartUpload command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected CreateMultipartUpload command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
@@ -14243,7 +14281,7 @@ fn complete_multipart_upload_version_reservation_maps_command_log_conflict_to_op
 }
 
 #[test]
-fn upload_part_append_request_maps_command_log_conflict_to_operation_aborted() {
+fn upload_part_append_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -14284,14 +14322,14 @@ fn upload_part_append_request_maps_command_log_conflict_to_operation_aborted() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session.session_id, 0, b"part")
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected UploadPart append command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected UploadPart append command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn upload_part_finalize_request_maps_command_log_conflict_to_operation_aborted() {
+fn upload_part_finalize_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -14344,14 +14382,14 @@ fn upload_part_finalize_request_maps_command_log_conflict_to_operation_aborted()
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected UploadPart finalize command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected UploadPart finalize command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn upload_part_copy_destination_finalize_maps_command_log_conflict_to_operation_aborted() {
+fn upload_part_copy_destination_finalize_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -14421,14 +14459,14 @@ fn upload_part_copy_destination_finalize_maps_command_log_conflict_to_operation_
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected UploadPartCopy destination commit conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected UploadPartCopy destination commit conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn abort_multipart_upload_request_maps_command_log_conflict_to_operation_aborted() {
+fn abort_multipart_upload_request_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -14460,8 +14498,8 @@ fn abort_multipart_upload_request_maps_command_log_conflict_to_operation_aborted
         ))
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected AbortMultipartUpload command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected AbortMultipartUpload command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
@@ -14495,7 +14533,7 @@ fn delete_bucket_begin_request_maps_command_log_conflict_to_operation_aborted() 
 }
 
 #[test]
-fn bucket_delete_finalizer_expired_route_map_maps_to_operation_aborted() {
+fn bucket_delete_finalizer_expired_route_map_maps_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -14549,8 +14587,8 @@ fn bucket_delete_finalizer_expired_route_map_maps_to_operation_aborted() {
         .try_finalize_bucket_delete_for(&bucket)
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected bucket delete finalizer route-map expiry to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected bucket delete finalizer route-map expiry to map to SlowDown, got {err:?}"
     );
 }
 
@@ -14598,8 +14636,8 @@ fn bucket_delete_finalizer_route_map_expiry_after_claim_releases_claim() {
         .try_finalize_bucket_delete_for(&bucket_name)
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected bucket delete finalizer mid-claim route-map expiry to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected bucket delete finalizer mid-claim route-map expiry to map to SlowDown, got {err:?}"
     );
     drop(_hook_guard);
 
@@ -14613,7 +14651,7 @@ fn bucket_delete_finalizer_route_map_expiry_after_claim_releases_claim() {
 }
 
 #[test]
-fn bucket_delete_finalizer_stale_metadata_route_maps_to_operation_aborted() {
+fn bucket_delete_finalizer_stale_metadata_route_maps_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -14647,13 +14685,13 @@ fn bucket_delete_finalizer_stale_metadata_route_maps_to_operation_aborted() {
         .try_finalize_bucket_delete_for(&bucket)
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected bucket delete finalizer stale metadata route to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected bucket delete finalizer stale metadata route to map to SlowDown, got {err:?}"
     );
 }
 
 #[test]
-fn lifecycle_current_expiry_maps_command_log_conflict_to_operation_aborted() {
+fn lifecycle_current_expiry_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
@@ -14725,14 +14763,14 @@ fn lifecycle_current_expiry_maps_command_log_conflict_to_operation_aborted() {
         )
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected lifecycle current expiry command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected lifecycle current expiry command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
 
 #[test]
-fn lifecycle_abort_multipart_maps_command_log_conflict_to_operation_aborted() {
+fn lifecycle_abort_multipart_maps_command_log_conflict_to_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_same_process_coordinator_with_storage_cluster_without_lifecycle_sweeper(
@@ -14794,8 +14832,8 @@ fn lifecycle_abort_multipart_maps_command_log_conflict_to_operation_aborted() {
         )
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::OperationAborted),
-        "expected lifecycle multipart abort command conflict to map to OperationAborted, got {err:?}"
+        matches!(err, ServerError::SlowDown),
+        "expected lifecycle multipart abort command conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
 }
@@ -16461,7 +16499,7 @@ fn delete_bucket_authorization_adopts_active_preserved_attempt_without_drain_wai
 }
 
 #[test]
-fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
+fn delete_bucket_expired_route_map_maps_to_slow_down() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-expired-route-map";
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -16477,11 +16515,11 @@ fn delete_bucket_expired_route_map_maps_to_operation_aborted() {
     );
     let expired_coord = setup_direct_coordinator_with_storage_cluster(expired_cluster);
     let err = delete_bucket_test(&expired_coord, bucket).unwrap_err();
-    assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
+    assert!(matches!(err, ServerError::SlowDown), "{err:?}");
 }
 
 #[test]
-fn delete_bucket_stale_metadata_route_maps_to_operation_aborted() {
+fn delete_bucket_stale_metadata_route_maps_to_slow_down() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-stale-route";
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -16506,11 +16544,11 @@ fn delete_bucket_stale_metadata_route_maps_to_operation_aborted() {
 
     let stale_coord = setup_direct_coordinator_with_storage_cluster(stale_cluster);
     let err = delete_bucket_test(&stale_coord, bucket).unwrap_err();
-    assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
+    assert!(matches!(err, ServerError::SlowDown), "{err:?}");
 }
 
 #[test]
-fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
+fn delete_bucket_route_map_expiry_after_drain_maps_to_slow_down() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-delete-mid-expired-route-map";
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
@@ -16547,7 +16585,7 @@ fn delete_bucket_route_map_expiry_after_drain_maps_to_operation_aborted() {
     });
 
     let err = delete_bucket_test(&expiring_coord, bucket).unwrap_err();
-    assert!(matches!(err, ServerError::OperationAborted), "{err:?}");
+    assert!(matches!(err, ServerError::SlowDown), "{err:?}");
 
     let info = storage_cluster
         .head_bucket_info(&trusted_bucket_name(bucket))
@@ -20470,7 +20508,7 @@ fn reclaim_zero_apply_failure_releases_claim_after_pending_slot_cleanup() {
         .unwrap_err();
     assert!(failed_once.load(Ordering::SeqCst));
     assert!(
-        matches!(error, ServerError::OperationAborted),
+        matches!(error, ServerError::SlowDown),
         "zero-apply route failure should remain retryable, got {error:?}"
     );
 
@@ -20521,7 +20559,7 @@ fn reclaim_route_failure_after_claim_acquisition_releases_claim() {
         .unwrap_err();
     assert!(admission_failed.load(Ordering::SeqCst));
     assert!(
-        matches!(error, ServerError::OperationAborted),
+        matches!(error, ServerError::SlowDown),
         "post-claim route failure should remain retryable, got {error:?}"
     );
     assert!(
@@ -20594,7 +20632,7 @@ fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
     assert!(apply_failed.load(Ordering::SeqCst));
     assert!(ownership_lookup_failed.load(Ordering::SeqCst));
     assert!(
-        matches!(error, ServerError::OperationAborted),
+        matches!(error, ServerError::SlowDown),
         "the original retryable apply error should be preserved, got {error:?}"
     );
     assert!(

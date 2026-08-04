@@ -214,16 +214,11 @@ impl ReadRuntime {
 
     fn map_bucket_snapshot_error(error: storage::BucketSnapshotLoadError) -> ServerError {
         match error {
-            storage::BucketSnapshotLoadError::Store(
-                storage::StoreError::MetadataCommandLogConflict { .. }
-                | storage::StoreError::MetadataCommandLogGap { .. }
-                | storage::StoreError::MetadataCommandPendingConflict { .. },
-            ) => ServerError::OperationAborted,
             storage::BucketSnapshotLoadError::Store(error) => super::map_store_error(error),
             storage::BucketSnapshotLoadError::Metadata(ref error)
                 if super::metadata_error_is_command_contention(error) =>
             {
-                ServerError::OperationAborted
+                ServerError::SlowDown
             }
             storage::BucketSnapshotLoadError::Metadata(
                 storage::MetadataError::BucketNotFound { name },
