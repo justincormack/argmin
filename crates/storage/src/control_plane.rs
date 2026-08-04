@@ -12719,7 +12719,11 @@ impl UnixControlPlaneClient {
         pg_id: PgId,
         _authority_now_ms: u64,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        self.pg_runtime_map_snapshot_with_read_timeout(pg_id, 0, CONTROL_PLANE_RPC_IO_TIMEOUT)
+        self.pg_runtime_map_snapshot_with_read_timeout(
+            pg_id,
+            0,
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
+        )
     }
 
     pub fn serving_pg_runtime_map_snapshot(
@@ -15159,7 +15163,7 @@ impl ControlPlaneRuntimeMapSource for AuthenticatedUnixControlPlaneClient {
             ControlPlaneRpcKind::PgRuntimeMapSnapshot,
             authority_now_ms,
             payload,
-            CONTROL_PLANE_RPC_IO_TIMEOUT,
+            CONTROL_PLANE_RPC_CHECK_APPLIED_IO_TIMEOUT,
         )?;
         let mut reader = PayloadReader::new(&payload);
         let runtime_map = read_runtime_map_snapshot(&mut reader)?;
@@ -36045,6 +36049,85 @@ mod tests {
         assert_eq!(status.cluster_epoch(), expected_epoch);
         assert_eq!(status.pg_routes(), 1);
         assert_eq!(status.active_serving_pg_routes(), 1);
+    }
+
+    #[test]
+    fn unix_pg_runtime_map_uses_check_applied_timeout_for_slow_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(250));
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_000)
+                .unwrap();
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let runtime_map =
+            ControlPlaneRuntimeMapSource::pg_runtime_map_snapshot(&client, PgId::new(7), 2_000)
+                .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
+        assert_eq!(runtime_map.pg_routes()[0].state(), PgState::Peering);
+    }
+
+    #[test]
+    fn authenticated_pg_runtime_map_uses_check_applied_timeout_for_slow_response() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let expected_epoch = authority.snapshot().cluster_epoch();
+        let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            std::thread::sleep(CONTROL_PLANE_RPC_IO_TIMEOUT + Duration::from_millis(250));
+            handle_control_plane_unix_stream_with_auth(
+                &mut authority,
+                &mut stream,
+                2_000,
+                &verifier,
+            )
+            .unwrap();
+        });
+
+        let client = AuthenticatedUnixControlPlaneClient::new(
+            UnixControlPlaneClient::new(&socket_path),
+            frontend_auth_credential("auth-cluster", "frontend-1"),
+        );
+        let runtime_map =
+            ControlPlaneRuntimeMapSource::pg_runtime_map_snapshot(&client, PgId::new(7), 2_000)
+                .unwrap();
+
+        server.join().unwrap();
+        assert_eq!(runtime_map.cluster_epoch(), expected_epoch);
+        assert_eq!(runtime_map.pg_routes().len(), 1);
+        assert_eq!(runtime_map.pg_routes()[0].pg_id(), PgId::new(7));
+        assert_eq!(runtime_map.pg_routes()[0].state(), PgState::Peering);
     }
 
     #[test]

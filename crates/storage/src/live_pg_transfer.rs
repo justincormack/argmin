@@ -183,6 +183,7 @@ enum LivePgMetadataTransferStorageTransport {
         generation: std::sync::atomic::AtomicU64,
         export_route_refresh_failures: std::sync::atomic::AtomicU64,
         import_route_refresh_failures: std::sync::atomic::AtomicU64,
+        import_pending_command_failures: std::sync::atomic::AtomicU64,
     },
 }
 
@@ -369,6 +370,7 @@ impl LivePgMetadataTransferAdmin {
                 generation: std::sync::atomic::AtomicU64::new(0),
                 export_route_refresh_failures: std::sync::atomic::AtomicU64::new(0),
                 import_route_refresh_failures: std::sync::atomic::AtomicU64::new(0),
+                import_pending_command_failures: std::sync::atomic::AtomicU64::new(0),
             },
             failpoint: None,
             after_transfer_install_hook: None,
@@ -387,6 +389,19 @@ impl LivePgMetadataTransferAdmin {
         };
         export_route_refresh_failures.store(export, std::sync::atomic::Ordering::Relaxed);
         import_route_refresh_failures.store(import, std::sync::atomic::Ordering::Relaxed);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_import_pending_command_failures(self, failures: u64) -> Self {
+        let LivePgMetadataTransferStorageTransport::InProcess {
+            import_pending_command_failures,
+            ..
+        } = &self.transport
+        else {
+            panic!("pending-command failure injection requires in-process storage");
+        };
+        import_pending_command_failures.store(failures, std::sync::atomic::Ordering::Relaxed);
         self
     }
 
@@ -1038,13 +1053,19 @@ impl LivePgMetadataTransferAdmin {
         let mut first_refresh_error = None;
         let mut refresh_failures = 0_u64;
         loop {
-            let result = self.injected_route_refresh_failure(false).map_or_else(
-                || cluster.import_pg_metadata_transfer_artifact_from_retained_log(artifact),
-                Err,
-            );
+            let result = self
+                .injected_import_pending_command_failure(context.pg_id)
+                .or_else(|| self.injected_route_refresh_failure(false))
+                .map_or_else(
+                    || cluster.import_pg_metadata_transfer_artifact_from_retained_log(artifact),
+                    Err,
+                );
             match result {
                 Ok(proof) => return Ok(proof),
-                Err(error) if error.requires_route_refresh_retry() => {
+                Err(error)
+                    if error.requires_route_refresh_retry()
+                        || error.is_transient_import_blocker() =>
+                {
                     refresh_failures = refresh_failures.saturating_add(1);
                     first_refresh_error.get_or_insert_with(|| error.to_string());
                     match self.refresh_import_route(&context)? {
@@ -1107,6 +1128,40 @@ impl LivePgMetadataTransferAdmin {
     fn injected_route_refresh_failure(
         &self,
         _export: bool,
+    ) -> Option<crate::error::PgMetadataTransferError> {
+        None
+    }
+
+    #[cfg(test)]
+    fn injected_import_pending_command_failure(
+        &self,
+        pg_id: PgId,
+    ) -> Option<crate::error::PgMetadataTransferError> {
+        let LivePgMetadataTransferStorageTransport::InProcess {
+            import_pending_command_failures,
+            ..
+        } = &self.transport
+        else {
+            return None;
+        };
+        import_pending_command_failures
+            .try_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |value| value.checked_sub(1),
+            )
+            .ok()
+            .map(
+                |_| crate::error::PgMetadataTransferError::PendingMetadataCommand {
+                    node_id: NodeId::new(pg_id.get()),
+                },
+            )
+    }
+
+    #[cfg(not(test))]
+    fn injected_import_pending_command_failure(
+        &self,
+        _pg_id: PgId,
     ) -> Option<crate::error::PgMetadataTransferError> {
         None
     }
@@ -2172,7 +2227,7 @@ mod tests {
     }
 
     #[test]
-    fn live_admin_refreshes_stale_source_and_destination_routes() {
+    fn live_admin_retries_stale_routes_and_pending_destination_recovery() {
         let tmp = test_util::tempdir();
         let socket_path = tmp.path().join("control-plane.sock");
         let (authority, now_ms, pg_id, source_node_id, destination_node_id) =
@@ -2190,19 +2245,17 @@ mod tests {
                 now_ms.saturating_add(74),
                 now_ms.saturating_add(75),
                 now_ms.saturating_add(76),
+                now_ms.saturating_add(77),
+                now_ms.saturating_add(78),
             ],
         );
         let _time = crate::clock::test_time_override_guard(now_ms.saturating_add(100));
 
         let summary = live_transfer_admin(tmp.path(), &socket_path)
             .with_route_refresh_failures(1, 1)
+            .with_import_pending_command_failures(1)
             .transfer(pg_id.get(), vec![destination_node_id.as_u32()])
-            .unwrap_or_else(|error| {
-                panic!(
-                    "route-refreshed live transfer failed: {}",
-                    error._diagnostic
-                )
-            });
+            .unwrap_or_else(|error| panic!("retried live transfer failed: {}", error._diagnostic));
 
         assert!(!summary.already_completed());
         assert_eq!(summary.source_node_id(), source_node_id.as_u32());

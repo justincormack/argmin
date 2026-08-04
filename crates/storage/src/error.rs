@@ -1276,12 +1276,20 @@ pub(crate) enum PgMetadataTransferError {
     Apply(#[from] BucketSnapshotLoadError),
     #[error("PG metadata transfer reconstruction failed: {message}")]
     Reconstruction { message: String },
+    #[error("PG peering node {node_id:?} still has a pending metadata command")]
+    PendingMetadataCommand { node_id: crate::NodeId },
     #[error("PG metadata transfer route changed during reconstruction: {message}")]
     RouteRefreshRequired { message: String },
 }
 
 impl PgMetadataTransferError {
     pub(crate) fn reconstruction(error: crate::peering::PgPeeringReconstructionError) -> Self {
+        let error = match error {
+            crate::peering::PgPeeringReconstructionError::PendingMetadataCommand { node_id } => {
+                return Self::PendingMetadataCommand { node_id };
+            }
+            error => error,
+        };
         let route_refresh_required = matches!(
             error,
             crate::peering::PgPeeringReconstructionError::StaleReplicaEpoch { .. }
@@ -1307,8 +1315,16 @@ impl PgMetadataTransferError {
             Self::Apply(BucketSnapshotLoadError::Metadata(_)) | Self::Reconstruction { .. } => {
                 false
             }
+            Self::PendingMetadataCommand { .. } => false,
             Self::RouteRefreshRequired { .. } => true,
         }
+    }
+
+    /// Report a safe transient import blocker that must be resolved by the
+    /// normal metadata-command recovery path before import retries.
+    #[must_use]
+    pub(crate) fn is_transient_import_blocker(&self) -> bool {
+        matches!(self, Self::PendingMetadataCommand { .. })
     }
 }
 
@@ -1560,9 +1576,21 @@ mod tests {
         ));
         assert!(stale_reconstruction.requires_route_refresh_retry());
 
-        let permanent_reconstruction = PgMetadataTransferError::reconstruction(
+        let pending_reconstruction = PgMetadataTransferError::reconstruction(
             crate::peering::PgPeeringReconstructionError::PendingMetadataCommand {
                 node_id: crate::NodeId::new(1),
+            },
+        );
+        assert!(matches!(
+            pending_reconstruction,
+            PgMetadataTransferError::PendingMetadataCommand { .. }
+        ));
+        assert!(!pending_reconstruction.requires_route_refresh_retry());
+        assert!(pending_reconstruction.is_transient_import_blocker());
+
+        let permanent_reconstruction = PgMetadataTransferError::reconstruction(
+            crate::peering::PgPeeringReconstructionError::PrimaryMissing {
+                primary: crate::NodeId::new(1),
             },
         );
         assert!(matches!(
@@ -1570,6 +1598,7 @@ mod tests {
             PgMetadataTransferError::Reconstruction { .. }
         ));
         assert!(!permanent_reconstruction.requires_route_refresh_retry());
+        assert!(!permanent_reconstruction.is_transient_import_blocker());
     }
 
     #[test]
