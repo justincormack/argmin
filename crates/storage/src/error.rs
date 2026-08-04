@@ -42,17 +42,130 @@ impl std::error::Error for DatabaseError {}
 
 /// Semantic classification of a transient failure reported by a storage node.
 ///
-/// The storage RPC wire error code is deliberately not part of this API. Higher
-/// layers may use this classification to make their own retry decisions without
-/// depending on the protocol representation.
+/// This is an owner-internal intermediate classification. Public callers receive
+/// the operation-level [`StoreOperationFailureClass`] instead of reconstructing
+/// policy from storage-node behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StorageNodeFailureClass {
+pub(crate) enum StorageNodeFailureClass {
     ShardLocationStale,
     PgRouteUnavailable,
     MetadataCommandContention,
     MetadataTransferHistoricalRouteActive,
     TransportInterrupted,
 }
+
+/// Exhaustive semantic classification of a failed storage operation.
+///
+/// This is the only storage failure policy exposed to higher layers. It is
+/// deliberately independent of PG, shard, database, route, command-log, and RPC
+/// representations. Adding a `StoreError` variant requires an explicit decision
+/// in [`StoreError::operation_failure_class`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreOperationFailureClass {
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    Other,
+}
+
+/// Bounded operator diagnostic retained when a concrete storage error crosses
+/// its ownership boundary.
+///
+/// This is deliberately separate from [`StoreOperationFailureClass`]: request
+/// policy must not depend on operational diagnosis, while operators still need
+/// to distinguish broad failure domains. The category contains no resource
+/// names, physical identifiers, paths, database text, or remote messages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreFailureDiagnosticCategory {
+    NotFound,
+    Integrity,
+    Topology,
+    MetadataContention,
+    MetadataConsistency,
+    ResourceExhausted,
+    RpcTransport,
+    RpcProtocol,
+    Schema,
+    Io,
+    Database,
+    Codec,
+    InternalInvariant,
+}
+
+impl StoreFailureDiagnosticCategory {
+    const fn cause_label(self) -> &'static str {
+        match self {
+            Self::NotFound => "store_not_found",
+            Self::Integrity => "store_integrity_failure",
+            Self::Topology => "store_topology_failure",
+            Self::MetadataContention => "store_metadata_command_contention",
+            Self::MetadataConsistency => "store_metadata_consistency_failure",
+            Self::ResourceExhausted => "store_resource_exhausted",
+            Self::RpcTransport => "store_rpc_transport_failure",
+            Self::RpcProtocol => "store_rpc_protocol_failure",
+            Self::Schema => "store_schema_failure",
+            Self::Io => "store_io_failure",
+            Self::Database => "store_database_failure",
+            Self::Codec => "store_codec_failure",
+            Self::InternalInvariant => "store_internal_failure",
+        }
+    }
+}
+
+/// A storage failure summarized for diagnosis without exposing its
+/// implementation representation to another crate.
+///
+/// Public formatting and the error chain are intentionally redacted. Callers may
+/// use [`StoreFailure::class`] to translate the semantic outcome into their own
+/// protocol response, but cannot inspect the original PG, shard, database,
+/// command-log, route, or RPC error. Operator diagnostics retain only a bounded
+/// storage-owned category.
+pub struct StoreFailure {
+    class: StoreOperationFailureClass,
+    diagnostic_category: StoreFailureDiagnosticCategory,
+}
+
+impl StoreFailure {
+    #[must_use]
+    pub const fn class(&self) -> StoreOperationFailureClass {
+        self.class
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+}
+
+impl From<StoreError> for StoreFailure {
+    fn from(error: StoreError) -> Self {
+        Self {
+            class: error.operation_failure_class(),
+            diagnostic_category: error.failure_diagnostic_category(),
+        }
+    }
+}
+
+impl std::fmt::Debug for StoreFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoreFailure")
+            .field("class", &self.class)
+            .field(
+                "diagnostic_category",
+                &self.diagnostic_category.cause_label(),
+            )
+            .finish()
+    }
+}
+
+impl std::fmt::Display for StoreFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("storage operation failed")
+    }
+}
+
+impl std::error::Error for StoreFailure {}
 
 /// Opaque diagnostic detail reported by a storage node.
 ///
@@ -536,6 +649,240 @@ pub enum StoreError {
 }
 
 impl StoreError {
+    /// Classify this failure for a higher-layer request operation.
+    ///
+    /// The match is intentionally exhaustive. Storage owns recursive adapter and
+    /// RPC interpretation; callers make protocol-specific decisions from this
+    /// bounded semantic result only.
+    #[must_use]
+    pub fn operation_failure_class(&self) -> StoreOperationFailureClass {
+        match self {
+            Self::ClusterMapHistoryReferenceLimitExceeded { .. }
+            | Self::StorageRpcResourceExhausted { .. } => {
+                StoreOperationFailureClass::ResourceExhausted
+            }
+            Self::MetadataCommandLogConflict { .. }
+            | Self::MetadataCommandLogGap { .. }
+            | Self::MetadataCommandPendingConflict { .. }
+            | Self::MetadataCommandContention { .. } => {
+                StoreOperationFailureClass::MetadataCommandContention
+            }
+            Self::StalePayloadOperation { .. }
+            | Self::StaleMetadataPrimaryBridge { .. }
+            | Self::StaleMetadataOperation { .. }
+            | Self::StaleMetadataRoute { .. }
+            | Self::StaleMetadataReadProof { .. }
+            | Self::RouteMapExpired { .. }
+            | Self::RouteAdmissionClusterMismatch { .. }
+            | Self::StaleMetadataCommand { .. }
+            | Self::StaleShardOperation { .. }
+            | Self::StaleShardLocation { .. }
+            | Self::PgNotActive { .. }
+            | Self::ShardPgNotActive { .. } => StoreOperationFailureClass::RetryableConvergence,
+            Self::ShardStore { source, .. } => source.operation_failure_class(),
+            Self::StorageRpc { failure, .. } => match failure.wire_code() {
+                StorageRpcWireErrorCode::MetadataCommandContention => {
+                    StoreOperationFailureClass::MetadataCommandContention
+                }
+                StorageRpcWireErrorCode::ResourceExhausted => {
+                    StoreOperationFailureClass::ResourceExhausted
+                }
+                StorageRpcWireErrorCode::StaleShardLocation
+                | StorageRpcWireErrorCode::InactivePgRoute
+                | StorageRpcWireErrorCode::NonActingSetAccess
+                | StorageRpcWireErrorCode::WrongClusterEpoch => {
+                    StoreOperationFailureClass::RetryableConvergence
+                }
+                StorageRpcWireErrorCode::FrameDecode
+                | StorageRpcWireErrorCode::PayloadDecode
+                | StorageRpcWireErrorCode::UnknownNode
+                | StorageRpcWireErrorCode::UnknownPg
+                | StorageRpcWireErrorCode::UnsupportedOperation
+                | StorageRpcWireErrorCode::Internal
+                | StorageRpcWireErrorCode::ReclaimClaimNotFound
+                | StorageRpcWireErrorCode::ShardDeleteInProgress
+                | StorageRpcWireErrorCode::BucketWriteDrainConflict
+                | StorageRpcWireErrorCode::BucketWriteDrainNotFound
+                | StorageRpcWireErrorCode::ReclaimClaimConflict
+                | StorageRpcWireErrorCode::NotFound
+                | StorageRpcWireErrorCode::BucketWriteReservationConflict
+                | StorageRpcWireErrorCode::BucketWriteReservationNotFound
+                | StorageRpcWireErrorCode::ShardIntegrity
+                | StorageRpcWireErrorCode::MultipartConditionalRequestConflict
+                | StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive
+                | StorageRpcWireErrorCode::TransportTimeout
+                | StorageRpcWireErrorCode::TransportClosed => StoreOperationFailureClass::Other,
+            },
+            Self::NotFound
+            | Self::IntegrityError { .. }
+            | Self::ShardAckMismatch { .. }
+            | Self::PayloadShardSetMismatch { .. }
+            | Self::PlacedSegmentBackfillSourceUnavailable
+            | Self::HistoricalPgRouteNotRetained { .. }
+            | Self::ObjectPayloadReclaimFenceAuthorityMismatch
+            | Self::PgDurableIdentityInvalid { .. }
+            | Self::PgNotFound { .. }
+            | Self::InvalidPgTopology { .. }
+            | Self::ClusterPgNotFound { .. }
+            | Self::ShardPgNotFound { .. }
+            | Self::StorageRpcShardDeleteInProgress { .. }
+            | Self::RouteCapabilitySubjectMismatch { .. }
+            | Self::MultipartUploadIdIssuanceFailed
+            | Self::MetadataCommandWrongPg { .. }
+            | Self::MetadataCommandFromNonPrimary { .. }
+            | Self::MetadataTransferEmpty { .. }
+            | Self::MetadataCommandPendingOnNonPrimary { .. }
+            | Self::MetadataCommandLogChecksumMismatch { .. }
+            | Self::MetadataCommandLogHashMismatch { .. }
+            | Self::MetadataCommandReplicaStateMissing { .. }
+            | Self::MetadataCommandReplicaStateDiverged { .. }
+            | Self::MetadataStateDigestMismatch { .. }
+            | Self::MetadataTransferUnsupportedProof { .. }
+            | Self::MetadataCheckpointInvalid { .. }
+            | Self::NodeNotFound { .. }
+            | Self::NodeNotInActingSet { .. }
+            | Self::ShardIndexMismatch { .. }
+            | Self::ShardScavengerObservationWrongPg { .. }
+            | Self::ShardScavengerObservationShardIndexMismatch { .. }
+            | Self::ShardScavengerObservationInconsistentReason { .. }
+            | Self::InvalidKeyLength { .. }
+            | Self::InvalidShardKeyHex
+            | Self::ShardScavengerScanIncomplete { .. }
+            | Self::PgSchemaInvalid { .. }
+            | Self::MetadataDigestBootstrapInvalid { .. }
+            | Self::Io { .. }
+            | Self::Db { .. }
+            | Self::ErasureCoding { .. } => StoreOperationFailureClass::Other,
+        }
+    }
+
+    /// Return a bounded storage-owned operator diagnostic label.
+    ///
+    /// This label is for reporting only. Request outcome and retry policy must
+    /// use [`Self::operation_failure_class`] instead. The label never contains
+    /// values retained by the concrete error.
+    #[must_use]
+    pub fn diagnostic_cause_label(&self) -> &'static str {
+        self.failure_diagnostic_category().cause_label()
+    }
+
+    fn failure_diagnostic_category(&self) -> StoreFailureDiagnosticCategory {
+        match self {
+            Self::NotFound | Self::PlacedSegmentBackfillSourceUnavailable => {
+                StoreFailureDiagnosticCategory::NotFound
+            }
+            Self::IntegrityError { .. }
+            | Self::ShardAckMismatch { .. }
+            | Self::PayloadShardSetMismatch { .. }
+            | Self::PgDurableIdentityInvalid { .. }
+            | Self::MetadataCommandLogChecksumMismatch { .. }
+            | Self::MetadataCommandLogHashMismatch { .. }
+            | Self::MetadataCommandReplicaStateDiverged { .. }
+            | Self::MetadataStateDigestMismatch { .. }
+            | Self::MetadataCheckpointInvalid { .. } => StoreFailureDiagnosticCategory::Integrity,
+            Self::HistoricalPgRouteNotRetained { .. }
+            | Self::PgNotFound { .. }
+            | Self::InvalidPgTopology { .. }
+            | Self::ClusterPgNotFound { .. }
+            | Self::ShardPgNotFound { .. }
+            | Self::PgNotActive { .. }
+            | Self::ShardPgNotActive { .. }
+            | Self::StalePayloadOperation { .. }
+            | Self::StaleMetadataPrimaryBridge { .. }
+            | Self::StaleMetadataOperation { .. }
+            | Self::StaleMetadataRoute { .. }
+            | Self::StaleMetadataReadProof { .. }
+            | Self::RouteMapExpired { .. }
+            | Self::RouteAdmissionClusterMismatch { .. }
+            | Self::RouteCapabilitySubjectMismatch { .. }
+            | Self::StaleMetadataCommand { .. }
+            | Self::MetadataCommandWrongPg { .. }
+            | Self::MetadataCommandFromNonPrimary { .. }
+            | Self::MetadataCommandPendingOnNonPrimary { .. }
+            | Self::StaleShardOperation { .. }
+            | Self::StaleShardLocation { .. }
+            | Self::NodeNotFound { .. }
+            | Self::NodeNotInActingSet { .. }
+            | Self::ShardIndexMismatch { .. } => StoreFailureDiagnosticCategory::Topology,
+            Self::MetadataCommandLogConflict { .. }
+            | Self::MetadataCommandLogGap { .. }
+            | Self::MetadataCommandPendingConflict { .. }
+            | Self::MetadataCommandContention { .. } => {
+                StoreFailureDiagnosticCategory::MetadataContention
+            }
+            Self::ObjectPayloadReclaimFenceAuthorityMismatch
+            | Self::MetadataTransferEmpty { .. }
+            | Self::MetadataCommandReplicaStateMissing { .. }
+            | Self::MetadataTransferUnsupportedProof { .. }
+            | Self::ShardScavengerObservationWrongPg { .. }
+            | Self::ShardScavengerObservationShardIndexMismatch { .. }
+            | Self::ShardScavengerObservationInconsistentReason { .. }
+            | Self::ShardScavengerScanIncomplete { .. }
+            | Self::StorageRpcShardDeleteInProgress { .. } => {
+                StoreFailureDiagnosticCategory::MetadataConsistency
+            }
+            Self::ClusterMapHistoryReferenceLimitExceeded { .. }
+            | Self::StorageRpcResourceExhausted { .. } => {
+                StoreFailureDiagnosticCategory::ResourceExhausted
+            }
+            Self::ShardStore { source, .. } => source.failure_diagnostic_category(),
+            Self::StorageRpc { failure, .. } => match failure.wire_code() {
+                StorageRpcWireErrorCode::TransportTimeout
+                | StorageRpcWireErrorCode::TransportClosed => {
+                    StoreFailureDiagnosticCategory::RpcTransport
+                }
+                StorageRpcWireErrorCode::FrameDecode
+                | StorageRpcWireErrorCode::PayloadDecode
+                | StorageRpcWireErrorCode::UnsupportedOperation => {
+                    StoreFailureDiagnosticCategory::RpcProtocol
+                }
+                StorageRpcWireErrorCode::ResourceExhausted => {
+                    StoreFailureDiagnosticCategory::ResourceExhausted
+                }
+                StorageRpcWireErrorCode::ShardIntegrity => {
+                    StoreFailureDiagnosticCategory::Integrity
+                }
+                StorageRpcWireErrorCode::NotFound => StoreFailureDiagnosticCategory::NotFound,
+                StorageRpcWireErrorCode::UnknownNode
+                | StorageRpcWireErrorCode::UnknownPg
+                | StorageRpcWireErrorCode::StaleShardLocation
+                | StorageRpcWireErrorCode::InactivePgRoute
+                | StorageRpcWireErrorCode::NonActingSetAccess
+                | StorageRpcWireErrorCode::WrongClusterEpoch
+                | StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive => {
+                    StoreFailureDiagnosticCategory::Topology
+                }
+                StorageRpcWireErrorCode::MetadataCommandContention => {
+                    StoreFailureDiagnosticCategory::MetadataContention
+                }
+                StorageRpcWireErrorCode::ReclaimClaimNotFound
+                | StorageRpcWireErrorCode::ShardDeleteInProgress
+                | StorageRpcWireErrorCode::BucketWriteDrainConflict
+                | StorageRpcWireErrorCode::BucketWriteDrainNotFound
+                | StorageRpcWireErrorCode::ReclaimClaimConflict
+                | StorageRpcWireErrorCode::BucketWriteReservationConflict
+                | StorageRpcWireErrorCode::BucketWriteReservationNotFound
+                | StorageRpcWireErrorCode::MultipartConditionalRequestConflict => {
+                    StoreFailureDiagnosticCategory::MetadataConsistency
+                }
+                StorageRpcWireErrorCode::Internal => {
+                    StoreFailureDiagnosticCategory::InternalInvariant
+                }
+            },
+            Self::PgSchemaInvalid { .. } | Self::MetadataDigestBootstrapInvalid { .. } => {
+                StoreFailureDiagnosticCategory::Schema
+            }
+            Self::Io { .. } => StoreFailureDiagnosticCategory::Io,
+            Self::Db { .. } => StoreFailureDiagnosticCategory::Database,
+            Self::InvalidKeyLength { .. }
+            | Self::InvalidShardKeyHex
+            | Self::ErasureCoding { .. } => StoreFailureDiagnosticCategory::Codec,
+            Self::MultipartUploadIdIssuanceFailed => {
+                StoreFailureDiagnosticCategory::InternalInvariant
+            }
+        }
+    }
+
     /// Construct the semantic resource-exhaustion state without exposing a
     /// remote storage-node diagnostic.
     #[must_use]
@@ -563,7 +910,7 @@ impl StoreError {
     /// Nested shard-store failures are unwrapped because callers make retry
     /// decisions for the logical operation, not for the internal adapter layer.
     #[must_use]
-    pub fn storage_node_failure_class(&self) -> Option<StorageNodeFailureClass> {
+    pub(crate) fn storage_node_failure_class(&self) -> Option<StorageNodeFailureClass> {
         match self {
             Self::ShardStore { source, .. } => source.storage_node_failure_class(),
             Self::StaleMetadataReadProof { .. } => {
@@ -630,7 +977,7 @@ impl StoreError {
 
     /// Return a bounded diagnostic category suitable for metrics labels.
     #[must_use]
-    pub fn diagnostic_kind(&self) -> &'static str {
+    pub(crate) fn diagnostic_kind(&self) -> &'static str {
         match self {
             Self::NotFound => "not_found",
             Self::IntegrityError { .. } => "integrity_error",
@@ -1260,13 +1607,93 @@ pub enum MetadataError {
     },
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum BucketSnapshotLoadError {
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    #[error(transparent)]
-    Metadata(#[from] MetadataError),
+impl MetadataError {
+    /// Report whether this metadata failure represents command contention.
+    ///
+    /// This interpretation is storage-owned because the individual reservation,
+    /// generation, and command variants are metadata implementation details.
+    #[must_use]
+    pub fn is_command_contention(&self) -> bool {
+        match self {
+            Self::BucketWriteReservationConflict { .. }
+            | Self::BucketWriteReservationNotFound { .. }
+            | Self::ObjectGenerationReservationConflict { .. }
+            | Self::ObjectVersionReservationConflict { .. }
+            | Self::StaleBucketMetadataCommand { .. }
+            | Self::StaleObjectWriteCommand { .. } => true,
+            Self::BucketNotFound { .. }
+            | Self::InvalidBucketName { .. }
+            | Self::InvalidObjectKey { .. }
+            | Self::BucketAlreadyExists
+            | Self::BucketNotEmpty
+            | Self::BucketNotFinalizedForDelete { .. }
+            | Self::BucketWriteDraining
+            | Self::BucketWriteDrainConflict { .. }
+            | Self::BucketWriteDrainNotFound { .. }
+            | Self::ReclaimClaimConflict { .. }
+            | Self::ReclaimClaimNotFound { .. }
+            | Self::RouteEffectRejected { .. }
+            | Self::ObjectNotFound
+            | Self::MethodNotAllowedOnDeleteMarker
+            | Self::InvalidVersioningTransition { .. }
+            | Self::NoSuchUpload { .. }
+            | Self::UploadNotInProgress { .. }
+            | Self::PartNotFound { .. }
+            | Self::StreamSessionNotFound { .. }
+            | Self::StreamSessionNotInProgress { .. }
+            | Self::StreamSegmentConflict { .. }
+            | Self::ObjectGenerationReservationNotFound { .. }
+            | Self::NotImplemented { .. }
+            | Self::InvariantViolation { .. }
+            | Self::Db { .. } => false,
+        }
+    }
 }
+
+pub enum BucketSnapshotLoadError {
+    Store(StoreError),
+    Metadata(MetadataError),
+}
+
+impl BucketSnapshotLoadError {
+    /// Return a bounded storage-owned label for operator diagnostics.
+    #[must_use]
+    pub fn diagnostic_cause_label(&self) -> &'static str {
+        match self {
+            Self::Store(error) => error.diagnostic_cause_label(),
+            Self::Metadata(_) => "metadata_failure",
+        }
+    }
+}
+
+impl From<StoreError> for BucketSnapshotLoadError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<MetadataError> for BucketSnapshotLoadError {
+    fn from(error: MetadataError) -> Self {
+        Self::Metadata(error)
+    }
+}
+
+impl std::fmt::Debug for BucketSnapshotLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BucketSnapshotLoadError")
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BucketSnapshotLoadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bucket snapshot load failed")
+    }
+}
+
+impl std::error::Error for BucketSnapshotLoadError {}
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum PgMetadataTransferError {
@@ -1360,33 +1787,126 @@ fn storage_node_failure_requires_metadata_transfer_route_refresh(
     }
 }
 
-#[derive(Debug, thiserror::Error)]
 pub enum BucketWriteDrainError {
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    #[error(transparent)]
-    Metadata(#[from] MetadataError),
+    Store(StoreError),
+    Metadata(MetadataError),
 }
 
-#[derive(Debug, thiserror::Error)]
+impl BucketWriteDrainError {
+    /// Return a bounded storage-owned label for operator diagnostics.
+    #[must_use]
+    pub fn diagnostic_cause_label(&self) -> &'static str {
+        match self {
+            Self::Store(error) => error.diagnostic_cause_label(),
+            Self::Metadata(_) => "metadata_failure",
+        }
+    }
+}
+
+impl From<StoreError> for BucketWriteDrainError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<MetadataError> for BucketWriteDrainError {
+    fn from(error: MetadataError) -> Self {
+        Self::Metadata(error)
+    }
+}
+
+impl std::fmt::Debug for BucketWriteDrainError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BucketWriteDrainError")
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BucketWriteDrainError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bucket write drain failed")
+    }
+}
+
+impl std::error::Error for BucketWriteDrainError {}
+
 pub enum ObjectPgActionError {
-    #[error(transparent)]
-    Store(#[from] StoreError),
-    #[error(transparent)]
-    Metadata(#[from] MetadataError),
-    #[error("invalid request: {reason}")]
+    Store(StoreError),
+    Metadata(MetadataError),
     InvalidRequest { reason: String },
-    #[error("object read subject changed before snapshot load")]
     StaleObjectReadSubject,
-    #[error("direct PUT commit snapshot changed before command build")]
     StaleDirectPutCommitSnapshot,
-    #[error("stream finalize snapshot changed before command build")]
     StaleStreamFinalizeSnapshot,
-    #[error("multipart completion snapshot changed before command build")]
     StaleMultipartCompletionSnapshot,
-    #[error("conditional multipart completion conflicts with an object write after initiation")]
     MultipartConditionalRequestConflict,
 }
+
+impl ObjectPgActionError {
+    /// Return a bounded storage-owned label for operator diagnostics.
+    #[must_use]
+    pub fn diagnostic_cause_label(&self) -> &'static str {
+        match self {
+            Self::Store(error) => error.diagnostic_cause_label(),
+            Self::Metadata(_) => "metadata_failure",
+            Self::InvalidRequest { .. } => "invalid_request",
+            Self::StaleObjectReadSubject => "stale_object_read_subject",
+            Self::StaleDirectPutCommitSnapshot => "stale_direct_put_commit_snapshot",
+            Self::StaleStreamFinalizeSnapshot => "stale_stream_finalize_snapshot",
+            Self::StaleMultipartCompletionSnapshot => "stale_multipart_completion_snapshot",
+            Self::MultipartConditionalRequestConflict => "multipart_conditional_request_conflict",
+        }
+    }
+
+    /// Report whether the underlying object-PG operation encountered metadata
+    /// command contention without exposing its storage representation.
+    #[must_use]
+    pub fn is_metadata_command_contention(&self) -> bool {
+        match self {
+            Self::Store(error) => {
+                error.operation_failure_class()
+                    == StoreOperationFailureClass::MetadataCommandContention
+            }
+            Self::Metadata(error) => error.is_command_contention(),
+            Self::InvalidRequest { .. }
+            | Self::StaleObjectReadSubject
+            | Self::StaleDirectPutCommitSnapshot
+            | Self::StaleStreamFinalizeSnapshot
+            | Self::StaleMultipartCompletionSnapshot
+            | Self::MultipartConditionalRequestConflict => false,
+        }
+    }
+}
+
+impl From<StoreError> for ObjectPgActionError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<MetadataError> for ObjectPgActionError {
+    fn from(error: MetadataError) -> Self {
+        Self::Metadata(error)
+    }
+}
+
+impl std::fmt::Debug for ObjectPgActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectPgActionError")
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ObjectPgActionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("object placement-group action failed")
+    }
+}
+
+impl std::error::Error for ObjectPgActionError {}
 
 #[cfg(test)]
 mod tests {
@@ -1486,6 +2006,351 @@ mod tests {
         assert_eq!(
             failure.storage_node_failure_class(),
             Some(StorageNodeFailureClass::TransportInterrupted)
+        );
+    }
+
+    #[test]
+    fn operation_failure_classification_is_storage_owned() {
+        let epoch_two = ClusterEpoch::new(2).unwrap();
+
+        for failure in [
+            StoreError::ClusterMapHistoryReferenceLimitExceeded { count: 2, max: 1 },
+            StoreError::storage_node_resource_exhausted(7, "resource test"),
+            remote_failure(StorageRpcErrorCode::ResourceExhausted),
+        ] {
+            assert_eq!(
+                failure.operation_failure_class(),
+                StoreOperationFailureClass::ResourceExhausted
+            );
+        }
+
+        for failure in [
+            StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            },
+            StoreError::MetadataCommandLogGap {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 4,
+                expected_log_index: 3,
+            },
+            StoreError::MetadataCommandPendingConflict {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                existing_log_index: 3,
+                candidate_log_index: 4,
+            },
+            StoreError::MetadataCommandContention { context: "test" },
+            remote_failure(StorageRpcErrorCode::MetadataCommandContention),
+        ] {
+            assert_eq!(
+                failure.operation_failure_class(),
+                StoreOperationFailureClass::MetadataCommandContention
+            );
+        }
+
+        for failure in [
+            StoreError::StalePayloadOperation {
+                pg_id: 2,
+                operation_epoch: ClusterEpoch::INITIAL,
+                current_epoch: epoch_two,
+            },
+            StoreError::StaleMetadataPrimaryBridge {
+                metadata_node_id: 1,
+                operation_epoch: ClusterEpoch::INITIAL,
+                current_epoch: epoch_two,
+            },
+            StoreError::StaleMetadataOperation {
+                pg_id: 2,
+                operation_epoch: ClusterEpoch::INITIAL,
+                current_epoch: epoch_two,
+            },
+            StoreError::StaleMetadataRoute {
+                pg_id: 2,
+                route_epoch: ClusterEpoch::INITIAL,
+                current_epoch: epoch_two,
+            },
+            StoreError::StaleMetadataReadProof {
+                node_id: 1,
+                pg_id: 2,
+            },
+            StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            },
+            StoreError::RouteAdmissionClusterMismatch {
+                admitted_epoch: ClusterEpoch::INITIAL,
+                operation_epoch: epoch_two,
+            },
+            StoreError::StaleMetadataCommand {
+                node_id: 1,
+                pg_id: 2,
+                command_epoch: ClusterEpoch::INITIAL,
+                current_epoch: epoch_two,
+            },
+            StoreError::StaleShardOperation {
+                node_id: 1,
+                pg_id: 2,
+                operation_epoch: ClusterEpoch::INITIAL,
+                current_epoch: epoch_two,
+            },
+            StoreError::StaleShardLocation {
+                node_id: 1,
+                pg_id: 2,
+                location_epoch: ClusterEpoch::INITIAL,
+                current_epoch: epoch_two,
+            },
+            StoreError::PgNotActive {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Peering,
+            },
+            StoreError::ShardPgNotActive {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Peering,
+            },
+            remote_failure(StorageRpcErrorCode::StaleShardLocation),
+            remote_failure(StorageRpcErrorCode::InactivePgRoute),
+            remote_failure(StorageRpcErrorCode::NonActingSetAccess),
+            remote_failure(StorageRpcErrorCode::WrongClusterEpoch),
+        ] {
+            assert_eq!(
+                failure.operation_failure_class(),
+                StoreOperationFailureClass::RetryableConvergence
+            );
+        }
+
+        for code in [
+            StorageRpcErrorCode::FrameDecode,
+            StorageRpcErrorCode::PayloadDecode,
+            StorageRpcErrorCode::UnknownNode,
+            StorageRpcErrorCode::UnknownPg,
+            StorageRpcErrorCode::UnsupportedOperation,
+            StorageRpcErrorCode::Internal,
+            StorageRpcErrorCode::ReclaimClaimNotFound,
+            StorageRpcErrorCode::ShardDeleteInProgress,
+            StorageRpcErrorCode::BucketWriteDrainConflict,
+            StorageRpcErrorCode::BucketWriteDrainNotFound,
+            StorageRpcErrorCode::ReclaimClaimConflict,
+            StorageRpcErrorCode::NotFound,
+            StorageRpcErrorCode::BucketWriteReservationConflict,
+            StorageRpcErrorCode::BucketWriteReservationNotFound,
+            StorageRpcErrorCode::ShardIntegrity,
+            StorageRpcErrorCode::MultipartConditionalRequestConflict,
+            StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
+            StorageRpcErrorCode::TransportTimeout,
+            StorageRpcErrorCode::TransportClosed,
+        ] {
+            assert_eq!(
+                remote_failure(code).operation_failure_class(),
+                StoreOperationFailureClass::Other,
+                "unexpected request classification for {code:?}"
+            );
+        }
+
+        for class in [
+            StoreOperationFailureClass::ResourceExhausted,
+            StoreOperationFailureClass::MetadataCommandContention,
+            StoreOperationFailureClass::RetryableConvergence,
+            StoreOperationFailureClass::Other,
+        ] {
+            let source = crate::test_support::store_error_for_operation_failure_class(class);
+            let nested = StoreError::ShardStore {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                source: Box::new(source),
+            };
+            assert_eq!(nested.operation_failure_class(), class);
+        }
+    }
+
+    #[test]
+    fn store_failure_reports_bounded_category_without_raw_detail() {
+        const SECRET: &str = "secret-storage-operation";
+        let failure = StoreFailure::from(StoreError::Io {
+            context: SECRET,
+            source: std::io::Error::other("secret operating-system detail"),
+        });
+
+        assert_eq!(failure.class(), StoreOperationFailureClass::Other);
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "storage operation failed");
+        let debug = format!("{failure:?}");
+        assert!(debug.contains("store_io_failure"));
+        assert!(!debug.contains(SECRET));
+        assert!(!debug.contains("operating-system"));
+        assert!(std::error::Error::source(&failure).is_none());
+    }
+
+    #[test]
+    fn store_failure_diagnostic_categories_distinguish_failure_domains() {
+        let cases = [
+            (
+                StoreError::NotFound,
+                StoreOperationFailureClass::Other,
+                "store_not_found",
+            ),
+            (
+                StoreError::IntegrityError {
+                    expected: 1,
+                    actual: 2,
+                },
+                StoreOperationFailureClass::Other,
+                "store_integrity_failure",
+            ),
+            (
+                StoreError::PgNotFound { pg_id: 7 },
+                StoreOperationFailureClass::Other,
+                "store_topology_failure",
+            ),
+            (
+                StoreError::MetadataCommandLogConflict {
+                    node_id: 1,
+                    pg_id: 2,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 3,
+                },
+                StoreOperationFailureClass::MetadataCommandContention,
+                "store_metadata_command_contention",
+            ),
+            (
+                StoreError::PgSchemaInvalid {
+                    reason: "secret schema detail".to_string(),
+                },
+                StoreOperationFailureClass::Other,
+                "store_schema_failure",
+            ),
+            (
+                StoreError::Db {
+                    context: "secret database operation",
+                    source: DatabaseError::new("secret database detail"),
+                },
+                StoreOperationFailureClass::Other,
+                "store_database_failure",
+            ),
+            (
+                remote_failure(StorageRpcErrorCode::TransportClosed),
+                StoreOperationFailureClass::Other,
+                "store_rpc_transport_failure",
+            ),
+            (
+                remote_failure(StorageRpcErrorCode::FrameDecode),
+                StoreOperationFailureClass::Other,
+                "store_rpc_protocol_failure",
+            ),
+        ];
+
+        for (error, expected_class, expected_label) in cases {
+            let failure = StoreFailure::from(error);
+            assert_eq!(failure.class(), expected_class);
+            assert_eq!(failure.diagnostic_cause_label(), expected_label);
+            let rendered = format!("{failure:?} {failure}");
+            assert!(!rendered.contains("secret"));
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+
+        let nested = StoreFailure::from(StoreError::ShardStore {
+            node_id: 1,
+            pg_id: 2,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            source: Box::new(StoreError::Db {
+                context: "nested secret operation",
+                source: DatabaseError::new("nested secret detail"),
+            }),
+        });
+        assert_eq!(nested.diagnostic_cause_label(), "store_database_failure");
+        assert!(!format!("{nested:?}").contains("secret"));
+    }
+
+    #[test]
+    fn bucket_write_drain_error_debug_redacts_nested_diagnostic() {
+        const SECRET_CONTEXT: &str = "secret bucket drain operation";
+        const SECRET_SOURCE: &str = "secret bucket drain source";
+        let error = BucketWriteDrainError::Store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+
+        assert_eq!(error.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(error.to_string(), "bucket write drain failed");
+        let debug = format!("{error:?}");
+        assert!(debug.contains("store_io_failure"));
+        assert!(!debug.contains(SECRET_CONTEXT));
+        assert!(!debug.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn exported_storage_wrapper_debug_redacts_nested_diagnostics() {
+        const SECRET_CONTEXT: &str = "secret exported wrapper operation";
+        const SECRET_SOURCE: &str = "secret exported wrapper source";
+        let snapshot = BucketSnapshotLoadError::Store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+        let object = ObjectPgActionError::InvalidRequest {
+            reason: "secret invalid request detail".to_string(),
+        };
+
+        assert_eq!(snapshot.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(snapshot.to_string(), "bucket snapshot load failed");
+        assert_eq!(object.diagnostic_cause_label(), "invalid_request");
+        assert_eq!(object.to_string(), "object placement-group action failed");
+        for rendered in [format!("{snapshot:?}"), format!("{object:?}")] {
+            assert!(!rendered.contains("secret"));
+            assert!(!rendered.contains(SECRET_CONTEXT));
+            assert!(!rendered.contains(SECRET_SOURCE));
+        }
+        assert!(std::error::Error::source(&snapshot).is_none());
+        assert!(std::error::Error::source(&object).is_none());
+    }
+
+    #[test]
+    fn metadata_contention_classification_is_storage_owned() {
+        let bucket = crate::types::BucketName::try_from("bucket".to_string()).unwrap();
+        let key = crate::types::ObjectKey::try_from("key".to_string()).unwrap();
+        for failure in [
+            MetadataError::BucketWriteReservationConflict {
+                reservation_id: "reservation".to_string(),
+            },
+            MetadataError::BucketWriteReservationNotFound {
+                reservation_id: "reservation".to_string(),
+            },
+            MetadataError::ObjectGenerationReservationConflict {
+                reservation_id: "reservation".to_string(),
+                generation_id: 1,
+            },
+            MetadataError::ObjectVersionReservationConflict {
+                version_id: crate::types::VersionId::from_u64(1),
+            },
+            MetadataError::StaleBucketMetadataCommand {
+                name: bucket.clone(),
+                bucket_execution_generation: 1,
+            },
+            MetadataError::StaleObjectWriteCommand {
+                bucket,
+                key,
+                write_sequence: 1,
+                generation_id: Some(1),
+            },
+        ] {
+            assert!(failure.is_command_contention());
+            assert!(ObjectPgActionError::Metadata(failure).is_metadata_command_contention());
+        }
+
+        assert!(!MetadataError::ObjectNotFound.is_command_contention());
+        assert!(!ObjectPgActionError::Store(StoreError::NotFound).is_metadata_command_contention());
+        assert!(
+            ObjectPgActionError::Store(StoreError::MetadataCommandContention { context: "test" })
+                .is_metadata_command_contention()
         );
     }
 

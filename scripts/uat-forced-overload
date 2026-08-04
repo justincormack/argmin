@@ -232,7 +232,7 @@ fi
 
 disallowed_matches="$(
     grep -HnE \
-        'server produced HTTP 500|request_500|status=500|InternalError|dispatch_internal_error|cause_label=storage_rpc_error|server_detail="storage_rpc |DispatchFailure|UnexpectedEof|Connection refused|connection refused|TimeoutError|OperationAttempt|panicked at|thread .* panicked' \
+        'server produced HTTP 500|request_500|status=500|InternalError|dispatch_internal_error|DispatchFailure|UnexpectedEof|Connection refused|connection refused|TimeoutError|OperationAttempt|panicked at|thread .* panicked' \
         "${scan_files[@]}" \
         2>/dev/null \
         | head -n 80 \

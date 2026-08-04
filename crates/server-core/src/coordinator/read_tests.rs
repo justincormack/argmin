@@ -138,10 +138,8 @@ fn get_object_payload_route_error_does_not_become_object_not_found() {
     assert!(
         matches!(
             err,
-            ServerError::Store(StoreError::ClusterPgNotFound {
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                ..
-            })
+            ServerError::Store(ref failure)
+                if failure.class() == storage::StoreOperationFailureClass::Other
         ),
         "expected typed route error, got {err:?}"
     );

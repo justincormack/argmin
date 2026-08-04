@@ -113,7 +113,7 @@ for the current local security suite.
 | `security/codex-90f9972` Tracing logs presigned URL queries and credentials | fixed | `./scripts/security-tests redaction` | Covered by redaction regressions for auth and observability surfaces. |
 | `security/codex-a413960` SQLite error details now leak in S3 error responses | fixed | `./scripts/security-tests redaction` | Covered by server-http sanitization regressions. |
 | `security/codex-2ce3446` DeleteBucket flight records leak raw bucket names | accepted | `./scripts/security-tests redaction` | Accepted under the observability policy: diagnostic resource names are escaped attacker-controlled text, not bearer secrets; normal request summaries still hash paths. |
-| `security/codex-84bb21e` Raw storage RPC details leak into 500 diagnostics | accepted | `./scripts/security-tests redaction` | Accepted for server-side operator diagnostics when values are observability-safe escaped; secret-bearing RPC values remain prohibited. |
+| `security/codex-84bb21e` Raw storage RPC details leak into 500 diagnostics | fixed | `./scripts/security-tests redaction`; `cargo nextest run -p storage -p server-core -p server-http` | Raw RPC and nested storage details no longer enter current production diagnostics, including pre-conversion wrapper paths. Concrete errors still transit designated adapters, but operator diagnostics and exported wrapper formatting use bounded categories with no nested error source. |
 
 ## Local Debug Endpoints
 

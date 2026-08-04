@@ -107,14 +107,13 @@ pub(super) fn map_store_error_with_metadata_contention(
     error: storage::StoreError,
     metadata_contention: MetadataContentionResponse,
 ) -> ServerError {
-    if store_error_is_resource_exhausted(&error) {
-        ServerError::SlowDown
-    } else if store_error_is_metadata_command_contention(&error) {
-        metadata_contention.into_server_error()
-    } else if store_error_is_retryable_convergence(&error) {
-        ServerError::SlowDown
-    } else {
-        ServerError::Store(error)
+    match error.operation_failure_class() {
+        storage::StoreOperationFailureClass::ResourceExhausted
+        | storage::StoreOperationFailureClass::RetryableConvergence => ServerError::SlowDown,
+        storage::StoreOperationFailureClass::MetadataCommandContention => {
+            metadata_contention.into_server_error()
+        }
+        storage::StoreOperationFailureClass::Other => ServerError::Store(error.into()),
     }
 }
 
@@ -133,96 +132,22 @@ impl<'a> StreamSegmentAppendPayload<'a> {
 }
 
 pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataError) -> bool {
-    matches!(
-        error,
-        storage::MetadataError::ObjectGenerationReservationConflict { .. }
-            | storage::MetadataError::ObjectVersionReservationConflict { .. }
-            | storage::MetadataError::BucketWriteReservationConflict { .. }
-            | storage::MetadataError::BucketWriteReservationNotFound { .. }
-            | storage::MetadataError::StaleBucketMetadataCommand { .. }
-            | storage::MetadataError::StaleObjectWriteCommand { .. }
-    )
+    error.is_command_contention()
 }
 
 fn store_error_is_metadata_command_contention(error: &storage::StoreError) -> bool {
-    if error.storage_node_failure_class()
-        == Some(storage::StorageNodeFailureClass::MetadataCommandContention)
-    {
-        return true;
-    }
-    match error {
-        storage::StoreError::MetadataCommandContention { .. }
-        | storage::StoreError::MetadataCommandLogConflict { .. }
-        | storage::StoreError::MetadataCommandLogGap { .. }
-        | storage::StoreError::MetadataCommandPendingConflict { .. } => true,
-        storage::StoreError::ShardStore { source, .. } => {
-            store_error_is_metadata_command_contention(source)
-        }
-        _ => false,
+    match error.operation_failure_class() {
+        storage::StoreOperationFailureClass::MetadataCommandContention => true,
+        storage::StoreOperationFailureClass::ResourceExhausted
+        | storage::StoreOperationFailureClass::RetryableConvergence
+        | storage::StoreOperationFailureClass::Other => false,
     }
 }
 
 pub(super) fn object_pg_action_error_is_metadata_command_contention(
     error: &storage::ObjectPgActionError,
 ) -> bool {
-    match error {
-        storage::ObjectPgActionError::Store(error) => {
-            store_error_is_metadata_command_contention(error)
-        }
-        storage::ObjectPgActionError::Metadata(error) => {
-            metadata_error_is_command_contention(error)
-        }
-        _ => false,
-    }
-}
-
-fn store_error_is_retryable_convergence(error: &storage::StoreError) -> bool {
-    if error
-        .storage_node_failure_class()
-        .is_some_and(storage_node_failure_is_retryable_convergence)
-    {
-        return true;
-    }
-    match error {
-        storage::StoreError::MetadataCommandContention { .. }
-        | storage::StoreError::MetadataCommandLogConflict { .. }
-        | storage::StoreError::MetadataCommandLogGap { .. }
-        | storage::StoreError::StalePayloadOperation { .. }
-        | storage::StoreError::StaleMetadataCommand { .. }
-        | storage::StoreError::StaleMetadataPrimaryBridge { .. }
-        | storage::StoreError::StaleMetadataOperation { .. }
-        | storage::StoreError::StaleMetadataRoute { .. }
-        | storage::StoreError::RouteMapExpired { .. }
-        | storage::StoreError::RouteAdmissionClusterMismatch { .. }
-        | storage::StoreError::StaleShardOperation { .. }
-        | storage::StoreError::StaleShardLocation { .. }
-        | storage::StoreError::PgNotActive { .. }
-        | storage::StoreError::ShardPgNotActive { .. } => true,
-        storage::StoreError::ShardStore { source, .. } => {
-            store_error_is_retryable_convergence(source)
-        }
-        _ => false,
-    }
-}
-
-fn storage_node_failure_is_retryable_convergence(
-    failure: storage::StorageNodeFailureClass,
-) -> bool {
-    match failure {
-        storage::StorageNodeFailureClass::ShardLocationStale
-        | storage::StorageNodeFailureClass::PgRouteUnavailable
-        | storage::StorageNodeFailureClass::MetadataCommandContention => true,
-        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive
-        | storage::StorageNodeFailureClass::TransportInterrupted => false,
-    }
-}
-
-fn store_error_is_resource_exhausted(error: &storage::StoreError) -> bool {
-    match error {
-        storage::StoreError::StorageRpcResourceExhausted { .. } => true,
-        storage::StoreError::ShardStore { source, .. } => store_error_is_resource_exhausted(source),
-        _ => false,
-    }
+    error.is_metadata_command_contention()
 }
 
 #[cfg(test)]

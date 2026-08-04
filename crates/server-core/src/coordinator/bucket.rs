@@ -23,10 +23,11 @@ use super::{
 use crate::error::ServerError;
 
 pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
+    let diagnostic_label = err.diagnostic_cause_label();
     let _ = observability::event(
         TRACE_TARGET,
         "bucket_write_drain_error",
-        Some(format_args!("error={err:?}")),
+        Some(format_args!("cause_label={diagnostic_label}")),
     );
     match err {
         storage::BucketWriteDrainError::Store(ref error)
@@ -52,6 +53,22 @@ pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) 
     }
 }
 
+pub(super) fn emit_bucket_delete_begin_failed(
+    name: &storage::BucketName,
+    elapsed_us: u128,
+    total_elapsed_us: u128,
+    error: &storage::BucketWriteDrainError,
+) {
+    let _ = observability::emit_flight_event(
+        TRACE_TARGET,
+        "bucket_delete_begin_failed",
+        format!(
+            "bucket={name:?} elapsed_us={elapsed_us} total_elapsed_us={total_elapsed_us} cause_label={}",
+            error.diagnostic_cause_label()
+        ),
+    );
+}
+
 impl Coordinator {
     pub(super) fn map_bucket_snapshot_load_error(
         err: storage::BucketSnapshotLoadError,
@@ -66,10 +83,14 @@ impl Coordinator {
         err: storage::BucketSnapshotLoadError,
         metadata_contention: super::MetadataContentionResponse,
     ) -> ServerError {
+        let diagnostic_label = match &err {
+            storage::BucketSnapshotLoadError::Store(error) => error.diagnostic_cause_label(),
+            storage::BucketSnapshotLoadError::Metadata(_) => "metadata_failure",
+        };
         let _ = observability::event(
             TRACE_TARGET,
             "bucket_snapshot_load_error",
-            Some(format_args!("error={err:?}")),
+            Some(format_args!("cause_label={diagnostic_label}")),
         );
         match err {
             storage::BucketSnapshotLoadError::Store(other) => {
@@ -445,11 +466,11 @@ impl Coordinator {
                     TRACE_TARGET,
                     "bucket_delete_authorize_failed",
                     format!(
-                        "bucket={:?} elapsed_us={} total_elapsed_us={} error={:?}",
+                        "bucket={:?} elapsed_us={} total_elapsed_us={} cause_label={}",
                         req.name,
                         authorize_started.elapsed().as_micros(),
                         request_started.elapsed().as_micros(),
-                        error
+                        error.diagnostic_cause_label()
                     ),
                 );
                 return Err(error);
@@ -481,16 +502,11 @@ impl Coordinator {
             bucket_execution_generation,
             bucket_incarnation_generation,
         }) {
-            let _ = observability::emit_flight_event(
-                TRACE_TARGET,
-                "bucket_delete_begin_failed",
-                format!(
-                    "bucket={:?} elapsed_us={} total_elapsed_us={} error={:?}",
-                    name,
-                    begin_started.elapsed().as_micros(),
-                    request_started.elapsed().as_micros(),
-                    err
-                ),
+            emit_bucket_delete_begin_failed(
+                &name,
+                begin_started.elapsed().as_micros(),
+                request_started.elapsed().as_micros(),
+                &err,
             );
             return Err(Self::map_bucket_write_drain_error(err));
         }

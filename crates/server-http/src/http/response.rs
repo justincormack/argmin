@@ -146,7 +146,6 @@ pub(crate) struct ErrorDiagnostic {
     pub error_code: &'static str,
     pub cause_label: &'static str,
     pub cause_chain: String,
-    pub server_detail: Option<String>,
 }
 
 pub struct CreateMultipartUploadResponseContext<'a> {
@@ -1549,7 +1548,6 @@ impl S3Response {
             error_code: err.s3_error_code(),
             cause_label: err.diagnostic_cause_label(),
             cause_chain: err.diagnostic_cause_chain(),
-            server_detail: err.server_storage_rpc_detail(),
         });
         self
     }
@@ -4908,7 +4906,7 @@ mod tests {
 
     #[test]
     fn error_response_500() {
-        let err = ServerError::Store(storage::StoreError::NotFound);
+        let err = ServerError::Store(storage::StoreError::NotFound.into());
         let resp = S3Response::error(&err, "/x", TEST_HOST_ID);
         assert_eq!(resp.status_code, 500);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
@@ -4971,10 +4969,15 @@ mod tests {
     fn error_response_internal_storage_and_ec_errors_are_sanitized() {
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
             (
-                ServerError::Store(storage::StoreError::Io {
-                    context: "read shard row",
-                    source: std::io::Error::other("sqlite path /tmp/secret.db near table shards"),
-                }),
+                ServerError::Store(
+                    storage::StoreError::Io {
+                        context: "read shard row",
+                        source: std::io::Error::other(
+                            "sqlite path /tmp/secret.db near table shards",
+                        ),
+                    }
+                    .into(),
+                ),
                 vec!["sqlite", "/tmp/secret.db", "read shard row", "table shards"],
             ),
             (

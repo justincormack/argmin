@@ -776,7 +776,6 @@ impl ResponseBodyTrace {
             error_code: err.s3_error_code(),
             cause_label: err.diagnostic_cause_label(),
             cause_chain: err.diagnostic_cause_chain(),
-            server_detail: err.server_storage_rpc_detail(),
         };
         self.emit_error_diagnostic(&diagnostic);
     }
@@ -804,14 +803,6 @@ impl ResponseBodyTrace {
                 diagnostic.cause_label,
                 &diagnostic.cause_chain,
             );
-            if let Some(server_detail) = diagnostic.server_detail.as_deref() {
-                let _ = observability::emit_http_500_server_detail(
-                    &self.meta.context,
-                    TRACE_TARGET,
-                    summary,
-                    server_detail,
-                );
-            }
         }
     }
 }
@@ -5356,14 +5347,10 @@ pub(crate) fn s3_response_to_hyper(
             .error_diagnostic
             .as_ref()
             .map(|diagnostic| {
-                let mut suffix = format!(
+                format!(
                     " cause_label={} cause_chain={}",
                     diagnostic.cause_label, diagnostic.cause_chain
-                );
-                if let Some(server_detail) = diagnostic.server_detail.as_deref() {
-                    suffix.push_str(&format!(" server_detail={server_detail:?}"));
-                }
-                suffix
+                )
             })
             .unwrap_or_default();
         if let Some(diagnostic) = resp.error_diagnostic.as_ref() {
@@ -5392,14 +5379,6 @@ pub(crate) fn s3_response_to_hyper(
                 diagnostic.cause_label,
                 &diagnostic.cause_chain,
             );
-            if let Some(server_detail) = diagnostic.server_detail.as_deref() {
-                let _ = observability::emit_http_500_server_detail(
-                    &trace_meta.context,
-                    TRACE_TARGET,
-                    summary,
-                    server_detail,
-                );
-            }
         }
         fail_on_500_diagnostic(
             format!(
@@ -8241,7 +8220,7 @@ mod tests {
         );
 
         trace.emit_error(&ServerError::Store(
-            storage::StoreError::storage_node_resource_exhausted(1, "ReadHandlesAcquire"),
+            storage::StoreError::storage_node_resource_exhausted(1, "ReadHandlesAcquire").into(),
         ));
 
         assert_eq!(trace.status_code, 206);

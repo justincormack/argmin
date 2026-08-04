@@ -149,9 +149,9 @@ pub use control_plane_service_client::{
 };
 pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
-    ObjectPgActionError, ShardIoError, StorageNodeFailureClass, StorageNodeFailureDetail,
-    StoreError,
+    ObjectPgActionError, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
 };
+pub(crate) use error::{StorageNodeFailureClass, StorageNodeFailureDetail};
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
     LivePgMetadataTransferError, LivePgMetadataTransferFailpoint, LivePgMetadataTransferSummary,
@@ -176,6 +176,32 @@ pub use maintenance::{
 #[doc(hidden)]
 pub mod test_support {
     use super::*;
+
+    /// Construct an opaque representative of an operation-level storage failure.
+    ///
+    /// Cross-crate tests use this to verify their protocol translation without
+    /// depending on a PG, route, command-log, or RPC error variant.
+    #[must_use]
+    pub fn store_error_for_operation_failure_class(
+        class: StoreOperationFailureClass,
+    ) -> StoreError {
+        match class {
+            StoreOperationFailureClass::ResourceExhausted => {
+                StoreError::storage_node_resource_exhausted(1, "test operation")
+            }
+            StoreOperationFailureClass::MetadataCommandContention => {
+                StoreError::MetadataCommandContention {
+                    context: "opaque test contention",
+                }
+            }
+            StoreOperationFailureClass::RetryableConvergence => StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            },
+            StoreOperationFailureClass::Other => StoreError::NotFound,
+        }
+    }
 
     #[cfg(feature = "test-hooks")]
     pub use super::cluster::{

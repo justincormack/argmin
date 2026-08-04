@@ -1,6 +1,6 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
-use storage::error::{MetadataError, StoreError};
+use storage::error::{MetadataError, StoreError, StoreFailure, StoreOperationFailureClass};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedEncryptionReadHeaderContext {
@@ -46,7 +46,7 @@ pub enum ServerError {
     DeleteMarkerHit { bucket: String, key: String },
 
     #[error("storage error: {0}")]
-    Store(StoreError),
+    Store(StoreFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -467,10 +467,11 @@ pub enum ServerError {
 
 impl From<StoreError> for ServerError {
     fn from(error: StoreError) -> Self {
-        if store_error_is_resource_exhausted(&error) {
-            Self::SlowDown
-        } else {
-            Self::Store(error)
+        match error.operation_failure_class() {
+            StoreOperationFailureClass::ResourceExhausted => Self::SlowDown,
+            StoreOperationFailureClass::MetadataCommandContention
+            | StoreOperationFailureClass::RetryableConvergence
+            | StoreOperationFailureClass::Other => Self::Store(error.into()),
         }
     }
 }
@@ -491,7 +492,7 @@ impl ServerError {
     /// policy, object, auth, or payload details.
     pub fn diagnostic_cause_label(&self) -> &'static str {
         match self {
-            Self::Store(error) => store_error_diagnostic_cause_label(error),
+            Self::Store(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -520,26 +521,13 @@ impl ServerError {
         match self {
             Self::Store(error) => format!(
                 "server_error>store_error>{}",
-                store_error_diagnostic_cause_chain(error)
+                error.diagnostic_cause_label()
             ),
             Self::Metadata(error) => format!(
                 "server_error>metadata_error>{}",
                 metadata_error_diagnostic_cause_chain(error)
             ),
             _ => format!("server_error>{}", self.diagnostic_cause_label()),
-        }
-    }
-
-    /// Server-side diagnostic detail for storage RPC failures.
-    ///
-    /// Unlike the stable cause labels, this may include the storage operation.
-    /// Storage-owned wire codes and remote messages remain opaque. This is
-    /// intended for local/server logs only, not response bodies or
-    /// customer-visible errors.
-    pub fn server_storage_rpc_detail(&self) -> Option<String> {
-        match self {
-            Self::Store(error) => store_error_storage_rpc_detail(error),
-            _ => None,
         }
     }
 
@@ -848,150 +836,6 @@ impl ServerError {
     }
 }
 
-fn store_error_is_resource_exhausted(error: &StoreError) -> bool {
-    match error {
-        StoreError::StorageRpcResourceExhausted { .. }
-        | StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => true,
-        StoreError::ShardStore { source, .. } => store_error_is_resource_exhausted(source),
-        _ => false,
-    }
-}
-
-fn store_error_diagnostic_cause_label(error: &StoreError) -> &'static str {
-    match error {
-        StoreError::NotFound => "store_not_found",
-        StoreError::IntegrityError { .. } => "store_integrity_error",
-        StoreError::ShardAckMismatch { .. } => "shard_ack_mismatch",
-        StoreError::PayloadShardSetMismatch { .. } => "payload_shard_set_mismatch",
-        StoreError::PlacedSegmentBackfillSourceUnavailable => {
-            "placed_segment_backfill_source_unavailable"
-        }
-        StoreError::HistoricalPgRouteNotRetained { .. } => "historical_pg_route_not_retained",
-        StoreError::ObjectPayloadReclaimFenceAuthorityMismatch => {
-            "object_payload_reclaim_fence_authority_mismatch"
-        }
-        StoreError::PgDurableIdentityInvalid { .. } => "pg_durable_identity_invalid",
-        StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => {
-            "cluster_map_history_reference_limit_exceeded"
-        }
-        StoreError::PgNotFound { .. } => "pg_not_found",
-        StoreError::InvalidPgTopology { .. } => "invalid_pg_topology",
-        StoreError::ClusterPgNotFound { .. } => "cluster_pg_not_found",
-        StoreError::ShardPgNotFound { .. } => "shard_pg_not_found",
-        StoreError::PgNotActive { .. } => "pg_not_active",
-        StoreError::ShardPgNotActive { .. } => "shard_pg_not_active",
-        StoreError::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
-        StoreError::MetadataCommandLogGap { .. } => "metadata_command_log_gap",
-        StoreError::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
-        StoreError::MetadataCommandContention { .. } => "metadata_command_contention",
-        StoreError::MetadataTransferEmpty { .. } => "metadata_transfer_empty",
-        StoreError::MetadataTransferUnsupportedProof { .. } => {
-            "metadata_transfer_unsupported_proof"
-        }
-        StoreError::MetadataCheckpointInvalid { .. } => "metadata_checkpoint_invalid",
-        StoreError::MetadataCommandPendingOnNonPrimary { .. } => {
-            "metadata_command_pending_on_non_primary"
-        }
-        StoreError::MetadataCommandLogChecksumMismatch { .. }
-        | StoreError::MetadataCommandLogHashMismatch { .. }
-        | StoreError::MetadataCommandReplicaStateDiverged { .. }
-        | StoreError::MetadataStateDigestMismatch { .. } => "metadata_command_replica_diverged",
-        StoreError::StorageRpcResourceExhausted { .. } => "storage_rpc_resource_exhausted",
-        StoreError::StorageRpcShardDeleteInProgress { .. } => {
-            "storage_rpc_shard_delete_in_progress"
-        }
-        StoreError::StorageRpc { .. } => "storage_rpc_error",
-        StoreError::ShardStore { source, .. } => match store_error_diagnostic_cause_label(source) {
-            "storage_rpc_resource_exhausted" => "shard_store_storage_rpc_resource_exhausted",
-            "storage_rpc_shard_delete_in_progress" => {
-                "shard_store_storage_rpc_shard_delete_in_progress"
-            }
-            "storage_rpc_error" => "shard_store_storage_rpc_error",
-            "stale_payload_operation" => "shard_store_stale_payload_operation",
-            _ => "shard_store_error",
-        },
-        StoreError::RouteMapExpired { .. } => "route_map_expired",
-        StoreError::RouteAdmissionClusterMismatch { .. } => "route_admission_cluster_mismatch",
-        StoreError::RouteCapabilitySubjectMismatch { .. } => "route_capability_subject_mismatch",
-        StoreError::MultipartUploadIdIssuanceFailed => "multipart_upload_id_issuance_failed",
-        StoreError::StalePayloadOperation { .. } => "stale_payload_operation",
-        StoreError::StaleMetadataPrimaryBridge { .. } => "stale_metadata_primary_bridge",
-        StoreError::StaleMetadataOperation { .. } => "stale_metadata_operation",
-        StoreError::StaleMetadataRoute { .. } => "stale_metadata_route",
-        StoreError::StaleMetadataReadProof { .. } => "stale_metadata_read_proof",
-        StoreError::StaleMetadataCommand { .. } => "stale_metadata_command",
-        StoreError::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
-        StoreError::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",
-        StoreError::MetadataCommandReplicaStateMissing { .. } => {
-            "metadata_command_replica_state_missing"
-        }
-        StoreError::StaleShardOperation { .. } => "stale_shard_operation",
-        StoreError::StaleShardLocation { .. } => "stale_shard_location",
-        StoreError::NodeNotFound { .. } => "storage_node_not_found",
-        StoreError::NodeNotInActingSet { .. } => "storage_node_not_in_acting_set",
-        StoreError::ShardIndexMismatch { .. } => "shard_index_mismatch",
-        StoreError::ShardScavengerObservationWrongPg { .. } => {
-            "shard_scavenger_observation_wrong_pg"
-        }
-        StoreError::ShardScavengerObservationShardIndexMismatch { .. } => {
-            "shard_scavenger_observation_shard_index_mismatch"
-        }
-        StoreError::ShardScavengerObservationInconsistentReason { .. } => {
-            "shard_scavenger_observation_inconsistent_reason"
-        }
-        StoreError::PgSchemaInvalid { .. } => "pg_schema_invalid",
-        StoreError::MetadataDigestBootstrapInvalid { .. } => "metadata_digest_bootstrap_invalid",
-        StoreError::InvalidKeyLength { .. } => "invalid_shard_key_length",
-        StoreError::InvalidShardKeyHex => "invalid_shard_key_hex",
-        StoreError::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
-        StoreError::Io { .. } => "store_io_error",
-        StoreError::Db { .. } => "store_db_error",
-        StoreError::ErasureCoding { .. } => "store_erasure_coding_error",
-    }
-}
-
-fn store_error_diagnostic_cause_chain(error: &StoreError) -> String {
-    match error {
-        StoreError::ShardStore { source, .. } => {
-            format!("shard_store>{}", store_error_diagnostic_cause_chain(source))
-        }
-        _ => store_error_diagnostic_cause_label(error).to_string(),
-    }
-}
-
-fn store_error_storage_rpc_detail(error: &StoreError) -> Option<String> {
-    match error {
-        StoreError::ShardStore {
-            node_id,
-            pg_id,
-            cluster_epoch,
-            source,
-        } => store_error_storage_rpc_detail(source).map(|detail| {
-            format!(
-                "shard_store node_id={node_id} pg_id={pg_id} cluster_epoch={} source=({detail})",
-                cluster_epoch.get()
-            )
-        }),
-        StoreError::StorageRpc {
-            node_id, operation, ..
-        } => Some(format!(
-            "storage_node_failure node_id={node_id} operation={operation:?} kind={:?}",
-            error.diagnostic_kind()
-        )),
-        StoreError::StorageRpcResourceExhausted {
-            node_id, operation, ..
-        } => Some(format!(
-            "storage_node_resource_exhausted node_id={node_id} operation={operation:?}"
-        )),
-        StoreError::StorageRpcShardDeleteInProgress {
-            node_id, operation, ..
-        } => Some(format!(
-            "storage_node_shard_delete_in_progress node_id={node_id} operation={operation:?}"
-        )),
-        _ => None,
-    }
-}
-
 fn metadata_error_diagnostic_cause_label(error: &MetadataError) -> &'static str {
     match error {
         MetadataError::BucketWriteDraining => "bucket_write_draining",
@@ -1109,72 +953,85 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_cause_label_classifies_contention_and_rpc_overload() {
-        let log_conflict = ServerError::Store(StoreError::MetadataCommandLogConflict {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            log_index: 3,
-        });
+    fn storage_diagnostics_use_bounded_categories_and_redact_implementation_errors() {
+        let log_conflict = ServerError::Store(
+            StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+                log_index: 3,
+            }
+            .into(),
+        );
         assert_eq!(
             log_conflict.diagnostic_cause_label(),
-            "metadata_command_log_conflict"
+            "store_metadata_command_contention"
         );
 
-        let log_gap = ServerError::Store(StoreError::MetadataCommandLogGap {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            log_index: 5,
-            expected_log_index: 4,
-        });
-        assert_eq!(log_gap.diagnostic_cause_label(), "metadata_command_log_gap");
+        let log_gap = ServerError::Store(
+            StoreError::MetadataCommandLogGap {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+                log_index: 5,
+                expected_log_index: 4,
+            }
+            .into(),
+        );
+        assert_eq!(
+            log_gap.diagnostic_cause_label(),
+            "store_metadata_command_contention"
+        );
 
-        let pending_conflict = ServerError::Store(StoreError::MetadataCommandPendingConflict {
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            existing_log_index: 3,
-            candidate_log_index: 4,
-        });
+        let pending_conflict = ServerError::Store(
+            StoreError::MetadataCommandPendingConflict {
+                pg_id: 2,
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+                existing_log_index: 3,
+                candidate_log_index: 4,
+            }
+            .into(),
+        );
         assert_eq!(
             pending_conflict.diagnostic_cause_label(),
-            "metadata_command_pending_conflict"
+            "store_metadata_command_contention"
         );
 
-        let contention = ServerError::Store(StoreError::MetadataCommandContention {
-            context: "pending command displaced during cleanup",
-        });
+        let contention = ServerError::Store(
+            StoreError::MetadataCommandContention {
+                context: "pending command displaced during cleanup",
+            }
+            .into(),
+        );
         assert_eq!(
             contention.diagnostic_cause_label(),
-            "metadata_command_contention"
+            "store_metadata_command_contention"
         );
 
-        let shard_overload = ServerError::Store(StoreError::ShardStore {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(StoreError::storage_node_resource_exhausted(
-                1,
-                "ReadHandlesAcquire",
-            )),
-        });
+        let shard_overload = ServerError::Store(
+            StoreError::ShardStore {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: storage::ClusterEpoch::INITIAL,
+                source: Box::new(StoreError::storage_node_resource_exhausted(
+                    1,
+                    "ReadHandlesAcquire",
+                )),
+            }
+            .into(),
+        );
         assert_eq!(
             shard_overload.diagnostic_cause_label(),
-            "shard_store_storage_rpc_resource_exhausted"
+            "store_resource_exhausted"
         );
         assert_eq!(
             shard_overload.diagnostic_cause_chain(),
-            "server_error>store_error>shard_store>storage_rpc_resource_exhausted"
+            "server_error>store_error>store_resource_exhausted"
         );
-        let server_detail = shard_overload
-            .server_storage_rpc_detail()
-            .expect("storage RPC detail should be available server-side");
-        assert_eq!(
-            server_detail,
-            "shard_store node_id=1 pg_id=2 cluster_epoch=1 \
-             source=(storage_node_resource_exhausted node_id=1 \
-             operation=\"ReadHandlesAcquire\")"
-        );
+        let rendered = format!("{shard_overload:?} {shard_overload}");
+        assert!(!rendered.contains("ReadHandlesAcquire"));
+        assert!(!rendered.contains("node_id"));
+        assert!(!rendered.contains("pg_id"));
         let converted_overload = ServerError::from(StoreError::ShardStore {
             node_id: 1,
             pg_id: 2,
@@ -1596,7 +1453,7 @@ mod tests {
 
     #[test]
     fn s3_error_code_store() {
-        let err = ServerError::Store(StoreError::NotFound);
+        let err = ServerError::Store(StoreError::NotFound.into());
         assert_eq!(err.s3_error_code(), "InternalError");
     }
 
@@ -1722,7 +1579,10 @@ mod tests {
 
     #[test]
     fn http_status_500_wildcard() {
-        assert_eq!(ServerError::Store(StoreError::NotFound).http_status(), 500);
+        assert_eq!(
+            ServerError::Store(StoreError::NotFound.into()).http_status(),
+            500
+        );
         assert_eq!(
             ServerError::Metadata(MetadataError::ObjectNotFound).http_status(),
             500

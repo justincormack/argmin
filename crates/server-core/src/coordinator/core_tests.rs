@@ -11608,163 +11608,75 @@ fn bucket_write_drain_contention_maps_to_operation_aborted() {
 }
 
 #[test]
-fn retryable_convergence_selects_storage_node_failure_classes() {
-    for failure in [
-        storage::StorageNodeFailureClass::ShardLocationStale,
-        storage::StorageNodeFailureClass::PgRouteUnavailable,
-        storage::StorageNodeFailureClass::MetadataCommandContention,
-    ] {
-        assert!(super::storage_node_failure_is_retryable_convergence(
-            failure
-        ));
-    }
-    for failure in [
-        storage::StorageNodeFailureClass::MetadataTransferHistoricalRouteActive,
-        storage::StorageNodeFailureClass::TransportInterrupted,
-    ] {
-        assert!(!super::storage_node_failure_is_retryable_convergence(
-            failure
-        ));
-    }
+fn bucket_write_drain_failure_flight_record_redacts_storage_diagnostic() {
+    const SECRET_CONTEXT: &str = "secret bucket drain operation";
+    const SECRET_SOURCE: &str = "secret bucket drain source";
+    let request_id = "request-bucket-drain-diagnostic-redaction";
+    let _attached = observability::AttachedTrace::new(observability::TraceContext::from_ids(
+        observability::TraceContextIds {
+            trace_id: "trace-bucket-drain-diagnostic-redaction".to_string(),
+            request_id: request_id.to_string(),
+        },
+    ));
+    let error = storage::BucketWriteDrainError::Store(storage::StoreError::Io {
+        context: SECRET_CONTEXT,
+        source: std::io::Error::other(SECRET_SOURCE),
+    });
+
+    super::bucket::emit_bucket_delete_begin_failed(
+        &trusted_bucket_name("bounded-diagnostic-bucket"),
+        11,
+        29,
+        &error,
+    );
+
+    let records = observability::flight_recorder_snapshot();
+    let record = records
+        .iter()
+        .rev()
+        .find(|record| {
+            record.request_id == request_id && record.event == "bucket_delete_begin_failed"
+        })
+        .expect("bucket drain failure should be recorded");
+    assert!(record.detail.contains("cause_label=store_io_failure"));
+    assert!(!record.detail.contains("error="));
+    assert!(!record.detail.contains(SECRET_CONTEXT));
+    assert!(!record.detail.contains(SECRET_SOURCE));
 }
 
 #[test]
-fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
-    fn resource_exhausted() -> storage::StoreError {
-        storage::StoreError::storage_node_resource_exhausted(1, "test operation")
+fn semantic_storage_failure_classes_map_to_s3_outcomes() {
+    fn failure(class: storage::StoreOperationFailureClass) -> storage::StoreError {
+        storage::test_support::store_error_for_operation_failure_class(class)
     }
 
-    fn nested_resource_exhausted() -> storage::StoreError {
-        storage::StoreError::ShardStore {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(resource_exhausted()),
-        }
+    for class in [
+        storage::StoreOperationFailureClass::ResourceExhausted,
+        storage::StoreOperationFailureClass::MetadataCommandContention,
+        storage::StoreOperationFailureClass::RetryableConvergence,
+    ] {
+        assert!(matches!(
+            super::map_store_error(failure(class)),
+            ServerError::SlowDown
+        ));
     }
-
-    fn nested_delete_in_progress() -> storage::StoreError {
-        storage::StoreError::ShardStore {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(storage::StoreError::storage_node_shard_delete_in_progress(
-                1,
-                "shard delete",
-            )),
-        }
-    }
-
-    fn assert_maps_to_slow_down(error: storage::StoreError) {
-        assert!(
-            matches!(super::map_store_error(error), ServerError::SlowDown),
-            "expected stale/retryable storage error to map to SlowDown"
-        );
-    }
-
     assert!(matches!(
-        super::map_store_error(nested_resource_exhausted()),
-        ServerError::SlowDown
+        super::map_store_error_with_metadata_contention(
+            failure(storage::StoreOperationFailureClass::MetadataCommandContention),
+            super::MetadataContentionResponse::OperationAborted,
+        ),
+        ServerError::OperationAborted
     ));
     assert!(matches!(
-        super::map_store_error(nested_delete_in_progress()),
-        ServerError::Store(storage::StoreError::ShardStore { source, .. })
-            if matches!(*source, storage::StoreError::StorageRpcShardDeleteInProgress { .. })
+        super::map_store_error(failure(storage::StoreOperationFailureClass::Other)),
+        ServerError::Store(ref failure)
+            if failure.class() == storage::StoreOperationFailureClass::Other
     ));
-    assert!(matches!(
-        super::map_store_error(storage::StoreError::MetadataCommandContention {
-            context: "pending command displaced during cleanup",
-        }),
-        ServerError::SlowDown
-    ));
-    assert_maps_to_slow_down(storage::StoreError::MetadataCommandLogGap {
-        node_id: 1,
-        pg_id: 2,
-        cluster_epoch: storage::ClusterEpoch::INITIAL,
-        log_index: 5,
-        expected_log_index: 4,
-    });
-    assert_maps_to_slow_down(storage::StoreError::StalePayloadOperation {
-        pg_id: 2,
-        operation_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    });
-    assert_maps_to_slow_down(storage::StoreError::StaleMetadataPrimaryBridge {
-        metadata_node_id: 1,
-        operation_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    });
-    assert_maps_to_slow_down(storage::StoreError::StaleMetadataOperation {
-        pg_id: 2,
-        operation_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    });
-    assert_maps_to_slow_down(storage::StoreError::StaleMetadataRoute {
-        pg_id: 2,
-        route_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    });
-    assert_maps_to_slow_down(storage::StoreError::RouteMapExpired {
-        cluster_epoch: storage::ClusterEpoch::INITIAL,
-        valid_until_ms: 1_000,
-        now_ms: 1_001,
-    });
-    assert_maps_to_slow_down(storage::StoreError::StaleMetadataCommand {
-        node_id: 1,
-        pg_id: 2,
-        command_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    });
-    assert_maps_to_slow_down(storage::StoreError::StaleShardOperation {
-        node_id: 1,
-        pg_id: 2,
-        operation_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    });
-    assert_maps_to_slow_down(storage::StoreError::StaleShardLocation {
-        node_id: 1,
-        pg_id: 2,
-        location_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    });
-    assert_maps_to_slow_down(storage::StoreError::PgNotActive {
-        pg_id: 2,
-        cluster_epoch: storage::ClusterEpoch::INITIAL,
-        state: PgState::Peering,
-    });
-    assert_maps_to_slow_down(storage::StoreError::ShardPgNotActive {
-        node_id: 1,
-        pg_id: 2,
-        cluster_epoch: storage::ClusterEpoch::INITIAL,
-        state: PgState::Peering,
-    });
-    assert_maps_to_slow_down(storage::StoreError::ShardStore {
-        node_id: 1,
-        pg_id: 2,
-        cluster_epoch: storage::ClusterEpoch::INITIAL,
-        source: Box::new(storage::StoreError::MetadataCommandContention {
-            context: "pending command displaced during cleanup",
-        }),
-    });
-    assert_maps_to_slow_down(storage::StoreError::ShardStore {
-        node_id: 1,
-        pg_id: 2,
-        cluster_epoch: storage::ClusterEpoch::INITIAL,
-        source: Box::new(storage::StoreError::RouteMapExpired {
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            valid_until_ms: 1_000,
-            now_ms: 1_001,
-        }),
-    });
+
+    let resource_exhausted = || failure(storage::StoreOperationFailureClass::ResourceExhausted);
     assert!(matches!(
         Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(
             resource_exhausted(),
-        )),
-        ServerError::SlowDown
-    ));
-    assert!(matches!(
-        Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(
-            nested_resource_exhausted(),
         )),
         ServerError::SlowDown
     ));
@@ -11789,12 +11701,9 @@ fn storage_rpc_resource_exhaustion_maps_to_slow_down() {
 }
 
 fn injected_stale_shard_location() -> storage::StoreError {
-    storage::StoreError::StaleShardLocation {
-        node_id: 0,
-        pg_id: 0,
-        location_epoch: storage::ClusterEpoch::INITIAL,
-        current_epoch: storage::ClusterEpoch::new(2).unwrap(),
-    }
+    storage::test_support::store_error_for_operation_failure_class(
+        storage::StoreOperationFailureClass::RetryableConvergence,
+    )
 }
 
 #[test]
@@ -14903,10 +14812,8 @@ fn direct_put_retry_converges_pending_partial_metadata_command() {
     assert!(
         matches!(
             first_err,
-            ServerError::Store(storage::StoreError::Io {
-                context: "injected coordinator direct put metadata command apply failure",
-                ..
-            })
+            ServerError::Store(ref failure)
+                if failure.class() == storage::StoreOperationFailureClass::Other
         ),
         "expected injected direct PUT command failure, got {first_err:?}"
     );
@@ -20652,10 +20559,8 @@ fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
     assert!(
         matches!(
             error,
-            ServerError::Store(storage::StoreError::Io {
-                context: "injected reclaim claim release failure",
-                ..
-            })
+            ServerError::Store(ref failure)
+                if failure.class() == storage::StoreOperationFailureClass::Other
         ),
         "claim release failure should be returned, got {error:?}"
     );
@@ -21335,7 +21240,11 @@ fn ec_drop_m_plus_one_shards_fails() {
         .unwrap();
     let err = obj.body.read_all().unwrap_err();
     assert!(
-        matches!(err, ServerError::Store(storage::StoreError::NotFound)),
+        matches!(
+            err,
+            ServerError::Store(ref failure)
+                if failure.class() == storage::StoreOperationFailureClass::Other
+        ),
         "unrecoverable payload loss must not be reported as NoSuchKey: {err:?}"
     );
     assert_eq!(err.http_status(), 500);

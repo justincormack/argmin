@@ -1,7 +1,7 @@
 Raw storage RPC details leak into 500 diagnostics
 Link: https://chatgpt.com/codex/cloud/security/findings/14a31ab2b9548191878e1f641fc01ce5?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
 Criticality: low (attack path: low)
-Status: accepted
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin
@@ -12,39 +12,35 @@ Assignee: Unassigned
 Signals: Security, Validated, Attack-path
 
 # Resolution
-Accepted as of 2026-07-07.
+Fixed as of 2026-08-04 by the item 13 storage-boundary containment change.
 
-The reported data flow is real: storage RPC diagnostic detail can include
-escaped bucket names, object keys, RPC operation names, node IDs, PG IDs, and
-route/epoch context, and HTTP 500 diagnostics can record that detail in
-server-side observability and flight-recorder output. This is accepted under
-the current observability policy rather than fixed as a one-off
-`server_storage_rpc_detail` issue.
+The earlier acceptance has been superseded. Raw storage RPC messages no longer
+enter HTTP 500 diagnostics, the flight recorder, panic-on-500, or abort-on-500
+output. Existing storage operation signatures still pass concrete `StoreError`
+values to designated `server-core` translation adapters; this resolution does
+not claim that representation transit has been eliminated. Those adapters do
+not match or render the concrete error. Storage classifies every local, nested
+shard, and RPC failure exhaustively through two independent bounded values:
 
-Rationale:
+- `StoreOperationFailureClass` carries only the semantic information required
+  for request outcome and retry policy.
+- A private storage-owned diagnostic category distinguishes broad operator
+  domains such as I/O, database, integrity, topology, schema, metadata
+  consistency, resource exhaustion, and RPC transport/protocol failures.
 
-- `guides/observability-formatting.md` classifies bucket names and object keys
-  as attacker-controlled text that must be escaped, not as secrets or bearer
-  material that must be redacted.
-- `request_500_server_detail` renders the detail with `observability::escaped`,
-  so the value cannot forge log structure even when it contains
-  attacker-controlled bucket or key text.
-- The value is not included in normal S3 response bodies. It is emitted only to
-  server-side diagnostic/operator surfaces such as trace output,
-  flight-recorder dumps, panic-on-500, and abort-on-500 diagnostics.
-- Internal node/PG/epoch context is currently treated as operational diagnostic
-  data. These 500 diagnostics have been useful for route-churn and storage RPC
-  correctness work.
-- This is not specific to one RPC or one operation. If bucket names, object
-  keys, or internal topology need to be hidden from diagnostic dumps in future,
-  the fix should be a global observability policy change with resource
-  hashing/redaction helpers and an audit of trace, flight-recorder,
-  local-debug, and HTTP 500 diagnostic sites.
-
-This acceptance does not permit secret-bearing values in storage RPC messages.
-If a storage RPC diagnostic can include SigV4 credentials, session tokens,
-authorization headers, SSE-C keys, wrapped keys, encrypted checksums, or object
-payload data, that is a separate fix-required redaction bug.
+The operator label contains no bucket or object name, node/PG/epoch identity,
+path, database text, RPC operation, remote message, or nested cause. Public
+`StoreFailure` formatting is bounded, its `Display` is generic, and
+`Error::source()` is deliberately empty. Exported `BucketWriteDrainError`,
+`BucketSnapshotLoadError`, and `ObjectPgActionError` values can be observed
+before conversion to `StoreFailure`; all three now expose only bounded
+storage-owned labels through public formatting and expose no nested error
+source. The bucket-drain failure flight record emits that label rather than
+formatting its wrapper. Owner-local and cross-crate flight-recorder regressions
+verify that the categories remain useful while sensitive implementation text
+is absent; the cross-crate boundary checker rejects renewed production policy
+matching or raw diagnostic formatting. Full removal of concrete errors from
+public operation signatures remains separate structural-containment work.
 
 # Summary
 Introduced: the commit propagates raw storage RPC diagnostic messages into HTTP 500 diagnostics and emits them to server-side observability sinks without redacting or hashing sensitive request-derived fields.

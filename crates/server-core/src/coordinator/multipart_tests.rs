@@ -9192,7 +9192,8 @@ fn get_object_rejects_bad_segment_crc64() {
     let err = result.body.read_all().unwrap_err();
     assert!(matches!(
         err,
-        ServerError::Store(storage::StoreError::IntegrityError { .. })
+        ServerError::Store(ref failure)
+            if failure.class() == storage::StoreOperationFailureClass::Other
     ));
 }
 

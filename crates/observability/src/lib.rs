@@ -3760,42 +3760,6 @@ pub fn emit_http_500_cause_chain(
     )
 }
 
-pub fn emit_http_500_server_detail(
-    context: &TraceContext,
-    target: &'static str,
-    summary: RequestSummary<'_>,
-    server_detail: &str,
-) -> bool {
-    record_flight_event(
-        context,
-        target,
-        "request_500_server_detail",
-        request_flight_detail(
-            summary,
-            format_args!("server_detail={}", escaped(server_detail)),
-        ),
-    );
-    event_in_context(
-        context,
-        target,
-        "request_500_server_detail",
-        Some(format_args!(
-            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} server_detail={}",
-            summary.status_code,
-            summary.method,
-            summary.path,
-            summary.query.has_query(),
-            summary.query.param_count(),
-            summary.query.has_sigv4_params(),
-            summary.streaming,
-            summary.body_len,
-            summary.bytes_sent,
-            summary.lifetime_us,
-            escaped(server_detail)
-        )),
-    )
-}
-
 pub fn emit_slow_request(
     context: &TraceContext,
     target: &'static str,
@@ -5563,7 +5527,7 @@ mod tests {
             summary,
             "response_body",
             "InternalError",
-            "storage_rpc_resource_exhausted",
+            "store_resource_exhausted",
         );
         emit_slow_request(&ctx, "server_http", summary, "error", Some("InternalError"));
         emit_request_admission_wait(
@@ -6362,7 +6326,7 @@ mod tests {
             summary,
             "response_body",
             "InternalError",
-            "metadata_command_log_conflict",
+            "store_metadata_command_contention",
         );
         summary.status_code = 409;
         emit_request_error(
@@ -6389,7 +6353,7 @@ mod tests {
             summary,
             "response_body",
             "InternalError",
-            "shard_store_storage_rpc_resource_exhausted",
+            "store_resource_exhausted",
         );
         emit_request_error(
             &ctx,

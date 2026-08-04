@@ -4364,6 +4364,29 @@ fail_with_matches \
     "Production coordinator bucket-write drain errors must use Coordinator::map_bucket_write_drain_error instead of ad hoc Store/Metadata mapping" \
     "$raw_coordinator_bucket_write_drain_error_mappers"
 
+raw_storage_wrapper_diagnostic_formatting=$(
+    {
+        rg -n -U --color=never \
+            '"bucket_delete_begin_failed"(?s:.{0,800})(error|err|failure)=\{:\?\}|"bucket_delete_begin_failed"(?s:.{0,800})\{(error|err|failure):\?\}' \
+            crates/server-core/src/coordinator/bucket.rs \
+            || true
+        rg -n -U --color=never \
+            '#\[derive\([^]]*(Debug|thiserror::Error)[^]]*\)\][[:space:]]*pub enum (BucketWriteDrainError|BucketSnapshotLoadError|ObjectPgActionError)' \
+            crates/storage/src/error.rs \
+            || true
+        if ! rg -q -U \
+            'fn emit_bucket_delete_begin_failed(?s:.{0,800})error\.diagnostic_cause_label\(\)' \
+            crates/server-core/src/coordinator/bucket.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/bucket.rs: bucket_delete_begin_failed must use BucketWriteDrainError::diagnostic_cause_label'
+        fi
+    }
+)
+fail_with_matches \
+    "Exported storage wrapper diagnostics must use owner-provided bounded labels and redacted formatting instead of raw nested errors" \
+    "$raw_storage_wrapper_diagnostic_formatting"
+
 raw_coordinator_payload_read_store_mapping=$(
     awk '
     FNR == 1 {
@@ -4705,8 +4728,41 @@ storage_rpc_wire_error_leaks=$(
     }
 )
 fail_with_matches \
-    "Storage-node wire errors and opaque diagnostics are private to storage; use StorageNodeFailureClass" \
+    "Storage-node wire errors and opaque diagnostics are private to storage; use StoreOperationFailureClass" \
     "$storage_rpc_wire_error_leaks"
+
+store_error_policy_leaks=$(
+    {
+        rg -n --color=never \
+            '\bStoreError::|\bstorage_node_failure_class\b|\bStorageNodeFailureClass\b' \
+            crates/server-core/src crates/server-http/src crates/argmin-s3/src \
+            -g '*.rs' \
+            -g '!**/*_tests.rs' \
+            -g '!**/tests/**' \
+            -g '!crates/server-core/src/error.rs' \
+            -g '!crates/server-http/src/http/mod.rs' \
+            -g '!crates/server-http/src/http/response.rs' \
+            -g '!crates/server-http/src/http/serve.rs' \
+            || true
+        for source in \
+            crates/server-core/src/error.rs \
+            crates/server-http/src/http/mod.rs \
+            crates/server-http/src/http/response.rs \
+            crates/server-http/src/http/serve.rs
+        do
+            awk '
+                previous_was_test_cfg && /^mod tests \{/ { exit }
+                { print FNR ":" $0 }
+                { previous_was_test_cfg = ($0 == "#[cfg(test)]") }
+            ' "$source" | rg --color=never \
+                '\bStoreError::|\bstorage_node_failure_class\b|\bStorageNodeFailureClass\b' \
+                || true
+        done
+    }
+)
+fail_with_matches \
+    "StoreError variants and storage-node failure classes are storage-owned; use StoreOperationFailureClass and opaque StoreFailure diagnostics" \
+    "$store_error_policy_leaks"
 
 metadata_transfer_retry_policy_leaks=$(
     rg -n --color=never \
