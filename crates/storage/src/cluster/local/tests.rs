@@ -1484,6 +1484,7 @@ mod object_metadata;
 mod object_read;
 mod payload_reclaim;
 mod placement;
+mod reclaim_trace;
 mod shard_scavenger;
 mod stream_commands;
 mod stream_put;

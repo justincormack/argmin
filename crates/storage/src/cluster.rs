@@ -716,17 +716,6 @@ pub(crate) enum ObjectPayloadReclaimAttempt {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-impl From<ObjectPayloadReclaimAttempt> for crate::test_support::TestObjectPayloadReclaimAttempt {
-    fn from(value: ObjectPayloadReclaimAttempt) -> Self {
-        match value {
-            ObjectPayloadReclaimAttempt::Completed => Self::Completed,
-            ObjectPayloadReclaimAttempt::Deferred => Self::Deferred,
-            ObjectPayloadReclaimAttempt::MissingRoot => Self::MissingRoot,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetadataCommandApplyTestContext {
     pub node_id: NodeId,
@@ -1781,10 +1770,7 @@ impl Drop for RetainedObjectPayloadRead {
         else {
             return;
         };
-        let released = lease.release();
-        if released.remaining() == 0 && released.payload_reclaim_exists().unwrap_or(true) {
-            released.enqueue_object_payload_reclaim();
-        }
+        lease.release_and_schedule_reclaim_if_needed();
     }
 }
 
@@ -1871,6 +1857,16 @@ impl ObjectPayloadLease {
             generation_id: self.generation_id,
             pg_id: self.pg_id,
             remaining,
+        }
+    }
+
+    /// Releases this deletion-exclusion lease and schedules payload reclaim
+    /// when it was the final lease for a generation that still has a durable
+    /// reclaim root.
+    pub fn release_and_schedule_reclaim_if_needed(self) {
+        let released = self.release();
+        if released.remaining() == 0 && released.payload_reclaim_exists().unwrap_or(true) {
+            released.enqueue_object_payload_reclaim();
         }
     }
 
@@ -5591,8 +5587,8 @@ mod runtime_map_refresh_invalidation_tests {
 
         foreground.enqueue_object_payload_reclaim(&bucket, &key, GenerationId::MIN);
 
-        assert!(maintenance.test_try_take_reclaim_work().is_some());
-        assert!(foreground.test_try_take_reclaim_work().is_none());
+        assert!(maintenance.try_take_reclaim_work().is_some());
+        assert!(foreground.try_take_reclaim_work().is_none());
     }
 
     fn runtime_map_with_historical_route() -> ClusterRuntimeMapSnapshot {

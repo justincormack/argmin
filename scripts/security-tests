@@ -81,7 +81,7 @@ run_parser() {
 run_stateful() {
     run_cmd "server-core multipart stateful" cargo test -p server-core multipart_stateful_tests
     run_cmd "server-core multipart trace" cargo test -p server-core multipart_trace_tests
-    run_cmd "server-core reclaim trace" cargo test -p server-core multipart_reclaim_trace_tests
+    run_cmd "storage reclaim trace" cargo test -p storage cluster::local::tests::reclaim_trace
     run_cmd "s3-local-tests lifecycle" cargo test -p s3-local-tests --test lifecycle
 }
 
@@ -120,7 +120,7 @@ run_all() {
     run_cmd "server-core authz model" cargo test -p server-core authz_model_
     run_cmd "server-core multipart stateful" cargo test -p server-core multipart_stateful_tests
     run_cmd "server-core multipart trace" cargo test -p server-core multipart_trace_tests
-    run_cmd "server-core reclaim trace" cargo test -p server-core multipart_reclaim_trace_tests
+    run_cmd "storage reclaim trace" cargo test -p storage cluster::local::tests::reclaim_trace
     run_cmd "server-core object-lock and retention" cargo test -p server-core object_lock
     run_cmd "server-core lifecycle behavior" cargo test -p server-core lifecycle_
     run_cmd "observability redaction primitives" cargo test -p observability

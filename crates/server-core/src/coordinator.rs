@@ -47,9 +47,9 @@ use self::payload::PayloadBufferPool;
 use self::read_core::{
     segment_payloads_from_object_segments, ReadObjectContext, SegmentPayloadRecord,
 };
-#[cfg(test)]
-use self::read_core::{PayloadLease, ReadRuntime, SegmentListReader};
 pub use self::read_core::{ReadChunk, ReadHandle};
+#[cfg(test)]
+use self::read_core::{ReadRuntime, SegmentListReader};
 pub use self::request_types::*;
 use self::request_types::{AuthorizedWriteTags, BucketCreateOutcome};
 pub use self::response_types::*;
@@ -72,8 +72,6 @@ use crate::error::ServerError;
 use crate::range::ByteRange;
 #[cfg(test)]
 use crate::sse::SseCustomerRequest;
-#[cfg(test)]
-use storage::test_support::TestReclaimWorkItem as ReclaimWorkItem;
 pub use storage::BucketObjectOwnership;
 pub use storage::OwnerIdentity;
 
@@ -854,8 +852,6 @@ mod infra;
 mod lifecycle;
 mod listing;
 mod multipart;
-#[cfg(test)]
-mod multipart_reclaim_trace_tests;
 #[cfg(test)]
 mod multipart_stateful_tests;
 #[cfg(test)]

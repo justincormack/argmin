@@ -1,10 +1,105 @@
-use super::test_support::open_test_storage_cluster;
 use super::*;
-use proptest::prelude::*;
+use crate::cluster::ObjectPayloadReclaimAttempt;
+use crate::{
+    BucketDeleteFinalizeOutcome, BucketWriteDrainError, ObjectPayloadLease, ObjectPgActionError,
+};
 use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
 use std::fmt::Write as _;
 use std::path::Path;
-use storage::test_support::TestReclaimWorkItem as ReclaimWorkItem;
+
+struct ReclaimTraceRuntime {
+    cluster: Arc<StorageCluster>,
+}
+
+type ReadRuntime = ReclaimTraceRuntime;
+struct PayloadLease(Option<ObjectPayloadLease>);
+
+impl PayloadLease {
+    fn new(lease: ObjectPayloadLease) -> Self {
+        Self(Some(lease))
+    }
+}
+
+impl Drop for PayloadLease {
+    fn drop(&mut self) {
+        if let Some(lease) = self.0.take() {
+            lease.release_and_schedule_reclaim_if_needed();
+        }
+    }
+}
+
+impl ReclaimTraceRuntime {
+    fn storage_node(&self) -> &Arc<StorageCluster> {
+        &self.cluster
+    }
+
+    fn acquire_object_payload_lease(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> PayloadLease {
+        PayloadLease::new(
+            self.cluster
+                .acquire_object_payload_lease(
+                    &trusted_bucket_name(bucket),
+                    &trusted_object_key(key),
+                    generation_id,
+                )
+                .expect("acquire traced object payload lease"),
+        )
+    }
+
+    fn enqueue_object_payload_reclaim(&self, bucket: &str, key: &str, generation_id: GenerationId) {
+        self.cluster.enqueue_object_payload_reclaim(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            generation_id,
+        );
+    }
+
+    fn try_reclaim_object_payload_with_outcome(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<ObjectPayloadReclaimAttempt, ObjectPgActionError> {
+        self.cluster
+            .reclaim_object_payload_if_unleased_with_outcome(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(key),
+                generation_id,
+            )
+    }
+
+    fn try_finalize_bucket_delete_for(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        self.cluster.try_finalize_bucket_delete(bucket)
+    }
+
+    fn try_finalize_bucket_delete_for_with_outcome(
+        &self,
+        root: &BucketDeleteFinalizeRoot,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        self.cluster.try_finalize_bucket_delete_root(root)
+    }
+
+    fn take_reclaim_work(&self) -> Option<ReclaimWorkItem> {
+        self.cluster.try_take_reclaim_work()
+    }
+
+    fn finish_object_payload_reclaim_work(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
+        self.cluster
+            .finish_object_payload_reclaim_work(bucket, key, generation_id);
+    }
+}
 
 const TRACE_BUCKET: &str = "bucket";
 const TRACE_KEY: &str = "key";
@@ -20,18 +115,26 @@ fn trace_generation_id_new() -> GenerationId {
     GenerationId::new(2).expect("constant generation id must be valid")
 }
 
-fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
-    let storage_cluster = open_test_storage_cluster(dir, &[0]);
-    let ec_shape = storage_cluster.default_payload_ec_shape();
-    ReadRuntime {
-        storage: super::read_core::ReadStorage::Cluster(storage_cluster),
-        payload_buffer_pool: PayloadBufferPool::new(ec_shape),
-        sse_c_validator: None,
-        managed_key_provider: None,
-    }
+fn trusted_bucket_name(name: &str) -> BucketName {
+    BucketName::try_from(name).expect("trusted test bucket name")
 }
 
-fn seed_deleting_bucket(runtime: &ReadRuntime) {
+fn trusted_object_key(key: &str) -> ObjectKey {
+    ObjectKey::try_from(key.to_string()).expect("trusted test object key")
+}
+
+fn make_test_read_runtime(dir: &Path) -> ReclaimTraceRuntime {
+    let cluster = StorageCluster::open_static_local_nodes(
+        dir,
+        &[NodeId::new(0)],
+        &[0],
+        EcShape { k: 1, m: 0 },
+    )
+    .expect("open reclaim trace storage cluster");
+    ReclaimTraceRuntime { cluster }
+}
+
+fn seed_deleting_bucket(runtime: &ReclaimTraceRuntime) {
     let bucket = trusted_bucket_name(TRACE_BUCKET);
     runtime
         .storage_node()
@@ -40,17 +143,14 @@ fn seed_deleting_bucket(runtime: &ReadRuntime) {
 }
 
 fn execute_object_payload_reclaim_worker_step(
-    runtime: &ReadRuntime,
+    runtime: &ReclaimTraceRuntime,
     key: &str,
     generation_id: GenerationId,
 ) -> Result<bool, TestCaseError> {
     let result = runtime.try_reclaim_object_payload_with_outcome(TRACE_BUCKET, key, generation_id);
     let finished = matches!(
         result,
-        Ok(
-            storage::test_support::TestObjectPayloadReclaimAttempt::Completed
-                | storage::test_support::TestObjectPayloadReclaimAttempt::MissingRoot
-        )
+        Ok(ObjectPayloadReclaimAttempt::Completed | ObjectPayloadReclaimAttempt::MissingRoot)
     );
     result.map_err(|err| {
         TestCaseError::fail(format!(
@@ -959,7 +1059,7 @@ impl ReclaimTraceHarness {
                 let work = self.take_next_work()?;
                 match work {
                     Some(ReclaimWorkItem::BucketDelete(root))
-                        if root.bucket() == &trusted_bucket_name(TRACE_BUCKET) => {}
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -1034,7 +1134,7 @@ impl ReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
+        Ok(self.runtime.take_reclaim_work())
     }
 
     fn expect_trace_object_work(&mut self) -> TestCaseResult {
@@ -1061,13 +1161,11 @@ impl ReclaimTraceHarness {
 
     fn finish_or_defer_trace_object_work(&mut self, completed: bool) {
         if completed {
-            self.runtime
-                .storage_node()
-                .test_finish_object_payload_reclaim_work(
-                    &trusted_bucket_name(TRACE_BUCKET),
-                    &trusted_object_key(TRACE_KEY),
-                    trace_generation_id(),
-                );
+            self.runtime.finish_object_payload_reclaim_work(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                trace_generation_id(),
+            );
             self.deferred_object_reclaim = false;
         } else {
             self.deferred_object_reclaim = true;
@@ -1117,7 +1215,7 @@ impl ReclaimKindTraceHarness {
                 let work = self.take_next_work()?;
                 match work {
                     Some(ReclaimWorkItem::BucketDelete(root))
-                        if root.bucket() == &trusted_bucket_name(TRACE_BUCKET) => {}
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
                     Some(ReclaimWorkItem::ObjectPayload(_)) => {
                         return Err(TestCaseError::fail(
                             "expected bucket delete finalize work item, got object reclaim",
@@ -1208,7 +1306,7 @@ impl ReclaimKindTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
+        Ok(self.runtime.take_reclaim_work())
     }
 
     fn expect_trace_object_work(&mut self) -> TestCaseResult {
@@ -1235,13 +1333,11 @@ impl ReclaimKindTraceHarness {
 
     fn finish_or_defer_trace_object_work(&mut self, completed: bool) {
         if completed {
-            self.runtime
-                .storage_node()
-                .test_finish_object_payload_reclaim_work(
-                    &trusted_bucket_name(TRACE_BUCKET),
-                    &trusted_object_key(TRACE_KEY),
-                    trace_generation_id(),
-                );
+            self.runtime.finish_object_payload_reclaim_work(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                trace_generation_id(),
+            );
             self.deferred_object_reclaim = false;
         } else {
             self.deferred_object_reclaim = true;
@@ -1312,7 +1408,7 @@ impl TwoGenerationReclaimTraceHarness {
                 let work = self.take_next_work()?;
                 let root = match work {
                     Some(ReclaimWorkItem::BucketDelete(root))
-                        if root.bucket() == &trusted_bucket_name(TRACE_BUCKET) =>
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) =>
                     {
                         root
                     }
@@ -1441,13 +1537,11 @@ impl TwoGenerationReclaimTraceHarness {
 
     fn finish_or_defer_generation_work(&mut self, generation: TraceGeneration, completed: bool) {
         if completed {
-            self.runtime
-                .storage_node()
-                .test_finish_object_payload_reclaim_work(
-                    &trusted_bucket_name(TRACE_BUCKET),
-                    &trusted_object_key(TRACE_KEY),
-                    generation.generation_id(),
-                );
+            self.runtime.finish_object_payload_reclaim_work(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(TRACE_KEY),
+                generation.generation_id(),
+            );
         } else if !self.deferred_object_reclaim.contains(&generation) {
             self.deferred_object_reclaim.push(generation);
         }
@@ -1473,7 +1567,7 @@ impl TwoGenerationReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
+        Ok(self.runtime.take_reclaim_work())
     }
 
     fn bucket_exists(&self) -> bool {
@@ -1533,7 +1627,7 @@ impl TwoKeyReclaimTraceHarness {
                 let work = self.take_next_work()?;
                 let root = match work {
                     Some(ReclaimWorkItem::BucketDelete(root))
-                        if root.bucket() == &trusted_bucket_name(TRACE_BUCKET) =>
+                        if root.bucket == trusted_bucket_name(TRACE_BUCKET) =>
                     {
                         root
                     }
@@ -1662,13 +1756,11 @@ impl TwoKeyReclaimTraceHarness {
 
     fn finish_or_defer_key_work(&mut self, key: TraceKey, completed: bool) {
         if completed {
-            self.runtime
-                .storage_node()
-                .test_finish_object_payload_reclaim_work(
-                    &trusted_bucket_name(TRACE_BUCKET),
-                    &trusted_object_key(key.key()),
-                    trace_generation_id(),
-                );
+            self.runtime.finish_object_payload_reclaim_work(
+                &trusted_bucket_name(TRACE_BUCKET),
+                &trusted_object_key(key.key()),
+                trace_generation_id(),
+            );
         } else if !self.deferred_object_reclaim.contains(&key) {
             self.deferred_object_reclaim.push(key);
         }
@@ -1694,7 +1786,7 @@ impl TwoKeyReclaimTraceHarness {
     }
 
     fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
-        Ok(self.runtime.storage_node().test_try_take_reclaim_work())
+        Ok(self.runtime.take_reclaim_work())
     }
 
     fn bucket_exists(&self) -> bool {
@@ -1954,7 +2046,7 @@ fn stale_bucket_delete_follow_on_does_not_skip_new_object_reclaim() {
 
     match harness.take_next_work().unwrap() {
         Some(ReclaimWorkItem::BucketDelete(root))
-            if root.bucket() == &trusted_bucket_name(TRACE_BUCKET) => {}
+            if root.bucket == trusted_bucket_name(TRACE_BUCKET) => {}
         Some(ReclaimWorkItem::BucketDelete(root)) => {
             panic!("expected bucket-delete follow-on for the trace bucket, got {root:?}")
         }

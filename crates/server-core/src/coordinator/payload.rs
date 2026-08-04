@@ -216,14 +216,6 @@ impl Drop for PayloadLease {
         let Some(lease) = self.lease.take() else {
             return;
         };
-        let released = lease.release();
-        if released.remaining() == 0 {
-            match released.payload_reclaim_exists() {
-                Ok(true) | Err(_) => {
-                    released.enqueue_object_payload_reclaim();
-                }
-                Ok(false) => {}
-            }
-        }
+        lease.release_and_schedule_reclaim_if_needed();
     }
 }

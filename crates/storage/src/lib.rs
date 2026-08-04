@@ -200,14 +200,6 @@ pub mod test_support {
         pub desired_cluster_epoch: ClusterEpoch,
     }
 
-    /// Logical result of one deterministic object-payload reclaim attempt.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum TestObjectPayloadReclaimAttempt {
-        Completed,
-        Deferred,
-        MissingRoot,
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct TestBucketDeleteFinalizeRoot {
@@ -238,38 +230,6 @@ pub mod test_support {
             Self {
                 bucket: root.bucket.clone(),
                 bucket_incarnation_generation: root.bucket_incarnation_generation,
-            }
-        }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct TestBucketDeleteBeginRoot(BucketDeleteBeginRoot);
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl TestBucketDeleteBeginRoot {
-        pub fn bucket(&self) -> &BucketName {
-            self.0.bucket()
-        }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub enum TestReclaimWorkItem {
-        ObjectPayload((BucketName, ObjectKey, GenerationId)),
-        BucketDeleteBegin(TestBucketDeleteBeginRoot),
-        BucketDelete(TestBucketDeleteFinalizeRoot),
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl From<ReclaimWorkItem> for TestReclaimWorkItem {
-        fn from(work: ReclaimWorkItem) -> Self {
-            match work {
-                ReclaimWorkItem::ObjectPayload(root) => Self::ObjectPayload(root),
-                ReclaimWorkItem::BucketDeleteBegin(root) => {
-                    Self::BucketDeleteBegin(TestBucketDeleteBeginRoot(root))
-                }
-                ReclaimWorkItem::BucketDelete(root) => Self::BucketDelete(root.into()),
             }
         }
     }
@@ -778,7 +738,7 @@ pub(crate) use test_support::{
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
     TestMultipartUploadRecord, TestObjectPayloadRepairObservation,
     TestObjectPayloadShardFileSnapshot, TestObjectPayloadSnapshot, TestPayloadReclaimRoot,
-    TestReclaimWorkItem, TestStreamUploadPayloadSnapshot,
+    TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

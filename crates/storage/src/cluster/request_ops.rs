@@ -12591,26 +12591,6 @@ impl super::StorageCluster {
         self.local_map.runtime_state().wake_reclaim_workers();
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_try_take_reclaim_work(&self) -> Option<crate::TestReclaimWorkItem> {
-        self.try_take_reclaim_work().map(Into::into)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_finish_object_payload_reclaim_work(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) {
-        self.finish_object_payload_reclaim_work(bucket, key, generation_id);
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_wake_reclaim_worker(&self) {
-        self.wake_reclaim_workers();
-    }
-
     pub(crate) fn reclaim_object_payload_if_unleased(
         &self,
         bucket: &BucketName,
@@ -12631,17 +12611,6 @@ impl super::StorageCluster {
         generation_id: GenerationId,
     ) -> Result<bool, ObjectPgActionError> {
         self.reclaim_object_payload_if_unleased(bucket, key, generation_id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_reclaim_object_payload_if_unleased_with_outcome(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<crate::test_support::TestObjectPayloadReclaimAttempt, ObjectPgActionError> {
-        self.reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)
-            .map(Into::into)
     }
 
     pub(crate) fn reclaim_object_payload_if_unleased_with_outcome(

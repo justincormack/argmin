@@ -5625,14 +5625,16 @@ The audit found four remaining classes of work:
    must never depend on weaker route, deadline, or subject validation than
    production.
 
-2. **Owner-local impossible-state fixtures.** Logical committed-object segment
+2. **Completed — owner-local impossible-state fixtures.** Logical committed-object segment
    layout, storage identity, placement distribution, and exact payload
    presence/reclamation assertions now use an opaque storage-owned payload
    snapshot. Object-payload corruption and repair tests now use that snapshot
    through storage-owned fault scenarios and logical repair observations. The
-   remaining cross-crate exception is raw reclaim-queue control. Move tests whose
-   assertion is about storage corruption, recovery, physical layout, claims,
-   or queue invariants into `storage`. Where an S3/coordinator response to a
+   reclaim-queue state-machine and ordering tests are now storage-owner-local;
+   the remaining coordinator lease-drop regressions observe only logical queue
+   depth and opaque reclaim-root presence. Tests whose assertion is about
+   storage corruption, recovery, physical layout, claims, or queue invariants
+   belong in `storage`. Where an S3/coordinator response to a
    storage failure genuinely requires a cross-crate test, expose an opaque
    scenario-level fault or logical observation rather than physical PG, shard,
    row, claim, or command records. This work is the test-fixture portion of
@@ -5798,11 +5800,16 @@ Implementation update (2026-08-03):
   pinned with two queued payloads. Explicit managed-encryption repair coverage
   verifies that logical and stored segment sizes remain distinct. The raw
   repair DTOs and queue accessors were removed; and
-- retained raw reclaim-queue controls remain the explicit transitional
-  exception owned by implementation slice 3. They do not satisfy the final
-  curated-boundary completion criterion merely because they live under
-  `storage::test_support` or on a feature-gated `StorageCluster`
-  implementation.
+- moved the reclaim queue's four state-machine property tests and four
+  deterministic ordering/finalization regressions into storage-owner tests.
+  Final payload-lease release and reclaim scheduling are now one storage-owned
+  production operation shared by retained reads and the coordinator wrapper.
+  The coordinator retains only logical lease-drop assertions using queue depth
+  and opaque reclaim-root presence; the raw reclaim-work DTO and cross-crate
+  dequeue, finish, wake, and outcome adapters were removed. The security
+  suite's stateful and all groups now select the storage-owner module, and the
+  15 historical Proptest regressions moved with their property tests so the
+  source-relative replay corpus remains active.
 
 Completion:
 

@@ -5,8 +5,6 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use s3_types::BucketLifecycleConfiguration;
-#[cfg(test)]
-use storage::test_support::TestBucketDeleteFinalizeRoot as BucketDeleteFinalizeRoot;
 use storage::{
     BucketInfo, BucketName, GenerationId, ObjectEncryption, ObjectKey, ProcessLocalRegistryKey,
     StorageCluster, StorageClusterRouteHandle, StorageMaintenanceAdmission, UploadId, UploadState,
@@ -237,20 +235,6 @@ impl ReadRuntime {
     ) {
         self.storage_node()
             .enqueue_object_payload_reclaim(bucket, key, generation_id);
-    }
-
-    #[cfg(test)]
-    pub(super) fn enqueue_object_payload_reclaim(
-        &self,
-        bucket: &str,
-        key: &str,
-        generation_id: GenerationId,
-    ) {
-        self.enqueue_object_payload_reclaim_for(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            generation_id,
-        );
     }
 
     fn lifecycle_config_for_bucket_info(
@@ -1008,32 +992,6 @@ impl ReadRuntime {
     }
 
     #[cfg(test)]
-    fn try_reclaim_object_payload_for_with_outcome(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<storage::test_support::TestObjectPayloadReclaimAttempt, ServerError> {
-        self.storage_node()
-            .test_reclaim_object_payload_if_unleased_with_outcome(bucket, key, generation_id)
-            .map_err(Coordinator::map_object_pg_action_error)
-    }
-
-    #[cfg(test)]
-    pub(super) fn try_reclaim_object_payload_with_outcome(
-        &self,
-        bucket: &str,
-        key: &str,
-        generation_id: GenerationId,
-    ) -> Result<storage::test_support::TestObjectPayloadReclaimAttempt, ServerError> {
-        self.try_reclaim_object_payload_for_with_outcome(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            generation_id,
-        )
-    }
-
-    #[cfg(test)]
     pub(super) fn try_reclaim_object_payload(
         &self,
         bucket: &str,
@@ -1065,24 +1023,6 @@ impl ReadRuntime {
             | storage::BucketDeleteFinalizeOutcome::Pending
             | storage::BucketDeleteFinalizeOutcome::Finalized => Ok(()),
         }
-    }
-
-    #[cfg(test)]
-    pub(super) fn try_finalize_bucket_delete_for_with_outcome(
-        &self,
-        root: &BucketDeleteFinalizeRoot,
-    ) -> Result<storage::BucketDeleteFinalizeOutcome, ServerError> {
-        let result = self
-            .storage_node()
-            .test_try_finalize_bucket_delete_root(root);
-        if let Err(error) = &result {
-            let _ = observability::event(
-                TRACE_TARGET,
-                "bucket_delete_finalize_storage_error",
-                Some(format_args!("root={root:?} error={error:?}")),
-            );
-        }
-        result.map_err(super::bucket::map_bucket_write_drain_error)
     }
 
     pub(super) fn read_checked_segment_payload(

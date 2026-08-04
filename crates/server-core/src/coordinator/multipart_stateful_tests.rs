@@ -1760,6 +1760,51 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
 }
 
 #[test]
+fn dropping_a_read_only_payload_lease_does_not_enqueue_reclaim_work() {
+    let dir = test_util::tempdir();
+    let runtime = make_test_read_runtime(dir.path());
+    let generation_id = GenerationId::new(1).unwrap();
+
+    drop(runtime.acquire_object_payload_lease("bucket", "key", generation_id));
+
+    assert_eq!(
+        runtime
+            .storage_node()
+            .test_object_payload_reclaim_outstanding_depth(),
+        0,
+        "dropping a read-only lease without durable reclaim metadata must not schedule work"
+    );
+}
+
+#[test]
+fn final_payload_lease_drop_enqueues_only_while_reclaim_metadata_exists() {
+    let dir = test_util::tempdir();
+    let runtime = make_test_read_runtime(dir.path());
+    let generation_id = GenerationId::new(1).unwrap();
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    runtime
+        .storage_node()
+        .test_seed_segmented_payload_reclaim(&bucket, &key, generation_id, 1)
+        .unwrap();
+
+    let lease = runtime.acquire_object_payload_lease("bucket", "key", generation_id);
+    drop(lease);
+
+    assert_eq!(
+        runtime
+            .storage_node()
+            .test_object_payload_reclaim_outstanding_depth(),
+        1,
+        "dropping the final lease must schedule the extant durable reclaim root"
+    );
+    assert!(runtime
+        .storage_node()
+        .test_payload_reclaim_exists(&bucket, &key, generation_id)
+        .unwrap());
+}
+
+#[test]
 fn failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans() {
     let dir = test_util::tempdir();
     let coord = setup_coordinator(dir.path());
@@ -1851,110 +1896,4 @@ fn failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans()
         .storage_node()
         .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
         .unwrap());
-}
-
-#[test]
-fn dropping_a_read_only_payload_lease_does_not_enqueue_reclaim_work() {
-    let dir = test_util::tempdir();
-    let runtime = make_test_read_runtime(dir.path());
-    let invariant =
-        "dropping a read-only payload lease without pending reclaim metadata must not enqueue reclaim work";
-    let generation_id = GenerationId::new(1).unwrap();
-
-    drop(runtime.acquire_object_payload_lease("bucket", "key", generation_id));
-
-    assert!(
-        runtime
-            .storage_node()
-            .test_try_take_reclaim_work()
-            .is_none(),
-        "{invariant}: unexpected reclaim work appeared after dropping a read-only lease"
-    );
-}
-
-#[test]
-fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
-    let dir = test_util::tempdir();
-    let runtime = make_test_read_runtime(dir.path());
-    let invariant =
-        "the final payload lease drop retries reclaim exactly while durable reclaim metadata still exists";
-    let generation_id = GenerationId::new(1).unwrap();
-    let bucket = trusted_bucket_name("bucket");
-    let key = trusted_object_key("key");
-    {
-        runtime
-            .storage_node()
-            .test_seed_segmented_payload_reclaim(&bucket, &key, generation_id, 1)
-            .unwrap();
-    }
-
-    let lease = runtime.acquire_object_payload_lease("bucket", "key", generation_id);
-    runtime.enqueue_object_payload_reclaim("bucket", "key", generation_id);
-
-    match runtime.storage_node().test_try_take_reclaim_work() {
-        Some(ReclaimWorkItem::ObjectPayload((bucket, key, queued_generation_id))) => {
-            assert_eq!(bucket, "bucket");
-            assert_eq!(key, "key");
-            assert_eq!(
-                queued_generation_id, generation_id,
-                "{invariant}: initial reclaim item targeted the wrong generation"
-            );
-        }
-        Some(ReclaimWorkItem::BucketDelete(root)) => {
-            panic!("{invariant}: expected object reclaim work, got {root:?}")
-        }
-        Some(ReclaimWorkItem::BucketDeleteBegin(root)) => {
-            panic!(
-                "{invariant}: expected object reclaim work, got bucket delete begin for {}",
-                root.bucket()
-            )
-        }
-        None => panic!("{invariant}: expected initial reclaim work, got none"),
-    }
-
-    runtime
-        .try_reclaim_object_payload("bucket", "key", generation_id)
-        .unwrap();
-    assert!(
-        runtime
-            .storage_node()
-            .test_payload_reclaim_exists(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                generation_id,
-            )
-            .unwrap(),
-        "{invariant}: lease-gated reclaim retry should leave durable reclaim metadata in place"
-    );
-
-    drop(lease);
-
-    assert!(
-        runtime
-            .storage_node()
-            .test_try_take_reclaim_work()
-            .is_none(),
-        "{invariant}: lease drop should deduplicate against the worker's deferred reclaim root"
-    );
-    let completed = runtime
-        .try_reclaim_object_payload("bucket", "key", generation_id)
-        .unwrap();
-    assert!(
-        completed,
-        "{invariant}: deferred reclaim should complete after the final lease drop"
-    );
-    runtime
-        .storage_node()
-        .test_finish_object_payload_reclaim_work(&bucket, &key, generation_id);
-    assert!(
-        !runtime
-            .storage_node()
-            .test_payload_reclaim_exists(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                generation_id,
-            )
-            .unwrap(),
-        "{invariant}: successful reclaim after the final lease drop should clear durable reclaim metadata"
-    );
 }
