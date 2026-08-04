@@ -34,6 +34,16 @@ pub(crate) enum ProcessRole {
 }
 
 impl ProcessRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::AllInOne => "all-in-one",
+            Self::Frontend => "frontend",
+            Self::StorageNode => "storage-node",
+            Self::Combined => "combined",
+            Self::ControlPlane => "control-plane",
+        }
+    }
+
     pub(crate) fn has_storage_node(self) -> bool {
         matches!(self, Self::StorageNode | Self::Combined)
     }
@@ -425,6 +435,7 @@ impl fmt::Debug for BinarySecretConfigValue {
 /// Configuration for the S3 server.
 #[derive(Debug, Clone)]
 pub(crate) struct ServerConfig {
+    pub(crate) allow_unauthenticated_internal_rpc_for_tests: bool,
     pub(crate) process_role: ProcessRole,
     pub(crate) listen_addr: String,
     pub(crate) tls_cert_path: Option<String>,
@@ -505,6 +516,55 @@ pub(crate) struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub(crate) fn validate_internal_rpc_auth(&self) -> Result<(), String> {
+        if self.process_role == ProcessRole::AllInOne
+            || self.internal_rpc_auth_is_complete()
+            || self.allow_unauthenticated_internal_rpc_for_tests
+        {
+            return Ok(());
+        }
+        Err(format!(
+            "{} processes require authenticated internal RPC; use a replicated cluster manifest",
+            self.process_role.as_str()
+        ))
+    }
+
+    fn internal_rpc_auth_is_complete(&self) -> bool {
+        let control_plane_server_auth = self.control_plane_auth_cluster_id.is_some()
+            && (!self.control_plane_storage_auth_credentials.is_empty()
+                || !self.control_plane_frontend_auth_credentials.is_empty()
+                || !self.control_plane_admin_auth_credentials.is_empty());
+        let storage_control_plane_auth = self.control_plane_socket_path.is_none()
+            || (self.control_plane_auth_cluster_id.is_some()
+                && !self.control_plane_storage_auth_credentials.is_empty());
+        let frontend_control_plane_auth = self.control_plane_socket_path.is_none()
+            || (self.control_plane_auth_cluster_id.is_some()
+                && self.control_plane_frontend_auth_instance_id.is_some()
+                && !self.control_plane_frontend_auth_credentials.is_empty());
+        match self.process_role {
+            ProcessRole::AllInOne => true,
+            ProcessRole::ControlPlane => control_plane_server_auth,
+            ProcessRole::StorageNode => {
+                storage_control_plane_auth
+                    && self.storage_rpc_server_auth.is_some()
+                    && self.storage_rpc_storage_node_client_auth.is_some()
+            }
+            ProcessRole::Frontend => {
+                frontend_control_plane_auth
+                    && self.storage_rpc_frontend_client_auth.is_some()
+                    && self.storage_rpc_maintenance_client_auth.is_some()
+            }
+            ProcessRole::Combined => {
+                storage_control_plane_auth
+                    && frontend_control_plane_auth
+                    && self.storage_rpc_server_auth.is_some()
+                    && self.storage_rpc_frontend_client_auth.is_some()
+                    && self.storage_rpc_maintenance_client_auth.is_some()
+                    && self.storage_rpc_storage_node_client_auth.is_some()
+            }
+        }
+    }
+
     /// Resolve configuration values from an environment-style lookup.
     ///
     /// Required: `ARGMIN_ACCOUNT_ID`, `ARGMIN_ACCESS_KEY_ID`,
@@ -1115,6 +1175,10 @@ impl ServerConfig {
         }
 
         Ok(Self {
+            allow_unauthenticated_internal_rpc_for_tests: cfg!(any(
+                test,
+                feature = "test-unauthenticated-internal-rpc"
+            )),
             process_role,
             listen_addr,
             tls_cert_path,
@@ -3394,6 +3458,30 @@ mod tests {
         assert_eq!(cfg.secret_access_key.as_str(), "");
         assert!(cfg.uat_credentials.is_empty());
         assert_eq!(cfg.sse_s3_wrapping_key_b64.as_str(), "");
+    }
+
+    #[test]
+    fn split_process_configuration_rejects_unauthenticated_internal_rpc() {
+        let mut cfg = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_PROCESS_ROLE", "storage-node"),
+            ("ARGMIN_STORAGE_NODE_ID", "0"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "/tmp/argmin-node-0.sock"),
+        ]))
+        .unwrap();
+        cfg.allow_unauthenticated_internal_rpc_for_tests = false;
+
+        let error = cfg.validate_internal_rpc_auth().unwrap_err();
+
+        assert!(error.contains("storage-node processes require authenticated internal RPC"));
+        assert!(error.contains("replicated cluster manifest"));
+    }
+
+    #[test]
+    fn embedded_all_in_one_configuration_needs_no_internal_rpc_auth() {
+        let mut cfg = ServerConfig::from_lookup(make_required_env(&[])).unwrap();
+        cfg.allow_unauthenticated_internal_rpc_for_tests = false;
+
+        cfg.validate_internal_rpc_auth().unwrap();
     }
 
     #[test]

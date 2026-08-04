@@ -2345,11 +2345,11 @@ trap 'exit 143' TERM
 if [[ -n "$server_binary" ]]; then
     server_cmd=("$server_binary")
 elif [[ "$topology" == "multihost" ]]; then
-    build_cmd=(cargo build -p argmin-s3)
-    uat_build_variant=plain
+    build_cmd=(cargo build -p argmin-s3 --features test-unauthenticated-internal-rpc)
+    uat_build_variant=test-unauthenticated-internal-rpc
     if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
         build_cmd+=(--features deep-tracing)
-        uat_build_variant=deep-tracing
+        uat_build_variant="${uat_build_variant}-deep-tracing"
     fi
     if local_debug_endpoint_enabled; then
         build_cmd+=(--features local-debug-endpoints)

@@ -29,6 +29,10 @@ use storage::control_plane_raft::{
 };
 use storage::{ClusterEpoch, ControlPlaneRaftPeerAuthCredentialInput, NodeId, PgId};
 
+const DEFAULT_CONTROL_PLANE_AUTH_CLUSTER: &str = "process-test-control-plane-auth";
+const DEFAULT_FRONTEND_INSTANCE_ID: &str = "runtime-map-ready";
+const DEFAULT_ADMIN_INSTANCE_ID: &str = "server-admin";
+
 struct TestDir {
     path: PathBuf,
 }
@@ -260,8 +264,12 @@ impl ChildGuard {
             })
             .collect::<Vec<_>>()
             .join(",");
-        let auth = ProcessTestControlPlaneAuth::new(cluster_name);
+        let auth = ProcessTestControlPlaneAuth::new(DEFAULT_CONTROL_PLANE_AUTH_CLUSTER);
         let peer_auth_credentials = auth.raft_peer_credentials_env(raft_node_id, peer_node_ids);
+        let storage_auth_credentials = auth.storage_node_credentials_env(&[0, 1]);
+        let frontend_auth_credentials =
+            auth.frontend_credentials_env(&[DEFAULT_FRONTEND_INSTANCE_ID]);
+        let admin_auth_credentials = auth.admin_credentials_env(&[DEFAULT_ADMIN_INSTANCE_ID]);
         let storage_node_sockets = format!(
             "0={},1={}",
             test_dir.join("storage-node-0.sock").display(),
@@ -293,6 +301,22 @@ impl ChildGuard {
             .env(
                 "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
                 peer_auth_credentials,
+            )
+            .env(
+                "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+                DEFAULT_CONTROL_PLANE_AUTH_CLUSTER,
+            )
+            .env(
+                "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
+                storage_auth_credentials,
+            )
+            .env(
+                "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+                frontend_auth_credentials,
+            )
+            .env(
+                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+                admin_auth_credentials,
             )
             .env("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "1000")
             .env("ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS", "50")
@@ -425,6 +449,7 @@ fn run_runtime_map_ready_with_extra_env(
     command
         .arg("control-plane-runtime-map-ready")
         .arg(socket_path);
+    configure_default_frontend_command_auth(&mut command);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -457,6 +482,7 @@ fn run_set_pg_acting_set_live_with_extra_env(
     for node_id in acting_set {
         command.arg(node_id.to_string());
     }
+    configure_default_admin_command_auth(&mut command);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -476,6 +502,7 @@ fn run_transfer_raft_leadership_with_extra_env(
         .arg("control-plane-transfer-raft-leadership")
         .arg(socket_path)
         .arg(node_id.to_string());
+    configure_default_admin_command_auth(&mut command);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -492,6 +519,7 @@ fn run_authority_clock_admin_with_extra_env(
 ) -> Output {
     let mut command = Command::new(bin);
     command.arg(command_name).arg(socket_path);
+    configure_default_admin_command_auth(&mut command);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -509,6 +537,7 @@ fn run_trigger_raft_snapshot_purge_with_extra_env(
     command
         .arg("control-plane-trigger-raft-snapshot-purge")
         .arg(socket_path);
+    configure_default_admin_command_auth(&mut command);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -518,11 +547,48 @@ fn run_trigger_raft_snapshot_purge_with_extra_env(
 }
 
 fn run_trigger_raft_election(bin: &Path, socket_path: &Path) -> Output {
-    Command::new(bin)
+    let mut command = Command::new(bin);
+    command
         .arg("control-plane-trigger-raft-election")
-        .arg(socket_path)
+        .arg(socket_path);
+    configure_default_admin_command_auth(&mut command);
+    command
         .output()
         .expect("trigger Raft election helper should run")
+}
+
+fn configure_default_frontend_command_auth(command: &mut Command) {
+    let auth = ProcessTestControlPlaneAuth::new(DEFAULT_CONTROL_PLANE_AUTH_CLUSTER);
+    command
+        .env(
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            DEFAULT_CONTROL_PLANE_AUTH_CLUSTER,
+        )
+        .env(
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
+            DEFAULT_FRONTEND_INSTANCE_ID,
+        )
+        .env(
+            "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
+            auth.frontend_credentials_env(&[DEFAULT_FRONTEND_INSTANCE_ID]),
+        );
+}
+
+fn configure_default_admin_command_auth(command: &mut Command) {
+    let auth = ProcessTestControlPlaneAuth::new(DEFAULT_CONTROL_PLANE_AUTH_CLUSTER);
+    command
+        .env(
+            "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
+            DEFAULT_CONTROL_PLANE_AUTH_CLUSTER,
+        )
+        .env(
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
+            DEFAULT_ADMIN_INSTANCE_ID,
+        )
+        .env(
+            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
+            auth.admin_credentials_env(&[DEFAULT_ADMIN_INSTANCE_ID]),
+        );
 }
 
 fn wait_for_trigger_raft_election(
@@ -1264,7 +1330,6 @@ region = "us-east-1"
 mode = "replicated"
 failure_domain = "host"
 failure_tolerance = 1
-internal_auth = "required"
 
 [storage]
 pg_count = 1
@@ -2189,13 +2254,13 @@ fn experimental_raft_transferred_process_leader_requires_explicit_clock_reestabl
             .as_nanos()
     );
     let raft_node_ids = [101, 102, 103];
-    let auth = ProcessTestControlPlaneAuth::new(&cluster_name);
+    let auth = ProcessTestControlPlaneAuth::new(DEFAULT_CONTROL_PLANE_AUTH_CLUSTER);
     let admin_instance_id = "transfer-admin";
     let admin_credentials = auth.admin_credentials_env(&[admin_instance_id]);
     let server_auth_env = [
         (
             "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
-            cluster_name.as_str(),
+            DEFAULT_CONTROL_PLANE_AUTH_CLUSTER,
         ),
         (
             "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
@@ -2205,7 +2270,7 @@ fn experimental_raft_transferred_process_leader_requires_explicit_clock_reestabl
     let admin_helper_auth_env = [
         (
             "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
-            cluster_name.as_str(),
+            DEFAULT_CONTROL_PLANE_AUTH_CLUSTER,
         ),
         (
             "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
@@ -2452,13 +2517,13 @@ fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot(
             .as_nanos()
     );
     let raft_node_ids = [101, 102, 103];
-    let auth = ProcessTestControlPlaneAuth::new(&cluster_name);
+    let auth = ProcessTestControlPlaneAuth::new(DEFAULT_CONTROL_PLANE_AUTH_CLUSTER);
     let admin_instance_id = "snapshot-catchup-admin";
     let admin_credentials = auth.admin_credentials_env(&[admin_instance_id]);
     let server_auth_env = [
         (
             "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
-            cluster_name.as_str(),
+            DEFAULT_CONTROL_PLANE_AUTH_CLUSTER,
         ),
         (
             "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
@@ -2468,7 +2533,7 @@ fn experimental_raft_restarted_process_follower_catches_up_from_leader_snapshot(
     let admin_helper_auth_env = [
         (
             "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
-            cluster_name.as_str(),
+            DEFAULT_CONTROL_PLANE_AUTH_CLUSTER,
         ),
         (
             "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",

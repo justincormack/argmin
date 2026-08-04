@@ -493,7 +493,6 @@ region = "us-east-1"
 mode = "replicated"
 failure_domain = "host"
 failure_tolerance = 1
-internal_auth = "required"
 
 [storage]
 pg_count = $pg_count

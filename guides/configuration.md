@@ -2,7 +2,7 @@
 
 Argmin supports two configuration modes:
 
-- environment-only configuration for standalone and local deployments; and
+- environment-only configuration for embedded standalone deployments; and
 - a versioned TOML cluster manifest for production-shaped standalone and
   replicated deployments.
 
@@ -60,7 +60,7 @@ objects and `ARGMIN_SSE_C_VALIDATOR_KEY` stable for existing SSE-C objects.
 
 | Variable | Default | Description |
 |---|---|---|
-| `ARGMIN_PROCESS_ROLE` | `all-in-one` | `all-in-one`, `frontend`, `storage-node`, `combined`, or `control-plane` |
+| `ARGMIN_PROCESS_ROLE` | `all-in-one` | The standard environment-only runtime supports `all-in-one`; split process roles require a cluster manifest |
 | `ARGMIN_DATA_DIR` | `./data` | Standalone data directory |
 | `ARGMIN_PG_COUNT` | `16` | Placement-group count |
 | `ARGMIN_EC_K` | `4` | Erasure-coding data shards |
@@ -89,31 +89,12 @@ shape, and local node count as cluster-creation settings.
 | `ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS` | `250` | Frontend runtime-map refresh interval |
 | `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` | `2000` | Storage-node heartbeat lease duration |
 
-### Environment-only split-process settings
-
-Environment-only mode can run frontend, storage-node, combined, and
-control-plane roles as separate processes connected over Unix sockets. It does
-not provide the manifest's cluster-wide topology identity or TLS/TCP endpoint
-configuration. Use a cluster manifest for production-shaped replicated
-deployments.
-
-| Variable | Description |
-|---|---|
-| `ARGMIN_CONTROL_PLANE_STATE_PATH` | Durable state path; required for a `control-plane` process |
-| `ARGMIN_CONTROL_PLANE_SOCKET_PATH` | Primary absolute Unix RPC socket; required for a `control-plane` process |
-| `ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS` | Comma-separated absolute authority sockets used by clients; must include the primary path when both are set |
-| `ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID` | Authentication namespace required when control-plane credentials are configured |
-| `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS` | `node_id=credential_id:version:secret,...` |
-| `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID` | Local frontend signing identity |
-| `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS` | `instance_id=credential_id:version:secret,...` |
-| `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID` | Local admin signing identity |
-| `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS` | `instance_id=credential_id:version:secret,...` |
-
-The environment credential syntax embeds secrets in the process environment.
-The manifest's `file:` references are preferred for production-shaped setups.
-
-Development and test harness configuration is documented separately in the
-[testing guide](testing.md).
+Environment-only split-process configuration is not a supported deployment
+mode. The standard binary rejects frontend, storage-node, combined, and
+control-plane process roles unless their complete authenticated internal RPC
+configuration came from a replicated cluster manifest. Development harnesses
+that exercise an environment-shaped process topology are documented in
+the [testing guide](testing.md).
 
 ### Standalone example
 
@@ -203,7 +184,7 @@ The top-level manifest is closed and versioned:
 |---|---|
 | `schema_version` | Must be `1` |
 | `[cluster]` | Stable cluster id, topology generation, and region |
-| `[deployment]` | `standalone` or `replicated`, failure-domain policy, and internal-auth policy |
+| `[deployment]` | `standalone` or `replicated` and its failure-domain policy |
 | `[storage]` | PG count, EC shape, and initial cluster epoch |
 | `[raft]` | Append batching and snapshot limits |
 | `[[transport_profiles]]` | Frame, connection, connect-timeout, and I/O-timeout limits |
@@ -226,7 +207,6 @@ Closed enum values are:
 
 - `deployment.mode`: `standalone`, `replicated`
 - `deployment.failure_domain`: `none`, `disk`, `host`
-- `deployment.internal_auth`: `disabled`, `required`
 - `processes.kind`: `all-in-one`, `frontend`, `storage-node`, `combined`,
   `control-plane`
 - `authorities.kind`: `single`, `raft-voter`
@@ -240,7 +220,7 @@ Scalar sections use these fields:
 | Section | Fields |
 |---|---|
 | `[cluster]` | `id` (string), `topology_generation` (nonzero integer), `region` (string) |
-| `[deployment]` | `mode`, `failure_domain`, `failure_tolerance` (integer), `internal_auth` |
+| `[deployment]` | `mode`, `failure_domain`, `failure_tolerance` (integer) |
 | `[storage]` | `pg_count` (nonzero integer), `ec_data_shards`, `ec_parity_shards`, `initial_cluster_epoch` (nonzero integer) |
 | `[raft]` | `max_append_entries`, `max_append_bytes`, `max_snapshot_bytes` |
 
@@ -270,16 +250,18 @@ The process role matrix is exact:
 
 Standalone mode requires one host, one storage node, one `single` authority,
 EC 1+0, `failure_domain = "none"`, and `failure_tolerance = 0`. Its local Unix
-endpoints may set `internal_auth = "disabled"`; TCP still requires TLS and
-protocol authentication.
+endpoint records describe the closed topology but are not activated by the
+current embedded all-in-one runtime. It therefore has no internal RPC
+authentication setting.
 
 Replicated mode requires `failure_domain = "disk"` or `"host"`, a failure
 tolerance of at least one, enough parity shards and distinct storage failure
 domains for that tolerance, and at least `2 * failure_tolerance + 1` Raft
 voters on distinct authority failure domains. It rejects `all-in-one`, requires
-`internal_auth = "required"`, and requires complete credentials for every
-configured internal role. Initial PG placement is calculated and checked
-during validation.
+complete credentials for every configured internal role, and authenticates
+every activated Unix or TLS/TCP internal endpoint. Authentication is derived
+from replicated mode and cannot be disabled. Initial PG placement is calculated
+and checked during validation.
 
 #### Failure domains
 
@@ -568,7 +550,6 @@ region = "us-east-1"
 mode = "standalone"
 failure_domain = "none"
 failure_tolerance = 0
-internal_auth = "disabled"
 
 [storage]
 pg_count = 16
@@ -758,7 +739,6 @@ region = "us-east-1"
 mode = "replicated"
 failure_domain = "host"
 failure_tolerance = 1
-internal_auth = "required"
 
 [storage]
 pg_count = 116

@@ -180,13 +180,13 @@ reused by TCP.
   mode. Storage data-plane TCP follows the separate mandatory-auth and
   operation-authorization contract already established by the Unix-first,
   transport-independent storage RPC auth slice in the multihost plan.
-- **Standalone Unix mode:** may explicitly disable internal auth when all
-  components share the local trust boundary and the deployment makes no
-  redundancy or remote-trust claim. Missing configuration must not silently
-  select this behavior for replicated mode.
+- **Standalone mode:** the supported all-in-one runtime is embedded and does
+  not activate an internal RPC endpoint. Any future split-process standalone
+  topology must authenticate its internal RPC rather than adding a second
+  production trust model.
 - **Tests:** standard replicated-mode process and UAT coverage uses authenticated
-  Unix helpers. Unauthenticated Unix is limited to explicit standalone coverage
-  and narrowly scoped auth-rejection or compatibility tests.
+  Unix helpers. Plain Unix framing is limited to explicit test builds and
+  narrowly scoped auth-rejection tests.
 
 Env vars are adequate for the first experimental slices and focused tests, but
 the full TCP plus secret-distribution/rotation shape will outgrow flat env
@@ -201,8 +201,8 @@ and should be able to describe:
 - scoped credential ids/versions and secret references, not raw secret dumps
   in diagnostics;
 - rotation windows with overlapping accepted credentials;
-- deployment mode and the derived auth policy: replicated mode cannot disable
-  auth, TCP cannot disable auth, and only standalone local Unix may opt out;
+- deployment mode and the derived auth policy: every activated internal RPC is
+  authenticated, while embedded standalone activates none;
 - peer endpoint identity and restart-artifact identity checks already required
   by the multihost/Raft plan.
 
@@ -279,8 +279,8 @@ frontend, admin, and runtime-map paths.
    for representative multi-node/UAT coverage without copying credential
    boilerplate into every test.
 9. **Transport/config policy bridge.** Enforce mandatory control-plane-family
-   auth for replicated mode on both Unix and TCP, retain only the explicit
-   standalone-local Unix opt-out, and transition from env-only experimental
+   auth for replicated mode on both Unix and TCP, confine plain Unix framing to
+   explicit test builds, and transition from env-only experimental
    configuration toward optional or required config files once TCP, secret
    distribution, and rotation are in scope. Reuse the shared identity
    primitives for the multihost plan's transport-independent storage data-plane
@@ -711,10 +711,10 @@ Coverage audit as of 2026-07-08:
 | --- | --- | --- |
 | Canonical auth envelope | Principal/role round trips; malformed frames; unknown tags; payload-size limits before allocation; wrong cluster/source/target/role; unknown and stale credential versions; issued/expiry failures; tampered payloads; wrong secrets; duplicate scoped credentials; redacted debug output. | None for the shared symmetric envelope. A future asymmetric or mTLS credential backend must reuse the same source/target/operation/freshness tests. |
 | Raft peer RPC | Missing auth, malformed frames, wrong cluster/source/target/role, bad MAC/payload bitflip, stale/unknown credentials, transfer-leader freshness/replay bounds, response reverse identity, and no-dispatch/no-checkpoint process behavior before OpenRaft mutation. Redacted peer-auth diagnostics expose required mode, local principal, credential id/version, and counters. | Broader per-RPC replay caches remain deferred unless operational review requires protection beyond transfer-leader freshness and Raft's own term/log fences. |
-| Storage-node heartbeat refresh | Missing and malformed auth, wrong node/incarnation, wrong source, missing/overlong/expired freshness windows, overlapping credential rotation, authenticated signed responses, unsigned response rejection, and pre-mutation state unchanged on rejection. | Production rollout still needs secret distribution and deployment-mode validation that makes heartbeat auth mandatory in replicated mode while permitting only an explicit standalone-local opt-out. |
+| Storage-node heartbeat refresh | Missing and malformed auth, wrong node/incarnation, wrong source, missing/overlong/expired freshness windows, overlapping credential rotation, authenticated signed responses, unsigned response rejection, pre-mutation state unchanged on rejection, and mandatory authenticated Unix admission for every activated replicated listener. | External secret distribution and rotation automation remains production-readiness work. |
 | Frontend runtime-map reads | Missing auth, wrong-role storage credentials, RPC-kind replay between snapshot/status, overlapping credential rotation, per-attempt re-signing during read retries, authenticated response identity, wrong-target response rejection, signed error responses, and unsigned response rejection. | Admin confirmation reads intentionally do not borrow frontend credentials; PG acting-set confirmation now has a dedicated admin-signed PG runtime-map read path. |
 | Admin control-plane commands | Missing auth, wrong-role frontend credentials, overlapping credential rotation, metadata-transfer admin command signing, Raft leadership/snapshot/election admin signing, authenticated response identity, signed error responses, unsigned response rejection, and receive-time response freshness. Authenticated PG acting-set updates now use admin-signed PG runtime-map confirmation reads after ambiguous response loss; metadata-transfer install uses the same admin-signed confirmation-read helper shape with response-loss regression coverage. Raft leadership/snapshot/election trigger clients fail closed as `RpcUnconfirmed` after ambiguous response loss without stopping Raft protocol progress. | Automatic retry for Raft admin triggers remains deferred until operation-specific confirmation predicates or an authoritative Raft status/read surface exist. |
-| Process/env configuration and diagnostics | Storage-node, frontend, admin, and Raft peer env parsers accept staged rotation by unique principal + credential id/version; local clients sign with the highest configured version; diagnostics expose counts and credential ids/versions without secrets, MACs, nonces, or payloads. | Add shared auth test helpers, move standard replicated Unix multi-node/UAT paths to authenticated mode, enforce the replicated-mode/standalone-local policy at config validation, and introduce a config-file surface with the TCP/secret-distribution slice instead of growing env vars indefinitely. External secret rotation/distribution mechanics remain required before replicated-mode cutover. |
+| Process/configuration and diagnostics | Storage-node, frontend, admin, and Raft peer parsers accept staged rotation by unique principal + credential id/version; local clients sign with the highest configured version; diagnostics expose counts and credential ids/versions without secrets, MACs, nonces, or payloads. The versioned manifest supplies the production configuration surface, replicated mode derives mandatory auth, the standard binary rejects environment-only split roles, and standard Raft process tests use authenticated Unix helpers. | External secret rotation/distribution automation remains required before production cutover. Environment-shaped split UAT retains an explicit test-only plain-RPC build capability until those fixtures move to shared manifests. |
 
 ## Observability
 
@@ -735,9 +735,9 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
   on Raft peer RPCs, then extend the same envelope/credential model to
   storage-node heartbeat refresh, frontend runtime-map reads, admin
   control-plane RPCs, and authenticated control-plane responses.
-- **Later Phase 12 / production cutover:** enforce mandatory auth for every
-  replicated-mode control-plane-family internal RPC on Unix and TCP, retain only
-  the explicit standalone-local Unix opt-out, add required external secret
+- **Later Phase 12 / production cutover:** mandatory auth is enforced for every
+  activated replicated-mode control-plane-family internal RPC on Unix and TCP,
+  and plain framing is available only to explicit test builds. Add external secret
   distribution/rotation automation, move complex control-plane auth/transport
   config into an optional or required config-file surface, remove or replace the
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` flag and associated

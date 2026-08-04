@@ -118,13 +118,6 @@ enum FailureDomain {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
-enum InternalAuth {
-    Required,
-    Disabled,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
 enum ProcessKind {
     AllInOne,
     Frontend,
@@ -207,7 +200,6 @@ struct DeploymentInput {
     mode: DeploymentMode,
     failure_domain: FailureDomain,
     failure_tolerance: u8,
-    internal_auth: InternalAuth,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq)]
@@ -636,7 +628,7 @@ impl ValidatedStaticClusterManifest {
                     .then_some((credential, principal))
             })
             .collect::<Vec<_>>();
-        if self.manifest.deployment.internal_auth == InternalAuth::Required {
+        if self.manifest.deployment.mode == DeploymentMode::Replicated {
             for required in &required_principals {
                 let active_signers = active_credentials
                     .iter()
@@ -1405,11 +1397,6 @@ impl ValidatedStaticClusterManifest {
         if self.manifest.deployment.mode != DeploymentMode::Replicated {
             return Err(
                 "replicated control-plane mapping requires deployment mode replicated".to_string(),
-            );
-        }
-        if self.manifest.deployment.internal_auth != InternalAuth::Required {
-            return Err(
-                "replicated control-plane mapping requires internal authentication".to_string(),
             );
         }
         let selected = &self.manifest.processes[self.selected_process_index];
@@ -2398,8 +2385,7 @@ impl ValidatedStaticClusterManifest {
                     .to_string(),
             );
         }
-        if self.manifest.deployment.internal_auth != InternalAuth::Disabled
-            || !self.manifest.auth_credentials.is_empty()
+        if !self.manifest.auth_credentials.is_empty()
             || !self.manifest.tls_identities.is_empty()
             || !self.manifest.tls_trust_bundles.is_empty()
             || self
@@ -2409,7 +2395,7 @@ impl ValidatedStaticClusterManifest {
                 .any(|endpoint| !endpoint.advertise.starts_with("unix://"))
         {
             return Err(
-                "standalone manifest runtime mapping currently requires Unix endpoints with internal auth disabled and no unresolved secret references"
+                "standalone manifest runtime mapping currently requires Unix endpoints and no internal authentication or TLS material"
                     .to_string(),
             );
         }
@@ -2526,7 +2512,7 @@ where
     F: Fn(&str) -> Option<String>,
     V: FnOnce(&ValidatedStaticClusterManifest) -> Result<(), String>,
 {
-    match (config_path, process_id) {
+    let config = match (config_path, process_id) {
         (None, None) => ServerConfig::from_lookup(get),
         (Some(_), None) => {
             Err("ARGMIN_PROCESS_ID is required with ARGMIN_CLUSTER_CONFIG_PATH".to_string())
@@ -2564,7 +2550,9 @@ where
                 }
             }
         }
-    }
+    }?;
+    config.validate_internal_rpc_auth()?;
+    Ok(config)
 }
 
 impl fmt::Debug for ValidatedStaticClusterManifest {
@@ -2867,7 +2855,6 @@ fn encode_deployment_topology(deployment: &DeploymentInput) -> Vec<u8> {
     encoder.u8(1, deployment_mode_tag(deployment.mode));
     encoder.u8(2, failure_domain_tag(deployment.failure_domain));
     encoder.u8(3, deployment.failure_tolerance);
-    encoder.u8(4, internal_auth_tag(deployment.internal_auth));
     encoder.finish()
 }
 
@@ -3146,13 +3133,6 @@ const fn failure_domain_tag(value: FailureDomain) -> u8 {
         FailureDomain::None => 1,
         FailureDomain::Disk => 2,
         FailureDomain::Host => 3,
-    }
-}
-
-const fn internal_auth_tag(value: InternalAuth) -> u8 {
-    match value {
-        InternalAuth::Required => 1,
-        InternalAuth::Disabled => 2,
     }
 }
 
@@ -3630,7 +3610,6 @@ fn validate_static_cluster_manifest(
         &transport_profiles,
         &tls_identities,
         &tls_trust_bundles,
-        &manifest.deployment,
     )?;
     validate_global_runtime_path_namespace(
         &manifest.authorities,
@@ -3651,7 +3630,7 @@ fn validate_static_cluster_manifest(
         &processes,
         &authorities,
         &storage_nodes,
-        manifest.deployment.internal_auth,
+        manifest.deployment.mode,
     )?;
     let canonical_raft_peer_endpoints =
         resolve_canonical_raft_peer_endpoints(&manifest, &authorities)?;
@@ -4328,7 +4307,6 @@ fn validate_tls_trust_bundles(bundles: &[TlsTrustBundleInput]) -> Result<BTreeSe
     Ok(result)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn validate_endpoints(
     endpoints: &[EndpointInput],
     processes: &BTreeMap<&str, &ProcessInput>,
@@ -4337,7 +4315,6 @@ fn validate_endpoints(
     transport_profiles: &BTreeMap<&str, &TransportProfileInput>,
     tls_identities: &BTreeSet<&str>,
     tls_trust_bundles: &BTreeSet<&str>,
-    deployment: &DeploymentInput,
 ) -> Result<(), String> {
     let authority_by_process: BTreeMap<&str, &AuthorityInput> = authorities
         .values()
@@ -4512,12 +4489,6 @@ fn validate_endpoints(
                 if advertise_host != server_name {
                     return Err(format!(
                         "TCP endpoint {} tls_server_name must match its advertised host",
-                        endpoint.id
-                    ));
-                }
-                if deployment.internal_auth != InternalAuth::Required {
-                    return Err(format!(
-                        "TCP endpoint {} requires internal authentication",
                         endpoint.id
                     ));
                 }
@@ -4729,9 +4700,6 @@ fn validate_deployment(
                     "all-in-one processes are permitted only in standalone deployment".to_string(),
                 );
             }
-            if manifest.deployment.internal_auth != InternalAuth::Required {
-                return Err("replicated deployment requires internal authentication".to_string());
-            }
             if !matches!(
                 manifest.deployment.failure_domain,
                 FailureDomain::Disk | FailureDomain::Host
@@ -4809,7 +4777,7 @@ fn validate_deployment(
                 process.id
             ));
         }
-        if manifest.deployment.internal_auth == InternalAuth::Required
+        if manifest.deployment.mode == DeploymentMode::Replicated
             && process.kind.has_frontend()
             && process.frontend_instance_id.is_none()
         {
@@ -4819,7 +4787,6 @@ fn validate_deployment(
             ));
         }
         if manifest.deployment.mode == DeploymentMode::Replicated
-            && manifest.deployment.internal_auth == InternalAuth::Required
             && process.kind.has_frontend()
             && process.maintenance_instance_id.is_none()
         {
@@ -4828,7 +4795,7 @@ fn validate_deployment(
                 process.id
             ));
         }
-        if manifest.deployment.internal_auth == InternalAuth::Required
+        if manifest.deployment.mode == DeploymentMode::Replicated
             && (process.kind.has_frontend() || process.kind.has_control_plane())
             && process.admin_instance_id.is_none()
         {
@@ -4888,7 +4855,7 @@ fn validate_auth_credentials(
     processes: &BTreeMap<&str, &ProcessInput>,
     authorities: &BTreeMap<&str, &AuthorityInput>,
     storage_nodes: &BTreeMap<u32, &StorageNodeInput>,
-    internal_auth: InternalAuth,
+    deployment_mode: DeploymentMode,
 ) -> Result<(), String> {
     let raft_nodes: BTreeSet<u64> = authorities
         .values()
@@ -4978,7 +4945,7 @@ fn validate_auth_credentials(
         }
     }
 
-    if internal_auth == InternalAuth::Required {
+    if deployment_mode == DeploymentMode::Replicated {
         let required = required_auth_principals(
             &raft_nodes,
             &storage_node_ids,
@@ -5995,7 +5962,6 @@ region = "us-east-1"
 mode = "replicated"
 failure_domain = "disk"
 failure_tolerance = 1
-internal_auth = "required"
 
 [storage]
 pg_count = {pg_count}
@@ -6184,7 +6150,6 @@ region = "us-east-1"
 mode = "standalone"
 failure_domain = "none"
 failure_tolerance = 0
-internal_auth = "disabled"
 
 [storage]
 pg_count = 16
@@ -6273,7 +6238,6 @@ region = "us-east-1"
 mode = "replicated"
 failure_domain = "host"
 failure_tolerance = 1
-internal_auth = "required"
 
 [storage]
 pg_count = 16
@@ -7800,7 +7764,7 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
         let error = credentialed
             .standalone_server_config(|key| environment.get(key).cloned())
             .unwrap_err();
-        assert!(error.contains("no unresolved secret references"));
+        assert!(error.contains("no internal authentication or TLS material"));
     }
 
     #[test]
@@ -7827,9 +7791,9 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
                 standalone.full_config_fingerprint(),
             ),
             (
-                "5bf5e1b7577fda247333aa68943c45f8915c0be6ca52d473f8819e3b6e05303f",
-                "99b77cf312149f5c31a21917e64f2cf6a426a6d7b6e56bdd437f8ffdbddb6467",
-                "e13971b1b0a1a5429a5a3c6369c4811e1bbc63af00b9e8f5c5cb5df7c55d4f5b",
+                "ce30e19d641d6c43b6b2ee4da53c2a98e6a9e1966b6d157bf4542e7ea21e5a54",
+                "603ad39045e499b35843ed647010738665bf478d2d204af57df1337f38f4bf07",
+                "cb6dc09b42b395c656e772b9d187a0920ca3561b7af01031866d9c0e51f50d93",
             )
         );
 
@@ -7842,9 +7806,9 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
                 replicated.full_config_fingerprint(),
             ),
             (
-                "d4a09bbe6634ffa1018d2aa9f6fe169e12e63d1fce9420a0e3bd2b69a9a753f9",
-                "5cca855c88bd37ec52e64a57f20edc3210525ab0e3b859c3a82c909309a4fdc9",
-                "745939e18166e912da49965165628a511ec46bdf6a65167cde7119c0a8957bd4",
+                "0d32b6801cdf4a4a37e9b8f294ed5d1f0e118edfccb6a6f5825e6f45962825ae",
+                "720ce6f51baf0752837a5250b5921c1dca2e4baff69b6c7ef4b1d7c4d5c62193",
+                "ef407ab87c3a309688bd3a42b147ba5389f3f4b37f8a6dfe94b9deb895d02a3c",
             )
         );
     }
@@ -8409,14 +8373,16 @@ tls_server_name = "control-1.internal""#,
                 .contains("production replication payload size")
         );
 
-        let unauthenticated = replace_once(
+        let obsolete_auth_switch = replace_once(
             &replicated_manifest(),
-            "internal_auth = \"required\"",
-            "internal_auth = \"disabled\"",
+            "failure_tolerance = 1",
+            "failure_tolerance = 1\ninternal_auth = \"disabled\"",
         );
-        assert!(parse_static_cluster_manifest(&unauthenticated, "control-1")
-            .unwrap_err()
-            .contains("requires internal authentication"));
+        assert!(
+            parse_static_cluster_manifest(&obsolete_auth_switch, "control-1")
+                .unwrap_err()
+                .contains("contains an unknown field")
+        );
 
         let insufficient_parity = replace_once(
             &replicated_manifest(),
@@ -8666,6 +8632,17 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             .all(|credential| credential.principal.principal != AuthPrincipal::RaftPeer));
         assert_eq!(storage_material.tls_identity_count(), 1);
         assert_eq!(storage_material.tls_trust_bundle_count(), 1);
+    }
+
+    #[test]
+    fn standalone_cluster_material_resolution_requires_no_auth_material() {
+        let manifest = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
+
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+
+        assert_eq!(material.auth_credential_count(), 0);
+        assert_eq!(material.tls_identity_count(), 0);
+        assert_eq!(material.tls_trust_bundle_count(), 0);
     }
 
     #[test]

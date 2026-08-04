@@ -12167,8 +12167,8 @@ Supported deployment modes, replicated topologies, and gating:
   transport hardening, but are not an alternative identity model and do not
   justify a second unauthenticated appliance configuration. Every TCP/non-local
   internal transport is likewise authenticated-only. Standalone may retain an
-  explicit unauthenticated local Unix mode because it makes no distributed or
-  redundant trust claim.
+  embedded in-process authority and storage path, but any future internal RPC
+  endpoint in that mode must use the same authenticated boundary.
 - Define one **replicated-authority production cutover gate**. Replicated mode
   must pass the compact-history and split-refresh invariants, quantitative
   heartbeat/checkpoint/WAL write-amplification bounds, restart/WAL/snapshot
@@ -12211,8 +12211,8 @@ Supported deployment modes, replicated topologies, and gating:
   deployments. In-process fake networks, static-map shortcuts, fault
   injection, and deliberately weakened protocol paths belong behind
   `cfg(test)` or the existing `test-hooks` feature. Standard replicated-mode
-  tests use authenticated helpers even over Unix sockets; unauthenticated Unix
-  is limited to explicit standalone coverage and narrowly scoped negative tests.
+  tests use authenticated helpers even over Unix sockets; plain Unix framing is
+  limited to explicit test builds and narrowly scoped negative tests.
 - Add a release matrix for every supported mode and topology. Standalone runs
   the full S3 behavior suite plus persistence/restart tests with one storage
   identity and no claimed redundancy. The local replicated topology runs real
@@ -12613,9 +12613,9 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   fixtures to shared manifest builders is cleanup rather than an activation
   blocker.
 - Replicated Unix mode now requires authentication. Unix sockets remain the
-  main local replicated and process-test transport; unauthenticated Unix
-  coverage is confined to standalone compatibility and explicit auth-
-  rejection tests.
+  main local replicated and process-test transport. The standard binary no
+  longer assembles an unauthenticated Unix internal RPC path; plain framing is
+  retained only for explicit test builds and auth-rejection coverage.
 - Do the Raft naming cleanup as a dedicated production-cutover slice, not
   piecemeal during WAL/auth work. That slice should remove or replace
   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT`, rename process/log/test labels and

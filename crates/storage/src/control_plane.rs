@@ -16955,7 +16955,7 @@ impl ControlPlaneRpcServerListener {
                     stream,
                     authority(),
                     policy.clone(),
-                    false,
+                    policy.authentication_required(),
                     self.max_frame_bytes,
                     worker_limit,
                     self.io_timeout,
@@ -24539,6 +24539,64 @@ mod tests {
         wait_for_control_plane_server_workers_to_finish(&policy);
 
         assert_eq!(status.pg_routes(), 0);
+    }
+
+    #[test]
+    fn control_plane_unix_server_requires_auth_before_authority_confirmation() {
+        let directory = test_util::tempdir();
+        let socket_path = directory.path().join("control-plane.sock");
+        let listener = ControlPlaneRpcServerListener::unix(
+            UnixListener::bind(&socket_path).unwrap(),
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let verifier = Arc::new(frontend_auth_verifier("auth-cluster", "frontend-1"));
+        let verifier_for_assert = Arc::clone(&verifier);
+        let confirmation_calls = Arc::new(AtomicUsize::new(0));
+        let confirmation_calls_for_policy = Arc::clone(&confirmation_calls);
+        let policy = ControlPlaneRpcServerPolicy::new(
+            ControlPlaneRpcServerRole::Ordinary,
+            1,
+            CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        )
+        .unwrap()
+        .with_auth_verifier(verifier)
+        .with_authority_confirmation(Arc::new(move || {
+            confirmation_calls_for_policy.fetch_add(1, Ordering::AcqRel);
+            Ok(())
+        }));
+        let authority = Arc::new(Mutex::new(
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+                directory.path().join("control.state"),
+            ))
+            .unwrap(),
+        ));
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).unwrap();
+            write_control_plane_rpc_frame(&mut stream, ControlPlaneRpcKind::RuntimeMapStatus, &[])
+                .unwrap();
+            stream.flush().unwrap();
+            read_control_plane_rpc_frame(&mut stream).unwrap_err()
+        });
+
+        listener
+            .accept_one(
+                &move || ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        let _error = client.join().unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert_eq!(confirmation_calls.load(Ordering::Acquire), 0);
+        let metrics = verifier_for_assert.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::Missing),
+            1
+        );
     }
 
     #[test]

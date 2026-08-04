@@ -199,7 +199,6 @@ region = "us-east-1"
 mode = "replicated"
 failure_domain = "host"
 failure_tolerance = 1
-internal_auth = "required"
 
 [storage]
 pg_count = 116
@@ -402,11 +401,6 @@ Unknown keys, duplicate keys, and unknown enum values fail closed.
 - `disk`; or
 - `host`.
 
-`deployment.internal_auth` is:
-
-- `required`; or
-- `disabled`, valid only for standalone when every internal endpoint is Unix.
-
 `processes.kind` is:
 
 - `all-in-one`;
@@ -480,12 +474,14 @@ not silently accepted.
 
 ## Authentication And Rotation
 
-Replicated mode derives `internal_auth = required`; specifying `disabled` is an
-error. Whenever internal auth is required, every authority, storage node,
-frontend, admin, and maintenance principal referenced by a local process must
-have an accepted credential. Standalone local Unix may explicitly disable
-internal auth. Every TCP endpoint requires authentication regardless of
-deployment mode.
+Authentication is derived from deployment mode rather than selected by a
+manifest field. Every replicated authority, storage node, frontend, admin, and
+maintenance principal referenced by a local process must have an accepted
+credential, and every activated replicated Unix or TLS/TCP endpoint requires
+authentication. The embedded standalone runtime activates no internal RPC
+endpoint and therefore has no internal-authentication mode. Any future
+split-process standalone topology must use the same authenticated internal RPC
+boundary rather than introducing an unauthenticated production profile.
 
 Credential identity is the tuple:
 
@@ -1254,6 +1250,16 @@ Progress as of 2026-08-02:
   Replicated replacement, dynamic topology lifecycle, and replicated
   `combined` activation remain open. Split-role storage/frontend process
   mapping and authenticated Unix/TLS/TCP transport are implemented.
+- The manifest no longer exposes an `internal_auth` policy switch.
+  Authentication is derived from runtime topology: every activated replicated
+  Unix or TLS/TCP internal endpoint requires scoped credentials, while the
+  supported standalone all-in-one runtime uses embedded calls and activates no
+  internal RPC endpoint. The standard binary rejects environment-only split
+  roles and missing control-plane or storage RPC authentication before listener
+  construction. Plain Unix framing remains available only through the explicit
+  `test-unauthenticated-internal-rpc` build capability for process harnesses and
+  negative protocol tests. The standard Raft process suite now installs and
+  uses authenticated Unix credentials by default.
 
 1. **Schema types and parser**
    - add closed Rust input types with unknown-field rejection;
@@ -1383,7 +1389,7 @@ The schema/parser release gate includes:
   fallback resolves to TCP in a multihost peer map;
 - Unix endpoint referenced across hosts;
 - TCP without auth or TLS;
-- replicated auth disabled;
+- obsolete manifest auth-policy fields rejected;
 - standalone EC other than 1+0;
 - replicated `m < f`, insufficient storage domains, and insufficient voters;
 - replicated all-in-one process rejection;

@@ -89,6 +89,14 @@ The process and UAT harnesses can configure the pre-manifest experimental Raft
 path directly through environment variables. This is test configuration, not
 the operator interface for a new replicated deployment:
 
+Environment-shaped split-process tests require the
+`argmin-s3/test-unauthenticated-internal-rpc` feature. The feature is a test
+compatibility boundary: it permits plain Unix internal RPC and is not part of a
+supported deployment build. `./scripts/uat-s3-tests` enables it automatically
+when it builds a multihost test process group. A binary supplied with
+`--binary` must have been built with that feature when the selected smoke uses
+the environment-shaped split-process topology.
+
 | Variable | Description |
 |---|---|
 | `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` | Enables the environment-only Raft path; default `false` |

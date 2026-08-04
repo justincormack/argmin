@@ -1111,6 +1111,11 @@ fn transfer_control_plane_pg_metadata_live(
     };
     let admission_settings = unix_storage_node_client_admission_settings(&config);
     let transfer = if config.storage_rpc_client_endpoints.is_empty() {
+        if config.storage_rpc_frontend_client_auth.is_none()
+            && !config.allow_unauthenticated_internal_rpc_for_tests
+        {
+            return Err("live metadata transfer requires authenticated storage RPC".to_string());
+        }
         storage::LivePgMetadataTransferAdmin::with_unix_storage_nodes(
             control_plane,
             ec_shape,
@@ -2455,14 +2460,18 @@ fn build_control_plane_rpc_server_auth(
         .iter()
         .map(configured_admin_auth_credential_input)
         .collect();
-    storage::ControlPlaneRpcServerAuth::new(
+    let auth = storage::ControlPlaneRpcServerAuth::new(
         config.control_plane_auth_cluster_id.as_deref(),
         config.control_plane_admin_auth_instance_id.as_deref(),
         storage_credentials,
         frontend_credentials,
         admin_credentials,
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| error.to_string())?;
+    if auth.diagnostics().is_none() && !config.allow_unauthenticated_internal_rpc_for_tests {
+        return Err("control-plane listeners require authentication".to_string());
+    }
+    Ok(auth)
 }
 
 fn build_frontend_control_plane_client(
@@ -2519,6 +2528,11 @@ fn build_frontend_control_plane_client_from_runtime_map_auth_env(
         return build_frontend_control_plane_client(&config, fallback);
     }
     let auth_config = ConfiguredControlPlaneFrontendRuntimeMapAuth::from_env()?;
+    if auth_config.is_none() && !unauthenticated_internal_rpc_tests_enabled() {
+        return Err(
+            "control-plane runtime-map commands require frontend authentication".to_string(),
+        );
+    }
     let (cluster_id, instance_id, credentials) = match &auth_config {
         Some(auth_config) => (
             Some(auth_config.cluster_id.as_str()),
@@ -2678,8 +2692,15 @@ fn build_admin_credential_binding_from_command_auth_env(
             Some(&auth_config.instance_id),
             &auth_config.credentials,
         ),
-        None => build_admin_credential_binding(None, None, &[]),
+        None if unauthenticated_internal_rpc_tests_enabled() => {
+            build_admin_credential_binding(None, None, &[])
+        }
+        None => Err("control-plane admin commands require authentication".to_string()),
     }
+}
+
+const fn unauthenticated_internal_rpc_tests_enabled() -> bool {
+    cfg!(any(test, feature = "test-unauthenticated-internal-rpc"))
 }
 
 fn build_admin_credential_binding_from_config(
@@ -3099,8 +3120,12 @@ fn build_storage_node_process_config(
         })
         .transpose()?;
     let mut prepared = PreparedStorageNodeServer::new(storage_node_config);
-    if let Some(rpc_auth) = config.storage_rpc_server_auth.clone() {
-        prepared = prepared.with_rpc_auth(rpc_auth);
+    match config.storage_rpc_server_auth.clone() {
+        Some(rpc_auth) => prepared = prepared.with_rpc_auth(rpc_auth),
+        None if config.allow_unauthenticated_internal_rpc_for_tests => {}
+        None => {
+            return Err("storage-node listeners require authenticated storage RPC".to_string());
+        }
     }
     if !config.storage_rpc_listeners.is_empty() {
         prepared = prepared.with_rpc_listeners(config.storage_rpc_listeners.clone());
@@ -3272,8 +3297,12 @@ fn build_control_plane_storage_node_process_config(
     let mut prepared_server = bootstrap
         .prepare(&runtime_map)
         .map_err(|error| error.to_string())?;
-    if let Some(rpc_auth) = config.storage_rpc_server_auth.clone() {
-        prepared_server = prepared_server.with_rpc_auth(rpc_auth);
+    match config.storage_rpc_server_auth.clone() {
+        Some(rpc_auth) => prepared_server = prepared_server.with_rpc_auth(rpc_auth),
+        None if config.allow_unauthenticated_internal_rpc_for_tests => {}
+        None => {
+            return Err("storage-node listeners require authenticated storage RPC".to_string());
+        }
     }
     if !config.storage_rpc_listeners.is_empty() {
         prepared_server = prepared_server.with_rpc_listeners(config.storage_rpc_listeners.clone());
@@ -3618,16 +3647,23 @@ fn build_remote_frontend_storage_cluster(
         cluster_epoch,
     )
     .map_err(|e| e.to_string())?;
+    let frontend_auth = config.storage_rpc_frontend_client_auth.clone();
+    if frontend_auth.is_none() && !config.allow_unauthenticated_internal_rpc_for_tests {
+        return Err("remote frontend storage RPC requires authentication".to_string());
+    }
     local_map
         .install_unix_storage_node_clients({
             let admission_settings = unix_storage_node_client_admission_settings(config);
             config.storage_node_sockets.iter().map(move |entry| {
-                LocalUnixStorageNodeClientConfig::with_rpc_admission_settings(
+                let client = LocalUnixStorageNodeClientConfig::with_rpc_admission_settings(
                     NodeId::new(entry.node_id),
                     entry.socket_path.clone(),
                     admission_settings,
-                )
-                .with_optional_frontend_rpc_auth(config.storage_rpc_frontend_client_auth.clone())
+                );
+                match frontend_auth.clone() {
+                    Some(auth) => client.with_frontend_rpc_auth(auth),
+                    None => client,
+                }
             })
         })
         .map_err(|e| e.to_string())?;
@@ -3711,12 +3747,15 @@ fn build_frontend_storage_cluster_from_runtime_map(
             unix_storage_node_client_admission_settings(config),
             capability,
         ),
-        None => StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
-            metadata_primary_node_id,
-            runtime_map,
-            ec_shape,
-            unix_storage_node_client_admission_settings(config),
-        ),
+        None if config.allow_unauthenticated_internal_rpc_for_tests => {
+            StorageCluster::from_runtime_map_with_unix_storage_node_client_admission_settings(
+                metadata_primary_node_id,
+                runtime_map,
+                ec_shape,
+                unix_storage_node_client_admission_settings(config),
+            )
+        }
+        None => return Err("frontend storage RPC requires authentication".to_string()),
     }
     .map_err(|error| error.to_string())
 }
@@ -4557,6 +4596,7 @@ mod tests {
 
     fn test_server_config() -> ServerConfig {
         ServerConfig {
+            allow_unauthenticated_internal_rpc_for_tests: true,
             process_role: ProcessRole::StorageNode,
             listen_addr: "127.0.0.1:9000".to_string(),
             tls_cert_path: None,
@@ -5173,6 +5213,17 @@ mod tests {
             .expect_err("frontend server auth should require admin credentials");
 
         assert!(error.contains("admin control-plane credentials are required"));
+    }
+
+    #[test]
+    fn control_plane_rpc_server_auth_rejects_unauthenticated_listener() {
+        let mut config = test_server_config();
+        config.allow_unauthenticated_internal_rpc_for_tests = false;
+
+        let error = build_control_plane_rpc_server_auth(&config)
+            .expect_err("control-plane listener without authentication must fail");
+
+        assert_eq!(error, "control-plane listeners require authentication");
     }
 
     #[test]
@@ -10536,6 +10587,22 @@ mod tests {
                 (3, ClusterEpoch::new(9).unwrap()),
                 (5, ClusterEpoch::new(9).unwrap()),
             ]
+        );
+    }
+
+    #[test]
+    fn storage_node_process_config_rejects_unauthenticated_listener() {
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let mut config = test_server_config();
+        config.allow_unauthenticated_internal_rpc_for_tests = false;
+
+        let error = build_storage_node_process_config(&config, &ec_config)
+            .err()
+            .expect("storage listener without authentication must fail");
+
+        assert_eq!(
+            error,
+            "storage-node listeners require authenticated storage RPC"
         );
     }
 

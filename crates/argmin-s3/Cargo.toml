@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [features]
 local-debug-endpoints = ["server-http/local-debug-endpoints"]
+test-unauthenticated-internal-rpc = []
 deep-tracing = [
     "auth/deep-tracing",
     "ec/deep-tracing",
