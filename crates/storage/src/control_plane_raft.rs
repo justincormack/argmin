@@ -495,7 +495,7 @@ impl Default for ControlPlaneRaftPeerTransportLimits {
 const CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ControlPlaneRaftPeerAuthMetricsSnapshot {
+pub(crate) struct ControlPlaneRaftPeerAuthMetricsSnapshot {
     accepted_total: u64,
     rejected_total: u64,
     rejected_without_operation_total: u64,
@@ -521,6 +521,7 @@ impl ControlPlaneRaftPeerAuthMetricsSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn accepted_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
         self.accepted_by_operation
             .get(&operation)
@@ -534,6 +535,7 @@ impl ControlPlaneRaftPeerAuthMetricsSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn rejected_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
         self.rejected_by_operation
             .get(&operation)
@@ -547,6 +549,7 @@ impl ControlPlaneRaftPeerAuthMetricsSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn rejected_for_reason(&self, reason: ControlPlaneAuthRejectionReason) -> u64 {
         self.rejected_by_reason
             .get(&reason)
@@ -561,7 +564,7 @@ impl ControlPlaneRaftPeerAuthMetricsSnapshot {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ControlPlaneRaftPeerAuthStatusSnapshot {
+pub(crate) struct ControlPlaneRaftPeerAuthStatusSnapshot {
     required: bool,
     local_principal: Option<ControlPlaneAuthPrincipal>,
     credential_id: Option<String>,
@@ -586,6 +589,7 @@ impl ControlPlaneRaftPeerAuthStatusSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn credential_id(&self) -> Option<&str> {
         self.credential_id.as_deref()
     }
@@ -661,7 +665,7 @@ fn increment_counter<K: Ord>(counters: &mut BTreeMap<K, u64>, key: K) {
 }
 
 #[derive(Debug, Clone)]
-pub struct ControlPlaneRaftPeerAuthPolicy {
+pub(crate) struct ControlPlaneRaftPeerAuthPolicy {
     local_credential: ControlPlaneScopedCredential,
     verifier: ControlPlaneScopedCredentialStore,
     metrics: Arc<ControlPlaneRaftPeerAuthMetrics>,
@@ -682,6 +686,7 @@ impl ControlPlaneRaftPeerAuthPolicy {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn metrics_snapshot(&self) -> ControlPlaneRaftPeerAuthMetricsSnapshot {
         self.metrics.snapshot()
     }
@@ -854,7 +859,7 @@ fn peer_auth_replay_policy(
 }
 
 #[derive(Debug, Clone)]
-pub struct ControlPlaneRaftPeerTransportPolicy {
+pub(crate) struct ControlPlaneRaftPeerTransportPolicy {
     cluster_name: String,
     topology: Option<ControlPlaneRaftTopologyIdentity>,
     initial_topology_certificate: Option<crate::control_plane::InitialClusterTopologyCertificate>,
@@ -918,7 +923,7 @@ impl ControlPlaneRaftPeerTransportPolicy {
     }
 
     #[must_use]
-    pub fn with_auth_policy(mut self, auth_policy: ControlPlaneRaftPeerAuthPolicy) -> Self {
+    pub(crate) fn with_auth_policy(mut self, auth_policy: ControlPlaneRaftPeerAuthPolicy) -> Self {
         self.auth_policy = Some(Arc::new(auth_policy));
         self
     }
@@ -971,11 +976,6 @@ impl ControlPlaneRaftPeerTransportPolicy {
     #[must_use]
     pub fn connect_timeout(&self) -> Duration {
         self.connect_timeout
-    }
-
-    #[must_use]
-    pub fn io_timeout(&self) -> Duration {
-        self.io_timeout
     }
 
     #[must_use]
@@ -1654,7 +1654,7 @@ enum ControlPlaneRaftPeerNetworkTransport {
 }
 
 #[derive(Clone)]
-pub struct ControlPlaneRaftPeerNetworkConfig {
+pub(crate) struct ControlPlaneRaftPeerNetworkConfig {
     rpc_timeout: Duration,
     transport: ControlPlaneRaftPeerNetworkTransport,
 }
@@ -1707,7 +1707,7 @@ impl ControlPlaneRaftPeerNetworkConfig {
         }
     }
 
-    fn validate_policy(
+    pub(crate) fn validate_policy(
         &self,
         policy: &ControlPlaneRaftPeerTransportPolicy,
     ) -> Result<(), ControlPlaneError> {
@@ -4816,6 +4816,14 @@ fn control_plane_raft_durable_purge_covers(
 }
 
 impl ControlPlaneRaftAuthority {
+    pub(crate) fn peer_server_binding(
+        &self,
+    ) -> Option<(ControlPlaneRaftNodeId, ControlPlaneRaftPeerTransportPolicy)> {
+        self.static_peer_policy
+            .clone()
+            .map(|policy| (self.node_id, policy))
+    }
+
     #[must_use]
     pub fn authority_clock_checkpoint_binding(
         &self,
@@ -4918,7 +4926,8 @@ impl ControlPlaneRaftAuthority {
             .with_durable_artifact_path(artifact_path))
     }
 
-    pub async fn new_experimental_unix_peer_durable(
+    #[cfg(test)]
+    pub(crate) async fn new_experimental_unix_peer_durable(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -4981,7 +4990,7 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub async fn new_experimental_peer_durable_network(
+    pub(crate) async fn new_experimental_peer_durable_network(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -5001,7 +5010,7 @@ impl ControlPlaneRaftAuthority {
         .await
     }
 
-    pub async fn new_experimental_peer_durable_pending_static_initialization_network(
+    pub(crate) async fn new_experimental_peer_durable_pending_static_initialization_network(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -5172,6 +5181,22 @@ impl ControlPlaneRaftAuthority {
             .clone())
     }
 
+    /// Bind process-hosted peer checkpoint work to this authority's durability
+    /// publication and poison domain.
+    pub fn bind_peer_server_durability(
+        &self,
+        checkpoint: Arc<dyn ControlPlaneRaftPeerServerCheckpoint>,
+    ) -> Result<ControlPlaneRaftPeerServerDurability, ControlPlaneError> {
+        let authority_instance_id = self.authority_instance_id()?;
+        let publication = self.durability_publication()?;
+        publication.validate_authority(authority_instance_id)?;
+        Ok(ControlPlaneRaftPeerServerDurability {
+            authority_instance_id,
+            publication,
+            checkpoint,
+        })
+    }
+
     #[must_use]
     fn with_durable_artifact_path(mut self, artifact_path: &Path) -> Self {
         self.durable_artifact_path = Some(Arc::new(artifact_path.to_path_buf()));
@@ -5268,7 +5293,7 @@ impl ControlPlaneRaftAuthority {
             })
     }
 
-    pub async fn initialize_membership(
+    pub(crate) async fn initialize_membership(
         &self,
         nodes: BTreeMap<ControlPlaneRaftNodeId, BasicNode>,
     ) -> Result<(), ControlPlaneError> {
@@ -5279,13 +5304,33 @@ impl ControlPlaneRaftAuthority {
         Ok(())
     }
 
-    pub async fn initialize_single_node_membership(
+    pub(crate) async fn initialize_single_node_membership(
         &self,
         node_id: ControlPlaneRaftNodeId,
     ) -> Result<(), ControlPlaneError> {
         let mut nodes = BTreeMap::new();
         nodes.insert(node_id, BasicNode::default());
         self.initialize_membership(nodes).await
+    }
+
+    /// Initialize the membership retained by this authority, when this node
+    /// owns initial membership submission.
+    pub async fn initialize_configured_membership_if_needed(
+        &self,
+    ) -> Result<bool, ControlPlaneError> {
+        if self.is_initialized().await? {
+            return Ok(false);
+        }
+        let Some(policy) = &self.static_peer_policy else {
+            self.initialize_single_node_membership(self.node_id).await?;
+            return Ok(true);
+        };
+        let peers = policy.peers();
+        if peers.len() > 1 && peers.keys().next().copied() != Some(self.node_id) {
+            return Ok(false);
+        }
+        self.initialize_membership(peers).await?;
+        Ok(true)
     }
 
     pub async fn is_initialized(&self) -> Result<bool, ControlPlaneError> {
@@ -10485,20 +10530,77 @@ pub(crate) fn read_control_plane_raft_peer_transport_frame_with_reservation<Rese
 const CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED: &str =
     "control-plane OpenRaft inbound peer connection deadline expired";
 
-/// Durability gate invoked by the storage-owned Raft peer server.
+/// Process-hosted checkpoint work invoked by the storage-owned Raft peer
+/// server.
 ///
-/// Implementations receive no transport or frame access. Storage decides
-/// when a snapshot response requires a checkpoint and owns the exact ordering
-/// of checkpoint, response publication, and acknowledgement.
-pub trait ControlPlaneRaftPeerServerDurability: Send + Sync {
-    fn is_poisoned(&self) -> bool;
+/// The server supplies its exact issuing authority. Implementations receive no
+/// transport, frame, poison, or response-publication access; storage owns those
+/// authority-bound operations and their ordering.
+pub trait ControlPlaneRaftPeerServerCheckpoint: Send + Sync {
+    fn checkpoint_before_snapshot_response(
+        &self,
+        authority: &ControlPlaneRaftAuthority,
+    ) -> Result<(), ControlPlaneError>;
+}
 
-    fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError>;
+/// Opaque peer-server durability capability bound to one Raft authority.
+#[derive(Clone)]
+pub struct ControlPlaneRaftPeerServerDurability {
+    authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
+    publication: ControlPlaneRaftDurabilityPublication,
+    checkpoint: Arc<dyn ControlPlaneRaftPeerServerCheckpoint>,
+}
+
+impl fmt::Debug for ControlPlaneRaftPeerServerDurability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRaftPeerServerDurability")
+            .field("authority", &"<opaque>")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftPeerServerDurability {
+    pub(crate) fn validate_authority(
+        &self,
+        authority: &ControlPlaneRaftAuthority,
+    ) -> Result<(), ControlPlaneError> {
+        if self.authority_instance_id != authority.authority_instance_id()? {
+            return Err(ControlPlaneError::invariant_failure(
+                "control-plane Raft peer-server durability belongs to another authority instance",
+            ));
+        }
+        self.publication
+            .validate_authority(self.authority_instance_id)
+    }
+
+    fn is_poisoned(&self) -> bool {
+        self.publication.is_poisoned()
+    }
+
+    fn checkpoint_before_snapshot_response(
+        &self,
+        authority: &ControlPlaneRaftAuthority,
+    ) -> Result<(), ControlPlaneError> {
+        self.validate_authority(authority)?;
+        let result = self
+            .checkpoint
+            .checkpoint_before_snapshot_response(authority);
+        if result.is_err() {
+            self.publication
+                .poison("control-plane Raft snapshot response checkpoint publication failed");
+        }
+        result
+    }
 
     fn publish_response(
         &self,
+        authority: &ControlPlaneRaftAuthority,
         publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
-    ) -> Result<(), ControlPlaneError>;
+    ) -> Result<(), ControlPlaneError> {
+        self.validate_authority(authority)?;
+        ControlPlaneRpcResponsePublication::publish(&self.publication, publish)
+    }
 }
 
 #[derive(Clone)]
@@ -10512,11 +10614,11 @@ struct ControlPlaneRaftPeerServerResources {
 /// policy owns peer identity, authentication, and frame limits; the server
 /// facade owns the order in which they are applied.
 #[derive(Clone)]
-pub struct ControlPlaneRaftPeerServerPolicy {
+pub(crate) struct ControlPlaneRaftPeerServerPolicy {
     local_node_id: ControlPlaneRaftNodeId,
     peer_policy: Arc<ControlPlaneRaftPeerTransportPolicy>,
     resources: ControlPlaneRaftPeerServerResources,
-    durability: Option<Arc<dyn ControlPlaneRaftPeerServerDurability>>,
+    durability: Option<ControlPlaneRaftPeerServerDurability>,
     fatal_error_handler: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
@@ -10533,7 +10635,7 @@ impl fmt::Debug for ControlPlaneRaftPeerServerPolicy {
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum ControlPlaneRaftPeerServerConfigError {
+pub(crate) enum ControlPlaneRaftPeerServerConfigError {
     #[error("control-plane Raft peer server endpoint id must not be empty")]
     EmptyEndpointId,
     #[error("control-plane Raft peer server local node is absent from the peer policy")]
@@ -10576,10 +10678,7 @@ impl ControlPlaneRaftPeerServerPolicy {
     }
 
     #[must_use]
-    pub fn with_durability(
-        mut self,
-        durability: Arc<dyn ControlPlaneRaftPeerServerDurability>,
-    ) -> Self {
+    pub fn with_durability(mut self, durability: ControlPlaneRaftPeerServerDurability) -> Self {
         self.durability = Some(durability);
         self
     }
@@ -10593,7 +10692,7 @@ impl ControlPlaneRaftPeerServerPolicy {
         self
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     #[must_use]
     pub fn reserved_pre_auth_bytes(&self) -> usize {
         self.resources.pre_auth_byte_budget.reserved_bytes()
@@ -10637,7 +10736,7 @@ impl ControlPlaneRaftPeerServerPreAuthByteBudget {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     fn reserved_bytes(&self) -> usize {
         self.reserved_bytes.load(Ordering::Acquire)
     }
@@ -10685,7 +10784,7 @@ enum ControlPlaneRaftPeerServerListenerKind {
 }
 
 /// Opaque bound listener for the storage-owned inbound Raft peer server.
-pub struct ControlPlaneRaftPeerServerListener {
+pub(crate) struct ControlPlaneRaftPeerServerListener {
     endpoint_id: String,
     kind: ControlPlaneRaftPeerServerListenerKind,
     max_connections: usize,
@@ -10797,7 +10896,7 @@ impl ControlPlaneRaftPeerServerListener {
 
 /// Opaque failure returned when a Raft peer listener can no longer accept
 /// connections. Concrete transport diagnostics remain inside storage.
-pub struct ControlPlaneRaftPeerServerError;
+pub(crate) struct ControlPlaneRaftPeerServerError;
 
 impl fmt::Debug for ControlPlaneRaftPeerServerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -11073,7 +11172,7 @@ impl ControlPlaneRaftPeerTestClient {
     }
 
     #[must_use]
-    pub fn with_auth_policy(mut self, auth_policy: ControlPlaneRaftPeerAuthPolicy) -> Self {
+    pub(crate) fn with_auth_policy(mut self, auth_policy: ControlPlaneRaftPeerAuthPolicy) -> Self {
         self.auth_policy = Some(auth_policy);
         self
     }
@@ -11369,13 +11468,17 @@ fn spawn_control_plane_raft_peer_server_worker<RawStream, Prepare>(
         + Send
         + 'static,
 {
-    if policy
-        .durability
-        .as_deref()
-        .is_some_and(ControlPlaneRaftPeerServerDurability::is_poisoned)
-    {
-        eprintln!("control-plane OpenRaft peer RPC rejected: durable authority is poisoned");
-        return;
+    if let Some(durability) = &policy.durability {
+        if durability.validate_authority(&authority).is_err() {
+            eprintln!(
+                "control-plane OpenRaft peer RPC rejected: durability authority binding is invalid"
+            );
+            return;
+        }
+        if durability.is_poisoned() {
+            eprintln!("control-plane OpenRaft peer RPC rejected: durable authority is poisoned");
+            return;
+        }
     }
     if active_workers
         .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -11436,7 +11539,7 @@ fn handle_control_plane_raft_peer_server_request(
     connection_deadline: Instant,
     response_timeout: Duration,
 ) -> Result<(), ControlPlaneRaftPeerServerWorkerError> {
-    ensure_control_plane_raft_peer_server_not_poisoned(policy)?;
+    ensure_control_plane_raft_peer_server_not_poisoned(authority, policy)?;
     let (received_frame, pre_auth_reservation) =
         read_control_plane_raft_peer_transport_frame_with_reservation(
             stream,
@@ -11497,7 +11600,7 @@ fn handle_control_plane_raft_peer_server_request(
         .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
     drop(pre_auth_reservation);
 
-    ensure_control_plane_raft_peer_server_not_poisoned(policy)?;
+    ensure_control_plane_raft_peer_server_not_poisoned(authority, policy)?;
     let raw_response_frame = block_on_control_plane_raft_peer_server(runtime, async {
         tokio::time::timeout_at(tokio::time::Instant::from_std(connection_deadline), async {
             match frame_kind {
@@ -11544,15 +11647,15 @@ fn handle_control_plane_raft_peer_server_request(
     };
 
     if frame_kind == ControlPlaneRaftPeerFrameKind::Snapshot {
-        let durability = policy.durability.as_deref().ok_or_else(|| {
+        let durability = policy.durability.as_ref().ok_or_else(|| {
             ControlPlaneRaftPeerServerWorkerError::Checkpoint(ControlPlaneError::rpc_protocol("control-plane OpenRaft snapshot peer RPC requires a durability checkpoint callback"
                         .to_owned()))
         })?;
         durability
-            .checkpoint_before_snapshot_response()
+            .checkpoint_before_snapshot_response(authority)
             .map_err(ControlPlaneRaftPeerServerWorkerError::Checkpoint)?;
     }
-    ensure_control_plane_raft_peer_server_not_poisoned(policy)?;
+    ensure_control_plane_raft_peer_server_not_poisoned(authority, policy)?;
 
     let mut response_frame = Some(response_frame);
     let mut publish = || {
@@ -11568,27 +11671,34 @@ fn handle_control_plane_raft_peer_server_request(
             ControlPlaneError::io("finalize control-plane OpenRaft peer response", source)
         })
     };
-    publish_control_plane_raft_peer_server_response(policy.durability.as_deref(), &mut publish)
-        .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)
+    publish_control_plane_raft_peer_server_response(
+        authority,
+        policy.durability.as_ref(),
+        &mut publish,
+    )
+    .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)
 }
 
 fn ensure_control_plane_raft_peer_server_not_poisoned(
+    authority: &ControlPlaneRaftAuthority,
     policy: &ControlPlaneRaftPeerServerPolicy,
 ) -> Result<(), ControlPlaneRaftPeerServerWorkerError> {
-    if policy
-        .durability
-        .as_deref()
-        .is_some_and(ControlPlaneRaftPeerServerDurability::is_poisoned)
-    {
-        return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(
-            ControlPlaneError::rpc_remote("control-plane OpenRaft durable authority is poisoned; refusing peer RPC until restart".to_owned()),
-        ));
+    if let Some(durability) = &policy.durability {
+        durability
+            .validate_authority(authority)
+            .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
+        if durability.is_poisoned() {
+            return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(
+                ControlPlaneError::rpc_remote("control-plane OpenRaft durable authority is poisoned; refusing peer RPC until restart".to_owned()),
+            ));
+        }
     }
     Ok(())
 }
 
 fn publish_control_plane_raft_peer_server_response(
-    durability: Option<&dyn ControlPlaneRaftPeerServerDurability>,
+    authority: &ControlPlaneRaftAuthority,
+    durability: Option<&ControlPlaneRaftPeerServerDurability>,
     publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
 ) -> Result<(), ControlPlaneError> {
     let mut published = false;
@@ -11603,7 +11713,7 @@ fn publish_control_plane_raft_peer_server_response(
             publish()
         };
         match durability {
-            Some(durability) => durability.publish_response(&mut publish_once),
+            Some(durability) => durability.publish_response(authority, &mut publish_once),
             None => publish_once(),
         }
     };
@@ -16904,29 +17014,41 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingPeerServerDurability {
+    struct RecordingPeerServerCheckpoint {
         events: Arc<Mutex<Vec<&'static str>>>,
-        poisoned: AtomicBool,
     }
 
-    impl ControlPlaneRaftPeerServerDurability for RecordingPeerServerDurability {
-        fn is_poisoned(&self) -> bool {
-            self.poisoned.load(Ordering::Acquire)
-        }
-
-        fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+    impl ControlPlaneRaftPeerServerCheckpoint for RecordingPeerServerCheckpoint {
+        fn checkpoint_before_snapshot_response(
+            &self,
+            _authority: &ControlPlaneRaftAuthority,
+        ) -> Result<(), ControlPlaneError> {
             self.events.lock().unwrap().push("checkpoint");
             Ok(())
         }
+    }
 
-        fn publish_response(
+    struct NoopPeerServerCheckpoint;
+
+    impl ControlPlaneRaftPeerServerCheckpoint for NoopPeerServerCheckpoint {
+        fn checkpoint_before_snapshot_response(
             &self,
-            publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
+            _authority: &ControlPlaneRaftAuthority,
         ) -> Result<(), ControlPlaneError> {
-            self.events.lock().unwrap().push("publish");
-            publish()?;
-            self.events.lock().unwrap().push("published");
             Ok(())
+        }
+    }
+
+    struct FailingPeerServerCheckpoint;
+
+    impl ControlPlaneRaftPeerServerCheckpoint for FailingPeerServerCheckpoint {
+        fn checkpoint_before_snapshot_response(
+            &self,
+            _authority: &ControlPlaneRaftAuthority,
+        ) -> Result<(), ControlPlaneError> {
+            Err(ControlPlaneError::durability_failure(
+                "injected peer-server checkpoint failure",
+            ))
         }
     }
 
@@ -16937,6 +17059,7 @@ mod tests {
         write_started: bool,
         fail_response_write: bool,
         response_deadline: Option<Instant>,
+        poison_after_request_read: Option<ControlPlaneRaftDurabilityPublication>,
     }
 
     impl RecordingPeerServerStream {
@@ -16948,6 +17071,7 @@ mod tests {
                 write_started: false,
                 fail_response_write: false,
                 response_deadline: None,
+                poison_after_request_read: None,
             }
         }
 
@@ -16960,11 +17084,25 @@ mod tests {
             self.response_deadline = Some(deadline);
             self
         }
+
+        fn with_poison_after_request_read(
+            mut self,
+            publication: ControlPlaneRaftDurabilityPublication,
+        ) -> Self {
+            self.poison_after_request_read = Some(publication);
+            self
+        }
     }
 
     impl Read for RecordingPeerServerStream {
         fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-            self.request.read(buffer)
+            let read = self.request.read(buffer)?;
+            if self.request.position() == self.request.get_ref().len() as u64 {
+                if let Some(publication) = self.poison_after_request_read.take() {
+                    publication.poison("injected poison after request admission");
+                }
+            }
+            Ok(read)
         }
     }
 
@@ -17032,10 +17170,13 @@ mod tests {
             [(1, "node-1".to_owned())],
             ControlPlaneRaftPeerTransportLimits::default(),
         );
-        let durability = Arc::new(RecordingPeerServerDurability::default());
+        let checkpoint = Arc::new(RecordingPeerServerCheckpoint::default());
+        let durability = authority
+            .bind_peer_server_durability(checkpoint.clone())
+            .unwrap();
         let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
             .unwrap()
-            .with_durability(durability.clone());
+            .with_durability(durability);
         let mut state_machine = ControlPlaneRaftStateMachine::empty();
         state_machine
             .apply_entry(bootstrap_membership_entry(1))
@@ -17053,7 +17194,7 @@ mod tests {
         let mut transport_request = Vec::new();
         write_control_plane_raft_peer_transport_frame(&mut transport_request, &request).unwrap();
         let mut stream =
-            RecordingPeerServerStream::new(transport_request, Arc::clone(&durability.events));
+            RecordingPeerServerStream::new(transport_request, Arc::clone(&checkpoint.events));
 
         handle_control_plane_raft_peer_server_request(
             runtime.handle(),
@@ -17066,15 +17207,8 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            *durability.events.lock().unwrap(),
-            [
-                "checkpoint",
-                "publish",
-                "begin_response",
-                "write",
-                "finish",
-                "published"
-            ]
+            *checkpoint.events.lock().unwrap(),
+            ["checkpoint", "begin_response", "write", "finish"]
         );
         assert!(!stream.response.is_empty());
         runtime.block_on(authority.shutdown()).unwrap();
@@ -17082,27 +17216,6 @@ mod tests {
 
     #[test]
     fn control_plane_raft_peer_server_poison_after_validation_prevents_dispatch() {
-        struct PoisonAfterAdmission {
-            checks: AtomicUsize,
-        }
-
-        impl ControlPlaneRaftPeerServerDurability for PoisonAfterAdmission {
-            fn is_poisoned(&self) -> bool {
-                self.checks.fetch_add(1, Ordering::AcqRel) >= 1
-            }
-
-            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
-                Ok(())
-            }
-
-            fn publish_response(
-                &self,
-                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
-            ) -> Result<(), ControlPlaneError> {
-                publish()
-            }
-        }
-
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -17127,9 +17240,11 @@ mod tests {
         );
         let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
             .unwrap()
-            .with_durability(Arc::new(PoisonAfterAdmission {
-                checks: AtomicUsize::new(0),
-            }));
+            .with_durability(
+                authority
+                    .bind_peer_server_durability(Arc::new(NoopPeerServerCheckpoint))
+                    .unwrap(),
+            );
         let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
             vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 1),
             last_log_id: None,
@@ -17140,7 +17255,8 @@ mod tests {
         let mut transport_request = Vec::new();
         write_control_plane_raft_peer_transport_frame(&mut transport_request, &request).unwrap();
         let events = Arc::new(Mutex::new(Vec::new()));
-        let mut stream = RecordingPeerServerStream::new(transport_request, events);
+        let mut stream = RecordingPeerServerStream::new(transport_request, events)
+            .with_poison_after_request_read(authority.durability_publication().unwrap());
 
         let result = handle_control_plane_raft_peer_server_request(
             runtime.handle(),
@@ -17163,84 +17279,67 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_raft_peer_server_publication_must_publish_exactly_once() {
-        struct SkipPublication;
-        impl ControlPlaneRaftPeerServerDurability for SkipPublication {
-            fn is_poisoned(&self) -> bool {
-                false
-            }
-            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
-                Ok(())
-            }
-            fn publish_response(
-                &self,
-                _publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
-            ) -> Result<(), ControlPlaneError> {
-                Ok(())
-            }
-        }
-
-        struct DuplicatePublication;
-        impl ControlPlaneRaftPeerServerDurability for DuplicatePublication {
-            fn is_poisoned(&self) -> bool {
-                false
-            }
-            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
-                Ok(())
-            }
-            fn publish_response(
-                &self,
-                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
-            ) -> Result<(), ControlPlaneError> {
-                publish()?;
-                publish()
-            }
-        }
-
+    fn control_plane_raft_peer_server_storage_owned_publication_publishes_once() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let authority = runtime
+            .block_on(
+                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                    "peer-server-publication-once",
+                    1,
+                ),
+            )
+            .unwrap();
+        let durability = authority
+            .bind_peer_server_durability(Arc::new(NoopPeerServerCheckpoint))
+            .unwrap();
         let calls = AtomicUsize::new(0);
         let mut publish = || {
             calls.fetch_add(1, Ordering::AcqRel);
             Ok(())
         };
-        assert!(publish_control_plane_raft_peer_server_response(
-            Some(&SkipPublication),
+        publish_control_plane_raft_peer_server_response(
+            &authority,
+            Some(&durability),
             &mut publish,
         )
-        .is_err());
-        assert_eq!(calls.load(Ordering::Acquire), 0);
-
-        assert!(publish_control_plane_raft_peer_server_response(
-            Some(&DuplicatePublication),
-            &mut publish,
-        )
-        .is_err());
+        .unwrap();
         assert_eq!(calls.load(Ordering::Acquire), 1);
+        runtime.block_on(authority.shutdown()).unwrap();
+    }
+
+    #[test]
+    fn control_plane_raft_peer_server_checkpoint_failure_poisons_bound_authority() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let authority = runtime
+            .block_on(
+                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                    "peer-server-checkpoint-failure-poison",
+                    1,
+                ),
+            )
+            .unwrap();
+        let durability = authority
+            .bind_peer_server_durability(Arc::new(FailingPeerServerCheckpoint))
+            .unwrap();
+
+        assert!(durability
+            .checkpoint_before_snapshot_response(&authority)
+            .is_err());
+        assert!(
+            authority.durability_publication().unwrap().is_poisoned(),
+            "storage must poison the issuing authority when checkpoint work fails"
+        );
+        runtime.block_on(authority.shutdown()).unwrap();
     }
 
     #[test]
     fn control_plane_raft_peer_server_response_deadline_starts_after_publication() {
-        struct SlowPublication {
-            delay: Duration,
-        }
-
-        impl ControlPlaneRaftPeerServerDurability for SlowPublication {
-            fn is_poisoned(&self) -> bool {
-                false
-            }
-
-            fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
-                Ok(())
-            }
-
-            fn publish_response(
-                &self,
-                publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
-            ) -> Result<(), ControlPlaneError> {
-                thread::sleep(self.delay);
-                publish()
-            }
-        }
-
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -17264,11 +17363,12 @@ mod tests {
         );
         let ingress_timeout = Duration::from_millis(250);
         let response_timeout = Duration::from_millis(100);
+        let durability = authority
+            .bind_peer_server_durability(Arc::new(NoopPeerServerCheckpoint))
+            .unwrap();
         let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
             .unwrap()
-            .with_durability(Arc::new(SlowPublication {
-                delay: ingress_timeout + Duration::from_millis(50),
-            }));
+            .with_durability(durability.clone());
         let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
         let request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
             vote: Vote::<ControlPlaneRaftLeaderId>::new(1, 1),
@@ -17284,6 +17384,24 @@ mod tests {
         let mut stream = RecordingPeerServerStream::new(transport_request, events)
             .with_ingress_deadline(ingress_deadline);
 
+        let publication = durability.publication.clone();
+        let publication_gate = Arc::clone(&publication.gate);
+        let gate_locked = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_locked_worker = Arc::clone(&gate_locked);
+        let hold_publication = thread::spawn(move || {
+            let _guard = publication_gate.0.lock().unwrap();
+            let (locked, wake) = &*gate_locked_worker;
+            *locked.lock().unwrap() = true;
+            wake.notify_one();
+            thread::sleep(ingress_timeout + Duration::from_millis(50));
+        });
+        let (locked, wake) = &*gate_locked;
+        let mut locked = locked.lock().unwrap();
+        while !*locked {
+            locked = wake.wait(locked).unwrap();
+        }
+        drop(locked);
+
         handle_control_plane_raft_peer_server_request(
             runtime.handle(),
             &authority,
@@ -17293,6 +17411,8 @@ mod tests {
             response_timeout,
         )
         .unwrap();
+
+        hold_publication.join().unwrap();
 
         assert!(!stream.response.is_empty());
         runtime.block_on(authority.shutdown()).unwrap();

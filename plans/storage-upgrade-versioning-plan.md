@@ -766,9 +766,10 @@ The public boundary and containment status for each surface are as follows.
   deadline installed after publication admission, worker admission, the shared pre-authentication
   allocation budget, authentication and peer admission ordering, OpenRaft dispatch, response
   signing/framing/finalization, and exact-once publication. The
-  process supplies bound listeners, certificate material, logical peer policy, and an opaque
+  process supplies bound listeners, certificate material, logical deployment inputs, and an opaque
   durability callback. Storage decides when snapshot responses require checkpointing and ensures
-  that checkpointing precedes every possible response write.
+  that checkpointing precedes every possible response write. The raw listener and policy are now
+  crate-private behind the peer-bootstrap capability described below.
 - **Completed representation-containment slice:** peer request/response/snapshot types,
   frame-kind and identity values, codecs, transport read/write helpers, raw frame handlers, the
   shared auth-envelope representation, the ALPN constant, and the underlying OpenRaft `Raft`
@@ -1584,6 +1585,39 @@ rejects process construction or composition of the raw server surface and constr
 production facade. Raft-peer transport bootstrap and the process-hosted control-plane authority
 implementation remain item 12 work.
 
+The thirty-ninth bounded slice contains Raft-peer transport bootstrap.
+`ControlPlaneRaftPeerBootstrap` is the single opaque configuration shared by durable authority
+construction, outbound peer networking, inbound peer serving, authentication, topology binding,
+membership initialization, and startup leader-wait policy. The process supplies logical peer and
+client endpoints, transport limits, timeouts, topology identity or certified initial topology,
+unscoped peer credentials, an optional signing-credential selector, bound sockets, and certificate
+material. Storage requires the credential principals to cover exactly the retained peer set,
+validates that the local peer and complete client route set match the retained peer policy, selects
+and scopes the local credential, applies the same topology and authentication policy to both
+directions, decides which peer may initialize membership, constructs the durable authority, and
+creates and owns the listener loops. Membership initialization derives only from the authority's
+retained policy, while the server derives its policy from and retains that exact authority, so
+neither path accepts a caller-paired second policy or authority. Peer-server poison state and
+response publication use a storage-owned durability capability bound to that authority, and any
+checkpoint callback failure poisons that domain before the error is returned. The remaining
+process-hosted checkpoint callback receives the server's exact authority rather than retaining or
+selecting another one and only reports its result; it cannot decide whether a failure poisons the
+server. A crossed durability capability is rejected before any listener loop starts. The facade
+also rejects missing listeners, duplicate endpoint identities, and cloned Unix or TCP listener
+handles before serving.
+Bootstrap and authentication diagnostics expose only peer counts, local node identity, credential
+version, and aggregate outcomes; cluster, topology digest, credential identifiers, and secrets
+remain redacted.
+The raw peer authentication, transport, network, listener, server-policy, and replicated-authority
+constructors are crate-private. Static-manifest capacity validation uses a narrow storage-owned
+limit validator, and cross-crate process tests use bounded semantic test client/server facilities.
+The process deliberately retains socket binding, checkpoint file/authority-clock sidecar
+publication, the periodic checkpoint worker, and the checkpoint implementation invoked by the
+storage-owned durability-before-ack gate until the final process-hosted authority slice. A
+repository check rejects raw peer-policy composition or replicated-authority construction outside
+`storage`. The process-hosted control-plane authority implementation is the only remaining item 12
+work.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1885,7 +1919,7 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     using the authority's single opaque response-publication and poison domain. Operator recovery
     endpoint and credential/transport assembly plus frontend/storage-node service-client
     bootstrap, server-side authentication bootstrap, and server listener/resource-policy
-    bootstrap are now storage-owned. The remaining work is Raft-peer transport bootstrap and the
+    bootstrap and Raft-peer transport bootstrap are now storage-owned. The remaining work is the
     process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.

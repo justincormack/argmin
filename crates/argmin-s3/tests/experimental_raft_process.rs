@@ -19,17 +19,15 @@ use storage::control_plane::{
 };
 use storage::control_plane_auth::{
     ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
-    ControlPlaneScopedCredentialStore,
 };
 use storage::control_plane_command::ControlPlaneCommand;
 use storage::control_plane_raft::{
     inspect_control_plane_raft_checkpoint_state_for_test,
     inspect_control_plane_raft_recovery_state_for_test,
     ControlPlaneRaftCheckpointWriteBlockerForTest, ControlPlaneRaftLogId,
-    ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerTestClient,
-    ControlPlaneRaftPeerTransportLimits,
+    ControlPlaneRaftPeerTestClient, ControlPlaneRaftPeerTransportLimits,
 };
-use storage::{ClusterEpoch, NodeId, PgId};
+use storage::{ClusterEpoch, ControlPlaneRaftPeerAuthCredentialInput, NodeId, PgId};
 
 struct TestDir {
     path: PathBuf,
@@ -181,17 +179,6 @@ impl ProcessTestControlPlaneAuth {
             .join(",")
     }
 
-    fn raft_peer_credential(&self, node_id: u64) -> ControlPlaneScopedCredential {
-        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
-            cluster_id: self.cluster_name.clone(),
-            credential_id: Self::raft_peer_credential_id(node_id),
-            credential_version: 1,
-            principal: ControlPlaneAuthPrincipal::RaftPeer { node_id },
-            secret: Self::raft_peer_secret(node_id).into_bytes(),
-        })
-        .expect("process test Raft peer credential should build")
-    }
-
     fn storage_node_credential(
         &self,
         node_id: u32,
@@ -210,28 +197,18 @@ impl ProcessTestControlPlaneAuth {
         .expect("process test storage-node credential should build")
     }
 
-    fn raft_peer_auth_policy(&self, source_node_id: u64) -> ControlPlaneRaftPeerAuthPolicy {
-        let credentials = vec![
-            self.raft_peer_credential(101),
-            self.raft_peer_credential(102),
-            self.raft_peer_credential(103),
-        ];
-        let local_credential = credentials
-            .iter()
-            .find(|credential| {
-                credential.principal()
-                    == &ControlPlaneAuthPrincipal::RaftPeer {
-                        node_id: source_node_id,
-                    }
+    fn raft_peer_auth_credentials() -> Vec<ControlPlaneRaftPeerAuthCredentialInput> {
+        [101, 102, 103]
+            .into_iter()
+            .map(|node_id| {
+                ControlPlaneRaftPeerAuthCredentialInput::new(
+                    node_id,
+                    Self::raft_peer_credential_id(node_id),
+                    1,
+                    Self::raft_peer_secret(node_id).into_bytes(),
+                )
             })
-            .expect("process test source credential should exist")
-            .clone();
-        ControlPlaneRaftPeerAuthPolicy::new(
-            local_credential,
-            ControlPlaneScopedCredentialStore::new(credentials)
-                .expect("process test credential store should build"),
-        )
-        .expect("process test Raft peer auth policy should build")
+            .collect()
     }
 }
 
@@ -2017,7 +1994,13 @@ fn experimental_raft_process_peer_wal_ack_then_checkpoint_failure_recovers_log_s
         ControlPlaneRaftPeerTransportLimits::default(),
         Duration::from_secs(5),
     )
-    .with_auth_policy(ProcessTestControlPlaneAuth::new(&cluster_name).raft_peer_auth_policy(101));
+    .with_auth_credentials(
+        &cluster_name,
+        101,
+        ProcessTestControlPlaneAuth::raft_peer_auth_credentials(),
+        None,
+    )
+    .expect("synthetic leader credentials should build");
     peer_client
         .append_commands(
             append_term,

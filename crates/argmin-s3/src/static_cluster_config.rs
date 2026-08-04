@@ -32,15 +32,15 @@ use storage::control_plane_auth::{
 };
 use storage::control_plane_raft::{
     ControlPlaneRaftPeerClientEndpoint, ControlPlaneRaftPeerTransportLimits,
-    ControlPlaneRaftPeerTransportPolicy,
 };
 use storage::storage_node_server::StorageNodeRpcListenerConfig;
 use storage::storage_rpc_transport::StorageRpcClientEndpoint;
 use storage::{
-    FrontendStorageRpcClientCapability, MaintenanceStorageRpcClientCapability,
-    StaticInitialControlPlaneTopology, StaticInitialPgPlacement, StaticStorageFailureDomain,
-    StaticStorageNodeEndpoint, StaticStoragePlacementNode, StorageNodeStorageRpcClientCapability,
-    StorageRpcServerAuthConfig, StorageRpcTransportLimits,
+    ControlPlaneRaftPeerBootstrap, FrontendStorageRpcClientCapability,
+    MaintenanceStorageRpcClientCapability, StaticInitialControlPlaneTopology,
+    StaticInitialPgPlacement, StaticStorageFailureDomain, StaticStorageNodeEndpoint,
+    StaticStoragePlacementNode, StorageNodeStorageRpcClientCapability, StorageRpcServerAuthConfig,
+    StorageRpcTransportLimits,
 };
 use x509_cert::der::Decode;
 use x509_cert::ext::pkix::{BasicConstraints, KeyUsage};
@@ -3657,12 +3657,7 @@ fn validate_static_cluster_manifest(
         resolve_canonical_raft_peer_endpoints(&manifest, &authorities)?;
     let canonical_storage_node_endpoints =
         resolve_canonical_storage_node_endpoints(&manifest, &storage_nodes)?;
-    validate_raft_transport_capacity(
-        &manifest,
-        &transport_profiles,
-        &authorities,
-        &canonical_raft_peer_endpoints,
-    )?;
+    validate_raft_transport_capacity(&manifest, &transport_profiles, &authorities)?;
     let topology_digest = topology_digest(
         &manifest,
         initial_pg_placement.logical_acting_sets(),
@@ -5136,7 +5131,6 @@ fn validate_raft_transport_capacity(
     manifest: &StaticClusterManifestInput,
     transport_profiles: &BTreeMap<&str, &TransportProfileInput>,
     authorities: &BTreeMap<&str, &AuthorityInput>,
-    canonical_raft_peer_endpoints: &BTreeMap<u64, CanonicalRaftPeerEndpoint>,
 ) -> Result<(), String> {
     let voter_processes: BTreeSet<&str> = authorities
         .values()
@@ -5227,15 +5221,7 @@ fn validate_raft_transport_capacity(
                 endpoint.id
             ));
         }
-        ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            manifest.cluster.id.clone(),
-            canonical_raft_peer_endpoints
-                .iter()
-                .map(|(&node_id, endpoint)| (node_id, endpoint.advertise.clone())),
-            limits,
-        )
-        .validate_replication_compatibility()
-        .map_err(|_| {
+        ControlPlaneRaftPeerBootstrap::validate_replication_limits(limits).map_err(|_| {
             format!(
                 "Raft endpoint {} transport limits are incompatible with production replication",
                 endpoint.id

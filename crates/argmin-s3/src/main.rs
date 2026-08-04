@@ -3,7 +3,6 @@ mod static_cluster_config;
 mod static_cluster_state;
 
 use std::ffi::OsString;
-use std::fmt::Write as _;
 use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io;
@@ -47,33 +46,27 @@ use storage::control_plane::{
     FileControlPlaneStore, LeaseHorizonAuthorityBinding, PgMetadataTransferProof,
     SingleAuthorityControlPlane, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
-#[cfg(test)]
-use storage::control_plane_auth::{ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason};
-use storage::control_plane_auth::{
-    ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
-    ControlPlaneScopedCredentialStore,
-};
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
     ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy,
-    ControlPlaneRaftPeerNetworkConfig, ControlPlaneRaftPeerServerDurability,
-    ControlPlaneRaftPeerServerListener, ControlPlaneRaftPeerServerPolicy,
-    ControlPlaneRaftPeerTransportPolicy, SubmittedControlPlaneRaftCommand,
+    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, ControlPlaneRaftPeerServerCheckpoint,
+    SubmittedControlPlaneRaftCommand,
 };
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
 };
-#[cfg(test)]
-use storage::ControlPlaneRpcOrdinaryTestServer;
 use storage::{
-    CanonicalUserId, ClusterEpoch, ControlPlaneRpcServerBootstrap,
-    ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
+    CanonicalUserId, ClusterEpoch, ControlPlaneRaftPeerAuthCredentialInput,
+    ControlPlaneRaftPeerBootstrap, ControlPlaneRaftPeerServerBootstrap,
+    ControlPlaneRaftPeerServerListenerInput, ControlPlaneRaftPeerTopologyBinding,
+    ControlPlaneRpcServerBootstrap, ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
     LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
     PgState, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
     StorageClusterRuntimeMapHandle,
 };
+#[cfg(test)]
+use storage::{ControlPlaneRaftPeerTestServer, ControlPlaneRpcOrdinaryTestServer};
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
 use tokio_rustls::TlsAcceptor;
@@ -81,10 +74,9 @@ use tokio_rustls::TlsAcceptor;
 use config::{
     ConfiguredControlPlaneAdminAuthCredential, ConfiguredControlPlaneAdminCommandAuth,
     ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneFrontendRuntimeMapAuth,
-    ConfiguredControlPlaneRaftAuthCredential, ConfiguredControlPlaneRaftPeerListener,
-    ConfiguredControlPlaneRpcListener, ConfiguredControlPlaneStorageAuthCredential,
-    ConfiguredCredential, ConfiguredCredentialProfile, ConfiguredStaticClusterIdentity,
-    ProcessRole, ServerConfig,
+    ConfiguredControlPlaneRaftPeerListener, ConfiguredControlPlaneRpcListener,
+    ConfiguredControlPlaneStorageAuthCredential, ConfiguredCredential, ConfiguredCredentialProfile,
+    ConfiguredStaticClusterIdentity, ProcessRole, ServerConfig,
 };
 use server_http::http::HttpFrontend;
 
@@ -2392,15 +2384,18 @@ where
     }
 }
 
-fn build_experimental_raft_peer_transport_policy(
+fn build_experimental_raft_peer_bootstrap(
     config: &ServerConfig,
     cluster_name: &str,
     local_node_id: ControlPlaneRaftNodeId,
-) -> Result<Option<ControlPlaneRaftPeerTransportPolicy>, String> {
+) -> Result<ControlPlaneRaftPeerBootstrap, String> {
     if config.control_plane_raft_peer_socket_path.is_none()
         && config.control_plane_raft_peer_listeners.is_empty()
     {
-        return Ok(None);
+        return Ok(ControlPlaneRaftPeerBootstrap::single_node(
+            cluster_name,
+            local_node_id,
+        ));
     }
     let peer_endpoints: Vec<_> = if config.control_plane_raft_peer_sockets.is_empty() {
         let local_peer_socket_path = config
@@ -2417,169 +2412,41 @@ fn build_experimental_raft_peer_transport_policy(
             .map(|entry| (entry.node_id, entry.socket_path.clone()))
             .collect()
     };
-    let mut policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-        cluster_name.to_string(),
-        peer_endpoints,
-        config.control_plane_raft_peer_transport_limits,
-    )
-    .with_timeouts(
-        config.control_plane_raft_peer_connect_timeout,
-        config.control_plane_raft_peer_io_timeout,
-    );
-    if let Some(initial) = &config.static_initial_cluster_map {
-        policy = policy.with_static_initial_topology(initial);
+    let topology = if let Some(initial) = &config.static_initial_cluster_map {
+        ControlPlaneRaftPeerTopologyBinding::StaticInitial(initial.clone())
     } else if let Some(identity) = &config.static_cluster_identity {
-        policy = policy.with_topology_identity(
-            identity.topology_generation,
-            identity.topology_digest.clone(),
-        );
-    }
-    if let Some(auth_policy) =
-        build_experimental_raft_peer_auth_policy(config, cluster_name, local_node_id)?
-    {
-        policy = policy.with_auth_policy(auth_policy);
-    }
-    Ok(Some(policy))
-}
-
-fn build_experimental_raft_peer_auth_policy(
-    config: &ServerConfig,
-    cluster_name: &str,
-    local_node_id: ControlPlaneRaftNodeId,
-) -> Result<Option<ControlPlaneRaftPeerAuthPolicy>, String> {
-    if config.control_plane_raft_auth_credentials.is_empty() {
-        return Ok(None);
-    }
-
-    let mut local_candidates = config
+        ControlPlaneRaftPeerTopologyBinding::Established {
+            generation: identity.topology_generation,
+            digest: identity.topology_digest.clone(),
+        }
+    } else {
+        ControlPlaneRaftPeerTopologyBinding::Unbound
+    };
+    let credentials = config
         .control_plane_raft_auth_credentials
         .iter()
-        .filter(|credential| credential.node_id == local_node_id);
-    let local_configured = match &config.control_plane_raft_auth_signing_credential {
-        Some((credential_id, credential_version)) => local_candidates.find(|credential| {
-                credential.credential_id == *credential_id
-                    && credential.credential_version == *credential_version
-            }),
-        None => latest_auth_credential_by_version_then_id(
-            local_candidates,
-            |credential| credential.credential_id.as_str(),
-            |credential| credential.credential_version,
-        ),
-    }
-    .ok_or_else(|| {
-        format!(
-            "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS must include local Raft node id {local_node_id}"
-        )
-    })?;
-    let local_credential = configured_raft_peer_auth_credential(local_configured, cluster_name)?;
-
-    let mut credentials = Vec::new();
-    for configured in &config.control_plane_raft_auth_credentials {
-        credentials.push(configured_raft_peer_auth_credential(
-            configured,
-            cluster_name,
-        )?);
-    }
-
-    let verifier = ControlPlaneScopedCredentialStore::new(credentials).map_err(|error| {
-        format!("invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS credential set: {error}")
-    })?;
-    ControlPlaneRaftPeerAuthPolicy::new(local_credential, verifier)
-        .map(Some)
-        .map_err(|error| {
-            format!("invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS auth policy: {error}")
+        .map(|credential| {
+            ControlPlaneRaftPeerAuthCredentialInput::new(
+                credential.node_id,
+                credential.credential_id.clone(),
+                credential.credential_version,
+                credential.secret.as_bytes().to_vec(),
+            )
         })
-}
-
-fn configured_raft_peer_auth_credential(
-    configured: &ConfiguredControlPlaneRaftAuthCredential,
-    cluster_name: &str,
-) -> Result<ControlPlaneScopedCredential, String> {
-    ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
-        cluster_id: cluster_name.to_string(),
-        credential_id: configured.credential_id.clone(),
-        credential_version: configured.credential_version,
-        principal: ControlPlaneAuthPrincipal::RaftPeer {
-            node_id: configured.node_id,
-        },
-        secret: configured.secret.as_bytes().to_vec(),
-    })
-    .map_err(|error| {
-        format!(
-            "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS scoped credential for node {}: {error}",
-            configured.node_id
-        )
-    })
-}
-
-fn format_experimental_raft_peer_auth_diagnostics(
-    policy: &ControlPlaneRaftPeerTransportPolicy,
-) -> String {
-    let status = policy.auth_status_snapshot();
-    let metrics = status.metrics();
-    let local_principal = status
-        .local_principal()
-        .map_or_else(|| "-".to_string(), |principal| format!("{principal:?}"));
-    let credential_id = status.credential_id().unwrap_or("-");
-    let credential_version = status
-        .credential_version()
-        .map_or_else(|| "-".to_string(), |version| version.to_string());
-    let mut diagnostics = format!(
-        "raft_peer_auth required={} local_principal={} credential_id={} credential_version={} accepted_total={} rejected_total={} rejected_without_operation_total={}",
-        status.required(),
-        local_principal,
-        credential_id,
-        credential_version,
-        metrics.accepted_total(),
-        metrics.rejected_total(),
-        metrics.rejected_without_operation_total()
-    );
-    for (operation, count) in metrics.accepted_by_operation() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "raft_peer_auth accepted_by_operation{{operation=\"{operation:?}\"}} {count}"
-        )
-        .expect("write to String should not fail");
-    }
-    for (operation, count) in metrics.rejected_by_operation() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "raft_peer_auth rejected_by_operation{{operation=\"{operation:?}\"}} {count}"
-        )
-        .expect("write to String should not fail");
-    }
-    for (reason, count) in metrics.rejected_by_reason() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "raft_peer_auth rejected_by_reason{{reason=\"{reason:?}\"}} {count}"
-        )
-        .expect("write to String should not fail");
-    }
-    diagnostics
-}
-
-fn experimental_raft_startup_requires_local_leader(
-    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
-) -> bool {
-    match peer_policy {
-        Some(policy) => policy.peers().len() == 1,
-        None => true,
-    }
-}
-
-fn experimental_raft_startup_initializes_membership(
-    peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
-    local_node_id: ControlPlaneRaftNodeId,
-) -> bool {
-    match peer_policy {
-        Some(policy) if policy.peers().len() > 1 => {
-            policy.peers().keys().next().copied() == Some(local_node_id)
-        }
-        _ => true,
-    }
+        .collect();
+    ControlPlaneRaftPeerBootstrap::replicated(
+        cluster_name,
+        local_node_id,
+        peer_endpoints,
+        config.control_plane_raft_peer_client_endpoints.clone(),
+        config.control_plane_raft_peer_transport_limits,
+        config.control_plane_raft_peer_connect_timeout,
+        config.control_plane_raft_peer_io_timeout,
+        topology,
+        credentials,
+        config.control_plane_raft_auth_signing_credential.clone(),
+    )
+    .map_err(|error| format!("invalid control-plane OpenRaft peer bootstrap: {error}"))
 }
 
 async fn experimental_raft_local_authority_serving_within(
@@ -2616,16 +2483,14 @@ fn bind_experimental_raft_peer_listener(
     config: &ServerConfig,
     cluster_name: &str,
     local_node_id: ControlPlaneRaftNodeId,
-) -> Result<Vec<ControlPlaneRaftPeerServerListener>, String> {
-    let policy =
-        build_experimental_raft_peer_transport_policy(config, cluster_name, local_node_id)?;
-    bind_experimental_raft_peer_listener_with_policy(config, policy)
+) -> Result<Vec<ControlPlaneRaftPeerServerListenerInput>, String> {
+    let _bootstrap = build_experimental_raft_peer_bootstrap(config, cluster_name, local_node_id)?;
+    bind_experimental_raft_peer_listener_inputs(config)
 }
 
-fn bind_experimental_raft_peer_listener_with_policy(
+fn bind_experimental_raft_peer_listener_inputs(
     config: &ServerConfig,
-    policy: Option<ControlPlaneRaftPeerTransportPolicy>,
-) -> Result<Vec<ControlPlaneRaftPeerServerListener>, String> {
+) -> Result<Vec<ControlPlaneRaftPeerServerListenerInput>, String> {
     let configured_listeners = if config.control_plane_raft_peer_listeners.is_empty() {
         config
             .control_plane_raft_peer_socket_path
@@ -2645,11 +2510,6 @@ fn bind_experimental_raft_peer_listener_with_policy(
     if configured_listeners.is_empty() {
         return Ok(Vec::new());
     }
-    let Some(_policy) = policy else {
-        return Err(
-            "configured OpenRaft peer listeners are missing peer transport policy".to_string(),
-        );
-    };
     configured_listeners
         .into_iter()
         .map(|listener| match listener {
@@ -2658,13 +2518,12 @@ fn bind_experimental_raft_peer_listener_with_policy(
                 socket_path,
                 max_connections,
                 io_timeout,
-            } => ControlPlaneRaftPeerServerListener::unix(
+            } => Ok(ControlPlaneRaftPeerServerListenerInput::Unix {
                 endpoint_id,
-                bind_control_plane_raft_peer_socket(Path::new(&socket_path))?,
+                listener: bind_control_plane_raft_peer_socket(Path::new(&socket_path))?,
                 max_connections,
                 io_timeout,
-            )
-            .map_err(|error| error.to_string()),
+            }),
             ConfiguredControlPlaneRaftPeerListener::Tcp {
                 endpoint_id,
                 bind_addr,
@@ -2677,14 +2536,13 @@ fn bind_experimental_raft_peer_listener_with_policy(
                         "bind control-plane OpenRaft TCP peer listener {endpoint_id} at {bind_addr}: {error}"
                     )
                 })?;
-                ControlPlaneRaftPeerServerListener::tls_tcp(
+                Ok(ControlPlaneRaftPeerServerListenerInput::TlsTcp {
                     endpoint_id,
                     listener,
                     certified_key,
                     max_connections,
                     io_timeout,
-                )
-                .map_err(|error| error.to_string())
+                })
             }
         })
         .collect()
@@ -2697,21 +2555,16 @@ struct ExperimentalRaftPeerDurabilityContext {
 }
 
 #[derive(Clone)]
-struct ExperimentalRaftPeerServerDurability {
+struct ExperimentalRaftPeerServerCheckpoint {
     runtime: Handle,
-    authority: Arc<ControlPlaneRaftAuthority>,
     context: ExperimentalRaftPeerDurabilityContext,
 }
 
-impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurability {
-    fn is_poisoned(&self) -> bool {
-        self.authority
-            .durability_publication()
-            .expect("Raft durability publication should already be initialized")
-            .is_poisoned()
-    }
-
-    fn checkpoint_before_snapshot_response(&self) -> Result<(), ControlPlaneError> {
+impl ControlPlaneRaftPeerServerCheckpoint for ExperimentalRaftPeerServerCheckpoint {
+    fn checkpoint_before_snapshot_response(
+        &self,
+        authority: &ControlPlaneRaftAuthority,
+    ) -> Result<(), ControlPlaneError> {
         let path = self
             .context
             .artifact_path
@@ -2721,27 +2574,12 @@ impl ControlPlaneRaftPeerServerDurability for ExperimentalRaftPeerServerDurabili
                     "experimental OpenRaft snapshot peer RPC requires durable checkpoint path before response",
                 )
             })?;
-        let result = store_experimental_raft_durable_restart_artifact(
+        store_experimental_raft_durable_restart_artifact(
             &self.runtime,
-            &self.authority,
+            authority,
             path,
             Some(&self.context.checkpoint_lock),
-        );
-        if result.is_err() {
-            self.authority
-                .durability_publication()
-                .expect("Raft durability publication should already be initialized")
-                .poison("control-plane Raft snapshot response checkpoint publication failed");
-        }
-        result
-    }
-
-    fn publish_response(
-        &self,
-        publish: &mut dyn FnMut() -> Result<(), ControlPlaneError>,
-    ) -> Result<(), ControlPlaneError> {
-        let publication = self.authority.durability_publication()?;
-        ControlPlaneRpcResponsePublication::publish(&publication, publish)
+        )
     }
 }
 
@@ -2934,22 +2772,6 @@ fn publish_experimental_raft_checkpoint_monitor_poison(authority: &ControlPlaneR
         .poison("control-plane Raft checkpoint monitor observed a durability failure");
 }
 
-fn spawn_experimental_raft_peer_listener_loop(
-    listener: ControlPlaneRaftPeerServerListener,
-    runtime: Handle,
-    authority: Arc<ControlPlaneRaftAuthority>,
-    policy: ControlPlaneRaftPeerServerPolicy,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || loop {
-        listener
-            .accept_one(&runtime, Arc::clone(&authority), &policy)
-            .unwrap_or_else(|error| {
-                eprintln!("control-plane OpenRaft peer listener stopped: {error}");
-                std::process::exit(1);
-            });
-    })
-}
-
 fn store_experimental_raft_durable_restart_artifact(
     runtime: &Handle,
     authority: &ControlPlaneRaftAuthority,
@@ -3112,149 +2934,86 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         .control_plane_raft_cluster_name
         .clone()
         .unwrap_or_else(|| format!("argmin-s3-experimental-control-plane-{socket_path}"));
-    let raft_peer_policy =
-        build_experimental_raft_peer_transport_policy(config, &cluster_name, node_id)
-            .unwrap_or_else(|error| {
+    let raft_peer_bootstrap =
+        build_experimental_raft_peer_bootstrap(config, &cluster_name, node_id).unwrap_or_else(
+            |error| {
                 eprintln!("{error}");
                 std::process::exit(1);
-            });
-    let raft_peer_network = raft_peer_policy.as_ref().map(|_| {
-        if config.control_plane_raft_peer_client_endpoints.is_empty() {
-            Ok(ControlPlaneRaftPeerNetworkConfig::unix(
-                config.control_plane_raft_peer_io_timeout,
-            ))
-        } else {
-            ControlPlaneRaftPeerNetworkConfig::with_peer_endpoints(
-                config.control_plane_raft_peer_io_timeout,
-                config.control_plane_raft_peer_client_endpoints.clone(),
-            )
-            .map_err(|error| format!("invalid control-plane Raft peer endpoints: {error}"))
-        }
-    });
-    let raft_peer_network = raft_peer_network.transpose().unwrap_or_else(|error| {
-        eprintln!("{error}");
-        std::process::exit(1);
-    });
+            },
+        );
+    let multi_node_raft_peer_mode = raft_peer_bootstrap.is_multi_node();
+    let raft_peer_auth_diagnostics = raft_peer_bootstrap.auth_diagnostics();
     let durable_checkpoint_lock = Arc::new(Mutex::new(()));
     let durable_artifact_path = Arc::new(PathBuf::from(state_path));
     let authority_clock_checkpoint_binding =
         ControlPlaneAuthorityClockCheckpointBinding::for_raft(&cluster_name, node_id);
-    let authority = block_on_control_plane_raft(&runtime, async {
-        let authority = if let Some(policy) = raft_peer_policy.clone() {
-            let network = raft_peer_network
-                .clone()
-                .expect("Raft peer policy has a validated peer network");
-            if config.static_cluster_identity.is_some() && !static_cluster_identity_established {
-                ControlPlaneRaftAuthority::new_experimental_peer_durable_pending_static_initialization_network(
-                        cluster_name.clone(),
-                        node_id,
-                        Path::new(state_path),
-                        policy,
-                        config.static_initial_cluster_map.as_ref().expect(
-                            "static initialization requires configured initial topology",
-                        ),
-                        network,
-                    )
-                    .await?
-            } else {
-                ControlPlaneRaftAuthority::new_experimental_peer_durable_network(
-                        cluster_name.clone(),
-                        node_id,
-                        Path::new(state_path),
-                        policy,
-                        network,
-                    )
-                    .await?
-            }
-        } else {
-            ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                cluster_name.clone(),
-                node_id,
-                Path::new(state_path),
-            )
-            .await?
-        };
-        Ok::<_, ControlPlaneError>(Arc::new(authority))
-    })
+    let authority = block_on_control_plane_raft(
+        &runtime,
+        raft_peer_bootstrap
+            .open_durable_authority(Path::new(state_path), static_cluster_identity_established),
+    )
+    .map(Arc::new)
     .unwrap_or_else(|error| {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
-    let raft_peer_listeners =
-        bind_experimental_raft_peer_listener_with_policy(config, raft_peer_policy.clone())
-            .unwrap_or_else(|error| {
-                eprintln!("{error}");
-                std::process::exit(1);
-            });
     let durable_publication = authority.durability_publication().unwrap_or_else(|error| {
         eprintln!("failed to initialize control-plane Raft durability publication: {error}");
         std::process::exit(1);
     });
-    let multi_node_raft_peer_mode = raft_peer_policy
-        .as_ref()
-        .is_some_and(|policy| policy.peers().len() > 1);
     let raft_peer_durability = ExperimentalRaftPeerDurabilityContext {
         artifact_path: Some(Arc::clone(&durable_artifact_path)),
         checkpoint_lock: Arc::clone(&durable_checkpoint_lock),
     };
-    let raft_peer_server_durability: Arc<dyn ControlPlaneRaftPeerServerDurability> =
-        Arc::new(ExperimentalRaftPeerServerDurability {
+    let raft_peer_server_checkpoint: Arc<dyn ControlPlaneRaftPeerServerCheckpoint> =
+        Arc::new(ExperimentalRaftPeerServerCheckpoint {
             runtime: runtime.clone(),
-            authority: Arc::clone(&authority),
             context: raft_peer_durability.clone(),
         });
-    let raft_peer_server_policy = raft_peer_policy.clone().map(|peer_policy| {
-        ControlPlaneRaftPeerServerPolicy::new(
-            node_id,
-            peer_policy,
-            CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET,
-        )
-        .map(|policy| {
-            policy
-                .with_durability(Arc::clone(&raft_peer_server_durability))
-                .with_fatal_error_handler(Arc::new(|| std::process::exit(1)))
-        })
-    });
-    let raft_peer_server_policy = match raft_peer_server_policy.transpose() {
-        Ok(policy) => policy,
-        Err(error) => {
-            eprintln!("failed to configure control-plane OpenRaft peer server: {error}");
+    let raft_peer_server_durability = authority
+        .bind_peer_server_durability(raft_peer_server_checkpoint)
+        .unwrap_or_else(|error| {
+            eprintln!("failed to bind control-plane OpenRaft peer durability: {error}");
             std::process::exit(1);
-        }
-    };
+        });
+    // Durable replay and authority validation must finish before the process
+    // publishes any inbound peer endpoint.
+    let raft_peer_listener_inputs = bind_experimental_raft_peer_listener_inputs(config)
+        .unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(1);
+        });
+    let raft_peer_server = ControlPlaneRaftPeerServerBootstrap::for_authority(
+        Arc::clone(&authority),
+        raft_peer_listener_inputs,
+        CONTROL_PLANE_RAFT_PEER_PRE_AUTH_BYTE_BUDGET,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("failed to configure control-plane OpenRaft peer server: {error}");
+        std::process::exit(1);
+    });
     let _raft_checkpoint_loop = spawn_experimental_raft_peer_checkpoint_loop(
         runtime.clone(),
         Arc::clone(&authority),
         raft_peer_durability.clone(),
         ExperimentalRaftPeerCheckpointPolicy::default(),
     );
-    let _raft_peer_listener_loops = raft_peer_listeners
-        .into_iter()
-        .map(|listener| {
-            spawn_experimental_raft_peer_listener_loop(
-                listener,
+    let _raft_peer_listener_loops = raft_peer_server.map(|server| {
+        server
+            .serve(
                 runtime.clone(),
-                Arc::clone(&authority),
-                raft_peer_server_policy
-                    .clone()
-                    .expect("bound Raft peer listeners require a server policy"),
+                raft_peer_server_durability,
+                Arc::new(|| std::process::exit(1)),
             )
-        })
-        .collect::<Vec<_>>();
-    let initialized_membership = block_on_control_plane_raft(&runtime, async {
-        let mut initialized_membership = false;
-        if !authority.is_initialized().await?
-            && experimental_raft_startup_initializes_membership(raft_peer_policy.as_ref(), node_id)
-        {
-            if let Some(policy) = &raft_peer_policy {
-                authority.initialize_membership(policy.peers()).await?;
-            } else {
-                authority.initialize_single_node_membership(node_id).await?;
-            }
-            initialized_membership = true;
-        }
-        Ok::<_, ControlPlaneError>(initialized_membership)
-    })
+            .unwrap_or_else(|error| {
+                eprintln!("failed to start control-plane OpenRaft peer server: {error}");
+                std::process::exit(1);
+            })
+    });
+    let initialized_membership = block_on_control_plane_raft(
+        &runtime,
+        authority.initialize_configured_membership_if_needed(),
+    )
     .unwrap_or_else(|error| {
         eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
@@ -3272,7 +3031,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         });
     }
     block_on_control_plane_raft(&runtime, async {
-        if experimental_raft_startup_requires_local_leader(raft_peer_policy.as_ref()) {
+        if raft_peer_bootstrap.startup_requires_local_leader() {
             authority
                 .wait_for_current_leader(
                     node_id,
@@ -3482,8 +3241,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         config.control_plane_raft_auth_credentials.len(),
         config.control_plane_lease_scan_interval.as_millis()
     );
-    if let Some(policy) = &raft_peer_policy {
-        process_info!("{}", format_experimental_raft_peer_auth_diagnostics(policy));
+    if let Some(diagnostics) = raft_peer_auth_diagnostics {
+        process_info!("{}", diagnostics);
     }
     if let Some(diagnostics) = server_auth.diagnostics() {
         process_info!("{}", diagnostics);
@@ -4088,18 +3847,6 @@ fn build_storage_node_control_plane_client(
         config.control_plane_storage_auth_signing_credential.clone(),
     )
     .map_err(|error| error.to_string())
-}
-
-fn latest_auth_credential_by_version_then_id<'a, T>(
-    credentials: impl Iterator<Item = &'a T>,
-    credential_id: impl Fn(&T) -> &str,
-    credential_version: impl Fn(&T) -> u64,
-) -> Option<&'a T> {
-    credentials.max_by(|left, right| {
-        credential_version(left)
-            .cmp(&credential_version(right))
-            .then_with(|| credential_id(left).cmp(credential_id(right)))
-    })
 }
 
 fn bind_configured_control_plane_rpc_listeners(
@@ -5405,6 +5152,22 @@ mod tests {
         ControlPlaneRaftPeerTransportLimits,
     };
 
+    fn test_raft_peer_credentials(
+        node_ids: impl IntoIterator<Item = ControlPlaneRaftNodeId>,
+    ) -> Vec<ControlPlaneRaftPeerAuthCredentialInput> {
+        node_ids
+            .into_iter()
+            .map(|node_id| {
+                ControlPlaneRaftPeerAuthCredentialInput::new(
+                    node_id,
+                    format!("test-node-{node_id}"),
+                    1,
+                    format!("test-node-{node_id}-secret").into_bytes(),
+                )
+            })
+            .collect()
+    }
+
     fn spawn_control_plane_test_rpc_server<T>(
         listener: UnixListener,
         authority: Arc<Mutex<T>>,
@@ -5972,7 +5735,7 @@ mod tests {
     }
 
     #[test]
-    fn static_raft_peer_policy_binds_manifest_topology_identity() {
+    fn static_raft_peer_bootstrap_accepts_manifest_topology_identity() {
         let mut config = test_server_config();
         config.control_plane_raft_peer_socket_path = Some("/tmp/raft-1.sock".to_string());
         config.control_plane_raft_peer_sockets = vec![
@@ -5985,6 +5748,20 @@ mod tests {
                 socket_path: "/tmp/raft-2.sock".to_string(),
             },
         ];
+        config.control_plane_raft_auth_credentials = vec![
+            ConfiguredControlPlaneRaftAuthCredential {
+                node_id: 1,
+                credential_id: "raft-node-1".to_owned(),
+                credential_version: 1,
+                secret: BinarySecretConfigValue::from_utf8("node-1-test-secret".to_owned()),
+            },
+            ConfiguredControlPlaneRaftAuthCredential {
+                node_id: 2,
+                credential_id: "raft-node-2".to_owned(),
+                credential_version: 1,
+                secret: BinarySecretConfigValue::from_utf8("node-2-test-secret".to_owned()),
+            },
+        ];
         config.static_cluster_identity = Some(ConfiguredStaticClusterIdentity {
             cluster_id: "cluster-a".to_string(),
             topology_generation: 7,
@@ -5993,18 +5770,12 @@ mod tests {
             process_identity_digest: "b".repeat(64),
         });
 
-        let policy = build_experimental_raft_peer_transport_policy(&config, "cluster-a", 1)
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            policy.topology_identity(),
-            Some(
-                &storage::control_plane_raft::ControlPlaneRaftTopologyIdentity {
-                    generation: 7,
-                    digest: "a".repeat(64),
-                }
-            )
-        );
+        let bootstrap = build_experimental_raft_peer_bootstrap(&config, "cluster-a", 1)
+            .expect("static Raft peer bootstrap should build");
+        assert!(bootstrap.is_multi_node());
+        let debug = format!("{bootstrap:?}");
+        assert!(debug.contains("peer_count: 2"), "{debug}");
+        assert!(!debug.contains(&"a".repeat(64)), "{debug}");
     }
 
     #[test]
@@ -6073,28 +5844,31 @@ mod tests {
             placement,
         )
         .expect("test static topology should derive");
-        let policy = ControlPlaneRaftPeerTransportPolicy::new(
+        let bootstrap = ControlPlaneRaftPeerBootstrap::replicated(
             cluster_name.clone(),
-            std::collections::BTreeMap::from([(1, BasicNode::new("localhost"))]),
+            1,
+            [(1, "localhost".to_owned())],
+            Vec::new(),
             ControlPlaneRaftPeerTransportLimits::default(),
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            ControlPlaneRaftPeerTopologyBinding::StaticInitial(topology.clone()),
+            test_raft_peer_credentials([1]),
+            None,
         )
-        .with_static_initial_topology(&topology);
+        .expect("static peer bootstrap should build");
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .expect("test runtime should build");
         let authority = runtime
             .block_on(async {
-                let authority = ControlPlaneRaftAuthority::new_experimental_peer_durable_pending_static_initialization_network(
-                    cluster_name,
-                    1,
-                    &state_path,
-                    policy,
-                    &topology,
-                    ControlPlaneRaftPeerNetworkConfig::unix(Duration::from_millis(50)),
-                )
-                .await?;
-                authority.initialize_single_node_membership(1).await?;
+                let authority = bootstrap.open_durable_authority(&state_path, false).await?;
+                assert!(
+                    authority
+                        .initialize_configured_membership_if_needed()
+                        .await?
+                );
                 authority
                     .wait_for_current_leader(
                         1,
@@ -6726,7 +6500,7 @@ mod tests {
             .await
             .expect("experimental raft authority should initialize");
             authority
-                .initialize_single_node_membership(1)
+                .initialize_configured_membership_if_needed()
                 .await
                 .expect("single-node raft membership should initialize");
             authority
@@ -6814,55 +6588,6 @@ mod tests {
         harness.shutdown();
     }
 
-    fn experimental_raft_peer_auth_credential(
-        cluster_name: &str,
-        node_id: ControlPlaneRaftNodeId,
-        credential_id: &str,
-        credential_version: u64,
-        secret: &str,
-    ) -> ControlPlaneScopedCredential {
-        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
-            cluster_id: cluster_name.to_string(),
-            credential_id: credential_id.to_string(),
-            credential_version,
-            principal: ControlPlaneAuthPrincipal::RaftPeer { node_id },
-            secret: secret.as_bytes().to_vec(),
-        })
-        .expect("test auth credential should build")
-    }
-
-    fn experimental_raft_peer_auth_policy(
-        cluster_name: &str,
-        local_node_id: ControlPlaneRaftNodeId,
-        node_1_version: u64,
-    ) -> ControlPlaneRaftPeerAuthPolicy {
-        let node_1 = experimental_raft_peer_auth_credential(
-            cluster_name,
-            1,
-            "raft-node-1",
-            node_1_version,
-            "node-1-test-secret",
-        );
-        let node_2 = experimental_raft_peer_auth_credential(
-            cluster_name,
-            2,
-            "raft-node-2",
-            1,
-            "node-2-test-secret",
-        );
-        let local_credential = match local_node_id {
-            1 => node_1.clone(),
-            2 => node_2.clone(),
-            other => panic!("unexpected test local node id {other}"),
-        };
-        ControlPlaneRaftPeerAuthPolicy::new(
-            local_credential,
-            ControlPlaneScopedCredentialStore::new(vec![node_1, node_2])
-                .expect("test auth verifier store should build"),
-        )
-        .expect("test peer auth policy should build")
-    }
-
     fn experimental_raft_durable_test_harness(
         name: &str,
         state_path: &Path,
@@ -6904,7 +6629,7 @@ mod tests {
                 .expect("durable raft initialization status should read")
             {
                 authority
-                    .initialize_single_node_membership(1)
+                    .initialize_configured_membership_if_needed()
                     .await
                     .expect("single-node durable raft membership should initialize");
                 authority
@@ -7036,6 +6761,13 @@ mod tests {
                 node_id: 1,
                 socket_path: peer_socket,
             }];
+        config.control_plane_raft_auth_credentials =
+            vec![ConfiguredControlPlaneRaftAuthCredential {
+                node_id: 1,
+                credential_id: "raft-node-1".to_owned(),
+                credential_version: 1,
+                secret: BinarySecretConfigValue::from_utf8("node-1-test-secret".to_owned()),
+            }];
 
         let listeners =
             bind_experimental_raft_peer_listener(&config, "process-peer-listener-test", 1)
@@ -7058,6 +6790,13 @@ mod tests {
             vec![config::ConfiguredControlPlaneRaftPeerSocket {
                 node_id: 1,
                 socket_path: "tcp://localhost:7401".to_string(),
+            }];
+        config.control_plane_raft_auth_credentials =
+            vec![ConfiguredControlPlaneRaftAuthCredential {
+                node_id: 1,
+                credential_id: "raft-node-1".to_owned(),
+                credential_version: 1,
+                secret: BinarySecretConfigValue::from_utf8("node-1-test-secret".to_owned()),
             }];
         let certificates = CertificateDer::pem_slice_iter(include_bytes!(
             "../../s3-tests/testdata/localhost-cert.pem"
@@ -7096,42 +6835,43 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_startup_leader_wait_tracks_peer_policy_size() {
-        assert!(experimental_raft_startup_requires_local_leader(None));
-        assert!(experimental_raft_startup_initializes_membership(None, 1));
+    fn experimental_raft_startup_leader_wait_tracks_peer_bootstrap_size() {
+        let standalone =
+            ControlPlaneRaftPeerBootstrap::single_node("process-peer-startup-leader-wait-test", 1);
+        assert!(standalone.startup_requires_local_leader());
 
-        let single_node_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+        let single_node = ControlPlaneRaftPeerBootstrap::replicated(
             "process-peer-startup-leader-wait-test",
+            1,
             [(1, "/tmp/argmin-raft-node-1.sock".to_string())],
+            Vec::new(),
             ControlPlaneRaftPeerTransportLimits::default(),
-        );
-        assert!(experimental_raft_startup_requires_local_leader(Some(
-            &single_node_policy
-        )));
-        assert!(experimental_raft_startup_initializes_membership(
-            Some(&single_node_policy),
-            1
-        ));
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ControlPlaneRaftPeerTopologyBinding::Unbound,
+            test_raft_peer_credentials([1]),
+            None,
+        )
+        .expect("single-peer bootstrap should build");
+        assert!(single_node.startup_requires_local_leader());
 
-        let multi_node_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+        let multi_node = ControlPlaneRaftPeerBootstrap::replicated(
             "process-peer-startup-leader-wait-test",
+            1,
             [
                 (1, "/tmp/argmin-raft-node-1.sock".to_string()),
                 (2, "/tmp/argmin-raft-node-2.sock".to_string()),
             ],
+            Vec::new(),
             ControlPlaneRaftPeerTransportLimits::default(),
-        );
-        assert!(!experimental_raft_startup_requires_local_leader(Some(
-            &multi_node_policy
-        )));
-        assert!(experimental_raft_startup_initializes_membership(
-            Some(&multi_node_policy),
-            1
-        ));
-        assert!(!experimental_raft_startup_initializes_membership(
-            Some(&multi_node_policy),
-            2
-        ));
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            ControlPlaneRaftPeerTopologyBinding::Unbound,
+            test_raft_peer_credentials([1, 2]),
+            None,
+        )
+        .expect("multi-peer bootstrap should build");
+        assert!(!multi_node.startup_requires_local_leader());
     }
 
     #[test]
@@ -8915,85 +8655,25 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_peer_auth_diagnostics_are_redacted() {
-        let cluster_name = format!(
-            "argmin-s3-experimental-raft-peer-auth-diagnostics-{}",
-            std::process::id()
-        );
-        let unauthenticated_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name.clone(),
-            [(1, "node-1".to_string()), (2, "node-2".to_string())],
-            ControlPlaneRaftPeerTransportLimits::default(),
-        );
-        let unauthenticated =
-            format_experimental_raft_peer_auth_diagnostics(&unauthenticated_policy);
-        assert!(
-            unauthenticated.contains("required=false"),
-            "{unauthenticated}"
-        );
-        assert!(
-            unauthenticated.contains("credential_id=-"),
-            "{unauthenticated}"
-        );
-
-        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name.clone(),
-            [(1, "node-1".to_string()), (2, "node-2".to_string())],
-            ControlPlaneRaftPeerTransportLimits::default(),
-        )
-        .with_auth_policy(experimental_raft_peer_auth_policy(&cluster_name, 2, 1));
-        let auth_policy = policy
-            .auth_policy()
-            .expect("test policy should have auth policy");
-        auth_policy.record_peer_frame_rejection(
-            ControlPlaneAuthOperation::RaftVote,
-            ControlPlaneAuthRejectionReason::WrongCluster,
-        );
-        auth_policy.record_peer_frame_rejection_without_operation(
-            ControlPlaneAuthRejectionReason::Malformed,
-        );
-
-        let diagnostics = format_experimental_raft_peer_auth_diagnostics(&policy);
-        assert!(diagnostics.contains("required=true"), "{diagnostics}");
-        assert!(
-            diagnostics.contains("local_principal=RaftPeer { node_id: 2 }"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("credential_id=raft-node-2"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("credential_version=1"),
-            "{diagnostics}"
-        );
-        assert!(diagnostics.contains("accepted_total=0"), "{diagnostics}");
-        assert!(diagnostics.contains("rejected_total=2"), "{diagnostics}");
-        assert!(
-            diagnostics.contains("rejected_without_operation_total=1"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("rejected_by_operation{operation=\"RaftVote\"} 1"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("rejected_by_reason{reason=\"WrongCluster\"} 1"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("rejected_by_reason{reason=\"Malformed\"} 1"),
-            "{diagnostics}"
-        );
-        assert!(!diagnostics.contains("node-1-test-secret"));
-        assert!(!diagnostics.contains("node-2-test-secret"));
-        assert!(!diagnostics.contains("payload"));
-        assert!(!diagnostics.contains("authenticator"));
-    }
-
-    #[test]
-    fn experimental_raft_peer_auth_policy_selects_latest_local_credential() {
+    fn experimental_raft_peer_bootstrap_maps_auth_configuration_and_redacts_diagnostics() {
         let mut config = test_server_config();
+        config.control_plane_raft_peer_socket_path = Some("/tmp/raft-2.sock".to_owned());
+        config.control_plane_raft_peer_sockets = vec![
+            ConfiguredControlPlaneRaftPeerSocket {
+                node_id: 1,
+                socket_path: "/tmp/raft-1.sock".to_owned(),
+            },
+            ConfiguredControlPlaneRaftPeerSocket {
+                node_id: 2,
+                socket_path: "/tmp/raft-2.sock".to_owned(),
+            },
+        ];
+        let unauthenticated = build_experimental_raft_peer_bootstrap(&config, "auth-cluster", 2)
+            .expect_err("unauthenticated peer bootstrap must fail closed");
+        assert!(
+            unauthenticated.contains("authentication configuration is invalid"),
+            "{unauthenticated}"
+        );
         config.control_plane_raft_auth_credentials = vec![
             ConfiguredControlPlaneRaftAuthCredential {
                 node_id: 2,
@@ -9015,13 +8695,28 @@ mod tests {
             },
         ];
 
-        let policy = build_experimental_raft_peer_auth_policy(&config, "auth-cluster", 2)
-            .expect("test Raft peer auth policy should build")
-            .expect("test Raft peer auth policy should be enabled");
-        let status = policy.status_snapshot();
-
-        assert_eq!(status.credential_id(), Some("raft-node-2"));
-        assert_eq!(status.credential_version(), Some(2));
+        let bootstrap = build_experimental_raft_peer_bootstrap(&config, "auth-cluster", 2)
+            .expect("authenticated peer bootstrap should build");
+        let diagnostics = bootstrap
+            .auth_diagnostics()
+            .expect("replicated bootstrap should expose auth diagnostics");
+        assert!(diagnostics.contains("required=true"), "{diagnostics}");
+        assert!(diagnostics.contains("local_node_id=2"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("credential_version=2"),
+            "{diagnostics}"
+        );
+        assert!(!diagnostics.contains("raft-node-1"), "{diagnostics}");
+        assert!(!diagnostics.contains("raft-node-2"), "{diagnostics}");
+        assert!(!diagnostics.contains("node-1-test-secret"), "{diagnostics}");
+        assert!(
+            !diagnostics.contains("node-2-old-test-secret"),
+            "{diagnostics}"
+        );
+        assert!(
+            !diagnostics.contains("node-2-new-test-secret"),
+            "{diagnostics}"
+        );
     }
 
     #[test]
@@ -9114,14 +8809,24 @@ mod tests {
             "argmin-s3-experimental-raft-peer-wal-ack-{}",
             std::process::id()
         );
+        let peer_bootstrap = ControlPlaneRaftPeerBootstrap::replicated(
+            cluster_name.clone(),
+            1,
+            [(1, "node-1".to_string())],
+            Vec::new(),
+            ControlPlaneRaftPeerTransportLimits::default(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            ControlPlaneRaftPeerTopologyBinding::Unbound,
+            test_raft_peer_credentials([1]),
+            None,
+        )
+        .expect("test peer bootstrap should build");
         let authority = runtime.block_on(async {
-            let authority = ControlPlaneRaftAuthority::new_experimental_single_node_durable(
-                cluster_name.clone(),
-                1,
-                &state_path,
-            )
-            .await
-            .expect("WAL-backed durable authority should initialize");
+            let authority = peer_bootstrap
+                .open_durable_authority(&state_path, true)
+                .await
+                .expect("WAL-backed durable peer authority should initialize");
             authority
                 .store_durable_restart_artifact()
                 .await
@@ -9140,48 +8845,45 @@ mod tests {
             "initial checkpoint should compact the WAL suffix"
         );
 
-        let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
-            cluster_name.clone(),
-            [(1, "node-1".to_string())],
-            ControlPlaneRaftPeerTransportLimits::default(),
-        );
         let checkpoint_lock = Arc::new(Mutex::new(()));
         let durability_context = ExperimentalRaftPeerDurabilityContext {
             artifact_path: Some(Arc::new(state_path.clone())),
             checkpoint_lock,
         };
-        let server_policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
-            .expect("test peer server policy should build")
-            .with_durability(Arc::new(ExperimentalRaftPeerServerDurability {
+        let server_durability = authority
+            .bind_peer_server_durability(Arc::new(ExperimentalRaftPeerServerCheckpoint {
                 runtime: runtime.handle().clone(),
-                authority: Arc::clone(&authority),
                 context: durability_context.clone(),
-            }));
-        let listener = Arc::new(
-            ControlPlaneRaftPeerServerListener::unix(
+            }))
+            .expect("test peer durability should bind to its authority");
+        let server = Arc::new(
+            ControlPlaneRaftPeerTestServer::unix(
+                Arc::clone(&authority),
                 "test-peer",
                 UnixListener::bind(&peer_socket_path).expect("test peer socket should bind"),
                 1,
                 Duration::from_secs(5),
+                4096,
+                server_durability,
             )
-            .expect("test peer listener should build"),
+            .expect("test peer server should build"),
         );
         let client = ControlPlaneRaftPeerTestClient::unix(
             peer_socket_path,
-            cluster_name,
+            cluster_name.clone(),
             1,
             1,
             ControlPlaneRaftPeerTransportLimits::default(),
             Duration::from_secs(5),
-        );
+        )
+        .with_auth_credentials(&cluster_name, 1, test_raft_peer_credentials([1]), None)
+        .expect("test peer client authentication should bind");
         let send_vote = |term| {
-            let accept_listener = Arc::clone(&listener);
-            let accept_authority = Arc::clone(&authority);
-            let accept_policy = server_policy.clone();
+            let accept_server = Arc::clone(&server);
             let runtime_handle = runtime.handle().clone();
             let accept = thread::spawn(move || {
-                accept_listener
-                    .accept_one(&runtime_handle, accept_authority, &accept_policy)
+                accept_server
+                    .accept_one(&runtime_handle)
                     .expect("test peer listener should accept");
             });
             let granted = client
@@ -9189,7 +8891,7 @@ mod tests {
                 .expect("test peer vote should receive a response");
             accept.join().expect("test peer accept should finish");
             let worker_deadline = Instant::now() + Duration::from_secs(5);
-            while listener.active_workers() != 0 {
+            while server.active_workers() != 0 {
                 assert!(
                     Instant::now() < worker_deadline,
                     "test peer worker did not release its listener slot"
@@ -9354,7 +9056,7 @@ mod tests {
             .await
             .expect("WAL-backed durable authority should initialize");
             authority
-                .initialize_single_node_membership(1)
+                .initialize_configured_membership_if_needed()
                 .await
                 .expect("single-node membership should initialize");
             authority

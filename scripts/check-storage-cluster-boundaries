@@ -4820,8 +4820,26 @@ raft_peer_server_transport_leaks=$(
         || true
 )
 fail_with_matches \
-    "Raft peer server listeners, TLS profile, and workers are private to storage; use ControlPlaneRaftPeerServerListener and ControlPlaneRaftPeerServerPolicy" \
+    "Raft peer server framing, TLS profile, admission, and workers are private to storage; use ControlPlaneRaftPeerBootstrap and ControlPlaneRaftPeerServerListenerInput" \
     "$raft_peer_server_transport_leaks"
+
+raft_peer_bootstrap_bypasses=$(
+    {
+        rg -n --color=never \
+            '\bControlPlaneRaftPeer(AuthPolicy|AuthMetricsSnapshot|AuthStatusSnapshot|TransportPolicy|NetworkConfig|ServerListener|ServerPolicy|ServerConfigError|ServerError)\b|\bnew_experimental_(unix_peer_durable|peer_durable_network|peer_durable_pending_static_initialization_network)\b|\.(initialize_membership|initialize_single_node_membership)\(|\bspawn_experimental_raft_peer_listener_loop\b|\bbuild_experimental_raft_peer_(transport_policy|auth_policy)\b' \
+            . \
+            -g 'crates/**/*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '^[[:space:]]*pub (struct|enum) ControlPlaneRaftPeer(AuthPolicy|AuthMetricsSnapshot|AuthStatusSnapshot|TransportPolicy|NetworkConfig|ServerListener|ServerPolicy|ServerConfigError|ServerError)\b|^[[:space:]]*pub async fn (new_experimental_(unix_peer_durable|peer_durable_network|peer_durable_pending_static_initialization_network)|initialize_membership|initialize_single_node_membership)\b' \
+            crates/storage/src/control_plane_raft.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "Raft peer authentication, topology policy, client/server pairing, and authority construction must remain behind ControlPlaneRaftPeerBootstrap" \
+    "$raft_peer_bootstrap_bypasses"
 
 raft_peer_representation_leaks=$(
     rg -n --color=never \

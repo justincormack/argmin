@@ -35,6 +35,7 @@ pub(crate) mod control_plane_lease;
 mod control_plane_operator_admin;
 mod control_plane_pg_admin;
 pub mod control_plane_raft;
+mod control_plane_raft_peer_bootstrap;
 mod control_plane_server_auth;
 mod control_plane_server_bootstrap;
 mod control_plane_service_client;
@@ -109,6 +110,16 @@ pub use control_plane_pg_admin::{
     set_offline_control_plane_pg_acting_set, ControlPlanePgAdminClient, ControlPlanePgAdminError,
     ControlPlanePgAdminInputError, ControlPlanePgMetadataTransferInstall,
     ControlPlanePgStatusClient,
+};
+pub use control_plane_raft_peer_bootstrap::{
+    ControlPlaneRaftPeerAuthCredentialInput, ControlPlaneRaftPeerBootstrap,
+    ControlPlaneRaftPeerBootstrapError, ControlPlaneRaftPeerServerBootstrap,
+    ControlPlaneRaftPeerServerListenerInput, ControlPlaneRaftPeerServerLoops,
+    ControlPlaneRaftPeerTopologyBinding,
+};
+#[cfg(feature = "test-hooks")]
+pub use control_plane_raft_peer_bootstrap::{
+    ControlPlaneRaftPeerTestServer, ControlPlaneRaftPeerTestServerError,
 };
 pub use control_plane_server_auth::{ControlPlaneRpcServerAuth, ControlPlaneRpcServerAuthError};
 #[cfg(feature = "test-hooks")]
