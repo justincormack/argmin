@@ -12,6 +12,16 @@ const CONTROL_PLANE_AUTH_MAX_NONCE_LEN: usize = 32;
 const CONTROL_PLANE_AUTH_MAX_AUTHENTICATOR_LEN: usize = 128;
 const CONTROL_PLANE_AUTH_MAX_SECRET_LEN: usize = 4096;
 
+pub(crate) fn validate_control_plane_auth_cluster_id(
+    cluster_id: &str,
+) -> Result<(), ControlPlaneError> {
+    validate_nonempty_string(
+        cluster_id,
+        CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN,
+        "auth cluster id",
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlPlaneAuthPrincipal {
     RaftPeer { node_id: u64 },
@@ -336,11 +346,7 @@ impl ControlPlaneScopedCredential {
     }
 
     fn validate(&self) -> Result<(), ControlPlaneError> {
-        validate_nonempty_string(
-            &self.cluster_id,
-            CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN,
-            "auth credential cluster id",
-        )?;
+        validate_control_plane_auth_cluster_id(&self.cluster_id)?;
         validate_nonempty_string(
             &self.credential_id,
             CONTROL_PLANE_AUTH_MAX_CREDENTIAL_ID_LEN,
@@ -723,11 +729,7 @@ impl ControlPlaneAuthEnvelopeHeader {
     }
 
     fn validate(&self) -> Result<(), ControlPlaneError> {
-        validate_nonempty_string(
-            &self.cluster_id,
-            CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN,
-            "auth cluster id",
-        )?;
+        validate_control_plane_auth_cluster_id(&self.cluster_id)?;
         validate_nonempty_string(
             &self.credential_id,
             CONTROL_PLANE_AUTH_MAX_CREDENTIAL_ID_LEN,
@@ -1269,9 +1271,9 @@ mod tests {
         }
     }
 
-    fn sample_header() -> ControlPlaneAuthEnvelopeHeader {
-        ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
-            cluster_id: "cluster-a".to_owned(),
+    fn sample_header_input(cluster_id: String) -> ControlPlaneAuthEnvelopeHeaderInput {
+        ControlPlaneAuthEnvelopeHeaderInput {
+            cluster_id,
             credential_id: "raft-peer-key-a".to_owned(),
             credential_version: 7,
             source: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
@@ -1283,8 +1285,11 @@ mod tests {
             expires_at_ms: Some(2_000),
             sequence: Some(42),
             nonce: vec![1, 2, 3, 4],
-        })
-        .unwrap()
+        }
+    }
+
+    fn sample_header() -> ControlPlaneAuthEnvelopeHeader {
+        ControlPlaneAuthEnvelopeHeader::new(sample_header_input("cluster-a".to_owned())).unwrap()
     }
 
     fn sample_envelope() -> ControlPlaneAuthEnvelope {
@@ -1321,6 +1326,39 @@ mod tests {
                 payload: b"raft-payload".to_vec(),
             })
             .unwrap()
+    }
+
+    #[test]
+    fn cluster_id_validation_is_shared_by_credentials_and_envelope_headers() {
+        let maximum_cluster_id = "c".repeat(CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN);
+        assert!(
+            ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+                cluster_id: maximum_cluster_id.clone(),
+                credential_id: "raft-peer-key-a".to_owned(),
+                credential_version: 7,
+                principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                secret: b"test scoped raft peer secret".to_vec(),
+            })
+            .is_ok()
+        );
+        assert!(
+            ControlPlaneAuthEnvelopeHeader::new(sample_header_input(maximum_cluster_id)).is_ok()
+        );
+
+        let overlong_cluster_id = "c".repeat(CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN + 1);
+        assert!(
+            ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+                cluster_id: overlong_cluster_id.clone(),
+                credential_id: "raft-peer-key-a".to_owned(),
+                credential_version: 7,
+                principal: ControlPlaneAuthPrincipal::RaftPeer { node_id: 101 },
+                secret: b"test scoped raft peer secret".to_vec(),
+            })
+            .is_err()
+        );
+        assert!(
+            ControlPlaneAuthEnvelopeHeader::new(sample_header_input(overlong_cluster_id)).is_err()
+        );
     }
 
     fn verify_signed_envelope(

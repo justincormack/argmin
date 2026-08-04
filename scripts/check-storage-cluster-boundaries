@@ -3225,6 +3225,58 @@ fail_with_matches \
     "Frontend and storage-node control-plane capabilities must retain transport and scoped credentials opaquely and expose only bounded service operations" \
     "$control_plane_service_client_opaque_surface_leaks"
 
+argmin_control_plane_server_auth_bootstrap_leaks=$(
+    awk '
+    /^mod tests[[:space:]]*\{/ {
+        exit
+    }
+    /(^|[^A-Za-z0-9_])ControlPlaneUnixAuthVerifier([^A-Za-z0-9_]|$)|(^|[^A-Za-z0-9_])ControlPlane(StorageNode|Frontend|Admin)AuthCredential([^A-Za-z0-9_I]|$)|build_control_plane_unix_auth_verifier|format_control_plane_unix_auth_diagnostics|\.with_auth_verifier\(/ {
+        print FILENAME ":" FNR ":" $0
+    }
+    ' crates/argmin-s3/src/main.rs
+)
+fail_with_matches \
+    "Control-plane server credential validation, verifier construction, policy attachment, and diagnostics must remain owned by storage" \
+    "$argmin_control_plane_server_auth_bootstrap_leaks"
+
+control_plane_server_auth_surface_leaks=$(
+    {
+        rg -n -U --color=never \
+            'pub struct ControlPlaneRpcServerAuth[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:|#\[derive\([^]]*(Debug|PartialEq|Eq|Hash)[^]]*\)\][[:space:]]*pub struct ControlPlaneRpcServerAuth' \
+            crates/storage/src/control_plane_server_auth.rs \
+            || true
+        awk '
+        /impl ControlPlaneRpcServerAuth[[:space:]]*\{/ {
+            in_auth = 1
+            depth = 0
+        }
+        in_auth {
+            if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+                method = $0
+                sub(/^.*fn[[:space:]]+/, "", method)
+                sub(/\(.*/, "", method)
+                if (method != "new" && method != "is_authenticated" && method != "diagnostics") {
+                    print FILENAME ":" FNR ":" $0
+                }
+            }
+            line = $0
+            depth += gsub(/\{/, "{", line)
+            depth -= gsub(/\}/, "}", line)
+            if (depth == 0 && $0 ~ /\}/) {
+                in_auth = 0
+            }
+        }
+        ' crates/storage/src/control_plane_server_auth.rs
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+(struct[[:space:]]+ControlPlaneUnixAuthVerifier|struct[[:space:]]+ControlPlane(StorageNode|Frontend|Admin)AuthCredential([^I]|$)|fn[[:space:]]+with_auth_verifier[[:space:]]*\()' \
+            crates/storage/src/control_plane.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "The control-plane server authentication capability must remain opaque and raw verifier or credential types must remain storage-private" \
+    "$control_plane_server_auth_surface_leaks"
+
 public_static_initial_topology_bypass_apis=$(
     rg -n --color=never \
         '^[[:space:]]*pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+(submit_static_initial_topology|validate_snapshot)[[:space:]]*\(' \

@@ -32,23 +32,22 @@ use server_core::coordinator::Coordinator;
 use server_core::sse::{
     ManagedWrappingKeyConfig, SseCustomerValidatorConfig, StaticManagedKeyProvider,
 };
+#[cfg(test)]
+use storage::control_plane::UnixControlPlaneClient;
 use storage::control_plane::{
     ensure_control_plane_state_parent_directory, invalidate_authority_clock_restart_checkpoint,
     load_authority_clock_restart_checkpoint, store_authority_clock_restart_checkpoint,
     ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneAdmin,
-    ControlPlaneAdminAuthCredential, ControlPlaneAdminAuthCredentialInput,
-    ControlPlaneAuthorityClock, ControlPlaneAuthorityClockCheckpointBinding,
-    ControlPlaneAuthorityClockCheckpointTarget, ControlPlaneAuthorityClockContext,
-    ControlPlaneError, ControlPlaneFrontendAuthCredential, ControlPlaneFrontendAuthCredentialInput,
+    ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
+    ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneAuthorityClockCheckpointTarget,
+    ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneFrontendAuthCredentialInput,
     ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneRpcResponsePublication, ControlPlaneRpcServerListener, ControlPlaneRpcServerPolicy,
-    ControlPlaneRpcServerRole, ControlPlaneRuntimeMapSource, ControlPlaneStorageNodeAuthCredential,
-    ControlPlaneStorageNodeAuthCredentialInput, ControlPlaneUnixAuthVerifier,
-    FencedPgMetadataTransferSnapshot, FileControlPlaneStore, LeaseHorizonAuthorityBinding,
-    PgMetadataTransferProof, SingleAuthorityControlPlane, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    ControlPlaneRpcServerRole, ControlPlaneRuntimeMapSource,
+    ControlPlaneStorageNodeAuthCredentialInput, FencedPgMetadataTransferSnapshot,
+    FileControlPlaneStore, LeaseHorizonAuthorityBinding, PgMetadataTransferProof,
+    SingleAuthorityControlPlane, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
-#[cfg(test)]
-use storage::control_plane::{AuthenticatedUnixControlPlaneClient, UnixControlPlaneClient};
 #[cfg(test)]
 use storage::control_plane_auth::{ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason};
 use storage::control_plane_auth::{
@@ -1483,7 +1482,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
             storage::control_plane_clock_recovery_socket_path(Path::new(socket_path))
         });
     let (
-        (authority, authority_clock, authority_clock_checkpoint_target, auth_verifier),
+        (authority, authority_clock, authority_clock_checkpoint_target, server_auth),
         (listeners, recovery_listeners),
     ) = initialize_standalone_control_plane_before_binding(
         || {
@@ -1542,12 +1541,10 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                         });
                 }
             }
-            let auth_verifier = build_control_plane_unix_auth_verifier(config)
-                .unwrap_or_else(|error| {
-                    eprintln!("failed to configure control-plane auth verifier: {error}");
-                    std::process::exit(1);
-                })
-                .map(Arc::new);
+            let server_auth = build_control_plane_rpc_server_auth(config).unwrap_or_else(|error| {
+                eprintln!("failed to configure control-plane auth verifier: {error}");
+                std::process::exit(1);
+            });
             (
                 Arc::new(Mutex::new(authority)),
                 Arc::new(Mutex::new(authority_clock)),
@@ -1555,7 +1552,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
                     state_path,
                     authority_clock_checkpoint_binding,
                 )),
-                auth_verifier,
+                server_auth,
             )
         },
         || {
@@ -1592,11 +1589,8 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         recovery_socket_path.display(),
         config.control_plane_lease_scan_interval.as_millis()
     );
-    if let Some(auth_verifier) = &auth_verifier {
-        process_info!(
-            "{}",
-            format_control_plane_unix_auth_diagnostics(auth_verifier)
-        );
+    if let Some(diagnostics) = server_auth.diagnostics() {
+        process_info!("{}", diagnostics);
     }
 
     let fatal_error_handler: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(1));
@@ -1612,10 +1606,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         true,
     )
     .with_fatal_error_handler(Arc::clone(&fatal_error_handler));
-    let ordinary_rpc_policy = match &auth_verifier {
-        Some(auth_verifier) => ordinary_rpc_policy.with_auth_verifier(Arc::clone(auth_verifier)),
-        None => ordinary_rpc_policy,
-    };
+    let ordinary_rpc_policy = ordinary_rpc_policy.with_server_auth(&server_auth);
     let recovery_rpc_policy = ControlPlaneRpcServerPolicy::new(
         ControlPlaneRpcServerRole::AuthorityClockRecovery,
         CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
@@ -1628,10 +1619,7 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
         true,
     )
     .with_fatal_error_handler(fatal_error_handler);
-    let recovery_rpc_policy = match &auth_verifier {
-        Some(auth_verifier) => recovery_rpc_policy.with_auth_verifier(Arc::clone(auth_verifier)),
-        None => recovery_rpc_policy,
-    };
+    let recovery_rpc_policy = recovery_rpc_policy.with_server_auth(&server_auth);
     let _rpc_listener_loops = listeners
         .into_iter()
         .map(|listener| {
@@ -2598,82 +2586,6 @@ fn format_experimental_raft_peer_auth_diagnostics(
     diagnostics
 }
 
-fn format_control_plane_unix_auth_diagnostics(verifier: &ControlPlaneUnixAuthVerifier) -> String {
-    let status = verifier.status_snapshot();
-    let metrics = status.metrics();
-    let mut diagnostics = format!(
-        "control_plane_unix_auth required={} storage_node_heartbeat_required={} frontend_runtime_map_required={} admin_control_plane_required={} cluster_id={} storage_node_credentials={} frontend_credentials={} admin_credentials={} accepted_total={} rejected_total={}",
-        status.required(),
-        status.storage_node_heartbeat_required(),
-        status.frontend_runtime_map_required(),
-        status.admin_control_plane_required(),
-        status.cluster_id(),
-        status.storage_node_credentials().len(),
-        status.frontend_credentials().len(),
-        status.admin_credentials().len(),
-        metrics.accepted_total(),
-        metrics.rejected_total()
-    );
-    for credential in status.storage_node_credentials() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "control_plane_unix_auth storage_node_credential{{node_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
-            credential.node_id().as_u32(),
-            credential.credential_id(),
-            credential.credential_version()
-        )
-        .expect("write to String should not fail");
-    }
-    for credential in status.frontend_credentials() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "control_plane_unix_auth frontend_credential{{instance_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
-            credential.instance_id(),
-            credential.credential_id(),
-            credential.credential_version()
-        )
-        .expect("write to String should not fail");
-    }
-    for credential in status.admin_credentials() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "control_plane_unix_auth admin_credential{{instance_id=\"{}\",credential_id=\"{}\",credential_version=\"{}\"}} 1",
-            credential.instance_id(),
-            credential.credential_id(),
-            credential.credential_version()
-        )
-        .expect("write to String should not fail");
-    }
-    for (operation, count) in metrics.accepted_by_operation() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "control_plane_unix_auth accepted_by_operation{{operation=\"{operation:?}\"}} {count}"
-        )
-        .expect("write to String should not fail");
-    }
-    for (operation, count) in metrics.rejected_by_operation() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "control_plane_unix_auth rejected_by_operation{{operation=\"{operation:?}\"}} {count}"
-        )
-        .expect("write to String should not fail");
-    }
-    for (reason, count) in metrics.rejected_by_reason() {
-        diagnostics.push('\n');
-        write!(
-            &mut diagnostics,
-            "control_plane_unix_auth rejected_by_reason{{reason=\"{reason:?}\"}} {count}"
-        )
-        .expect("write to String should not fail");
-    }
-    diagnostics
-}
-
 fn experimental_raft_startup_requires_local_leader(
     peer_policy: Option<&ControlPlaneRaftPeerTransportPolicy>,
 ) -> bool {
@@ -3576,12 +3488,10 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             durable_artifact_path.as_ref().clone(),
             authority_clock_checkpoint_binding,
         ));
-    let auth_verifier = build_control_plane_unix_auth_verifier(config)
-        .unwrap_or_else(|error| {
-            eprintln!("failed to configure control-plane auth verifier: {error}");
-            std::process::exit(1);
-        })
-        .map(Arc::new);
+    let server_auth = build_control_plane_rpc_server_auth(config).unwrap_or_else(|error| {
+        eprintln!("failed to configure control-plane auth verifier: {error}");
+        std::process::exit(1);
+    });
     let raft_peer_socket_path = config
         .control_plane_raft_peer_socket_path
         .as_deref()
@@ -3600,11 +3510,8 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     if let Some(policy) = &raft_peer_policy {
         process_info!("{}", format_experimental_raft_peer_auth_diagnostics(policy));
     }
-    if let Some(auth_verifier) = &auth_verifier {
-        process_info!(
-            "{}",
-            format_control_plane_unix_auth_diagnostics(auth_verifier)
-        );
+    if let Some(diagnostics) = server_auth.diagnostics() {
+        process_info!("{}", diagnostics);
     }
 
     let rpc_runtime = runtime.clone();
@@ -3634,10 +3541,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     .with_authority_confirmation(Arc::clone(&raft_authority_confirmation))
     .with_response_publication(Arc::clone(&response_publication))
     .with_fatal_error_handler(Arc::clone(&fatal_error_handler));
-    let ordinary_rpc_policy = match &auth_verifier {
-        Some(auth_verifier) => ordinary_rpc_policy.with_auth_verifier(Arc::clone(auth_verifier)),
-        None => ordinary_rpc_policy,
-    };
+    let ordinary_rpc_policy = ordinary_rpc_policy.with_server_auth(&server_auth);
     let recovery_rpc_policy = ControlPlaneRpcServerPolicy::new(
         ControlPlaneRpcServerRole::AuthorityClockRecovery,
         CONTROL_PLANE_CLOCK_RECOVERY_RPC_WORKER_LIMIT,
@@ -3652,10 +3556,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
     .with_authority_confirmation(raft_authority_confirmation)
     .with_response_publication(response_publication)
     .with_fatal_error_handler(fatal_error_handler);
-    let recovery_rpc_policy = match &auth_verifier {
-        Some(auth_verifier) => recovery_rpc_policy.with_auth_verifier(Arc::clone(auth_verifier)),
-        None => recovery_rpc_policy,
-    };
+    let recovery_rpc_policy = recovery_rpc_policy.with_server_auth(&server_auth);
     let _rpc_listener_loops = listeners
         .into_iter()
         .map(|listener| {
@@ -3940,20 +3841,6 @@ fn load_process_authority_clock_restart_checkpoint(
     }
 }
 
-fn configured_storage_node_auth_credential(
-    configured: &ConfiguredControlPlaneStorageAuthCredential,
-) -> Result<ControlPlaneStorageNodeAuthCredential, String> {
-    ControlPlaneStorageNodeAuthCredential::new(configured_storage_node_auth_credential_input(
-        configured,
-    ))
-    .map_err(|error| {
-        format!(
-            "invalid ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS credential for node {}: {error}",
-            configured.node_id
-        )
-    })
-}
-
 fn configured_storage_node_auth_credential_input(
     configured: &ConfiguredControlPlaneStorageAuthCredential,
 ) -> ControlPlaneStorageNodeAuthCredentialInput {
@@ -3963,18 +3850,6 @@ fn configured_storage_node_auth_credential_input(
         credential_version: configured.credential_version,
         secret: configured.secret.as_bytes().to_vec(),
     }
-}
-
-fn configured_frontend_auth_credential(
-    configured: &ConfiguredControlPlaneFrontendAuthCredential,
-) -> Result<ControlPlaneFrontendAuthCredential, String> {
-    ControlPlaneFrontendAuthCredential::new(configured_frontend_auth_credential_input(configured))
-        .map_err(|error| {
-            format!(
-                "invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS credential for instance {}: {error}",
-                configured.instance_id
-            )
-        })
 }
 
 fn configured_frontend_auth_credential_input(
@@ -3988,84 +3863,43 @@ fn configured_frontend_auth_credential_input(
     }
 }
 
-fn configured_admin_auth_credential(
+fn configured_admin_auth_credential_input(
     configured: &ConfiguredControlPlaneAdminAuthCredential,
-) -> Result<ControlPlaneAdminAuthCredential, String> {
-    ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+) -> ControlPlaneAdminAuthCredentialInput {
+    ControlPlaneAdminAuthCredentialInput {
         instance_id: configured.instance_id.clone(),
         credential_id: configured.credential_id.clone(),
         credential_version: configured.credential_version,
         secret: configured.secret.as_bytes().to_vec(),
-    })
-    .map_err(|error| {
-        format!(
-            "invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS credential for instance {}: {error}",
-            configured.instance_id
-        )
-    })
+    }
 }
 
-fn build_control_plane_unix_auth_verifier(
+fn build_control_plane_rpc_server_auth(
     config: &ServerConfig,
-) -> Result<Option<ControlPlaneUnixAuthVerifier>, String> {
-    if config.control_plane_storage_auth_credentials.is_empty()
-        && config.control_plane_frontend_auth_credentials.is_empty()
-        && config.control_plane_admin_auth_credentials.is_empty()
-    {
-        return Ok(None);
-    }
-    let cluster_id = config
-        .control_plane_auth_cluster_id
-        .as_deref()
-        .expect("control-plane Unix auth credentials require control-plane auth cluster id");
+) -> Result<storage::ControlPlaneRpcServerAuth, String> {
     let storage_credentials = config
         .control_plane_storage_auth_credentials
         .iter()
-        .map(configured_storage_node_auth_credential)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(configured_storage_node_auth_credential_input)
+        .collect();
     let frontend_credentials = config
         .control_plane_frontend_auth_credentials
         .iter()
-        .map(configured_frontend_auth_credential)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(configured_frontend_auth_credential_input)
+        .collect();
     let admin_credentials = config
         .control_plane_admin_auth_credentials
         .iter()
-        .map(configured_admin_auth_credential)
-        .collect::<Result<Vec<_>, _>>()?;
-    if admin_credentials.is_empty() {
-        return Err(
-            "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is required when any Unix control-plane auth credentials are configured for the control-plane verifier"
-                .to_string(),
-        );
-    }
-    if let Some(instance_id) = config.control_plane_admin_auth_instance_id.as_deref() {
-        if !config
-            .control_plane_admin_auth_credentials
-            .iter()
-            .any(|credential| credential.instance_id == instance_id)
-        {
-            return Err(format!(
-                "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS must include local admin instance id {instance_id}"
-            ));
-        }
-    }
-    let verifier = if storage_credentials.is_empty() {
-        ControlPlaneUnixAuthVerifier::new_empty(cluster_id)
-    } else {
-        ControlPlaneUnixAuthVerifier::new(cluster_id, storage_credentials)
-    }
-    .map_err(|error| format!("invalid control-plane Unix auth credential verifier: {error}"))?;
-    verifier
-        .with_frontend_credentials(frontend_credentials)
-        .map_err(|error| {
-            format!("invalid ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS verifier: {error}")
-        })?
-        .with_admin_credentials(admin_credentials)
-        .map(Some)
-        .map_err(|error| {
-            format!("invalid ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS verifier: {error}")
-        })
+        .map(configured_admin_auth_credential_input)
+        .collect();
+    storage::ControlPlaneRpcServerAuth::new(
+        config.control_plane_auth_cluster_id.as_deref(),
+        config.control_plane_admin_auth_instance_id.as_deref(),
+        storage_credentials,
+        frontend_credentials,
+        admin_credentials,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn build_frontend_control_plane_client(
@@ -5678,7 +5512,7 @@ mod tests {
         listener: UnixListener,
         authority: Arc<Mutex<T>>,
         authority_times_ms: impl IntoIterator<Item = u64> + Send + 'static,
-        auth_verifier: Option<Arc<ControlPlaneUnixAuthVerifier>>,
+        server_auth: Option<storage::ControlPlaneRpcServerAuth>,
     ) -> std::thread::JoinHandle<()>
     where
         T: ControlPlaneAdmin
@@ -5700,8 +5534,8 @@ mod tests {
             CONTROL_PLANE_RPC_PRE_AUTH_BYTE_BUDGET,
         )
         .unwrap();
-        let policy = match auth_verifier {
-            Some(auth_verifier) => policy.with_auth_verifier(auth_verifier),
+        let policy = match server_auth {
+            Some(server_auth) => policy.with_server_auth(&server_auth),
             None => policy,
         };
         std::thread::spawn(move || {
@@ -5824,33 +5658,25 @@ mod tests {
             .expect("recovery endpoint should bind after replay completes");
         drop(recovery_listeners);
 
-        let frontend_credential =
-            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
-                instance_id: "frontend-1".to_owned(),
-                credential_id: "frontend-1".to_owned(),
-                credential_version: 1,
-                secret: b"frontend-secret".to_vec(),
-            })
-            .unwrap();
-        let admin_credential =
-            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
+        let frontend_credential = ControlPlaneFrontendAuthCredentialInput {
+            instance_id: "frontend-1".to_owned(),
+            credential_id: "frontend-1".to_owned(),
+            credential_version: 1,
+            secret: b"frontend-secret".to_vec(),
+        };
+        let server_auth = storage::ControlPlaneRpcServerAuth::new(
+            Some("startup-order-cluster"),
+            Some("admin-1"),
+            Vec::new(),
+            vec![frontend_credential.clone()],
+            vec![ControlPlaneAdminAuthCredentialInput {
                 instance_id: "admin-1".to_owned(),
                 credential_id: "admin-1".to_owned(),
                 credential_version: 1,
                 secret: b"admin-secret".to_vec(),
-            })
-            .unwrap();
-        let verifier = Arc::new(
-            ControlPlaneUnixAuthVerifier::new_empty("startup-order-cluster")
-                .unwrap()
-                .with_frontend_credentials(vec![frontend_credential.clone()])
-                .unwrap()
-                .with_admin_credentials(vec![admin_credential])
-                .unwrap(),
-        );
-        let client_credential = frontend_credential
-            .scoped_for_cluster("startup-order-cluster")
-            .unwrap();
+            }],
+        )
+        .unwrap();
         let ordinary_listener = ordinary_listeners.pop().unwrap();
         let policy = ControlPlaneRpcServerPolicy::new(
             ControlPlaneRpcServerRole::Ordinary,
@@ -5858,13 +5684,17 @@ mod tests {
             CONTROL_PLANE_RPC_PRE_AUTH_BYTE_BUDGET,
         )
         .unwrap()
-        .with_auth_verifier(verifier);
+        .with_server_auth(&server_auth);
         let _server = spawn_control_plane_rpc_listener_loop(ordinary_listener, authority, policy);
         let now_ms = storage::clock::current_time_millis();
-        let status = AuthenticatedUnixControlPlaneClient::new(
-            UnixControlPlaneClient::new(ordinary_path),
-            client_credential,
+        let status = storage::ControlPlaneFrontendClient::with_socket_paths(
+            [ordinary_path],
+            Some("startup-order-cluster"),
+            Some("frontend-1"),
+            vec![frontend_credential],
+            None,
         )
+        .unwrap()
         .runtime_map_status(now_ms)
         .expect("freshly signed request should succeed after replay and binding");
         assert_eq!(status.pg_routes(), 0);
@@ -6458,15 +6288,17 @@ mod tests {
                 credential_version: 7,
                 secret: BinarySecretConfigValue::from_utf8("storage-node-2-secret".to_string()),
             }];
-        let storage_credential = configured_storage_node_auth_credential(
-            &config.control_plane_storage_auth_credentials[0],
-        )
-        .expect("test storage-node credential should build");
-        let verifier = Arc::new(
-            ControlPlaneUnixAuthVerifier::new("control-auth", vec![storage_credential])
-                .expect("test storage-node verifier should build"),
-        );
-        let verifier_for_assert = Arc::clone(&verifier);
+        config.control_plane_admin_auth_instance_id = Some("admin-1".to_string());
+        config.control_plane_admin_auth_credentials =
+            vec![ConfiguredControlPlaneAdminAuthCredential {
+                instance_id: "admin-1".to_string(),
+                credential_id: "admin".to_string(),
+                credential_version: 1,
+                secret: BinarySecretConfigValue::from_utf8("admin-secret".to_string()),
+            }];
+        let server_auth = build_control_plane_rpc_server_auth(&config)
+            .expect("test storage-node server auth should build");
+        let server_auth_for_assert = server_auth.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let store = FileControlPlaneStore::new(state_path);
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -6477,7 +6309,7 @@ mod tests {
             listener,
             Arc::new(Mutex::new(authority)),
             [2_000],
-            Some(verifier),
+            Some(server_auth),
         );
 
         let mut client = build_storage_node_control_plane_client(
@@ -6508,13 +6340,13 @@ mod tests {
             refresh.runtime_map().nodes()[0].endpoint(),
             "/tmp/argmin-node-2.sock"
         );
-        let metrics = verifier_for_assert.metrics_snapshot();
-        assert_eq!(metrics.accepted_total(), 1);
-        assert_eq!(
-            metrics.accepted_for_operation(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
-            1
+        let diagnostics = server_auth_for_assert.diagnostics().unwrap();
+        assert!(diagnostics.contains("accepted_total=1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("accepted_by_operation{operation=\"StorageRuntimeMapRefresh\"} 1"),
+            "{diagnostics}"
         );
-        assert_eq!(metrics.rejected_total(), 0);
+        assert!(diagnostics.contains("rejected_total=0"), "{diagnostics}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6587,16 +6419,17 @@ mod tests {
                 credential_version: 7,
                 secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
             }];
-        let frontend_credential =
-            configured_frontend_auth_credential(&config.control_plane_frontend_auth_credentials[0])
-                .expect("test frontend credential should build");
-        let verifier = Arc::new(
-            ControlPlaneUnixAuthVerifier::new_empty("control-auth")
-                .unwrap()
-                .with_frontend_credentials(vec![frontend_credential])
-                .expect("test frontend verifier should build"),
-        );
-        let verifier_for_assert = Arc::clone(&verifier);
+        config.control_plane_admin_auth_instance_id = Some("admin-1".to_string());
+        config.control_plane_admin_auth_credentials =
+            vec![ConfiguredControlPlaneAdminAuthCredential {
+                instance_id: "admin-1".to_string(),
+                credential_id: "admin".to_string(),
+                credential_version: 1,
+                secret: BinarySecretConfigValue::from_utf8("admin-secret".to_string()),
+            }];
+        let server_auth = build_control_plane_rpc_server_auth(&config)
+            .expect("test frontend server auth should build");
+        let server_auth_for_assert = server_auth.clone();
         let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
         let store = FileControlPlaneStore::new(state_path);
         let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
@@ -6607,7 +6440,7 @@ mod tests {
             listener,
             Arc::new(Mutex::new(authority)),
             [2_000],
-            Some(verifier),
+            Some(server_auth),
         );
 
         let client = build_frontend_control_plane_client(&config, socket_path.to_str().unwrap())
@@ -6617,13 +6450,13 @@ mod tests {
                 .expect("authenticated frontend runtime-map read should succeed");
 
         server.join().unwrap();
-        let metrics = verifier_for_assert.metrics_snapshot();
-        assert_eq!(metrics.accepted_total(), 1);
-        assert_eq!(
-            metrics.accepted_for_operation(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
-            1
+        let diagnostics = server_auth_for_assert.diagnostics().unwrap();
+        assert!(diagnostics.contains("accepted_total=1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("accepted_by_operation{operation=\"FrontendRuntimeMapRead\"} 1"),
+            "{diagnostics}"
         );
-        assert_eq!(metrics.rejected_total(), 0);
+        assert!(diagnostics.contains("rejected_total=0"), "{diagnostics}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -6691,7 +6524,7 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_unix_auth_verifier_includes_frontend_credentials() {
+    fn control_plane_rpc_server_auth_includes_frontend_credentials() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("control-auth".to_string());
         config.control_plane_frontend_auth_credentials =
@@ -6709,24 +6542,44 @@ mod tests {
                 secret: BinarySecretConfigValue::from_utf8("admin-1-secret".to_string()),
             }];
 
-        let verifier = build_control_plane_unix_auth_verifier(&config)
-            .expect("frontend auth verifier should build")
-            .expect("frontend auth verifier should be enabled");
-        let status = verifier.status_snapshot();
+        let auth = build_control_plane_rpc_server_auth(&config)
+            .expect("frontend server auth should build");
+        let diagnostics = auth.diagnostics().expect("server auth should be enabled");
 
-        assert!(status.required());
-        assert!(!status.storage_node_heartbeat_required());
-        assert!(status.frontend_runtime_map_required());
-        assert!(status.admin_control_plane_required());
-        assert_eq!(status.storage_node_credentials().len(), 0);
-        assert_eq!(status.frontend_credentials().len(), 1);
-        assert_eq!(status.frontend_credentials()[0].instance_id(), "frontend-1");
-        assert_eq!(status.admin_credentials().len(), 1);
-        assert_eq!(status.admin_credentials()[0].instance_id(), "admin-1");
+        assert!(diagnostics.contains("required=true"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("storage_node_heartbeat_required=false"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("frontend_runtime_map_required=true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("admin_control_plane_required=true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("storage_node_credentials=0"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("frontend_credentials=1"),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("admin_credentials=1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("instance_id=\"frontend-1\""),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("instance_id=\"admin-1\""),
+            "{diagnostics}"
+        );
     }
 
     #[test]
-    fn control_plane_unix_auth_verifier_rejects_frontend_without_admin_credentials() {
+    fn control_plane_rpc_server_auth_rejects_frontend_without_admin_credentials() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("control-auth".to_string());
         config.control_plane_frontend_auth_credentials =
@@ -6737,14 +6590,14 @@ mod tests {
                 secret: BinarySecretConfigValue::from_utf8("frontend-1-secret".to_string()),
             }];
 
-        let error = build_control_plane_unix_auth_verifier(&config)
-            .expect_err("frontend auth verifier should require admin credentials");
+        let error = build_control_plane_rpc_server_auth(&config)
+            .expect_err("frontend server auth should require admin credentials");
 
-        assert!(error.contains("ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS is required"));
+        assert!(error.contains("admin control-plane credentials are required"));
     }
 
     #[test]
-    fn control_plane_unix_auth_verifier_includes_admin_credentials() {
+    fn control_plane_rpc_server_auth_includes_admin_credentials() {
         let mut config = test_server_config();
         config.control_plane_auth_cluster_id = Some("control-auth".to_string());
         config.control_plane_admin_auth_credentials =
@@ -6755,19 +6608,36 @@ mod tests {
                 secret: BinarySecretConfigValue::from_utf8("admin-1-secret".to_string()),
             }];
 
-        let verifier = build_control_plane_unix_auth_verifier(&config)
-            .expect("admin auth verifier should build")
-            .expect("admin auth verifier should be enabled");
-        let status = verifier.status_snapshot();
+        let auth =
+            build_control_plane_rpc_server_auth(&config).expect("admin server auth should build");
+        let diagnostics = auth.diagnostics().expect("server auth should be enabled");
 
-        assert!(status.required());
-        assert!(!status.storage_node_heartbeat_required());
-        assert!(!status.frontend_runtime_map_required());
-        assert!(status.admin_control_plane_required());
-        assert_eq!(status.storage_node_credentials().len(), 0);
-        assert_eq!(status.frontend_credentials().len(), 0);
-        assert_eq!(status.admin_credentials().len(), 1);
-        assert_eq!(status.admin_credentials()[0].instance_id(), "admin-1");
+        assert!(diagnostics.contains("required=true"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("storage_node_heartbeat_required=false"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("frontend_runtime_map_required=false"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("admin_control_plane_required=true"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("storage_node_credentials=0"),
+            "{diagnostics}"
+        );
+        assert!(
+            diagnostics.contains("frontend_credentials=0"),
+            "{diagnostics}"
+        );
+        assert!(diagnostics.contains("admin_credentials=1"), "{diagnostics}");
+        assert!(
+            diagnostics.contains("instance_id=\"admin-1\""),
+            "{diagnostics}"
+        );
     }
 
     #[test]
@@ -9249,156 +9119,6 @@ mod tests {
 
         assert_eq!(status.credential_id(), Some("raft-node-2"));
         assert_eq!(status.credential_version(), Some(2));
-    }
-
-    #[test]
-    fn control_plane_unix_auth_diagnostics_are_redacted() {
-        let verifier = ControlPlaneUnixAuthVerifier::new(
-            "control-auth",
-            vec![
-                ControlPlaneStorageNodeAuthCredential::new(
-                    ControlPlaneStorageNodeAuthCredentialInput {
-                        node_id: NodeId::new(7),
-                        credential_id: "storage-node-7".to_owned(),
-                        credential_version: 3,
-                        secret: b"storage-node-7-test-secret".to_vec(),
-                    },
-                )
-                .expect("test storage-node credential should build"),
-                ControlPlaneStorageNodeAuthCredential::new(
-                    ControlPlaneStorageNodeAuthCredentialInput {
-                        node_id: NodeId::new(7),
-                        credential_id: "storage-node-7".to_owned(),
-                        credential_version: 4,
-                        secret: b"storage-node-7-new-test-secret".to_vec(),
-                    },
-                )
-                .expect("test rotated storage-node credential should build"),
-            ],
-        )
-        .expect("test Unix auth verifier should build")
-        .with_frontend_credentials(vec![
-            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
-                instance_id: "frontend-1".to_owned(),
-                credential_id: "frontend".to_owned(),
-                credential_version: 5,
-                secret: b"frontend-1-test-secret".to_vec(),
-            })
-            .expect("test frontend credential should build"),
-            ControlPlaneFrontendAuthCredential::new(ControlPlaneFrontendAuthCredentialInput {
-                instance_id: "frontend-1".to_owned(),
-                credential_id: "frontend".to_owned(),
-                credential_version: 6,
-                secret: b"frontend-1-new-test-secret".to_vec(),
-            })
-            .expect("test rotated frontend credential should build"),
-        ])
-        .expect("test frontend credentials should install")
-        .with_admin_credentials(vec![
-            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
-                instance_id: "admin-1".to_owned(),
-                credential_id: "admin".to_owned(),
-                credential_version: 7,
-                secret: b"admin-1-test-secret".to_vec(),
-            })
-            .expect("test admin credential should build"),
-            ControlPlaneAdminAuthCredential::new(ControlPlaneAdminAuthCredentialInput {
-                instance_id: "admin-1".to_owned(),
-                credential_id: "admin".to_owned(),
-                credential_version: 8,
-                secret: b"admin-1-new-test-secret".to_vec(),
-            })
-            .expect("test rotated admin credential should build"),
-        ])
-        .expect("test admin credentials should install");
-
-        let error = verifier
-            .verify_storage_node_heartbeat_request_payload(b"not an auth envelope", 2_000)
-            .expect_err("missing auth envelope should reject");
-        assert_eq!(error.to_string(), "control-plane RPC protocol failure");
-
-        let diagnostics = format_control_plane_unix_auth_diagnostics(&verifier);
-        assert!(diagnostics.contains("required=true"), "{diagnostics}");
-        assert!(
-            diagnostics.contains("storage_node_heartbeat_required=true"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("frontend_runtime_map_required=true"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("admin_control_plane_required=true"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("cluster_id=control-auth"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("storage_node_credentials=2"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("frontend_credentials=2"),
-            "{diagnostics}"
-        );
-        assert!(diagnostics.contains("admin_credentials=2"), "{diagnostics}");
-        assert!(
-            diagnostics.contains(
-                "storage_node_credential{node_id=\"7\",credential_id=\"storage-node-7\",credential_version=\"3\"} 1"
-            ),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains(
-                "storage_node_credential{node_id=\"7\",credential_id=\"storage-node-7\",credential_version=\"4\"} 1"
-            ),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains(
-                "frontend_credential{instance_id=\"frontend-1\",credential_id=\"frontend\",credential_version=\"5\"} 1"
-            ),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains(
-                "frontend_credential{instance_id=\"frontend-1\",credential_id=\"frontend\",credential_version=\"6\"} 1"
-            ),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains(
-                "admin_credential{instance_id=\"admin-1\",credential_id=\"admin\",credential_version=\"7\"} 1"
-            ),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains(
-                "admin_credential{instance_id=\"admin-1\",credential_id=\"admin\",credential_version=\"8\"} 1"
-            ),
-            "{diagnostics}"
-        );
-        assert!(diagnostics.contains("accepted_total=0"), "{diagnostics}");
-        assert!(diagnostics.contains("rejected_total=1"), "{diagnostics}");
-        assert!(
-            diagnostics.contains("rejected_by_operation{operation=\"StorageRuntimeMapRefresh\"} 1"),
-            "{diagnostics}"
-        );
-        assert!(
-            diagnostics.contains("rejected_by_reason{reason=\"Missing\"} 1"),
-            "{diagnostics}"
-        );
-        assert!(!diagnostics.contains("storage-node-7-test-secret"));
-        assert!(!diagnostics.contains("storage-node-7-new-test-secret"));
-        assert!(!diagnostics.contains("frontend-1-test-secret"));
-        assert!(!diagnostics.contains("frontend-1-new-test-secret"));
-        assert!(!diagnostics.contains("admin-1-test-secret"));
-        assert!(!diagnostics.contains("admin-1-new-test-secret"));
-        assert!(!diagnostics.contains("payload"));
-        assert!(!diagnostics.contains("authenticator"));
-        assert!(!diagnostics.contains("not an auth envelope"));
     }
 
     #[test]

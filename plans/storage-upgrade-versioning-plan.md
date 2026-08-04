@@ -1544,6 +1544,26 @@ construction, raw status/transfer composition, public fields, derived diagnostic
 of the bounded service-client surface. Server listener/auth-verifier bootstrap, Raft-peer
 transport bootstrap, and the process-hosted authority implementation remain item 12 work.
 
+The thirty-seventh bounded slice contains control-plane RPC server authentication bootstrap. The
+process supplies only logical cluster and optional local-admin identities plus unscoped
+storage-node, frontend, and admin credential inputs to `ControlPlaneRpcServerAuth`. Storage
+validates the complete role set, requires admin credentials whenever server authentication is
+enabled, validates the actual cluster identity against the authentication-envelope codec bound,
+rejects crossed local-admin configuration, constructs every concrete credential and the
+role-aware verifier, and attaches that verifier to server policies without exposing it. The
+capability retains shared authentication metrics and owns the existing operator diagnostic
+format; its `Debug` and diagnostic output redact secrets and authentication envelopes, while
+byte-escaping every untrusted identifier into a single-line quoted value. The raw
+verifier, concrete server-side credentials, and direct policy attachment are crate-private.
+Owner-local tests pin all-role construction, rejection accounting, diagnostic shape and redaction,
+the exact 256/257-byte cluster-identity boundary, adversarial diagnostic identifiers, plain mode,
+and incomplete or crossed configuration without network use. Process tests retain the
+production authenticated frontend and storage-node request paths through the opaque capability.
+A repository check rejects process construction or formatting of raw verifier state and constrains
+the capability to construction, authentication-state observation, and redacted diagnostics.
+Server listener/resource-policy bootstrap, Raft-peer transport bootstrap, and the process-hosted
+authority implementation remain item 12 work.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1844,8 +1864,9 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     checkpoint publication, leader retry, and resolution are likewise one storage-owned operation
     using the authority's single opaque response-publication and poison domain. Operator recovery
     endpoint and credential/transport assembly plus frontend/storage-node service-client
-    bootstrap are now storage-owned. The remaining work is server listener/auth-verifier and
-    Raft-peer transport bootstrap, and the process-hosted control-plane authority implementation.
+    bootstrap and server-side authentication bootstrap are now storage-owned. The remaining work
+    is server listener/resource-policy bootstrap, Raft-peer transport bootstrap, and the
+    process-hosted control-plane authority implementation.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

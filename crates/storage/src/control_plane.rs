@@ -10657,9 +10657,19 @@ impl ControlPlaneRpcServerPolicy {
         })
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn with_auth_verifier(mut self, auth_verifier: Arc<ControlPlaneUnixAuthVerifier>) -> Self {
+    pub(crate) fn with_auth_verifier(
+        mut self,
+        auth_verifier: Arc<ControlPlaneUnixAuthVerifier>,
+    ) -> Self {
         self.auth_verifier = Some(auth_verifier);
+        self
+    }
+
+    #[must_use]
+    pub fn with_server_auth(mut self, auth: &crate::ControlPlaneRpcServerAuth) -> Self {
+        self.auth_verifier.clone_from(&auth.verifier);
         self
     }
 
@@ -10989,7 +10999,7 @@ pub struct AuthenticatedUnixControlPlaneClient {
 }
 
 #[derive(Debug, Clone)]
-pub struct ControlPlaneUnixAuthVerifier {
+pub(crate) struct ControlPlaneUnixAuthVerifier {
     cluster_id: String,
     storage_node_credentials: BTreeMap<NodeId, Vec<ControlPlaneStorageNodeAuthCredential>>,
     frontend_credentials: BTreeMap<String, Vec<ControlPlaneFrontendAuthCredential>>,
@@ -10998,7 +11008,7 @@ pub struct ControlPlaneUnixAuthVerifier {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneStorageNodeAuthCredential {
+pub(crate) struct ControlPlaneStorageNodeAuthCredential {
     node_id: NodeId,
     credential_id: String,
     credential_version: u64,
@@ -11036,7 +11046,7 @@ impl std::fmt::Debug for ControlPlaneStorageNodeAuthCredential {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneFrontendAuthCredential {
+pub(crate) struct ControlPlaneFrontendAuthCredential {
     instance_id: String,
     credential_id: String,
     credential_version: u64,
@@ -11074,7 +11084,7 @@ impl std::fmt::Debug for ControlPlaneFrontendAuthCredential {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub struct ControlPlaneAdminAuthCredential {
+pub(crate) struct ControlPlaneAdminAuthCredential {
     instance_id: String,
     credential_id: String,
     credential_version: u64,
@@ -11112,7 +11122,7 @@ impl std::fmt::Debug for ControlPlaneAdminAuthCredential {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneUnixAuthCredentialStatus {
+pub(crate) struct ControlPlaneUnixAuthCredentialStatus {
     node_id: NodeId,
     credential_id: String,
     credential_version: u64,
@@ -11136,7 +11146,7 @@ impl ControlPlaneUnixAuthCredentialStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneUnixFrontendAuthCredentialStatus {
+pub(crate) struct ControlPlaneUnixFrontendAuthCredentialStatus {
     instance_id: String,
     credential_id: String,
     credential_version: u64,
@@ -11160,7 +11170,7 @@ impl ControlPlaneUnixFrontendAuthCredentialStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneUnixAdminAuthCredentialStatus {
+pub(crate) struct ControlPlaneUnixAdminAuthCredentialStatus {
     instance_id: String,
     credential_id: String,
     credential_version: u64,
@@ -11184,7 +11194,7 @@ impl ControlPlaneUnixAdminAuthCredentialStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneUnixAuthStatusSnapshot {
+pub(crate) struct ControlPlaneUnixAuthStatusSnapshot {
     required: bool,
     storage_node_heartbeat_required: bool,
     frontend_runtime_map_required: bool,
@@ -11244,7 +11254,7 @@ impl ControlPlaneUnixAuthStatusSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ControlPlaneUnixAuthMetricsSnapshot {
+pub(crate) struct ControlPlaneUnixAuthMetricsSnapshot {
     accepted_total: u64,
     rejected_total: u64,
     accepted_by_operation: BTreeMap<ControlPlaneAuthOperation, u64>,
@@ -11264,6 +11274,7 @@ impl ControlPlaneUnixAuthMetricsSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn accepted_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
         self.accepted_by_operation
             .get(&operation)
@@ -11272,6 +11283,7 @@ impl ControlPlaneUnixAuthMetricsSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn rejected_for_operation(&self, operation: ControlPlaneAuthOperation) -> u64 {
         self.rejected_by_operation
             .get(&operation)
@@ -11280,6 +11292,7 @@ impl ControlPlaneUnixAuthMetricsSnapshot {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn rejected_for_reason(&self, reason: ControlPlaneAuthRejectionReason) -> u64 {
         self.rejected_by_reason.get(&reason).copied().unwrap_or(0)
     }
@@ -14479,11 +14492,7 @@ impl ControlPlaneUnixAuthVerifier {
         Ok(self)
     }
 
-    #[must_use]
-    pub fn cluster_id(&self) -> &str {
-        &self.cluster_id
-    }
-
+    #[cfg(test)]
     #[must_use]
     pub fn metrics_snapshot(&self) -> ControlPlaneUnixAuthMetricsSnapshot {
         self.metrics.snapshot()
@@ -14560,6 +14569,7 @@ impl ControlPlaneUnixAuthVerifier {
         !self.admin_credentials.is_empty()
     }
 
+    #[cfg(test)]
     pub fn verify_storage_node_heartbeat_request_payload(
         &self,
         payload: &[u8],

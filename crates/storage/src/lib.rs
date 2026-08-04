@@ -35,6 +35,7 @@ pub(crate) mod control_plane_lease;
 mod control_plane_operator_admin;
 mod control_plane_pg_admin;
 pub mod control_plane_raft;
+mod control_plane_server_auth;
 mod control_plane_service_client;
 pub(crate) mod data_dir;
 pub mod deadline_io;
@@ -108,6 +109,7 @@ pub use control_plane_pg_admin::{
     ControlPlanePgAdminInputError, ControlPlanePgMetadataTransferInstall,
     ControlPlanePgStatusClient,
 };
+pub use control_plane_server_auth::{ControlPlaneRpcServerAuth, ControlPlaneRpcServerAuthError};
 pub use control_plane_service_client::{
     ControlPlaneFrontendClient, ControlPlaneServiceClientBootstrapError,
     ControlPlaneStorageNodeClient,
