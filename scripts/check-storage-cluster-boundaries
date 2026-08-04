@@ -3564,6 +3564,53 @@ fail_with_matches \
     "Raft logical command, authority-clock, checkpoint, and RPC-serving composition must remain inside the storage-owned authority host" \
     "$argmin_raft_authority_host_leaks"
 
+argmin_raft_authority_startup_leaks=$(
+    rg -n --color=never \
+        '\.(open_durable_authority|durability_lifecycle|durability_publication|authority_clock_checkpoint_binding|bind_peer_server_durability|peer_server_durability|spawn_checkpoint_monitor|initialize_configured_membership_if_needed|wait_for_current_leader|establish_static_initial_topology|durability_metric_snapshots|durable_wal_monitor_snapshot|trigger_snapshot_applied|trigger_local_snapshot_applied|purge_log_through_snapshot|store_durable_restart_artifact|capture_durable_restart_checkpoint|persist_durable_restart_checkpoint|publish_static_identity_restart_checkpoint|store_restart_artifact|establish_static_outer_identity)\(|ControlPlaneRaftAuthority::new_experimental_single_node_durable\(|ControlPlaneRaftAuthorityHost::start_durable\(|ControlPlaneRaftPeerServerBootstrap' \
+        crates/argmin-s3/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Durable Raft authority open, peer/monitor start, membership, topology, and initial publication sequencing must remain inside storage" \
+    "$argmin_raft_authority_startup_leaks"
+
+public_raft_authority_startup_bypasses=$(
+    rg -n --color=never \
+        '^[[:space:]]*pub[[:space:]]+(async[[:space:]]+)?fn[[:space:]]+(new_experimental_single_node_durable|open_durable_authority|durability_lifecycle|durability_publication|authority_clock_checkpoint_binding|bind_peer_server_durability|peer_server_durability|spawn_checkpoint_monitor|initialize_configured_membership_if_needed|wait_for_current_leader|establish_static_initial_topology|durability_metric_snapshots|durable_wal_monitor_snapshot|trigger_snapshot_applied|trigger_local_snapshot_applied|purge_log_through_snapshot|store_durable_restart_artifact|capture_durable_restart_checkpoint|persist_durable_restart_checkpoint|publish_static_identity_restart_checkpoint|store_restart_artifact|establish_static_outer_identity|start_durable)\(' \
+        crates/storage/src/control_plane_raft.rs \
+        crates/storage/src/control_plane_raft_durability.rs \
+        crates/storage/src/control_plane_raft_host.rs \
+        crates/storage/src/control_plane_raft_peer_bootstrap.rs \
+        || true
+)
+fail_with_matches \
+    "Low-level durable Raft authority startup operations must remain private to storage" \
+    "$public_raft_authority_startup_bypasses"
+
+raft_authority_startup_surface_leaks=$(
+    awk '
+    /pub struct (PreparedControlPlaneRaftAuthority|ControlPlaneRaftAuthorityService)[[:space:]]*\{/ {
+        in_startup = 1
+        depth = 0
+    }
+    in_startup {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_startup = 0
+        }
+    }
+    ' crates/storage/src/control_plane_raft_peer_bootstrap.rs
+)
+fail_with_matches \
+    "Prepared and running Raft authority startup capabilities must not expose their retained lifecycle components" \
+    "$raft_authority_startup_surface_leaks"
+
 raft_authority_host_surface_leaks=$(
     awk '
     /pub struct ControlPlaneRaftAuthorityHost[[:space:]]*\{/ {

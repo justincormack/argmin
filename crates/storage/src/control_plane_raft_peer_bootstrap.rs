@@ -24,12 +24,16 @@ use crate::control_plane_raft::ControlPlaneRaftPeerServerCheckpoint;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::control_plane_raft::ControlPlaneRaftPeerTestClient;
 use crate::control_plane_raft::{
-    ControlPlaneRaftAuthority, ControlPlaneRaftNodeId, ControlPlaneRaftPeerAuthPolicy,
-    ControlPlaneRaftPeerClientEndpoint, ControlPlaneRaftPeerNetworkConfig,
-    ControlPlaneRaftPeerServerDurability, ControlPlaneRaftPeerServerListener,
-    ControlPlaneRaftPeerServerPolicy, ControlPlaneRaftPeerTransportLimits,
-    ControlPlaneRaftPeerTransportPolicy,
+    ControlPlaneRaftAuthority, ControlPlaneRaftLogId, ControlPlaneRaftNodeId,
+    ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerClientEndpoint,
+    ControlPlaneRaftPeerNetworkConfig, ControlPlaneRaftPeerServerDurability,
+    ControlPlaneRaftPeerServerListener, ControlPlaneRaftPeerServerPolicy,
+    ControlPlaneRaftPeerTransportLimits, ControlPlaneRaftPeerTransportPolicy,
 };
+use crate::control_plane_raft_durability::{
+    ControlPlaneRaftCheckpointMonitor, ControlPlaneRaftOuterIdentityPublisher,
+};
+use crate::control_plane_raft_host::ControlPlaneRaftAuthorityHost;
 use crate::StaticInitialControlPlaneTopology;
 
 /// Logical credential material for one Raft peer principal.
@@ -191,6 +195,130 @@ pub struct ControlPlaneRaftPeerBootstrap {
     replicated: Option<ReplicatedPeerBootstrap>,
 }
 
+/// Deployment-owned state of the outer static-cluster identity.
+///
+/// Storage uses this logical state to select durable-authority recovery and
+/// to decide whether initial topology and outer identity publication are
+/// required. The process never supplies the corresponding checkpoint or
+/// membership decisions.
+pub enum ControlPlaneRaftOuterIdentityStartup<'a> {
+    NotConfigured,
+    Established,
+    Publish(&'a dyn ControlPlaneRaftOuterIdentityPublisher),
+}
+
+impl fmt::Debug for ControlPlaneRaftOuterIdentityStartup<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NotConfigured => "NotConfigured",
+            Self::Established => "Established",
+            Self::Publish(_) => "Publish(<opaque>)",
+        })
+    }
+}
+
+impl ControlPlaneRaftOuterIdentityStartup<'_> {
+    fn is_configured(&self) -> bool {
+        !matches!(self, Self::NotConfigured)
+    }
+
+    fn is_established(&self) -> bool {
+        matches!(self, Self::Established)
+    }
+}
+
+/// A durable authority whose replay and validation have completed, but whose
+/// inbound peer listeners have not yet been published.
+///
+/// This typestate lets the deployment bind sockets after durable replay while
+/// preventing membership, checkpoint, topology, or host composition before
+/// storage starts the prepared authority.
+pub struct PreparedControlPlaneRaftAuthority<'a> {
+    bootstrap: ControlPlaneRaftPeerBootstrap,
+    authority: Arc<ControlPlaneRaftAuthority>,
+    durability: crate::control_plane_raft_durability::ControlPlaneRaftAuthorityDurability,
+    outer_identity: ControlPlaneRaftOuterIdentityStartup<'a>,
+}
+
+impl fmt::Debug for PreparedControlPlaneRaftAuthority<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedControlPlaneRaftAuthority")
+            .field("bootstrap", &self.bootstrap)
+            .field("authority", &"<opaque>")
+            .field("durability", &self.durability)
+            .field("outer_identity", &self.outer_identity)
+            .finish()
+    }
+}
+
+/// One fully opened durable Raft authority service.
+///
+/// The host, checkpoint monitor, and peer listener loops are issued from one
+/// authority and retained together. Callers receive only the logical host and
+/// cannot replace any member of its durability/publication lifecycle.
+#[must_use = "dropping the service detaches its authority worker threads"]
+pub struct ControlPlaneRaftAuthorityService {
+    host: ControlPlaneRaftAuthorityHost,
+    _checkpoint_monitor: ControlPlaneRaftCheckpointMonitor,
+    _peer_server_loops: Option<ControlPlaneRaftPeerServerLoops>,
+    multi_node: bool,
+}
+
+struct AuthorityStartupFailureGuard {
+    authority: Arc<ControlPlaneRaftAuthority>,
+    armed: bool,
+}
+
+impl AuthorityStartupFailureGuard {
+    fn new(authority: Arc<ControlPlaneRaftAuthority>) -> Self {
+        Self {
+            authority,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for AuthorityStartupFailureGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Ok(publication) = self.authority.durability_publication() {
+                publication.poison("durable Raft authority startup did not complete");
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ControlPlaneRaftAuthorityService {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ControlPlaneRaftAuthorityService")
+            .field("host", &self.host)
+            .field("multi_node", &self.multi_node)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ControlPlaneRaftAuthorityService {
+    #[must_use]
+    pub fn host(&self) -> &ControlPlaneRaftAuthorityHost {
+        &self.host
+    }
+
+    pub fn host_mut(&mut self) -> &mut ControlPlaneRaftAuthorityHost {
+        &mut self.host
+    }
+
+    #[must_use]
+    pub fn is_multi_node(&self) -> bool {
+        self.multi_node
+    }
+}
+
 impl fmt::Debug for ControlPlaneRaftPeerBootstrap {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -326,7 +454,7 @@ impl ControlPlaneRaftPeerBootstrap {
             .map_or(1, |peer| peer.policy.peers().len())
     }
 
-    pub async fn open_durable_authority(
+    pub(crate) async fn open_durable_authority(
         &self,
         artifact_path: &Path,
         static_identity_established: bool,
@@ -362,10 +490,268 @@ impl ControlPlaneRaftPeerBootstrap {
         .await
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn open_durable_authority_for_test(
+        &self,
+        artifact_path: &Path,
+        static_identity_established: bool,
+    ) -> Result<ControlPlaneRaftAuthority, ControlPlaneError> {
+        self.open_durable_authority(artifact_path, static_identity_established)
+            .await
+    }
+
+    /// Open and validate durable state before the deployment publishes any
+    /// inbound peer listener.
+    ///
+    /// The returned typestate owns the exact authority and durability
+    /// lifecycle needed to complete startup after process-owned socket
+    /// binding.
+    pub async fn prepare_durable_authority<'a>(
+        &self,
+        runtime: Handle,
+        artifact_path: &Path,
+        outer_identity: ControlPlaneRaftOuterIdentityStartup<'a>,
+    ) -> Result<PreparedControlPlaneRaftAuthority<'a>, ControlPlaneError> {
+        if outer_identity.is_configured()
+            && self
+                .replicated
+                .as_ref()
+                .and_then(|peer| peer.static_initial_topology.as_ref())
+                .is_none()
+        {
+            return Err(ControlPlaneError::static_topology_failure(
+                "static outer identity requires a certified initial topology",
+            ));
+        }
+
+        let authority = Arc::new(
+            self.open_durable_authority(artifact_path, outer_identity.is_established())
+                .await?,
+        );
+        let durability = authority.durability_lifecycle(runtime)?;
+        Ok(PreparedControlPlaneRaftAuthority {
+            bootstrap: self.clone(),
+            authority,
+            durability,
+            outer_identity,
+        })
+    }
+
     #[must_use]
     pub fn auth_diagnostics(&self) -> Option<String> {
         let peer = self.replicated.as_ref()?;
         Some(format_auth_diagnostics(&peer.policy))
+    }
+}
+
+impl PreparedControlPlaneRaftAuthority<'_> {
+    /// Publish peer listeners and complete startup as one storage-owned
+    /// lifecycle.
+    ///
+    /// Storage owns checkpoint monitoring, membership initialization, startup
+    /// convergence, certified topology establishment, initial durability
+    /// publication, and steady-state host construction in that order.
+    pub async fn start(
+        self,
+        listener_inputs: Vec<ControlPlaneRaftPeerServerListenerInput>,
+        pre_auth_byte_budget: usize,
+        startup_timeout: Duration,
+        terminal_failure_handler: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<ControlPlaneRaftAuthorityService, ControlPlaneError> {
+        let Self {
+            bootstrap,
+            authority,
+            durability,
+            outer_identity,
+        } = self;
+        let mut startup_failure_guard = AuthorityStartupFailureGuard::new(Arc::clone(&authority));
+        let runtime = durability.runtime();
+        let peer_server_durability = durability.peer_server_durability()?;
+        let peer_server = ControlPlaneRaftPeerServerBootstrap::for_authority(
+            Arc::clone(&authority),
+            listener_inputs,
+            pre_auth_byte_budget,
+        )
+        .map_err(control_plane_peer_startup_error)?;
+
+        // Monitoring starts before the peer endpoint is published, so every
+        // remotely applied command is covered by the durability lifecycle.
+        let checkpoint_monitor =
+            durability.spawn_checkpoint_monitor(Arc::clone(&terminal_failure_handler))?;
+        let peer_server_loops = peer_server
+            .map(|server| {
+                server.serve(
+                    runtime.clone(),
+                    peer_server_durability,
+                    terminal_failure_handler,
+                )
+            })
+            .transpose()
+            .map_err(control_plane_peer_startup_error)?;
+
+        let initialized_membership = authority
+            .initialize_configured_membership_if_needed()
+            .await?;
+        if initialized_membership {
+            durability.store_restart_artifact()?;
+        }
+
+        if bootstrap.startup_requires_local_leader() {
+            authority
+                .wait_for_current_leader(
+                    bootstrap.local_node_id,
+                    startup_timeout,
+                    "single-node control-plane startup leadership",
+                )
+                .await?;
+            wait_for_local_authority_serving(
+                &authority,
+                startup_timeout,
+                "single-node control-plane startup",
+            )
+            .await?;
+        } else if !outer_identity.is_configured() {
+            wait_for_startup_catch_up(
+                &authority,
+                startup_timeout,
+                "control-plane startup committed replay",
+            )
+            .await?;
+        }
+
+        if outer_identity.is_configured() {
+            let topology = bootstrap
+                .replicated
+                .as_ref()
+                .and_then(|peer| peer.static_initial_topology.as_ref())
+                .ok_or_else(|| {
+                    ControlPlaneError::static_topology_failure(
+                        "static outer identity requires a certified initial topology",
+                    )
+                })?;
+            authority
+                .establish_static_initial_topology(topology, !outer_identity.is_established())
+                .await?;
+        }
+
+        match outer_identity {
+            ControlPlaneRaftOuterIdentityStartup::Publish(publisher) => {
+                durability.establish_static_outer_identity(publisher)?;
+            }
+            ControlPlaneRaftOuterIdentityStartup::NotConfigured
+            | ControlPlaneRaftOuterIdentityStartup::Established => {
+                durability.store_restart_artifact()?;
+            }
+        }
+
+        let host = ControlPlaneRaftAuthorityHost::start_durable(runtime, authority)?;
+        startup_failure_guard.disarm();
+        Ok(ControlPlaneRaftAuthorityService {
+            host,
+            _checkpoint_monitor: checkpoint_monitor,
+            _peer_server_loops: peer_server_loops,
+            multi_node: bootstrap.is_multi_node(),
+        })
+    }
+}
+
+fn control_plane_peer_startup_error(
+    error: ControlPlaneRaftPeerBootstrapError,
+) -> ControlPlaneError {
+    ControlPlaneError::invariant_failure(format!(
+        "control-plane Raft peer startup configuration failed: {error}"
+    ))
+}
+
+async fn wait_for_local_authority_serving(
+    authority: &ControlPlaneRaftAuthority,
+    timeout: Duration,
+    message: &'static str,
+) -> Result<(), ControlPlaneError> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if authority.status().await?.linearized_authority_serving() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ControlPlaneError::startup_timeout(format!(
+                "local OpenRaft authority did not become serving within {timeout:?}: {message}"
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn wait_for_startup_catch_up(
+    authority: &ControlPlaneRaftAuthority,
+    timeout: Duration,
+    message: &'static str,
+) -> Result<(), ControlPlaneError> {
+    wait_for_startup_catch_up_from(authority, timeout, message).await
+}
+
+trait StartupCatchUpSource {
+    type Position: Copy + Eq;
+
+    async fn committed_and_applied(
+        &self,
+    ) -> Result<(Option<Self::Position>, Option<Self::Position>), ControlPlaneError>;
+
+    async fn wait_for_applied(
+        &self,
+        position: Self::Position,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError>;
+}
+
+impl StartupCatchUpSource for ControlPlaneRaftAuthority {
+    type Position = ControlPlaneRaftLogId;
+
+    async fn committed_and_applied(
+        &self,
+    ) -> Result<(Option<Self::Position>, Option<Self::Position>), ControlPlaneError> {
+        let status = self.status().await?;
+        Ok((status.committed(), status.applied()))
+    }
+
+    async fn wait_for_applied(
+        &self,
+        position: Self::Position,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        self.wait_for_applied_log_id(position, timeout, message)
+            .await
+    }
+}
+
+async fn wait_for_startup_catch_up_from<S>(
+    source: &S,
+    timeout: Duration,
+    message: &'static str,
+) -> Result<(), ControlPlaneError>
+where
+    S: StartupCatchUpSource,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (committed, applied) = source.committed_and_applied().await?;
+        let Some(committed) = committed else {
+            return Ok(());
+        };
+        if applied == Some(committed) {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(ControlPlaneError::startup_timeout(format!(
+                "OpenRaft startup did not apply through committed state within {timeout:?}: {message}"
+            )));
+        }
+        source
+            .wait_for_applied(committed, deadline.saturating_duration_since(now), message)
+            .await?;
     }
 }
 
@@ -529,14 +915,14 @@ fn format_auth_diagnostics(policy: &ControlPlaneRaftPeerTransportPolicy) -> Stri
     diagnostics
 }
 
-pub struct ControlPlaneRaftPeerServerBootstrap {
+pub(crate) struct ControlPlaneRaftPeerServerBootstrap {
     authority: Arc<ControlPlaneRaftAuthority>,
     listeners: Vec<ControlPlaneRaftPeerServerListener>,
     policy: ControlPlaneRaftPeerServerPolicy,
 }
 
 #[must_use = "dropping the handles detaches the Raft peer server loops"]
-pub struct ControlPlaneRaftPeerServerLoops {
+pub(crate) struct ControlPlaneRaftPeerServerLoops {
     handles: Vec<thread::JoinHandle<()>>,
 }
 
@@ -573,7 +959,7 @@ impl fmt::Debug for ControlPlaneRaftPeerServerLoops {
 }
 
 impl ControlPlaneRaftPeerServerBootstrap {
-    pub fn for_authority(
+    pub(crate) fn for_authority(
         authority: Arc<ControlPlaneRaftAuthority>,
         listeners: Vec<ControlPlaneRaftPeerServerListenerInput>,
         pre_auth_byte_budget: usize,
@@ -632,7 +1018,7 @@ impl ControlPlaneRaftPeerServerBootstrap {
         }))
     }
 
-    pub fn serve(
+    pub(crate) fn serve(
         self,
         runtime: Handle,
         durability: ControlPlaneRaftPeerServerDurability,
@@ -750,6 +1136,8 @@ mod tests {
     use super::*;
     use crate::control_plane_auth::{ControlPlaneAuthOperation, ControlPlaneAuthRejectionReason};
     use crate::control_plane_raft::ControlPlaneRaftTopologyIdentity;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     struct NoopPeerServerCheckpoint;
 
@@ -760,6 +1148,204 @@ mod tests {
         ) -> Result<(), ControlPlaneError> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn startup_catch_up_rechecks_an_advanced_committed_watermark() {
+        struct ScriptedCatchUpSource {
+            statuses: Mutex<VecDeque<(Option<u64>, Option<u64>)>>,
+            waited_for: Mutex<Vec<u64>>,
+        }
+
+        impl StartupCatchUpSource for ScriptedCatchUpSource {
+            type Position = u64;
+
+            async fn committed_and_applied(
+                &self,
+            ) -> Result<(Option<Self::Position>, Option<Self::Position>), ControlPlaneError>
+            {
+                Ok(self
+                    .statuses
+                    .lock()
+                    .expect("scripted status mutex should not be poisoned")
+                    .pop_front()
+                    .expect("catch-up loop requested an unexpected status"))
+            }
+
+            async fn wait_for_applied(
+                &self,
+                position: Self::Position,
+                _timeout: Duration,
+                _message: &'static str,
+            ) -> Result<(), ControlPlaneError> {
+                self.waited_for
+                    .lock()
+                    .expect("scripted wait mutex should not be poisoned")
+                    .push(position);
+                Ok(())
+            }
+        }
+
+        let source = ScriptedCatchUpSource {
+            statuses: Mutex::new(VecDeque::from([
+                (Some(1), None),
+                (Some(2), Some(1)),
+                (Some(2), Some(2)),
+            ])),
+            waited_for: Mutex::new(Vec::new()),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("catch-up test runtime should build");
+
+        runtime
+            .block_on(wait_for_startup_catch_up_from(
+                &source,
+                Duration::from_secs(1),
+                "scripted advancing committed watermark",
+            ))
+            .expect("catch-up should follow the advanced committed watermark");
+
+        assert_eq!(
+            *source
+                .waited_for
+                .lock()
+                .expect("scripted wait mutex should not be poisoned"),
+            vec![1, 2]
+        );
+        assert!(source
+            .statuses
+            .lock()
+            .expect("scripted status mutex should not be poisoned")
+            .is_empty());
+    }
+
+    #[test]
+    fn single_node_startup_returns_only_after_membership_and_checkpoint_publication() {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("startup test runtime should build");
+        let bootstrap = ControlPlaneRaftPeerBootstrap::single_node("startup-owner", 1);
+        let prepared = runtime
+            .block_on(bootstrap.prepare_durable_authority(
+                runtime.handle().clone(),
+                &artifact_path,
+                ControlPlaneRaftOuterIdentityStartup::NotConfigured,
+            ))
+            .expect("durable replay should prepare the authority");
+        let authority = Arc::clone(&prepared.authority);
+
+        let service = runtime
+            .block_on(prepared.start(Vec::new(), 1024, Duration::from_secs(1), Arc::new(|| {})))
+            .expect("storage-owned startup should complete");
+
+        assert!(artifact_path.is_file());
+        let status = runtime
+            .block_on(authority.status())
+            .expect("started authority status should load");
+        assert!(status.linearized_authority_serving());
+        assert!(runtime
+            .block_on(authority.is_initialized())
+            .expect("started authority membership should inspect"));
+        service
+            .host()
+            .linearized_authority_serving()
+            .expect("returned host should share the serving authority");
+
+        authority
+            .durability_publication()
+            .expect("startup should retain one publication domain")
+            .poison("stop storage-owned startup test");
+        service
+            ._checkpoint_monitor
+            .join_for_test()
+            .expect("checkpoint monitor should stop after poison");
+        runtime
+            .block_on(authority.shutdown())
+            .expect("started authority should shut down");
+    }
+
+    #[test]
+    fn static_identity_is_rejected_before_open_without_a_certified_topology() {
+        struct UnexpectedPublisher;
+
+        impl ControlPlaneRaftOuterIdentityPublisher for UnexpectedPublisher {
+            fn publish(
+                &self,
+                _authority_artifact_path: &Path,
+            ) -> Result<
+                (),
+                crate::control_plane_raft_durability::ControlPlaneRaftOuterIdentityPublicationError,
+            > {
+                panic!("invalid static startup must not publish an outer identity")
+            }
+        }
+
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("startup test runtime should build");
+        let bootstrap = ControlPlaneRaftPeerBootstrap::single_node("invalid-static-startup", 1);
+        let error = runtime
+            .block_on(bootstrap.prepare_durable_authority(
+                runtime.handle().clone(),
+                &artifact_path,
+                ControlPlaneRaftOuterIdentityStartup::Publish(&UnexpectedPublisher),
+            ))
+            .expect_err("static identity without certified topology must fail closed");
+
+        assert!(matches!(
+            error,
+            ControlPlaneError::StaticTopologyFailure { .. }
+        ));
+        assert!(!artifact_path.exists());
+    }
+
+    #[test]
+    fn failed_start_poisons_the_prepared_authority_before_returning() {
+        let tmp = test_util::tempdir();
+        let artifact_path = tmp.path().join("authority.state");
+        let peer_socket = tmp.path().join("unexpected-peer.sock");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("startup test runtime should build");
+        let bootstrap = ControlPlaneRaftPeerBootstrap::single_node("failed-start-owner", 1);
+        let prepared = runtime
+            .block_on(bootstrap.prepare_durable_authority(
+                runtime.handle().clone(),
+                &artifact_path,
+                ControlPlaneRaftOuterIdentityStartup::NotConfigured,
+            ))
+            .expect("durable replay should prepare the authority");
+        let authority = Arc::clone(&prepared.authority);
+        let listeners = vec![ControlPlaneRaftPeerServerListenerInput::Unix {
+            endpoint_id: "unexpected-peer".to_owned(),
+            listener: UnixListener::bind(peer_socket).expect("test peer listener should bind"),
+            max_connections: 1,
+            io_timeout: Duration::from_secs(1),
+        }];
+
+        let error = runtime
+            .block_on(prepared.start(listeners, 1024, Duration::from_secs(1), Arc::new(|| {})))
+            .expect_err("single-node startup must reject a peer listener");
+
+        assert!(matches!(error, ControlPlaneError::InvariantFailure { .. }));
+        assert!(authority
+            .durability_publication()
+            .expect("prepared authority should retain its publication domain")
+            .is_poisoned());
+        runtime
+            .block_on(authority.shutdown())
+            .expect("failed authority should shut down");
     }
 
     fn replicated_bootstrap(

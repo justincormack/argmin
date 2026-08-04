@@ -1670,6 +1670,43 @@ monitor, membership/catch-up waits, static topology and outer-identity publicati
 durability publication. That startup sequence must move behind a storage-owned authority-open
 operation before the remaining low-level authority startup APIs can become crate-private.
 
+The forty-second bounded slice completes item 12 by containing durable authority startup behind
+an opaque two-phase storage operation. `ControlPlaneRaftPeerBootstrap::prepare_durable_authority`
+opens, replays, and validates the exact durable authority and issues its one durability lifecycle
+before the process binds an inbound peer socket. The resulting
+`PreparedControlPlaneRaftAuthority` is the only value that can start service after binding; it owns
+the authority, bootstrap policy, durability lifecycle, and logical outer-identity state without
+exposing any of them. Its consuming start operation constructs the authority-bound peer durability
+callback, validates and publishes peer listeners, starts the single checkpoint monitor,
+initializes and checkpoints configured membership, waits for the required single-node leadership
+or multi-node committed-state catch-up, establishes the bootstrap's retained certified topology,
+publishes the initial restart artifact/clock sidecar/outer identity, and only then returns the
+steady-state host. A failure after preparation poisons the authority's publication domain rather
+than leaving a partially started authority eligible to serve.
+
+The returned `ControlPlaneRaftAuthorityService` retains the host, checkpoint monitor, and peer
+listener loops as one opaque lifecycle. Multi-node mode is derived from that service rather than
+re-read from an independently retained process configuration. The process retains deployment
+state-directory locking, socket binding, the opaque outer-identity publisher, fatal-process
+callbacks, and logical steady-state configuration only. Superseded authority-open, durability,
+peer-server, membership, leadership, topology, checkpoint, outer-publication, and direct host-start
+operations are crate-private in production; explicitly named hooks remain feature-gated for
+cross-crate process behavior tests. Owner-local regressions pin replay-before-listener typestate,
+membership and initial checkpoint completion before return, advancing committed-watermark catch-up,
+pre-open rejection of an outer identity without a certified topology, and poisoning after a
+prepared startup fails. The repository boundary check rejects both process-side recomposition and
+renewed public low-level startup methods.
+
+The closed primitive inventory includes durable single-node authority construction, authority-clock
+checkpoint binding, durability publication/lifecycle issuance, peer-server durability binding,
+membership initialization and leader waits, durability metrics/WAL observation, snapshot trigger
+and purge, restart-checkpoint capture/publication/persistence, certified static-identity checkpoint
+publication, static-topology establishment, checkpoint-monitor start, outer-identity publication,
+and direct durable-host start. Their production methods are crate-private; cross-crate tests use
+only same-operation names carrying an explicit `_for_test` suffix behind `test-hooks`. The boundary
+checker enumerates these exact primitive names rather than relying on the process's former call
+spellings.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1950,7 +1987,7 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     Physical placement records and mutation APIs are private to `storage`; the remaining
     feature-gated projections are narrow, read-only test facilities for cross-crate behavioral
     assertions, while impossible physical-state tests are owner-local.
-12. **In progress:** deterministic static storage-placement interpretation and certified initial
+12. **Complete:** deterministic static storage-placement interpretation and certified initial
     topology/bootstrap assembly are storage-owned without transferring outer manifest ownership.
     Certified live Raft membership convergence and initial-topology establishment are now bound to
     the authority's retained static peer policy and topology certificate; the process neither
@@ -1976,10 +2013,12 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     policy and monitor execution, and peer checkpoint callbacks are now contained by one
     authority-bound storage capability. The steady-state logical command, clock/lease-horizon,
     heartbeat, runtime-map, administration, and RPC-serving implementation is now contained by
-    the authority-issued storage host. The remaining work is containing deployment startup
-    sequencing—authority open, peer/monitor start, membership and catch-up, topology/outer
-    identity, and initial checkpoint publication—then privatizing the low-level authority startup
-    operations it replaces.
+    the authority-issued storage host. Durable deployment startup is now a two-phase storage-owned
+    typestate: durable replay and validation precede process-owned socket binding, after which one
+    consuming operation starts the peer/monitor lifecycle, initializes and checkpoints membership,
+    waits for leadership or catch-up, establishes certified topology and outer identity, publishes
+    initial durability, and returns the bound steady-state service. The low-level authority startup
+    operations it replaces are production-private and boundary-checked.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

@@ -243,7 +243,7 @@ impl ControlPlaneRaftAuthorityDurability {
         self.inner.runtime.clone()
     }
 
-    pub fn peer_server_durability(
+    pub(crate) fn peer_server_durability(
         &self,
     ) -> Result<ControlPlaneRaftPeerServerDurability, ControlPlaneError> {
         self.authority
@@ -252,7 +252,14 @@ impl ControlPlaneRaftAuthorityDurability {
             }))
     }
 
-    pub fn store_restart_artifact(&self) -> Result<(), ControlPlaneError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn peer_server_durability_for_test(
+        &self,
+    ) -> Result<ControlPlaneRaftPeerServerDurability, ControlPlaneError> {
+        self.peer_server_durability()
+    }
+
+    pub(crate) fn store_restart_artifact(&self) -> Result<(), ControlPlaneError> {
         let _guard = self
             .inner
             .checkpoint_lock
@@ -261,7 +268,12 @@ impl ControlPlaneRaftAuthorityDurability {
         self.store_restart_artifact_while_locked()
     }
 
-    pub fn checkpoint_successful_linearized_read(&self) -> Result<(), ControlPlaneError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn store_restart_artifact_for_test(&self) -> Result<(), ControlPlaneError> {
+        self.store_restart_artifact()
+    }
+
+    pub(crate) fn checkpoint_successful_linearized_read(&self) -> Result<(), ControlPlaneError> {
         self.publication()?.ensure_available()?;
         if self.authority.durability_metric_snapshots().wal.is_some() {
             let wal_status = self.authority.durable_wal_monitor_snapshot()?;
@@ -297,7 +309,7 @@ impl ControlPlaneRaftAuthorityDurability {
         Ok(())
     }
 
-    pub fn authority_clock_checkpoint_target(
+    pub(crate) fn authority_clock_checkpoint_target(
         &self,
     ) -> Arc<ControlPlaneAuthorityClockCheckpointTarget> {
         Arc::new(ControlPlaneAuthorityClockCheckpointTarget::new(
@@ -306,7 +318,7 @@ impl ControlPlaneRaftAuthorityDurability {
         ))
     }
 
-    pub fn load_authority_clock_restart_checkpoint(
+    pub(crate) fn load_authority_clock_restart_checkpoint(
         &self,
     ) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
         load_authority_clock_restart_checkpoint(
@@ -315,7 +327,7 @@ impl ControlPlaneRaftAuthorityDurability {
         )
     }
 
-    pub fn load_authority_clock_restart_checkpoint_for_startup(
+    pub(crate) fn load_authority_clock_restart_checkpoint_for_startup(
         &self,
     ) -> Result<Option<ControlPlaneAuthorityClockRestartCheckpoint>, ControlPlaneError> {
         match self.load_authority_clock_restart_checkpoint() {
@@ -330,11 +342,13 @@ impl ControlPlaneRaftAuthorityDurability {
         }
     }
 
-    pub fn invalidate_authority_clock_restart_checkpoint(&self) -> Result<(), ControlPlaneError> {
+    pub(crate) fn invalidate_authority_clock_restart_checkpoint(
+        &self,
+    ) -> Result<(), ControlPlaneError> {
         invalidate_authority_clock_restart_checkpoint(&self.inner.artifact_path)
     }
 
-    pub fn establish_static_outer_identity(
+    pub(crate) fn establish_static_outer_identity(
         &self,
         publisher: &dyn ControlPlaneRaftOuterIdentityPublisher,
     ) -> Result<(), ControlPlaneError> {
@@ -379,7 +393,15 @@ impl ControlPlaneRaftAuthorityDurability {
         }
     }
 
-    pub fn spawn_checkpoint_monitor(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn establish_static_outer_identity_for_test(
+        &self,
+        publisher: &dyn ControlPlaneRaftOuterIdentityPublisher,
+    ) -> Result<(), ControlPlaneError> {
+        self.establish_static_outer_identity(publisher)
+    }
+
+    pub(crate) fn spawn_checkpoint_monitor(
         &self,
         terminal_failure_handler: Arc<dyn Fn() + Send + Sync>,
     ) -> Result<ControlPlaneRaftCheckpointMonitor, ControlPlaneError> {

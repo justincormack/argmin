@@ -81,7 +81,7 @@ impl ControlPlaneRaftHeartbeatLeaseExpiry {
 }
 
 impl ControlPlaneRaftAuthorityHost {
-    pub fn start_durable(
+    pub(crate) fn start_durable(
         runtime: Handle,
         authority: Arc<ControlPlaneRaftAuthority>,
     ) -> Result<Self, ControlPlaneError> {

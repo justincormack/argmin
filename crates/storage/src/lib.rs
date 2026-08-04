@@ -125,10 +125,10 @@ pub use control_plane_raft_host::{
     ControlPlaneRaftAuthorityHost, ControlPlaneRaftHeartbeatLeaseExpiry,
 };
 pub use control_plane_raft_peer_bootstrap::{
+    ControlPlaneRaftAuthorityService, ControlPlaneRaftOuterIdentityStartup,
     ControlPlaneRaftPeerAuthCredentialInput, ControlPlaneRaftPeerBootstrap,
-    ControlPlaneRaftPeerBootstrapError, ControlPlaneRaftPeerServerBootstrap,
-    ControlPlaneRaftPeerServerListenerInput, ControlPlaneRaftPeerServerLoops,
-    ControlPlaneRaftPeerTopologyBinding,
+    ControlPlaneRaftPeerBootstrapError, ControlPlaneRaftPeerServerListenerInput,
+    ControlPlaneRaftPeerTopologyBinding, PreparedControlPlaneRaftAuthority,
 };
 #[cfg(feature = "test-hooks")]
 pub use control_plane_raft_peer_bootstrap::{

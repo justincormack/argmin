@@ -4829,10 +4829,18 @@ impl ControlPlaneRaftAuthority {
     }
 
     #[must_use]
-    pub fn authority_clock_checkpoint_binding(
+    pub(crate) fn authority_clock_checkpoint_binding(
         &self,
     ) -> ControlPlaneAuthorityClockCheckpointBinding {
         ControlPlaneAuthorityClockCheckpointBinding::for_raft(&self.cluster_name, self.node_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn authority_clock_checkpoint_binding_for_test(
+        &self,
+    ) -> ControlPlaneAuthorityClockCheckpointBinding {
+        self.authority_clock_checkpoint_binding()
     }
 
     pub async fn new_experimental_single_node_in_memory(
@@ -4869,7 +4877,7 @@ impl ControlPlaneRaftAuthority {
         )
     }
 
-    pub async fn new_experimental_single_node_durable(
+    pub(crate) async fn new_experimental_single_node_durable(
         cluster_name: impl Into<String>,
         node_id: ControlPlaneRaftNodeId,
         artifact_path: &Path,
@@ -4882,6 +4890,15 @@ impl ControlPlaneRaftAuthority {
             Some(&wal_path),
         )
         .await
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn new_experimental_single_node_durable_for_test(
+        cluster_name: impl Into<String>,
+        node_id: ControlPlaneRaftNodeId,
+        artifact_path: &Path,
+    ) -> Result<Self, ControlPlaneError> {
+        Self::new_experimental_single_node_durable(cluster_name, node_id, artifact_path).await
     }
 
     #[cfg(test)]
@@ -5178,7 +5195,7 @@ impl ControlPlaneRaftAuthority {
 
     /// Return the single response-publication and durability-poison domain
     /// bound to this authority.
-    pub fn durability_publication(
+    pub(crate) fn durability_publication(
         &self,
     ) -> Result<ControlPlaneRaftDurabilityPublication, ControlPlaneError> {
         if let Some(publication) = self.durability_publication.get() {
@@ -5191,12 +5208,19 @@ impl ControlPlaneRaftAuthority {
             .clone())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn durability_publication_for_test(
+        &self,
+    ) -> Result<ControlPlaneRaftDurabilityPublication, ControlPlaneError> {
+        self.durability_publication()
+    }
+
     /// Issue the one shared durability lifecycle bound to this authority.
     ///
     /// Repeated calls while the authority is hosted return clones of the same
     /// lifecycle, including its checkpoint lock, serving marker, and monitor
     /// registration state.
-    pub fn durability_lifecycle(
+    pub(crate) fn durability_lifecycle(
         self: &Arc<Self>,
         runtime: tokio::runtime::Handle,
     ) -> Result<crate::ControlPlaneRaftAuthorityDurability, ControlPlaneError> {
@@ -5204,6 +5228,14 @@ impl ControlPlaneRaftAuthority {
             runtime,
             Arc::clone(self),
         )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn durability_lifecycle_for_test(
+        self: &Arc<Self>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<crate::ControlPlaneRaftAuthorityDurability, ControlPlaneError> {
+        self.durability_lifecycle(runtime)
     }
 
     pub(crate) fn durability_lifecycle_slot(
@@ -5225,7 +5257,7 @@ impl ControlPlaneRaftAuthority {
 
     /// Bind process-hosted peer checkpoint work to this authority's durability
     /// publication and poison domain.
-    pub fn bind_peer_server_durability(
+    pub(crate) fn bind_peer_server_durability(
         &self,
         checkpoint: Arc<dyn ControlPlaneRaftPeerServerCheckpoint>,
     ) -> Result<ControlPlaneRaftPeerServerDurability, ControlPlaneError> {
@@ -5304,7 +5336,7 @@ impl ControlPlaneRaftAuthority {
     }
 
     #[must_use]
-    pub fn durability_metric_snapshots(&self) -> ControlPlaneRaftDurabilityMetricSnapshots {
+    pub(crate) fn durability_metric_snapshots(&self) -> ControlPlaneRaftDurabilityMetricSnapshots {
         ControlPlaneRaftDurabilityMetricSnapshots {
             checkpoint: self.checkpoint_metrics.snapshot(),
             wal: self
@@ -5315,7 +5347,15 @@ impl ControlPlaneRaftAuthority {
         }
     }
 
-    pub fn durable_wal_monitor_snapshot(
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn durability_metric_snapshots_for_test(
+        &self,
+    ) -> ControlPlaneRaftDurabilityMetricSnapshots {
+        self.durability_metric_snapshots()
+    }
+
+    pub(crate) fn durable_wal_monitor_snapshot(
         &self,
     ) -> Result<ControlPlaneRaftWalMonitorSnapshot, ControlPlaneError> {
         let log_store = self.log_store.as_ref().ok_or_else(|| {
@@ -5333,6 +5373,13 @@ impl ControlPlaneRaftAuthority {
                     "OpenRaft WAL monitor requires a WAL-backed log store".to_string(),
                 )
             })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn durable_wal_monitor_snapshot_for_test(
+        &self,
+    ) -> Result<ControlPlaneRaftWalMonitorSnapshot, ControlPlaneError> {
+        self.durable_wal_monitor_snapshot()
     }
 
     pub(crate) async fn initialize_membership(
@@ -5357,7 +5404,7 @@ impl ControlPlaneRaftAuthority {
 
     /// Initialize the membership retained by this authority, when this node
     /// owns initial membership submission.
-    pub async fn initialize_configured_membership_if_needed(
+    pub(crate) async fn initialize_configured_membership_if_needed(
         &self,
     ) -> Result<bool, ControlPlaneError> {
         if self.is_initialized().await? {
@@ -5377,6 +5424,13 @@ impl ControlPlaneRaftAuthority {
         self.initialized_membership_in_process
             .store(true, Ordering::Release);
         Ok(true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn initialize_configured_membership_if_needed_for_test(
+        &self,
+    ) -> Result<bool, ControlPlaneError> {
+        self.initialize_configured_membership_if_needed().await
     }
 
     pub async fn is_initialized(&self) -> Result<bool, ControlPlaneError> {
@@ -5486,7 +5540,7 @@ impl ControlPlaneRaftAuthority {
         })?
     }
 
-    pub async fn trigger_snapshot_applied(
+    pub(crate) async fn trigger_snapshot_applied(
         &self,
     ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
         let status = self.status().await?;
@@ -5500,7 +5554,14 @@ impl ControlPlaneRaftAuthority {
         self.trigger_local_snapshot_applied().await
     }
 
-    pub async fn trigger_local_snapshot_applied(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn trigger_snapshot_applied_for_test(
+        &self,
+    ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
+        self.trigger_snapshot_applied().await
+    }
+
+    pub(crate) async fn trigger_local_snapshot_applied(
         &self,
     ) -> Result<Option<LogIdOf<ControlPlaneRaftTypeConfig>>, ControlPlaneError> {
         let Some(applied) = self
@@ -5542,7 +5603,7 @@ impl ControlPlaneRaftAuthority {
         Ok(Some(snapshot_log_id))
     }
 
-    pub async fn purge_log_through_snapshot(
+    pub(crate) async fn purge_log_through_snapshot(
         &self,
         snapshot_log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
     ) -> Result<(), ControlPlaneError> {
@@ -5595,6 +5656,14 @@ impl ControlPlaneRaftAuthority {
                 )))??;
         }
         Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn purge_log_through_snapshot_for_test(
+        &self,
+        snapshot_log_id: LogIdOf<ControlPlaneRaftTypeConfig>,
+    ) -> Result<(), ControlPlaneError> {
+        self.purge_log_through_snapshot(snapshot_log_id).await
     }
 
     pub async fn wait_for_applied_index_at_least(
@@ -5652,7 +5721,7 @@ impl ControlPlaneRaftAuthority {
         })?
     }
 
-    pub async fn wait_for_current_leader(
+    pub(crate) async fn wait_for_current_leader(
         &self,
         leader_id: ControlPlaneRaftNodeId,
         timeout: Duration,
@@ -5664,6 +5733,17 @@ impl ControlPlaneRaftAuthority {
             .await
             .map(|_| ())
             .map_err(|error| openraft_remote_error("wait-current-leader", error))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn wait_for_current_leader_for_test(
+        &self,
+        leader_id: ControlPlaneRaftNodeId,
+        timeout: Duration,
+        message: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        self.wait_for_current_leader(leader_id, timeout, message)
+            .await
     }
 
     /// Read only the Raft and state-machine fields needed to validate process
@@ -5956,7 +6036,7 @@ impl ControlPlaneRaftAuthority {
     /// retry classification remain storage-owned. `allow_bootstrap` is false
     /// after an outer static identity has already been durably published, so a
     /// missing certified topology then fails closed rather than being replaced.
-    pub async fn establish_static_initial_topology(
+    pub(crate) async fn establish_static_initial_topology(
         &self,
         topology: &StaticInitialControlPlaneTopology,
         allow_bootstrap: bool,
@@ -5991,6 +6071,16 @@ impl ControlPlaneRaftAuthority {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn establish_static_initial_topology_for_test(
+        &self,
+        topology: &StaticInitialControlPlaneTopology,
+        allow_bootstrap: bool,
+    ) -> Result<(), ControlPlaneError> {
+        self.establish_static_initial_topology(topology, allow_bootstrap)
+            .await
     }
 
     fn validate_static_initial_topology_binding(
@@ -6455,7 +6545,9 @@ impl ControlPlaneRaftAuthority {
         })
     }
 
-    pub async fn store_durable_restart_artifact(&self) -> Result<Option<u64>, ControlPlaneError> {
+    pub(crate) async fn store_durable_restart_artifact(
+        &self,
+    ) -> Result<Option<u64>, ControlPlaneError> {
         let checkpoint = self.capture_durable_restart_checkpoint().await?;
         let path = self.configured_durable_artifact_path()?;
         let authority_instance_id = self.authority_instance_id()?;
@@ -6480,7 +6572,14 @@ impl ControlPlaneRaftAuthority {
         })?
     }
 
-    pub async fn capture_durable_restart_checkpoint(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn store_durable_restart_artifact_for_test(
+        &self,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        self.store_durable_restart_artifact().await
+    }
+
+    pub(crate) async fn capture_durable_restart_checkpoint(
         &self,
     ) -> Result<ControlPlaneRaftCapturedRestartCheckpoint, ControlPlaneError> {
         let authority_instance_id = self.authority_instance_id()?;
@@ -6497,7 +6596,7 @@ impl ControlPlaneRaftAuthority {
     /// not yet converged. The caller receives no checkpoint or policy details
     /// and cannot publish the outer static identity until storage returns the
     /// opaque publication proof.
-    pub async fn publish_static_identity_restart_checkpoint(
+    pub(crate) async fn publish_static_identity_restart_checkpoint(
         &self,
     ) -> Result<Option<ControlPlaneRaftStaticIdentityCheckpointPublication>, ControlPlaneError>
     {
@@ -6525,7 +6624,7 @@ impl ControlPlaneRaftAuthority {
         }
     }
 
-    pub fn persist_durable_restart_checkpoint(
+    pub(crate) fn persist_durable_restart_checkpoint(
         &self,
         checkpoint: ControlPlaneRaftCapturedRestartCheckpoint,
     ) -> Result<Option<u64>, ControlPlaneError> {
@@ -6538,6 +6637,14 @@ impl ControlPlaneRaftAuthority {
             checkpoint,
             path.as_ref(),
         )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub async fn capture_and_persist_restart_checkpoint_without_clock_sidecar_for_test(
+        &self,
+    ) -> Result<Option<u64>, ControlPlaneError> {
+        let checkpoint = self.capture_durable_restart_checkpoint().await?;
+        self.persist_durable_restart_checkpoint(checkpoint)
     }
 
     pub(crate) fn configured_durable_artifact_path(
@@ -7561,26 +7668,26 @@ struct ControlPlaneRaftRestartArtifact {
     state_machine: ControlPlaneRaftStateMachineRestartArtifact,
 }
 
-pub struct ControlPlaneRaftCapturedRestartCheckpoint {
+pub(crate) struct ControlPlaneRaftCapturedRestartCheckpoint {
     artifact: ControlPlaneRaftRestartArtifact,
     authority_instance_id: ControlPlaneRaftAuthorityInstanceId,
 }
 
 /// Opaque proof that this authority captured, certified, and durably published
 /// a restart checkpoint against its retained static peer policy.
-pub struct ControlPlaneRaftStaticIdentityCheckpointPublication {
+pub(crate) struct ControlPlaneRaftStaticIdentityCheckpointPublication {
     authority_clock_binding: ControlPlaneAuthorityClockCheckpointBinding,
     committed_timestamp_high_water_ms: Option<u64>,
 }
 
 impl ControlPlaneRaftStaticIdentityCheckpointPublication {
     #[must_use]
-    pub fn authority_clock_binding(&self) -> ControlPlaneAuthorityClockCheckpointBinding {
+    pub(crate) fn authority_clock_binding(&self) -> ControlPlaneAuthorityClockCheckpointBinding {
         self.authority_clock_binding
     }
 
     #[must_use]
-    pub fn committed_timestamp_high_water_ms(&self) -> Option<u64> {
+    pub(crate) fn committed_timestamp_high_water_ms(&self) -> Option<u64> {
         self.committed_timestamp_high_water_ms
     }
 }
