@@ -140,15 +140,9 @@ fn get_object_payload_route_error_does_not_become_object_not_found() {
     .unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let mut segments = coord
-        .storage_node()
-        .test_get_object_segments(&bucket, &key, put.version_id)
-        .unwrap();
-    assert_eq!(segments.len(), 1);
-    segments[0].data_pg_id = 99;
     coord
         .storage_node()
-        .test_replace_live_object_segments(&bucket, &key, put.version_id, &segments)
+        .test_inject_first_object_segment_unknown_data_pg(&bucket, &key, put.version_id)
         .unwrap();
 
     let err = match coord.get_object(&GetObjectRequest {
@@ -170,8 +164,8 @@ fn get_object_payload_route_error_does_not_become_object_not_found() {
         matches!(
             err,
             ServerError::Store(StoreError::ClusterPgNotFound {
-                pg_id: 99,
                 cluster_epoch: storage::ClusterEpoch::INITIAL,
+                ..
             })
         ),
         "expected typed route error, got {err:?}"

@@ -1208,11 +1208,10 @@ fn aborting_multipart_upload_rejects_late_list_parts_without_state_loss() {
 
     coord
         .storage_node()
-        .test_set_upload_state(
+        .test_mark_multipart_upload_aborting(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
-            UploadState::Aborting,
         )
         .unwrap();
 
@@ -1251,11 +1250,10 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
 
     coord
         .storage_node()
-        .test_set_upload_state(
+        .test_mark_multipart_upload_completing(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
-            UploadState::Completing,
         )
         .unwrap();
 

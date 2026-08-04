@@ -3087,11 +3087,10 @@ fn complete_multipart_upload_rejects_non_in_progress_upload() {
 
     coord
         .storage_node()
-        .test_set_upload_state(
+        .test_mark_multipart_upload_completing(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &upload_id,
-            UploadState::Completing,
         )
         .unwrap();
 
@@ -4212,11 +4211,10 @@ fn begin_stream_part_aborting_upload_returns_no_such_upload_without_creating_ses
 
     coord
         .storage_node()
-        .test_set_upload_state(
+        .test_mark_multipart_upload_aborting(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &upload.upload_id,
-            UploadState::Aborting,
         )
         .unwrap();
 
@@ -4269,11 +4267,10 @@ fn begin_stream_part_completing_upload_returns_no_such_upload_without_creating_s
 
     coord
         .storage_node()
-        .test_set_upload_state(
+        .test_mark_multipart_upload_completing(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &upload.upload_id,
-            UploadState::Completing,
         )
         .unwrap();
 
@@ -4487,7 +4484,7 @@ fn create_completed_multipart_vec(
         .unwrap()
 }
 
-fn corrupt_committed_part_payload_crc64(
+fn inject_committed_part_payload_checksum_mismatch(
     coord: &Coordinator,
     bucket: &str,
     key: &str,
@@ -4498,7 +4495,12 @@ fn corrupt_committed_part_payload_crc64(
     let object_key = trusted_object_key(key);
     coord
         .storage_node()
-        .test_corrupt_object_part_payload_crc64(&bucket_name, &object_key, version_id, part_number)
+        .test_inject_object_part_payload_checksum_mismatch(
+            &bucket_name,
+            &object_key,
+            version_id,
+            part_number,
+        )
         .unwrap();
 }
 
@@ -5106,19 +5108,10 @@ fn get_object_rejects_incomplete_manifest_before_body_read() {
 
     let result = create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
-    // Remove part 1 from the real manifest, leaving a gap before part 2.
-    let real_parts = coord
-        .storage_node()
-        .test_get_object_parts(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            result.version_id,
-        )
-        .unwrap();
-    assert_eq!(real_parts.len(), 2);
+    // Inject a missing part 1, leaving a gap before part 2.
     coord
         .storage_node()
-        .test_remove_object_part(
+        .test_inject_incomplete_multipart_manifest(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             result.version_id,
@@ -5155,7 +5148,7 @@ fn get_object_part_rejects_bad_part_payload_crc64() {
     let part2 = make_part(0xBB, 100);
     let result = create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
-    corrupt_committed_part_payload_crc64(&coord, "bucket", "key", result.version_id, 1);
+    inject_committed_part_payload_checksum_mismatch(&coord, "bucket", "key", result.version_id, 1);
 
     let err = coord
         .get_object_part(&GetObjectPartRequest {
@@ -5192,7 +5185,7 @@ fn get_multipart_range_uses_segment_crc_without_whole_part_payload_crc64() {
     let part2 = make_part(0xBB, 100);
     let result = create_completed_multipart_vec(&coord, "bucket", "key", &[(1, part1), (2, part2)]);
 
-    corrupt_committed_part_payload_crc64(&coord, "bucket", "key", result.version_id, 1);
+    inject_committed_part_payload_checksum_mismatch(&coord, "bucket", "key", result.version_id, 1);
 
     let body = coord
         .get_object_range(&GetObjectRangeRequest {
@@ -9439,28 +9432,14 @@ fn get_object_rejects_bad_segment_crc64() {
     )
     .unwrap();
 
-    {
-        let mut segments = coord
-            .storage_node()
-            .test_get_object_segments(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("bad-segment-crc"),
-                put.version_id,
-            )
-            .unwrap();
-        assert_eq!(segments.len(), 1);
-        segments[0].segment_crc64 ^= 1;
-
-        coord
-            .storage_node()
-            .test_replace_live_object_segments(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("bad-segment-crc"),
-                put.version_id,
-                &segments,
-            )
-            .unwrap();
-    }
+    coord
+        .storage_node()
+        .test_inject_first_object_segment_checksum_mismatch(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("bad-segment-crc"),
+            put.version_id,
+        )
+        .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {

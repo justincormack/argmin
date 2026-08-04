@@ -2387,14 +2387,9 @@ fn lifecycle_sweep_old_incarnation_expired_claim_does_not_skip_current_root() {
         .as_live()
         .unwrap()
         .last_modified;
-    let bucket_info = coord.storage_node().head_bucket_info(&bucket).unwrap();
     coord
         .storage_node()
-        .test_insert_lifecycle_sweep_claim(
-            &bucket,
-            bucket_info.bucket_incarnation_generation.saturating_sub(1),
-            Some(50),
-        )
+        .test_seed_stale_lifecycle_sweep_claim(&bucket)
         .unwrap();
 
     let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
@@ -4173,7 +4168,7 @@ fn lifecycle_aborting_upload_finish_stops_when_delete_drain_starts_after_claim()
     .unwrap();
     coord
         .storage_node()
-        .test_set_upload_state(&bucket, &key, &upload.upload_id, UploadState::Aborting)
+        .test_mark_multipart_upload_aborting(&bucket, &key, &upload.upload_id)
         .unwrap();
 
     let bucket_info = coord.storage_node().head_bucket_info(&bucket).unwrap();
@@ -4268,11 +4263,10 @@ fn lifecycle_sweep_finishes_aborting_multipart_upload_without_current_lifecycle_
     {
         coord
             .storage_node()
-            .test_set_upload_state(
+            .test_mark_multipart_upload_aborting(
                 &trusted_bucket_name("bucket"),
                 &trusted_object_key("logs/app"),
                 &upload.upload_id,
-                UploadState::Aborting,
             )
             .unwrap();
     }

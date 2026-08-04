@@ -17279,16 +17279,28 @@ impl super::StorageCluster {
             .test_get_object_segments(bucket, key, version_id)
     }
 
+    /// Injects a storage-owned read-route failure into the first segment.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_replace_live_object_segments(
+    pub fn test_inject_first_object_segment_unknown_data_pg(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-        segments: &[ObjectSegmentRecord],
     ) -> Result<(), ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
-            .test_replace_live_object_segments(bucket, key, version_id, segments)
+            .test_inject_first_object_segment_unknown_data_pg(bucket, key, version_id)
+    }
+
+    /// Injects a storage-owned checksum mismatch into the first object segment.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_inject_first_object_segment_checksum_mismatch(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), ObjectPgActionError> {
+        self.metadata_primary_bridge_node()?
+            .test_inject_first_object_segment_checksum_mismatch(bucket, key, version_id)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -17302,8 +17314,9 @@ impl super::StorageCluster {
             .test_get_object_parts(bucket, key, version_id)
     }
 
+    /// Injects a storage-owned payload-checksum mismatch for one logical part.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_corrupt_object_part_payload_crc64(
+    pub fn test_inject_object_part_payload_checksum_mismatch(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17314,8 +17327,9 @@ impl super::StorageCluster {
             .test_corrupt_object_part_payload_crc64(bucket, key, version_id, part_number)
     }
 
+    /// Injects a storage-owned incomplete-manifest fault at one logical part.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_remove_object_part(
+    pub fn test_inject_incomplete_multipart_manifest(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17556,20 +17570,23 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_insert_lifecycle_sweep_claim(
+    /// Seeds a storage-owned stale-incarnation lifecycle claim scenario.
+    pub fn test_seed_stale_lifecycle_sweep_claim(
         &self,
         bucket: &BucketName,
-        bucket_incarnation_generation: u64,
-        lease_deadline: Option<u64>,
     ) -> Result<(), ObjectPgActionError> {
         let pg = self.metadata_pg(self.bucket_metadata_pg_id(bucket))?;
+        let bucket_incarnation_generation = pg
+            .head_bucket_raw(bucket)?
+            .bucket_incarnation_generation
+            .saturating_sub(1);
         pg.test_insert_lifecycle_sweep_claim(
             bucket,
             bucket_incarnation_generation,
             "test-lifecycle-claim",
             "test-owner-token",
             self.operation_epoch(),
-            lease_deadline,
+            Some(50),
         )?;
         Ok(())
     }
@@ -17586,7 +17603,29 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_set_upload_state(
+    /// Seeds the storage-owned terminal state used to test abort recovery.
+    pub fn test_mark_multipart_upload_aborting(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<(), ObjectPgActionError> {
+        self.test_set_upload_state(bucket, key, upload_id, UploadState::Aborting)
+    }
+
+    /// Seeds the storage-owned terminal state used to test completion recovery.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_mark_multipart_upload_completing(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<(), ObjectPgActionError> {
+        self.test_set_upload_state(bucket, key, upload_id, UploadState::Completing)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_set_upload_state(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

@@ -5733,14 +5733,25 @@ Implementation update (2026-08-03):
   bucket, key, generation, and ordering timestamp; storage derives the hash,
   data-PG placement, segment/part shape, and EC geometry. Reclaim observation
   exposes presence only, rather than returning the physical durable record;
-  and
+- replaced cross-crate segment-layout replacement, multipart-part checksum-row
+  mutation, and multipart-part deletion with storage-owned fault scenarios.
+  Coordinator tests now select only a logical object/version/part and assert
+  the resulting coordinator error; storage owns the unknown-PG, checksum
+  mismatch, and incomplete-manifest representation. The test-only PG topology
+  previously carried by `ReadRuntime` solely to construct reclaim placement
+  was removed;
+- replaced the generic upload-state mutation with explicit storage-owned
+  aborting/completing scenarios, and replaced caller-authored lifecycle claim
+  generation, owner, and deadline fields with one stale-incarnation claim
+  scenario. Cross-crate tests still exercise the coordinator recovery and
+  response behavior without constructing durable storage records; and
 - retained physical multipart segment/part observations, segment-layout
-  replacement, lifecycle-claim insertion, upload/session state and timestamp
-  mutation, deleting-bucket construction, and raw reclaim-queue controls are
-  explicit transitional exceptions still owned by implementation slice 3.
-  They do not satisfy the final curated-boundary completion criterion merely
-  because they now live under `storage::test_support` or on a feature-gated
-  `StorageCluster` implementation.
+  observations, stream-session timestamp mutation, deleting-bucket
+  construction, and raw reclaim-queue controls remain explicit transitional
+  exceptions owned by implementation slice 3. They do not satisfy the final
+  curated-boundary completion criterion merely because they now live under
+  `storage::test_support` or on a feature-gated `StorageCluster`
+  implementation.
 
 Completion:
 

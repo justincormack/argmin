@@ -1197,6 +1197,32 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_inject_first_object_segment_unknown_data_pg(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), ObjectPgActionError> {
+        let mut segments = self.test_get_object_segments(bucket, key, version_id)?;
+        let segment = segments.first_mut().ok_or(StoreError::NotFound)?;
+        segment.data_pg_id = u32::MAX;
+        self.test_replace_live_object_segments(bucket, key, version_id, &segments)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_inject_first_object_segment_checksum_mismatch(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<(), ObjectPgActionError> {
+        let mut segments = self.test_get_object_segments(bucket, key, version_id)?;
+        let segment = segments.first_mut().ok_or(StoreError::NotFound)?;
+        segment.segment_crc64 ^= 1;
+        self.test_replace_live_object_segments(bucket, key, version_id, &segments)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_object_parts(
         &self,
         bucket: &BucketName,
