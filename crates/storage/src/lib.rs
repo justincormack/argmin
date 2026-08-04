@@ -448,6 +448,14 @@ pub mod test_support {
         }
     }
 
+    /// Logical layout of one staged stream-upload segment.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TestStreamUploadSegmentObservation {
+        pub segment_index: u32,
+        pub size: u64,
+    }
+
     /// Opaque evidence for the exact staged payload of one stream upload.
     ///
     /// Physical placement and shard identities remain storage-owned. Callers
@@ -485,6 +493,20 @@ pub mod test_support {
 
         pub fn segment_count(&self) -> usize {
             self.segments.len()
+        }
+
+        pub fn has_same_staged_payload_as(&self, other: &Self) -> bool {
+            self.segments == other.segments
+        }
+
+        pub fn layout(&self) -> Vec<TestStreamUploadSegmentObservation> {
+            self.segments
+                .iter()
+                .map(|segment| TestStreamUploadSegmentObservation {
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                })
+                .collect()
         }
     }
 

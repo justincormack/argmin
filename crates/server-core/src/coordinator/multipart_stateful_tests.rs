@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::test_support::{
     TestMultipartPartPayloadSnapshot, TestMultipartUploadRecord, TestPayloadReclaimRoot,
+    TestStreamUploadPayloadSnapshot,
 };
-use storage::{EcShape, StreamUploadRecord, StreamUploadSegmentRecord};
+use storage::StreamUploadRecord;
 
 const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -317,15 +318,15 @@ impl<'a> InvariantHarness<'a> {
             .unwrap()
     }
 
-    fn stream_segments(
+    fn stream_payload(
         &self,
         bucket: &str,
         key: &str,
         session_id: &SessionId,
-    ) -> Vec<StreamUploadSegmentRecord> {
+    ) -> TestStreamUploadPayloadSnapshot {
         self.coord
             .storage_node()
-            .test_list_stream_segments(
+            .test_capture_stream_upload_payload(
                 &trusted_bucket_name(bucket),
                 &trusted_object_key(key),
                 session_id,
@@ -366,80 +367,6 @@ impl<'a> InvariantHarness<'a> {
             roots.is_empty(),
             "{invariant}: expected no pending reclaim roots for {bucket}/{key}, found {roots:?}"
         );
-    }
-}
-
-fn assert_segment_shards_exist(
-    coord: &Coordinator,
-    segments: &[StreamUploadSegmentRecord],
-    invariant: &str,
-    phase: &str,
-) {
-    for segment in segments {
-        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
-        for i in 0..total_shards {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            assert!(
-                coord
-                    .storage_node()
-                    .test_shard_exists(segment.data_pg_id, &shard_key)
-                    .unwrap(),
-                "{invariant}: shard {i} should exist {phase}"
-            );
-            assert!(
-                coord
-                    .storage_node()
-                    .test_payload_shard_file_exists(
-                        segment.data_pg_id,
-                        EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        },
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                        i as u8,
-                    )
-                    .unwrap(),
-                "{invariant}: placed shard file {i} should exist {phase}"
-            );
-        }
-    }
-}
-
-fn assert_segment_shards_deleted(
-    coord: &Coordinator,
-    segments: &[StreamUploadSegmentRecord],
-    invariant: &str,
-    phase: &str,
-) {
-    for segment in segments {
-        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
-        for i in 0..total_shards {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            assert!(
-                !coord
-                    .storage_node()
-                    .test_shard_exists(segment.data_pg_id, &shard_key)
-                    .unwrap(),
-                "{invariant}: shard {i} should be deleted {phase}"
-            );
-            assert!(
-                !coord
-                    .storage_node()
-                    .test_payload_shard_file_exists(
-                        segment.data_pg_id,
-                        EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        },
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                        i as u8,
-                    )
-                    .unwrap(),
-                "{invariant}: placed shard file {i} should be deleted {phase}"
-            );
-        }
     }
 }
 
@@ -717,25 +644,21 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
 
     let staged = admin
         .storage_node()
-        .test_list_stream_segments(
+        .test_capture_stream_upload_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key(&key),
             &session_id,
         )
         .unwrap();
+    let staged_layout = staged.layout();
     assert_eq!(
-        staged.len(),
+        staged_layout.len(),
         1,
         "{invariant}: expected exactly one staged segment after duplicate append race"
     );
     assert_eq!(
-        staged[0].segment_index, 0,
+        staged_layout[0].segment_index, 0,
         "{invariant}: expected the winner to occupy segment index 0"
-    );
-    assert!(
-        staged[0].segment_vid == GenerationId::new(1).unwrap()
-            || staged[0].segment_vid == GenerationId::new(2).unwrap(),
-        "{invariant}: expected the winner to retain one prepared payload generation"
     );
     admin
         .finalize_stream_put(&FinalizeStreamPutRequest {
@@ -1767,18 +1690,16 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"hello")
         .unwrap();
 
-    let staged_segments = state.stream_segments("bucket", "key", &session_id);
+    let staged_payload = state.stream_payload("bucket", "key", &session_id);
     assert_eq!(
-        staged_segments.len(),
+        staged_payload.segment_count(),
         1,
         "{invariant}: expected one staged segment before finalize failure"
     );
-    assert_segment_shards_exist(
-        &coord,
-        &staged_segments,
-        invariant,
-        "before finalize failure",
-    );
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+        .unwrap());
 
     let err = coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
@@ -1832,7 +1753,10 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
 
     state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
     state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
-    assert_segment_shards_deleted(&coord, &staged_segments, invariant, "after scavenging");
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+        .unwrap());
 }
 
 #[test]
@@ -1855,18 +1779,16 @@ fn failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans()
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"part-data")
         .unwrap();
 
-    let staged_segments = state.stream_segments("bucket", "key", &session_id);
+    let staged_payload = state.stream_payload("bucket", "key", &session_id);
     assert_eq!(
-        staged_segments.len(),
+        staged_payload.segment_count(),
         1,
         "{invariant}: expected one staged multipart segment before finalize failure"
     );
-    assert_segment_shards_exist(
-        &coord,
-        &staged_segments,
-        invariant,
-        "before finalize failure",
-    );
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+        .unwrap());
 
     let err = coord
         .finalize_stream_part(FinalizeStreamPartRequest {
@@ -1925,7 +1847,10 @@ fn failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans()
             .is_empty(),
         "{invariant}: failed finalize should leave no committed multipart part segments"
     );
-    assert_segment_shards_deleted(&coord, &staged_segments, invariant, "after abort cleanup");
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+        .unwrap());
 }
 
 #[test]

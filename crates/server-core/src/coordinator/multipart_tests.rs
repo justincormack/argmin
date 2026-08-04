@@ -52,27 +52,6 @@ fn upload_part_stream_session_count(
         .count()
 }
 
-fn assert_payload_shard_files_state(
-    coord: &Coordinator,
-    data_pg_id: u32,
-    ec: EcShape,
-    okh: &[u8; 16],
-    generation_id: GenerationId,
-    expected: bool,
-    context: &str,
-) {
-    for shard_index in 0..(ec.k + ec.m) {
-        let exists = coord
-            .storage_node()
-            .test_payload_shard_file_exists(data_pg_id, ec, okh, generation_id, shard_index)
-            .unwrap();
-        assert_eq!(
-            exists, expected,
-            "{context}: placed shard file {shard_index} state mismatch"
-        );
-    }
-}
-
 #[test]
 fn create_multipart_upload_returns_upload_id() {
     let tmp = test_util::tempdir();
@@ -7525,66 +7504,28 @@ fn stream_put_abort_cleans_up_shards() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"data-to-clean")
         .unwrap();
 
-    // Record shard keys before abort for verification.
-    let segments = coord
+    let staged_payload = coord
         .storage_node()
-        .test_list_stream_segments(
+        .test_capture_stream_upload_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &session_id,
         )
         .unwrap();
-    assert_eq!(segments.len(), 1);
-    let segment = segments[0].clone();
-    let data_pg_id = segment.data_pg_id;
-    let ec = EcShape {
-        k: segment.ec_k,
-        m: segment.ec_m,
-    };
-    for i in 0..ec.k + ec.m {
-        assert!(
-            coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    data_pg_id,
-                    ec,
-                    &segment.segment_okh,
-                    segment.segment_vid,
-                    i,
-                )
-                .unwrap(),
-            "placed shard {i} should exist before abort"
-        );
-    }
+    assert_eq!(staged_payload.segment_count(), 1);
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+        .unwrap());
 
     coord
         .abort_stream_put("bucket", "key", &session_id)
         .unwrap();
 
-    // Verify shards were cleaned up.
-    for i in 0..ec.k + ec.m {
-        let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i);
-        assert!(
-            !coord
-                .storage_node()
-                .test_shard_exists(data_pg_id, &shard_key)
-                .unwrap(),
-            "shard {i} should have been deleted"
-        );
-        assert!(
-            !coord
-                .storage_node()
-                .test_payload_shard_file_exists(
-                    data_pg_id,
-                    ec,
-                    &segment.segment_okh,
-                    segment.segment_vid,
-                    i,
-                )
-                .unwrap(),
-            "placed shard {i} should have been deleted"
-        );
-    }
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+        .unwrap());
 }
 
 #[test]
@@ -8413,27 +8354,19 @@ fn stream_append_accepts_upload_part_session() {
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session.session_id, 0, b"data")
         .unwrap();
-    let segments = coord
+    let staged_payload = coord
         .storage_node()
-        .test_list_stream_segments(
+        .test_capture_stream_upload_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &session.session_id,
         )
         .unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_payload_shard_files_state(
-        &coord,
-        segments[0].data_pg_id,
-        EcShape {
-            k: segments[0].ec_k,
-            m: segments[0].ec_m,
-        },
-        &segments[0].segment_okh,
-        segments[0].segment_vid,
-        true,
-        "streamed UploadPart append",
-    );
+    assert_eq!(staged_payload.segment_count(), 1);
+    assert!(coord
+        .storage_node()
+        .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+        .unwrap());
 }
 
 #[test]

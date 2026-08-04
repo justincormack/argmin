@@ -1916,7 +1916,7 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         );
     }
     assert!(cluster
-        .test_list_stream_segments(&bucket, &key, &begin.session_id)
+        .test_capture_stream_upload_payload(&bucket, &key, &begin.session_id)
         .unwrap()
         .is_empty());
     assert!(cluster
@@ -4497,7 +4497,7 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert!(cluster
-        .test_list_stream_segments(
+        .test_capture_stream_upload_payload(
             &append_request.bucket,
             &append_request.key,
             &streamed_part.session_id,
@@ -13004,10 +13004,13 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
         .unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let staged_segments = storage_cluster
-        .test_list_stream_segments(&bucket, &key, &session_id)
+    let staged_payload = storage_cluster
+        .test_capture_stream_upload_payload(&bucket, &key, &session_id)
         .unwrap();
-    assert_eq!(staged_segments.len(), 1);
+    assert_eq!(staged_payload.segment_count(), 1);
+    assert!(storage_cluster
+        .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+        .unwrap());
 
     let hook_ran = Arc::new(AtomicBool::new(false));
     let hook_ran_for_closure = Arc::clone(&hook_ran);
@@ -13068,11 +13071,11 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
         })
         .unwrap();
     assert_eq!(current.body.read_all().unwrap(), b"competing object");
-    assert_eq!(
+    assert!(
         storage_cluster
-            .test_list_stream_segments(&bucket, &key, &session_id)
-            .unwrap(),
-        staged_segments,
+            .test_capture_stream_upload_payload(&bucket, &key, &session_id)
+            .unwrap()
+            .has_same_staged_payload_as(&staged_payload),
         "retry exhaustion must preserve the session for caller-owned cleanup"
     );
 
@@ -13081,9 +13084,8 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
         .unwrap();
     assert!(
         storage_cluster
-            .test_list_stream_segments(&bucket, &key, &session_id)
-            .unwrap()
-            .is_empty(),
+            .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+            .unwrap(),
         "caller cleanup must remove the staged stream segments"
     );
     assert!(

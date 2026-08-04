@@ -1393,7 +1393,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_stream_segments(
+    pub(crate) fn test_list_stream_segments(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
