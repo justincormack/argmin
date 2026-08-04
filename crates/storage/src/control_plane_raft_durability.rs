@@ -234,6 +234,15 @@ impl ControlPlaneRaftAuthorityDurability {
         Ok(Self { authority, inner })
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn shares_lifecycle_for_test(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn runtime(&self) -> Handle {
+        self.inner.runtime.clone()
+    }
+
     pub fn peer_server_durability(
         &self,
     ) -> Result<ControlPlaneRaftPeerServerDurability, ControlPlaneError> {

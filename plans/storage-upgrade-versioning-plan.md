@@ -1645,6 +1645,31 @@ checkpoint/poison handling, and the control-plane trait implementations. Those o
 their remaining low-level authority calls must move behind a storage-owned authority host before
 the raw durability and OpenRaft operation APIs can become crate-private.
 
+The forty-first bounded slice adds that storage-owned steady-state authority host.
+`ControlPlaneRaftAuthorityHost` now owns logical command submission, liveness-command checkpoint
+policy, committed-command checkpoint/poison sequencing, authority-clock and lease-horizon
+sampling, heartbeat expiry, volatile-heartbeat reconciliation, runtime-map reads, operator
+administration, and the control-plane runtime-map/heartbeat/admin trait implementations. It also
+binds ordinary and recovery RPC serving to the host's exact authority clock, checkpoint target,
+linearized-authority confirmation, and durability-publication domain. The process no longer
+defines a parallel Raft control-plane implementation or composes those capabilities.
+
+The exact durable host lifecycle is authority-issued and retained. Repeated host issuance reuses
+the first runtime, authority clock, durability lifecycle, and publication domain; the process
+cannot pair an authority with an independent clock, checkpoint lifecycle, or runtime. Whether the
+fresh-cluster leadership-term exception applies is recorded by the authority when it initializes
+membership, rather than supplied as a constructor boolean. Owner-local tests pin shared issuance,
+crossed-runtime derivation, in-memory rejection, and redacted diagnostics. Existing process
+regressions exercise the same production host through bounded test hooks, and a repository check
+rejects renewed process-owned command/clock/checkpoint/RPC composition and unapproved public host
+surface.
+
+This slice still does not complete item 12. The process retains deployment startup sequencing:
+opening the authority through the peer bootstrap, starting peer service and the checkpoint
+monitor, membership/catch-up waits, static topology and outer-identity publication, and initial
+durability publication. That startup sequence must move behind a storage-owned authority-open
+operation before the remaining low-level authority startup APIs can become crate-private.
+
 This audit covers production boundaries. Existing `PgTopology` use in `server-core` is test-gated;
 those tests must migrate with the relevant owner-local impossible-state fixtures, but it is not a
 separate production leak. UAT/process tests may continue to identify an operator-visible topology
@@ -1949,9 +1974,12 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     bootstrap and Raft-peer transport bootstrap are now storage-owned. Raft checkpoint-path
     derivation, checkpoint/sidecar coordination, serving-read checkpoint state, WAL checkpoint
     policy and monitor execution, and peer checkpoint callbacks are now contained by one
-    authority-bound storage capability. The remaining work is moving the process-hosted logical
-    command, clock/lease-horizon, and control-plane trait implementation behind the storage-owned
-    authority host, then privatizing the low-level authority operations it replaces.
+    authority-bound storage capability. The steady-state logical command, clock/lease-horizon,
+    heartbeat, runtime-map, administration, and RPC-serving implementation is now contained by
+    the authority-issued storage host. The remaining work is containing deployment startup
+    sequencing—authority open, peer/monitor start, membership and catch-up, topology/outer
+    identity, and initial checkpoint publication—then privatizing the low-level authority startup
+    operations it replaces.
 13. **Pending:** replace cross-crate `StoreError` variant matching with exhaustive semantic
     classifications and opaque diagnostics owned by storage.
 14. **Pending:** contain local debug PG operations behind owner-provided opaque diagnostics, move

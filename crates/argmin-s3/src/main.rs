@@ -33,42 +33,43 @@ use server_core::sse::{
 };
 use storage::control_plane::{
     ensure_control_plane_state_parent_directory, invalidate_authority_clock_restart_checkpoint,
-    load_authority_clock_restart_checkpoint, ClusterControlSnapshot, ClusterRuntimeMapSnapshot,
-    ControlPlaneAdmin, ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
+    load_authority_clock_restart_checkpoint, ClusterRuntimeMapSnapshot,
+    ControlPlaneAdminAuthCredentialInput, ControlPlaneAuthorityClock,
     ControlPlaneAuthorityClockCheckpointBinding, ControlPlaneAuthorityClockCheckpointTarget,
-    ControlPlaneAuthorityClockContext, ControlPlaneError, ControlPlaneFrontendAuthCredentialInput,
-    ControlPlaneHeartbeatRefresh, ControlPlaneHeartbeatRuntimeMapSource,
-    ControlPlaneRpcResponsePublication, ControlPlaneRuntimeMapSource,
-    ControlPlaneStorageNodeAuthCredentialInput, FencedPgMetadataTransferSnapshot,
-    FileControlPlaneStore, LeaseHorizonAuthorityBinding, PgMetadataTransferProof,
-    SingleAuthorityControlPlane, CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    ControlPlaneError, ControlPlaneFrontendAuthCredentialInput,
+    ControlPlaneHeartbeatRuntimeMapSource, ControlPlaneRuntimeMapSource,
+    ControlPlaneStorageNodeAuthCredentialInput, FileControlPlaneStore, SingleAuthorityControlPlane,
+    CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
 };
 #[cfg(test)]
-use storage::control_plane::{store_authority_clock_restart_checkpoint, UnixControlPlaneClient};
+use storage::control_plane::{
+    store_authority_clock_restart_checkpoint, ClusterControlSnapshot, ControlPlaneAdmin,
+    ControlPlaneAuthorityClockContext, ControlPlaneRpcResponsePublication,
+    LeaseHorizonAuthorityBinding, PgMetadataTransferProof, UnixControlPlaneClient,
+};
+#[cfg(test)]
 use storage::control_plane_command::{ControlPlaneCommand, ControlPlaneCommandResponse};
 use storage::control_plane_raft::{
-    ControlPlaneRaftAuthority, ControlPlaneRaftAuthorityStatus, ControlPlaneRaftCommandOutcome,
-    ControlPlaneRaftLogId, ControlPlaneRaftNodeId, SubmittedControlPlaneRaftCommand,
+    ControlPlaneRaftAuthority, ControlPlaneRaftLogId, ControlPlaneRaftNodeId,
 };
 use storage::storage_node_server::{
     PreparedStorageNodeServer, StorageNodeBootstrap, StorageNodeControlPlaneRefreshLoop,
     StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
 };
 use storage::{
-    CanonicalUserId, ClusterEpoch, ControlPlaneRaftAuthorityDurability,
+    CanonicalUserId, ClusterEpoch, ControlPlaneRaftAuthorityHost,
     ControlPlaneRaftOuterIdentityPublicationError, ControlPlaneRaftOuterIdentityPublisher,
     ControlPlaneRaftPeerAuthCredentialInput, ControlPlaneRaftPeerBootstrap,
     ControlPlaneRaftPeerServerBootstrap, ControlPlaneRaftPeerServerListenerInput,
     ControlPlaneRaftPeerTopologyBinding, ControlPlaneRpcServerBootstrap,
     ControlPlaneRpcServerListenerInput, EcShape, LocalClusterMap,
-    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgId,
-    PgState, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
-    StorageClusterRuntimeMapHandle,
+    LocalUnixStorageNodeClientAdmissionSettings, LocalUnixStorageNodeClientConfig, NodeId, PgState,
+    RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
 };
 #[cfg(test)]
 use storage::{
-    ControlPlaneRaftCheckpointMonitorForTest, ControlPlaneRaftPeerTestServer,
-    ControlPlaneRpcOrdinaryTestServer,
+    ControlPlaneRaftAuthorityDurability, ControlPlaneRaftCheckpointMonitorForTest,
+    ControlPlaneRaftPeerTestServer, ControlPlaneRpcOrdinaryTestServer, PgId,
 };
 use tokio::net::TcpListener;
 use tokio::runtime::Handle;
@@ -1648,553 +1649,6 @@ fn run_control_plane_process(config: &ServerConfig) -> ! {
     }
 }
 
-// RPC workers clone this wrapper so quorum waits never hold a process-wide
-// authority mutex. Every mutable correctness field remains explicitly shared.
-#[derive(Clone)]
-struct ExperimentalRaftControlPlane {
-    runtime: Handle,
-    authority: Arc<ControlPlaneRaftAuthority>,
-    durability: Option<ControlPlaneRaftAuthorityDurability>,
-    resample_authority_time: bool,
-    authority_clock: Option<Arc<Mutex<ControlPlaneAuthorityClock>>>,
-    #[cfg(test)]
-    after_heartbeat_commit_hook: Arc<Mutex<Option<ExperimentalRaftAfterHeartbeatCommitHook>>>,
-}
-
-#[cfg(test)]
-type ExperimentalRaftAfterHeartbeatCommitHook = Box<
-    dyn FnOnce(&ExperimentalRaftControlPlane) -> Result<Option<u64>, ControlPlaneError>
-        + Send
-        + 'static,
->;
-
-impl ExperimentalRaftControlPlane {
-    fn block_on<F: Future>(&self, future: F) -> F::Output {
-        block_on_control_plane_raft(&self.runtime, future)
-    }
-
-    #[cfg(test)]
-    fn run_after_heartbeat_commit_hook(&self) -> Result<Option<u64>, ControlPlaneError> {
-        let Some(hook) = self
-            .after_heartbeat_commit_hook
-            .lock()
-            .expect("experimental OpenRaft heartbeat hook mutex poisoned")
-            .take()
-        else {
-            return Ok(None);
-        };
-        hook(self)
-    }
-
-    fn authority_now_ms(&self, supplied_now_ms: u64) -> Result<u64, ControlPlaneError> {
-        Ok(self
-            .authority_time_and_lease_horizon_binding(supplied_now_ms)?
-            .0)
-    }
-
-    fn authority_time_and_lease_horizon_binding(
-        &self,
-        supplied_now_ms: u64,
-    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
-        if !self.resample_authority_time {
-            #[cfg(test)]
-            {
-                let status = self.block_on(self.authority.status())?;
-                let term = status
-                    .local_leader()
-                    .then(|| status.current_term())
-                    .flatten()
-                    .ok_or(ControlPlaneError::AuthorityNotServing)?;
-                return Ok((
-                    supplied_now_ms,
-                    LeaseHorizonAuthorityBinding::checked_new(1, Some(term)),
-                ));
-            }
-            #[cfg(not(test))]
-            return Ok((supplied_now_ms, None));
-        }
-        let status = self.block_on(self.authority.confirmed_linearized_authority_status())?;
-        self.authority_time_and_lease_horizon_binding_for_status(status)
-    }
-
-    fn local_authority_time_and_lease_horizon_binding(
-        &self,
-        supplied_now_ms: u64,
-    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
-        if !self.resample_authority_time {
-            return self.authority_time_and_lease_horizon_binding(supplied_now_ms);
-        }
-        let status = self.block_on(self.authority.status())?;
-        if !status.linearized_authority_serving() {
-            return Err(ControlPlaneError::AuthorityNotServing);
-        }
-        self.authority_time_and_lease_horizon_binding_for_status(status)
-    }
-
-    fn authority_time_and_lease_horizon_binding_for_status(
-        &self,
-        status: ControlPlaneRaftAuthorityStatus,
-    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
-        let current_term = status.current_term().ok_or_else(|| {
-            ControlPlaneError::invariant_failure("local OpenRaft leader has no current term")
-        })?;
-        self.authority_time_and_lease_horizon_binding_for_term(current_term)
-    }
-
-    fn authority_time_and_lease_horizon_binding_for_term(
-        &self,
-        current_term: u64,
-    ) -> Result<(u64, Option<LeaseHorizonAuthorityBinding>), ControlPlaneError> {
-        let max_committed_timestamp_ms = self.current_snapshot()?.max_committed_timestamp_ms();
-        let mut authority_clock = self
-            .authority_clock
-            .as_ref()
-            .expect("resampled authority time requires a clock gate")
-            .lock()
-            .expect("control-plane authority clock mutex poisoned");
-        authority_clock.observe_committed_timestamp_high_water(max_committed_timestamp_ms);
-        authority_clock.validate_raft_leadership_term(current_term)?;
-        let authority_now_ms = authority_clock.effective_process_now_ms()?;
-        let authority = authority_clock.lease_horizon_authority_binding(Some(current_term))?;
-        Ok((authority_now_ms, Some(authority)))
-    }
-
-    fn ensure_not_durably_poisoned(&self) -> Result<(), ControlPlaneError> {
-        self.authority.durability_publication()?.ensure_available()
-    }
-
-    fn poison_durable_authority(&self, message: String) {
-        self.authority
-            .durability_publication()
-            .expect("Raft durability publication should already be initialized")
-            .poison(message);
-    }
-
-    fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError> {
-        let Some(durability) = &self.durability else {
-            return Ok(());
-        };
-        durability.store_restart_artifact()
-    }
-
-    fn checkpoint_successful_linearized_read(&self) -> Result<(), ControlPlaneError> {
-        let Some(durability) = &self.durability else {
-            return self.ensure_not_durably_poisoned();
-        };
-        durability.checkpoint_successful_linearized_read()
-    }
-
-    fn submit_raft_command(
-        &mut self,
-        command: ControlPlaneCommand,
-    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
-        self.submit_raft_command_with_checkpoint_policy(command, true)
-    }
-
-    fn submit_raft_liveness_command(
-        &mut self,
-        command: ControlPlaneCommand,
-    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
-        let wal_backed = self.authority.durability_metric_snapshots().wal.is_some();
-        self.submit_raft_command_with_checkpoint_policy(command, !wal_backed)
-    }
-
-    fn submit_raft_command_with_checkpoint_policy(
-        &mut self,
-        command: ControlPlaneCommand,
-        checkpoint_after_commit: bool,
-    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let submitted = self.block_on(self.authority.submit_control_plane_command(command))?;
-        self.finish_submitted_raft_command(submitted, checkpoint_after_commit)
-    }
-
-    fn finish_submitted_raft_command(
-        &mut self,
-        submitted: SubmittedControlPlaneRaftCommand,
-        checkpoint_after_commit: bool,
-    ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
-        let outcome = submitted.into_outcome();
-        if checkpoint_after_commit {
-            self.checkpoint_committed_raft_command()?;
-        }
-        match outcome {
-            ControlPlaneRaftCommandOutcome::Applied(response) => Ok(response),
-            ControlPlaneRaftCommandOutcome::Rejected(error) => Err(error),
-        }
-    }
-
-    fn checkpoint_committed_raft_command(&self) -> Result<(), ControlPlaneError> {
-        if let Err(error) = self.store_durable_restart_artifact() {
-            self.poison_durable_authority(format!(
-                "experimental OpenRaft control-plane durability checkpoint failed after a \
-                 committed command; refusing to serve until restart: {error}"
-            ));
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        self.block_on(self.authority.current_control_plane_snapshot())
-    }
-
-    fn expire_heartbeat_leases(
-        &mut self,
-        now_ms: u64,
-    ) -> Result<(ClusterEpoch, usize, usize), ControlPlaneError> {
-        let (preflight_now_ms, preflight_authority) =
-            self.local_authority_time_and_lease_horizon_binding(now_ms)?;
-        let preflight_snapshot = self.current_snapshot()?;
-        let preflight_expired = preflight_snapshot.expired_node_heartbeat_leases(
-            preflight_snapshot.heartbeat_lease_expiry_timestamp(preflight_now_ms),
-        );
-        if preflight_expired.is_empty() {
-            return Ok((preflight_snapshot.cluster_epoch(), 0, 0));
-        }
-        let preflight_authority = preflight_authority.ok_or_else(|| {
-            ControlPlaneError::invariant_failure(
-                "OpenRaft heartbeat expiry has no serving lease-horizon authority",
-            )
-        })?;
-        preflight_snapshot
-            .validate_lease_grant_horizon_rebinding(preflight_authority, preflight_now_ms)?;
-
-        let (now_ms, lease_horizon_authority) =
-            self.authority_time_and_lease_horizon_binding(now_ms)?;
-        let snapshot = self.current_snapshot()?;
-        let expire_at_ms = snapshot.heartbeat_lease_expiry_timestamp(now_ms);
-        let expired = snapshot.expired_node_heartbeat_leases(expire_at_ms);
-        if expired.is_empty() {
-            return Ok((snapshot.cluster_epoch(), 0, 0));
-        }
-        let authority = lease_horizon_authority.ok_or_else(|| {
-            ControlPlaneError::invariant_failure(
-                "OpenRaft heartbeat expiry has no serving lease-horizon authority",
-            )
-        })?;
-        snapshot.validate_lease_grant_horizon_rebinding(authority, now_ms)?;
-        let response =
-            self.submit_raft_liveness_command(ControlPlaneCommand::ExpireNodeHeartbeatLeases {
-                authority,
-                expire_at_ms,
-                expired,
-            })?;
-        let ControlPlaneCommandResponse::ExpireHeartbeatLeases {
-            expired_nodes,
-            peering_pgs,
-        } = response
-        else {
-            unreachable!("heartbeat lease expiry command returned the wrong response");
-        };
-        Ok((
-            self.current_snapshot()?.cluster_epoch(),
-            expired_nodes.len(),
-            peering_pgs.len(),
-        ))
-    }
-}
-
-impl ControlPlaneRuntimeMapSource for ExperimentalRaftControlPlane {
-    fn runtime_map_snapshot(
-        &self,
-        authority_now_ms: u64,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
-        let snapshot = self.block_on(
-            self.authority
-                .linearized_runtime_map_snapshot(authority_now_ms),
-        )?;
-        self.checkpoint_successful_linearized_read()?;
-        Ok(snapshot)
-    }
-
-    fn runtime_map_status(
-        &self,
-        authority_now_ms: u64,
-    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapStatus, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
-        let status = self.block_on(
-            self.authority
-                .linearized_runtime_map_status(authority_now_ms),
-        )?;
-        self.checkpoint_successful_linearized_read()?;
-        Ok(status)
-    }
-
-    fn runtime_map_diagnostics_snapshot(
-        &self,
-        authority_now_ms: u64,
-    ) -> Result<storage::control_plane::ControlPlaneRuntimeMapDiagnosticSnapshot, ControlPlaneError>
-    {
-        self.ensure_not_durably_poisoned()?;
-        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
-        let diagnostics = self.block_on(
-            self.authority
-                .linearized_runtime_map_diagnostics_snapshot(authority_now_ms),
-        )?;
-        self.checkpoint_successful_linearized_read()?;
-        Ok(diagnostics)
-    }
-
-    fn serving_pg_runtime_map_snapshot(
-        &self,
-        pg_id: PgId,
-        authority_now_ms: u64,
-    ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let authority_now_ms = self.authority_now_ms(authority_now_ms)?;
-        let snapshot = self.block_on(
-            self.authority
-                .linearized_serving_pg_runtime_map_snapshot(pg_id, authority_now_ms),
-        )?;
-        self.checkpoint_successful_linearized_read()?;
-        Ok(snapshot)
-    }
-}
-
-impl ControlPlaneHeartbeatRuntimeMapSource for ExperimentalRaftControlPlane {
-    fn refresh_node_heartbeat(
-        &mut self,
-        heartbeat: storage::control_plane::NodeHeartbeat,
-        authority_now_ms: u64,
-    ) -> Result<ControlPlaneHeartbeatRefresh, ControlPlaneError> {
-        let (authority_now_ms, lease_horizon_authority) =
-            self.authority_time_and_lease_horizon_binding(authority_now_ms)?;
-        let node_id = heartbeat.node_id;
-        let requested_observed_epoch = heartbeat.observed_epoch;
-        let requested_lease_duration_ms = heartbeat.requested_lease_duration_ms;
-        let pre_record_snapshot = self.current_snapshot()?;
-        let previous_observed_epoch = pre_record_snapshot
-            .node(node_id)
-            .and_then(|node| node.last_observed_epoch());
-        let carries_peering_evidence = heartbeat
-            .pg_observations
-            .iter()
-            .any(|observation| observation.state == PgState::Peering);
-        let lease_deadline_ms = pre_record_snapshot.heartbeat_lease_deadline(
-            node_id,
-            authority_now_ms,
-            requested_lease_duration_ms,
-        )?;
-        let pre_record_epoch = pre_record_snapshot.cluster_epoch();
-        let command = ControlPlaneCommand::RecordNodeHeartbeat {
-            heartbeat,
-            heartbeat_at_ms: authority_now_ms,
-            lease_deadline_ms,
-            lease_horizon_authority,
-        };
-        let mut volatile_snapshot = if carries_peering_evidence {
-            None
-        } else {
-            self.block_on(self.authority.try_apply_volatile_heartbeat(command.clone()))?
-        };
-        if volatile_snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .ready_pg_peering_completions(authority_now_ms)
-                .is_ok_and(|ready| !ready.is_empty())
-        }) {
-            volatile_snapshot = None;
-        }
-        if volatile_snapshot.is_none() {
-            self.submit_raft_liveness_command(command)?;
-        }
-        #[cfg(test)]
-        let post_commit_term_override = if volatile_snapshot.is_none() {
-            self.run_after_heartbeat_commit_hook()?
-        } else {
-            None
-        };
-        let snapshot = match volatile_snapshot {
-            Some(snapshot) => snapshot,
-            None => self.current_snapshot()?,
-        };
-        if let Some(expected_authority) = lease_horizon_authority {
-            #[cfg(test)]
-            let current_authority = match post_commit_term_override {
-                Some(current_term) => {
-                    self.authority_time_and_lease_horizon_binding_for_term(current_term)?
-                        .1
-                }
-                None => {
-                    self.authority_time_and_lease_horizon_binding(authority_now_ms)?
-                        .1
-                }
-            };
-            #[cfg(not(test))]
-            let current_authority = self
-                .authority_time_and_lease_horizon_binding(authority_now_ms)?
-                .1;
-            if current_authority != Some(expected_authority) {
-                return Err(ControlPlaneError::LeaseGrantHorizonAuthorityTermMismatch {
-                    authority_term: expected_authority.raft_term(),
-                    committed_term: current_authority.and_then(|authority| authority.raft_term()),
-                });
-            }
-            if !snapshot.lease_grant_horizon_covers(expected_authority, lease_deadline_ms) {
-                return Err(ControlPlaneError::SnapshotInvariantViolation {
-                    context: "committed Raft heartbeat horizon does not cover its lease",
-                    message: format!(
-                        "lease deadline {lease_deadline_ms} is outside the committed horizon"
-                    ),
-                });
-            }
-        }
-        let mut lease = snapshot.heartbeat_lease_after_record(
-            node_id,
-            requested_observed_epoch,
-            pre_record_epoch,
-            lease_deadline_ms,
-            authority_now_ms,
-        )?;
-        let ready = snapshot.ready_pg_peering_completions(authority_now_ms)?;
-        if !ready.is_empty() {
-            self.submit_raft_liveness_command(ControlPlaneCommand::CompleteReadyPgPeerings {
-                ready_at_ms: authority_now_ms,
-                ready,
-            })?;
-            lease = self
-                .current_snapshot()?
-                .current_heartbeat_lease_for_node(node_id, authority_now_ms)?;
-        }
-        let current_snapshot = self.current_snapshot()?;
-        let current_epoch = current_snapshot.cluster_epoch();
-        let observed_epoch = [Some(requested_observed_epoch), previous_observed_epoch]
-            .into_iter()
-            .flatten()
-            .filter(|observed_epoch| *observed_epoch <= current_epoch)
-            .max()
-            .unwrap_or(requested_observed_epoch);
-        let runtime_map = self
-            .current_snapshot()?
-            .runtime_map_for_storage_node_refresh(authority_now_ms, node_id, observed_epoch)?;
-        Ok(ControlPlaneHeartbeatRefresh::new(
-            lease,
-            runtime_map,
-            pre_record_epoch,
-        ))
-    }
-}
-
-impl ControlPlaneAdmin for ExperimentalRaftControlPlane {
-    fn authority_clock_context(
-        &self,
-    ) -> Result<ControlPlaneAuthorityClockContext, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        self.block_on(self.authority.authority_clock_context())
-    }
-
-    fn set_pg_acting_set(
-        &mut self,
-        pg_id: PgId,
-        acting_set: Vec<NodeId>,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.submit_raft_command(ControlPlaneCommand::SetPgActingSet { pg_id, acting_set })?;
-        self.current_snapshot()
-    }
-
-    fn fence_pg_for_metadata_transfer(
-        &mut self,
-        pg_id: PgId,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        Ok(self
-            .fence_pg_for_metadata_transfer_with_source_lease(pg_id)?
-            .into_parts()
-            .0)
-    }
-
-    fn fence_pg_for_metadata_transfer_with_source_lease(
-        &mut self,
-        pg_id: PgId,
-    ) -> Result<FencedPgMetadataTransferSnapshot, ControlPlaneError> {
-        let response =
-            self.submit_raft_command(ControlPlaneCommand::FencePgForMetadataTransfer {
-                pg_id,
-                source_primary_lease_deadline_ms: None,
-                lease_horizon_authority: None,
-            })?;
-        let ControlPlaneCommandResponse::FencePgForMetadataTransfer {
-            source_primary_lease_deadline_ms,
-        } = response
-        else {
-            unreachable!("metadata transfer fence command returned the wrong response");
-        };
-        Ok(FencedPgMetadataTransferSnapshot::new(
-            self.current_snapshot()?,
-            source_primary_lease_deadline_ms,
-        ))
-    }
-
-    fn set_pg_acting_set_with_metadata_transfer(
-        &mut self,
-        pg_id: PgId,
-        acting_set: Vec<NodeId>,
-        transfer: PgMetadataTransferProof,
-        expected_destination_epoch: ClusterEpoch,
-    ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
-        self.submit_raft_command(ControlPlaneCommand::SetPgActingSetWithMetadataTransfer {
-            pg_id,
-            acting_set,
-            transfer,
-            expected_destination_epoch,
-        })?;
-        self.current_snapshot()
-    }
-
-    fn transfer_raft_leadership_to(
-        &mut self,
-        node_id: ControlPlaneRaftNodeId,
-    ) -> Result<(), ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        self.block_on(self.authority.transfer_leadership_to(node_id))
-    }
-
-    fn trigger_raft_snapshot_and_purge(&mut self) -> Result<Option<u64>, ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        let snapshot_log_id = self.block_on(self.authority.trigger_snapshot_applied())?;
-        if let Err(error) = self.store_durable_restart_artifact() {
-            self.poison_durable_authority(format!(
-                "experimental OpenRaft control-plane durability checkpoint failed before a \
-                 snapshot purge; refusing to serve until restart: {error}"
-            ));
-            return Err(error);
-        }
-        let Some(snapshot_log_id) = snapshot_log_id else {
-            return Ok(None);
-        };
-        let purge_result =
-            self.block_on(self.authority.purge_log_through_snapshot(snapshot_log_id));
-        if let Err(error) = self.store_durable_restart_artifact() {
-            self.poison_durable_authority(format!(
-                "experimental OpenRaft control-plane durability checkpoint failed after a \
-                 snapshot purge attempt; refusing to serve until restart: {error}"
-            ));
-            return Err(error);
-        }
-        purge_result?;
-        Ok(Some(snapshot_log_id.index()))
-    }
-
-    fn trigger_raft_election(&mut self) -> Result<(), ControlPlaneError> {
-        self.ensure_not_durably_poisoned()?;
-        self.block_on(
-            self.authority
-                .trigger_pre_vote_election_until_serving(Duration::from_secs(10)),
-        )?;
-        if let Err(error) = self.store_durable_restart_artifact() {
-            self.poison_durable_authority(format!(
-                "experimental OpenRaft control-plane durability checkpoint failed after an \
-                 election trigger; refusing to serve until restart: {error}"
-            ));
-            return Err(error);
-        }
-        Ok(())
-    }
-}
-
 fn block_on_control_plane_raft<F: Future>(runtime: &Handle, future: F) -> F::Output {
     if Handle::try_current().is_ok() {
         tokio::task::block_in_place(|| runtime.block_on(future))
@@ -2540,10 +1994,6 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             eprintln!("failed to initialize control-plane Raft durability host: {error}");
             std::process::exit(1);
         });
-    let durable_publication = authority.durability_publication().unwrap_or_else(|error| {
-        eprintln!("failed to initialize control-plane Raft durability publication: {error}");
-        std::process::exit(1);
-    });
     let raft_peer_server_durability = durability.peer_server_durability().unwrap_or_else(|error| {
         eprintln!("failed to bind control-plane OpenRaft peer durability: {error}");
         std::process::exit(1);
@@ -2666,75 +2116,14 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
             std::process::exit(1);
         });
     }
-    let restart_clock_checkpoint = durability
-        .load_authority_clock_restart_checkpoint_for_startup()
-        .unwrap_or_else(|error| {
-            eprintln!("failed to load experimental OpenRaft authority clock checkpoint: {error}");
-            std::process::exit(1);
-        });
-    let initial_clock_snapshot =
-        block_on_control_plane_raft(&runtime, authority.current_control_plane_snapshot())
+    let control_plane =
+        ControlPlaneRaftAuthorityHost::start_durable(runtime.clone(), Arc::clone(&authority))
             .unwrap_or_else(|error| {
-                eprintln!(
-                    "failed to read experimental OpenRaft control-plane clock state: {error}"
-                );
+                eprintln!("failed to initialize experimental OpenRaft authority host: {error}");
                 std::process::exit(1);
             });
-    let initial_clock_status = block_on_control_plane_raft(&runtime, authority.status())
-        .unwrap_or_else(|error| {
-            eprintln!("failed to read experimental OpenRaft leadership state: {error}");
-            std::process::exit(1);
-        });
-    let mut initial_authority_clock =
-        ControlPlaneAuthorityClock::new_from_process_clock_with_restart_checkpoint(
-            initial_clock_snapshot.max_committed_timestamp_ms(),
-            restart_clock_checkpoint,
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("failed to initialize experimental OpenRaft authority clock: {error}");
-            std::process::exit(1);
-        });
-    if !initial_authority_clock.is_established() {
-        durability
-            .invalidate_authority_clock_restart_checkpoint()
-            .unwrap_or_else(|error| {
-                eprintln!(
-                    "failed to invalidate blocked experimental OpenRaft authority clock checkpoint: {error}"
-                );
-                std::process::exit(1);
-            });
-    }
-    if let Some(previous_authority) = initial_clock_snapshot.lease_grant_horizon_authority() {
-        initial_authority_clock
-            .advance_generation_past_lease_horizon(previous_authority)
-            .unwrap_or_else(|error| {
-                eprintln!(
-                    "failed to advance restarted experimental OpenRaft clock generation: {error}"
-                );
-                std::process::exit(1);
-            });
-    }
-    if initial_clock_status.local_leader() {
-        initial_authority_clock
-            .bind_initial_raft_leadership_term(initial_clock_status.current_term());
-    } else if !initialized_membership {
-        // A restored or joining follower must not use the fresh-cluster first
-        // term exception when it later becomes leader. Only the process that
-        // initialized new membership may bind that initial term lazily.
-        initial_authority_clock.bind_initial_raft_leadership_term(None);
-    }
-    let authority_clock = Arc::new(Mutex::new(initial_authority_clock));
-    let mut control_plane = ExperimentalRaftControlPlane {
-        runtime: runtime.clone(),
-        authority: Arc::clone(&authority),
-        durability: Some(durability.clone()),
-        resample_authority_time: true,
-        authority_clock: Some(Arc::clone(&authority_clock)),
-        #[cfg(test)]
-        after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
-    };
     if config.static_initial_cluster_map.is_none() {
-        bootstrap_empty_experimental_raft_control_plane(&mut control_plane, config).unwrap_or_else(
+        bootstrap_empty_experimental_raft_control_plane(&control_plane, config).unwrap_or_else(
             |error| {
                 eprintln!("failed to bootstrap experimental OpenRaft control-plane state: {error}");
                 std::process::exit(1);
@@ -2761,9 +2150,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("{error}");
         std::process::exit(1);
     });
-    let raft_authority = Arc::clone(&authority);
     let mut authority = control_plane;
-    let authority_clock_checkpoint_target = durability.authority_clock_checkpoint_target();
     let server_auth = build_control_plane_rpc_server_auth(config).unwrap_or_else(|error| {
         eprintln!("failed to configure control-plane auth verifier: {error}");
         std::process::exit(1);
@@ -2790,19 +2177,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         process_info!("{}", diagnostics);
     }
 
-    let rpc_runtime = runtime.clone();
-    let rpc_raft_authority = Arc::clone(&raft_authority);
-    let raft_authority_confirmation: Arc<dyn Fn() -> Result<(), ControlPlaneError> + Send + Sync> =
-        Arc::new(move || {
-            block_on_control_plane_raft(
-                &rpc_runtime,
-                rpc_raft_authority.confirmed_linearized_authority_status(),
-            )
-            .map(|_| ())
-        });
     let fatal_error_handler: Arc<dyn Fn() + Send + Sync> = Arc::new(|| std::process::exit(1));
-    let response_publication: Arc<dyn ControlPlaneRpcResponsePublication> =
-        Arc::new(durable_publication.clone());
     let rpc_server = ControlPlaneRpcServerBootstrap::new(
         listeners,
         recovery_listeners,
@@ -2816,70 +2191,61 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         eprintln!("failed to configure control-plane RPC server: {error}");
         std::process::exit(1);
     });
-    let _rpc_listener_loops = rpc_server.serve_cloned_raft_authority(
-        authority.clone(),
-        Arc::clone(&authority_clock),
-        Arc::clone(&authority_clock_checkpoint_target),
-        raft_authority_confirmation,
-        response_publication,
-        fatal_error_handler,
-    );
+    let _rpc_listener_loops = authority
+        .serve_rpc(rpc_server, fatal_error_handler)
+        .unwrap_or_else(|error| {
+            eprintln!("failed to start experimental OpenRaft RPC server: {error}");
+            std::process::exit(1);
+        });
 
     let mut lease_expiry_not_before_ms = None;
     loop {
-        let raft_status = if multi_node_raft_peer_mode {
-            block_on_control_plane_raft(&runtime, async { raft_authority.status().await })
-                .map(Some)
+        let local_raft_authority_serving = if multi_node_raft_peer_mode {
+            authority
+                .linearized_authority_serving()
                 .unwrap_or_else(|error| {
                     eprintln!("experimental OpenRaft control-plane status check failed: {error}");
                     std::process::exit(1);
                 })
         } else {
-            None
+            true
         };
-        let local_raft_authority_serving = raft_status
-            .as_ref()
-            .is_none_or(|status| status.linearized_authority_serving());
         let expiry_now_ms = storage::clock::current_time_millis();
         let expiry = if local_raft_authority_serving {
             if multi_node_raft_peer_mode && config.static_initial_cluster_map.is_none() {
-                bootstrap_empty_experimental_raft_control_plane(&mut authority, config)
-                    .unwrap_or_else(|error| {
+                bootstrap_empty_experimental_raft_control_plane(&authority, config).unwrap_or_else(
+                    |error| {
                         eprintln!(
                             "failed to bootstrap experimental OpenRaft control-plane state: {error}"
                         );
                         std::process::exit(1);
-                    });
+                    },
+                );
             }
             if lease_expiry_not_before_ms.is_some_and(|not_before_ms| expiry_now_ms < not_before_ms)
             {
-                Ok((ClusterEpoch::INITIAL, 0, 0))
+                Ok(None)
             } else {
-                authority.expire_heartbeat_leases(expiry_now_ms)
+                authority.expire_heartbeat_leases(expiry_now_ms).map(Some)
             }
         } else {
-            Ok((ClusterEpoch::INITIAL, 0, 0))
+            Ok(None)
         };
-        {
-            let authority_clock = authority_clock
-                .lock()
-                .expect("control-plane authority clock mutex poisoned");
-            authority_clock_checkpoint_target
-                .invalidate_if_blocked(&authority_clock)
+        authority
+            .invalidate_blocked_authority_clock_checkpoint()
             .unwrap_or_else(|error| {
                 eprintln!(
                     "failed to invalidate blocked experimental OpenRaft authority clock checkpoint: {error}"
                 );
                 std::process::exit(1);
             });
-        }
         match expiry {
-            Ok((cluster_epoch, expired_nodes, peering_pgs)) if expired_nodes > 0 => {
+            Ok(Some(expiry)) if expiry.expired_nodes() > 0 => {
                 process_info!(
                     "experimental OpenRaft control-plane expired {} node leases at epoch {} and moved {} PGs to peering",
-                    expired_nodes,
-                    cluster_epoch,
-                    peering_pgs
+                    expiry.expired_nodes(),
+                    expiry.cluster_epoch(),
+                    expiry.peering_pgs()
                 );
             }
             Ok(_) => {}
@@ -2965,7 +2331,7 @@ fn experimental_raft_lease_expiry_error_is_transient(error: &ControlPlaneError) 
 }
 
 fn bootstrap_empty_experimental_raft_control_plane(
-    authority: &mut ExperimentalRaftControlPlane,
+    authority: &ControlPlaneRaftAuthorityHost,
     config: &ServerConfig,
 ) -> Result<(), ControlPlaneError> {
     if config.static_initial_cluster_map.is_some() {
@@ -2973,12 +2339,7 @@ fn bootstrap_empty_experimental_raft_control_plane(
     }
     let topology = uncertified_initial_control_plane_topology(config)
         .map_err(storage::StaticStorageTopologyError::into_control_plane_error)?;
-    let Some(epoch) = authority.block_on(
-        authority
-            .authority
-            .establish_uncertified_initial_control_plane_topology(&topology),
-    )?
-    else {
+    let Some(epoch) = authority.establish_uncertified_initial_topology(&topology)? else {
         return Ok(());
     };
     process_info!(
@@ -5984,10 +5345,62 @@ mod tests {
             .is_empty());
     }
 
+    trait ControlPlaneRaftAuthorityHostTestExt {
+        fn block_on<F: Future>(&self, future: F) -> F::Output;
+        fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError>;
+        fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError>;
+        fn submit_raft_command(
+            &mut self,
+            command: ControlPlaneCommand,
+        ) -> Result<ControlPlaneCommandResponse, ControlPlaneError>;
+        fn submit_raft_liveness_command(
+            &mut self,
+            command: ControlPlaneCommand,
+        ) -> Result<ControlPlaneCommandResponse, ControlPlaneError>;
+        fn ensure_not_durably_poisoned(&self) -> Result<(), ControlPlaneError>;
+        fn poison_durable_authority(&self, message: String);
+    }
+
+    impl ControlPlaneRaftAuthorityHostTestExt for ControlPlaneRaftAuthorityHost {
+        fn block_on<F: Future>(&self, future: F) -> F::Output {
+            self.block_on_for_test(future)
+        }
+
+        fn current_snapshot(&self) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+            self.current_snapshot_for_test()
+        }
+
+        fn store_durable_restart_artifact(&self) -> Result<(), ControlPlaneError> {
+            self.store_restart_artifact_for_test()
+        }
+
+        fn submit_raft_command(
+            &mut self,
+            command: ControlPlaneCommand,
+        ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+            self.submit_command_for_test(command)
+        }
+
+        fn submit_raft_liveness_command(
+            &mut self,
+            command: ControlPlaneCommand,
+        ) -> Result<ControlPlaneCommandResponse, ControlPlaneError> {
+            self.submit_liveness_command_for_test(command)
+        }
+
+        fn ensure_not_durably_poisoned(&self) -> Result<(), ControlPlaneError> {
+            self.ensure_available_for_test()
+        }
+
+        fn poison_durable_authority(&self, message: String) {
+            self.poison_for_test(message);
+        }
+    }
+
     struct ExperimentalRaftTestHarness {
         runtime: tokio::runtime::Runtime,
         authority: Arc<ControlPlaneRaftAuthority>,
-        control_plane: ExperimentalRaftControlPlane,
+        control_plane: ControlPlaneRaftAuthorityHost,
         _owned_state_dir: Option<test_util::TempDir>,
     }
 
@@ -6000,27 +5413,12 @@ mod tests {
     }
 
     fn enable_resampled_authority_time(
-        control_plane: &mut ExperimentalRaftControlPlane,
+        control_plane: &mut ControlPlaneRaftAuthorityHost,
         now_ms: u64,
     ) {
-        let max_committed_timestamp_ms = control_plane
-            .current_snapshot()
-            .expect("experimental snapshot should read before enabling clock resampling")
-            .max_committed_timestamp_ms();
-        let status = control_plane
-            .block_on(control_plane.authority.status())
-            .expect("experimental status should read before enabling clock resampling");
-        let mut authority_clock =
-            ControlPlaneAuthorityClock::new(max_committed_timestamp_ms, now_ms, Some(now_ms))
-                .expect("test authority clock should initialize");
-        authority_clock.bind_initial_raft_leadership_term(
-            status
-                .local_leader()
-                .then(|| status.current_term())
-                .flatten(),
-        );
-        control_plane.authority_clock = Some(Arc::new(Mutex::new(authority_clock)));
-        control_plane.resample_authority_time = true;
+        control_plane
+            .enable_resampled_authority_time_for_test(now_ms)
+            .expect("test authority clock should initialize");
     }
 
     fn experimental_raft_test_harness(name: &str) -> ExperimentalRaftTestHarness {
@@ -6061,14 +5459,9 @@ mod tests {
             .expect("single-node raft should apply committed membership and become serving");
             Arc::new(authority)
         });
-        let control_plane = ExperimentalRaftControlPlane {
-            runtime: handle,
-            authority: Arc::clone(&authority),
-            durability: None,
-            resample_authority_time: false,
-            authority_clock: None,
-            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
-        };
+        let control_plane =
+            ControlPlaneRaftAuthorityHost::new_for_test(handle, Arc::clone(&authority), false)
+                .expect("in-memory test authority host should initialize");
         ExperimentalRaftTestHarness {
             runtime,
             authority,
@@ -6083,7 +5476,7 @@ mod tests {
         let in_flight = harness.control_plane.clone();
         let poisoner = harness.control_plane.clone();
         let publication = in_flight
-            .authority
+            .authority_for_test()
             .durability_publication()
             .expect("test authority durability publication should initialize");
         let published = Arc::new(AtomicBool::new(false));
@@ -6196,17 +5589,9 @@ mod tests {
                 .expect("single-node durable raft startup should checkpoint");
             Arc::new(authority)
         });
-        let durability = authority
-            .durability_lifecycle(handle.clone())
-            .expect("durable test authority should create its durability runtime");
-        let control_plane = ExperimentalRaftControlPlane {
-            runtime: handle,
-            authority: Arc::clone(&authority),
-            durability: Some(durability),
-            resample_authority_time: false,
-            authority_clock: None,
-            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
-        };
+        let control_plane =
+            ControlPlaneRaftAuthorityHost::new_for_test(handle, Arc::clone(&authority), true)
+                .expect("durable test authority host should initialize");
         ExperimentalRaftTestHarness {
             runtime,
             authority,
@@ -6230,14 +5615,7 @@ mod tests {
         request_count: usize,
     ) -> std::thread::JoinHandle<()> {
         let listener = std::os::unix::net::UnixListener::bind(socket_path).unwrap();
-        let control_plane = ExperimentalRaftControlPlane {
-            runtime: harness.runtime.handle().clone(),
-            authority: Arc::clone(&harness.authority),
-            durability: None,
-            resample_authority_time: false,
-            authority_clock: None,
-            after_heartbeat_commit_hook: Arc::new(Mutex::new(None)),
-        };
+        let control_plane = harness.control_plane.clone();
         spawn_control_plane_test_rpc_server(
             listener,
             Arc::new(Mutex::new(control_plane)),
@@ -6254,7 +5632,7 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_bootstraps_runtime_map() {
-        let mut harness = experimental_raft_test_harness("process-bootstrap-test");
+        let harness = experimental_raft_test_harness("process-bootstrap-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
@@ -6262,7 +5640,7 @@ mod tests {
         }];
         config.storage_pg_ids = vec![0];
 
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let runtime_map = harness
             .control_plane
@@ -6411,14 +5789,14 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_bootstrap_does_not_rewrite_existing_state() {
-        let mut harness = experimental_raft_test_harness("process-bootstrap-idempotence-test");
+        let harness = experimental_raft_test_harness("process-bootstrap-idempotence-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![0];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let initial_snapshot = harness
             .control_plane
@@ -6430,7 +5808,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-2.sock".to_string(),
         }];
         config.storage_pg_ids = vec![1];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap retry should succeed");
         let retried_snapshot = harness
             .control_plane
@@ -6458,7 +5836,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -6737,7 +6115,7 @@ mod tests {
             "production-shaped-write-amplification",
             &state_path,
         );
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("production-shaped Raft bootstrap should succeed");
 
         let acting_set_a = vec![NodeId::new(0), NodeId::new(1)];
@@ -6872,8 +6250,8 @@ mod tests {
 
         let monitor_durability = harness
             .control_plane
-            .durability
-            .clone()
+            .durability_for_test()
+            .cloned()
             .expect("durable test authority should retain its durability runtime");
         let mut monitor_tracker = ControlPlaneRaftCheckpointMonitorForTest::default();
         let peering_monitor_started_at = Instant::now();
@@ -7466,8 +6844,8 @@ mod tests {
         let checkpoint_start = Arc::clone(&concurrent_start);
         let checkpoint_durability = harness
             .control_plane
-            .durability
-            .clone()
+            .durability_for_test()
+            .cloned()
             .expect("durable release harness should retain its durability runtime");
         let checkpoint_thread = thread::spawn(move || {
             checkpoint_start.wait();
@@ -7606,7 +6984,7 @@ mod tests {
             },
         ];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         for (node_id, now_ms) in [(1, 20_000), (2, 20_010)] {
@@ -7715,7 +7093,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
@@ -7742,16 +7120,11 @@ mod tests {
         assert_eq!(refresh.lease().lease_deadline_ms(), 30_500);
         let status = harness
             .control_plane
-            .block_on(harness.control_plane.authority.status())
+            .block_on(harness.authority.status())
             .expect("experimental Raft status should read");
         let lease_horizon_authority = harness
             .control_plane
-            .authority_clock
-            .as_ref()
-            .expect("resampled authority uses a clock gate")
-            .lock()
-            .expect("authority clock mutex should not be poisoned")
-            .lease_horizon_authority_binding(status.current_term())
+            .lease_horizon_authority_for_test(status.current_term())
             .expect("heartbeat authority binding should remain established");
         assert!(harness
             .control_plane
@@ -7774,7 +7147,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
@@ -7784,16 +7157,13 @@ mod tests {
         enable_resampled_authority_time(&mut harness.control_plane, 31_000);
         let initial_term = harness
             .control_plane
-            .block_on(harness.control_plane.authority.status())
+            .block_on(harness.authority.status())
             .expect("experimental Raft status should read")
             .current_term()
             .expect("single-node leader should have a term");
-        *harness
+        harness
             .control_plane
-            .after_heartbeat_commit_hook
-            .lock()
-            .expect("heartbeat hook mutex should not be poisoned") =
-            Some(Box::new(move |_| Ok(Some(initial_term + 1))));
+            .set_after_heartbeat_commit_term_for_test(initial_term + 1);
 
         let error = storage::clock::with_time_override(31_000, || {
             harness.control_plane.refresh_node_heartbeat(
@@ -7851,7 +7221,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![7];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -8019,7 +7389,7 @@ mod tests {
             .control_plane
             .expire_heartbeat_leases(41_000)
             .expect("the old durable deadline must not expire a rebased volatile lease");
-        assert_eq!(expiry.1, 0);
+        assert_eq!(expiry.expired_nodes(), 0);
         assert_eq!(
             harness
                 .control_plane
@@ -8043,7 +7413,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![30];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -8583,7 +7953,7 @@ mod tests {
         config.storage_pg_ids = vec![7];
 
         let mut harness = experimental_raft_durable_test_harness("heartbeat-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -8706,7 +8076,7 @@ mod tests {
 
         let mut restarted =
             experimental_raft_durable_test_harness("heartbeat-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
@@ -8792,7 +8162,7 @@ mod tests {
 
         let mut harness =
             experimental_raft_durable_wal_test_harness("wal-heartbeat-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("WAL-backed control-plane bootstrap should succeed");
         let checkpoint_before = harness.authority.durability_metric_snapshots().checkpoint;
         let wal_offsets_before = harness
@@ -8882,9 +8252,9 @@ mod tests {
         }];
         config.storage_pg_ids = vec![7];
 
-        let mut harness =
+        let harness =
             experimental_raft_durable_wal_test_harness("wal-snapshot-purge-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("WAL-backed control-plane bootstrap should succeed");
         let snapshot_log_id = harness
             .control_plane
@@ -8955,7 +8325,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![17];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -9092,7 +8462,9 @@ mod tests {
             .control_plane
             .expire_heartbeat_leases(50_900)
             .expect("the old durable deadline must not expire the acknowledged lease");
-        assert_eq!(no_expiry, (active_cluster_epoch, 0, 0));
+        assert_eq!(no_expiry.cluster_epoch(), active_cluster_epoch);
+        assert_eq!(no_expiry.expired_nodes(), 0);
+        assert_eq!(no_expiry.peering_pgs(), 0);
         assert_eq!(
             harness
                 .control_plane
@@ -9107,9 +8479,9 @@ mod tests {
             .control_plane
             .expire_heartbeat_leases(51_100)
             .expect("acknowledged deadline expiry should apply through raft");
-        assert!(expiry.0 > active_cluster_epoch);
-        assert_eq!(expiry.1, 1);
-        assert_eq!(expiry.2, 1);
+        assert!(expiry.cluster_epoch() > active_cluster_epoch);
+        assert_eq!(expiry.expired_nodes(), 1);
+        assert_eq!(expiry.peering_pgs(), 1);
         let expired_snapshot = harness
             .control_plane
             .current_snapshot()
@@ -9217,7 +8589,7 @@ mod tests {
             },
         ];
         config.storage_pg_ids.clear();
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         for (node_id, now_ms, lease_ms) in [(1, 50_000, 900), (2, 50_010, 1_000)] {
@@ -9319,7 +8691,7 @@ mod tests {
             .control_plane
             .expire_heartbeat_leases(50_900)
             .expect("targeted expiry should commit through Raft");
-        assert_eq!(expiry.1, 1);
+        assert_eq!(expiry.expired_nodes(), 1);
         let after_expiry = harness
             .control_plane
             .current_snapshot()
@@ -9350,7 +8722,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![17];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -9435,8 +8807,8 @@ mod tests {
             .control_plane
             .expire_heartbeat_leases(far_future_now_ms)
             .expect("elapsed expiry should commit through raft");
-        assert_eq!(expiry.1, 1);
-        assert_eq!(expiry.2, 1);
+        assert_eq!(expiry.expired_nodes(), 1);
+        assert_eq!(expiry.peering_pgs(), 1);
         let expired_snapshot = harness
             .control_plane
             .current_snapshot()
@@ -9502,7 +8874,7 @@ mod tests {
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![17];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -9585,8 +8957,8 @@ mod tests {
             harness.control_plane.expire_heartbeat_leases(50_000)
         })
         .expect("deadline expiry should use resampled time");
-        assert_eq!(expiry.1, 1);
-        assert_eq!(expiry.2, 1);
+        assert_eq!(expiry.expired_nodes(), 1);
+        assert_eq!(expiry.peering_pgs(), 1);
         let expired_snapshot = harness
             .control_plane
             .current_snapshot()
@@ -9604,14 +8976,14 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_serves_unix_heartbeat_refresh() {
-        let mut harness = experimental_raft_test_harness("unix-heartbeat-test");
+        let harness = experimental_raft_test_harness("unix-heartbeat-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![9];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let bootstrap_epoch = harness
@@ -9690,14 +9062,14 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_unix_heartbeat_rejects_unknown_node() {
-        let mut harness = experimental_raft_test_harness("unix-heartbeat-reject-test");
+        let harness = experimental_raft_test_harness("unix-heartbeat-reject-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![9];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
@@ -9742,14 +9114,14 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_serves_unix_runtime_map_read_index() {
-        let mut harness = experimental_raft_test_harness("unix-runtime-map-test");
+        let harness = experimental_raft_test_harness("unix-runtime-map-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![11];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
 
         let tmp = short_unix_socket_test_dir("experimental-raft-unix-runtime-map");
@@ -9786,14 +9158,14 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_serves_runtime_map_admin_helpers() {
-        let mut harness = experimental_raft_test_harness("runtime-map-admin-helpers-test");
+        let harness = experimental_raft_test_harness("runtime-map-admin-helpers-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![12];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
@@ -9849,7 +9221,7 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_serves_unix_acting_set_admin() {
-        let mut harness = experimental_raft_test_harness("unix-acting-set-admin-test");
+        let harness = experimental_raft_test_harness("unix-acting-set-admin-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
@@ -9862,7 +9234,7 @@ mod tests {
             },
         ];
         config.storage_pg_ids = vec![19];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
@@ -9900,7 +9272,7 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_serves_live_acting_set_helper() {
-        let mut harness = experimental_raft_test_harness("live-acting-set-helper-test");
+        let harness = experimental_raft_test_harness("live-acting-set-helper-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![
             config::ConfiguredStorageNodeSocket {
@@ -9913,7 +9285,7 @@ mod tests {
             },
         ];
         config.storage_pg_ids = vec![19];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let bootstrap_epoch = harness
             .control_plane
@@ -9949,14 +9321,14 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_unix_acting_set_admin_rejects_unknown_node() {
-        let mut harness = experimental_raft_test_harness("unix-acting-set-admin-reject-test");
+        let harness = experimental_raft_test_harness("unix-acting-set-admin-reject-test");
         let mut config = test_server_config();
         config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
             node_id: 1,
             socket_path: "/tmp/argmin-experimental-raft-node-1.sock".to_string(),
         }];
         config.storage_pg_ids = vec![19];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
@@ -10011,7 +9383,7 @@ mod tests {
         config.storage_pg_ids = vec![19];
 
         let mut harness = experimental_raft_durable_test_harness("acting-set-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
         let changed = harness
             .control_plane
@@ -10026,9 +9398,8 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let mut restarted =
-            experimental_raft_durable_test_harness("acting-set-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
+        let restarted = experimental_raft_durable_test_harness("acting-set-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
@@ -10060,7 +9431,7 @@ mod tests {
         config.storage_pg_ids = vec![19];
 
         let mut harness = experimental_raft_durable_test_harness("reject-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
         let before = harness
             .control_plane
@@ -10098,8 +9469,8 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let mut restarted = experimental_raft_durable_test_harness("reject-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
+        let restarted = experimental_raft_durable_test_harness("reject-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
@@ -10132,7 +9503,7 @@ mod tests {
             },
         ];
         config.storage_pg_ids = vec![13];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         harness
             .control_plane
@@ -10365,7 +9736,7 @@ mod tests {
         config.storage_pg_ids = vec![13];
 
         let mut harness = experimental_raft_durable_test_harness("transfer-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("durable experimental raft control-plane bootstrap should succeed");
         harness
             .control_plane
@@ -10504,8 +9875,8 @@ mod tests {
         assert!(state_path.exists());
         harness.shutdown();
 
-        let mut restarted = experimental_raft_durable_test_harness("transfer-restart", &state_path);
-        bootstrap_empty_experimental_raft_control_plane(&mut restarted.control_plane, &config)
+        let restarted = experimental_raft_durable_test_harness("transfer-restart", &state_path);
+        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
             .expect("durable experimental raft control-plane restart bootstrap should be a no-op");
         let restored = restarted
             .control_plane
@@ -10552,7 +9923,7 @@ mod tests {
             },
         ];
         config.storage_pg_ids = vec![14];
-        bootstrap_empty_experimental_raft_control_plane(&mut harness.control_plane, &config)
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
             .expect("experimental raft control-plane bootstrap should succeed");
         harness
             .control_plane
@@ -12051,7 +11422,7 @@ mod tests {
         let mut harness =
             experimental_raft_durable_test_harness("runtime-refresh-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(
-            &mut harness.control_plane,
+            &harness.control_plane,
             &control_plane_config,
         )
         .expect("durable experimental raft control-plane bootstrap should succeed");
@@ -12127,10 +11498,10 @@ mod tests {
             .expect("durable experimental Active heartbeat should checkpoint");
         harness.shutdown();
 
-        let mut restarted =
+        let restarted =
             experimental_raft_durable_test_harness("runtime-refresh-restart", &state_path);
         bootstrap_empty_experimental_raft_control_plane(
-            &mut restarted.control_plane,
+            &restarted.control_plane,
             &control_plane_config,
         )
         .expect("durable experimental raft control-plane restart bootstrap should be a no-op");

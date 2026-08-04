@@ -3401,6 +3401,7 @@ uncertified_initial_topology_opaque_surface_leaks=$(
             method = $0
             sub(/^.*fn[[:space:]]+/, "", method)
             sub(/\(.*/, "", method)
+            sub(/<.*/, "", method)
             if (method != "node_count" && method != "pg_count") {
                 print FILENAME ":" FNR ":" $0
             }
@@ -3551,6 +3552,61 @@ argmin_raft_durability_lifecycle_leaks=$(
 fail_with_matches \
     "Raft checkpoint paths, locks, serving markers, WAL checkpoint policy, and monitor lifecycle must remain authority-issued and owned by storage" \
     "$argmin_raft_durability_lifecycle_leaks"
+
+argmin_raft_authority_host_leaks=$(
+    rg -n --color=never \
+        '\bExperimentalRaftControlPlane\b|\bauthority_time_and_lease_horizon_binding(_for_(status|term))?\b|\bsubmit_raft_command_with_checkpoint_policy\b|\bfinish_submitted_raft_command\b|\bcheckpoint_committed_raft_command\b|\.serve_cloned_raft_authority\(' \
+        crates/argmin-s3/src \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Raft logical command, authority-clock, checkpoint, and RPC-serving composition must remain inside the storage-owned authority host" \
+    "$argmin_raft_authority_host_leaks"
+
+raft_authority_host_surface_leaks=$(
+    awk '
+    /pub struct ControlPlaneRaftAuthorityHost[[:space:]]*\{/ {
+        in_host = 1
+        depth = 0
+    }
+    in_host {
+        if ($0 ~ /^[[:space:]]*pub([[:space:]]*\([^)]*\))?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:/) {
+            print FILENAME ":" FNR ":" $0
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_host = 0
+        }
+    }
+    /impl ControlPlaneRaftAuthorityHost[[:space:]]*\{/ {
+        in_host_impl = 1
+        depth = 0
+    }
+    in_host_impl {
+        if ($0 ~ /^[[:space:]]*pub[[:space:]]+([^[:space:]]+[[:space:]]+)*fn[[:space:]]+/) {
+            method = $0
+            sub(/^.*fn[[:space:]]+/, "", method)
+            sub(/\(.*/, "", method)
+            sub(/<.*/, "", method)
+            if (method != "start_durable" && method != "serve_rpc" && method != "establish_uncertified_initial_topology" && method != "linearized_authority_serving" && method != "invalidate_blocked_authority_clock_checkpoint" && method != "expire_heartbeat_leases" && method != "new_for_test" && method != "enable_resampled_authority_time_for_test" && method != "block_on_for_test" && method != "authority_for_test" && method != "durability_for_test" && method != "current_snapshot_for_test" && method != "store_restart_artifact_for_test" && method != "submit_command_for_test" && method != "submit_liveness_command_for_test" && method != "ensure_available_for_test" && method != "poison_for_test" && method != "lease_horizon_authority_for_test" && method != "set_after_heartbeat_commit_term_for_test" && method != "shares_lifecycle_for_test") {
+                print FILENAME ":" FNR ":" $0
+            }
+        }
+        line = $0
+        depth += gsub(/\{/, "{", line)
+        depth -= gsub(/\}/, "}", line)
+        if (depth == 0 && $0 ~ /\}/) {
+            in_host_impl = 0
+        }
+    }
+    ' crates/storage/src/control_plane_raft_host.rs
+)
+fail_with_matches \
+    "The storage-owned Raft authority host must remain opaque and expose only logical operations or bounded test hooks" \
+    "$raft_authority_host_surface_leaks"
 
 raft_authority_durability_surface_leaks=$(
     awk '

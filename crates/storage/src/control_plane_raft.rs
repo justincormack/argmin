@@ -2797,6 +2797,9 @@ pub struct ControlPlaneRaftAuthority {
     authority_instance_id: OnceLock<ControlPlaneRaftAuthorityInstanceId>,
     durability_publication: OnceLock<ControlPlaneRaftDurabilityPublication>,
     durability_lifecycle: OnceLock<Arc<crate::control_plane_raft_durability::DurabilityInner>>,
+    authority_host_lifecycle:
+        OnceLock<Arc<crate::control_plane_raft_host::DurableAuthorityHostLifecycle>>,
+    initialized_membership_in_process: AtomicBool,
     uncertified_initial_topology_checkpoint_published: OnceLock<()>,
     checkpoint_publication: Arc<Mutex<Option<ControlPlaneRaftCheckpointPosition>>>,
     durable_artifact_path: Option<Arc<PathBuf>>,
@@ -5117,6 +5120,8 @@ impl ControlPlaneRaftAuthority {
             authority_instance_id: OnceLock::new(),
             durability_publication: OnceLock::new(),
             durability_lifecycle: OnceLock::new(),
+            authority_host_lifecycle: OnceLock::new(),
+            initialized_membership_in_process: AtomicBool::new(false),
             uncertified_initial_topology_checkpoint_published: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
@@ -5146,6 +5151,8 @@ impl ControlPlaneRaftAuthority {
             authority_instance_id: OnceLock::new(),
             durability_publication: OnceLock::new(),
             durability_lifecycle: OnceLock::new(),
+            authority_host_lifecycle: OnceLock::new(),
+            initialized_membership_in_process: AtomicBool::new(false),
             uncertified_initial_topology_checkpoint_published: OnceLock::new(),
             checkpoint_publication: Arc::new(Mutex::new(None)),
             durable_artifact_path: None,
@@ -5203,6 +5210,17 @@ impl ControlPlaneRaftAuthority {
         &self,
     ) -> &OnceLock<Arc<crate::control_plane_raft_durability::DurabilityInner>> {
         &self.durability_lifecycle
+    }
+
+    pub(crate) fn authority_host_lifecycle_slot(
+        &self,
+    ) -> &OnceLock<Arc<crate::control_plane_raft_host::DurableAuthorityHostLifecycle>> {
+        &self.authority_host_lifecycle
+    }
+
+    pub(crate) fn initialized_membership_in_process(&self) -> bool {
+        self.initialized_membership_in_process
+            .load(Ordering::Acquire)
     }
 
     /// Bind process-hosted peer checkpoint work to this authority's durability
@@ -5347,6 +5365,8 @@ impl ControlPlaneRaftAuthority {
         }
         let Some(policy) = &self.static_peer_policy else {
             self.initialize_single_node_membership(self.node_id).await?;
+            self.initialized_membership_in_process
+                .store(true, Ordering::Release);
             return Ok(true);
         };
         let peers = policy.peers();
@@ -5354,6 +5374,8 @@ impl ControlPlaneRaftAuthority {
             return Ok(false);
         }
         self.initialize_membership(peers).await?;
+        self.initialized_membership_in_process
+            .store(true, Ordering::Release);
         Ok(true)
     }
 
