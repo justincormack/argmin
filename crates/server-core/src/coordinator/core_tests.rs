@@ -19642,18 +19642,16 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let segment = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
-        .unwrap()
-        .pop()
-        .expect("put object should create one segment");
+        .test_capture_object_payload(&bucket, &key, VersionId::Null)
+        .unwrap();
     let corrupt_shard_index = 0;
-    let corrupt_path = shard_file_path(&coord, "bucket", "key", corrupt_shard_index);
-    let original_bytes = std::fs::read(&corrupt_path).unwrap();
-    corrupt_shard_on_disk(&coord, "bucket", "key", corrupt_shard_index);
-    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
-    assert_ne!(corrupt_bytes, original_bytes);
+    inject_object_shard_corruption(&coord, "bucket", "key", corrupt_shard_index);
+    let corrupt_state = coord
+        .storage_node()
+        .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
+        .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -19670,29 +19668,104 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
         .unwrap();
     assert_eq!(result.body.read_all().unwrap(), data);
 
-    assert_eq!(
-        std::fs::read(&corrupt_path).unwrap(),
-        corrupt_bytes,
+    assert!(
+        coord
+            .storage_node()
+            .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
+            .unwrap()
+            .has_same_state_as(&corrupt_state),
         "foreground read recovery must not rewrite the damaged shard inline"
     );
     let repairs = coord
         .storage_node()
-        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_object_payload_repair_observations(&payload)
         .unwrap();
     assert_eq!(repairs.len(), 1);
-    let repair = &repairs[0].work_item;
-    assert_eq!(repair.request.data_pg_id, segment.data_pg_id);
-    assert_eq!(repair.request.segment_okh, segment.segment_okh);
-    assert_eq!(repair.request.segment_vid, segment.segment_vid);
-    assert_eq!(repair.request.segment_crc64, segment.segment_crc64);
-    assert_eq!(repair.shard_index.get(), corrupt_shard_index);
+    assert_eq!(repairs[0].segment_index, 0);
+    assert_eq!(repairs[0].shard_index, corrupt_shard_index);
+    assert!(repairs[0].last_error.is_none());
     assert_eq!(
         coord
             .storage_node()
-            .test_take_placed_segment_shard_repair_work(),
-        Some(*repair),
+            .test_take_object_payload_repair_wake(&payload)
+            .unwrap(),
+        Some(repairs[0].clone()),
         "successful read recovery should leave a background repair wake hint"
     );
+}
+
+#[test]
+fn repair_wake_selection_preserves_unrelated_payload_work() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let mut payloads = Vec::new();
+    for (key, data) in [
+        ("first", b"first repair payload".as_slice()),
+        ("second", b"second repair payload".as_slice()),
+    ] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", key, test_requester(), None),
+                data,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let payload = coord
+            .storage_node()
+            .test_capture_object_payload(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key(key),
+                VersionId::Null,
+            )
+            .unwrap();
+        inject_object_shard_corruption(&coord, "bucket", key, 0);
+        let result = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(result.body.read_all().unwrap(), data);
+        payloads.push(payload);
+    }
+
+    let second = coord
+        .storage_node()
+        .test_take_object_payload_repair_wake(&payloads[1])
+        .unwrap()
+        .expect("second payload repair wake exists");
+    assert_eq!(second.segment_index, 0);
+    assert_eq!(second.shard_index, 0);
+    let first = coord
+        .storage_node()
+        .test_take_object_payload_repair_wake(&payloads[0])
+        .unwrap()
+        .expect("selecting the second payload must preserve the first wake");
+    assert_eq!(first.segment_index, 0);
+    assert_eq!(first.shard_index, 0);
 }
 
 #[test]
@@ -19710,7 +19783,7 @@ fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
     test_helpers::put_object(
         &coord,
         &PutObjectRequest {
-            encryption: WriteEncryptionRequest::none(),
+            encryption: WriteEncryptionRequest::managed(ManagedEncryptionAlgorithm::Aes256),
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
             object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
@@ -19726,14 +19799,12 @@ fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
 
     let bucket = trusted_bucket_name("bucket");
     let source_key = trusted_object_key("src");
-    let segment = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments_physical(&bucket, &source_key, VersionId::Null)
-        .unwrap()
-        .pop()
-        .expect("source object should create one segment");
+        .test_capture_object_payload(&bucket, &source_key, VersionId::Null)
+        .unwrap();
     let corrupt_shard_index = 0;
-    corrupt_shard_on_disk(&coord, "bucket", "src", corrupt_shard_index);
+    inject_object_shard_corruption(&coord, "bucket", "src", corrupt_shard_index);
 
     coord
         .copy_object(&CopyObjectRequest {
@@ -19772,15 +19843,12 @@ fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
 
     let repairs = coord
         .storage_node()
-        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_object_payload_repair_observations(&payload)
         .unwrap();
     assert_eq!(repairs.len(), 1);
-    let repair = &repairs[0].work_item;
-    assert_eq!(repair.request.data_pg_id, segment.data_pg_id);
-    assert_eq!(repair.request.segment_okh, segment.segment_okh);
-    assert_eq!(repair.request.segment_vid, segment.segment_vid);
-    assert_eq!(repair.request.segment_crc64, segment.segment_crc64);
-    assert_eq!(repair.shard_index.get(), corrupt_shard_index);
+    assert_eq!(repairs[0].segment_index, 0);
+    assert_eq!(repairs[0].shard_index, corrupt_shard_index);
+    assert!(repairs[0].last_error.is_none());
 }
 
 #[test]
@@ -19828,14 +19896,12 @@ fn upload_part_copy_discovered_corrupt_source_shard_queues_background_repair() {
 
     let bucket = trusted_bucket_name("bucket");
     let source_key = trusted_object_key("src");
-    let segment = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments_physical(&bucket, &source_key, VersionId::Null)
-        .unwrap()
-        .pop()
-        .expect("source object should create one segment");
+        .test_capture_object_payload(&bucket, &source_key, VersionId::Null)
+        .unwrap();
     let corrupt_shard_index = 0;
-    corrupt_shard_on_disk(&coord, "bucket", "src", corrupt_shard_index);
+    inject_object_shard_corruption(&coord, "bucket", "src", corrupt_shard_index);
 
     let part = coord
         .upload_part_copy(&UploadPartCopyRequest {
@@ -19891,15 +19957,12 @@ fn upload_part_copy_discovered_corrupt_source_shard_queues_background_repair() {
 
     let repairs = coord
         .storage_node()
-        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_object_payload_repair_observations(&payload)
         .unwrap();
     assert_eq!(repairs.len(), 1);
-    let repair = &repairs[0].work_item;
-    assert_eq!(repair.request.data_pg_id, segment.data_pg_id);
-    assert_eq!(repair.request.segment_okh, segment.segment_okh);
-    assert_eq!(repair.request.segment_vid, segment.segment_vid);
-    assert_eq!(repair.request.segment_crc64, segment.segment_crc64);
-    assert_eq!(repair.shard_index.get(), corrupt_shard_index);
+    assert_eq!(repairs[0].segment_index, 0);
+    assert_eq!(repairs[0].shard_index, corrupt_shard_index);
+    assert!(repairs[0].last_error.is_none());
 }
 
 #[test]
@@ -19959,19 +20022,17 @@ fn retained_read_skips_repair_record_after_admitted_route_expiry_without_publica
         .unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let segment = cluster
-        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
-        .unwrap()
-        .pop()
-        .expect("put object should create one segment");
-    corrupt_shard_on_disk(&coord, "bucket", "key", 0);
+    let payload = cluster
+        .test_capture_object_payload(&bucket, &key, VersionId::Null)
+        .unwrap();
+    inject_object_shard_corruption(&coord, "bucket", "key", 0);
 
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     time.set(6_000);
     assert_eq!(result.body.read_all().unwrap(), data);
     assert!(
         cluster
-            .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+            .test_object_payload_repair_observations(&payload)
             .unwrap()
             .is_empty(),
         "expired admitted authority must not record repair through the renewed raw route"
@@ -20025,16 +20086,16 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let segment = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
-        .unwrap()
-        .pop()
-        .expect("put object should create one segment");
+        .test_capture_object_payload(&bucket, &key, VersionId::Null)
+        .unwrap();
     let corrupt_shard_index = 0;
-    let corrupt_path = shard_file_path(&coord, "bucket", "key", corrupt_shard_index);
-    corrupt_shard_on_disk(&coord, "bucket", "key", corrupt_shard_index);
-    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+    inject_object_shard_corruption(&coord, "bucket", "key", corrupt_shard_index);
+    let corrupt_state = coord
+        .storage_node()
+        .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
+        .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -20073,7 +20134,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
     assert!(repair.test_repair_one_pending());
     let repairs = coord
         .storage_node()
-        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_object_payload_repair_observations(&payload)
         .unwrap();
     assert!(repairs.iter().any(|repair| {
         repair.last_error.as_deref().is_some_and(|error| {
@@ -20089,12 +20150,15 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
     assert!(repair.test_repair_one_pending());
     assert!(coord
         .storage_node()
-        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_object_payload_repair_observations(&payload)
         .unwrap()
         .is_empty());
-    let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
-    assert_ne!(
-        repaired_bytes, corrupt_bytes,
+    assert!(
+        !coord
+            .storage_node()
+            .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
+            .unwrap()
+            .has_same_state_as(&corrupt_state),
         "retry should rewrite the corrupt shard after transient failure"
     );
 }
@@ -20145,15 +20209,15 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let segment = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
-        .unwrap()
-        .pop()
-        .expect("put object should create one segment");
-    let corrupt_path = shard_file_path(&coord, "bucket", "key", 0);
-    corrupt_shard_on_disk(&coord, "bucket", "key", 0);
-    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+        .test_capture_object_payload(&bucket, &key, VersionId::Null)
+        .unwrap();
+    inject_object_shard_corruption(&coord, "bucket", "key", 0);
+    let corrupt_state = coord
+        .storage_node()
+        .test_capture_object_payload_shard_file(&payload, 0, 0)
+        .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -20170,12 +20234,11 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
         .unwrap();
     assert_eq!(result.body.read_all().unwrap(), data);
 
-    let missing_paths = [
-        shard_file_path(&coord, "bucket", "key", 1),
-        shard_file_path(&coord, "bucket", "key", 2),
-    ];
-    for path in &missing_paths {
-        std::fs::remove_file(path).unwrap();
+    for shard_index in [1, 2] {
+        coord
+            .storage_node()
+            .test_inject_object_payload_shard_loss(&payload, 0, shard_index)
+            .unwrap();
     }
 
     let repair = storage::StorageShardRepairSweeper::disabled(test_storage_route_handle(
@@ -20184,15 +20247,23 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
     assert!(repair.test_repair_one_pending());
     let repairs = coord
         .storage_node()
-        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_object_payload_repair_observations(&payload)
         .unwrap();
     assert_eq!(repairs.len(), 1);
     assert!(repairs[0].last_error.is_some());
-    assert_eq!(repairs[0].work_item.shard_index.get(), 0);
-    assert_eq!(std::fs::read(&corrupt_path).unwrap(), corrupt_bytes);
-    for path in &missing_paths {
+    assert_eq!(repairs[0].shard_index, 0);
+    assert!(coord
+        .storage_node()
+        .test_capture_object_payload_shard_file(&payload, 0, 0)
+        .unwrap()
+        .has_same_state_as(&corrupt_state));
+    for shard_index in [1, 2] {
         assert!(
-            !path.exists(),
+            coord
+                .storage_node()
+                .test_capture_object_payload_shard_file(&payload, 0, shard_index)
+                .unwrap()
+                .is_missing(),
             "unrecoverable repair should not recreate any shard from an insufficient EC set"
         );
     }
@@ -20244,16 +20315,16 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let segment = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments_physical(&bucket, &key, VersionId::Null)
-        .unwrap()
-        .pop()
-        .expect("put object should create one segment");
+        .test_capture_object_payload(&bucket, &key, VersionId::Null)
+        .unwrap();
     let corrupt_shard_index = 0;
-    let corrupt_path = shard_file_path(&coord, "bucket", "key", corrupt_shard_index);
-    corrupt_shard_on_disk(&coord, "bucket", "key", corrupt_shard_index);
-    let corrupt_bytes = std::fs::read(&corrupt_path).unwrap();
+    inject_object_shard_corruption(&coord, "bucket", "key", corrupt_shard_index);
+    let corrupt_state = coord
+        .storage_node()
+        .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
+        .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -20273,7 +20344,7 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
     assert!(coord._shard_repair_sweeper.test_repair_one_pending());
     assert!(coord
         .storage_node()
-        .test_list_placed_segment_shard_repairs(segment.data_pg_id)
+        .test_object_payload_repair_observations(&payload)
         .unwrap()
         .is_empty());
     let repaired = coord
@@ -20290,9 +20361,12 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
         })
         .unwrap();
     assert_eq!(repaired.body.read_all().unwrap(), data);
-    let repaired_bytes = std::fs::read(&corrupt_path).unwrap();
-    assert_ne!(
-        repaired_bytes, corrupt_bytes,
+    assert!(
+        !coord
+            .storage_node()
+            .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
+            .unwrap()
+            .has_same_state_as(&corrupt_state),
         "repair should rewrite the corrupt shard file"
     );
 }
@@ -21064,76 +21138,39 @@ fn put_get_object_trailing_slash_key() {
     assert_eq!(obj.size, 4);
 }
 
-// ── Disk manipulation helpers for EC tests ────────────────────────
+// ── Opaque storage fault scenarios for EC tests ────────────────────
 
-/// Compute shard file path on disk for a given object and shard index.
-fn shard_file_path(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) -> PathBuf {
-    let (data_pg_id, okh, generation_id, ec) = {
-        let bucket_name = trusted_bucket_name(bucket);
-        let object_key = trusted_object_key(key);
-        let record = coord
-            .storage_node()
-            .test_get_object_meta(&bucket_name, &object_key)
-            .unwrap();
-        let segments = coord
-            .storage_node()
-            .test_get_object_segments_physical(&bucket_name, &object_key, record.version_id())
-            .unwrap();
-        if let Some(segment) = segments.first() {
-            (
-                segment.data_pg_id,
-                segment.segment_okh,
-                segment.segment_vid,
-                EcShape {
-                    k: segment.ec_k,
-                    m: segment.ec_m,
-                },
-            )
-        } else {
-            let live = record.as_live().expect("expected live object");
-            (
-                object_data_pg_id(
-                    coord,
-                    bucket_name.as_str(),
-                    object_key.as_str(),
-                    live.generation_id,
-                ),
-                object_key_hash(bucket_name.as_str(), object_key.as_str()),
-                live.generation_id,
-                live.ec,
-            )
-        }
-    };
+fn capture_object_payload_for_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+) -> storage::test_support::TestObjectPayloadSnapshot {
     coord
         .storage_node()
-        .test_payload_shard_file_path(data_pg_id, ec, &okh, generation_id, shard_index)
+        .test_capture_object_payload(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            VersionId::Null,
+        )
         .unwrap()
 }
 
-/// Delete a specific shard file from disk.
-fn delete_shard_on_disk(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
-    let path = shard_file_path(coord, bucket, key, shard_index);
-    std::fs::remove_file(&path).unwrap_or_else(|e| {
-        panic!(
-            "failed to delete shard {shard_index} at {}: {e}",
-            path.display()
-        )
-    });
+/// Inject loss of a logical shard while storage retains physical ownership.
+fn inject_object_shard_loss(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
+    let payload = capture_object_payload_for_test(coord, bucket, key);
+    coord
+        .storage_node()
+        .test_inject_object_payload_shard_loss(&payload, 0, shard_index)
+        .unwrap();
 }
 
-/// Corrupt a specific shard file on disk (flip first byte).
-/// PgStore's read_shard will detect CRC mismatch.
-fn corrupt_shard_on_disk(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
-    let path = shard_file_path(coord, bucket, key, shard_index);
-    let mut data = std::fs::read(&path).unwrap_or_else(|e| {
-        panic!(
-            "failed to read shard {shard_index} at {}: {e}",
-            path.display()
-        )
-    });
-    assert!(!data.is_empty(), "shard file is empty");
-    data[0] ^= 0xFF;
-    std::fs::write(&path, &data).unwrap();
+/// Inject a logical shard corruption while storage retains physical ownership.
+fn inject_object_shard_corruption(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
+    let payload = capture_object_payload_for_test(coord, bucket, key);
+    coord
+        .storage_node()
+        .test_inject_object_payload_shard_corruption(&payload, 0, shard_index)
+        .unwrap();
 }
 
 // ── EC fault injection tests ────────────────────────────────────
@@ -21178,7 +21215,7 @@ fn ec_reconstruction_after_shard_loss() {
     .unwrap();
 
     // Delete one data shard using the helper
-    delete_shard_on_disk(&coord, "bucket", "resilient", 0);
+    inject_object_shard_loss(&coord, "bucket", "resilient", 0);
 
     // Get should still succeed via EC reconstruction
     let obj = coord
@@ -21227,7 +21264,7 @@ fn ec_drop_one_data_shard_get() {
     )
     .unwrap();
 
-    delete_shard_on_disk(&coord, "bucket", "obj1", 0);
+    inject_object_shard_loss(&coord, "bucket", "obj1", 0);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21280,7 +21317,7 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
     )
     .unwrap();
 
-    delete_shard_on_disk(&coord, "bucket", "obj-reconstruct", 0);
+    inject_object_shard_loss(&coord, "bucket", "obj-reconstruct", 0);
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
     let ec = coord.storage_node().default_payload_ec_shape();
@@ -21353,8 +21390,8 @@ fn ec_drop_m_shards_at_limit() {
     .unwrap();
 
     // Delete 2 data shards (indices 0 and 1)
-    delete_shard_on_disk(&coord, "bucket", "obj2", 0);
-    delete_shard_on_disk(&coord, "bucket", "obj2", 1);
+    inject_object_shard_loss(&coord, "bucket", "obj2", 0);
+    inject_object_shard_loss(&coord, "bucket", "obj2", 1);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21401,9 +21438,9 @@ fn ec_drop_m_plus_one_shards_fails() {
     .unwrap();
 
     // Delete 3 shards (indices 0, 1, 2)
-    delete_shard_on_disk(&coord, "bucket", "obj3", 0);
-    delete_shard_on_disk(&coord, "bucket", "obj3", 1);
-    delete_shard_on_disk(&coord, "bucket", "obj3", 2);
+    inject_object_shard_loss(&coord, "bucket", "obj3", 0);
+    inject_object_shard_loss(&coord, "bucket", "obj3", 1);
+    inject_object_shard_loss(&coord, "bucket", "obj3", 2);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21458,7 +21495,7 @@ fn ec_corrupt_one_data_shard_recovery() {
     )
     .unwrap();
 
-    corrupt_shard_on_disk(&coord, "bucket", "obj4", 0);
+    inject_object_shard_corruption(&coord, "bucket", "obj4", 0);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21514,31 +21551,17 @@ fn ec_range_get_with_missing_shard() {
         .into_live()
         .expect("put object should create a live object")
         .generation_id;
-    let segment = coord
+    let payload = coord
         .storage_node()
-        .test_get_object_segments_physical(&bucket, &key, put.version_id)
-        .unwrap()
-        .pop()
-        .expect("put object should create one object segment");
+        .test_capture_object_payload(&bucket, &key, put.version_id)
+        .unwrap();
     let expected_selected_nodes = coord
         .storage_node()
-        .segment_payload_shard_locations(
-            segment.data_pg_id,
-            storage::EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-        )
-        .unwrap()
-        .into_iter()
-        .map(|location| location.node_id())
-        .collect::<BTreeSet<_>>()
-        .len();
+        .test_object_payload_segment_shard_node_count(&payload, 0)
+        .unwrap();
 
     // Delete shard 0 (covers the beginning of the data)
-    delete_shard_on_disk(&coord, "bucket", "obj5", 0);
+    inject_object_shard_loss(&coord, "bucket", "obj5", 0);
 
     // Range get should still succeed via EC reconstruction
     let result = coord
@@ -21604,7 +21627,7 @@ fn ec_drop_parity_shard_data_still_works() {
     .unwrap();
 
     // Delete first parity shard (index 4, since k=4)
-    delete_shard_on_disk(&coord, "bucket", "obj6", 4);
+    inject_object_shard_loss(&coord, "bucket", "obj6", 4);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21634,7 +21657,7 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
     let data = b"EC healthy read should skip parity shards";
-    let put = test_helpers::put_object(
+    test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
@@ -21652,20 +21675,13 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
     )
     .unwrap();
 
-    let segment = {
-        let segments = coord
-            .storage_node()
-            .test_get_object_segments_physical(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("obj7"),
-                put.version_id,
-            )
-            .unwrap();
-        assert_eq!(segments.len(), 1);
-        segments[0].clone()
-    };
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj7");
 
-    corrupt_shard_on_disk(&coord, "bucket", "obj7", 4);
+    inject_object_shard_corruption(&coord, "bucket", "obj7", 4);
+    assert!(!coord
+        .storage_node()
+        .test_object_payload_shard_file_matches_ack(&payload, 0, 4)
+        .unwrap());
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21682,11 +21698,10 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), data);
 
-    let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 4);
     assert!(
-        coord
+        !coord
             .storage_node()
-            .test_shard_exists(segment.data_pg_id, &parity_key)
+            .test_object_payload_shard_file_matches_ack(&payload, 0, 4)
             .unwrap(),
         "healthy-path read should not touch parity shard 4"
     );
@@ -21704,7 +21719,7 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
     let data = b"EC reconstruction should stop after first needed parity";
-    let put = test_helpers::put_object(
+    test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
@@ -21722,21 +21737,10 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
     )
     .unwrap();
 
-    let segment = {
-        let segments = coord
-            .storage_node()
-            .test_get_object_segments_physical(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("obj8"),
-                put.version_id,
-            )
-            .unwrap();
-        assert_eq!(segments.len(), 1);
-        segments[0].clone()
-    };
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj8");
 
-    delete_shard_on_disk(&coord, "bucket", "obj8", 0);
-    corrupt_shard_on_disk(&coord, "bucket", "obj8", 5);
+    inject_object_shard_loss(&coord, "bucket", "obj8", 0);
+    inject_object_shard_corruption(&coord, "bucket", "obj8", 5);
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21753,11 +21757,10 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), data);
 
-    let parity_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), 5);
     assert!(
-        coord
+        !coord
             .storage_node()
-            .test_shard_exists(segment.data_pg_id, &parity_key)
+            .test_object_payload_shard_file_matches_ack(&payload, 0, 5)
             .unwrap(),
         "reconstruction should stop once enough shards are present"
     );

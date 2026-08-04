@@ -530,6 +530,7 @@ pub mod test_support {
     #[derive(Clone)]
     pub struct TestObjectPayloadSnapshot {
         segments: Vec<types::ObjectSegmentRecord>,
+        stored_size_extra: usize,
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -544,12 +545,27 @@ pub mod test_support {
 
     #[cfg(any(test, feature = "test-hooks"))]
     impl TestObjectPayloadSnapshot {
-        pub(crate) fn new(segments: Vec<types::ObjectSegmentRecord>) -> Self {
-            Self { segments }
+        pub(crate) fn new(
+            segments: Vec<types::ObjectSegmentRecord>,
+            stored_size_extra: usize,
+        ) -> Self {
+            Self {
+                segments,
+                stored_size_extra,
+            }
         }
 
         pub(crate) fn segments(&self) -> &[types::ObjectSegmentRecord] {
             &self.segments
+        }
+
+        pub(crate) fn stored_size_for(
+            &self,
+            segment: &types::ObjectSegmentRecord,
+        ) -> Option<usize> {
+            usize::try_from(segment.size)
+                .ok()?
+                .checked_add(self.stored_size_extra)
         }
 
         pub fn is_empty(&self) -> bool {
@@ -569,6 +585,48 @@ pub mod test_support {
                     has_nonzero_stored_checksum: segment.segment_crc64 != 0,
                 })
                 .collect()
+        }
+    }
+
+    /// Logical observation of one repair discovered for a captured payload.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct TestObjectPayloadRepairObservation {
+        pub segment_index: u32,
+        pub shard_index: u8,
+        pub last_error: Option<String>,
+    }
+
+    /// Opaque evidence for the exact file state of one captured payload shard.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Clone, PartialEq, Eq)]
+    pub struct TestObjectPayloadShardFileSnapshot {
+        bytes: Option<Vec<u8>>,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl TestObjectPayloadShardFileSnapshot {
+        pub(crate) fn new(bytes: Option<Vec<u8>>) -> Self {
+            Self { bytes }
+        }
+
+        pub fn is_missing(&self) -> bool {
+            self.bytes.is_none()
+        }
+
+        pub fn has_same_state_as(&self, other: &Self) -> bool {
+            self == other
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl std::fmt::Debug for TestObjectPayloadShardFileSnapshot {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestObjectPayloadShardFileSnapshot")
+                .field("present", &self.bytes.is_some())
+                .field("length", &self.bytes.as_ref().map(Vec::len))
+                .finish()
         }
     }
 
@@ -714,7 +772,8 @@ pub use storage_rpc_auth::{
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
-    TestMultipartUploadRecord, TestObjectPayloadSnapshot, TestPayloadReclaimRoot,
+    TestMultipartUploadRecord, TestObjectPayloadRepairObservation,
+    TestObjectPayloadShardFileSnapshot, TestObjectPayloadSnapshot, TestPayloadReclaimRoot,
     TestReclaimWorkItem, TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]

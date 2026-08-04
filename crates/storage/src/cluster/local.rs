@@ -1608,6 +1608,26 @@ impl LocalClusterRuntimeState {
         Some(work)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn try_take_matching_placed_segment_shard_repair_work(
+        &self,
+        mut matches: impl FnMut(&PlacedSegmentShardRepairWorkItem) -> bool,
+    ) -> Option<PlacedSegmentShardRepairWorkItem> {
+        let mut state = self
+            .placed_segment_shard_repair_queue
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let position = state.work_queue.iter().position(&mut matches)?;
+        let work = state
+            .work_queue
+            .remove(position)
+            .expect("matched repair queue position exists");
+        state.queued.remove(&work);
+        Self::emit_shard_repair_queue_event(&state, Some(work.request.data_pg_id), "dequeued");
+        Some(work)
+    }
+
     pub(crate) fn wait_for_placed_segment_shard_repair_work_poll(
         &self,
         stop: &AtomicBool,

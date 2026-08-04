@@ -450,67 +450,6 @@ pub(crate) struct DurablePlacedSegmentShardRepairEnqueueSummary {
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StorageShardRepairTestRequest {
-    pub data_pg_id: u32,
-    pub segment_okh: [u8; 16],
-    pub segment_vid: GenerationId,
-    pub stored_size: usize,
-    pub segment_crc64: u64,
-    pub ec: EcShape,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StorageShardRepairTestWorkItem {
-    pub request: StorageShardRepairTestRequest,
-    pub shard_index: ShardIndex,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StorageShardRepairTestRecord {
-    pub work_item: StorageShardRepairTestWorkItem,
-    pub first_seen_at: u64,
-    pub last_seen_at: u64,
-    pub observation_count: u64,
-    pub last_error: Option<String>,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<PlacedSegmentShardRepairWorkItem> for StorageShardRepairTestWorkItem {
-    fn from(work_item: PlacedSegmentShardRepairWorkItem) -> Self {
-        Self {
-            request: StorageShardRepairTestRequest {
-                data_pg_id: work_item.request.data_pg_id,
-                segment_okh: work_item.request.segment_okh,
-                segment_vid: work_item.request.segment_vid,
-                stored_size: work_item.request.stored_size,
-                segment_crc64: work_item.request.segment_crc64,
-                ec: work_item.request.ec,
-            },
-            shard_index: work_item.shard_index,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-impl From<PlacedSegmentShardRepairRecord> for StorageShardRepairTestRecord {
-    fn from(record: PlacedSegmentShardRepairRecord) -> Self {
-        Self {
-            work_item: record.work_item.into(),
-            first_seen_at: record.first_seen_at,
-            last_seen_at: record.last_seen_at,
-            observation_count: record.observation_count,
-            last_error: record.last_error,
-        }
-    }
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-#[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct TestDirectPutWrittenSegment {
     pub data_pg_id: u32,
@@ -17401,6 +17340,16 @@ impl StorageCluster {
             .try_take_placed_segment_shard_repair_work()
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn try_take_matching_placed_segment_shard_repair_work(
+        &self,
+        matches: impl FnMut(&PlacedSegmentShardRepairWorkItem) -> bool,
+    ) -> Option<PlacedSegmentShardRepairWorkItem> {
+        self.local_map
+            .runtime_state()
+            .try_take_matching_placed_segment_shard_repair_work(matches)
+    }
+
     pub(crate) fn wait_for_placed_segment_shard_repair_work(
         &self,
         stop: &AtomicBool,
@@ -17444,25 +17393,6 @@ impl StorageCluster {
         let data_pg_id = self.validated_data_pg(PgId::new(data_pg_id))?;
         self.metadata_pg_primary_shard_ack_route(data_pg_id)?
             .list_placed_segment_shard_repairs()
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_list_placed_segment_shard_repairs(
-        &self,
-        data_pg_id: u32,
-    ) -> Result<Vec<StorageShardRepairTestRecord>, StoreError> {
-        self.list_placed_segment_shard_repairs(data_pg_id)
-            .map(|records| records.into_iter().map(Into::into).collect())
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn test_take_placed_segment_shard_repair_work(
-        &self,
-    ) -> Option<StorageShardRepairTestWorkItem> {
-        self.try_take_placed_segment_shard_repair_work()
-            .map(Into::into)
     }
 
     pub(crate) fn acquire_placed_segment_shard_repair_claim(

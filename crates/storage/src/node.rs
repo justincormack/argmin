@@ -1138,6 +1138,42 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_capture_object_payload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<crate::TestObjectPayloadSnapshot, ObjectPgActionError> {
+        self.test_capture_object_payload_with_hook(bucket, key, version_id, || {})
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_capture_object_payload_with_hook(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        after_segments: impl FnOnce(),
+    ) -> Result<crate::TestObjectPayloadSnapshot, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        let segments = pg.get_object_segments(bucket, key, version_id)?;
+        after_segments();
+        if segments.is_empty() {
+            return Ok(crate::TestObjectPayloadSnapshot::new(segments, 0));
+        }
+        let stored = pg.get_object_version(bucket, key, version_id)?;
+        let stored_size_extra = stored
+            .as_live()
+            .map(|live| live.encryption.segment_ciphertext_extra_len())
+            .unwrap_or_default();
+        Ok(crate::TestObjectPayloadSnapshot::new(
+            segments,
+            stored_size_extra,
+        ))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_replace_live_object_segments(
         &self,
         bucket: &BucketName,
@@ -2248,6 +2284,66 @@ mod tests {
         object_pg.get_object_meta(bucket, key).unwrap()
     }
 
+    fn put_segmented_object_for_snapshot_test(
+        node: &SharedStorageNode,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        size: u64,
+        encryption: crate::ObjectEncryption,
+    ) -> StoredObject {
+        let object_pg = node
+            .get_pg(node.pg_topology().object_pg_for(bucket, key))
+            .unwrap();
+        let segment = ObjectSegmentRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: VersionId::Null,
+            segment_index: 0,
+            size,
+            segment_crc64: generation_id.get(),
+            segment_okh: [generation_id.get() as u8; 16],
+            segment_vid: generation_id,
+            data_pg_id: 0,
+            placement_cluster_epoch: ClusterEpoch::INITIAL,
+            ec_k: SharedStorageNode::DEFAULT_EC_SHAPE.k,
+            ec_m: SharedStorageNode::DEFAULT_EC_SHAPE.m,
+        };
+        object_pg
+            .put_object_with_segments(
+                &PutLiveObjectReq {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    version_id: VersionId::Null,
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id,
+                    size,
+                    etag: crate::ObjectEtag::single_part(size),
+                    ec: SharedStorageNode::DEFAULT_EC_SHAPE,
+                    layout: crate::ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: crate::ObjectLockState::default(),
+                    encryption,
+                },
+                &[segment],
+            )
+            .unwrap();
+        object_pg.get_object_meta(bucket, key).unwrap()
+    }
+
+    fn test_managed_object_encryption() -> crate::ObjectEncryption {
+        crate::ObjectEncryption::SseS3(crate::SseS3ObjectState::new(
+            9,
+            [10; crate::SSE_S3_WRAP_NONCE_LEN],
+            [11; crate::SSE_S3_WRAPPED_DEK_LEN],
+            [12; crate::SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
+        ))
+    }
+
     #[test]
     fn data_dir_accessor() {
         let tmp = test_util::tempdir();
@@ -2987,6 +3083,78 @@ mod tests {
             )
             .unwrap();
         assert_eq!(snapshot.stored, fresh_subject.stored);
+    }
+
+    #[test]
+    fn test_payload_capture_keeps_segments_and_encryption_from_one_pg_snapshot() {
+        let tmp = test_util::tempdir();
+        let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap());
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let key = object_key("key");
+        let old_generation = GenerationId::MIN;
+        let old_size = 47;
+        put_segmented_object_for_snapshot_test(
+            &node,
+            &bucket,
+            &key,
+            old_generation,
+            old_size,
+            test_managed_object_encryption(),
+        );
+
+        let object_pg_id = node.pg_topology().object_pg_for(&bucket, &key);
+        let (start_tx, start_rx) = std::sync::mpsc::channel();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let replacement_node = Arc::clone(&node);
+        let replacement_bucket = bucket.clone();
+        let replacement_key = key.clone();
+        let replacement = std::thread::spawn(move || {
+            start_rx.recv().unwrap();
+            assert!(matches!(
+                replacement_node
+                    .stores
+                    .get(&object_pg_id)
+                    .expect("object PG exists")
+                    .try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            blocked_tx.send(()).unwrap();
+            put_segmented_object_for_snapshot_test(
+                &replacement_node,
+                &replacement_bucket,
+                &replacement_key,
+                GenerationId::new(2).unwrap(),
+                80,
+                crate::ObjectEncryption::None,
+            )
+        });
+
+        let snapshot = node
+            .test_capture_object_payload_with_hook(&bucket, &key, VersionId::Null, || {
+                start_tx.send(()).unwrap();
+                blocked_rx.recv().unwrap();
+            })
+            .unwrap();
+        replacement.join().unwrap();
+
+        let segment = snapshot
+            .segments()
+            .first()
+            .expect("old segmented payload was captured");
+        assert_eq!(segment.segment_vid, old_generation);
+        assert_eq!(
+            snapshot.stored_size_for(segment),
+            Some(old_size as usize + crate::OBJECT_ENCRYPTION_SEGMENT_TAG_LEN),
+            "replacement cannot pair old segments with its unencrypted metadata"
+        );
+        assert_eq!(
+            node.test_get_object_version(&bucket, &key, VersionId::Null)
+                .unwrap()
+                .as_live()
+                .unwrap()
+                .generation_id,
+            GenerationId::new(2).unwrap()
+        );
     }
 
     #[test]

@@ -67,6 +67,7 @@ use crate::types::{
 use crate::types::{
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    PlacedSegmentShardRepairWorkItem,
 };
 use crate::*;
 
@@ -17301,8 +17302,7 @@ impl super::StorageCluster {
         version_id: VersionId,
     ) -> Result<crate::TestObjectPayloadSnapshot, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
-            .test_get_object_segments(bucket, key, version_id)
-            .map(crate::TestObjectPayloadSnapshot::new)
+            .test_capture_object_payload(bucket, key, version_id)
     }
 
     /// Transitional owner-private representation seam. New cross-crate tests
@@ -17332,6 +17332,305 @@ impl super::StorageCluster {
         snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<bool, StoreError> {
         self.test_object_payload_snapshot_matches_presence(snapshot, false)
+    }
+
+    /// Injects loss of one placed shard file from a captured committed payload.
+    ///
+    /// The durable acknowledgement is intentionally retained so reads exercise
+    /// the production missing-file reconstruction path. Physical placement and
+    /// shard identity remain owned by storage.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_inject_object_payload_shard_loss(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<(), StoreError> {
+        let path = self.test_object_payload_shard_file_path_from_snapshot(
+            snapshot,
+            segment_index,
+            shard_index,
+        )?;
+        std::fs::remove_file(path).map_err(|source| StoreError::Io {
+            context: "inject object payload shard loss",
+            source,
+        })
+    }
+
+    /// Injects corruption of one placed shard file from a captured payload.
+    ///
+    /// The durable acknowledgement is intentionally left unchanged so the
+    /// production read path discovers the checksum mismatch.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_inject_object_payload_shard_corruption(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<(), StoreError> {
+        let path = self.test_object_payload_shard_file_path_from_snapshot(
+            snapshot,
+            segment_index,
+            shard_index,
+        )?;
+        let mut data = std::fs::read(&path).map_err(|source| StoreError::Io {
+            context: "read object payload shard for corruption",
+            source,
+        })?;
+        let first = data.first_mut().ok_or_else(|| StoreError::Io {
+            context: "corrupt object payload shard",
+            source: std::io::Error::other("placed payload shard is empty"),
+        })?;
+        *first ^= 0xff;
+        std::fs::write(path, data).map_err(|source| StoreError::Io {
+            context: "write corrupt object payload shard",
+            source,
+        })
+    }
+
+    /// Reports whether one captured shard file still matches its durable ack.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_shard_file_matches_ack(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<bool, StoreError> {
+        let (segment, location, shard_key, path) =
+            self.test_object_payload_shard_from_snapshot(snapshot, segment_index, shard_index)?;
+        let route = self.reconstructed_pg_route_at_epoch(
+            location.data_pg_id().pg_id(),
+            segment.placement_cluster_epoch,
+        )?;
+        let expected = self.load_payload_shard_ack_for_pg_route_snapshot(
+            &route,
+            segment.data_pg_id,
+            &shard_key,
+        )?;
+        let data = match std::fs::read(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(StoreError::Io {
+                    context: "inspect captured object payload shard",
+                    source,
+                });
+            }
+        };
+        Ok(data.len() as u64 == expected.stored_size
+            && checksum::crc64::checksum(&data) == expected.crc64)
+    }
+
+    /// Captures exact shard-file state without exposing its path or bytes.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_capture_object_payload_shard_file(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<crate::TestObjectPayloadShardFileSnapshot, StoreError> {
+        let path = self.test_object_payload_shard_file_path_from_snapshot(
+            snapshot,
+            segment_index,
+            shard_index,
+        )?;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(source) => {
+                return Err(StoreError::Io {
+                    context: "capture object payload shard file",
+                    source,
+                });
+            }
+        };
+        Ok(crate::TestObjectPayloadShardFileSnapshot::new(bytes))
+    }
+
+    /// Returns the number of distinct nodes holding one captured segment.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_segment_shard_node_count(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+    ) -> Result<usize, StoreError> {
+        let segment = snapshot
+            .segments()
+            .iter()
+            .find(|segment| segment.segment_index == segment_index)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload segment for placement observation",
+                source: std::io::Error::other(format!(
+                    "captured payload has no segment {segment_index}"
+                )),
+            })?;
+        let request = SegmentStoredBytesRequest {
+            data_pg_id: segment.data_pg_id,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.segment_vid,
+            stored_size: 0,
+            segment_crc64: segment.segment_crc64,
+            ec: EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            },
+        };
+        self.segment_payload_shard_locations_at_placement_epoch(
+            segment.placement_cluster_epoch,
+            &request,
+        )
+        .map(|locations| {
+            locations
+                .into_iter()
+                .map(|location| location.node_id())
+                .collect::<HashSet<_>>()
+                .len()
+        })
+    }
+
+    /// Returns logical repair observations belonging to a captured payload.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_object_payload_repair_observations(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<Vec<crate::TestObjectPayloadRepairObservation>, StoreError> {
+        let mut observations = Vec::new();
+        let mut scanned_pgs = HashSet::new();
+        for segment in snapshot.segments() {
+            if !scanned_pgs.insert(segment.data_pg_id) {
+                continue;
+            }
+            for repair in self.list_placed_segment_shard_repairs(segment.data_pg_id)? {
+                if let Some(target) =
+                    Self::test_object_payload_repair_segment(snapshot, &repair.work_item)
+                {
+                    observations.push(crate::TestObjectPayloadRepairObservation {
+                        segment_index: target.segment_index,
+                        shard_index: repair.work_item.shard_index.get(),
+                        last_error: repair.last_error,
+                    });
+                }
+            }
+        }
+        observations.sort_by_key(|repair| (repair.segment_index, repair.shard_index));
+        Ok(observations)
+    }
+
+    /// Consumes one repair wake hint and binds it to a captured payload.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_take_object_payload_repair_wake(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<Option<crate::TestObjectPayloadRepairObservation>, StoreError> {
+        let Some(work_item) =
+            self.try_take_matching_placed_segment_shard_repair_work(|work_item| {
+                Self::test_object_payload_repair_segment(snapshot, work_item).is_some()
+            })
+        else {
+            return Ok(None);
+        };
+        let segment = Self::test_object_payload_repair_segment(snapshot, &work_item)
+            .expect("matching repair dequeue preserves its predicate");
+        Ok(Some(crate::TestObjectPayloadRepairObservation {
+            segment_index: segment.segment_index,
+            shard_index: work_item.shard_index.get(),
+            last_error: None,
+        }))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_object_payload_repair_segment<'a>(
+        snapshot: &'a crate::TestObjectPayloadSnapshot,
+        work_item: &PlacedSegmentShardRepairWorkItem,
+    ) -> Option<&'a ObjectSegmentRecord> {
+        snapshot.segments().iter().find(|segment| {
+            segment.data_pg_id == work_item.request.data_pg_id
+                && segment.segment_okh == work_item.request.segment_okh
+                && segment.segment_vid == work_item.request.segment_vid
+                && snapshot.stored_size_for(segment) == Some(work_item.request.stored_size)
+                && segment.segment_crc64 == work_item.request.segment_crc64
+                && segment.ec_k == work_item.request.ec.k
+                && segment.ec_m == work_item.request.ec.m
+        })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_object_payload_shard_file_path_from_snapshot(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<std::path::PathBuf, StoreError> {
+        self.test_object_payload_shard_from_snapshot(snapshot, segment_index, shard_index)
+            .map(|(_, _, _, path)| path)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_object_payload_shard_from_snapshot(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<
+        (
+            ObjectSegmentRecord,
+            ShardLocation,
+            ShardKey,
+            std::path::PathBuf,
+        ),
+        StoreError,
+    > {
+        let segment = snapshot
+            .segments()
+            .iter()
+            .find(|segment| segment.segment_index == segment_index)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload segment for fault injection",
+                source: std::io::Error::other(format!(
+                    "captured payload has no segment {segment_index}"
+                )),
+            })?;
+        let ec = EcShape {
+            k: segment.ec_k,
+            m: segment.ec_m,
+        };
+        let request = SegmentStoredBytesRequest {
+            data_pg_id: segment.data_pg_id,
+            segment_okh: segment.segment_okh,
+            segment_vid: segment.segment_vid,
+            stored_size: 0,
+            segment_crc64: segment.segment_crc64,
+            ec,
+        };
+        let locations = self.segment_payload_shard_locations_at_placement_epoch(
+            segment.placement_cluster_epoch,
+            &request,
+        )?;
+        let location = locations
+            .into_iter()
+            .find(|location| location.shard_index().get() == shard_index)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload shard for fault injection",
+                source: std::io::Error::other(format!(
+                    "shard index {shard_index} outside captured segment EC layout"
+                )),
+            })?;
+        let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index);
+        let node = self
+            .local_map
+            .node(location.node_id())
+            .ok_or(StoreError::NodeNotFound {
+                node_id: location.node_id().as_u32(),
+                pg_id: location.data_pg_id().get(),
+                cluster_epoch: location.cluster_epoch(),
+            })?;
+        let path = node
+            .data_dir()
+            .join(format!("pg-{:04}", location.data_pg_id().get()))
+            .join("shards")
+            .join(shard_key.hex_prefix())
+            .join(shard_key.hex());
+        Ok((segment.clone(), location, shard_key, path))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

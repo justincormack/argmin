@@ -5628,8 +5628,9 @@ The audit found four remaining classes of work:
 2. **Owner-local impossible-state fixtures.** Logical committed-object segment
    layout, storage identity, placement distribution, and exact payload
    presence/reclamation assertions now use an opaque storage-owned payload
-   snapshot. The remaining cross-crate exceptions are raw object-payload
-   corruption/repair controls and raw reclaim-queue controls. Move tests whose
+   snapshot. Object-payload corruption and repair tests now use that snapshot
+   through storage-owned fault scenarios and logical repair observations. The
+   remaining cross-crate exception is raw reclaim-queue control. Move tests whose
    assertion is about storage corruption, recovery, physical layout, claims,
    or queue invariants into `storage`. Where an S3/coordinator response to a
    storage failure genuinely requires a cross-crate test, expose an opaque
@@ -5772,7 +5773,7 @@ Implementation update (2026-08-03):
   selection, distinct shard-node placement, and both durable shard rows and
   files for exact pre-mutation evidence. The raw record seam has been renamed
   explicitly as transitional and is retained only by the not-yet-migrated
-  corruption, repair, retained-placement, and shard-selection tests; and
+  retained-placement, reclaim, and shard-selection tests; and
 - replaced HTTP and coordinator streaming-cleanup tests' raw staged-segment
   records and caller-reconstructed shard paths with an opaque storage-owned
   stream-upload payload snapshot. Downstream tests can observe only segment
@@ -5785,11 +5786,23 @@ Implementation update (2026-08-03):
   remains pinned by its storage-owner test rather than being reconstructed by
   the coordinator test. The raw staged-segment loader is now crate-private
   behind the opaque capture operation; and
-- retained raw object-payload corruption/repair controls and raw reclaim-queue
-  controls remain explicit transitional exceptions owned by implementation
-  slice 3. They do not satisfy the final curated-boundary completion criterion
-  merely because they live under `storage::test_support` or on a
-  feature-gated `StorageCluster` implementation.
+- replaced cross-crate object-payload shard mutation and repair-queue records
+  with storage-owned snapshot scenarios. Coordinator GET, range GET,
+  CopyObject, UploadPartCopy, admitted-route expiry, and repair-worker tests now
+  select only logical segment/shard ordinals. Storage owns exact historical
+  placement, missing-file and corruption injection, durable-ack comparison,
+  opaque before/after file-state evidence, repair-target matching, and wake-hint
+  consumption. Payload capture reads segments and encryption metadata under one
+  object-PG lock, including a replacement-interleaving regression, while wake
+  selection atomically removes only work matching the supplied snapshot and is
+  pinned with two queued payloads. Explicit managed-encryption repair coverage
+  verifies that logical and stored segment sizes remain distinct. The raw
+  repair DTOs and queue accessors were removed; and
+- retained raw reclaim-queue controls remain the explicit transitional
+  exception owned by implementation slice 3. They do not satisfy the final
+  curated-boundary completion criterion merely because they live under
+  `storage::test_support` or on a feature-gated `StorageCluster`
+  implementation.
 
 Completion:
 

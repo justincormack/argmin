@@ -274,9 +274,6 @@ use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use crate::system_metadata::SystemMetadata;
-#[cfg(test)]
-use storage::object_key_hash;
-
 const TRACE_TARGET: &str = "server_core";
 
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
