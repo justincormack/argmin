@@ -17194,23 +17194,6 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_multipart_part_data_pg_id_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        object_generation_id: GenerationId,
-        part_number: u32,
-    ) -> u32 {
-        self.local_map
-            .object_generation_multipart_part_data_pg(
-                bucket,
-                key,
-                object_generation_id,
-                part_number,
-            )
-            .get()
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_object_meta(
         &self,
@@ -17246,13 +17229,13 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_multipart_part(
+    pub fn test_get_multipart_part_observation(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
         part_number: u16,
-    ) -> Result<crate::TestMultipartPartRecord, ObjectPgActionError> {
+    ) -> Result<crate::TestMultipartPartObservation, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_multipart_part(bucket, key, upload_id, part_number)
             .map(Into::into)
@@ -17560,15 +17543,90 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_all_multipart_part_segments_for_upload(
+    pub fn test_capture_multipart_upload_payload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<Vec<crate::TestMultipartPartSegmentRecord>, ObjectPgActionError> {
+    ) -> Result<crate::TestMultipartPartPayloadSnapshot, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_all_multipart_part_segments_for_upload(bucket, key, upload_id)
-            .map(|segments| segments.into_iter().map(Into::into).collect())
+            .map(crate::TestMultipartPartPayloadSnapshot::new)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_capture_multipart_part_payload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<crate::TestMultipartPartPayloadSnapshot, ObjectPgActionError> {
+        self.metadata_primary_bridge_node()?
+            .test_get_all_multipart_part_segments_for_upload(bucket, key, upload_id)
+            .map(|segments| {
+                crate::TestMultipartPartPayloadSnapshot::new(
+                    segments
+                        .into_iter()
+                        .filter(|segment| segment.part_number == part_number)
+                        .collect(),
+                )
+            })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_multipart_part_payload_snapshot_is_fully_present(
+        &self,
+        snapshot: &crate::TestMultipartPartPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        self.test_multipart_part_payload_snapshot_matches_presence(snapshot, true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_multipart_part_payload_snapshot_is_fully_absent(
+        &self,
+        snapshot: &crate::TestMultipartPartPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        self.test_multipart_part_payload_snapshot_matches_presence(snapshot, false)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_multipart_part_payload_snapshot_matches_presence(
+        &self,
+        snapshot: &crate::TestMultipartPartPayloadSnapshot,
+        expected: bool,
+    ) -> Result<bool, StoreError> {
+        for segment in snapshot.segments() {
+            let ec = EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            };
+            let request = SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: 0,
+                segment_crc64: segment.segment_crc64,
+                ec,
+            };
+            let locations = self.segment_payload_shard_locations_at_placement_epoch(
+                segment.placement_cluster_epoch,
+                &request,
+            )?;
+            for location in locations {
+                let shard_key = ShardKey::new(
+                    &segment.segment_okh,
+                    segment.segment_vid.get(),
+                    location.shard_index().get(),
+                );
+                if self.test_placed_payload_shard_row_exists(location, &shard_key)? != expected
+                    || self.test_placed_payload_shard_file_exists(location, &shard_key)? != expected
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

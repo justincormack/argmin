@@ -3682,7 +3682,7 @@ fn lifecycle_sweep_aborts_due_incomplete_multipart_upload() {
     ));
     assert!(coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(
+        .test_capture_multipart_upload_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("logs/app"),
             &matching.upload_id

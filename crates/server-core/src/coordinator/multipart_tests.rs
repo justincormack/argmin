@@ -1647,40 +1647,19 @@ fn upload_part_first_upload() {
     // Verify part metadata was recorded.
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let upload = coord
-        .storage_node()
-        .test_get_multipart_upload(&bucket, &key, &create.upload_id)
-        .unwrap();
     let part = coord
         .storage_node()
-        .test_get_multipart_part(&bucket, &key, &create.upload_id, 1)
+        .test_get_multipart_part_observation(&bucket, &key, &create.upload_id, 1)
         .unwrap();
-    assert_eq!(part.part_number, 1);
     assert_eq!(part.generation, 0);
     assert_eq!(part.size, 11); // "hello world".len()
-    assert_eq!(part.part_vid, GenerationId::MIN);
 
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &create.upload_id)
+        .test_capture_multipart_part_payload(&bucket, &key, &create.upload_id, 1)
         .unwrap();
-    assert_eq!(segments.len(), 1);
-    assert_eq!(segments[0].part_number, 1);
-    assert_eq!(segments[0].segment_index, 0);
-    assert_eq!(segments[0].size, 11);
-    let topology = storage::PgTopology::new(coord.storage_node().test_pg_ids()).unwrap();
-    assert_eq!(
-        segments[0].data_pg_id,
-        topology
-            .object_generation_multipart_part_segment_data_pg(
-                &bucket,
-                &key,
-                upload.object_generation_id,
-                1,
-                0,
-            )
-            .get()
-    );
+    assert_eq!(payload.segment_count(), 1);
+    assert_eq!(payload.single_segment_size(1), Some(11));
 }
 
 #[test]
@@ -1749,7 +1728,7 @@ fn upload_part_reupload_increments_generation() {
 
     let part = coord
         .storage_node()
-        .test_get_multipart_part(
+        .test_get_multipart_part_observation(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
@@ -2031,7 +2010,7 @@ fn upload_part_repeated_reupload_generations() {
 
     let part = coord
         .storage_node()
-        .test_get_multipart_part(
+        .test_get_multipart_part_observation(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
@@ -2107,7 +2086,7 @@ fn upload_part_boundary_part_numbers() {
 
     coord
         .storage_node()
-        .test_get_multipart_part(
+        .test_get_multipart_part_observation(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
@@ -2116,7 +2095,7 @@ fn upload_part_boundary_part_numbers() {
         .unwrap();
     coord
         .storage_node()
-        .test_get_multipart_part(
+        .test_get_multipart_part_observation(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
@@ -2286,7 +2265,7 @@ fn upload_part_same_part_last_writer_wins() {
     // Final state should reflect the last writer.
     let part = coord
         .storage_node()
-        .test_get_multipart_part(
+        .test_get_multipart_part_observation(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
@@ -2388,15 +2367,19 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         .unwrap();
 
     let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part")]);
-    let segments_to_reclaim = coord
+    let payload_to_reclaim = coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(
+        .test_capture_multipart_upload_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &upload_id,
         )
         .unwrap();
-    assert!(!segments_to_reclaim.is_empty());
+    assert!(!payload_to_reclaim.is_empty());
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&payload_to_reclaim)
+        .unwrap());
     coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
@@ -2440,18 +2423,10 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         .unwrap();
 
     reclaim_object_payload(&coord, "bucket", "key", generation_id);
-    for segment in segments_to_reclaim {
-        assert_shard_set_deleted(
-            &coord,
-            segment.data_pg_id,
-            &segment.segment_okh,
-            segment.segment_vid,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-        );
-    }
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_absent(&payload_to_reclaim)
+        .unwrap());
 }
 
 #[test]
@@ -3163,29 +3138,19 @@ fn abort_multipart_upload_reclaims_part_shards() {
         })
         .unwrap();
 
-    let streamed_segments = coord
+    let streamed_payload = coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(
+        .test_capture_multipart_upload_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &create.upload_id,
         )
         .unwrap();
-    assert!(!streamed_segments.is_empty());
-    for segment in &streamed_segments {
-        assert_payload_shard_files_state(
-            &coord,
-            segment.data_pg_id,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-            true,
-            "streamed UploadPart before abort",
-        );
-    }
+    assert!(!streamed_payload.is_empty());
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&streamed_payload)
+        .unwrap());
 
     coord
         .abort_multipart_upload(&multipart_object_request_with_expected_owner(
@@ -3197,18 +3162,10 @@ fn abort_multipart_upload_reclaims_part_shards() {
         ))
         .unwrap();
 
-    for segment in streamed_segments {
-        assert_shard_set_deleted(
-            &coord,
-            segment.data_pg_id,
-            &segment.segment_okh,
-            segment.segment_vid,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-        );
-    }
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_absent(&streamed_payload)
+        .unwrap());
 }
 
 #[test]
@@ -7034,28 +6991,17 @@ fn sse_c_multipart_parts_with_same_plaintext_use_distinct_nonce_scopes() {
         .unwrap();
     }
 
-    let segments = coord
+    let payload = coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(
+        .test_capture_multipart_upload_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             &upload.upload_id,
         )
         .unwrap();
-    let part1: Vec<_> = segments
-        .iter()
-        .filter(|segment| segment.part_number == 1)
-        .collect();
-    let part2: Vec<_> = segments
-        .iter()
-        .filter(|segment| segment.part_number == 2)
-        .collect();
-
-    assert_eq!(part1.len(), 1);
-    assert_eq!(part2.len(), 1);
-    assert_eq!(part1[0].segment_index, 0);
-    assert_eq!(part2[0].segment_index, 0);
-    assert_ne!(part1[0].segment_crc64, part2[0].segment_crc64);
+    assert_eq!(payload.part_segment_count(1), 1);
+    assert_eq!(payload.part_segment_count(2), 1);
+    assert!(payload.parts_have_distinct_stored_checksums(1, 2));
 }
 
 #[test]
@@ -8648,50 +8594,15 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let before_segments = coord
+    let omitted_payload = coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
+        .test_capture_multipart_part_payload(&bucket, &key, &mpu.upload_id, 2)
         .unwrap();
-    let part2_segments: Vec<_> = before_segments
-        .iter()
-        .filter(|segment| segment.part_number == 2)
-        .cloned()
-        .collect();
-    assert_eq!(part2_segments.len(), 1);
-    let part2_shards: Vec<_> = part2_segments
-        .iter()
-        .flat_map(|segment| {
-            (0..(segment.ec_k + segment.ec_m)).map(|shard_index| {
-                (
-                    segment.data_pg_id,
-                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), shard_index),
-                )
-            })
-        })
-        .collect();
-    for segment in &part2_segments {
-        assert_payload_shard_files_state(
-            &coord,
-            segment.data_pg_id,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-            true,
-            "omitted streamed part before complete",
-        );
-    }
-    for (pg_id, shard_key) in &part2_shards {
-        assert!(
-            coord
-                .storage_node()
-                .test_shard_exists(*pg_id, shard_key)
-                .unwrap(),
-            "omitted part shard should exist before complete"
-        );
-    }
+    assert_eq!(omitted_payload.segment_count(), 1);
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&omitted_payload)
+        .unwrap());
 
     coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -8714,39 +8625,18 @@ fn complete_multipart_upload_omits_streamed_part_cleanup() {
         })
         .unwrap();
 
-    let after_segments = coord
+    let remaining_omitted_payload = coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
+        .test_capture_multipart_part_payload(&bucket, &key, &mpu.upload_id, 2)
         .unwrap();
     assert!(
-        after_segments
-            .iter()
-            .all(|segment| segment.part_number != 2),
+        remaining_omitted_payload.is_empty(),
         "omitted part segment rows must be deleted"
     );
-    for (pg_id, shard_key) in &part2_shards {
-        assert!(
-            !coord
-                .storage_node()
-                .test_shard_exists(*pg_id, shard_key)
-                .unwrap(),
-            "omitted part shard should be deleted after complete"
-        );
-    }
-    for segment in &part2_segments {
-        assert_payload_shard_files_state(
-            &coord,
-            segment.data_pg_id,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-            false,
-            "omitted streamed part after complete",
-        );
-    }
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_absent(&omitted_payload)
+        .unwrap());
 
     let object = coord
         .get_object(&GetObjectRequest {
@@ -8816,28 +8706,15 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
         .unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let first_segments: Vec<_> = coord
+    let first_payload = coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
-        .unwrap()
-        .into_iter()
-        .filter(|segment| segment.part_number == 1)
-        .collect();
-    assert_eq!(first_segments.len(), 1);
-    for segment in &first_segments {
-        assert_payload_shard_files_state(
-            &coord,
-            segment.data_pg_id,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-            true,
-            "first streamed UploadPart version",
-        );
-    }
+        .test_capture_multipart_part_payload(&bucket, &key, &mpu.upload_id, 1)
+        .unwrap();
+    assert_eq!(first_payload.segment_count(), 1);
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&first_payload)
+        .unwrap());
     let result_a = coord
         .finalize_stream_part(FinalizeStreamPartRequest {
             upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
@@ -8850,42 +8727,20 @@ fn streamed_upload_part_same_part_last_finisher_wins() {
         })
         .unwrap();
     assert_ne!(result_a.etag, result_b.etag);
-    for segment in &first_segments {
-        assert_payload_shard_files_state(
-            &coord,
-            segment.data_pg_id,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-            false,
-            "displaced streamed UploadPart version",
-        );
-    }
-    let final_segments: Vec<_> = coord
+    assert!(coord
         .storage_node()
-        .test_get_all_multipart_part_segments_for_upload(&bucket, &key, &mpu.upload_id)
-        .unwrap()
-        .into_iter()
-        .filter(|segment| segment.part_number == 1)
-        .collect();
-    assert_eq!(final_segments.len(), 1);
-    for segment in &final_segments {
-        assert_payload_shard_files_state(
-            &coord,
-            segment.data_pg_id,
-            EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-            &segment.segment_okh,
-            segment.segment_vid,
-            true,
-            "winning streamed UploadPart version",
-        );
-    }
+        .test_multipart_part_payload_snapshot_is_fully_absent(&first_payload)
+        .unwrap());
+    let final_payload = coord
+        .storage_node()
+        .test_capture_multipart_part_payload(&bucket, &key, &mpu.upload_id, 1)
+        .unwrap();
+    assert_eq!(final_payload.segment_count(), 1);
+    assert!(first_payload.part_payload_identity_differs_from(&final_payload, 1));
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&final_payload)
+        .unwrap());
 
     let parts = coord
         .list_parts(&ListPartsRequest {

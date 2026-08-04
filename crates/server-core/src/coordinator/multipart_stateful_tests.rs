@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::test_support::{
-    TestMultipartPartSegmentRecord, TestMultipartUploadRecord, TestPayloadReclaimRoot,
+    TestMultipartPartPayloadSnapshot, TestMultipartUploadRecord, TestPayloadReclaimRoot,
 };
 use storage::{EcShape, StreamUploadRecord, StreamUploadSegmentRecord};
 
@@ -285,15 +285,15 @@ impl<'a> InvariantHarness<'a> {
             .collect()
     }
 
-    fn multipart_part_segments(
+    fn multipart_part_payload(
         &self,
         bucket: &str,
         key: &str,
         upload_id: &UploadId,
-    ) -> Vec<TestMultipartPartSegmentRecord> {
+    ) -> TestMultipartPartPayloadSnapshot {
         self.coord
             .storage_node()
-            .test_get_all_multipart_part_segments_for_upload(
+            .test_capture_multipart_upload_payload(
                 &trusted_bucket_name(bucket),
                 &trusted_object_key(key),
                 upload_id,
@@ -813,25 +813,16 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
         })
         .unwrap();
 
-    let segments_before = state.multipart_part_segments("bucket", "key", &mpu.upload_id);
+    let payload_before = state.multipart_part_payload("bucket", "key", &mpu.upload_id);
     assert_eq!(
-        segments_before.len(),
+        payload_before.segment_count(),
         1,
         "{invariant}: expected exactly one committed segment set before reupload"
     );
-    for segment in &segments_before {
-        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
-        for i in 0..total_shards {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            assert!(
-                coord
-                    .storage_node()
-                    .test_shard_exists(segment.data_pg_id, &shard_key)
-                    .unwrap(),
-                "{invariant}: displaced shard {i} should exist before the reupload commits"
-            );
-        }
-    }
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&payload_before)
+        .unwrap());
 
     let session_b = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
         .unwrap()
@@ -853,43 +844,24 @@ fn streamed_part_reupload_replaces_displaced_shards_without_orphans() {
         .unwrap();
     assert_ne!(result_a.etag, result_b.etag);
 
-    let segments_after = state.multipart_part_segments("bucket", "key", &mpu.upload_id);
+    let payload_after = state.multipart_part_payload("bucket", "key", &mpu.upload_id);
     assert_eq!(
-        segments_after.len(),
+        payload_after.segment_count(),
         1,
         "{invariant}: expected exactly one current committed segment set after reupload"
     );
-    assert_ne!(
-        segments_before[0].segment_okh, segments_after[0].segment_okh,
+    assert!(
+        payload_before.part_payload_identity_differs_from(&payload_after, 1),
         "{invariant}: reupload should replace the committed segment generation"
     );
-
-    for segment in &segments_before {
-        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
-        for i in 0..total_shards {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            assert!(
-                !coord
-                    .storage_node()
-                    .test_shard_exists(segment.data_pg_id, &shard_key)
-                    .unwrap(),
-                "{invariant}: displaced shard {i} should be deleted after the reupload commits"
-            );
-        }
-    }
-    for segment in &segments_after {
-        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
-        for i in 0..total_shards {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            assert!(
-                coord
-                    .storage_node()
-                    .test_shard_exists(segment.data_pg_id, &shard_key)
-                    .unwrap(),
-                "{invariant}: current shard {i} should remain after reupload"
-            );
-        }
-    }
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_absent(&payload_before)
+        .unwrap());
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&payload_after)
+        .unwrap());
     state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
 }
 
@@ -938,40 +910,15 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
         })
         .unwrap();
 
-    let segments_before = state.multipart_part_segments("bucket", "key", &mpu.upload_id);
+    let payload_before = state.multipart_part_payload("bucket", "key", &mpu.upload_id);
     assert!(
-        !segments_before.is_empty(),
+        !payload_before.is_empty(),
         "{invariant}: expected committed multipart segments before abort"
     );
-    for segment in &segments_before {
-        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
-        for i in 0..total_shards {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            assert!(
-                coord
-                    .storage_node()
-                    .test_shard_exists(segment.data_pg_id, &shard_key)
-                    .unwrap(),
-                "{invariant}: shard {i} should exist before abort"
-            );
-            assert!(
-                coord
-                    .storage_node()
-                    .test_payload_shard_file_exists(
-                        segment.data_pg_id,
-                        EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        },
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                        i as u8,
-                    )
-                    .unwrap(),
-                "{invariant}: placed shard file {i} should exist before abort"
-            );
-        }
-    }
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_present(&payload_before)
+        .unwrap());
 
     coord
         .abort_multipart_upload(&multipart_object_request(
@@ -984,42 +931,17 @@ fn aborting_streamed_multipart_upload_cleans_committed_segments_and_shards() {
 
     assert!(
         state
-            .multipart_part_segments("bucket", "key", &mpu.upload_id)
+            .multipart_part_payload("bucket", "key", &mpu.upload_id)
             .is_empty(),
         "{invariant}: expected no multipart segment rows after abort"
     );
     state.assert_no_pending_multipart_uploads_for("bucket", "key", invariant);
     state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
 
-    for segment in &segments_before {
-        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
-        for i in 0..total_shards {
-            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
-            assert!(
-                !coord
-                    .storage_node()
-                    .test_shard_exists(segment.data_pg_id, &shard_key)
-                    .unwrap(),
-                "{invariant}: shard {i} should be deleted after abort"
-            );
-            assert!(
-                !coord
-                    .storage_node()
-                    .test_payload_shard_file_exists(
-                        segment.data_pg_id,
-                        EcShape {
-                            k: segment.ec_k,
-                            m: segment.ec_m,
-                        },
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                        i as u8,
-                    )
-                    .unwrap(),
-                "{invariant}: placed shard file {i} should be deleted after abort"
-            );
-        }
-    }
+    assert!(coord
+        .storage_node()
+        .test_multipart_part_payload_snapshot_is_fully_absent(&payload_before)
+        .unwrap());
 }
 
 #[test]
@@ -1447,7 +1369,7 @@ fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
     state.assert_no_pending_reclaim_roots_for(bucket, key, invariant);
     assert!(
         state
-            .multipart_part_segments(bucket, key, &upload_id)
+            .multipart_part_payload(bucket, key, &upload_id)
             .is_empty(),
         "{invariant}: abort winner should leave no committed multipart segment rows"
     );
@@ -1999,7 +1921,7 @@ fn failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans()
     state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
     assert!(
         state
-            .multipart_part_segments("bucket", "key", &mpu.upload_id)
+            .multipart_part_payload("bucket", "key", &mpu.upload_id)
             .is_empty(),
         "{invariant}: failed finalize should leave no committed multipart part segments"
     );

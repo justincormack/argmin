@@ -318,85 +318,106 @@ pub mod test_support {
         }
     }
 
-    /// Test-only observation of one in-progress multipart part.
+    /// Logical test-only observation of one in-progress multipart part.
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct TestMultipartPartRecord {
-        pub upload_id: UploadId,
-        pub part_number: u32,
+    pub struct TestMultipartPartObservation {
         pub generation: u32,
         pub size: u64,
-        pub payload_crc64: u64,
-        pub etag: Vec<u8>,
-        pub etag_kind: EtagKind,
-        pub part_vid: GenerationId,
-        pub placement_cluster_epoch: ClusterEpoch,
-        pub ec_k: u8,
-        pub ec_m: u8,
-        pub last_modified: u64,
-        pub checksum: Option<ChecksumBytes>,
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    impl From<types::MultipartPartRecord> for TestMultipartPartRecord {
+    impl From<types::MultipartPartRecord> for TestMultipartPartObservation {
         fn from(part: types::MultipartPartRecord) -> Self {
             Self {
-                upload_id: part.upload_id,
-                part_number: part.part_number,
                 generation: part.generation,
                 size: part.size,
-                payload_crc64: part.payload_crc64,
-                etag: part.etag,
-                etag_kind: part.etag_kind,
-                part_vid: part.part_vid,
-                placement_cluster_epoch: part.placement_cluster_epoch,
-                ec_k: part.ec_k,
-                ec_m: part.ec_m,
-                last_modified: part.last_modified,
-                checksum: part.checksum,
             }
         }
     }
 
-    /// Test-only physical observation used to verify streamed UploadPart cleanup.
+    /// Opaque evidence for the exact payload generations selected by a test.
+    ///
+    /// Physical placement and shard identities remain storage-owned. Callers
+    /// can compare logical layout facts and ask storage to verify whether the
+    /// captured payload is wholly present or absent.
     #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct TestMultipartPartSegmentRecord {
-        pub bucket: BucketName,
-        pub key: ObjectKey,
-        pub upload_id: UploadId,
-        pub version_id: u64,
-        pub part_number: u32,
-        pub segment_index: u32,
-        pub size: u64,
-        pub segment_crc64: u64,
-        pub segment_okh: [u8; 16],
-        pub segment_vid: GenerationId,
-        pub data_pg_id: u32,
-        pub placement_cluster_epoch: ClusterEpoch,
-        pub ec_k: u8,
-        pub ec_m: u8,
+    #[derive(Clone)]
+    pub struct TestMultipartPartPayloadSnapshot {
+        segments: Vec<types::MultipartPartSegmentRecord>,
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    impl From<types::MultipartPartSegmentRecord> for TestMultipartPartSegmentRecord {
-        fn from(segment: types::MultipartPartSegmentRecord) -> Self {
-            Self {
-                bucket: segment.bucket,
-                key: segment.key,
-                upload_id: segment.upload_id,
-                version_id: segment.version_id,
-                part_number: segment.part_number,
-                segment_index: segment.segment_index,
-                size: segment.size,
-                segment_crc64: segment.segment_crc64,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                data_pg_id: segment.data_pg_id,
-                placement_cluster_epoch: segment.placement_cluster_epoch,
-                ec_k: segment.ec_k,
-                ec_m: segment.ec_m,
-            }
+    impl std::fmt::Debug for TestMultipartPartPayloadSnapshot {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestMultipartPartPayloadSnapshot")
+                .field("segment_count", &self.segments.len())
+                .finish()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl TestMultipartPartPayloadSnapshot {
+        pub(crate) fn new(segments: Vec<types::MultipartPartSegmentRecord>) -> Self {
+            Self { segments }
+        }
+
+        pub(crate) fn segments(&self) -> &[types::MultipartPartSegmentRecord] {
+            &self.segments
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.segments.is_empty()
+        }
+
+        pub fn segment_count(&self) -> usize {
+            self.segments.len()
+        }
+
+        pub fn part_segment_count(&self, part_number: u32) -> usize {
+            self.segments
+                .iter()
+                .filter(|segment| segment.part_number == part_number)
+                .count()
+        }
+
+        pub fn single_segment_size(&self, part_number: u32) -> Option<u64> {
+            let mut segments = self
+                .segments
+                .iter()
+                .filter(|segment| segment.part_number == part_number);
+            let size = segments.next()?.size;
+            segments.next().is_none().then_some(size)
+        }
+
+        pub fn part_payload_identity_differs_from(&self, other: &Self, part_number: u32) -> bool {
+            let identities = |snapshot: &Self| {
+                snapshot
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.part_number == part_number)
+                    .map(|segment| (segment.segment_okh, segment.segment_vid))
+                    .collect::<Vec<_>>()
+            };
+            identities(self) != identities(other)
+        }
+
+        pub fn parts_have_distinct_stored_checksums(
+            &self,
+            first_part_number: u32,
+            second_part_number: u32,
+        ) -> bool {
+            let checksums = |part_number| {
+                self.segments
+                    .iter()
+                    .filter(|segment| segment.part_number == part_number)
+                    .map(|segment| segment.segment_crc64)
+                    .collect::<Vec<_>>()
+            };
+            let first = checksums(first_part_number);
+            let second = checksums(second_part_number);
+            !first.is_empty() && !second.is_empty() && first != second
         }
     }
 
@@ -541,7 +562,7 @@ pub use storage_rpc_auth::{
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
-    TestBucketDeleteProgress, TestMultipartPartRecord, TestMultipartPartSegmentRecord,
+    TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
     TestMultipartUploadRecord, TestPayloadReclaimRoot, TestReclaimWorkItem,
 };
 #[cfg(test)]

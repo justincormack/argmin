@@ -19957,6 +19957,37 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_placed_payload_shard_row_exists(
+        &self,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<bool, StoreError> {
+        if location.shard_index() != key.shard_index() {
+            return Err(StoreError::Io {
+                context: "validate placed payload shard test identity",
+                source: std::io::Error::other(format!(
+                    "location shard index {} does not match key shard index {}",
+                    location.shard_index().get(),
+                    key.shard_index().get()
+                )),
+            });
+        }
+        let route = self.reconstructed_pg_route_at_epoch(
+            location.data_pg_id().pg_id(),
+            location.cluster_epoch(),
+        )?;
+        match self.load_payload_shard_ack_for_pg_route_snapshot(
+            &route,
+            location.data_pg_id().get(),
+            key,
+        ) {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_placed_payload_shard_file_exists(
         &self,
         location: ShardLocation,

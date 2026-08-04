@@ -5750,11 +5750,18 @@ Implementation update (2026-08-03):
   handling retain access to the lower mutation primitive;
 - replaced the exported committed multipart-part record with a logical ordered
   part-number observation. Physical placement is a storage-owned invariant and
-  is no longer reconstructed or asserted by coordinator tests; and
-- retained physical in-progress multipart part/segment observations,
-  segment-layout observations, deleting-bucket construction, and raw
-  reclaim-queue controls remain explicit transitional exceptions owned by
-  implementation slice 3. They do not satisfy the final curated-boundary
+  is no longer reconstructed or asserted by coordinator tests;
+- replaced exported in-progress multipart part and segment records with a
+  logical generation/size observation and an opaque storage-owned payload
+  snapshot. Coordinator cleanup tests can retain exact pre-mutation evidence
+  and ask storage whether it is wholly present or absent. Storage verifies both
+  the acknowledgement row at the captured historical data-PG primary and the
+  physical file at each captured historical shard placement, while callers
+  cannot inspect PG IDs, shard hashes, EC layout, placement epochs, or payload
+  generations; and
+- retained object segment-layout observations, deleting-bucket construction,
+  and raw reclaim-queue controls remain explicit transitional exceptions owned
+  by implementation slice 3. They do not satisfy the final curated-boundary
   completion criterion merely because they now live under
   `storage::test_support` or on a feature-gated `StorageCluster`
   implementation.

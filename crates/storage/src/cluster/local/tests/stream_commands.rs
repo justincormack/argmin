@@ -3752,6 +3752,160 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
 }
 
 #[test]
+fn multipart_payload_snapshot_does_not_treat_shard_rows_without_files_as_absent() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let upload_id = upload_id_from_label("partpayloadrowwithoutfile");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    let session_id = crate::SessionId::try_from("93".repeat(16)).unwrap();
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            1,
+            &session_id,
+        )
+        .unwrap();
+
+    let payload = b"multipart snapshot row without shard file";
+    let payload_crc64 = checksum::crc64::checksum(payload);
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: payload_crc64,
+                payload_crc64,
+                segment_okh: [0x93; 16],
+            },
+        )
+        .unwrap();
+    let written_shards = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let part = crate::MultipartPartRecord {
+        upload_id: upload_id.clone(),
+        part_number: 1,
+        generation: 0,
+        size: payload.len() as u64,
+        payload_crc64,
+        etag: payload_crc64.to_be_bytes().to_vec(),
+        etag_kind: crate::EtagKind::Crc64,
+        part_vid: crate::GenerationId::MIN,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
+        ec_k: segment.ec_k,
+        ec_m: segment.ec_m,
+        last_modified: 123_456,
+        checksum: None,
+    };
+    let _ = cluster
+        .finalize_upload_part_stream(
+            &bucket,
+            &key,
+            stream_part_finalize_input(&upload_id, &session_id, 1, part.size, part.payload_crc64),
+            |_| Ok::<_, ()>(prepared_stream_part((), &part)),
+        )
+        .unwrap();
+
+    let snapshot = cluster
+        .test_capture_multipart_part_payload(&bucket, &key, &upload_id, 1)
+        .unwrap();
+    assert!(cluster
+        .test_multipart_part_payload_snapshot_is_fully_present(&snapshot)
+        .unwrap());
+
+    for shard_index in 0..segment.ec_k + segment.ec_m {
+        let shard_path = cluster
+            .test_payload_shard_file_path(
+                segment.data_pg_id,
+                EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+                &segment.segment_okh,
+                segment.segment_vid,
+                shard_index,
+            )
+            .unwrap();
+        std::fs::remove_file(shard_path).unwrap();
+    }
+
+    assert!(!cluster
+        .test_multipart_part_payload_snapshot_is_fully_present(&snapshot)
+        .unwrap());
+    assert!(
+        !cluster
+            .test_multipart_part_payload_snapshot_is_fully_absent(&snapshot)
+            .unwrap(),
+        "durable shard rows without files must not be classified as fully absent"
+    );
+}
+
+#[test]
 fn stream_put_finalize_matching_pending_install_race_returns_success() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

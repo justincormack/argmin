@@ -1070,23 +1070,6 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_multipart_part_data_pg_id_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        object_generation_id: GenerationId,
-        part_number: u32,
-    ) -> u32 {
-        self.pg_topology
-            .object_generation_multipart_part_data_pg(
-                bucket,
-                key,
-                object_generation_id,
-                part_number,
-            )
-            .get()
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_object_meta(
         &self,
