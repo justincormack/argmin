@@ -17922,6 +17922,72 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_capture_stream_upload_payload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<crate::TestStreamUploadPayloadSnapshot, ObjectPgActionError> {
+        self.test_list_stream_segments(bucket, key, session_id)
+            .map(crate::TestStreamUploadPayloadSnapshot::new)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_stream_upload_payload_snapshot_is_fully_present(
+        &self,
+        snapshot: &crate::TestStreamUploadPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        self.test_stream_upload_payload_snapshot_matches_presence(snapshot, true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_stream_upload_payload_snapshot_is_fully_absent(
+        &self,
+        snapshot: &crate::TestStreamUploadPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        self.test_stream_upload_payload_snapshot_matches_presence(snapshot, false)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_stream_upload_payload_snapshot_matches_presence(
+        &self,
+        snapshot: &crate::TestStreamUploadPayloadSnapshot,
+        expected: bool,
+    ) -> Result<bool, StoreError> {
+        for segment in snapshot.segments() {
+            let ec = EcShape {
+                k: segment.ec_k,
+                m: segment.ec_m,
+            };
+            let request = SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: 0,
+                segment_crc64: segment.segment_crc64,
+                ec,
+            };
+            let locations = self.segment_payload_shard_locations_at_placement_epoch(
+                segment.placement_cluster_epoch,
+                &request,
+            )?;
+            for location in locations {
+                let shard_key = ShardKey::new(
+                    &segment.segment_okh,
+                    segment.segment_vid.get(),
+                    location.shard_index().get(),
+                );
+                if self.test_placed_payload_shard_row_exists(location, &shard_key)? != expected
+                    || self.test_placed_payload_shard_file_exists(location, &shard_key)? != expected
+                {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     /// Marks one logical stream upload stale without exposing its durable
     /// timestamp representation across the storage boundary.
     pub fn test_mark_stream_upload_stale(

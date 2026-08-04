@@ -5773,6 +5773,13 @@ Implementation update (2026-08-03):
   files for exact pre-mutation evidence. The raw record seam has been renamed
   explicitly as transitional and is retained only by the not-yet-migrated
   corruption, repair, retained-placement, and shard-selection tests; and
+- replaced HTTP streaming-cleanup tests' raw staged-segment records and
+  caller-reconstructed shard paths with an opaque storage-owned stream-upload
+  payload snapshot. The HTTP tests can observe only whether staged payload
+  exists and ask storage to prove that the captured payload is wholly present
+  before cleanup and wholly absent afterward; storage checks both the durable
+  shard acknowledgement row and physical file at every captured historical
+  placement; and
 - retained raw object-payload corruption/repair controls and raw reclaim-queue
   controls remain explicit transitional exceptions owned by implementation
   slice 3. They do not satisfy the final curated-boundary completion criterion

@@ -5926,12 +5926,12 @@ Content-Length: {}\r\n\
                     })
                 {
                     if initial
-                        .test_list_stream_segments(
+                        .test_capture_stream_upload_payload(
                             &session.bucket,
                             &session.key,
                             &session.session_id,
                         )
-                        .is_ok_and(|segments| !segments.is_empty())
+                        .is_ok_and(|payload| !payload.is_empty())
                     {
                         break session;
                     }
@@ -5941,10 +5941,13 @@ Content-Length: {}\r\n\
         })
         .await
         .expect("streaming PUT must promote and publish a staged segment before expiry");
-        let staged_segments = initial
-            .test_list_stream_segments(&session.bucket, &session.key, &session.session_id)
+        let staged_payload = initial
+            .test_capture_stream_upload_payload(&session.bucket, &session.key, &session.session_id)
             .unwrap();
-        assert!(!staged_segments.is_empty());
+        assert!(!staged_payload.is_empty());
+        assert!(initial
+            .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+            .unwrap());
         assert!(initial
             .test_object_generation_reservation_for(
                 &session.bucket,
@@ -5998,23 +6001,9 @@ Content-Length: {}\r\n\
                 storage::MetadataError::ObjectGenerationReservationNotFound { .. }
             ))
         ));
-        for segment in &staged_segments {
-            let ec = storage::EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            };
-            for shard_index in 0..(ec.k + ec.m) {
-                assert!(!initial
-                    .test_payload_shard_file_exists(
-                        segment.data_pg_id,
-                        ec,
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                        shard_index,
-                    )
-                    .unwrap());
-            }
-        }
+        assert!(initial
+            .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+            .unwrap());
 
         let mut response = Vec::new();
         tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
@@ -6373,10 +6362,13 @@ Connection: close\r\n\r\n",
         let session_id = ctx.session_id().clone();
         let bucket = ctx.bucket().clone();
         let key = ctx.key().clone();
-        let staged_segments = initial
-            .test_list_stream_segments(&bucket, &key, &session_id)
+        let staged_payload = initial
+            .test_capture_stream_upload_payload(&bucket, &key, &session_id)
             .unwrap();
-        assert!(!staged_segments.is_empty());
+        assert!(!staged_payload.is_empty());
+        assert!(initial
+            .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+            .unwrap());
         let cleanup_after = initial
             .list_stream_upload_sessions_best_effort()
             .into_iter()
@@ -6467,7 +6459,9 @@ Connection: close\r\n\r\n",
                 storage::MetadataError::ObjectGenerationReservationNotFound { .. }
             ))
         ));
-        assert_staged_stream_shards_absent(&initial, &staged_segments);
+        assert!(initial
+            .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+            .unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6513,10 +6507,13 @@ Connection: close\r\n\r\n",
         let session_id = ctx.session_id().clone();
         let bucket = ctx.bucket().clone();
         let key = ctx.key().clone();
-        let staged_segments = initial
-            .test_list_stream_segments(&bucket, &key, &session_id)
+        let staged_payload = initial
+            .test_capture_stream_upload_payload(&bucket, &key, &session_id)
             .unwrap();
-        assert!(!staged_segments.is_empty());
+        assert!(!staged_payload.is_empty());
+        assert!(initial
+            .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
+            .unwrap());
         let cleanup_after = initial
             .list_stream_upload_sessions_best_effort()
             .into_iter()
@@ -6601,30 +6598,9 @@ Connection: close\r\n\r\n",
             .list_stream_upload_sessions_best_effort()
             .into_iter()
             .all(|session| session.session_id != session_id));
-        assert_staged_stream_shards_absent(&initial, &staged_segments);
-    }
-
-    fn assert_staged_stream_shards_absent(
-        cluster: &storage::StorageCluster,
-        segments: &[storage::StreamUploadSegmentRecord],
-    ) {
-        for segment in segments {
-            let ec = storage::EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            };
-            for shard_index in 0..(ec.k + ec.m) {
-                assert!(!cluster
-                    .test_payload_shard_file_exists(
-                        segment.data_pg_id,
-                        ec,
-                        &segment.segment_okh,
-                        segment.segment_vid,
-                        shard_index,
-                    )
-                    .unwrap());
-            }
-        }
+        assert!(initial
+            .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+            .unwrap());
     }
 
     #[tokio::test(flavor = "multi_thread")]

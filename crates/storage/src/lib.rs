@@ -439,6 +439,46 @@ pub mod test_support {
         }
     }
 
+    /// Opaque evidence for the exact staged payload of one stream upload.
+    ///
+    /// Physical placement and shard identities remain storage-owned. Callers
+    /// may observe whether any segment was staged and ask storage to verify
+    /// that every captured shard row and file has been removed.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Clone)]
+    pub struct TestStreamUploadPayloadSnapshot {
+        segments: Vec<types::StreamUploadSegmentRecord>,
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl std::fmt::Debug for TestStreamUploadPayloadSnapshot {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestStreamUploadPayloadSnapshot")
+                .field("segment_count", &self.segments.len())
+                .finish()
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    impl TestStreamUploadPayloadSnapshot {
+        pub(crate) fn new(segments: Vec<types::StreamUploadSegmentRecord>) -> Self {
+            Self { segments }
+        }
+
+        pub(crate) fn segments(&self) -> &[types::StreamUploadSegmentRecord] {
+            &self.segments
+        }
+
+        pub fn is_empty(&self) -> bool {
+            self.segments.is_empty()
+        }
+
+        pub fn segment_count(&self) -> usize {
+            self.segments.len()
+        }
+    }
+
     /// Logical layout of one committed object segment.
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -644,7 +684,7 @@ pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
     TestMultipartUploadRecord, TestObjectPayloadSnapshot, TestPayloadReclaimRoot,
-    TestReclaimWorkItem,
+    TestReclaimWorkItem, TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;
