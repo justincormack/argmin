@@ -6,7 +6,7 @@ Related plans:
 
 - [static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md)
 - [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
-- [multihost-transition-plan.md](multihost-transition-plan.md)
+- [multihost-followup-plan.md](multihost-followup-plan.md)
 - [storage-upgrade-versioning-plan.md](storage-upgrade-versioning-plan.md)
 
 ## Goal

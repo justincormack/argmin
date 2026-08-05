@@ -42,7 +42,7 @@ Completed:
   - `request_finish`
   - `request_error`
   - `slow_request`
-- [Multihost transition Phase 10.9](multihost-transition-plan.md#phase-109-stabilization-error-semantics-diagnostics-and-backpressure)
+- [Multihost transition Phase 10.9](completed/multihost-transition-plan.md#phase-109-multihost-stabilization-gate)
   adds bounded, redacted storage race diagnostics for:
   - `metadata_command_conflict`
   - `metadata_command_pending_slot_action`

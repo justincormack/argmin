@@ -1,5 +1,11 @@
 # Distributed Correctness Review — July 2026
 
+Status: historical review, completed July 2026. Current work derived from this
+review is tracked in the
+[multihost production follow-up plan](../multihost-followup-plan.md). Finding
+statuses, source locations, and production-readiness conclusions below describe
+the reviewed revisions and are not current implementation status.
+
 Review of the multihost transition ahead of production, covering the Phase 12
 OpenRaft control plane, the Phase 11 single-authority control plane, metadata
 replication and PG store recovery, cluster routing/epoch fencing/peering, and

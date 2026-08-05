@@ -12,8 +12,8 @@ reservations to empty. This plan describes a future refinement that can return
 `BucketNotEmpty` or proceed with deletion from durable reservation context when
 that decision is mechanically provable.
 
-Background: [Phase 9.4.4 in the multihost transition
-plan](multihost-transition-plan.md#phase-944-make-deletebucket-begin-durable-and-recoverable)
+Background: [Phase 9.4.4 in the completed multihost transition
+plan](completed/multihost-transition-plan.md#phase-9-replace-process-local-coordination)
 keeps the conservative return boundary while DeleteBucket begin is made durable
 and recoverable.
 
@@ -174,7 +174,7 @@ Phase 11 soak failures have clustered around `DeleteBucket`. Treat that as a
 correctness and retry-semantics signal, not just benchmark noise.
 
 The concrete Phase 11 close-out checklist now lives in
-[`multihost-transition-plan.md`](multihost-transition-plan.md) under
-"DeleteBucket soak-stabilization follow-up". Revisit this reservation
+[`multihost-followup-plan.md`](multihost-followup-plan.md#21-close-deletebucket-attempt-convergence).
+Revisit this reservation
 classification optimization only after those correctness, retry-semantics, and
 cleanup-stress items are stable.

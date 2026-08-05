@@ -61,7 +61,7 @@ The target canonical state includes:
   the fixed-size multipart completion barrier sequence
 
 The current
-[multihost transition Phase 7](../plans/multihost-transition-plan.md#phase-7-metadata-model-integrity-and-divergence-policy)
+[multihost transition Phase 7](../plans/completed/multihost-transition-plan.md#phase-7-metadata-model-integrity-and-divergence-policy)
 implementation has an explicit canonical binary digest inventory for the
 command-owned durable serving, in-progress, and cleanup metadata:
 

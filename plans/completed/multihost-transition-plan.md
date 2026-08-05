@@ -1,6 +1,9 @@
 # Multihost Storage Transition Plan
 
-Status: active
+Status: complete as of 2026-08-05. This document records the initial static
+multihost transition and its implementation history. Remaining production,
+dynamic-topology, and independent-confidence work is tracked in
+[multihost-followup-plan.md](../multihost-followup-plan.md).
 
 ## Context
 
@@ -1724,7 +1727,7 @@ Proposed slices:
    - define deterministic preconditions and state transitions for the retained
      command set over canonical metadata state
    - add a command mapping matrix to
-     [metadata-model.md](../guides/metadata-model.md) covering current command
+     [metadata-model.md](../../guides/metadata-model.md) covering current command
      shape, canonical state read/write sets, deterministic preconditions, and
      retry/idempotence behavior
    - make the rule explicit for future commands: coordinator/auth code handles
@@ -1775,7 +1778,7 @@ Proposed slices:
    - add divergence tests for primary row corruption, replica row corruption,
      missing/extra/reordered replica log entries, same materialized state with
      different history, and matching history with corrupted materialized state
-   - close out by updating [metadata-model.md](../guides/metadata-model.md)
+   - close out by updating [metadata-model.md](../../guides/metadata-model.md)
      with the implemented formats, checksum coverage, replay guarantees, and
      any retention/compaction items deferred to Phase 7.5
 5. Phase 7.5: retention and compaction policy. Complete.
@@ -1832,7 +1835,7 @@ Proposed slices:
      routed to the same metadata PG, and it needs a command-log, retry,
      partial-failure, and AWS per-object error design before implementation.
      Track that work in
-     [delete-objects-batch-command-plan.md](delete-objects-batch-command-plan.md).
+     [delete-objects-batch-command-plan.md](../delete-objects-batch-command-plan.md).
    - measure every slice before and after:
      - full `cargo nextest run` wall time
      - summed libtest per-test seconds grouped by server-core authz model,
@@ -1871,7 +1874,7 @@ Proposed slices:
 Completed:
 
 - Phase 7.1:
-  - added [metadata-model.md](../guides/metadata-model.md) with the
+  - added [metadata-model.md](../../guides/metadata-model.md) with the
     source-of-truth split, payload-byte boundary, target canonical state,
     command-mapping direction, integrity requirements, and divergence rules
   - replaced SQLite schema discovery in the online metadata state digest with an
@@ -1882,7 +1885,7 @@ Completed:
     remain visible Phase 7 gaps rather than hidden schema-scan exclusions
 - Phase 7.2 first slice:
   - added the command mapping inventory to
-    [metadata-model.md](../guides/metadata-model.md), including current command
+    [metadata-model.md](../../guides/metadata-model.md), including current command
     shape, canonical read/write sets, and retry behavior
   - converted `CreateStreamUploadCommand` from an embedded
     `CreateStreamUploadReq` to a storage-shaped stream session row
@@ -2041,7 +2044,7 @@ Completed:
     counter removal.
 - Phase 7.4 step 1:
   - added the persisted integrity record inventory to
-    [metadata-model.md](../guides/metadata-model.md), covering current
+    [metadata-model.md](../../guides/metadata-model.md), covering current
     `metadata_command_log` rows, in-memory canonical command bytes,
     `metadata_command_replica_state`, full-PG canonical digest input,
     checkpoint/range block gap, and the object-payload boundary
@@ -2391,7 +2394,7 @@ Completed:
       here unless new production-shaped measurements show a concrete
       regression.
     - `DeleteObjects` storage-level batching has been moved to
-      [delete-objects-batch-command-plan.md](delete-objects-batch-command-plan.md)
+      [delete-objects-batch-command-plan.md](../delete-objects-batch-command-plan.md)
       because it is a semantic API change that needs separate cost/benefit and
       failure-mode analysis before implementation
 
@@ -2426,7 +2429,7 @@ Decide the policy for writes while one or more target nodes are temporarily
 unavailable.
 
 The policy decision and future handoff model are recorded in
-[temporary-write-availability.md](../guides/temporary-write-availability.md).
+[temporary-write-availability.md](../../guides/temporary-write-availability.md).
 The summary is:
 
 - keep strict writes as the implemented policy for now
@@ -2502,7 +2505,7 @@ Proposed subphases:
 2. Phase 9.2 metadata command stream runtime state. Complete for the local
    PG-primary command-stream runtime state.
    - implement the target model in
-     [metadata-command-stream.md](../guides/metadata-command-stream.md):
+     [metadata-command-stream.md](../../guides/metadata-command-stream.md):
      a PG command stream is strictly single-writer and single-pending, with
      concurrency coming from different PGs rather than concurrent mutation
      inside one PG
@@ -2653,7 +2656,7 @@ Proposed subphases:
      normal pending-command retry, and terminal pending-slot cleanup before a
      later command.
    - freeze Phase 9.2 semantics in
-     [metadata-command-stream.md](../guides/metadata-command-stream.md) as
+     [metadata-command-stream.md](../../guides/metadata-command-stream.md) as
      invariants rather than implementation notes:
      - a PG command stream has one primary-owned durable pending slot
      - stale snapshot commands must rebuild after pending-slot contention
@@ -2695,7 +2698,7 @@ Proposed subphases:
      `set_pending_metadata_command_for_bucket`; each call site must be covered
      by the publisher/path classification above
      - status: initial publisher/path classification is documented in
-       [metadata-command-stream.md](../guides/metadata-command-stream.md), and
+       [metadata-command-stream.md](../../guides/metadata-command-stream.md), and
        `scripts/check-storage-cluster-boundaries` now fails if the production
        pending-command install call-site inventory changes without updating the
        documented classification and script allowlist
@@ -2853,7 +2856,7 @@ Proposed subphases:
        command only as contention progress before the caller restarts from a
        fresh snapshot.
      - status: finish/convergence paths are documented in
-       [metadata-command-stream.md](../guides/metadata-command-stream.md), the
+       [metadata-command-stream.md](../../guides/metadata-command-stream.md), the
        boundary script inventories every production command-log conflict
        match, bans the legacy bucket-named object finisher helpers, and
        local-cluster tests cover partial exact `MarkBucketDeleting` retry,
@@ -2917,7 +2920,7 @@ Proposed subphases:
      serialization and fresh-snapshot retry rules
    - scope:
      - convert the Phase 9.2H multipart publisher deferrals from
-       [metadata-command-stream.md](../guides/metadata-command-stream.md):
+       [metadata-command-stream.md](../../guides/metadata-command-stream.md):
        `begin_upload_part_stream_session`,
        `create_upload_part_stream_session`, `finalize_upload_part_stream`,
        `complete_multipart_upload_commit_serialized`,
@@ -2951,7 +2954,7 @@ Proposed subphases:
    1. Phase 9.3.1: multipart command-stream audit and invariants
       - status: complete. The multipart command-stream invariants are now
         documented in
-        [metadata-command-stream.md](../guides/metadata-command-stream.md),
+        [metadata-command-stream.md](../../guides/metadata-command-stream.md),
         and the boundary script inventory remains the source of truth for
         multipart pending-slot publisher shapes while the following subphases
         convert them.
@@ -3253,7 +3256,7 @@ Proposed subphases:
         contender is finished and returned from the matching-pending branch
         rather than drained generically.
       - remove Phase 9.3 deferral wording from
-        [metadata-command-stream.md](../guides/metadata-command-stream.md)
+        [metadata-command-stream.md](../../guides/metadata-command-stream.md)
       - update `scripts/check-storage-cluster-boundaries` so multipart
         publishers are no longer exempt from snapshot-sensitive install rules
       - make any remaining local multipart locks clearly performance-only, or
@@ -3378,10 +3381,10 @@ Proposed subphases:
         - a new write that arrives after `MarkBucketDeleting` is durable fails
           as the bucket no longer accepts writes
       - add the audit result to
-        [bucket-write-drain.md](../guides/bucket-write-drain.md), and link it
+        [bucket-write-drain.md](../../guides/bucket-write-drain.md), and link it
         from this plan
       - status: complete. The Phase 9.4.1 audit is captured in
-        [bucket-write-drain.md](../guides/bucket-write-drain.md), including the
+        [bucket-write-drain.md](../../guides/bucket-write-drain.md), including the
         retired counter authority, publisher classification, cross-PG
         apply-time reservation fence, reservation reap vs object-PG convergence
         rule, DeleteBucket drain loop, and required test matrix.
@@ -3610,7 +3613,7 @@ Proposed subphases:
         correct.
         A future optimization for classifying publish-ready durable write
         reservations without waiting is tracked separately in
-        [DeleteBucket Reservation Classification Optimization](delete-bucket-reservation-classification-plan.md).
+        [DeleteBucket Reservation Classification Optimization](../delete-bucket-reservation-classification-plan.md).
       - crash/restart rules:
         - drain fence present, no `MarkBucketDeleting`, owner alive: writers
           continue to wait/retry
@@ -3763,8 +3766,8 @@ Proposed subphases:
         `active_write_reservations` from bucket schema, bucket row types, and
         command-owned bucket projections.
       - status: complete. Updated
-        [metadata-model.md](../guides/metadata-model.md) and
-        [storage-cluster-invariants.md](../guides/storage-cluster-invariants.md):
+        [metadata-model.md](../../guides/metadata-model.md) and
+        [storage-cluster-invariants.md](../../guides/storage-cluster-invariants.md):
         - bucket write-drain state is no longer an unresolved Phase 9
           exception
         - the new reservation/drain rows are the only production authority
@@ -6160,7 +6163,7 @@ RPC/session saturation surfacing as EOF or SDK operation-attempt timeout, and
 known places where the local six-process UAT harness can hide or amplify server
 progress bugs. Broader throughput tuning, adaptive admission, workload-specific
 capacity weights, and production SLO policy belong in
-[`production-backpressure-plan.md`](production-backpressure-plan.md) after a more
+[`production-backpressure-plan.md`](../production-backpressure-plan.md) after a more
 representative production-style harness exists.
 
 Work items:
@@ -6170,7 +6173,7 @@ pieces of item 4, the required implementation-order pieces for Phase 10.9 in
 item 5, and the UAT observability/forced-overload gate in item 6 are complete
 for this stabilization gate. The remaining broader capacity-policy bullets in
 items 4-5 are deliberately deferred to Phase 11 or
-[`production-backpressure-plan.md`](production-backpressure-plan.md), where they
+[`production-backpressure-plan.md`](../production-backpressure-plan.md), where they
 can be tuned against a production-realistic workload rather than the local S3
 test harness.
 
@@ -6453,7 +6456,7 @@ test harness.
      unfinished stream sessions, pending appends, pending metadata commands,
      staged payloads, and cleanup backlog grow.
    - leave the bounded adaptive controller to
-     [`production-backpressure-plan.md`](production-backpressure-plan.md). Before
+     [`production-backpressure-plan.md`](../production-backpressure-plan.md). Before
      Phase 11, require only the fixed/static admission and bounded-work pieces
      needed to avoid EOFs, HTTP 500s, unbounded request loops, and SDK
      operation-attempt timeouts for expected contention.
@@ -6586,7 +6589,7 @@ Exit criteria:
 Status: complete.
 
 - Started Phase 10.9 with the error semantics audit in
-  [`completed/phase-10-9-error-semantics-audit.md`](completed/phase-10-9-error-semantics-audit.md).
+  [`completed/phase-10-9-error-semantics-audit.md`](phase-10-9-error-semantics-audit.md).
   The first slice classifies expected metadata-command contention, stale object
   generation reservations, stale bucket metadata command generations, current
   RPC/overload gaps, and the request mappers that still need follow-up tests or
@@ -6649,7 +6652,7 @@ Status: complete.
   ownership controls, and the create-bucket RPC/config payload now carries the
   required ownership mode.
 - Closed the mapper-audit slice in
-  [`completed/phase-10-9-error-semantics-audit.md`](completed/phase-10-9-error-semantics-audit.md)
+  [`completed/phase-10-9-error-semantics-audit.md`](phase-10-9-error-semantics-audit.md)
   after adding typed storage-RPC resource exhaustion mapping to `SlowDown`,
   preserving shard-delete-in-progress as internal/recoverable only, and adding
   drift guardrails for object-PG mappers, bucket snapshot mappers,
@@ -6979,7 +6982,7 @@ recorded the epoch/map/incarnation tuple being leased.
 
 Threat-model boundary: Phase 11 treats storage-node and single-authority
 control-plane processes as trusted runtime components on trusted hosts, as
-documented in [`guides/threat_model.md`](../guides/threat_model.md). The
+documented in [`guides/threat_model.md`](../../guides/threat_model.md). The
 authority validates heartbeat freshness, epoch/incarnation fencing, PG state,
 pending-command absence, and peering/active metadata proof floors, but it does
 not attempt to prove that a hostile storage node's future metadata proof is a
@@ -7784,7 +7787,7 @@ Shard repair design:
   generation through metadata, and leave the old corrupt generation for reclaim.
   That would need schema, read-path, scavenger, and cleanup invariants and is
   deliberately left open rather than folded into this UAT coverage slice. See
-  [versioned physical shard files option](versioned-physical-shard-files-option.md)
+  [versioned physical shard files option](../versioned-physical-shard-files-option.md)
   for the standalone evaluation note.
 
 PG backfill and migration design notes:
@@ -9095,7 +9098,7 @@ Keep an explicit Phase 11 close-out before treating the phase as soak-clean:
     retry AWS-compatible retryable responses, but they must not hide server
     `InternalError`; local 500s during cleanup are bugs and should continue to
     fail the run with enough diagnostics;
-11. status: open. Update [`delete-bucket-reservation-classification-plan.md`](delete-bucket-reservation-classification-plan.md)
+11. status: open. Update [`delete-bucket-reservation-classification-plan.md`](../delete-bucket-reservation-classification-plan.md)
     if the audit shows synchronous begin work is still too conservative. The
     optimization should remain secondary to correctness: `DeleteBucket` must not
     return success while visible object/MPU state can still appear, but it should
@@ -12021,7 +12024,7 @@ Phase 12.4 proposed scope:
   regression, avoid reviving expired leases after leader failover or local clock
   rollback, and document the remaining operational clock assumptions.
   The normative model is
-  [control-plane-clock-and-lease-model.md](../guides/control-plane-clock-and-lease-model.md):
+  [control-plane-clock-and-lease-model.md](../../guides/control-plane-clock-and-lease-model.md):
   the current 1,000 ms maximum pairwise skew budget is subtracted when a
   frontend or storage node binds a map to its process-local monotonic clock,
   and added before a successor passes an old-primary deadline. The pure model,
@@ -12048,7 +12051,7 @@ Phase 12.4 proposed scope:
   explicit recovery restores serving and survives old-leader loss. DCC-2 is
   closed; independent-host clock fault runs remain pre-release validation.
 - Add the shared internal control-plane identity/auth foundation described in
-  [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
+  [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md),
   and enforce it first on the Raft control-plane peer transport. The Phase 12.3
   identity envelope proves cluster/source/target fields match the configured
   peer map, but any process with socket access can still claim those fields.
@@ -12387,7 +12390,7 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
 
 - The initial versioned manifest schema, validation contract, canonical digest
   boundaries, secret-reference model, and implementation slices are defined in
-  [static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md).
+  [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md).
   Treat that document as the normative config-file contract for the static
   TCP/reference-workload work below.
 - Resolve the critical control-plane write-amplification and history-size
@@ -12620,7 +12623,7 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   Saturation coverage composes one ordinary authenticated TLS request with a
   subsequent stateful metadata-command session at that minimum limit.
 - Shared authenticated test helpers are implemented in
-  [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md),
+  [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md),
   allowing replicated process and UAT tests to configure authenticated Unix
   sockets without duplicating scoped-credential setup. Migration of remaining
   fixtures to shared manifest builders is cleanup rather than an activation
@@ -12676,7 +12679,7 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   shard writes and transfer/bootstrap checkpoint installation remain denied to
   maintenance. This table is not a substitute for the non-forgeable PG roles
   and request-scoped route/payload capabilities in
-  [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md);
+  [storage-boundary-compiler-enforcement-plan.md](../storage-boundary-compiler-enforcement-plan.md);
   authenticated Unix/TCP dispatch must validate and construct those local
   capabilities before storage effects. Because the full nested frame is
   covered, its route epoch,

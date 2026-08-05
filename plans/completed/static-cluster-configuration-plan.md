@@ -7,7 +7,7 @@ are future multihost lifecycle work rather than static-configuration work.
 
 Related plans:
 
-- [multihost-transition-plan.md](../multihost-transition-plan.md)
+- [multihost-followup-plan.md](../multihost-followup-plan.md)
 - [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md)
 - [storage-boundary-compiler-enforcement-plan.md](../storage-boundary-compiler-enforcement-plan.md)
 

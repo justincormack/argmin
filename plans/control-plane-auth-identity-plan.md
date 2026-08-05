@@ -748,12 +748,11 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
   TCP/config-file work exposes ambiguity in the admin operation surface.
 - **Out of scope for this plan:** public S3 authentication/authorization,
   external tenant identity, and implementation of data-plane storage RPC
-  authentication and operation authorization. Every replicated deployment
-  still requires authenticated storage RPC, including local Unix topologies;
-  that work is explicitly delegated to the Unix-first, transport-independent
-  storage RPC auth slice in
-  [multihost-transition-plan.md](multihost-transition-plan.md), which may reuse
-  this plan's cluster/principal/credential primitives and is then reused by TCP.
+  authentication and operation authorization. Authenticated storage RPC for
+  replicated deployments, including local Unix topologies, was implemented by
+  the Unix-first, transport-independent slices recorded in the
+  [completed multihost transition plan](completed/multihost-transition-plan.md),
+  reusing this plan's cluster/principal/credential primitives for Unix and TCP.
   Its authenticated process-role permission is only the outer authorization
   layer; trusted PG roles and request-scoped route/payload capabilities remain
   owned by

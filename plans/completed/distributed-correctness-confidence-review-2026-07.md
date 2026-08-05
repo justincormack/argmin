@@ -1,5 +1,11 @@
 # Distributed Correctness Confidence Review - July 2026
 
+Status: historical review, completed July 2026. Its worthwhile outstanding
+recommendations are tracked in the
+[multihost production follow-up plan](../multihost-followup-plan.md). Finding
+statuses, source locations, and production-readiness conclusions below describe
+the reviewed revision and are not current implementation status.
+
 Review baseline: `0d61d3fc` (`Bound committed timestamp catch-up`), 2026-07-09.
 
 This is a companion to
