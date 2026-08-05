@@ -17244,7 +17244,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_capture_object_payload(
+    pub(crate) fn test_capture_object_payload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17255,7 +17255,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_snapshot_is_fully_present(
+    pub(crate) fn test_object_payload_snapshot_is_fully_present(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<bool, StoreError> {
@@ -17263,7 +17263,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_snapshot_is_fully_absent(
+    pub(crate) fn test_object_payload_snapshot_is_fully_absent(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<bool, StoreError> {
@@ -17737,7 +17737,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
+    pub(crate) fn test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<bool, StoreError> {
@@ -17770,7 +17770,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_snapshot_uses_generation_layout(
+    pub(crate) fn test_object_payload_snapshot_uses_generation_layout(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
         generation_id: GenerationId,
@@ -17799,7 +17799,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_snapshot_uses_transient_direct_put_layout(
+    pub(crate) fn test_object_payload_snapshot_uses_transient_direct_put_layout(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
         generation_id: GenerationId,
@@ -18144,7 +18144,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_capture_multipart_upload_payload(
+    pub(crate) fn test_capture_multipart_upload_payload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18156,7 +18156,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_capture_multipart_part_payload(
+    pub(crate) fn test_capture_multipart_part_payload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18176,7 +18176,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_multipart_part_payload_snapshot_is_fully_present(
+    pub(crate) fn test_multipart_part_payload_snapshot_is_fully_present(
         &self,
         snapshot: &crate::TestMultipartPartPayloadSnapshot,
     ) -> Result<bool, StoreError> {
@@ -18184,7 +18184,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_multipart_part_payload_snapshot_is_fully_absent(
+    pub(crate) fn test_multipart_part_payload_snapshot_is_fully_absent(
         &self,
         snapshot: &crate::TestMultipartPartPayloadSnapshot,
     ) -> Result<bool, StoreError> {
@@ -18316,7 +18316,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_capture_stream_upload_payload(
+    pub(crate) fn test_capture_stream_upload_payload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18327,7 +18327,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_stream_upload_payload_snapshot_is_fully_present(
+    pub(crate) fn test_stream_upload_payload_snapshot_is_fully_present(
         &self,
         snapshot: &crate::TestStreamUploadPayloadSnapshot,
     ) -> Result<bool, StoreError> {
@@ -18335,7 +18335,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_stream_upload_payload_snapshot_is_fully_absent(
+    pub(crate) fn test_stream_upload_payload_snapshot_is_fully_absent(
         &self,
         snapshot: &crate::TestStreamUploadPayloadSnapshot,
     ) -> Result<bool, StoreError> {

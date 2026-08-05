@@ -179,6 +179,209 @@ pub mod test_support {
 
     use super::*;
 
+    /// Curated opaque payload observations for cross-crate tests.
+    ///
+    /// The underlying storage operations remain crate-private. Importing this
+    /// trait makes only storage-owned opaque snapshots and logical predicates
+    /// available to downstream test code.
+    pub trait StorageClusterPayloadTestSupport {
+        fn test_capture_object_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<TestObjectPayloadSnapshot, ObjectPgActionError>;
+
+        fn test_object_payload_snapshot_is_fully_present(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<bool, StoreError>;
+
+        fn test_object_payload_snapshot_is_fully_absent(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<bool, StoreError>;
+
+        fn test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<bool, StoreError>;
+
+        fn test_object_payload_snapshot_uses_generation_layout(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+            generation_id: GenerationId,
+        ) -> Result<bool, StoreError>;
+
+        fn test_object_payload_snapshot_uses_transient_direct_put_layout(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+            generation_id: GenerationId,
+        ) -> Result<bool, StoreError>;
+
+        fn test_capture_multipart_upload_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError>;
+
+        fn test_capture_multipart_part_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+            part_number: u32,
+        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError>;
+
+        fn test_multipart_part_payload_snapshot_is_fully_present(
+            &self,
+            snapshot: &TestMultipartPartPayloadSnapshot,
+        ) -> Result<bool, StoreError>;
+
+        fn test_multipart_part_payload_snapshot_is_fully_absent(
+            &self,
+            snapshot: &TestMultipartPartPayloadSnapshot,
+        ) -> Result<bool, StoreError>;
+
+        fn test_capture_stream_upload_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            session_id: &SessionId,
+        ) -> Result<TestStreamUploadPayloadSnapshot, ObjectPgActionError>;
+
+        fn test_stream_upload_payload_snapshot_is_fully_present(
+            &self,
+            snapshot: &TestStreamUploadPayloadSnapshot,
+        ) -> Result<bool, StoreError>;
+
+        fn test_stream_upload_payload_snapshot_is_fully_absent(
+            &self,
+            snapshot: &TestStreamUploadPayloadSnapshot,
+        ) -> Result<bool, StoreError>;
+    }
+
+    impl StorageClusterPayloadTestSupport for StorageCluster {
+        fn test_capture_object_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<TestObjectPayloadSnapshot, ObjectPgActionError> {
+            StorageCluster::test_capture_object_payload(self, bucket, key, version_id)
+        }
+
+        fn test_object_payload_snapshot_is_fully_present(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_object_payload_snapshot_is_fully_present(self, snapshot)
+        }
+
+        fn test_object_payload_snapshot_is_fully_absent(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_object_payload_snapshot_is_fully_absent(self, snapshot)
+        }
+
+        fn test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
+                self, snapshot,
+            )
+        }
+
+        fn test_object_payload_snapshot_uses_generation_layout(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+            generation_id: GenerationId,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_object_payload_snapshot_uses_generation_layout(
+                self,
+                snapshot,
+                generation_id,
+            )
+        }
+
+        fn test_object_payload_snapshot_uses_transient_direct_put_layout(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+            generation_id: GenerationId,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_object_payload_snapshot_uses_transient_direct_put_layout(
+                self,
+                snapshot,
+                generation_id,
+            )
+        }
+
+        fn test_capture_multipart_upload_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError> {
+            StorageCluster::test_capture_multipart_upload_payload(self, bucket, key, upload_id)
+        }
+
+        fn test_capture_multipart_part_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+            part_number: u32,
+        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError> {
+            StorageCluster::test_capture_multipart_part_payload(
+                self,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            )
+        }
+
+        fn test_multipart_part_payload_snapshot_is_fully_present(
+            &self,
+            snapshot: &TestMultipartPartPayloadSnapshot,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_multipart_part_payload_snapshot_is_fully_present(self, snapshot)
+        }
+
+        fn test_multipart_part_payload_snapshot_is_fully_absent(
+            &self,
+            snapshot: &TestMultipartPartPayloadSnapshot,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_multipart_part_payload_snapshot_is_fully_absent(self, snapshot)
+        }
+
+        fn test_capture_stream_upload_payload(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            session_id: &SessionId,
+        ) -> Result<TestStreamUploadPayloadSnapshot, ObjectPgActionError> {
+            StorageCluster::test_capture_stream_upload_payload(self, bucket, key, session_id)
+        }
+
+        fn test_stream_upload_payload_snapshot_is_fully_present(
+            &self,
+            snapshot: &TestStreamUploadPayloadSnapshot,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_stream_upload_payload_snapshot_is_fully_present(self, snapshot)
+        }
+
+        fn test_stream_upload_payload_snapshot_is_fully_absent(
+            &self,
+            snapshot: &TestStreamUploadPayloadSnapshot,
+        ) -> Result<bool, StoreError> {
+            StorageCluster::test_stream_upload_payload_snapshot_is_fully_absent(self, snapshot)
+        }
+    }
+
     mod retained_read;
     pub use retained_read::{TestRetainedReadPgMoveScenario, TestRetainedReadPgMoveScenarioError};
 

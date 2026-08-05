@@ -9,6 +9,7 @@ use crate::system_metadata::SystemMetadata;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
+use storage::test_support::StorageClusterPayloadTestSupport as _;
 use storage::test_support::{TestMultipartPartPayloadSnapshot, TestStreamUploadPayloadSnapshot};
 
 const NO_READ: &ReadCondition = &ReadCondition {

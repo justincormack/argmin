@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use storage::test_support::StorageClusterPayloadTestSupport as _;
 use storage::test_support::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, MetadataCommandApplyTestKind,
     TestRetainedReadPgMoveScenario,

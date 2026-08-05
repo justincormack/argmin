@@ -5968,6 +5968,13 @@ Final Phase 5 audit (2026-08-04):
   compiles without `storage/test-hooks`; `server-core` unit tests may continue
   to enable `storage/test-hooks` through their dev-dependency while the
   remaining migrations are performed;
+- opaque committed-object, multipart-part, and staged-stream payload capture
+  and presence/layout predicates are now exposed only through the curated
+  `storage::test_support::StorageClusterPayloadTestSupport` trait. The
+  physical `StorageCluster` implementations are crate-private, so downstream
+  tests must explicitly import the owner namespace and cannot discover these
+  operations on the ordinary production surface. The snapshot values remain
+  opaque and expose only their existing logical projections; and
 
 The audited cross-crate support families are:
 
@@ -5998,7 +6005,10 @@ Remaining implementation order after this audit:
    lifecycle controls under `storage::test_support` and remove obsolete
    inherent `StorageCluster` test methods. The `server-core/test-utils`
    forwarding of `storage/test-hooks` is removed; its externally consumed
-   helpers now compile over the production storage feature set; and
+   helpers now compile over the production storage feature set. The opaque
+   object, multipart-part, and stream-payload snapshot family is consolidated
+   behind one curated test-support trait and its inherent implementations are
+   crate-private; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the transitional raw-record seam and its plan exception are gone.
 

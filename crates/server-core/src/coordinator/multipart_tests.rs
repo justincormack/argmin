@@ -4,6 +4,7 @@ use super::*;
 use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
 use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
 use std::sync::Arc;
+use storage::test_support::StorageClusterPayloadTestSupport as _;
 
 fn create_bucket_with_explicit_writer_grant(
     coord: &Coordinator,
