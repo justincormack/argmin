@@ -1,4 +1,5 @@
 use super::test_helpers;
+use super::test_support::{setup_coordinator_without_reclaim_sweeper, NO_WRITE};
 use super::test_topology::*;
 use super::*;
 use crate::conditional::{ReadCondition, SpecificEtag};
@@ -8,11 +9,7 @@ use crate::system_metadata::SystemMetadata;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, MutexGuard};
-use storage::test_support::{
-    TestMultipartPartPayloadSnapshot, TestMultipartUploadRecord, TestPayloadReclaimRoot,
-    TestStreamUploadPayloadSnapshot,
-};
-use storage::StreamUploadRecord;
+use storage::test_support::{TestMultipartPartPayloadSnapshot, TestStreamUploadPayloadSnapshot};
 
 const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -242,48 +239,37 @@ impl<'a> InvariantHarness<'a> {
         Self { coord }
     }
 
-    fn active_stream_sessions(&self) -> Vec<StreamUploadRecord> {
-        self.coord
-            .storage_node()
-            .test_list_all_stream_uploads()
-            .unwrap()
-    }
-
-    fn active_stream_sessions_for(&self, bucket: &str, key: &str) -> Vec<StreamUploadRecord> {
-        let bucket = trusted_bucket_name(bucket);
-        let key = trusted_object_key(key);
-        self.active_stream_sessions()
-            .into_iter()
-            .filter(|session| session.bucket == bucket && session.key == key)
-            .collect()
-    }
-
-    fn pending_multipart_uploads_for(
-        &self,
-        bucket: &str,
-        key: &str,
-    ) -> Vec<TestMultipartUploadRecord> {
+    fn active_stream_session_count_for(&self, bucket: &str, key: &str) -> usize {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
-        self.coord
-            .storage_node()
-            .test_list_multipart_uploads_for_bucket(&bucket_name)
-            .unwrap()
-            .into_iter()
-            .filter(|upload| upload.key == key_name)
-            .collect()
+        storage::test_support::stream_upload_session_count_for_object(
+            &self.coord.storage_node(),
+            &bucket_name,
+            &key_name,
+        )
+        .unwrap()
     }
 
-    fn pending_reclaim_roots_for(&self, bucket: &str, key: &str) -> Vec<TestPayloadReclaimRoot> {
+    fn pending_multipart_upload_count_for(&self, bucket: &str, key: &str) -> usize {
         let bucket_name = trusted_bucket_name(bucket);
         let key_name = trusted_object_key(key);
-        self.coord
-            .storage_node()
-            .test_list_bucket_payload_reclaim_roots(&bucket_name)
-            .unwrap()
-            .into_iter()
-            .filter(|root| root.key == key_name)
-            .collect()
+        storage::test_support::multipart_upload_count_for_object(
+            &self.coord.storage_node(),
+            &bucket_name,
+            &key_name,
+        )
+        .unwrap()
+    }
+
+    fn pending_reclaim_root_count_for(&self, bucket: &str, key: &str) -> usize {
+        let bucket_name = trusted_bucket_name(bucket);
+        let key_name = trusted_object_key(key);
+        storage::test_support::object_payload_reclaim_root_count_for(
+            &self.coord.storage_node(),
+            &bucket_name,
+            &key_name,
+        )
+        .unwrap()
     }
 
     fn multipart_part_payload(
@@ -302,20 +288,14 @@ impl<'a> InvariantHarness<'a> {
             .unwrap()
     }
 
-    fn multipart_upload(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &UploadId,
-    ) -> TestMultipartUploadRecord {
-        self.coord
-            .storage_node()
-            .test_get_multipart_upload(
-                &trusted_bucket_name(bucket),
-                &trusted_object_key(key),
-                upload_id,
-            )
-            .unwrap()
+    fn multipart_upload_state(&self, bucket: &str, key: &str, upload_id: &UploadId) -> UploadState {
+        storage::test_support::multipart_upload_state(
+            &self.coord.storage_node(),
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            upload_id,
+        )
+        .unwrap()
     }
 
     fn stream_payload(
@@ -346,26 +326,26 @@ impl<'a> InvariantHarness<'a> {
     }
 
     fn assert_no_active_stream_sessions_for(&self, bucket: &str, key: &str, invariant: &str) {
-        let sessions = self.active_stream_sessions_for(bucket, key);
-        assert!(
-            sessions.is_empty(),
-            "{invariant}: expected no active stream sessions for {bucket}/{key}, found {sessions:?}"
+        let session_count = self.active_stream_session_count_for(bucket, key);
+        assert_eq!(
+            session_count, 0,
+            "{invariant}: expected no active stream sessions for {bucket}/{key}"
         );
     }
 
     fn assert_no_pending_multipart_uploads_for(&self, bucket: &str, key: &str, invariant: &str) {
-        let uploads = self.pending_multipart_uploads_for(bucket, key);
-        assert!(
-            uploads.is_empty(),
-            "{invariant}: expected no pending multipart uploads for {bucket}/{key}, found {uploads:?}"
+        let upload_count = self.pending_multipart_upload_count_for(bucket, key);
+        assert_eq!(
+            upload_count, 0,
+            "{invariant}: expected no pending multipart uploads for {bucket}/{key}"
         );
     }
 
     fn assert_no_pending_reclaim_roots_for(&self, bucket: &str, key: &str, invariant: &str) {
-        let roots = self.pending_reclaim_roots_for(bucket, key);
-        assert!(
-            roots.is_empty(),
-            "{invariant}: expected no pending reclaim roots for {bucket}/{key}, found {roots:?}"
+        let root_count = self.pending_reclaim_root_count_for(bucket, key);
+        assert_eq!(
+            root_count, 0,
+            "{invariant}: expected no pending reclaim roots for {bucket}/{key}"
         );
     }
 }
@@ -1001,10 +981,9 @@ fn staged_stream_object_is_not_visible_before_finalize() {
         "{invariant}: staged object became head-visible before finalize, got {err:?}"
     );
 
-    let sessions = state.active_stream_sessions_for("bucket", "new-key");
+    let session_count = state.active_stream_session_count_for("bucket", "new-key");
     assert_eq!(
-        sessions.len(),
-        1,
+        session_count, 1,
         "{invariant}: expected exactly one active session to hold the staged object state"
     );
     state.assert_no_pending_reclaim_roots_for("bucket", "new-key", invariant);
@@ -1065,9 +1044,8 @@ fn aborting_multipart_upload_rejects_late_list_parts_without_state_loss() {
         "{invariant}: expected NoSuchUpload once the upload is aborting, got {err:?}"
     );
 
-    let upload = state.multipart_upload("bucket", "key", &create.upload_id);
     assert_eq!(
-        upload.state,
+        state.multipart_upload_state("bucket", "key", &create.upload_id),
         UploadState::Aborting,
         "{invariant}: late list-parts should not change the aborting terminal state"
     );
@@ -1108,9 +1086,8 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
         "{invariant}: expected NoSuchUpload once the upload is completing, got {err:?}"
     );
 
-    let upload = state.multipart_upload("bucket", "key", &create.upload_id);
     assert_eq!(
-        upload.state,
+        state.multipart_upload_state("bucket", "key", &create.upload_id),
         UploadState::Completing,
         "{invariant}: late abort should not change the completing terminal state"
     );
@@ -1569,7 +1546,7 @@ fn stale_snapshot_time_budget_exhaustion_returns_operation_aborted_without_publi
     assert_eq!(listed.parts[0].part_number, 1, "{invariant}");
     assert_eq!(listed.parts[0].etag, parts[0].etag, "{invariant}");
     assert_eq!(
-        state.multipart_upload(bucket, key, &upload_id).state,
+        state.multipart_upload_state(bucket, key, &upload_id),
         UploadState::InProgress,
         "{invariant}"
     );
@@ -1734,10 +1711,9 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
         "{invariant}: failed finalize should not make the object visible, got {err:?}"
     );
 
-    let sessions = state.active_stream_sessions_for("bucket", "key");
+    let session_count = state.active_stream_session_count_for("bucket", "key");
     assert_eq!(
-        sessions.len(),
-        1,
+        session_count, 1,
         "{invariant}: failed finalize should leave exactly one stale session to scavenge"
     );
     state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
@@ -1762,13 +1738,38 @@ fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
 #[test]
 fn dropping_a_read_only_payload_lease_does_not_enqueue_reclaim_work() {
     let dir = test_util::tempdir();
-    let runtime = make_test_read_runtime(dir.path());
-    let generation_id = GenerationId::new(1).unwrap();
+    let coord = setup_coordinator_without_reclaim_sweeper(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request("bucket", "key", test_requester()),
+            data: b"leased live payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        VersionId::Null,
+    )
+    .unwrap();
 
-    drop(runtime.acquire_object_payload_lease("bucket", "key", generation_id));
+    drop(coord.read_runtime().acquire_object_payload_lease(&subject));
 
     assert_eq!(
-        runtime
+        coord
             .storage_node()
             .test_object_payload_reclaim_outstanding_depth(),
         0,
@@ -1780,15 +1781,17 @@ fn dropping_a_read_only_payload_lease_does_not_enqueue_reclaim_work() {
 fn final_payload_lease_drop_enqueues_only_while_reclaim_metadata_exists() {
     let dir = test_util::tempdir();
     let runtime = make_test_read_runtime(dir.path());
-    let generation_id = GenerationId::new(1).unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    runtime
-        .storage_node()
-        .test_seed_segmented_payload_reclaim(&bucket, &key, generation_id, 1)
-        .unwrap();
+    let subject = storage::test_support::seed_segmented_object_payload_reclaim(
+        runtime.storage_node(),
+        &bucket,
+        &key,
+        1,
+    )
+    .unwrap();
 
-    let lease = runtime.acquire_object_payload_lease("bucket", "key", generation_id);
+    let lease = runtime.acquire_object_payload_lease(&subject);
     drop(lease);
 
     assert_eq!(
@@ -1798,10 +1801,11 @@ fn final_payload_lease_drop_enqueues_only_while_reclaim_metadata_exists() {
         1,
         "dropping the final lease must schedule the extant durable reclaim root"
     );
-    assert!(runtime
-        .storage_node()
-        .test_payload_reclaim_exists(&bucket, &key, generation_id)
-        .unwrap());
+    assert!(storage::test_support::object_payload_has_reclaim_root(
+        runtime.storage_node(),
+        &subject,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -1863,16 +1867,15 @@ fn failed_stream_part_finalize_abort_cleanup_leaves_no_visible_part_or_orphans()
         "{invariant}: failed finalize should not expose a committed multipart part"
     );
 
-    let upload = state.multipart_upload("bucket", "key", &mpu.upload_id);
     assert_eq!(
-        upload.state,
+        state.multipart_upload_state("bucket", "key", &mpu.upload_id),
         UploadState::InProgress,
         "{invariant}: failed part finalize should not change the multipart upload state"
     );
 
-    let sessions = state.active_stream_sessions_for("bucket", "key");
+    let session_count = state.active_stream_session_count_for("bucket", "key");
     assert_eq!(
-        sessions.len(),
+        session_count,
         1,
         "{invariant}: failed part finalize should leave exactly one active session for the request abort guard"
     );

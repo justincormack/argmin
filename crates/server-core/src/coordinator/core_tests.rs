@@ -5948,15 +5948,16 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
         },
     )
     .unwrap();
-    let generation_id = initial
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .into_live()
-        .expect("first put should create a live object")
-        .generation_id;
-    let payload_lease = initial
-        .acquire_object_payload_lease(&bucket, &key, generation_id)
-        .unwrap();
+    let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &initial,
+        &bucket,
+        &key,
+        VersionId::Null,
+    )
+    .unwrap();
+    let payload_lease =
+        storage::test_support::acquire_object_payload_reclaim_lease(&initial, &reclaim_subject)
+            .unwrap();
     test_helpers::put_object(
         &coord,
         &PutObjectRequest {
@@ -5992,8 +5993,7 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
     let attempts_for_hook = Arc::clone(&attempts);
     let runtime_handle_for_hook = runtime_handle.clone();
     let replacement_for_hook = Arc::clone(&replacement);
-    let duplicate_bucket = bucket.clone();
-    let duplicate_key = key.clone();
+    let duplicate_reclaim_subject = reclaim_subject.clone();
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
         before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
@@ -6001,10 +6001,9 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
                 runtime_handle_for_hook
                     .install(Arc::clone(&replacement_for_hook))
                     .unwrap();
-                replacement_for_hook.enqueue_object_payload_reclaim(
-                    &duplicate_bucket,
-                    &duplicate_key,
-                    generation_id,
+                storage::test_support::enqueue_object_payload_reclaim(
+                    &replacement_for_hook,
+                    &duplicate_reclaim_subject,
                 );
             }
         })),
@@ -11527,12 +11526,13 @@ fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
         )
         .unwrap();
         let object_key = trusted_object_key(key);
-        let generation_id = storage_cluster
-            .test_get_object_meta(&bucket_name, &object_key)
-            .unwrap()
-            .into_live()
-            .expect("put object should create a live object")
-            .generation_id;
+        let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+            &storage_cluster,
+            &bucket_name,
+            &object_key,
+            VersionId::Null,
+        )
+        .unwrap();
         coord
             .delete_object(&delete_object_request(
                 bucket,
@@ -11543,12 +11543,11 @@ fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
                 NO_DELETE,
             ))
             .unwrap();
-        reclaim_roots.push((object_key, generation_id));
+        reclaim_roots.push(reclaim_subject);
     }
     assert!(
-        reclaim_roots.iter().all(|(key, generation_id)| {
-            storage_cluster
-                .test_payload_reclaim_exists(&bucket_name, key, *generation_id)
+        reclaim_roots.iter().all(|subject| {
+            storage::test_support::object_payload_has_reclaim_root(&storage_cluster, subject)
                 .unwrap()
         }),
         "all durable roots must exist before the reclaim worker starts"
@@ -11570,8 +11569,8 @@ fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
     gate.wait_until_arrived(Duration::from_secs(10));
     let root_presence = reclaim_roots
         .iter()
-        .map(|(key, generation_id)| {
-            storage_cluster.test_payload_reclaim_exists(&bucket_name, key, *generation_id)
+        .map(|subject| {
+            storage::test_support::object_payload_has_reclaim_root(&storage_cluster, subject)
         })
         .collect::<Vec<_>>();
     gate.release();
@@ -11589,9 +11588,8 @@ fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
     loop {
         let remaining = reclaim_roots
             .iter()
-            .filter(|(key, generation_id)| {
-                storage_cluster
-                    .test_payload_reclaim_exists(&bucket_name, key, *generation_id)
+            .filter(|subject| {
+                storage::test_support::object_payload_has_reclaim_root(&storage_cluster, subject)
                     .unwrap()
             })
             .count();
@@ -18744,29 +18742,20 @@ fn delete_object_eventually_reclaims_simple_shards() {
     )
     .unwrap();
 
-    let (generation_id, payload) = {
-        match coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-            .unwrap()
-        {
-            StoredObject::Live(record) => {
-                let payload = coord
-                    .storage_node()
-                    .test_capture_object_payload(
-                        &trusted_bucket_name("bucket"),
-                        &trusted_object_key("key"),
-                        record.version_id,
-                    )
-                    .unwrap();
-                assert_eq!(payload.segment_count(), 1);
-                (record.generation_id, payload)
-            }
-            other @ StoredObject::DeleteMarker(_) => {
-                panic!("expected live object, got {other:?}")
-            }
-        }
-    };
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let payload = coord
+        .storage_node()
+        .test_capture_object_payload(&bucket, &key, VersionId::Null)
+        .unwrap();
+    assert_eq!(payload.segment_count(), 1);
+    let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        VersionId::Null,
+    )
+    .unwrap();
 
     coord
         .delete_object(&delete_object_request(
@@ -18779,7 +18768,7 @@ fn delete_object_eventually_reclaims_simple_shards() {
         ))
         .unwrap();
 
-    reclaim_object_payload(&coord, "bucket", "key", generation_id);
+    reclaim_object_payload(&coord, &reclaim_subject);
     assert!(coord
         .storage_node()
         .test_object_payload_snapshot_is_fully_absent(&payload)
@@ -19618,7 +19607,7 @@ fn setup_deleted_object_reclaim_test(
     Coordinator,
     BucketName,
     ObjectKey,
-    GenerationId,
+    storage::test_support::TestObjectPayloadReclaimSubject,
 ) {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator_without_reclaim_sweeper(tmp.path());
@@ -19649,13 +19638,13 @@ fn setup_deleted_object_reclaim_test(
         },
     )
     .unwrap();
-    let generation_id = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .into_live()
-        .expect("put object should create a live object")
-        .generation_id;
+    let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        VersionId::Null,
+    )
+    .unwrap();
     coord
         .delete_object(&delete_object_request(
             bucket.as_str(),
@@ -19667,7 +19656,7 @@ fn setup_deleted_object_reclaim_test(
         ))
         .unwrap();
 
-    (tmp, coord, bucket, key, generation_id)
+    (tmp, coord, bucket, key, reclaim_subject)
 }
 
 #[test]
@@ -19676,7 +19665,7 @@ fn reclaim_zero_apply_failure_releases_claim_after_pending_slot_cleanup() {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();
-    let (_tmp, coord, bucket, key, generation_id) =
+    let (_tmp, coord, _bucket, _key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-release-after-zero-apply");
 
     let failed_once = Arc::new(AtomicBool::new(false));
@@ -19698,7 +19687,7 @@ fn reclaim_zero_apply_failure_releases_claim_after_pending_slot_cleanup() {
 
     let error = coord
         .read_runtime()
-        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
     assert!(failed_once.load(Ordering::SeqCst));
     assert!(
@@ -19710,15 +19699,16 @@ fn reclaim_zero_apply_failure_releases_claim_after_pending_slot_cleanup() {
     assert!(
         coord
             .read_runtime()
-            .try_reclaim_object_payload("bucket", "key", generation_id)
+            .try_reclaim_object_payload(&reclaim_subject)
             .unwrap(),
         "retry must complete rather than defer behind a leaked reclaim claim"
     );
     assert!(
-        !coord
-            .storage_node()
-            .test_payload_reclaim_exists(&bucket, &key, generation_id,)
-            .unwrap(),
+        !storage::test_support::object_payload_has_reclaim_root(
+            &coord.storage_node(),
+            &reclaim_subject,
+        )
+        .unwrap(),
         "completed retry must remove the durable reclaim root"
     );
 }
@@ -19729,7 +19719,7 @@ fn reclaim_route_failure_after_claim_acquisition_releases_claim() {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();
-    let (_tmp, coord, bucket, key, generation_id) =
+    let (_tmp, coord, _bucket, _key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-release-after-route-failure");
 
     let admission_failed = Arc::new(AtomicBool::new(false));
@@ -19749,7 +19739,7 @@ fn reclaim_route_failure_after_claim_acquisition_releases_claim() {
 
     let error = coord
         .read_runtime()
-        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
     assert!(admission_failed.load(Ordering::SeqCst));
     assert!(
@@ -19757,9 +19747,10 @@ fn reclaim_route_failure_after_claim_acquisition_releases_claim() {
         "post-claim route failure should remain retryable, got {error:?}"
     );
     assert!(
-        !coord
-            .storage_node()
-            .test_object_payload_reclaim_is_active(&bucket, &key, generation_id),
+        !storage::test_support::object_payload_reclaim_is_active(
+            &coord.storage_node(),
+            &reclaim_subject,
+        ),
         "failure before reclaim admission must not create a process-local active slot"
     );
 
@@ -19767,15 +19758,16 @@ fn reclaim_route_failure_after_claim_acquisition_releases_claim() {
     assert!(
         coord
             .read_runtime()
-            .try_reclaim_object_payload("bucket", "key", generation_id)
+            .try_reclaim_object_payload(&reclaim_subject)
             .unwrap(),
         "retry must not defer behind the claim acquired by the failed attempt"
     );
     assert!(
-        !coord
-            .storage_node()
-            .test_payload_reclaim_exists(&bucket, &key, generation_id)
-            .unwrap(),
+        !storage::test_support::object_payload_has_reclaim_root(
+            &coord.storage_node(),
+            &reclaim_subject,
+        )
+        .unwrap(),
         "completed retry must remove the durable reclaim root"
     );
 }
@@ -19786,7 +19778,7 @@ fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();
-    let (_tmp, coord, bucket, key, generation_id) =
+    let (_tmp, coord, _bucket, _key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-ownership-lookup-failure");
 
     let apply_failed = Arc::new(AtomicBool::new(false));
@@ -19821,7 +19813,7 @@ fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
 
     let error = coord
         .read_runtime()
-        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
     assert!(apply_failed.load(Ordering::SeqCst));
     assert!(ownership_lookup_failed.load(Ordering::SeqCst));
@@ -19830,16 +19822,18 @@ fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
         "the original retryable apply error should be preserved, got {error:?}"
     );
     assert!(
-        !coord
-            .storage_node()
-            .test_object_payload_reclaim_is_active(&bucket, &key, generation_id),
+        !storage::test_support::object_payload_reclaim_is_active(
+            &coord.storage_node(),
+            &reclaim_subject,
+        ),
         "ownership uncertainty must retain the fence without stranding the process-local active slot"
     );
     assert!(
-        coord
-            .storage_node()
-            .test_payload_reclaim_exists(&bucket, &key, generation_id)
-            .unwrap(),
+        storage::test_support::object_payload_has_reclaim_root(
+            &coord.storage_node(),
+            &reclaim_subject,
+        )
+        .unwrap(),
         "ownership uncertainty must preserve the durable reclaim root"
     );
 }
@@ -19850,7 +19844,7 @@ fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();
-    let (_tmp, coord, bucket, key, generation_id) =
+    let (_tmp, coord, _bucket, _key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-release-failure");
 
     let apply_failed = Arc::new(AtomicBool::new(false));
@@ -19885,7 +19879,7 @@ fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
 
     let error = coord
         .read_runtime()
-        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
     assert!(apply_failed.load(Ordering::SeqCst));
     assert!(claim_release_failed.load(Ordering::SeqCst));
@@ -19898,16 +19892,18 @@ fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
         "claim release failure should be returned, got {error:?}"
     );
     assert!(
-        !coord
-            .storage_node()
-            .test_object_payload_reclaim_is_active(&bucket, &key, generation_id),
+        !storage::test_support::object_payload_reclaim_is_active(
+            &coord.storage_node(),
+            &reclaim_subject,
+        ),
         "claim release uncertainty must retain the fence without stranding the process-local active slot"
     );
     assert!(
-        coord
-            .storage_node()
-            .test_payload_reclaim_exists(&bucket, &key, generation_id)
-            .unwrap(),
+        storage::test_support::object_payload_has_reclaim_root(
+            &coord.storage_node(),
+            &reclaim_subject,
+        )
+        .unwrap(),
         "claim release uncertainty must preserve the durable reclaim root"
     );
 }

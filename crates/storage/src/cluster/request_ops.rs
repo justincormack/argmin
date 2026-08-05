@@ -63,9 +63,12 @@ use crate::types::{
     BucketDeleteDebugPayloadReclaimRoot, BucketDeleteDebugPayloadReclaimRootError,
     BucketDeleteDebugPendingCommand, BucketDeleteDebugSnapshot,
 };
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 use crate::types::{
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+};
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::types::{
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
     PlacedSegmentShardRepairWorkItem,
 };
@@ -12604,7 +12607,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_reclaim_object_payload_if_unleased(
+    pub(crate) fn test_reclaim_object_payload_if_unleased(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17926,7 +17929,7 @@ impl super::StorageCluster {
 
     /// Observes only whether the durable segmented-payload reclaim root exists.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_segments_reclaim(
+    pub(crate) fn test_get_object_segments_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17940,7 +17943,7 @@ impl super::StorageCluster {
     /// Seeds the canonical storage-owned reclaim scenario for one orphaned
     /// segmented-object generation.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_seed_segmented_payload_reclaim(
+    pub(crate) fn test_seed_segmented_payload_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17975,10 +17978,41 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_next_unreferenced_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let pg_id = PgId::new(self.object_metadata_pg_id(bucket, key));
+        let mut candidate = None;
+        for node in self
+            .local_map
+            .metadata_pg_acting_nodes(self.operation_epoch(), pg_id)?
+        {
+            let node_candidate = node
+                .test_node()
+                .test_next_unreferenced_object_generation(bucket, key)?;
+            match candidate {
+                None => candidate = Some(node_candidate),
+                Some(expected) if expected == node_candidate => {}
+                Some(_) => {
+                    return Err(ObjectPgActionError::InvalidRequest {
+                        reason: "acting set disagrees on the next unreferenced object generation"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        candidate.ok_or_else(|| ObjectPgActionError::InvalidRequest {
+            reason: "object metadata acting set is empty".to_string(),
+        })
+    }
+
     /// Seeds the canonical storage-owned reclaim scenario for one orphaned
     /// multipart-object generation.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_seed_multipart_payload_reclaim(
+    #[cfg(test)]
+    pub(crate) fn test_seed_multipart_payload_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18018,7 +18052,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_payload_reclaim_exists(
+    pub(crate) fn test_payload_reclaim_exists(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18029,7 +18063,17 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_reclaim_is_active(
+    pub(crate) fn test_payload_reclaim_count_for_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<usize, ObjectPgActionError> {
+        self.metadata_primary_bridge_node()?
+            .test_payload_reclaim_count_for_object(bucket, key)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_object_payload_reclaim_is_active(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18037,16 +18081,6 @@ impl super::StorageCluster {
     ) -> bool {
         self.local_map
             .test_object_payload_reclaim_is_active(bucket, key, generation_id)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_bucket_payload_reclaim_roots(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<Vec<crate::TestPayloadReclaimRoot>, ObjectPgActionError> {
-        self.metadata_primary_bridge_node()?
-            .test_list_bucket_payload_reclaim_roots(bucket)
-            .map(|roots| roots.into_iter().map(Into::into).collect())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

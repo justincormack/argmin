@@ -539,6 +539,23 @@ pub(crate) trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<bool, MetadataError>;
 
+    /// Test-support exact count of reclaim roots for one object subject.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn payload_reclaim_count_for_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<usize, MetadataError>;
+
+    /// Test-support generation candidate proven absent from every durable
+    /// object-generation reference owned by this PG.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn next_unreferenced_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, MetadataError>;
+
     /// Return one reclaim root in the bucket, if any exist.
     ///
     /// Used by synchronous bucket deletion to drain deferred reclaim work.

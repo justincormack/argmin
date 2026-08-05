@@ -509,13 +509,11 @@ pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
 
 pub(crate) fn reclaim_object_payload(
     coord: &Coordinator,
-    bucket: &str,
-    key: &str,
-    generation_id: GenerationId,
+    subject: &storage::test_support::TestObjectPayloadReclaimSubject,
 ) {
     coord
         .read_runtime()
-        .try_reclaim_object_payload(bucket, key, generation_id)
+        .try_reclaim_object_payload(subject)
         .unwrap();
 }
 

@@ -5875,7 +5875,26 @@ Implementation update (2026-08-03):
   deadline, while retaining the object generation and payload subject
   privately for an opaque deletion-exclusion lease and reclaim-root presence
   query. Current, versioned, suspended-null, and noncurrent expiration tests no
-  longer read durable live-object generations or reclaim records directly.
+  longer read durable live-object generations or reclaim records directly; and
+- introduced an opaque storage-issued object-payload reclaim subject for
+  coordinator reclaim behavior. Runtime-map queue ownership, worker
+  rediscovery, delete cleanup, claim release/failure, active-slot, lease, and
+  durable-root assertions now pass this subject back to storage-owned helpers;
+  they no longer extract or reconstruct the payload generation. The multipart
+  state-machine harness now observes only a logical per-object reclaim-root
+  count, and the raw bucket reclaim-root projection is removed. Synthetic
+  segmented-root cases are storage-owned opaque scenarios, while the no-root
+  lease case now captures an object written through the production PUT path;
+  callers no longer choose generation `1`, and the raw `StorageCluster`
+  generation/reclaim test methods are crate-private. The state-machine harness
+  also observes only per-object session/upload counts and the selected upload's
+  logical state; it no longer imports `StreamUploadRecord` or the broad
+  multipart-upload projection. The reclaim count is an exact bucket/key query,
+  rather than filtering the one-root-per-PG recovery scan; synthetic reclaim
+  subjects select a generation above every durable object, reclaim, upload,
+  and reservation reference on the acting set; and multipart state projection
+  rejects a returned upload whose bucket/key differs from the requested
+  subject.
 
 Final Phase 5 audit (2026-08-04):
 
@@ -5900,14 +5919,14 @@ Final Phase 5 audit (2026-08-04):
   EC-index selection, and shard-fault inspection are storage-owned, while the
   coordinator test retains only the meaningful response-lifetime ordering and
   body/result assertions;
-- lifecycle sweep tests now use the narrow storage-owned lifecycle observation
-  for deadline timestamps, payload leases, and reclaim-root presence. Residual
-  coordinator reclaim-worker and multipart cleanup tests still discover
-  private generation IDs through raw object records before checking reclaim
-  state; replace those reads with opaque payload evidence or logical
-  object-scoped reclaim scenarios. The multipart state-machine harness also reads
-  `StreamUploadRecord` and the broad `TestMultipartUploadRecord` projection;
-  narrow these to the exact logical session/upload facts used by the model so
+- lifecycle sweep tests use the narrow storage-owned lifecycle observation for
+  deadline timestamps, payload leases, and reclaim-root presence. The ordinary
+  coordinator reclaim-worker and multipart cleanup paths now use an opaque
+  object-scoped reclaim subject, including a storage-owned synthetic
+  segmented-root scenario and a production-written no-root lease case. The
+  multipart state-machine harness now uses exact logical session/upload counts
+  and upload state. Other coordinator suites still consume the broad
+  multipart upload/session observations; narrow those remaining call sites so
   metadata blobs, encryption state, storage generation IDs, and other durable
   record fields do not cross the owner boundary;
 - the runtime-map validity, admission barriers, fault scheduling hooks, opaque

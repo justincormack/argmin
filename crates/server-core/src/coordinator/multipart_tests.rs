@@ -1285,13 +1285,15 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let generation_id = GenerationId::new(1).unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("ghost");
-    coord
-        .storage_node()
-        .test_seed_segmented_payload_reclaim(&bucket, &key, generation_id, 1)
-        .unwrap();
+    let reclaim_subject = storage::test_support::seed_segmented_object_payload_reclaim(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        1,
+    )
+    .unwrap();
 
     delete_bucket_eventually_test(&coord, "bucket").unwrap();
     assert!(matches!(
@@ -1301,10 +1303,11 @@ fn delete_bucket_drains_unqueued_payload_reclaim() {
 
     wait_until_bucket_gone(&coord, "bucket");
 
-    assert!(!coord
-        .storage_node()
-        .test_payload_reclaim_exists(&bucket, &key, generation_id)
-        .unwrap());
+    assert!(!storage::test_support::object_payload_has_reclaim_root(
+        &coord.storage_node(),
+        &reclaim_subject,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -1351,18 +1354,13 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
         })
         .unwrap();
 
-    let generation_id = {
-        match admin
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-            .unwrap()
-        {
-            StoredObject::Live(record) => record.generation_id,
-            other @ StoredObject::DeleteMarker(_) => {
-                panic!("expected live object, got {other:?}")
-            }
-        }
-    };
+    let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &admin.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        VersionId::Null,
+    )
+    .unwrap();
 
     admin
         .delete_object(&delete_object_request(
@@ -1376,15 +1374,11 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
         .unwrap();
 
     {
-        assert!(admin
-            .storage_node()
-            .test_get_object_segments_reclaim(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                generation_id,
-            )
-            .unwrap()
-            .is_some());
+        assert!(storage::test_support::object_payload_has_reclaim_root(
+            &admin.storage_node(),
+            &reclaim_subject,
+        )
+        .unwrap());
     }
 
     delete_bucket_test(&deleter, "bucket").unwrap();
@@ -1398,15 +1392,11 @@ fn delete_bucket_returns_before_payload_lease_and_reclaim_complete() {
     ));
 
     {
-        assert!(admin
-            .storage_node()
-            .test_get_object_segments_reclaim(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                generation_id,
-            )
-            .unwrap()
-            .is_some());
+        assert!(storage::test_support::object_payload_has_reclaim_root(
+            &admin.storage_node(),
+            &reclaim_subject,
+        )
+        .unwrap());
     }
 
     drop(held_read);
@@ -2359,7 +2349,7 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         .storage_node()
         .test_multipart_part_payload_snapshot_is_fully_present(&payload_to_reclaim)
         .unwrap());
-    coord
+    let completed = coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
                 "bucket",
@@ -2378,17 +2368,13 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
             sse_customer: None,
         })
         .unwrap();
-
-    let generation_id = match coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap()
-    {
-        StoredObject::Live(record) => record.generation_id,
-        other @ StoredObject::DeleteMarker(_) => {
-            panic!("expected live multipart object, got {other:?}")
-        }
-    };
+    let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        completed.version_id,
+    )
+    .unwrap();
 
     coord
         .delete_object(&delete_object_request(
@@ -2401,7 +2387,7 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         ))
         .unwrap();
 
-    reclaim_object_payload(&coord, "bucket", "key", generation_id);
+    reclaim_object_payload(&coord, &reclaim_subject);
     assert!(coord
         .storage_node()
         .test_multipart_part_payload_snapshot_is_fully_absent(&payload_to_reclaim)
@@ -7709,27 +7695,19 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         })
         .unwrap();
 
-    let (generation_id, payload) = {
-        let generation_id = match coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-            .unwrap()
-        {
-            StoredObject::Live(record) => record.generation_id,
-            other @ StoredObject::DeleteMarker(_) => {
-                panic!("expected live streamed object, got {other:?}")
-            }
-        };
-        let payload = coord
-            .storage_node()
-            .test_capture_object_payload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                result.version_id,
-            )
-            .unwrap();
-        (generation_id, payload)
-    };
+    let bucket = trusted_bucket_name("bucket");
+    let key = trusted_object_key("key");
+    let payload = coord
+        .storage_node()
+        .test_capture_object_payload(&bucket, &key, result.version_id)
+        .unwrap();
+    let reclaim_subject = storage::test_support::capture_object_payload_reclaim_subject(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        result.version_id,
+    )
+    .unwrap();
 
     coord
         .delete_object(&delete_object_request(
@@ -7742,7 +7720,7 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         ))
         .unwrap();
 
-    reclaim_object_payload(&coord, "bucket", "key", generation_id);
+    reclaim_object_payload(&coord, &reclaim_subject);
     assert!(coord
         .storage_node()
         .test_object_payload_snapshot_is_fully_absent(&payload)

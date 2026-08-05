@@ -68,9 +68,8 @@ use crate::types::{
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
     CreateStreamUploadReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PayloadReclaimRoot,
-    PutLiveObjectReq, SessionId, StreamUploadRecord, StreamUploadSegmentRecord, UploadId,
-    UploadState,
+    MultipartUploadRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PutLiveObjectReq,
+    SessionId, StreamUploadRecord, StreamUploadSegmentRecord, UploadId, UploadState,
 };
 #[cfg(test)]
 use crate::types::{StreamUploadState, StreamUploadTarget};
@@ -1090,7 +1089,15 @@ impl SharedStorageNode {
     ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        Ok(pg.get_multipart_upload(upload_id)?)
+        let upload = pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != *bucket || upload.key != *key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "test get multipart upload",
+                },
+            ));
+        }
+        Ok(upload)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1345,18 +1352,25 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_bucket_payload_reclaim_roots(
+    pub(crate) fn test_payload_reclaim_count_for_object(
         &self,
         bucket: &BucketName,
-    ) -> Result<Vec<PayloadReclaimRoot>, ObjectPgActionError> {
-        let mut roots = Vec::new();
-        for &pg_id in &self.pg_id_list {
-            let pg = self.get_pg(pg_id)?;
-            if let Some(root) = PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, bucket)? {
-                roots.push(root);
-            }
-        }
-        Ok(roots)
+        key: &ObjectKey,
+    ) -> Result<usize, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.payload_reclaim_count_for_object(bucket, key)?)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_next_unreferenced_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        Ok(pg.next_unreferenced_object_generation(bucket, key)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

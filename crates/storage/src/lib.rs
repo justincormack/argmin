@@ -654,6 +654,27 @@ pub mod test_support {
         payload: TestObjectPayloadSnapshot,
     }
 
+    /// Opaque storage-owned identity for one live object's payload reclaim.
+    ///
+    /// Cross-crate tests may pass this identity back to the narrow helpers
+    /// below, but cannot select or forge a durable payload generation.
+    #[derive(Clone)]
+    pub struct TestObjectPayloadReclaimSubject {
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+    }
+
+    impl std::fmt::Debug for TestObjectPayloadReclaimSubject {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestObjectPayloadReclaimSubject")
+                .field("bucket", &self.bucket)
+                .field("key", &self.key)
+                .finish_non_exhaustive()
+        }
+    }
+
     impl std::fmt::Debug for TestLifecycleObjectObservation {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             formatter
@@ -748,6 +769,166 @@ pub mod test_support {
             .map(|reclaim| reclaim.is_some())
     }
 
+    pub fn capture_object_payload_reclaim_subject(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<TestObjectPayloadReclaimSubject, ObjectPgActionError> {
+        let stored = cluster.test_get_object_version(bucket, key, version_id)?;
+        let live = stored
+            .as_live()
+            .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                reason: "selected reclaim subject is not a live object version".to_string(),
+            })?;
+        Ok(TestObjectPayloadReclaimSubject {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id: live.generation_id,
+        })
+    }
+
+    fn prepare_object_payload_reclaim_subject_without_root(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<TestObjectPayloadReclaimSubject, ObjectPgActionError> {
+        let generation_id = cluster.test_next_unreferenced_object_generation(bucket, key)?;
+        let subject = TestObjectPayloadReclaimSubject {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+        };
+        if object_payload_has_reclaim_root(cluster, &subject)? {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "selected no-root reclaim subject already has durable reclaim metadata"
+                    .to_string(),
+            });
+        }
+        Ok(subject)
+    }
+
+    /// Seeds one canonical storage-owned segmented reclaim root and returns
+    /// only its opaque logical subject to the caller.
+    pub fn seed_segmented_object_payload_reclaim(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        created_at: u64,
+    ) -> Result<TestObjectPayloadReclaimSubject, ObjectPgActionError> {
+        let subject = prepare_object_payload_reclaim_subject_without_root(cluster, bucket, key)?;
+        cluster.test_seed_segmented_payload_reclaim(
+            bucket,
+            key,
+            subject.generation_id,
+            created_at,
+        )?;
+        Ok(subject)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn acquire_object_payload_reclaim_lease(
+        cluster: &Arc<StorageCluster>,
+        subject: &TestObjectPayloadReclaimSubject,
+    ) -> Result<ObjectPayloadLease, ObjectPgActionError> {
+        cluster
+            .acquire_object_payload_lease(&subject.bucket, &subject.key, subject.generation_id)
+            .map_err(ObjectPgActionError::Store)
+    }
+
+    pub fn object_payload_has_reclaim_root(
+        cluster: &StorageCluster,
+        subject: &TestObjectPayloadReclaimSubject,
+    ) -> Result<bool, ObjectPgActionError> {
+        cluster.test_payload_reclaim_exists(&subject.bucket, &subject.key, subject.generation_id)
+    }
+
+    pub fn object_payload_reclaim_is_active(
+        cluster: &StorageCluster,
+        subject: &TestObjectPayloadReclaimSubject,
+    ) -> bool {
+        cluster.test_object_payload_reclaim_is_active(
+            &subject.bucket,
+            &subject.key,
+            subject.generation_id,
+        )
+    }
+
+    pub fn object_payload_reclaim_root_count_for(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<usize, ObjectPgActionError> {
+        cluster.test_payload_reclaim_count_for_object(bucket, key)
+    }
+
+    pub fn stream_upload_session_count_for_object(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<usize, ObjectPgActionError> {
+        cluster.test_list_all_stream_uploads().map(|sessions| {
+            sessions
+                .into_iter()
+                .filter(|session| session.bucket == *bucket && session.key == *key)
+                .count()
+        })
+    }
+
+    pub fn multipart_upload_count_for_object(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<usize, ObjectPgActionError> {
+        cluster
+            .test_list_multipart_uploads_for_bucket(bucket)
+            .map(|uploads| {
+                uploads
+                    .into_iter()
+                    .filter(|upload| upload.key == *key)
+                    .count()
+            })
+    }
+
+    pub fn multipart_upload_state(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<UploadState, ObjectPgActionError> {
+        let upload = cluster.test_get_multipart_upload(bucket, key, upload_id)?;
+        if upload.bucket != *bucket || upload.key != *key {
+            return Err(ObjectPgActionError::Store(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "observe multipart upload state",
+                },
+            ));
+        }
+        Ok(upload.state)
+    }
+
+    pub fn enqueue_object_payload_reclaim(
+        cluster: &StorageCluster,
+        subject: &TestObjectPayloadReclaimSubject,
+    ) {
+        cluster.enqueue_object_payload_reclaim(
+            &subject.bucket,
+            &subject.key,
+            subject.generation_id,
+        );
+    }
+
+    pub fn reclaim_object_payload_if_unleased(
+        cluster: &StorageCluster,
+        subject: &TestObjectPayloadReclaimSubject,
+    ) -> Result<bool, ObjectPgActionError> {
+        cluster.test_reclaim_object_payload_if_unleased(
+            &subject.bucket,
+            &subject.key,
+            subject.generation_id,
+        )
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub struct TestBucketDeleteFinalizeRoot {
@@ -780,15 +961,6 @@ pub mod test_support {
                 bucket_incarnation_generation: root.bucket_incarnation_generation,
             }
         }
-    }
-
-    /// Test-only observation of a bucket-scoped durable reclaim root.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct TestPayloadReclaimRoot {
-        pub bucket: BucketName,
-        pub key: ObjectKey,
-        pub generation_id: GenerationId,
     }
 
     /// Test-only logical observation of one durable multipart upload.
@@ -1202,17 +1374,6 @@ pub mod test_support {
             }
         }
     }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl From<types::PayloadReclaimRoot> for TestPayloadReclaimRoot {
-        fn from(root: types::PayloadReclaimRoot) -> Self {
-            Self {
-                bucket: root.bucket,
-                key: root.key,
-                generation_id: root.generation_id,
-            }
-        }
-    }
 }
 
 pub use metadata_command::BucketWriteReservationProof;
@@ -1259,7 +1420,7 @@ pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
     TestMultipartUploadRecord, TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot,
-    TestPayloadReclaimRoot, TestStreamUploadPayloadSnapshot,
+    TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

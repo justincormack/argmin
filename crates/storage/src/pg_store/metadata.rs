@@ -8578,6 +8578,43 @@ impl PgMetadataStore for PgStore {
         )
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn payload_reclaim_count_for_object(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<usize, MetadataError> {
+        self.query_row_cached_metadata(
+            "SELECT
+                (SELECT COUNT(*) FROM object_segments_reclaims
+                 WHERE bucket = ?1 AND key = ?2)
+                +
+                (SELECT COUNT(*) FROM multipart_reclaims
+                 WHERE bucket = ?1 AND key = ?2)",
+            params![bucket, key],
+            "payload reclaim count for object",
+            |row| {
+                let count = row.get::<_, i64>(0)?;
+                usize::try_from(count).map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative payload reclaim count: {count}")),
+                    )
+                })
+            },
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn next_unreferenced_object_generation(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, MetadataError> {
+        self.next_generation_id(bucket, key)
+    }
+
     fn get_bucket_payload_reclaim_root(
         &self,
         bucket: &BucketName,

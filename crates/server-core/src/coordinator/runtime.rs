@@ -15,8 +15,6 @@ use super::payload::SharedPayloadBuffer;
 use super::read_core::{PayloadLease, ReadRuntime, ReadStorage, SegmentPayloadRecord};
 use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
-#[cfg(test)]
-use super::{trusted_bucket_name, trusted_object_key};
 use crate::error::ServerError;
 use crate::sse::{
     decrypt_managed_encryption_segment, decrypt_sse_customer_segment, SseCustomerRequest,
@@ -931,19 +929,6 @@ impl ReadRuntime {
             .map_err(Coordinator::map_object_pg_action_error)
     }
 
-    #[cfg(test)]
-    pub(super) fn acquire_object_payload_lease_for(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<PayloadLease, ServerError> {
-        let lease = self
-            .storage_node()
-            .acquire_object_payload_lease(bucket, key, generation_id)?;
-        Ok(PayloadLease { lease: Some(lease) })
-    }
-
     pub(super) fn prepare_object_payload_read<'a>(
         &self,
         bucket: &BucketName,
@@ -979,31 +964,22 @@ impl ReadRuntime {
     #[cfg(test)]
     pub(super) fn acquire_object_payload_lease(
         &self,
-        bucket: &str,
-        key: &str,
-        generation_id: GenerationId,
+        subject: &storage::test_support::TestObjectPayloadReclaimSubject,
     ) -> PayloadLease {
-        self.acquire_object_payload_lease_for(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            generation_id,
+        let lease = storage::test_support::acquire_object_payload_reclaim_lease(
+            self.storage_node(),
+            subject,
         )
-        .expect("current storage cluster should acquire payload lease")
+        .expect("current storage cluster should acquire payload lease");
+        PayloadLease { lease: Some(lease) }
     }
 
     #[cfg(test)]
     pub(super) fn try_reclaim_object_payload(
         &self,
-        bucket: &str,
-        key: &str,
-        generation_id: GenerationId,
+        subject: &storage::test_support::TestObjectPayloadReclaimSubject,
     ) -> Result<bool, ServerError> {
-        self.storage_node()
-            .test_reclaim_object_payload_if_unleased(
-                &trusted_bucket_name(bucket),
-                &trusted_object_key(key),
-                generation_id,
-            )
+        storage::test_support::reclaim_object_payload_if_unleased(self.storage_node(), subject)
             .map_err(Coordinator::map_object_pg_action_error)
     }
 

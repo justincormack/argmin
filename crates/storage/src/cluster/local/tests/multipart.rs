@@ -241,6 +241,59 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
 }
 
 #[test]
+fn multipart_state_observation_rejects_crossed_same_pg_key() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let stored_key = crate::ObjectKey::try_from("stored-key".to_string()).unwrap();
+    let crossed_key = crate::ObjectKey::try_from("crossed-key".to_string()).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let upload_id = upload_id_from_label("crossedstate");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: stored_key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &stored_key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    let error =
+        crate::test_support::multipart_upload_state(&cluster, &bucket, &crossed_key, &upload_id)
+            .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "test get multipart upload",
+        })
+    ));
+}
+
+#[test]
 fn multipart_abort_fanout_rejects_live_crossed_reservation_subjects() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

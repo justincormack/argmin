@@ -52,6 +52,70 @@ fn object_payload_reclaim_capacity_counts_dequeued_work_until_finished() {
         ReclaimQueueInsert::Queued
     );
 }
+
+#[test]
+fn object_scoped_reclaim_count_sees_later_same_pg_root() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+    let bucket = BucketName::try_from("bucket").unwrap();
+    let first_key = ObjectKey::try_from("a-first".to_string()).unwrap();
+    let target_key = ObjectKey::try_from("z-target".to_string()).unwrap();
+
+    cluster
+        .test_seed_segmented_payload_reclaim(&bucket, &first_key, GenerationId::new(1).unwrap(), 1)
+        .unwrap();
+    cluster
+        .test_seed_segmented_payload_reclaim(&bucket, &target_key, GenerationId::new(1).unwrap(), 1)
+        .unwrap();
+
+    assert_eq!(
+        crate::test_support::object_payload_reclaim_root_count_for(&cluster, &bucket, &target_key,)
+            .unwrap(),
+        1,
+        "an earlier root on the same PG must not hide the target object's root"
+    );
+}
+
+#[test]
+fn opaque_segmented_reclaim_subject_skips_live_generation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec_shape).unwrap();
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+    let bucket = BucketName::try_from("bucket").unwrap();
+    let key = ObjectKey::try_from("live-key".to_string()).unwrap();
+    let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"live payload");
+
+    let candidate = cluster
+        .test_next_unreferenced_object_generation(&bucket, &key)
+        .unwrap();
+    assert!(candidate.get() > committed.generation_id.get());
+    let subject =
+        crate::test_support::seed_segmented_object_payload_reclaim(&cluster, &bucket, &key, 1)
+            .unwrap();
+    assert!(crate::test_support::object_payload_has_reclaim_root(&cluster, &subject,).unwrap());
+    assert!(crate::test_support::reclaim_object_payload_if_unleased(&cluster, &subject,).unwrap());
+
+    for shard_index in 0..committed.written.ec.k + committed.written.ec.m {
+        assert!(
+            cluster
+                .test_payload_shard_file_exists(
+                    committed.written.data_pg_id,
+                    committed.written.ec,
+                    &committed.segment_okh,
+                    committed.generation_id,
+                    shard_index,
+                )
+                .unwrap(),
+            "synthetic reclaim must not delete live generation shard {shard_index}"
+        );
+    }
+}
+
 #[test]
 fn bucket_payload_reclaim_root_validation_rejects_wrong_object_pg() {
     let tmp = test_util::tempdir();
