@@ -12317,8 +12317,8 @@ impl super::StorageCluster {
             .expect("test payload lease count should be readable")
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn object_payload_lease_holder_node_count(
+    #[cfg(test)]
+    pub(crate) fn object_payload_lease_holder_node_count(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17296,7 +17296,7 @@ impl super::StorageCluster {
     /// the production missing-file reconstruction path. Physical placement and
     /// shard identity remain owned by storage.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_object_payload_shard_loss(
+    pub(crate) fn test_inject_object_payload_shard_loss(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
         segment_index: u32,
@@ -17318,7 +17318,7 @@ impl super::StorageCluster {
     /// The durable acknowledgement is intentionally left unchanged so the
     /// production read path discovers the checksum mismatch.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_object_payload_shard_corruption(
+    pub(crate) fn test_inject_object_payload_shard_corruption(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
         segment_index: u32,
@@ -17346,7 +17346,7 @@ impl super::StorageCluster {
 
     /// Reports whether one captured shard file still matches its durable ack.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_shard_file_matches_ack(
+    pub(crate) fn test_object_payload_shard_file_matches_ack(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
         segment_index: u32,
@@ -17377,77 +17377,10 @@ impl super::StorageCluster {
             && checksum::crc64::checksum(&data) == expected.crc64)
     }
 
-    /// Captures exact shard-file state without exposing its path or bytes.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_capture_object_payload_shard_file(
-        &self,
-        snapshot: &crate::TestObjectPayloadSnapshot,
-        segment_index: u32,
-        shard_index: u8,
-    ) -> Result<crate::TestObjectPayloadShardFileSnapshot, StoreError> {
-        let path = self.test_object_payload_shard_file_path_from_snapshot(
-            snapshot,
-            segment_index,
-            shard_index,
-        )?;
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => Some(bytes),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(source) => {
-                return Err(StoreError::Io {
-                    context: "capture object payload shard file",
-                    source,
-                });
-            }
-        };
-        Ok(crate::TestObjectPayloadShardFileSnapshot::new(bytes))
-    }
-
-    /// Returns the number of distinct nodes holding one captured segment.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_segment_shard_node_count(
-        &self,
-        snapshot: &crate::TestObjectPayloadSnapshot,
-        segment_index: u32,
-    ) -> Result<usize, StoreError> {
-        let segment = snapshot
-            .segments()
-            .iter()
-            .find(|segment| segment.segment_index == segment_index)
-            .ok_or_else(|| StoreError::Io {
-                context: "select object payload segment for placement observation",
-                source: std::io::Error::other(format!(
-                    "captured payload has no segment {segment_index}"
-                )),
-            })?;
-        let request = SegmentStoredBytesRequest {
-            data_pg_id: segment.data_pg_id,
-            segment_okh: segment.segment_okh,
-            segment_vid: segment.segment_vid,
-            stored_size: 0,
-            segment_crc64: segment.segment_crc64,
-            ec: EcShape {
-                k: segment.ec_k,
-                m: segment.ec_m,
-            },
-        };
-        self.segment_payload_shard_locations_at_placement_epoch(
-            segment.placement_cluster_epoch,
-            &request,
-        )
-        .map(|locations| {
-            locations
-                .into_iter()
-                .map(|location| location.node_id())
-                .collect::<HashSet<_>>()
-                .len()
-        })
-    }
-
     /// Verifies that opaque payload evidence was written using the data-PG
     /// derivation and placement epoch of this cluster generation.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_snapshot_uses_current_placement(
+    pub(crate) fn test_object_payload_snapshot_uses_current_placement(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<bool, StoreError> {
@@ -17471,13 +17404,13 @@ impl super::StorageCluster {
             }))
     }
 
-    /// Returns the number of nodes currently holding payload leases for the
-    /// exact object generation captured by opaque test evidence.
+    /// Reports whether the exact shard-owner set selected by a captured
+    /// payload currently holds deletion-exclusion leases for that generation.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_snapshot_lease_holder_node_count(
+    pub(crate) fn test_object_payload_snapshot_has_exact_shard_owner_leases(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
-    ) -> Result<usize, StoreError> {
+    ) -> Result<bool, StoreError> {
         let first = snapshot.segments().first().ok_or_else(|| StoreError::Io {
             context: "select object payload for lease observation",
             source: std::io::Error::other("captured object payload has no segments"),
@@ -17498,12 +17431,102 @@ impl super::StorageCluster {
             context: "select object payload generation for lease observation",
             source: std::io::Error::other("captured object payload has no generation"),
         })?;
-        Ok(self.object_payload_lease_holder_node_count(&first.bucket, &first.key, generation_id))
+        let mut expected_nodes = HashSet::new();
+        for segment in snapshot.segments() {
+            let request = SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size: 0,
+                segment_crc64: segment.segment_crc64,
+                ec: EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            };
+            expected_nodes.extend(
+                self.segment_payload_shard_locations_at_placement_epoch(
+                    segment.placement_cluster_epoch,
+                    &request,
+                )?
+                .into_iter()
+                .map(|location| location.node_id()),
+            );
+        }
+        Ok(expected_nodes
+            == self.local_map.object_payload_lease_holder_node_ids(
+                &first.bucket,
+                &first.key,
+                generation_id,
+            ))
+    }
+
+    /// Reports whether a captured payload generation has no remaining
+    /// deletion-exclusion lease on any storage node.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_object_payload_snapshot_has_no_leases(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        let first = snapshot.segments().first().ok_or_else(|| StoreError::Io {
+            context: "select object payload for lease observation",
+            source: std::io::Error::other("captured object payload has no segments"),
+        })?;
+        if snapshot
+            .segments()
+            .iter()
+            .any(|segment| segment.bucket != first.bucket || segment.key != first.key)
+        {
+            return Err(StoreError::Io {
+                context: "validate object payload lease observation",
+                source: std::io::Error::other(
+                    "captured object payload contains multiple object generations",
+                ),
+            });
+        }
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select object payload generation for lease observation",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
+        Ok(self
+            .local_map
+            .object_payload_lease_holder_node_ids(&first.bucket, &first.key, generation_id)
+            .is_empty())
+    }
+
+    /// Acquires one opaque generation-wide deletion-exclusion lease for a
+    /// captured test payload without exposing its storage generation.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_acquire_object_payload_lease_for_snapshot(
+        self: &std::sync::Arc<Self>,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+    ) -> Result<ObjectPayloadLease, StoreError> {
+        let first = snapshot.segments().first().ok_or_else(|| StoreError::Io {
+            context: "select object payload for test lease",
+            source: std::io::Error::other("captured object payload has no segments"),
+        })?;
+        if snapshot
+            .segments()
+            .iter()
+            .any(|segment| segment.bucket != first.bucket || segment.key != first.key)
+        {
+            return Err(StoreError::Io {
+                context: "validate object payload test lease",
+                source: std::io::Error::other(
+                    "captured object payload contains multiple object generations",
+                ),
+            });
+        }
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select object payload generation for test lease",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
+        self.acquire_object_payload_lease(&first.bucket, &first.key, generation_id)
     }
 
     /// Returns logical repair observations belonging to a captured payload.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_payload_repair_observations(
+    pub(crate) fn test_object_payload_repair_observations(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<Vec<crate::TestObjectPayloadRepairObservation>, StoreError> {
@@ -17529,26 +17552,74 @@ impl super::StorageCluster {
         Ok(observations)
     }
 
-    /// Consumes one repair wake hint and binds it to a captured payload.
+    /// Creates the durable repair record and in-memory wake for one exact
+    /// storage-selected fault. The physical subject remains crate-private.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_take_object_payload_repair_wake(
+    pub(crate) fn test_schedule_object_payload_repair_wake(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
-    ) -> Result<Option<crate::TestObjectPayloadRepairObservation>, StoreError> {
-        let Some(work_item) =
-            self.try_take_matching_placed_segment_shard_repair_work(|work_item| {
-                Self::test_object_payload_repair_segment(snapshot, work_item).is_some()
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<(), StoreError> {
+        let segment = snapshot
+            .segments()
+            .iter()
+            .find(|segment| segment.segment_index == segment_index)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload segment for repair wake",
+                source: std::io::Error::other(format!(
+                    "captured payload has no segment {segment_index}"
+                )),
+            })?;
+        if shard_index >= segment.ec_k.saturating_add(segment.ec_m) {
+            return Err(StoreError::Io {
+                context: "select object payload shard for repair wake",
+                source: std::io::Error::other(format!(
+                    "shard {shard_index} is outside the captured EC layout"
+                )),
+            });
+        }
+        let stored_size = snapshot
+            .stored_size_for(segment)
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload stored size for repair wake",
+                source: std::io::Error::other("captured payload stored size is invalid"),
+            })?;
+        self.schedule_placed_segment_shard_repair(
+            SegmentStoredBytesRequest {
+                data_pg_id: segment.data_pg_id,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                stored_size,
+                segment_crc64: segment.segment_crc64,
+                ec: EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+            },
+            ShardIndex::new(shard_index),
+        )
+    }
+
+    /// Atomically consumes the exact repair wake selected from a captured
+    /// payload without disturbing another shard's wake.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_take_object_payload_repair_wake(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    ) -> Result<bool, StoreError> {
+        Ok(self
+            .try_take_matching_placed_segment_shard_repair_work(|work_item| {
+                Self::test_object_payload_repair_segment(snapshot, work_item).is_some_and(
+                    |segment| {
+                        segment.segment_index == segment_index
+                            && work_item.shard_index.get() == shard_index
+                    },
+                )
             })
-        else {
-            return Ok(None);
-        };
-        let segment = Self::test_object_payload_repair_segment(snapshot, &work_item)
-            .expect("matching repair dequeue preserves its predicate");
-        Ok(Some(crate::TestObjectPayloadRepairObservation {
-            segment_index: segment.segment_index,
-            shard_index: work_item.shard_index.get(),
-            last_error: None,
-        }))
+            .is_some())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

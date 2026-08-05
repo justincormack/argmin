@@ -4028,22 +4028,34 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn object_payload_lease_holder_node_ids(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> HashSet<NodeId> {
+        self.nodes
+            .iter()
+            .filter_map(|(node_id, node)| {
+                let lease_count = node
+                    .object_payload_lease_client()
+                    .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
+                    .and_then(|route| route.object_payload_lease_count())
+                    .unwrap_or(0);
+                (lease_count != 0).then_some(*node_id)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(crate) fn object_payload_lease_holder_node_count(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
-        self.nodes
-            .values()
-            .filter(|node| {
-                node.object_payload_lease_client()
-                    .open_object_payload_lease_route(self.epoch, bucket, key, generation_id)
-                    .and_then(|route| route.object_payload_lease_count())
-                    .unwrap_or(0)
-                    != 0
-            })
-            .count()
+        self.object_payload_lease_holder_node_ids(bucket, key, generation_id)
+            .len()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

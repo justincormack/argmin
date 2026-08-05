@@ -175,7 +175,12 @@ pub use maintenance::{
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod test_support {
+    use std::sync::Arc;
+
     use super::*;
+
+    mod retained_read;
+    pub use retained_read::{TestRetainedReadPgMoveScenario, TestRetainedReadPgMoveScenarioError};
 
     /// Construct an opaque representative of an operation-level storage failure.
     ///
@@ -243,6 +248,504 @@ pub mod test_support {
             cluster.test_inject_object_payload_shard_loss(snapshot, segment_index, shard_index)?;
         }
         Ok(())
+    }
+
+    /// Reports whether the exact shard-owner set selected by an opaque payload
+    /// snapshot currently holds deletion-exclusion leases for its generation.
+    pub fn object_payload_snapshot_has_exact_shard_owner_leases(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        cluster.test_object_payload_snapshot_has_exact_shard_owner_leases(snapshot)
+    }
+
+    /// Reports whether an opaque payload snapshot has no deletion-exclusion
+    /// leases remaining on any storage node.
+    pub fn object_payload_snapshot_has_no_leases(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<bool, StoreError> {
+        cluster.test_object_payload_snapshot_has_no_leases(snapshot)
+    }
+
+    /// Opaque evidence for one storage-selected committed-payload shard fault.
+    #[derive(Clone)]
+    pub struct TestObjectPayloadShardFault {
+        snapshot: TestObjectPayloadSnapshot,
+        segment_index: u32,
+        shard_index: u8,
+    }
+
+    impl std::fmt::Debug for TestObjectPayloadShardFault {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestObjectPayloadShardFault")
+                .finish_non_exhaustive()
+        }
+    }
+
+    /// Opaque evidence for a storage-selected set of committed-payload shard
+    /// faults. Callers may choose a logical count, but storage retains the
+    /// physical segment and shard selection.
+    #[derive(Clone)]
+    pub struct TestObjectPayloadShardFaultSet {
+        faults: Vec<TestObjectPayloadShardFault>,
+    }
+
+    impl std::fmt::Debug for TestObjectPayloadShardFaultSet {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestObjectPayloadShardFaultSet")
+                .field("fault_count", &self.faults.len())
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestObjectPayloadShardRole {
+        FirstData,
+        FirstParity,
+        LastParity,
+    }
+
+    fn select_object_payload_shard_fault(
+        snapshot: &TestObjectPayloadSnapshot,
+        role: TestObjectPayloadShardRole,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        let segment = snapshot.segments().first().ok_or_else(|| StoreError::Io {
+            context: "select object payload shard fault",
+            source: std::io::Error::other("captured object payload has no segments"),
+        })?;
+        let shard_index = match role {
+            TestObjectPayloadShardRole::FirstData => 0,
+            TestObjectPayloadShardRole::FirstParity => segment.ec_k,
+            TestObjectPayloadShardRole::LastParity => segment
+                .ec_k
+                .checked_add(segment.ec_m)
+                .and_then(|count| count.checked_sub(1))
+                .ok_or_else(|| StoreError::Io {
+                    context: "select object payload shard fault",
+                    source: std::io::Error::other("captured payload has no parity shard"),
+                })?,
+        };
+        if matches!(
+            role,
+            TestObjectPayloadShardRole::FirstParity | TestObjectPayloadShardRole::LastParity
+        ) && segment.ec_m == 0
+        {
+            return Err(StoreError::Io {
+                context: "select object payload shard fault",
+                source: std::io::Error::other("captured payload has no parity shard"),
+            });
+        }
+        Ok(TestObjectPayloadShardFault {
+            snapshot: snapshot.clone(),
+            segment_index: segment.segment_index,
+            shard_index,
+        })
+    }
+
+    fn inject_object_payload_shard_loss_by_role(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+        role: TestObjectPayloadShardRole,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        let fault = select_object_payload_shard_fault(snapshot, role)?;
+        cluster.test_inject_object_payload_shard_loss(
+            &fault.snapshot,
+            fault.segment_index,
+            fault.shard_index,
+        )?;
+        Ok(fault)
+    }
+
+    fn inject_object_payload_shard_corruption_by_role(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+        role: TestObjectPayloadShardRole,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        let fault = select_object_payload_shard_fault(snapshot, role)?;
+        cluster.test_inject_object_payload_shard_corruption(
+            &fault.snapshot,
+            fault.segment_index,
+            fault.shard_index,
+        )?;
+        Ok(fault)
+    }
+
+    pub fn inject_object_payload_first_data_shard_loss(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        inject_object_payload_shard_loss_by_role(
+            cluster,
+            snapshot,
+            TestObjectPayloadShardRole::FirstData,
+        )
+    }
+
+    /// Removes the requested number of data shards from storage's first
+    /// payload segment without exposing their physical indices.
+    pub fn inject_object_payload_data_shard_losses(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+        count: usize,
+    ) -> Result<TestObjectPayloadShardFaultSet, StoreError> {
+        let segment = snapshot.segments().first().ok_or_else(|| StoreError::Io {
+            context: "select object payload data-shard losses",
+            source: std::io::Error::other("captured object payload has no segments"),
+        })?;
+        if count > usize::from(segment.ec_k) {
+            return Err(StoreError::Io {
+                context: "select object payload data-shard losses",
+                source: std::io::Error::other(format!(
+                    "requested {count} data-shard losses from an EC layout with {} data shards",
+                    segment.ec_k
+                )),
+            });
+        }
+        let mut faults = Vec::with_capacity(count);
+        for shard_index in 0..u8::try_from(count).map_err(|_| StoreError::Io {
+            context: "select object payload data-shard losses",
+            source: std::io::Error::other("requested data-shard loss count does not fit u8"),
+        })? {
+            let fault = TestObjectPayloadShardFault {
+                snapshot: snapshot.clone(),
+                segment_index: segment.segment_index,
+                shard_index,
+            };
+            cluster.test_inject_object_payload_shard_loss(
+                &fault.snapshot,
+                fault.segment_index,
+                fault.shard_index,
+            )?;
+            faults.push(fault);
+        }
+        Ok(TestObjectPayloadShardFaultSet { faults })
+    }
+
+    /// Schedules the requested number of data-shard repair wakes for storage's
+    /// first payload segment without exposing their physical identities.
+    pub fn schedule_object_payload_data_shard_repair_wakes(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+        count: usize,
+    ) -> Result<TestObjectPayloadShardFaultSet, StoreError> {
+        let segment = snapshot.segments().first().ok_or_else(|| StoreError::Io {
+            context: "select object payload data-shard repair wakes",
+            source: std::io::Error::other("captured object payload has no segments"),
+        })?;
+        if count > usize::from(segment.ec_k) {
+            return Err(StoreError::Io {
+                context: "select object payload data-shard repair wakes",
+                source: std::io::Error::other(format!(
+                    "requested {count} data-shard repair wakes from an EC layout with {} data shards",
+                    segment.ec_k
+                )),
+            });
+        }
+        let mut faults = Vec::with_capacity(count);
+        for shard_index in 0..u8::try_from(count).map_err(|_| StoreError::Io {
+            context: "select object payload data-shard repair wakes",
+            source: std::io::Error::other("requested data-shard repair count does not fit u8"),
+        })? {
+            let fault = TestObjectPayloadShardFault {
+                snapshot: snapshot.clone(),
+                segment_index: segment.segment_index,
+                shard_index,
+            };
+            cluster.test_schedule_object_payload_repair_wake(
+                &fault.snapshot,
+                fault.segment_index,
+                fault.shard_index,
+            )?;
+            faults.push(fault);
+        }
+        Ok(TestObjectPayloadShardFaultSet { faults })
+    }
+
+    /// Removes enough additional data shards to make repair of an already
+    /// faulted first data shard exceed the payload's parity tolerance.
+    pub fn inject_object_payload_additional_data_losses_beyond_parity(
+        cluster: &StorageCluster,
+        fault: &TestObjectPayloadShardFault,
+    ) -> Result<TestObjectPayloadShardFaultSet, StoreError> {
+        let segment = fault
+            .snapshot
+            .segments()
+            .iter()
+            .find(|segment| segment.segment_index == fault.segment_index)
+            .ok_or_else(|| StoreError::Io {
+                context: "select additional object payload data-shard losses",
+                source: std::io::Error::other("fault segment is absent from its payload snapshot"),
+            })?;
+        if fault.shard_index != 0 || segment.ec_m >= segment.ec_k {
+            return Err(StoreError::Io {
+                context: "select additional object payload data-shard losses",
+                source: std::io::Error::other(
+                    "first-data fault and at least one surviving data shard are required",
+                ),
+            });
+        }
+        let mut faults = Vec::with_capacity(usize::from(segment.ec_m));
+        for shard_index in 1..=segment.ec_m {
+            let additional = TestObjectPayloadShardFault {
+                snapshot: fault.snapshot.clone(),
+                segment_index: fault.segment_index,
+                shard_index,
+            };
+            cluster.test_inject_object_payload_shard_loss(
+                &additional.snapshot,
+                additional.segment_index,
+                additional.shard_index,
+            )?;
+            faults.push(additional);
+        }
+        Ok(TestObjectPayloadShardFaultSet { faults })
+    }
+
+    pub fn inject_object_payload_first_data_shard_corruption(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        inject_object_payload_shard_corruption_by_role(
+            cluster,
+            snapshot,
+            TestObjectPayloadShardRole::FirstData,
+        )
+    }
+
+    pub fn inject_object_payload_first_parity_shard_loss(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        inject_object_payload_shard_loss_by_role(
+            cluster,
+            snapshot,
+            TestObjectPayloadShardRole::FirstParity,
+        )
+    }
+
+    pub fn inject_object_payload_first_parity_shard_corruption(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        inject_object_payload_shard_corruption_by_role(
+            cluster,
+            snapshot,
+            TestObjectPayloadShardRole::FirstParity,
+        )
+    }
+
+    pub fn inject_object_payload_last_parity_shard_corruption(
+        cluster: &StorageCluster,
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+        inject_object_payload_shard_corruption_by_role(
+            cluster,
+            snapshot,
+            TestObjectPayloadShardRole::LastParity,
+        )
+    }
+
+    /// Reports whether the selected shard still differs from its durable
+    /// acknowledgement after the operation under test.
+    pub fn object_payload_shard_fault_remains(
+        cluster: &StorageCluster,
+        fault: &TestObjectPayloadShardFault,
+    ) -> Result<bool, StoreError> {
+        cluster
+            .test_object_payload_shard_file_matches_ack(
+                &fault.snapshot,
+                fault.segment_index,
+                fault.shard_index,
+            )
+            .map(|matches| !matches)
+    }
+
+    pub fn object_payload_shard_faults_remain(
+        cluster: &StorageCluster,
+        faults: &TestObjectPayloadShardFaultSet,
+    ) -> Result<bool, StoreError> {
+        for fault in &faults.faults {
+            if !object_payload_shard_fault_remains(cluster, fault)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Reports whether exactly the selected fault is queued for repair and
+    /// currently has no recorded worker error.
+    pub fn object_payload_shard_fault_has_pending_repair(
+        cluster: &StorageCluster,
+        fault: &TestObjectPayloadShardFault,
+    ) -> Result<bool, StoreError> {
+        let repairs = cluster.test_object_payload_repair_observations(&fault.snapshot)?;
+        Ok(matches!(repairs.as_slice(), [repair]
+            if repair.segment_index == fault.segment_index
+                && repair.shard_index == fault.shard_index
+                && repair.last_error.is_none()))
+    }
+
+    /// Returns the worker error for the selected fault, if that exact fault is
+    /// the sole queued repair.
+    pub fn object_payload_shard_fault_repair_error(
+        cluster: &StorageCluster,
+        fault: &TestObjectPayloadShardFault,
+    ) -> Result<Option<String>, StoreError> {
+        let repairs = cluster.test_object_payload_repair_observations(&fault.snapshot)?;
+        Ok(match repairs.as_slice() {
+            [repair]
+                if repair.segment_index == fault.segment_index
+                    && repair.shard_index == fault.shard_index =>
+            {
+                repair.last_error.clone()
+            }
+            _ => None,
+        })
+    }
+
+    pub fn object_payload_shard_fault_has_no_pending_repair(
+        cluster: &StorageCluster,
+        fault: &TestObjectPayloadShardFault,
+    ) -> Result<bool, StoreError> {
+        cluster
+            .test_object_payload_repair_observations(&fault.snapshot)
+            .map(|repairs| repairs.is_empty())
+    }
+
+    /// Takes the repair wake for the fault's payload and reports whether it
+    /// names the exact storage-selected shard.
+    pub fn take_object_payload_shard_fault_repair_wake(
+        cluster: &StorageCluster,
+        fault: &TestObjectPayloadShardFault,
+    ) -> Result<bool, StoreError> {
+        cluster.test_take_object_payload_repair_wake(
+            &fault.snapshot,
+            fault.segment_index,
+            fault.shard_index,
+        )
+    }
+
+    /// Takes every selected repair wake in reverse selection order. This pins
+    /// that an exact later-shard selection cannot consume an earlier shard's
+    /// wake for the same payload.
+    pub fn take_object_payload_shard_fault_wakes_in_reverse(
+        cluster: &StorageCluster,
+        faults: &TestObjectPayloadShardFaultSet,
+    ) -> Result<bool, StoreError> {
+        for fault in faults.faults.iter().rev() {
+            if !take_object_payload_shard_fault_repair_wake(cluster, fault)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Narrow logical lifecycle observation for one live object version.
+    ///
+    /// The durable generation and payload identity remain private and may be
+    /// passed back only to storage-owned lease and reclaim observations.
+    #[derive(Clone)]
+    pub struct TestLifecycleObjectObservation {
+        last_modified: u64,
+        became_noncurrent_at: Option<u64>,
+        payload: TestObjectPayloadSnapshot,
+    }
+
+    impl std::fmt::Debug for TestLifecycleObjectObservation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestLifecycleObjectObservation")
+                .field("last_modified", &self.last_modified)
+                .field("became_noncurrent_at", &self.became_noncurrent_at)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl TestLifecycleObjectObservation {
+        pub fn last_modified(&self) -> u64 {
+            self.last_modified
+        }
+
+        pub fn became_noncurrent_at(&self) -> Option<u64> {
+            self.became_noncurrent_at
+        }
+    }
+
+    fn object_payload_subject(
+        snapshot: &TestObjectPayloadSnapshot,
+    ) -> Result<(&BucketName, &ObjectKey, GenerationId), StoreError> {
+        let first = snapshot.segments().first().ok_or_else(|| StoreError::Io {
+            context: "select captured object payload subject",
+            source: std::io::Error::other("captured object payload has no segments"),
+        })?;
+        if snapshot
+            .segments()
+            .iter()
+            .any(|segment| segment.bucket != first.bucket || segment.key != first.key)
+        {
+            return Err(StoreError::Io {
+                context: "validate captured object payload subject",
+                source: std::io::Error::other(
+                    "captured object payload contains multiple object subjects",
+                ),
+            });
+        }
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select captured object payload generation",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
+        Ok((&first.bucket, &first.key, generation_id))
+    }
+
+    pub fn capture_lifecycle_object_observation(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> Result<TestLifecycleObjectObservation, ObjectPgActionError> {
+        let stored = cluster.test_get_object_version(bucket, key, version_id)?;
+        let live = stored
+            .as_live()
+            .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                reason: "selected lifecycle object is not a live version".to_string(),
+            })?;
+        let payload = cluster.test_capture_object_payload(bucket, key, version_id)?;
+        let (_, _, payload_generation) =
+            object_payload_subject(&payload).map_err(ObjectPgActionError::Store)?;
+        if payload_generation != live.generation_id {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "object version changed while capturing lifecycle payload evidence"
+                    .to_string(),
+            });
+        }
+        Ok(TestLifecycleObjectObservation {
+            last_modified: live.last_modified,
+            became_noncurrent_at: live.became_noncurrent_at,
+            payload,
+        })
+    }
+
+    pub fn acquire_lifecycle_object_payload_lease(
+        cluster: &Arc<StorageCluster>,
+        observation: &TestLifecycleObjectObservation,
+    ) -> Result<ObjectPayloadLease, ObjectPgActionError> {
+        cluster
+            .test_acquire_object_payload_lease_for_snapshot(&observation.payload)
+            .map_err(ObjectPgActionError::Store)
+    }
+
+    pub fn lifecycle_object_has_reclaim_root(
+        cluster: &StorageCluster,
+        observation: &TestLifecycleObjectObservation,
+    ) -> Result<bool, ObjectPgActionError> {
+        let (bucket, key, generation_id) =
+            object_payload_subject(&observation.payload).map_err(ObjectPgActionError::Store)?;
+        cluster
+            .test_get_object_segments_reclaim(bucket, key, generation_id)
+            .map(|reclaim| reclaim.is_some())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -607,43 +1110,10 @@ pub mod test_support {
     /// Logical observation of one repair discovered for a captured payload.
     #[cfg(any(test, feature = "test-hooks"))]
     #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct TestObjectPayloadRepairObservation {
-        pub segment_index: u32,
-        pub shard_index: u8,
-        pub last_error: Option<String>,
-    }
-
-    /// Opaque evidence for the exact file state of one captured payload shard.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Clone, PartialEq, Eq)]
-    pub struct TestObjectPayloadShardFileSnapshot {
-        bytes: Option<Vec<u8>>,
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl TestObjectPayloadShardFileSnapshot {
-        pub(crate) fn new(bytes: Option<Vec<u8>>) -> Self {
-            Self { bytes }
-        }
-
-        pub fn is_missing(&self) -> bool {
-            self.bytes.is_none()
-        }
-
-        pub fn has_same_state_as(&self, other: &Self) -> bool {
-            self == other
-        }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl std::fmt::Debug for TestObjectPayloadShardFileSnapshot {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter
-                .debug_struct("TestObjectPayloadShardFileSnapshot")
-                .field("present", &self.bytes.is_some())
-                .field("length", &self.bytes.as_ref().map(Vec::len))
-                .finish()
-        }
+    pub(crate) struct TestObjectPayloadRepairObservation {
+        pub(crate) segment_index: u32,
+        pub(crate) shard_index: u8,
+        pub(crate) last_error: Option<String>,
     }
 
     /// Test-only logical observation of accepted bucket-deletion progress.
@@ -788,9 +1258,8 @@ pub use storage_rpc_auth::{
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
-    TestMultipartUploadRecord, TestObjectPayloadRepairObservation,
-    TestObjectPayloadShardFileSnapshot, TestObjectPayloadSnapshot, TestPayloadReclaimRoot,
-    TestStreamUploadPayloadSnapshot,
+    TestMultipartUploadRecord, TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot,
+    TestPayloadReclaimRoot, TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

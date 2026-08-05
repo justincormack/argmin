@@ -2198,18 +2198,20 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
     )
     .unwrap();
 
-    let (last_modified, generation_id) = {
-        let stored = coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-            .unwrap();
-        let live = stored.as_live().unwrap();
-        (live.last_modified, live.generation_id)
-    };
-    let lease = coord
-        .read_runtime()
-        .acquire_object_payload_lease("bucket", "key", generation_id);
-    let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        VersionId::Null,
+    )
+    .unwrap();
+    let lease = storage::test_support::acquire_lifecycle_object_payload_lease(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap();
+    let deadline =
+        Coordinator::lifecycle_day_based_deadline(lifecycle_object.last_modified(), 1).unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
@@ -2223,15 +2225,11 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
             storage::MetadataError::ObjectNotFound
         ))
     ));
-    assert!(coord
-        .storage_node()
-        .test_get_object_segments_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            generation_id
-        )
-        .unwrap()
-        .is_some());
+    assert!(storage::test_support::lifecycle_object_has_reclaim_root(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap());
     assert!(coord
         .storage_node()
         .test_capture_object_payload(
@@ -2441,19 +2439,15 @@ fn lifecycle_sweep_expires_versioned_current_with_delete_marker() {
     )
     .unwrap();
 
-    let (last_modified, generation_id) = {
-        let stored = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                put.version_id,
-            )
-            .unwrap();
-        let live = stored.as_live().unwrap();
-        (live.last_modified, live.generation_id)
-    };
-    let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        put.version_id,
+    )
+    .unwrap();
+    let deadline =
+        Coordinator::lifecycle_day_based_deadline(lifecycle_object.last_modified(), 1).unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
@@ -2473,15 +2467,11 @@ fn lifecycle_sweep_expires_versioned_current_with_delete_marker() {
         )
         .unwrap();
     assert!(matches!(original, StoredObject::Live(_)));
-    assert!(coord
-        .storage_node()
-        .test_get_object_segments_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            generation_id
-        )
-        .unwrap()
-        .is_none());
+    assert!(!storage::test_support::lifecycle_object_has_reclaim_root(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -2552,22 +2542,20 @@ fn lifecycle_sweep_expires_suspended_null_current_with_null_delete_marker() {
     .unwrap();
     assert_eq!(put.version_id, VersionId::Null);
 
-    let (last_modified, generation_id) = {
-        let stored = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                VersionId::Null,
-            )
-            .unwrap();
-        let live = stored.as_live().unwrap();
-        (live.last_modified, live.generation_id)
-    };
-    let lease = coord
-        .read_runtime()
-        .acquire_object_payload_lease("bucket", "key", generation_id);
-    let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        VersionId::Null,
+    )
+    .unwrap();
+    let lease = storage::test_support::acquire_lifecycle_object_payload_lease(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap();
+    let deadline =
+        Coordinator::lifecycle_day_based_deadline(lifecycle_object.last_modified(), 1).unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
@@ -2599,15 +2587,11 @@ fn lifecycle_sweep_expires_suspended_null_current_with_null_delete_marker() {
         )
         .unwrap();
     assert!(matches!(null_version, StoredObject::DeleteMarker(_)));
-    assert!(coord
-        .storage_node()
-        .test_get_object_segments_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            generation_id
-        )
-        .unwrap()
-        .is_some());
+    assert!(storage::test_support::lifecycle_object_has_reclaim_root(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap());
 
     let versions = coord
         .list_object_versions(&ListObjectVersionsRequest {
@@ -2690,22 +2674,23 @@ fn lifecycle_sweep_expires_noncurrent_versioned_live_object() {
     )
     .unwrap();
 
-    let (became_noncurrent_at, generation_id) = {
-        let stored = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                older.version_id,
-            )
-            .unwrap();
-        let live = stored.as_live().unwrap();
-        (live.became_noncurrent_at.unwrap(), live.generation_id)
-    };
-    let lease = coord
-        .read_runtime()
-        .acquire_object_payload_lease("bucket", "key", generation_id);
-    let deadline = Coordinator::lifecycle_day_based_deadline(became_noncurrent_at, 1).unwrap();
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        older.version_id,
+    )
+    .unwrap();
+    let lease = storage::test_support::acquire_lifecycle_object_payload_lease(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap();
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        lifecycle_object.became_noncurrent_at().unwrap(),
+        1,
+    )
+    .unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
@@ -2727,15 +2712,11 @@ fn lifecycle_sweep_expires_noncurrent_versioned_live_object() {
             storage::MetadataError::ObjectNotFound
         ))
     ));
-    assert!(coord
-        .storage_node()
-        .test_get_object_segments_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            generation_id
-        )
-        .unwrap()
-        .is_some());
+    assert!(storage::test_support::lifecycle_object_has_reclaim_root(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap());
     drop(lease);
 }
 
@@ -2806,34 +2787,31 @@ fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
     .unwrap();
     assert_eq!(null_current.version_id, VersionId::Null);
 
-    let (became_noncurrent_at, generation_id) = {
-        let stored = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                numbered.version_id,
-            )
-            .unwrap();
-        let live = stored.as_live().unwrap();
-        (live.became_noncurrent_at.unwrap(), live.generation_id)
-    };
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        numbered.version_id,
+    )
+    .unwrap();
     assert!(
-        coord
-            .storage_node()
-            .test_get_object_segments_reclaim(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                generation_id
-            )
-            .unwrap()
-            .is_none(),
+        !storage::test_support::lifecycle_object_has_reclaim_root(
+            &coord.storage_node(),
+            &lifecycle_object,
+        )
+        .unwrap(),
         "suspended null-version write must not enqueue reclaim for the numbered version"
     );
-    let lease = coord
-        .read_runtime()
-        .acquire_object_payload_lease("bucket", "key", generation_id);
-    let deadline = Coordinator::lifecycle_day_based_deadline(became_noncurrent_at, 1).unwrap();
+    let lease = storage::test_support::acquire_lifecycle_object_payload_lease(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap();
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        lifecycle_object.became_noncurrent_at().unwrap(),
+        1,
+    )
+    .unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
@@ -2855,15 +2833,11 @@ fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
             storage::MetadataError::ObjectNotFound
         ))
     ));
-    assert!(coord
-        .storage_node()
-        .test_get_object_segments_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            generation_id
-        )
-        .unwrap()
-        .is_some());
+    assert!(storage::test_support::lifecycle_object_has_reclaim_root(
+        &coord.storage_node(),
+        &lifecycle_object,
+    )
+    .unwrap());
     drop(lease);
 }
 
@@ -2928,28 +2902,20 @@ fn suspended_direct_put_reclaims_replaced_null_under_numbered_current() {
     .unwrap();
     assert_ne!(numbered.version_id, VersionId::Null);
 
-    let (old_null_generation, numbered_generation) = {
-        let old_null = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                VersionId::Null,
-            )
-            .unwrap();
-        let numbered = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                numbered.version_id,
-            )
-            .unwrap();
-        (
-            old_null.as_live().unwrap().generation_id,
-            numbered.as_live().unwrap().generation_id,
-        )
-    };
+    let old_null = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        VersionId::Null,
+    )
+    .unwrap();
+    let numbered = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        numbered.version_id,
+    )
+    .unwrap();
 
     put_bucket_versioning_test(
         &coord,
@@ -2978,27 +2944,16 @@ fn suspended_direct_put_reclaims_replaced_null_under_numbered_current() {
     assert_eq!(replacement_null.version_id, VersionId::Null);
 
     assert!(
-        coord
-            .storage_node()
-            .test_get_object_segments_reclaim(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                old_null_generation,
-            )
-            .unwrap()
-            .is_some(),
+        storage::test_support::lifecycle_object_has_reclaim_root(&coord.storage_node(), &old_null,)
+            .unwrap(),
         "suspended null-version direct PUT must reclaim the replaced null payload"
     );
     assert!(
-        coord
-            .storage_node()
-            .test_get_object_segments_reclaim(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                numbered_generation,
-            )
-            .unwrap()
-            .is_none(),
+        !storage::test_support::lifecycle_object_has_reclaim_root(
+            &coord.storage_node(),
+            &numbered,
+        )
+        .unwrap(),
         "suspended null-version direct PUT must not reclaim the displaced numbered payload"
     );
 }
@@ -3078,37 +3033,30 @@ fn lifecycle_sweep_noncurrent_expiration_respects_newer_noncurrent_versions() {
     )
     .unwrap();
 
-    let (oldest_became_noncurrent_at, oldest_generation_id, middle_generation_id) = {
-        let oldest_record = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                oldest.version_id,
-            )
-            .unwrap();
-        let middle_record = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                middle.version_id,
-            )
-            .unwrap();
-        let oldest_live = oldest_record.as_live().unwrap();
-        let middle_live = middle_record.as_live().unwrap();
-        (
-            oldest_live.became_noncurrent_at.unwrap(),
-            oldest_live.generation_id,
-            middle_live.generation_id,
-        )
-    };
-    let lease =
-        coord
-            .read_runtime()
-            .acquire_object_payload_lease("bucket", "key", oldest_generation_id);
-    let deadline =
-        Coordinator::lifecycle_day_based_deadline(oldest_became_noncurrent_at, 1).unwrap();
+    let oldest_lifecycle = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        oldest.version_id,
+    )
+    .unwrap();
+    let middle_lifecycle = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        middle.version_id,
+    )
+    .unwrap();
+    let lease = storage::test_support::acquire_lifecycle_object_payload_lease(
+        &coord.storage_node(),
+        &oldest_lifecycle,
+    )
+    .unwrap();
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        oldest_lifecycle.became_noncurrent_at().unwrap(),
+        1,
+    )
+    .unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
@@ -3138,24 +3086,16 @@ fn lifecycle_sweep_noncurrent_expiration_respects_newer_noncurrent_versions() {
         ),
         Ok(StoredObject::Live(_))
     ));
-    assert!(coord
-        .storage_node()
-        .test_get_object_segments_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            oldest_generation_id
-        )
-        .unwrap()
-        .is_some());
-    assert!(coord
-        .storage_node()
-        .test_get_object_segments_reclaim(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            middle_generation_id
-        )
-        .unwrap()
-        .is_none());
+    assert!(storage::test_support::lifecycle_object_has_reclaim_root(
+        &coord.storage_node(),
+        &oldest_lifecycle,
+    )
+    .unwrap());
+    assert!(!storage::test_support::lifecycle_object_has_reclaim_root(
+        &coord.storage_node(),
+        &middle_lifecycle,
+    )
+    .unwrap());
     drop(lease);
 }
 

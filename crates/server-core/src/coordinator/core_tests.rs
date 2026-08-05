@@ -6,24 +6,18 @@ use super::*;
 use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
 use crate::coordinator::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixStream;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use storage::storage_node_server::{
-    StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeProcessConfigParts, StorageNodeServer,
-};
 use storage::test_support::{
     install_bucket_scoped_test_hooks, BucketScopedTestHooks, MetadataCommandApplyTestKind,
+    TestRetainedReadPgMoveScenario,
 };
 use storage::{
-    ClusterEpoch, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute,
-    LocalUnixStorageNodeClientConfig, NodeId, PgId, PgState, RouteMapValidity, StorageCluster,
-    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    ClusterEpoch, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, NodeId, PgId, PgState,
+    RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -121,45 +115,6 @@ fn setup_coordinator_with_only_reclaim_worker(
         ),
     )
     .unwrap()
-}
-
-fn make_private_socket_dir(path: &std::path::Path) {
-    std::fs::create_dir_all(path).unwrap();
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
-    perms.set_mode(0o700);
-    std::fs::set_permissions(path, perms).unwrap();
-}
-
-fn spawn_storage_node_server_loop(
-    server: Arc<StorageNodeServer>,
-    stop: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        while !stop.load(Ordering::SeqCst) {
-            match server.accept_one() {
-                Ok(()) => {}
-                Err(error) if stop.load(Ordering::SeqCst) => {
-                    let _ = error;
-                    break;
-                }
-                Err(error) => panic!("storage node server failed: {error}"),
-            }
-        }
-    })
-}
-
-fn stop_storage_node_server_loops(
-    stop: Arc<AtomicBool>,
-    socket_paths: &[PathBuf],
-    threads: Vec<thread::JoinHandle<()>>,
-) {
-    stop.store(true, Ordering::SeqCst);
-    for socket_path in socket_paths {
-        let _ = UnixStream::connect(socket_path);
-    }
-    for thread in threads {
-        thread.join().unwrap();
-    }
 }
 
 #[test]
@@ -7688,33 +7643,6 @@ fn install_same_store_next_epoch_runtime_map_with_peering_pg(
     next_epoch
 }
 
-fn find_bucket_key_for_metadata_and_data_pg(
-    storage_cluster: &StorageCluster,
-    metadata_pg_id: u32,
-    data_pg_id: u32,
-) -> (String, String) {
-    for bucket_suffix in 0..1024 {
-        let bucket = format!("remote-read-epoch-bucket-{bucket_suffix}");
-        let bucket_name = trusted_bucket_name(&bucket);
-        if storage_cluster.test_bucket_pg_id_for(&bucket_name) != metadata_pg_id {
-            continue;
-        }
-        for key_suffix in 0..10_000 {
-            let key = format!("key-{key_suffix:04}");
-            let object_key = trusted_object_key(&key);
-            if storage_cluster.test_object_pg_id_for(&bucket_name, &object_key) == metadata_pg_id
-                && storage_cluster.test_data_pg_id_for(&bucket_name, &object_key, GenerationId::MIN)
-                    == data_pg_id
-            {
-                return (bucket, key);
-            }
-        }
-    }
-    panic!(
-        "failed to find bucket/key with bucket and object PG {metadata_pg_id} and data PG {data_pg_id}"
-    );
-}
-
 fn find_key_for_object_metadata_pg_with_prefix(
     storage_cluster: &StorageCluster,
     bucket: &str,
@@ -9441,54 +9369,10 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
 #[test]
 fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read() {
     let tmp = test_util::tempdir();
-    let old_acting_set = vec![NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-    let moved_acting_set = vec![NodeId::new(3), NodeId::new(4), NodeId::new(5)];
-    let node_ids = (0..6).map(NodeId::new).collect::<Vec<_>>();
-    let pg_ids = vec![0, 1];
-    let metadata_pg_id = 0;
-    let moved_data_pg_id = 1;
-    let ec_shape = storage::EcShape { k: 2, m: 1 };
-    let current_epoch = ClusterEpoch::INITIAL;
-    let next_epoch = ClusterEpoch::new(current_epoch.get() + 1).unwrap();
-    let configs = node_ids
-        .iter()
-        .map(|node_id| {
-            LocalNodeStoreConfig::new(
-                *node_id,
-                tmp.path()
-                    .join(format!("remote-read-node-{:04}", node_id.as_u32())),
-            )
-        })
-        .collect::<Vec<_>>();
-    let current_routes = pg_ids
-        .iter()
-        .map(|pg_id| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                current_epoch,
-                PgId::new(*pg_id),
-                NodeId::new(0),
-                old_acting_set.clone(),
-                PgState::Active,
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut current_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs.clone(),
-        &pg_ids,
-        ec_shape,
-        current_epoch,
-        current_routes.iter().map(LocalPgRoute::from),
-    )
-    .unwrap();
-    current_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let current_cluster =
-        StorageCluster::test_from_local_map_with_epoch(Arc::new(current_map), current_epoch)
-            .unwrap();
-    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&current_cluster));
+    let mut scenario = TestRetainedReadPgMoveScenario::new(tmp.path()).unwrap();
     let coord =
         Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
-            handle.clone(),
+            scenario.route_handle(),
             "us-east-1".to_string(),
             None,
             test_sse_s3_provider(),
@@ -9496,11 +9380,8 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
         )
         .unwrap();
 
-    let (bucket, key) = find_bucket_key_for_metadata_and_data_pg(
-        &current_cluster,
-        metadata_pg_id,
-        moved_data_pg_id,
-    );
+    let bucket = scenario.bucket().to_string();
+    let key = scenario.key().to_string();
     coord
         .create_bucket_for_owner("default-owner", &bucket, false)
         .unwrap();
@@ -9521,98 +9402,7 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
         },
     )
     .unwrap();
-    let bucket_name = trusted_bucket_name(&bucket);
-    let object_key = trusted_object_key(&key);
-    let payload_snapshot = current_cluster
-        .test_capture_object_payload(&bucket_name, &object_key, put.version_id)
-        .unwrap();
-    assert_eq!(
-        payload_snapshot.segment_count(),
-        1,
-        "direct PUT should record one logical segment"
-    );
-    assert!(
-        current_cluster
-            .test_object_payload_snapshot_uses_current_placement(&payload_snapshot)
-            .unwrap(),
-        "direct PUT must use the selected key's data PG and the original placement epoch"
-    );
-
-    let next_routes = pg_ids
-        .iter()
-        .map(|pg_id| {
-            let (primary, acting_set) = if *pg_id == moved_data_pg_id {
-                (NodeId::new(3), moved_acting_set.clone())
-            } else {
-                (NodeId::new(0), old_acting_set.clone())
-            };
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                next_epoch,
-                PgId::new(*pg_id),
-                primary,
-                acting_set,
-                PgState::Active,
-            )
-        })
-        .collect::<Vec<_>>();
-    let socket_dir = tmp.path().join("remote-read-sockets");
-    make_private_socket_dir(&socket_dir);
-    let server_route_validity = long_lived_test_route_map_validity();
-    let stop = Arc::new(AtomicBool::new(false));
-    let mut server_threads = Vec::new();
-    let mut wake_socket_paths = Vec::new();
-    let mut servers = Vec::new();
-    let mut client_configs = Vec::new();
-    for config in &configs {
-        let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
-        let server_config = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
-            node_id: config.node_id(),
-            cluster_epoch: current_epoch,
-            route_map_validity: server_route_validity,
-            data_dir: config.data_dir().to_path_buf(),
-            default_ec_shape: ec_shape,
-            pg_ids: pg_ids.clone(),
-            socket_path: socket_path.clone(),
-            pg_routes: current_routes
-                .iter()
-                .map(StorageNodePgRoute::from)
-                .collect(),
-            historical_pg_routes: Vec::new(),
-            pending_metadata_command_recoveries: Vec::new(),
-        })
-        .unwrap();
-        let server = Arc::new(StorageNodeServer::bind(server_config).unwrap());
-        for _ in 0..4 {
-            server_threads.push(spawn_storage_node_server_loop(
-                Arc::clone(&server),
-                Arc::clone(&stop),
-            ));
-            wake_socket_paths.push(socket_path.clone());
-        }
-        servers.push(Arc::clone(&server));
-        client_configs.push(LocalUnixStorageNodeClientConfig::new(
-            config.node_id(),
-            socket_path,
-        ));
-    }
-
-    let mut current_unix_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs.clone(),
-        &pg_ids,
-        ec_shape,
-        current_epoch,
-        current_routes.iter().map(LocalPgRoute::from),
-    )
-    .unwrap();
-    current_unix_map
-        .install_unix_storage_node_clients(client_configs.clone())
-        .unwrap();
-    current_unix_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let current_unix_cluster =
-        StorageCluster::test_from_local_map_with_epoch(Arc::new(current_unix_map), current_epoch)
-            .unwrap();
-    runtime_handle.install(current_unix_cluster).unwrap();
+    scenario.prepare_after_put(put.version_id).unwrap();
 
     let read = coord
         .get_object(&GetObjectRequest {
@@ -9628,54 +9418,10 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
         })
         .unwrap();
 
-    // Force the first retained body read to reconstruct from parity. Besides
-    // proving the payload RPC uses the exact historical route after the map
-    // advance, this pins that repair reporting cannot fall back to an active
-    // epoch-N mutation once that frontend generation has been unpublished.
-    current_cluster
-        .test_inject_object_payload_shard_corruption(&payload_snapshot, 0, 0)
-        .unwrap();
-
-    for (server, config) in servers.iter().zip(&configs) {
-        let socket_path = socket_dir.join(format!("node-{}.sock", config.node_id().as_u32()));
-        let next_server_config = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
-            node_id: config.node_id(),
-            cluster_epoch: next_epoch,
-            route_map_validity: server_route_validity,
-            data_dir: config.data_dir().to_path_buf(),
-            default_ec_shape: ec_shape,
-            pg_ids: pg_ids.clone(),
-            socket_path,
-            pg_routes: next_routes.iter().map(StorageNodePgRoute::from).collect(),
-            historical_pg_routes: current_routes
-                .iter()
-                .map(StorageNodePgRoute::from)
-                .collect(),
-            pending_metadata_command_recoveries: Vec::new(),
-        })
-        .unwrap();
-        server
-            .install_control_plane_runtime_config(next_server_config)
-            .unwrap();
-    }
-
-    let mut next_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs,
-        &pg_ids,
-        ec_shape,
-        next_epoch,
-        next_routes.iter().map(LocalPgRoute::from),
-    )
-    .unwrap();
-    next_map.test_install_historical_pg_routes(current_routes);
-    next_map
-        .install_unix_storage_node_clients(client_configs)
-        .unwrap();
-    next_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let next_cluster =
-        StorageCluster::test_from_local_map_with_epoch(Arc::new(next_map), next_epoch).unwrap();
-    runtime_handle.install(next_cluster).unwrap();
+    // Storage corrupts one owner-selected shard and moves the payload PG. The
+    // response body was already created, so its first read must use the exact
+    // retained route and reconstruct from parity after publication.
+    scenario.corrupt_and_advance_after_body_created().unwrap();
 
     assert_eq!(read.body.read_all().unwrap(), payload);
     let head = coord
@@ -9728,7 +9474,7 @@ fn get_body_created_before_unix_data_pg_move_uses_retained_route_on_first_read()
     assert_eq!(version_keys, [key.as_str()]);
     assert!(!versions.is_truncated);
 
-    stop_storage_node_server_loops(stop, &wake_socket_paths, server_threads);
+    scenario.finish().unwrap();
 }
 
 #[test]
@@ -19075,12 +18821,11 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
         .storage_node()
         .test_capture_object_payload(&bucket, &key, VersionId::Null)
         .unwrap();
-    let corrupt_shard_index = 0;
-    inject_object_shard_corruption(&coord, "bucket", "key", corrupt_shard_index);
-    let corrupt_state = coord
-        .storage_node()
-        .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
-        .unwrap();
+    let corrupt_fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -19098,27 +18843,26 @@ fn read_discovered_corrupt_shard_queues_background_repair_without_inline_rewrite
     assert_eq!(result.body.read_all().unwrap(), data);
 
     assert!(
-        coord
-            .storage_node()
-            .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
-            .unwrap()
-            .has_same_state_as(&corrupt_state),
+        storage::test_support::object_payload_shard_fault_remains(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap(),
         "foreground read recovery must not rewrite the damaged shard inline"
     );
-    let repairs = coord
-        .storage_node()
-        .test_object_payload_repair_observations(&payload)
-        .unwrap();
-    assert_eq!(repairs.len(), 1);
-    assert_eq!(repairs[0].segment_index, 0);
-    assert_eq!(repairs[0].shard_index, corrupt_shard_index);
-    assert!(repairs[0].last_error.is_none());
-    assert_eq!(
-        coord
-            .storage_node()
-            .test_take_object_payload_repair_wake(&payload)
-            .unwrap(),
-        Some(repairs[0].clone()),
+    assert!(
+        storage::test_support::object_payload_shard_fault_has_pending_repair(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap()
+    );
+    assert!(
+        storage::test_support::take_object_payload_shard_fault_repair_wake(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap(),
         "successful read recovery should leave a background repair wake hint"
     );
 }
@@ -19134,7 +18878,7 @@ fn repair_wake_selection_preserves_unrelated_payload_work() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
-    let mut payloads = Vec::new();
+    let mut faults = Vec::new();
     for (key, data) in [
         ("first", b"first repair payload".as_slice()),
         ("second", b"second repair payload".as_slice()),
@@ -19163,7 +18907,11 @@ fn repair_wake_selection_preserves_unrelated_payload_work() {
                 VersionId::Null,
             )
             .unwrap();
-        inject_object_shard_corruption(&coord, "bucket", key, 0);
+        let fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap();
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
@@ -19178,23 +18926,78 @@ fn repair_wake_selection_preserves_unrelated_payload_work() {
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), data);
-        payloads.push(payload);
+        faults.push(fault);
     }
 
-    let second = coord
+    assert!(
+        storage::test_support::take_object_payload_shard_fault_repair_wake(
+            &coord.storage_node(),
+            &faults[1],
+        )
+        .unwrap(),
+        "second payload repair wake exists"
+    );
+    assert!(
+        storage::test_support::take_object_payload_shard_fault_repair_wake(
+            &coord.storage_node(),
+            &faults[0],
+        )
+        .unwrap(),
+        "selecting the second payload must preserve the first wake"
+    );
+}
+
+#[test]
+fn repair_wake_selection_preserves_another_shard_of_the_same_payload() {
+    if !backend_supports_parity_recovery() {
+        return;
+    }
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count_without_background_sweepers(tmp.path(), 1);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let data = b"one payload with two independently queued shard repairs";
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data,
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let payload = coord
         .storage_node()
-        .test_take_object_payload_repair_wake(&payloads[1])
-        .unwrap()
-        .expect("second payload repair wake exists");
-    assert_eq!(second.segment_index, 0);
-    assert_eq!(second.shard_index, 0);
-    let first = coord
-        .storage_node()
-        .test_take_object_payload_repair_wake(&payloads[0])
-        .unwrap()
-        .expect("selecting the second payload must preserve the first wake");
-    assert_eq!(first.segment_index, 0);
-    assert_eq!(first.shard_index, 0);
+        .test_capture_object_payload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            VersionId::Null,
+        )
+        .unwrap();
+    let faults = storage::test_support::schedule_object_payload_data_shard_repair_wakes(
+        &coord.storage_node(),
+        &payload,
+        2,
+    )
+    .unwrap();
+
+    assert!(
+        storage::test_support::take_object_payload_shard_fault_wakes_in_reverse(
+            &coord.storage_node(),
+            &faults,
+        )
+        .unwrap(),
+        "selecting the later shard first must preserve the earlier shard's wake"
+    );
 }
 
 #[test]
@@ -19232,8 +19035,11 @@ fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
         .storage_node()
         .test_capture_object_payload(&bucket, &source_key, VersionId::Null)
         .unwrap();
-    let corrupt_shard_index = 0;
-    inject_object_shard_corruption(&coord, "bucket", "src", corrupt_shard_index);
+    let corrupt_fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     coord
         .copy_object(&CopyObjectRequest {
@@ -19270,14 +19076,13 @@ fn copy_object_discovered_corrupt_source_shard_queues_background_repair() {
         .unwrap();
     assert_eq!(copied.body.read_all().unwrap(), data);
 
-    let repairs = coord
-        .storage_node()
-        .test_object_payload_repair_observations(&payload)
-        .unwrap();
-    assert_eq!(repairs.len(), 1);
-    assert_eq!(repairs[0].segment_index, 0);
-    assert_eq!(repairs[0].shard_index, corrupt_shard_index);
-    assert!(repairs[0].last_error.is_none());
+    assert!(
+        storage::test_support::object_payload_shard_fault_has_pending_repair(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -19329,8 +19134,11 @@ fn upload_part_copy_discovered_corrupt_source_shard_queues_background_repair() {
         .storage_node()
         .test_capture_object_payload(&bucket, &source_key, VersionId::Null)
         .unwrap();
-    let corrupt_shard_index = 0;
-    inject_object_shard_corruption(&coord, "bucket", "src", corrupt_shard_index);
+    let corrupt_fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let part = coord
         .upload_part_copy(&UploadPartCopyRequest {
@@ -19384,14 +19192,13 @@ fn upload_part_copy_discovered_corrupt_source_shard_queues_background_repair() {
         .unwrap();
     assert_eq!(copied.body.read_all().unwrap(), data);
 
-    let repairs = coord
-        .storage_node()
-        .test_object_payload_repair_observations(&payload)
-        .unwrap();
-    assert_eq!(repairs.len(), 1);
-    assert_eq!(repairs[0].segment_index, 0);
-    assert_eq!(repairs[0].shard_index, corrupt_shard_index);
-    assert!(repairs[0].last_error.is_none());
+    assert!(
+        storage::test_support::object_payload_shard_fault_has_pending_repair(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -19454,16 +19261,21 @@ fn retained_read_skips_repair_record_after_admitted_route_expiry_without_publica
     let payload = cluster
         .test_capture_object_payload(&bucket, &key, VersionId::Null)
         .unwrap();
-    inject_object_shard_corruption(&coord, "bucket", "key", 0);
+    let corrupt_fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
     time.set(6_000);
     assert_eq!(result.body.read_all().unwrap(), data);
     assert!(
-        cluster
-            .test_object_payload_repair_observations(&payload)
-            .unwrap()
-            .is_empty(),
+        storage::test_support::object_payload_shard_fault_has_no_pending_repair(
+            &cluster,
+            &corrupt_fault,
+        )
+        .unwrap(),
         "expired admitted authority must not record repair through the renewed raw route"
     );
 }
@@ -19519,12 +19331,11 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         .storage_node()
         .test_capture_object_payload(&bucket, &key, VersionId::Null)
         .unwrap();
-    let corrupt_shard_index = 0;
-    inject_object_shard_corruption(&coord, "bucket", "key", corrupt_shard_index);
-    let corrupt_state = coord
-        .storage_node()
-        .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
-        .unwrap();
+    let corrupt_fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -19561,33 +19372,33 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         Arc::clone(&storage_cluster),
     ));
     assert!(repair.test_repair_one_pending());
-    let repairs = coord
-        .storage_node()
-        .test_object_payload_repair_observations(&payload)
-        .unwrap();
-    assert!(repairs.iter().any(|repair| {
-        repair.last_error.as_deref().is_some_and(|error| {
-            error.contains(
-                "storage-node repair read payload shard on node 0 exhausted resources: \
-                 storage-node diagnostic redacted",
-            )
-        })
-    }));
+    let repair_error = storage::test_support::object_payload_shard_fault_repair_error(
+        &coord.storage_node(),
+        &corrupt_fault,
+    )
+    .unwrap()
+    .expect("selected corrupt shard should retain the transient repair failure");
+    assert!(repair_error.contains(
+        "storage-node repair read payload shard on node 0 exhausted resources: \
+         storage-node diagnostic redacted",
+    ));
     assert!(failure_injected.load(Ordering::SeqCst));
 
     time.set(2_001);
     assert!(repair.test_repair_one_pending());
-    assert!(coord
-        .storage_node()
-        .test_object_payload_repair_observations(&payload)
-        .unwrap()
-        .is_empty());
     assert!(
-        !coord
-            .storage_node()
-            .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
-            .unwrap()
-            .has_same_state_as(&corrupt_state),
+        storage::test_support::object_payload_shard_fault_has_no_pending_repair(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap()
+    );
+    assert!(
+        !storage::test_support::object_payload_shard_fault_remains(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap(),
         "retry should rewrite the corrupt shard after transient failure"
     );
 }
@@ -19642,11 +19453,11 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
         .storage_node()
         .test_capture_object_payload(&bucket, &key, VersionId::Null)
         .unwrap();
-    inject_object_shard_corruption(&coord, "bucket", "key", 0);
-    let corrupt_state = coord
-        .storage_node()
-        .test_capture_object_payload_shard_file(&payload, 0, 0)
-        .unwrap();
+    let corrupt_fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -19663,39 +19474,38 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
         .unwrap();
     assert_eq!(result.body.read_all().unwrap(), data);
 
-    for shard_index in [1, 2] {
-        coord
-            .storage_node()
-            .test_inject_object_payload_shard_loss(&payload, 0, shard_index)
-            .unwrap();
-    }
+    let additional_losses =
+        storage::test_support::inject_object_payload_additional_data_losses_beyond_parity(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap();
 
     let repair = storage::StorageShardRepairSweeper::disabled(test_storage_route_handle(
         Arc::clone(&storage_cluster),
     ));
     assert!(repair.test_repair_one_pending());
-    let repairs = coord
-        .storage_node()
-        .test_object_payload_repair_observations(&payload)
-        .unwrap();
-    assert_eq!(repairs.len(), 1);
-    assert!(repairs[0].last_error.is_some());
-    assert_eq!(repairs[0].shard_index, 0);
-    assert!(coord
-        .storage_node()
-        .test_capture_object_payload_shard_file(&payload, 0, 0)
+    assert!(
+        storage::test_support::object_payload_shard_fault_repair_error(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
         .unwrap()
-        .has_same_state_as(&corrupt_state));
-    for shard_index in [1, 2] {
-        assert!(
-            coord
-                .storage_node()
-                .test_capture_object_payload_shard_file(&payload, 0, shard_index)
-                .unwrap()
-                .is_missing(),
-            "unrecoverable repair should not recreate any shard from an insufficient EC set"
-        );
-    }
+        .is_some()
+    );
+    assert!(storage::test_support::object_payload_shard_fault_remains(
+        &coord.storage_node(),
+        &corrupt_fault,
+    )
+    .unwrap());
+    assert!(
+        storage::test_support::object_payload_shard_faults_remain(
+            &coord.storage_node(),
+            &additional_losses,
+        )
+        .unwrap(),
+        "unrecoverable repair should not recreate any shard from an insufficient EC set"
+    );
 }
 
 #[test]
@@ -19748,12 +19558,11 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
         .storage_node()
         .test_capture_object_payload(&bucket, &key, VersionId::Null)
         .unwrap();
-    let corrupt_shard_index = 0;
-    inject_object_shard_corruption(&coord, "bucket", "key", corrupt_shard_index);
-    let corrupt_state = coord
-        .storage_node()
-        .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
-        .unwrap();
+    let corrupt_fault = storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let result = coord
         .get_object(&GetObjectRequest {
@@ -19771,11 +19580,13 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
     assert_eq!(result.body.read_all().unwrap(), data);
 
     assert!(coord._shard_repair_sweeper.test_repair_one_pending());
-    assert!(coord
-        .storage_node()
-        .test_object_payload_repair_observations(&payload)
+    assert!(
+        storage::test_support::object_payload_shard_fault_has_no_pending_repair(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
         .unwrap()
-        .is_empty());
+    );
     let repaired = coord
         .get_object(&GetObjectRequest {
             sse_customer: None,
@@ -19791,11 +19602,11 @@ fn shard_repair_worker_repairs_read_discovered_corrupt_shard() {
         .unwrap();
     assert_eq!(repaired.body.read_all().unwrap(), data);
     assert!(
-        !coord
-            .storage_node()
-            .test_capture_object_payload_shard_file(&payload, 0, corrupt_shard_index)
-            .unwrap()
-            .has_same_state_as(&corrupt_state),
+        !storage::test_support::object_payload_shard_fault_remains(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap(),
         "repair should rewrite the corrupt shard file"
     );
 }
@@ -20460,24 +20271,6 @@ fn capture_object_payload_for_test(
         .unwrap()
 }
 
-/// Inject loss of a logical shard while storage retains physical ownership.
-fn inject_object_shard_loss(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
-    let payload = capture_object_payload_for_test(coord, bucket, key);
-    coord
-        .storage_node()
-        .test_inject_object_payload_shard_loss(&payload, 0, shard_index)
-        .unwrap();
-}
-
-/// Inject a logical shard corruption while storage retains physical ownership.
-fn inject_object_shard_corruption(coord: &Coordinator, bucket: &str, key: &str, shard_index: u8) {
-    let payload = capture_object_payload_for_test(coord, bucket, key);
-    coord
-        .storage_node()
-        .test_inject_object_payload_shard_corruption(&payload, 0, shard_index)
-        .unwrap();
-}
-
 // ── EC fault injection tests ────────────────────────────────────
 
 fn setup_ec_fault_injection_coordinator(dir: &std::path::Path) -> Coordinator {
@@ -20519,8 +20312,12 @@ fn ec_reconstruction_after_shard_loss() {
     )
     .unwrap();
 
-    // Delete one data shard using the helper
-    inject_object_shard_loss(&coord, "bucket", "resilient", 0);
+    let payload = capture_object_payload_for_test(&coord, "bucket", "resilient");
+    storage::test_support::inject_object_payload_first_data_shard_loss(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     // Get should still succeed via EC reconstruction
     let obj = coord
@@ -20569,7 +20366,12 @@ fn ec_drop_one_data_shard_get() {
     )
     .unwrap();
 
-    inject_object_shard_loss(&coord, "bucket", "obj1", 0);
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj1");
+    storage::test_support::inject_object_payload_first_data_shard_loss(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -20622,7 +20424,12 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
     )
     .unwrap();
 
-    inject_object_shard_loss(&coord, "bucket", "obj-reconstruct", 0);
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj-reconstruct");
+    storage::test_support::inject_object_payload_first_data_shard_loss(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
     let ec = coord.storage_node().default_payload_ec_shape();
@@ -20694,9 +20501,13 @@ fn ec_drop_m_shards_at_limit() {
     )
     .unwrap();
 
-    // Delete 2 data shards (indices 0 and 1)
-    inject_object_shard_loss(&coord, "bucket", "obj2", 0);
-    inject_object_shard_loss(&coord, "bucket", "obj2", 1);
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj2");
+    storage::test_support::inject_object_payload_data_shard_losses(
+        &coord.storage_node(),
+        &payload,
+        2,
+    )
+    .unwrap();
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -20742,10 +20553,13 @@ fn ec_drop_m_plus_one_shards_fails() {
     )
     .unwrap();
 
-    // Delete 3 shards (indices 0, 1, 2)
-    inject_object_shard_loss(&coord, "bucket", "obj3", 0);
-    inject_object_shard_loss(&coord, "bucket", "obj3", 1);
-    inject_object_shard_loss(&coord, "bucket", "obj3", 2);
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj3");
+    storage::test_support::inject_object_payload_data_shard_losses(
+        &coord.storage_node(),
+        &payload,
+        3,
+    )
+    .unwrap();
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -20804,7 +20618,12 @@ fn ec_corrupt_one_data_shard_recovery() {
     )
     .unwrap();
 
-    inject_object_shard_corruption(&coord, "bucket", "obj4", 0);
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj4");
+    storage::test_support::inject_object_payload_first_data_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -20853,24 +20672,16 @@ fn ec_range_get_with_missing_shard() {
     .unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("obj5");
-    let generation_id = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .into_live()
-        .expect("put object should create a live object")
-        .generation_id;
     let payload = coord
         .storage_node()
         .test_capture_object_payload(&bucket, &key, put.version_id)
         .unwrap();
-    let expected_selected_nodes = coord
-        .storage_node()
-        .test_object_payload_segment_shard_node_count(&payload, 0)
-        .unwrap();
 
-    // Delete shard 0 (covers the beginning of the data)
-    inject_object_shard_loss(&coord, "bucket", "obj5", 0);
+    storage::test_support::inject_object_payload_first_data_shard_loss(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     // Range get should still succeed via EC reconstruction
     let result = coord
@@ -20887,19 +20698,21 @@ fn ec_range_get_with_missing_shard() {
             cond: NO_READ,
         })
         .unwrap();
-    assert_eq!(
-        coord
-            .storage_node()
-            .object_payload_lease_holder_node_count(&bucket, &key, generation_id),
-        expected_selected_nodes,
+    assert!(
+        storage::test_support::object_payload_snapshot_has_exact_shard_owner_leases(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap(),
         "degraded EC range read should hold handles for the selected recovery shard-owner set"
     );
     assert_eq!(result.body.read_all().unwrap(), b"Hello");
-    assert_eq!(
-        coord
-            .storage_node()
-            .object_payload_lease_holder_node_count(&bucket, &key, generation_id),
-        0,
+    assert!(
+        storage::test_support::object_payload_snapshot_has_no_leases(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap(),
         "degraded EC range read should release shard-owner handles after body consumption"
     );
 }
@@ -20935,8 +20748,12 @@ fn ec_drop_parity_shard_data_still_works() {
     )
     .unwrap();
 
-    // Delete first parity shard (index 4, since k=4)
-    inject_object_shard_loss(&coord, "bucket", "obj6", 4);
+    let payload = capture_object_payload_for_test(&coord, "bucket", "obj6");
+    storage::test_support::inject_object_payload_first_parity_shard_loss(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -20986,11 +20803,16 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
 
     let payload = capture_object_payload_for_test(&coord, "bucket", "obj7");
 
-    inject_object_shard_corruption(&coord, "bucket", "obj7", 4);
-    assert!(!coord
-        .storage_node()
-        .test_object_payload_shard_file_matches_ack(&payload, 0, 4)
-        .unwrap());
+    let parity_fault = storage::test_support::inject_object_payload_first_parity_shard_corruption(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
+    assert!(storage::test_support::object_payload_shard_fault_remains(
+        &coord.storage_node(),
+        &parity_fault,
+    )
+    .unwrap());
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21008,11 +20830,12 @@ fn ec_healthy_read_skips_corrupt_parity_shards() {
     assert_eq!(obj.body.read_all().unwrap(), data);
 
     assert!(
-        !coord
-            .storage_node()
-            .test_object_payload_shard_file_matches_ack(&payload, 0, 4)
-            .unwrap(),
-        "healthy-path read should not touch parity shard 4"
+        storage::test_support::object_payload_shard_fault_remains(
+            &coord.storage_node(),
+            &parity_fault,
+        )
+        .unwrap(),
+        "healthy-path read should not touch an unneeded parity shard"
     );
 }
 
@@ -21048,8 +20871,17 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
 
     let payload = capture_object_payload_for_test(&coord, "bucket", "obj8");
 
-    inject_object_shard_loss(&coord, "bucket", "obj8", 0);
-    inject_object_shard_corruption(&coord, "bucket", "obj8", 5);
+    storage::test_support::inject_object_payload_first_data_shard_loss(
+        &coord.storage_node(),
+        &payload,
+    )
+    .unwrap();
+    let unneeded_parity_fault =
+        storage::test_support::inject_object_payload_last_parity_shard_corruption(
+            &coord.storage_node(),
+            &payload,
+        )
+        .unwrap();
 
     let obj = coord
         .get_object(&GetObjectRequest {
@@ -21067,10 +20899,11 @@ fn ec_reconstruction_stops_after_first_needed_parity_shard() {
     assert_eq!(obj.body.read_all().unwrap(), data);
 
     assert!(
-        !coord
-            .storage_node()
-            .test_object_payload_shard_file_matches_ack(&payload, 0, 5)
-            .unwrap(),
+        storage::test_support::object_payload_shard_fault_remains(
+            &coord.storage_node(),
+            &unneeded_parity_fault,
+        )
+        .unwrap(),
         "reconstruction should stop once enough shards are present"
     );
 }
@@ -22445,10 +22278,6 @@ fn get_object_range_holds_payload_lease_on_selected_shard_nodes() {
         .test_capture_object_payload(&bucket, &key, put.version_id)
         .unwrap();
     assert_eq!(payload_snapshot.segment_count(), 1);
-    let expected_selected_nodes = storage_cluster
-        .test_object_payload_segment_shard_node_count(&payload_snapshot, 0)
-        .unwrap();
-
     let result = coord
         .get_object_range(&GetObjectRangeRequest {
             sse_customer: None,
@@ -22463,19 +22292,21 @@ fn get_object_range_holds_payload_lease_on_selected_shard_nodes() {
             cond: NO_READ,
         })
         .unwrap();
-    assert_eq!(
-        storage_cluster
-            .test_object_payload_snapshot_lease_holder_node_count(&payload_snapshot)
-            .unwrap(),
-        expected_selected_nodes,
+    assert!(
+        storage::test_support::object_payload_snapshot_has_exact_shard_owner_leases(
+            &storage_cluster,
+            &payload_snapshot,
+        )
+        .unwrap(),
         "range read should hold payload leases only on selected shard-owner nodes"
     );
     assert_eq!(result.body.read_all().unwrap(), b"read ");
-    assert_eq!(
-        storage_cluster
-            .test_object_payload_snapshot_lease_holder_node_count(&payload_snapshot)
-            .unwrap(),
-        0,
+    assert!(
+        storage::test_support::object_payload_snapshot_has_no_leases(
+            &storage_cluster,
+            &payload_snapshot,
+        )
+        .unwrap(),
         "read handle drop should release selected shard-owner payload leases"
     );
 }

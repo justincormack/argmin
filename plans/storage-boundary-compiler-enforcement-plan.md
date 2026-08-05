@@ -5854,16 +5854,28 @@ Implementation update (2026-08-03):
   case. The cross-crate backfill work-item/record DTOs and generic test methods
   were removed; storage tests use the private durable work item, route-health,
   acknowledgement, and queue APIs owned by the implementation; and
-- narrowed the retained-read and range-read shard-selection regressions to
-  opaque payload evidence. Storage now owns corruption injection, placement
-  selection, generation identity, placement-provenance validation, and
-  lease-holder lookup. The retained-route regression has a storage-owned
-  canary proving that every captured segment uses the key's derived data PG and
-  the capturing cluster's epoch before moving that PG; coordinator tests then
-  assert only that a body created before publication remains readable and that
-  its range body holds leases on exactly the selected-node count. The raw
-  committed-segment accessor was removed, and raw shard construction,
-  acknowledgement, and file-path helpers are now storage-unit-test-only.
+- completed the retained-read and range-read shard-selection migration. One
+  storage-owned opaque scenario now selects the metadata/data PG split,
+  validates the original payload placement provenance, starts and advances the
+  six Unix storage nodes, chooses and corrupts a shard, retains the historical
+  route, and publishes the moved-data-PG map. The coordinator regression
+  controls only write, response creation, publication, and body consumption.
+  Range-read lease assertions now ask storage whether the exact owner-selected
+  shard set is leased and later fully released, without exposing node counts.
+  Healthy/degraded EC and repair regressions use opaque
+  first-data/first-parity/last-parity or logical-count fault evidence, so
+  storage owns EC-index selection and callers observe only whether the selected
+  fault remains, is queued, or is repaired. The indexed fault mutators are
+  crate-private, and the boundary checker rejects cross-crate physical shard
+  mutation, file, and repair-row APIs. The raw committed-segment accessor was
+  removed, and raw shard construction, acknowledgement, and file-path helpers
+  are storage-unit-test-only; and
+- narrowed the lifecycle sweep suite to a storage-owned logical object
+  observation. It exposes only the timestamps needed to choose the sweep
+  deadline, while retaining the object generation and payload subject
+  privately for an opaque deletion-exclusion lease and reclaim-root presence
+  query. Current, versioned, suspended-null, and noncurrent expiration tests no
+  longer read durable live-object generations or reclaim records directly.
 
 Final Phase 5 audit (2026-08-04):
 
@@ -5883,15 +5895,17 @@ Final Phase 5 audit (2026-08-04):
   UploadPartCopy source-loss migrations are complete;
 - shard-backfill regressions have moved to `storage`, including refreshed-map,
   obsolete-source/payload, and installed-Unix execution. Retained-placement
-  and shard-selection regressions still construct `PgRouteSnapshot`, physical
-  segment writes, acknowledgement rows, and historical routes. Their
-  placement and durable-row assertions belong in `storage`; any coordinator
-  runtime-map behavior which remains relevant should consume an opaque
-  storage-owned topology scenario;
-- lifecycle and multipart cleanup tests still discover private generation IDs
-  through raw object records before checking reclaim-root state. Replace those
-  reads with opaque payload evidence or a logical object-scoped reclaim
-  observation. The multipart state-machine harness also reads
+  and shard-selection migration is also complete: physical route construction,
+  historical-route publication, placement validation, Unix node lifecycle,
+  EC-index selection, and shard-fault inspection are storage-owned, while the
+  coordinator test retains only the meaningful response-lifetime ordering and
+  body/result assertions;
+- lifecycle sweep tests now use the narrow storage-owned lifecycle observation
+  for deadline timestamps, payload leases, and reclaim-root presence. Residual
+  coordinator reclaim-worker and multipart cleanup tests still discover
+  private generation IDs through raw object records before checking reclaim
+  state; replace those reads with opaque payload evidence or logical
+  object-scoped reclaim scenarios. The multipart state-machine harness also reads
   `StreamUploadRecord` and the broad `TestMultipartUploadRecord` projection;
   narrow these to the exact logical session/upload facts used by the model so
   metadata blobs, encryption state, storage generation IDs, and other durable
@@ -5928,9 +5942,9 @@ Remaining implementation order after this audit:
 1. **Completed:** stream cleanup, direct-PUT/reclaim cleanup, and UploadPartCopy
    source loss have owner-local physical assertions and only logical or opaque
    coordinator-facing coverage;
-2. move the retained-placement and shard-selection physical regressions into
-   `storage`, replacing any genuinely cross-crate runtime-map case with one
-   opaque topology scenario; the backfill migration is complete;
+2. **Completed:** retained-placement and shard-selection physical invariants
+   are storage-owned; the genuinely cross-crate runtime-map case uses one
+   opaque topology scenario, and the backfill migration is complete;
 3. narrow lifecycle/reclaim and multipart state-machine observations to
    logical owner-defined values, and remove raw generation/record access from
    the coordinator harnesses;
