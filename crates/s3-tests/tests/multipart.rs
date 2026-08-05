@@ -7207,6 +7207,21 @@ fn test_versioned_completion_racing_delete_retains_version_and_marker() {
                 .unwrap();
             assert_eq!(listed.versions().len(), 1);
             assert_eq!(listed.delete_markers().len(), 1);
+            let listed_delete_marker_version_ids = listed
+                .delete_markers()
+                .iter()
+                .map(|marker| {
+                    marker
+                        .version_id()
+                        .expect("versioned delete marker must have a version ID")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                listed_delete_marker_version_ids,
+                vec![delete_marker_version_id.clone()],
+                "attempt {attempt} published an unexpected delete-marker history"
+            );
             let object_is_latest = listed.versions()[0].is_latest() == Some(true);
             let marker_is_latest = listed.delete_markers()[0].is_latest() == Some(true);
             assert_ne!(object_is_latest, marker_is_latest);

@@ -93,13 +93,108 @@ const BUCKET_DELETE_RESERVATION_WAIT_BLOCKED_CONTEXT: &str =
 const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(10);
-const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
+pub(super) const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
 const BUCKET_WRITE_RESERVATION_LEASE_MILLIS: u64 = 15_000;
 // HTTP streaming PutObject heartbeats active sessions every 10s. Keep the
 // durable create reservation only slightly longer than that so abandoned
 // sessions stop blocking DeleteBucket well before common 30s client attempt
 // timeouts, while still allowing one delayed heartbeat under contention.
 const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = BUCKET_WRITE_RESERVATION_LEASE_MILLIS;
+
+fn metadata_command_terminal_cleanup_error_is_retryable(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::Io { .. }
+            | StoreError::StorageRpcResourceExhausted { .. }
+            | StoreError::MetadataCommandContention { .. }
+            | StoreError::PgNotActive { .. }
+            | StoreError::RouteMapExpired { .. }
+            | StoreError::StaleMetadataOperation { .. }
+            | StoreError::StaleMetadataRoute { .. }
+            | StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::TransportTimeout
+                    | StorageRpcErrorCode::TransportClosed
+                    | StorageRpcErrorCode::MetadataCommandContention
+                    | StorageRpcErrorCode::StaleShardLocation
+                    | StorageRpcErrorCode::WrongClusterEpoch,
+                ..
+            }
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingMetadataCommandTerminalCleanup {
+    Removed,
+    AlreadyAbsent,
+    Deferred,
+}
+
+fn emit_metadata_command_terminal_cleanup_deferred(
+    pg_id: PgId,
+    reason: &'static str,
+    error: Option<&StoreError>,
+) {
+    let _ = observability::event(
+        super::TRACE_TARGET,
+        "metadata_command_terminal_cleanup_deferred",
+        Some(format_args!(
+            "pg_id={} reason={} error={:?}",
+            pg_id.get(),
+            reason,
+            error
+        )),
+    );
+}
+
+pub(super) fn remove_pending_metadata_command_slot_after_terminal_outcome(
+    pg_id: PgId,
+    mut work_budget: Option<&mut super::RequestWorkBudget>,
+    mut remove: impl FnMut() -> Result<bool, StoreError>,
+) -> Result<PendingMetadataCommandTerminalCleanup, StoreError> {
+    loop {
+        if let Some(work_budget) = work_budget.as_deref_mut() {
+            if work_budget
+                .check("metadata command pending-slot remove retry budget exhausted")
+                .is_err()
+            {
+                emit_metadata_command_terminal_cleanup_deferred(
+                    pg_id,
+                    "caller budget exhausted",
+                    None,
+                );
+                return Ok(PendingMetadataCommandTerminalCleanup::Deferred);
+            }
+        }
+        match remove() {
+            Ok(true) => return Ok(PendingMetadataCommandTerminalCleanup::Removed),
+            Ok(false) => return Ok(PendingMetadataCommandTerminalCleanup::AlreadyAbsent),
+            Err(error) if metadata_command_terminal_cleanup_error_is_retryable(&error) => {
+                let Some(work_budget) = work_budget.as_deref_mut() else {
+                    emit_metadata_command_terminal_cleanup_deferred(
+                        pg_id,
+                        "one-shot cleanup failed transiently",
+                        Some(&error),
+                    );
+                    return Ok(PendingMetadataCommandTerminalCleanup::Deferred);
+                };
+                if work_budget
+                    .sleep_after_contention(
+                        "metadata command pending-slot remove retry budget exhausted",
+                    )
+                    .is_err()
+                {
+                    emit_metadata_command_terminal_cleanup_deferred(
+                        pg_id,
+                        "caller budget exhausted after transient failure",
+                        Some(&error),
+                    );
+                    return Ok(PendingMetadataCommandTerminalCleanup::Deferred);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct DurableObjectPayloadReclaimScan {
@@ -2752,19 +2847,19 @@ impl super::StorageCluster {
                 self.release_metadata_command_bucket_write_reservation(&command)?;
                 match route_mode {
                     MetadataCommandRouteMode::Normal => self
-                        .remove_pending_metadata_command_for_bucket(
+                        .remove_pending_metadata_command_for_bucket_with_work_budget(
                             pg_id,
                             command_bucket,
                             &command,
+                            work_budget,
                         ),
                     MetadataCommandRouteMode::Recovery => self
                         .remove_pending_metadata_command_for_bucket_recovery(
-                            execution_route.recovery_proof(),
-                            recovery_authorized_source.as_ref(),
-                            recovery_abandoned_source.as_ref(),
+                            execution_route,
                             pg_id,
                             command_bucket,
                             &command,
+                            work_budget,
                         ),
                 }?;
                 return Ok(FinishPendingMetadataCommandResult::Abandoned);
@@ -2794,19 +2889,19 @@ impl super::StorageCluster {
                     self.release_applied_metadata_command_bucket_write_reservations(&command)?;
                     match route_mode {
                         MetadataCommandRouteMode::Normal => self
-                            .remove_pending_metadata_command_for_bucket(
+                            .remove_pending_metadata_command_for_bucket_with_work_budget(
                                 pg_id,
                                 command_bucket,
                                 &command,
+                                work_budget,
                             ),
                         MetadataCommandRouteMode::Recovery => self
                             .remove_pending_metadata_command_for_bucket_recovery(
-                                execution_route.recovery_proof(),
-                                recovery_authorized_source.as_ref(),
-                                recovery_abandoned_source.as_ref(),
+                                execution_route,
                                 pg_id,
                                 command_bucket,
                                 &command,
+                                work_budget,
                             ),
                     }?;
                     return Ok(FinishPendingMetadataCommandResult::Applied);
@@ -2841,19 +2936,19 @@ impl super::StorageCluster {
                             )?;
                             match route_mode {
                                 MetadataCommandRouteMode::Normal => self
-                                    .remove_pending_metadata_command_for_bucket(
+                                    .remove_pending_metadata_command_for_bucket_with_work_budget(
                                         pg_id,
                                         command_bucket,
                                         &command,
+                                        work_budget,
                                     ),
                                 MetadataCommandRouteMode::Recovery => self
                                     .remove_pending_metadata_command_for_bucket_recovery(
-                                        execution_route.recovery_proof(),
-                                        recovery_authorized_source.as_ref(),
-                                        recovery_abandoned_source.as_ref(),
+                                        execution_route,
                                         pg_id,
                                         command_bucket,
                                         &command,
+                                        work_budget,
                                     ),
                             }?;
                             return Ok(FinishPendingMetadataCommandResult::Applied);
@@ -2900,19 +2995,19 @@ impl super::StorageCluster {
                         .map_err(|error| error.source)?;
                         match route_mode {
                             MetadataCommandRouteMode::Normal => self
-                                .remove_pending_metadata_command_for_bucket(
+                                .remove_pending_metadata_command_for_bucket_with_work_budget(
                                     pg_id,
                                     command_bucket,
                                     &command,
+                                    work_budget,
                                 ),
                             MetadataCommandRouteMode::Recovery => self
                                 .remove_pending_metadata_command_for_bucket_recovery(
-                                    execution_route.recovery_proof(),
-                                    recovery_authorized_source.as_ref(),
-                                    recovery_abandoned_source.as_ref(),
+                                    execution_route,
                                     pg_id,
                                     command_bucket,
                                     &command,
+                                    work_budget,
                                 ),
                         }?;
                     }
@@ -10579,10 +10674,11 @@ impl super::StorageCluster {
                 Ok(()) => {
                     self.release_applied_metadata_command_bucket_write_reservations(&command)
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                    self.remove_pending_metadata_command_for_bucket(
+                    self.remove_pending_metadata_command_for_bucket_with_work_budget(
                         pg_id,
                         command.bucket_name(),
                         &command,
+                        &mut work_budget,
                     )
                     .map_err(ObjectPgActionError::from)?;
                     self.after_object_metadata_command_applied(&command);
@@ -10611,10 +10707,11 @@ impl super::StorageCluster {
                                 &command,
                             )
                             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                            self.remove_pending_metadata_command_for_bucket(
+                            self.remove_pending_metadata_command_for_bucket_with_work_budget(
                                 pg_id,
                                 command.bucket_name(),
                                 &command,
+                                &mut work_budget,
                             )
                             .map_err(ObjectPgActionError::from)?;
                             self.after_object_metadata_command_applied(&command);
@@ -10660,8 +10757,13 @@ impl super::StorageCluster {
                         }
                         self.release_metadata_command_bucket_write_reservation(&command)
                             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                            .map_err(ObjectPgActionError::from)?;
+                        self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                            pg_id,
+                            bucket,
+                            &command,
+                            &mut work_budget,
+                        )
+                        .map_err(ObjectPgActionError::from)?;
                         return Err(super::bucket_snapshot_error_to_object_pg_action_error(
                             source,
                         ));
@@ -10679,8 +10781,13 @@ impl super::StorageCluster {
                         }
                         self.release_metadata_command_bucket_write_reservation(&command)
                             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                            .map_err(ObjectPgActionError::from)?;
+                        self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                            pg_id,
+                            bucket,
+                            &command,
+                            &mut work_budget,
+                        )
+                        .map_err(ObjectPgActionError::from)?;
                     }
                     return Err(super::bucket_snapshot_error_to_object_pg_action_error(
                         source,
@@ -18471,5 +18578,112 @@ mod bounded_pg_scan_tests {
 
         assert_eq!(visited, pg_ids);
         assert_eq!(batches, 25);
+    }
+}
+
+#[cfg(test)]
+mod pending_command_terminal_cleanup_tests {
+    use super::*;
+
+    #[test]
+    fn pending_slot_remove_retries_response_loss_after_remote_removal() {
+        let mut pending = true;
+        let mut attempts = 0usize;
+        let mut work_budget =
+            super::super::RequestWorkBudget::new(std::time::Duration::from_secs(1), None);
+
+        let cleanup = remove_pending_metadata_command_slot_after_terminal_outcome(
+            PgId::new(7),
+            Some(&mut work_budget),
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    pending = false;
+                    return Err(StoreError::Io {
+                        context: "read storage RPC response",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "injected response loss after pending-slot removal",
+                        ),
+                    });
+                }
+                Ok(std::mem::replace(&mut pending, false))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            cleanup,
+            PendingMetadataCommandTerminalCleanup::AlreadyAbsent,
+            "the retry should confirm the slot is already absent",
+        );
+        assert_eq!(attempts, 2);
+    }
+
+    #[test]
+    fn pending_slot_remove_budget_exhaustion_preserves_committed_outcome() {
+        let mut pending = true;
+        let mut attempts = 0usize;
+        let mut work_budget =
+            super::super::RequestWorkBudget::new(std::time::Duration::from_secs(1), Some(1));
+
+        let cleanup = remove_pending_metadata_command_slot_after_terminal_outcome(
+            PgId::new(7),
+            Some(&mut work_budget),
+            || {
+                attempts += 1;
+                pending = false;
+                Err(StoreError::Io {
+                    context: "read storage RPC response",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "injected response loss after pending-slot removal",
+                    ),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cleanup, PendingMetadataCommandTerminalCleanup::Deferred);
+        assert!(
+            !pending,
+            "the remote cleanup committed before response loss"
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn pending_slot_remove_uses_callers_existing_budget() {
+        let mut attempts = 0usize;
+        let mut work_budget =
+            super::super::RequestWorkBudget::new(std::time::Duration::from_secs(1), Some(1));
+        work_budget.check("consume caller budget").unwrap();
+
+        let cleanup = remove_pending_metadata_command_slot_after_terminal_outcome(
+            PgId::new(7),
+            Some(&mut work_budget),
+            || {
+                attempts += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cleanup, PendingMetadataCommandTerminalCleanup::Deferred);
+        assert_eq!(attempts, 0, "cleanup must not reset the caller's budget");
+    }
+
+    #[test]
+    fn pending_slot_remove_does_not_retry_semantic_failure() {
+        let mut attempts = 0usize;
+        let error =
+            remove_pending_metadata_command_slot_after_terminal_outcome(PgId::new(7), None, || {
+                attempts += 1;
+                Err(StoreError::PgNotFound { pg_id: 7 })
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, StoreError::PgNotFound { pg_id: 7 }));
+        assert_eq!(attempts, 1);
     }
 }

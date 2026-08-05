@@ -10689,42 +10689,69 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
-    ) -> Result<bool, StoreError> {
-        let primary = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+    ) -> Result<request_ops::PendingMetadataCommandTerminalCleanup, StoreError> {
+        self.remove_pending_metadata_command_for_bucket_inner(pg_id, bucket, command, None)
+    }
+
+    fn remove_pending_metadata_command_for_bucket_with_work_budget(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<request_ops::PendingMetadataCommandTerminalCleanup, StoreError> {
+        self.remove_pending_metadata_command_for_bucket_inner(
+            pg_id,
+            bucket,
+            command,
+            Some(work_budget),
+        )
+    }
+
+    fn remove_pending_metadata_command_for_bucket_inner(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: Option<&mut RequestWorkBudget>,
+    ) -> Result<request_ops::PendingMetadataCommandTerminalCleanup, StoreError> {
         let _ = bucket;
-        primary
-            .metadata_command_client()
-            .remove_pending_metadata_command_slot(pg_id, command)
+        request_ops::remove_pending_metadata_command_slot_after_terminal_outcome(
+            pg_id,
+            work_budget,
+            || {
+                self.local_map
+                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+                    .metadata_command_client()
+                    .remove_pending_metadata_command_slot(pg_id, command)
+            },
+        )
     }
 
     fn remove_pending_metadata_command_for_bucket_recovery(
         &self,
-        recovery_proof: MetadataCommandRecoveryProof<'_>,
-        authorized_source: Option<&MetadataCommandEnvelope>,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
+        execution_route: MetadataCommandExecutionRoute<'_>,
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
-    ) -> Result<bool, StoreError> {
-        let execution_route = MetadataCommandExecutionRoute::recovery(
-            recovery_proof,
-            authorized_source,
-            abandoned_source,
-        );
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<request_ops::PendingMetadataCommandTerminalCleanup, StoreError> {
         execution_route.require_command(pg_id, command)?;
         execution_route.require_recovery_predecessor(pg_id)?;
-        let primary = self
-            .local_map
-            .metadata_pg_primary_node_for_metadata_command_recovery(
-                self.operation_epoch(),
-                pg_id,
-            )?;
         let _ = bucket;
-        primary
-            .metadata_command_client()
-            .remove_pending_metadata_command_slot(pg_id, command)
+        request_ops::remove_pending_metadata_command_slot_after_terminal_outcome(
+            pg_id,
+            Some(work_budget),
+            || {
+                self.local_map
+                    .metadata_pg_primary_node_for_metadata_command_recovery(
+                        self.operation_epoch(),
+                        pg_id,
+                    )?
+                    .metadata_command_client()
+                    .remove_pending_metadata_command_slot(pg_id, command)
+            },
+        )
     }
 
     fn next_metadata_command_id(&self, pg_id: PgId) -> Result<MetadataCommandId, StoreError> {
@@ -13206,7 +13233,7 @@ impl StorageCluster {
                 pg_id,
                 command,
                 true,
-                Some(work_budget),
+                work_budget,
                 reservation_authority,
                 match route_mode {
                     MetadataCommandRouteMode::Normal => MetadataCommandExecutionRoute::normal(),
@@ -13275,11 +13302,17 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        let mut work_budget = RequestWorkBudget::new(
+            Duration::from_millis(request_ops::METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("object_metadata_pending_command_apply")
+        .for_pg(pg_id);
         self.finish_object_pg_pending_slot_inner(
             pg_id,
             command,
             false,
-            None,
+            &mut work_budget,
             self,
             MetadataCommandExecutionRoute::normal(),
         )
@@ -13290,7 +13323,7 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         abandon_zero_apply_stale_reservation: bool,
-        mut work_budget: Option<&mut RequestWorkBudget>,
+        work_budget: &mut RequestWorkBudget,
         reservation_authority: &StorageCluster,
         mut execution_route: MetadataCommandExecutionRoute<'_>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
@@ -13302,9 +13335,7 @@ impl StorageCluster {
         let recovery_abandoned_source = execution_route.recovery_abandoned_source.cloned();
         let mut command = command.clone();
         loop {
-            if let Some(work_budget) = work_budget.as_deref_mut() {
-                work_budget.check("object metadata pending command apply budget exhausted")?;
-            }
+            work_budget.check("object metadata pending command apply budget exhausted")?;
             let command_bucket = command.bucket_name();
             let abandoned_on_acting_set = match route_mode {
                 MetadataCommandRouteMode::Normal => {
@@ -13341,7 +13372,7 @@ impl StorageCluster {
                     &command,
                     reservation_authority,
                     execution_route,
-                    work_budget.as_deref_mut(),
+                    work_budget,
                 )?;
                 return Ok(PendingMetadataCommandOutcome::Abandoned);
             }
@@ -13374,19 +13405,19 @@ impl StorageCluster {
                         .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                     match route_mode {
                         MetadataCommandRouteMode::Normal => self
-                            .remove_pending_metadata_command_for_bucket(
+                            .remove_pending_metadata_command_for_bucket_with_work_budget(
                                 pg_id,
                                 command_bucket,
                                 &command,
+                                work_budget,
                             ),
                         MetadataCommandRouteMode::Recovery => self
                             .remove_pending_metadata_command_for_bucket_recovery(
-                                execution_route.recovery_proof(),
-                                recovery_authorized_source.as_ref(),
-                                recovery_abandoned_source.as_ref(),
+                                execution_route,
                                 pg_id,
                                 command_bucket,
                                 &command,
+                                work_budget,
                             ),
                     }
                     .map_err(ObjectPgActionError::from)?;
@@ -13423,19 +13454,19 @@ impl StorageCluster {
                             .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
                         match route_mode {
                             MetadataCommandRouteMode::Normal => self
-                                .remove_pending_metadata_command_for_bucket(
+                                .remove_pending_metadata_command_for_bucket_with_work_budget(
                                     pg_id,
                                     command_bucket,
                                     &command,
+                                    work_budget,
                                 ),
                             MetadataCommandRouteMode::Recovery => self
                                 .remove_pending_metadata_command_for_bucket_recovery(
-                                    execution_route.recovery_proof(),
-                                    recovery_authorized_source.as_ref(),
-                                    recovery_abandoned_source.as_ref(),
+                                    execution_route,
                                     pg_id,
                                     command_bucket,
                                     &command,
+                                    work_budget,
                                 ),
                         }
                         .map_err(ObjectPgActionError::from)?;
@@ -13504,7 +13535,7 @@ impl StorageCluster {
                         &command,
                         reservation_authority,
                         execution_route,
-                        work_budget.as_deref_mut(),
+                        work_budget,
                     )?;
                     return Ok(PendingMetadataCommandOutcome::Abandoned);
                 }
@@ -13523,7 +13554,7 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         reservation_authority: &StorageCluster,
         execution_route: MetadataCommandExecutionRoute<'_>,
-        work_budget: Option<&mut RequestWorkBudget>,
+        work_budget: &mut RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
         reservation_authority
             .release_metadata_command_bucket_write_reservation(command)
@@ -13585,17 +13616,20 @@ impl StorageCluster {
 
         let command_bucket = command.bucket_name();
         match execution_route.mode {
-            MetadataCommandRouteMode::Normal => {
-                self.remove_pending_metadata_command_for_bucket(pg_id, command_bucket, command)
-            }
-            MetadataCommandRouteMode::Recovery => self
-                .remove_pending_metadata_command_for_bucket_recovery(
-                    execution_route.recovery_proof(),
-                    execution_route.recovery_authorized_source,
-                    execution_route.recovery_abandoned_source,
+            MetadataCommandRouteMode::Normal => self
+                .remove_pending_metadata_command_for_bucket_with_work_budget(
                     pg_id,
                     command_bucket,
                     command,
+                    work_budget,
+                ),
+            MetadataCommandRouteMode::Recovery => self
+                .remove_pending_metadata_command_for_bucket_recovery(
+                    execution_route,
+                    pg_id,
+                    command_bucket,
+                    command,
+                    work_budget,
                 ),
         }
         .map_err(ObjectPgActionError::from)?;
