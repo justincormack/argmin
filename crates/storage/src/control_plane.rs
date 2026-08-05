@@ -8805,12 +8805,15 @@ impl ControlPlaneStore for FileControlPlaneStore {
                 DurableJournalAppendError::BeforeReplayableRecord(error) => Err(error),
                 DurableJournalAppendError::AmbiguousRecordMayExist(error)
                 | DurableJournalAppendError::ReplayableRecordMayExist(error) => {
-                    durability.poisoned = Some(error.to_string());
-                    Err(ControlPlaneError::CommandDecode {
+                    Self::latch_durability_failure(&mut durability, &error);
+                    let result = Err(ControlPlaneError::CommandDecode {
                         message: format!(
                             "single-authority control-plane durability poisoned after ambiguous journal append: {error}"
                         ),
-                    })
+                    });
+                    drop(durability);
+                    Self::log_durability_failure("journal_append", &error);
+                    result
                 }
             };
         }
@@ -8852,6 +8855,38 @@ impl ControlPlaneStore for FileControlPlaneStore {
 }
 
 impl FileControlPlaneStore {
+    fn durability_failure_log_message(stage: &'static str, error: &ControlPlaneError) -> String {
+        format!(
+            "single-authority control-plane durability failure stage={stage}: {}",
+            error.retained_diagnostic_message()
+        )
+    }
+
+    fn latch_durability_failure(
+        durability: &mut FileControlPlaneStoreDurability,
+        error: &ControlPlaneError,
+    ) {
+        durability.poisoned.get_or_insert_with(|| error.to_string());
+    }
+
+    fn write_durability_failure(
+        stage: &'static str,
+        error: &ControlPlaneError,
+        output: &mut dyn std::io::Write,
+    ) -> std::io::Result<()> {
+        writeln!(
+            output,
+            "{}",
+            Self::durability_failure_log_message(stage, error)
+        )
+    }
+
+    fn log_durability_failure(stage: &'static str, error: &ControlPlaneError) {
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = Self::write_durability_failure(stage, error, &mut stderr);
+    }
+
     fn lock_durability(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, FileControlPlaneStoreDurability>, ControlPlaneError> {
@@ -8922,8 +8957,12 @@ impl FileControlPlaneStore {
         observability::record_control_plane_snapshot_save(save_started.elapsed(), result.is_ok());
         if let Err(error) = &result {
             if let Ok(mut durability) = self.lock_durability() {
-                durability.poisoned.get_or_insert_with(|| error.to_string());
+                Self::latch_durability_failure(&mut durability, error);
             }
+        }
+        drop(_publication);
+        if let Err(error) = &result {
+            Self::log_durability_failure("checkpoint_persistence", error);
         }
         result
     }
@@ -28963,6 +29002,11 @@ mod tests {
         const SECRET_RPC: &str = "secret control-plane RPC diagnostic";
 
         let io_error = ControlPlaneError::io(SECRET_CONTEXT, std::io::Error::other(SECRET_SOURCE));
+        let owner_local_diagnostic =
+            FileControlPlaneStore::durability_failure_log_message("journal_append", &io_error);
+        assert!(owner_local_diagnostic.contains("stage=journal_append"));
+        assert!(owner_local_diagnostic.contains(SECRET_CONTEXT));
+        assert!(owner_local_diagnostic.contains(SECRET_SOURCE));
         assert!(!io_error.to_string().contains(SECRET_CONTEXT));
         assert!(!io_error.to_string().contains(SECRET_SOURCE));
         assert!(!format!("{io_error:?}").contains(SECRET_CONTEXT));
@@ -28991,6 +29035,55 @@ mod tests {
             assert!(!diagnostic.to_string().contains(SECRET_RPC));
             assert!(!format!("{diagnostic:?}").contains(SECRET_RPC));
         }
+    }
+
+    #[test]
+    fn failed_owner_local_durability_log_observes_published_poison() {
+        struct FailedOutput {
+            durability: Arc<Mutex<FileControlPlaneStoreDurability>>,
+            observed_poison: bool,
+        }
+
+        impl std::io::Write for FailedOutput {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                let durability = self.durability.try_lock().map_err(|_| {
+                    std::io::Error::other("durability lock remained held during diagnostic write")
+                })?;
+                self.observed_poison = durability.poisoned.is_some();
+                Err(std::io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "injected diagnostic output failure",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = ControlPlaneError::io(
+            "sync single-authority control-plane journal",
+            std::io::Error::from(ErrorKind::StorageFull),
+        );
+        let durability = Arc::new(Mutex::new(FileControlPlaneStoreDurability::default()));
+        {
+            let mut durability = durability.lock().unwrap();
+            FileControlPlaneStore::latch_durability_failure(&mut durability, &error);
+        }
+        let mut output = FailedOutput {
+            durability: Arc::clone(&durability),
+            observed_poison: false,
+        };
+        let write_error =
+            FileControlPlaneStore::write_durability_failure("journal_append", &error, &mut output)
+                .unwrap_err();
+
+        assert_eq!(write_error.kind(), ErrorKind::BrokenPipe);
+        assert!(output.observed_poison);
+        assert_eq!(
+            durability.lock().unwrap().poisoned.as_deref(),
+            Some("control-plane transport I/O failure")
+        );
     }
 
     #[test]
@@ -40267,6 +40360,37 @@ mod tests {
             .unwrap();
 
         assert_ne!(std::fs::read(store.path()).unwrap(), checkpoint_before);
+    }
+
+    #[test]
+    fn captured_checkpoint_preparation_failure_latches_poison() {
+        let tmp = test_util::tempdir();
+        let path = tmp.path().join("control-plane.state");
+        let store = FileControlPlaneStore::with_checkpoint_limits(path.clone(), 1, u64::MAX);
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let checkpoint = authority
+            .capture_durable_checkpoint_if_due(Instant::now())
+            .unwrap()
+            .expect("command threshold should be due");
+        let prepared_path = single_authority_snapshot_tmp_path(&path);
+        std::fs::create_dir(&prepared_path).unwrap();
+
+        assert!(matches!(
+            checkpoint.persist(),
+            Err(ControlPlaneError::Io { diagnostic })
+                if diagnostic.context() == "create control-plane state"
+        ));
+        let error = authority
+            .set_node_membership(NodeId::new(2), NodeMembershipState::Active)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneError::CommandDecode { message }
+                if message.contains("durability is poisoned")
+        ));
     }
 
     #[test]
