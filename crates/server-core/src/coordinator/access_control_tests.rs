@@ -5,6 +5,7 @@ use crate::coordinator::authz::BucketPolicyRequestContext;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
+use storage::test_support::StorageClusterMultipartTestSupport as _;
 
 #[derive(Debug, PartialEq, Eq)]
 enum SamePgProgressEvent {

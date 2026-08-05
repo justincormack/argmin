@@ -5989,7 +5989,14 @@ Final Phase 5 audit (2026-08-04):
   `StorageClusterLifecycleTestSupport`. These feature-gated trait methods
   remain intentionally callable by downstream tests; their corresponding
   inherent `StorageCluster` helpers are crate-private, and no durable claim,
-  queue, upload, or session record crosses the owner boundary; and
+  queue, upload, or session record crosses the owner boundary;
+- multipart authorization candidates, logical part observations, committed
+  manifest part numbers, and owner-defined checksum/incomplete-manifest fault
+  scenarios are exposed only through `StorageClusterMultipartTestSupport`.
+  These feature-gated trait methods remain intentionally callable by
+  downstream tests; their corresponding inherent `StorageCluster` helpers are
+  crate-private, so the production cluster surface no longer exposes these
+  test-only multipart entry points; and
 
 The audited cross-crate support families are:
 
@@ -6029,7 +6036,11 @@ Remaining implementation order after this audit:
    corresponding inherent helper methods are crate-private. Logical worker
    depth observations and storage-owned lifecycle setup are likewise
    consolidated behind `StorageClusterLifecycleTestSupport`, with the raw
-   inherent helpers made crate-private; and
+   inherent helpers made crate-private. The logical multipart observation and
+   semantic-fault family is consolidated behind
+   `StorageClusterMultipartTestSupport`; its feature-gated trait methods remain
+   downstream-callable while the corresponding inherent helpers are
+   crate-private; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the transitional raw-record seam and its plan exception are gone.
 

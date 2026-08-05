@@ -17210,7 +17210,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_multipart_completion_candidate(
+    pub(crate) fn test_get_multipart_completion_candidate(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17222,7 +17222,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_multipart_part_observation(
+    pub(crate) fn test_get_multipart_part_observation(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17856,7 +17856,7 @@ impl super::StorageCluster {
 
     /// Returns the logical part numbers in one committed multipart manifest.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_part_numbers(
+    pub(crate) fn test_get_object_part_numbers(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17869,7 +17869,7 @@ impl super::StorageCluster {
 
     /// Injects a storage-owned payload-checksum mismatch for one logical part.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_object_part_payload_checksum_mismatch(
+    pub(crate) fn test_inject_object_part_payload_checksum_mismatch(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17882,7 +17882,7 @@ impl super::StorageCluster {
 
     /// Injects a storage-owned incomplete-manifest fault at one logical part.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_incomplete_multipart_manifest(
+    pub(crate) fn test_inject_incomplete_multipart_manifest(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

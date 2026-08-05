@@ -538,6 +538,121 @@ pub mod test_support {
         }
     }
 
+    /// Logical multipart observations and storage-owned semantic fault setup
+    /// for cross-crate coordinator tests.
+    ///
+    /// Durable upload, part, and object-manifest records remain private to
+    /// storage. Callers receive only the production authorization candidate,
+    /// narrow logical part observations, or the result of an owner-defined
+    /// corruption scenario.
+    pub trait StorageClusterMultipartTestSupport {
+        fn test_get_multipart_completion_candidate(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<MultipartUploadCompletionCandidate, ObjectPgActionError>;
+
+        fn test_get_multipart_part_observation(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+            part_number: u16,
+        ) -> Result<TestMultipartPartObservation, ObjectPgActionError>;
+
+        fn test_get_object_part_numbers(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<Vec<u32>, ObjectPgActionError>;
+
+        fn test_inject_object_part_payload_checksum_mismatch(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            part_number: u32,
+        ) -> Result<(), ObjectPgActionError>;
+
+        fn test_inject_incomplete_multipart_manifest(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            part_number: u32,
+        ) -> Result<(), ObjectPgActionError>;
+    }
+
+    impl StorageClusterMultipartTestSupport for StorageCluster {
+        fn test_get_multipart_completion_candidate(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<MultipartUploadCompletionCandidate, ObjectPgActionError> {
+            StorageCluster::test_get_multipart_completion_candidate(self, bucket, key, upload_id)
+        }
+
+        fn test_get_multipart_part_observation(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+            part_number: u16,
+        ) -> Result<TestMultipartPartObservation, ObjectPgActionError> {
+            StorageCluster::test_get_multipart_part_observation(
+                self,
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            )
+        }
+
+        fn test_get_object_part_numbers(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<Vec<u32>, ObjectPgActionError> {
+            StorageCluster::test_get_object_part_numbers(self, bucket, key, version_id)
+        }
+
+        fn test_inject_object_part_payload_checksum_mismatch(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            part_number: u32,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_inject_object_part_payload_checksum_mismatch(
+                self,
+                bucket,
+                key,
+                version_id,
+                part_number,
+            )
+        }
+
+        fn test_inject_incomplete_multipart_manifest(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            part_number: u32,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_inject_incomplete_multipart_manifest(
+                self,
+                bucket,
+                key,
+                version_id,
+                part_number,
+            )
+        }
+    }
+
     mod retained_read;
     pub use retained_read::{TestRetainedReadPgMoveScenario, TestRetainedReadPgMoveScenarioError};
 
