@@ -17,7 +17,7 @@ subtle = "2"
 thiserror = "2"
 
 [features]
-test-utils = ["storage/test-hooks"]
+test-utils = []
 deep-tracing = [
     "auth/deep-tracing",
     "ec/deep-tracing",

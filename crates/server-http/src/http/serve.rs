@@ -5324,6 +5324,7 @@ mod tests {
     fn setup_frontend_with_storage_handle(
         storage_handle: storage::StorageClusterRouteHandle,
     ) -> Arc<HttpFrontend> {
+        let test_storage_cluster = storage_handle.current();
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
@@ -5347,6 +5348,7 @@ mod tests {
             identity_provider: auth::IdentityProvider::in_memory(credentials)
                 .expect("initialize session-token key ring"),
             host_id: Arc::<str>::from("host-id"),
+            test_storage_cluster,
             actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
@@ -6448,7 +6450,7 @@ Connection: close\r\n\r\n",
                 storage::RouteMapValidity::until_ms(cleanup_after.saturating_add(1_000)).unwrap(),
             );
             assert_eq!(
-                initial.test_scavenge_abandoned_stream_sessions(60_000),
+                storage::test_support::sweep_abandoned_stream_upload_sessions(&initial, 60_000,),
                 1,
                 "the durable deadline must let independent current-route cleanup finish"
             );
@@ -6601,7 +6603,7 @@ Connection: close\r\n\r\n",
                 storage::RouteMapValidity::until_ms(cleanup_after.saturating_add(1_000)).unwrap(),
             );
             assert_eq!(
-                initial.test_scavenge_abandoned_stream_sessions(60_000),
+                storage::test_support::sweep_abandoned_stream_upload_sessions(&initial, 60_000,),
                 1,
                 "the durable deadline must independently clean UploadPart state"
             );
@@ -8763,7 +8765,8 @@ Connection: close\r\n\r\n",
             "expected BadDigest body, got: {response}"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming session leaked after UploadPart bad checksum"
         );
@@ -8808,7 +8811,8 @@ Connection: close\r\n\r\n",
             "expected SignatureDoesNotMatch body, got: {response}"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming session leaked after UploadPart bad terminal signature"
         );
@@ -8863,7 +8867,8 @@ Connection: close\r\n\r\n",
             "expected BadDigest body, got: {response}"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming session leaked after PutObject bad checksum"
         );
@@ -8909,7 +8914,8 @@ Connection: close\r\n\r\n",
             "expected SignatureDoesNotMatch body, got: {response}"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming session leaked after PutObject bad terminal signature"
         );
@@ -9182,7 +9188,8 @@ Connection: close\r\n\r\n",
             assert_signed_list_parts_empty(&addr, "mybucket", "mykey", &upload_id);
         }
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming session leaked after presigned UploadPart rejection"
         );
@@ -9231,7 +9238,8 @@ Connection: close\r\n\r\n",
 
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming PUT abort guard left a durable stream session behind"
         );
@@ -9467,7 +9475,8 @@ Connection: close\r\n\r\n",
         let session_id = join.await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming PUT abort guard left session {session_id:?} after request-side drop"
         );
@@ -9514,7 +9523,8 @@ Connection: close\r\n\r\n",
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming POST abort guard left session {session_id:?} after request-side drop"
         );
@@ -9565,7 +9575,8 @@ Connection: close\r\n\r\n",
         let session_id = join.await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "streaming UploadPart abort guard left session {session_id:?} after request-side drop"
         );
@@ -9846,7 +9857,8 @@ Connection: keep-alive\r\n\r\n",
             "server read the full missing-sha256 PUT body before responding: sent {bytes_sent} bytes"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "missing-sha256 PUT should not create a stream session"
         );
@@ -9910,7 +9922,8 @@ Connection: keep-alive\r\n\r\n",
             "server read the full object-lock checksum failure PUT body before responding: sent {bytes_sent} bytes"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "object-lock checksum failure PUT should not create a stream session"
         );
@@ -9961,7 +9974,8 @@ Connection: keep-alive\r\n\r\n"
             "server read the full denied POST body before responding: sent {bytes_sent} bytes"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "policy-denied POST should not create a stream session"
         );
@@ -10012,7 +10026,8 @@ Connection: keep-alive\r\n\r\n"
             "server read the full over-max POST body before responding: sent {bytes_sent} bytes"
         );
         assert_eq!(
-            frontend.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&frontend.test_storage_cluster,)
+                .unwrap(),
             0,
             "over-max POST should not leak a stream session"
         );

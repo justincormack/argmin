@@ -17166,9 +17166,8 @@ impl StorageCluster {
         self.list_stream_upload_sessions_best_effort_inner()
     }
 
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn test_scavenge_abandoned_stream_sessions(&self, max_age_ms: u64) -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_scavenge_abandoned_stream_sessions(&self, max_age_ms: u64) -> usize {
         self.scavenge_abandoned_stream_sessions(max_age_ms).cleaned
     }
 

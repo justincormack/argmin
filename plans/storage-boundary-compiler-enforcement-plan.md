@@ -5959,18 +5959,21 @@ Final Phase 5 audit (2026-08-04):
   under `storage::test_support`, but they should not be moved owner-local when
   the test's actual assertion is HTTP/coordinator behavior across the
   publication boundary; and
-- `server-core/test-utils` still forwards `storage/test-hooks`. Its public
+- `server-core/test-utils` no longer forwards `storage/test-hooks`. Its public
   `put_object`, `upload_part`, and requester helpers use production admitted
-  paths, but enabling the feature also compiles older in-crate raw convenience
-  methods. Split or retire those methods, then remove the forwarding edge.
-  `server-core` unit tests may continue to enable `storage/test-hooks` through
-  their dev-dependency while the remaining migrations are performed.
+  paths. The obsolete raw-cluster stream-heartbeat helper was replaced by the
+  admitted production route, and the stale-session sweep is now either an
+  owner-local coordinator-unit helper or the storage-owned logical lifecycle
+  operation used by HTTP tests. `server-core --features test-utils` now
+  compiles without `storage/test-hooks`; `server-core` unit tests may continue
+  to enable `storage/test-hooks` through their dev-dependency while the
+  remaining migrations are performed;
 
 The audited cross-crate support families are:
 
 | Surface family | Principal consumers | Durable mutation | Final disposition |
 | --- | --- | --- | --- |
-| admitted `put_object`/`upload_part` test helpers | `server-http` | production operation | retain; remove unnecessary feature forwarding |
+| admitted `put_object`/`upload_part` test helpers | `server-http` | production operation | retained; unnecessary feature forwarding removed |
 | opaque object, multipart-part, and stream payload snapshots | `server-core`, `server-http` | no | retain under `storage::test_support` |
 | scheduling/deadline/publication hooks and worker lifecycle controls | `server-core`, `server-http`, `argmin-s3` | controlled fault/lifecycle action | retain under `storage::test_support` |
 | raw object/version/upload/session/bucket observations | `server-core` | no | replace with narrow logical observations or owner-local assertions |
@@ -5991,10 +5994,11 @@ Remaining implementation order after this audit:
 3. **Completed:** multipart-upload observations are logical owner-defined
    values or opaque generation evidence; raw upload generation/record access
    has been removed from the coordinator harnesses;
-4. consolidate the surviving guards, observations, and lifecycle controls
-   under `storage::test_support`, remove obsolete inherent `StorageCluster`
-   test methods, and remove `server-core/test-utils` forwarding of
-   `storage/test-hooks`; and
+4. **In progress:** consolidate the surviving guards, observations, and
+   lifecycle controls under `storage::test_support` and remove obsolete
+   inherent `StorageCluster` test methods. The `server-core/test-utils`
+   forwarding of `storage/test-hooks` is removed; its externally consumed
+   helpers now compile over the production storage feature set; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the transitional raw-record seam and its plan exception are gone.
 

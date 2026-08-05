@@ -941,6 +941,20 @@ pub mod test_support {
             .map(|sessions| sessions.len())
     }
 
+    /// Runs one storage-owned abandoned-session cleanup pass and returns the
+    /// number of sessions removed.
+    ///
+    /// This is a deterministic test-runtime lifecycle operation. Callers do
+    /// not select PGs, inspect durable session records, or bypass the
+    /// production cleanup implementation.
+    #[must_use]
+    pub fn sweep_abandoned_stream_upload_sessions(
+        cluster: &StorageCluster,
+        max_age_ms: u64,
+    ) -> usize {
+        cluster.test_scavenge_abandoned_stream_sessions(max_age_ms)
+    }
+
     /// Returns the number of sessions for one exact UploadPart target.
     ///
     /// Storage retains ownership of the durable session record and target

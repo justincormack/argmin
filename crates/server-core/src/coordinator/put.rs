@@ -867,25 +867,10 @@ impl Coordinator {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<(), ServerError> {
-        self.heartbeat_stream_put_session_with_storage_node(
-            &self.storage_node(),
-            bucket,
-            key,
-            session_id,
+        let admission = self.admit_storage_route_for_request()?;
+        self.heartbeat_stream_put_session_with_storage_admission(
+            &admission, bucket, key, session_id,
         )
-    }
-
-    #[cfg(any(test, feature = "test-utils"))]
-    pub fn heartbeat_stream_put_session_with_storage_node(
-        &self,
-        storage_node: &std::sync::Arc<storage::StorageCluster>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        session_id: &SessionId,
-    ) -> Result<(), ServerError> {
-        storage_node
-            .heartbeat_put_object_stream_session(bucket, key, session_id)
-            .map_err(Self::map_object_pg_action_error)
     }
 
     pub fn heartbeat_stream_put_session_with_storage_admission(

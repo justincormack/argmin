@@ -693,9 +693,11 @@ impl Coordinator {
         )
     }
 
-    #[cfg(any(test, feature = "test-utils"))]
+    #[cfg(test)]
     pub fn scavenge_stale_sessions(&self, max_age_ms: u64) -> usize {
-        self.storage_node()
-            .test_scavenge_abandoned_stream_sessions(max_age_ms)
+        storage::test_support::sweep_abandoned_stream_upload_sessions(
+            &self.storage_node(),
+            max_age_ms,
+        )
     }
 }

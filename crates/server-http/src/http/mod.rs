@@ -642,6 +642,8 @@ pub struct HttpFrontend {
     pub identity_provider: IdentityProvider,
     pub host_id: Arc<str>,
     #[cfg(test)]
+    test_storage_cluster: Arc<storage::StorageCluster>,
+    #[cfg(test)]
     actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize,
 }
 
@@ -651,6 +653,8 @@ impl Clone for HttpFrontend {
             coordinator: Arc::clone(&self.coordinator),
             identity_provider: self.identity_provider.clone(),
             host_id: Arc::clone(&self.host_id),
+            #[cfg(test)]
+            test_storage_cluster: Arc::clone(&self.test_storage_cluster),
             #[cfg(test)]
             actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize::new(
                 self.actual_cors_metadata_lookup_count
@@ -6775,7 +6779,7 @@ mod tests {
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
         let coordinator = Coordinator::new_with_managed_key_provider_for_storage_cluster(
-            storage_cluster,
+            Arc::clone(&storage_cluster),
             "us-east-1".to_string(),
             None,
             sse_s3_provider,
@@ -6793,6 +6797,7 @@ mod tests {
             identity_provider: auth::IdentityProvider::in_memory(credentials)
                 .expect("initialize session-token key ring"),
             host_id: Arc::<str>::from("host-id"),
+            test_storage_cluster: storage_cluster,
             actual_cors_metadata_lookup_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
@@ -10908,7 +10913,7 @@ mod tests {
         }
 
         assert_eq!(
-            fe.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&fe.test_storage_cluster).unwrap(),
             0,
             "policy-denied POST should not create a stream session"
         );
@@ -10949,7 +10954,7 @@ mod tests {
         fe.abort_streaming_post_object(&ctx);
 
         assert_eq!(
-            fe.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&fe.test_storage_cluster).unwrap(),
             0,
             "aborted POST should not leave a stream session"
         );
@@ -11051,7 +11056,7 @@ mod tests {
         }
 
         assert_eq!(
-            fe.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&fe.test_storage_cluster).unwrap(),
             0,
             "wrong-region POST should not create a stream session"
         );
@@ -13096,7 +13101,7 @@ mod tests {
 
         // No leaked streaming sessions.
         assert_eq!(
-            fe.coordinator.scavenge_stale_sessions(0),
+            storage::test_support::stream_upload_session_count(&fe.test_storage_cluster).unwrap(),
             0,
             "streaming session leaked after PutObject precondition failure"
         );
