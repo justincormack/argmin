@@ -82,6 +82,20 @@ impl PgStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_force_stream_upload_cleanup_after(
+        &self,
+        session_id: &SessionId,
+        cleanup_after: Option<u64>,
+    ) -> Result<(), StoreError> {
+        let changed = self.execute_cached(
+            "UPDATE stream_uploads SET cleanup_after = ?1 WHERE session_id = ?2",
+            params![cleanup_after.map(|deadline| deadline as i64), session_id],
+            "force stream upload cleanup_after for test",
+        )?;
+        require_one_test_mutation(changed)
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_force_stream_upload_next_segment_vid(
         &self,
         session_id: &SessionId,

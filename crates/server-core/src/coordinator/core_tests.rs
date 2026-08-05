@@ -1337,12 +1337,14 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
-    assert!(
-        cluster
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .all(|session| session.bucket.as_str() != "bucket"
-                || session.key.as_str() != "late-stream-create"),
+    assert_eq!(
+        storage::test_support::stream_upload_session_count_for_object(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-stream-create"),
+        )
+        .unwrap(),
+        0,
         "expired creation must not publish a stream session"
     );
 
@@ -1467,12 +1469,14 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
         )
         .unwrap()
         .is_none());
-    assert!(
-        cluster
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .all(|session| session.bucket.as_str() != "bucket"
-                || session.key.as_str() != "late-promoted-put"),
+    assert_eq!(
+        storage::test_support::stream_upload_session_count_for_object(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-promoted-put"),
+        )
+        .unwrap(),
+        0,
         "the failed buffered PUT must abort its promoted stream session"
     );
 }
@@ -1587,12 +1591,14 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
         )
         .unwrap()
         .is_none());
-    assert!(
-        cluster
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .all(|session| session.bucket.as_str() != "bucket"
-                || session.key.as_str() != "late-copy-destination"),
+    assert_eq!(
+        storage::test_support::stream_upload_session_count_for_object(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-copy-destination"),
+        )
+        .unwrap(),
+        0,
         "failed CopyObject must abort its destination stream session through retained cleanup"
     );
 }
@@ -1678,16 +1684,25 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
     let hook_cluster = Arc::clone(&cluster);
     let append_hook =
         cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
-            let session = hook_cluster
-                .list_stream_upload_sessions_best_effort()
-                .into_iter()
-                .find(|session| {
-                    session.bucket.as_str() == "bucket"
-                        && session.key.as_str() == "late-part-copy-destination"
-                })
-                .expect("UploadPartCopy stream session must exist before append publication");
+            let bucket = trusted_bucket_name("bucket");
+            let key = trusted_object_key("late-part-copy-destination");
+            let session_ids = storage::test_support::stream_upload_session_ids_for_object(
+                &hook_cluster,
+                &bucket,
+                &key,
+            )
+            .unwrap();
+            let [session_id] = session_ids.as_slice() else {
+                panic!("UploadPartCopy must have exactly one destination stream session")
+            };
             assert_eq!(
-                session.cleanup_after,
+                storage::test_support::stream_upload_session_cleanup_after(
+                    &hook_cluster,
+                    &bucket,
+                    &key,
+                    session_id,
+                )
+                .unwrap(),
                 Some(5_000),
                 "the admitted multipart route must persist its captured authority deadline"
             );
@@ -1731,12 +1746,14 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
             "expired UploadPartCopy must remove every staged destination shard"
         );
     }
-    assert!(
-        cluster
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .all(|session| session.bucket.as_str() != "bucket"
-                || session.key.as_str() != "late-part-copy-destination"),
+    assert_eq!(
+        storage::test_support::stream_upload_session_count_for_object(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-part-copy-destination"),
+        )
+        .unwrap(),
+        0,
         "failed UploadPartCopy must abort its destination stream session"
     );
     assert!(storage::test_support::multipart_upload_exists(
@@ -1813,13 +1830,14 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
             },
         )
         .unwrap();
-    let session = cluster
-        .list_stream_upload_sessions_best_effort()
-        .into_iter()
-        .find(|session| session.session_id == begin.session_id)
-        .expect("ordinary UploadPart must create a durable stream session");
     assert_eq!(
-        session.cleanup_after,
+        storage::test_support::stream_upload_session_cleanup_after(
+            &cluster,
+            &bucket,
+            &key,
+            &begin.session_id,
+        )
+        .unwrap(),
         Some(5_000),
         "ordinary UploadPart must persist the captured admission deadline"
     );
@@ -1875,17 +1893,23 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         .test_capture_stream_upload_payload(&bucket, &key, &begin.session_id)
         .unwrap()
         .is_empty());
-    assert!(cluster
-        .list_stream_upload_sessions_best_effort()
-        .into_iter()
-        .any(|session| session.session_id == begin.session_id));
+    assert!(storage::test_support::stream_upload_session_exists(
+        &cluster,
+        &bucket,
+        &key,
+        &begin.session_id,
+    )
+    .unwrap());
     coord
         .abort_stream_upload_with_retained_cleanup(&cleanup, &begin.session_id)
         .unwrap();
-    assert!(cluster
-        .list_stream_upload_sessions_best_effort()
-        .into_iter()
-        .all(|session| session.session_id != begin.session_id));
+    assert!(!storage::test_support::stream_upload_session_exists(
+        &cluster,
+        &bucket,
+        &key,
+        &begin.session_id,
+    )
+    .unwrap());
     assert!(storage::test_support::multipart_upload_exists(
         &cluster,
         &bucket,
@@ -1978,10 +2002,13 @@ fn stream_put_finalization_expires_inside_command_build() {
         )
         .unwrap()
         .is_none());
-    assert!(cluster
-        .list_stream_upload_sessions_best_effort()
-        .iter()
-        .any(|session| session.session_id == prepared.session_id));
+    assert!(storage::test_support::stream_upload_session_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("late-stream-finalize"),
+        &prepared.session_id,
+    )
+    .unwrap());
     drop(admission);
     coord
         .abort_stream_upload_with_retained_cleanup(&cleanup, &prepared.session_id)
@@ -4438,7 +4465,10 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         .begin_stream_part_on_admitted_route(&foreign_admission, &streamed_part_request)
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
-    assert!(cluster.list_stream_upload_sessions_best_effort().is_empty());
+    assert_eq!(
+        storage::test_support::stream_upload_session_count(&cluster).unwrap(),
+        0
+    );
 
     let streamed_part = foreign
         .begin_stream_part_on_admitted_route(&foreign_admission, &streamed_part_request)
@@ -6082,10 +6112,13 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
         "the cleanup deadline must survive route publication"
     );
     assert!(
-        refreshed
-            .list_stream_upload_sessions_best_effort()
-            .iter()
-            .any(|session| session.session_id == session_id),
+        storage::test_support::stream_upload_session_exists(
+            &refreshed,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap(),
         "the refreshed maintenance scan must discover the durable session"
     );
     time.set(cleanup_after + 1);
@@ -12270,10 +12303,13 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
         "caller cleanup must remove the staged stream segments"
     );
     assert!(
-        storage_cluster
-            .list_stream_upload_sessions_best_effort()
-            .iter()
-            .all(|session| session.session_id != session_id),
+        !storage::test_support::stream_upload_session_exists(
+            &storage_cluster,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap(),
         "caller cleanup must remove the stale stream session"
     );
 }
@@ -12343,10 +12379,10 @@ fn copy_object_destination_create_stream_maps_command_log_conflict_to_slow_down(
         "expected CopyObject destination stream create conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
-    let leaked_sessions = storage_cluster.list_stream_upload_sessions_best_effort();
-    assert!(
-        leaked_sessions.is_empty(),
-        "failed CopyObject destination stream create must not leave stream uploads: {leaked_sessions:?}"
+    assert_eq!(
+        storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
+        0,
+        "failed CopyObject destination stream create must not leave stream uploads"
     );
 }
 
@@ -12526,10 +12562,10 @@ fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
         source.body.read_all().unwrap(),
         b"copy source that must not be published"
     );
-    let leaked_sessions = storage_cluster.list_stream_upload_sessions_best_effort();
-    assert!(
-        leaked_sessions.is_empty(),
-        "failed CopyObject must clean its destination stream: {leaked_sessions:?}"
+    assert_eq!(
+        storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
+        0,
+        "failed CopyObject must clean its destination stream"
     );
 }
 
@@ -12655,10 +12691,10 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
         0,
         "CopyObject cleanup should retry transient abort conflicts"
     );
-    let leaked_sessions = storage_cluster.list_stream_upload_sessions_best_effort();
-    assert!(
-        leaked_sessions.is_empty(),
-        "failed CopyObject must not leave stream uploads after retrying abort cleanup: {leaked_sessions:?}"
+    assert_eq!(
+        storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
+        0,
+        "failed CopyObject must not leave stream uploads after retrying abort cleanup"
     );
 }
 

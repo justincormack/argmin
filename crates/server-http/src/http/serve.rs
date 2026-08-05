@@ -5915,25 +5915,20 @@ Content-Length: {}\r\n\
         .await
         .unwrap();
 
-        let session = tokio::time::timeout(Duration::from_secs(3), async {
+        let bucket = storage::BucketName::try_from("route-expiry-bucket".to_string()).unwrap();
+        let key = storage::ObjectKey::try_from("key".to_string()).unwrap();
+        let session_id = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                if let Some(session) = initial
-                    .list_stream_upload_sessions_best_effort()
-                    .into_iter()
-                    .find(|session| {
-                        session.bucket.as_str() == "route-expiry-bucket"
-                            && session.key.as_str() == "key"
-                    })
-                {
+                let session_ids = storage::test_support::stream_upload_session_ids_for_object(
+                    &initial, &bucket, &key,
+                )
+                .unwrap();
+                if let [session_id] = session_ids.as_slice() {
                     if initial
-                        .test_capture_stream_upload_payload(
-                            &session.bucket,
-                            &session.key,
-                            &session.session_id,
-                        )
+                        .test_capture_stream_upload_payload(&bucket, &key, session_id)
                         .is_ok_and(|payload| !payload.is_empty())
                     {
-                        break session;
+                        break session_id.clone();
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -5942,18 +5937,14 @@ Content-Length: {}\r\n\
         .await
         .expect("streaming PUT must promote and publish a staged segment before expiry");
         let staged_payload = initial
-            .test_capture_stream_upload_payload(&session.bucket, &session.key, &session.session_id)
+            .test_capture_stream_upload_payload(&bucket, &key, &session_id)
             .unwrap();
         assert!(!staged_payload.is_empty());
         assert!(initial
             .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
             .unwrap());
         assert!(initial
-            .test_object_generation_reservation_for(
-                &session.bucket,
-                &session.key,
-                &session.session_id,
-            )
+            .test_object_generation_reservation_for(&bucket, &key, &session_id,)
             .is_ok());
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
@@ -5987,16 +5978,15 @@ Content-Length: {}\r\n\
         .unwrap();
         assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
         initial.test_store_route_map_validity(long_lived_test_route_map_validity());
-        assert!(initial
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .all(|candidate| candidate.session_id != session.session_id));
+        assert!(!storage::test_support::stream_upload_session_exists(
+            &initial,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap());
         assert!(matches!(
-            initial.test_object_generation_reservation_for(
-                &session.bucket,
-                &session.key,
-                &session.session_id,
-            ),
+            initial.test_object_generation_reservation_for(&bucket, &key, &session_id,),
             Err(storage::ObjectPgActionError::Metadata(
                 storage::MetadataError::ObjectGenerationReservationNotFound { .. }
             ))
@@ -6136,7 +6126,10 @@ Connection: close\r\n\r\n",
             Err(ServerError::SlowDown)
         ));
         drop(hook);
-        assert!(initial.list_stream_upload_sessions_best_effort().is_empty());
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&initial).unwrap(),
+            0
+        );
 
         initial.test_store_route_map_validity(
             storage::RouteMapValidity::until_ms(
@@ -6178,7 +6171,10 @@ Connection: close\r\n\r\n",
             Err(ServerError::SlowDown)
         ));
         drop(hook);
-        assert!(initial.list_stream_upload_sessions_best_effort().is_empty());
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&initial).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -6221,9 +6217,10 @@ Connection: close\r\n\r\n",
             .admit_storage_route_for_request()
             .is_ok());
         drop(hook);
-        assert!(storage_cluster
-            .list_stream_upload_sessions_best_effort()
-            .is_empty());
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
+            0
+        );
 
         clock.set(1_000);
         create_test_bucket(&frontend, "initial-mutation-put-bucket");
@@ -6273,9 +6270,10 @@ Connection: close\r\n\r\n",
             .admit_storage_route_for_request()
             .is_ok());
         drop(hook);
-        assert!(storage_cluster
-            .list_stream_upload_sessions_best_effort()
-            .is_empty());
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
+            0
+        );
 
         clock.set(1_000);
         storage_cluster
@@ -6321,9 +6319,10 @@ Connection: close\r\n\r\n",
             .admit_storage_route_for_request()
             .is_ok());
         drop(hook);
-        assert!(storage_cluster
-            .list_stream_upload_sessions_best_effort()
-            .is_empty());
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
+            0
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6369,12 +6368,14 @@ Connection: close\r\n\r\n",
         assert!(initial
             .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
             .unwrap());
-        let cleanup_after = initial
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .find(|session| session.session_id == session_id)
-            .and_then(|session| session.cleanup_after)
-            .expect("HTTP stream creation must persist its route cleanup deadline");
+        let cleanup_after = storage::test_support::stream_upload_session_cleanup_after(
+            &initial,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap()
+        .expect("HTTP stream creation must persist its route cleanup deadline");
 
         let state = Arc::new(ServerState {
             pool: vec![Arc::clone(&frontend)],
@@ -6434,10 +6435,13 @@ Connection: close\r\n\r\n",
         .await
         .expect("retained POST cleanup must be attempted before the durable handoff");
         initial.test_store_route_map_validity(long_lived_test_route_map_validity());
-        assert!(initial
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .any(|session| session.session_id == session_id));
+        assert!(storage::test_support::stream_upload_session_exists(
+            &initial,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap());
         drop(retained_abort_failure);
         storage::clock::with_time_override(cleanup_after, || {
             initial.test_store_route_map_validity(
@@ -6449,10 +6453,13 @@ Connection: close\r\n\r\n",
                 "the durable deadline must let independent current-route cleanup finish"
             );
         });
-        assert!(initial
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .all(|session| session.session_id != session_id));
+        assert!(!storage::test_support::stream_upload_session_exists(
+            &initial,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap());
         assert!(matches!(
             initial.test_object_generation_reservation_for(&bucket, &key, &session_id),
             Err(storage::ObjectPgActionError::Metadata(
@@ -6514,12 +6521,14 @@ Connection: close\r\n\r\n",
         assert!(initial
             .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
             .unwrap());
-        let cleanup_after = initial
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .find(|session| session.session_id == session_id)
-            .and_then(|session| session.cleanup_after)
-            .expect("UploadPart stream creation must persist its route cleanup deadline");
+        let cleanup_after = storage::test_support::stream_upload_session_cleanup_after(
+            &initial,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap()
+        .expect("UploadPart stream creation must persist its route cleanup deadline");
 
         let state = Arc::new(ServerState {
             pool: vec![Arc::clone(&frontend)],
@@ -6579,10 +6588,13 @@ Connection: close\r\n\r\n",
         .await
         .expect("retained UploadPart cleanup must be attempted before the durable handoff");
         initial.test_store_route_map_validity(long_lived_test_route_map_validity());
-        assert!(initial
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .any(|session| session.session_id == session_id));
+        assert!(storage::test_support::stream_upload_session_exists(
+            &initial,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap());
         drop(retained_abort_failure);
         storage::clock::with_time_override(cleanup_after, || {
             initial.test_store_route_map_validity(
@@ -6594,10 +6606,13 @@ Connection: close\r\n\r\n",
                 "the durable deadline must independently clean UploadPart state"
             );
         });
-        assert!(initial
-            .list_stream_upload_sessions_best_effort()
-            .into_iter()
-            .all(|session| session.session_id != session_id));
+        assert!(!storage::test_support::stream_upload_session_exists(
+            &initial,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap());
         assert!(initial
             .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
             .unwrap());

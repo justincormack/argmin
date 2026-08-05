@@ -79,15 +79,48 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
     for session in &sessions {
         cluster.test_create_stream_upload(session).unwrap();
     }
+    let deadline_session_id = crate::SessionId::try_from("07".repeat(16)).unwrap();
+    let deadline_session = crate::CreateStreamUploadReq {
+        session_id: deadline_session_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        target: crate::StreamUploadTarget::PutObject,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .test_create_stream_upload(&deadline_session)
+        .unwrap();
+    cluster
+        .test_force_stream_upload_cleanup_after(&bucket, &key, &deadline_session_id, Some(1_234))
+        .unwrap();
+    let second_deadline_session_id = crate::SessionId::try_from("08".repeat(16)).unwrap();
+    let second_deadline_session = crate::CreateStreamUploadReq {
+        session_id: second_deadline_session_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        target: crate::StreamUploadTarget::PutObject,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .test_create_stream_upload(&second_deadline_session)
+        .unwrap();
+    cluster
+        .test_force_stream_upload_cleanup_after(
+            &bucket,
+            &key,
+            &second_deadline_session_id,
+            Some(5_678),
+        )
+        .unwrap();
 
     assert_eq!(
         crate::test_support::stream_upload_session_count(&cluster).unwrap(),
-        6
+        8
     );
     assert_eq!(
         crate::test_support::stream_upload_session_count_for_object(&cluster, &bucket, &key)
             .unwrap(),
-        4
+        6
     );
     assert_eq!(
         crate::test_support::stream_upload_session_count_for_object(
@@ -97,6 +130,95 @@ fn logical_upload_part_stream_session_count_binds_the_complete_target() {
         )
         .unwrap(),
         1
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_ids_for_object(&cluster, &bucket, &key).unwrap(),
+        vec![
+            sessions[0].session_id.clone(),
+            sessions[2].session_id.clone(),
+            sessions[3].session_id.clone(),
+            sessions[4].session_id.clone(),
+            deadline_session_id.clone(),
+            second_deadline_session_id.clone(),
+        ]
+    );
+    assert!(crate::test_support::stream_upload_session_exists(
+        &cluster,
+        &bucket,
+        &key,
+        &sessions[0].session_id,
+    )
+    .unwrap());
+    assert!(!crate::test_support::stream_upload_session_exists(
+        &cluster,
+        &crossed_bucket,
+        &key,
+        &sessions[0].session_id,
+    )
+    .unwrap());
+    assert!(!crate::test_support::stream_upload_session_exists(
+        &cluster,
+        &bucket,
+        &crossed_key,
+        &sessions[0].session_id,
+    )
+    .unwrap());
+    assert!(!crate::test_support::stream_upload_session_exists(
+        &cluster,
+        &bucket,
+        &key,
+        &sessions[1].session_id,
+    )
+    .unwrap());
+    assert_eq!(
+        crate::test_support::stream_upload_session_cleanup_after(
+            &cluster,
+            &bucket,
+            &key,
+            &deadline_session_id,
+        )
+        .unwrap(),
+        Some(1_234)
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_cleanup_after(
+            &cluster,
+            &bucket,
+            &key,
+            &second_deadline_session_id,
+        )
+        .unwrap(),
+        Some(5_678)
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_cleanup_after(
+            &cluster,
+            &bucket,
+            &key,
+            &sessions[0].session_id,
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_cleanup_after(
+            &cluster,
+            &bucket,
+            &crossed_key,
+            &deadline_session_id,
+        )
+        .unwrap(),
+        None
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_cleanup_after(
+            &cluster,
+            &crossed_bucket,
+            &key,
+            &deadline_session_id,
+        )
+        .unwrap(),
+        None
     );
     assert_eq!(
         crate::test_support::stream_upload_session_count_for_object(

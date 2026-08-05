@@ -875,6 +875,62 @@ pub mod test_support {
         })
     }
 
+    /// Returns the logical session identities for one object without exposing
+    /// durable stream-upload records or their physical placement.
+    pub fn stream_upload_session_ids_for_object(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<SessionId>, ObjectPgActionError> {
+        cluster.test_list_all_stream_uploads().map(|sessions| {
+            let mut session_ids = sessions
+                .into_iter()
+                .filter(|session| session.bucket == *bucket && session.key == *key)
+                .map(|session| session.session_id)
+                .collect::<Vec<_>>();
+            session_ids.sort();
+            session_ids
+        })
+    }
+
+    pub fn stream_upload_session_exists(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<bool, ObjectPgActionError> {
+        cluster.test_list_all_stream_uploads().map(|sessions| {
+            sessions.into_iter().any(|session| {
+                session.bucket == *bucket
+                    && session.key == *key
+                    && session.session_id == *session_id
+            })
+        })
+    }
+
+    /// Returns the durable cleanup deadline for one exact stream session.
+    ///
+    /// `None` covers both an absent session and a session deliberately created
+    /// without a deadline. Callers which need to distinguish those states must
+    /// first use [`stream_upload_session_exists`].
+    pub fn stream_upload_session_cleanup_after(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<Option<u64>, ObjectPgActionError> {
+        cluster.test_list_all_stream_uploads().map(|sessions| {
+            sessions
+                .into_iter()
+                .find(|session| {
+                    session.bucket == *bucket
+                        && session.key == *key
+                        && session.session_id == *session_id
+                })
+                .and_then(|session| session.cleanup_after)
+        })
+    }
+
     /// Returns the logical number of durable stream-upload sessions without
     /// exposing their storage-owned records to downstream crates.
     pub fn stream_upload_session_count(

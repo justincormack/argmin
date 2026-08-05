@@ -5901,9 +5901,12 @@ Implementation update (2026-08-03):
   and that raw cluster listing is crate-private. An owner-local positive matrix
   creates matching and crossed bucket, key, upload-ID, part-number, and
   PutObject sessions and pins every field in the per-object and exact-target
-  predicates. The separately retained production best-effort diagnostic still
-  returns session records to expiry/cleanup tests and remains part of the final
-  support-surface consolidation; and
+  predicates. The later expiry/cleanup migration also removed the raw
+  best-effort record listing from downstream tests. Those tests now use exact
+  logical session IDs, existence, counts, and cleanup deadlines, with an
+  owner-local matrix pinning bucket, key, session identity, deadline presence,
+  and crossed subjects. The raw best-effort scan remains private to storage's
+  production sweeper and storage-owner tests; and
 - removed the broad cross-crate multipart-upload projection. Coordinator and
   property tests now use separate storage-owned observations for existence,
   per-bucket/per-object counts and IDs, initiation time, owner selection,
@@ -5946,9 +5949,10 @@ Final Phase 5 audit (2026-08-04):
   multipart state-machine harness now uses exact logical session/upload counts
   and upload state. The other coordinator suites now use purpose-specific
   multipart-upload observations and an opaque completion-generation subject;
-  the broad upload record projection is gone. Most stream-session observation
-  uses logical counts, while the production best-effort diagnostic still
-  exposes records to expiry/cleanup tests and remains to be consolidated;
+  the broad upload record projection is gone. Stream-session observation now
+  uses exact logical counts, IDs, existence, target counts, and cleanup
+  deadlines; no downstream test receives the production sweeper's raw record
+  listing;
 - the runtime-map validity, admission barriers, fault scheduling hooks, opaque
   payload snapshots, worker wake/drain controls, and process-level Raft test
   servers fit the allowed support categories. They should be consolidated

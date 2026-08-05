@@ -18420,6 +18420,18 @@ impl super::StorageCluster {
             .test_create_stream_upload(req)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_force_stream_upload_cleanup_after(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        cleanup_after: Option<u64>,
+    ) -> Result<(), ObjectPgActionError> {
+        self.metadata_primary_bridge_node()?
+            .test_force_stream_upload_cleanup_after(bucket, key, session_id, cleanup_after)
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
         self.metadata_primary_bridge_node()?

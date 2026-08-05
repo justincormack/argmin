@@ -1492,6 +1492,20 @@ impl SharedStorageNode {
         Ok(pg.create_stream_upload(req)?)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_force_stream_upload_cleanup_after(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        cleanup_after: Option<u64>,
+    ) -> Result<(), ObjectPgActionError> {
+        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg = self.get_pg(pg_id)?;
+        pg.test_force_stream_upload_cleanup_after(session_id, cleanup_after)?;
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_hook_scope_id(&self) -> usize {
         std::ptr::from_ref(self).addr()

@@ -17161,9 +17161,8 @@ impl StorageCluster {
         summary
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[doc(hidden)]
-    pub fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
+    #[cfg(test)]
+    pub(crate) fn list_stream_upload_sessions_best_effort(&self) -> Vec<StreamUploadRecord> {
         self.list_stream_upload_sessions_best_effort_inner()
     }
 
