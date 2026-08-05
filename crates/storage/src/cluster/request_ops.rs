@@ -4582,14 +4582,14 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_seed_bucket_delete_attempt_outcome(
+    pub(crate) fn test_seed_bucket_delete_attempt_outcome(
         &self,
         bucket: &BucketName,
         outcome: crate::TestBucketDeleteAttemptOutcomeKind,
         phase: crate::TestBucketDeleteAttemptPhase,
         detail: String,
         post_reservation_next_object_pg_id: Option<u32>,
-    ) -> Result<(), BucketWriteDrainError> {
+    ) -> Result<crate::BucketDeleteBeginRoot, BucketWriteDrainError> {
         let drain = match self.begin_durable_bucket_delete_drain(bucket)? {
             super::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
             super::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
@@ -4604,6 +4604,33 @@ impl super::StorageCluster {
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)
             .map_err(BucketWriteDrainError::from)?;
+        let bucket_info = node
+            .bucket_metadata_client()
+            .open_bucket_metadata_route(
+                self.operation_epoch(),
+                self.validated_bucket_metadata_pg(pg_id),
+                bucket,
+            )
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
+            .head_bucket_raw()
+            .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        if bucket_info.state != BucketState::Active {
+            return Err(MetadataError::BucketNotFinalizedForDelete {
+                state: bucket_info.state,
+            }
+            .into());
+        }
+        if bucket_info.bucket_execution_generation != drain.record.bucket_execution_generation {
+            return Err(MetadataError::BucketWriteDrainConflict {
+                drain_id: drain.record.drain_id.clone(),
+            }
+            .into());
+        }
+        let root = crate::BucketDeleteBeginRoot {
+            bucket: drain.record.bucket.clone(),
+            bucket_execution_generation: drain.record.bucket_execution_generation,
+            bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
+        };
         let record = BucketDeleteAttemptOutcomeRecord {
             bucket: drain.record.bucket.clone(),
             drain_id: drain.record.drain_id.clone(),
@@ -4628,7 +4655,8 @@ impl super::StorageCluster {
         )
         .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
         .record_bucket_delete_attempt_outcome(&record)
-        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)
+        .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
+        Ok(root)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -12576,7 +12604,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_enqueue_bucket_delete_begin(
+    pub(crate) fn test_enqueue_bucket_delete_begin(
         &self,
         bucket: &BucketName,
         bucket_execution_generation: u64,
@@ -16905,7 +16933,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
+    pub(crate) fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
         self.metadata_primary_bridge_node()
             .expect("test hook requires a current storage cluster handle")
             .test_ec_scratch_allocation_count(shape)
@@ -16921,7 +16949,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_head_bucket_raw(
+    pub(crate) fn test_head_bucket_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
@@ -16930,7 +16958,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_begin_bucket_delete_if_current(
+    pub(crate) fn test_begin_bucket_delete_if_current(
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
@@ -17207,7 +17235,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_bucket_delete_progress(
+    pub(crate) fn test_bucket_delete_progress(
         &self,
         bucket: &BucketName,
     ) -> Result<crate::TestBucketDeleteProgress, BucketSnapshotLoadError> {
@@ -17284,7 +17312,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_generation_reservation_for(
+    pub(crate) fn test_object_generation_reservation_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17294,7 +17322,6 @@ impl super::StorageCluster {
             .test_object_generation_reservation_for(bucket, key, reservation_id)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn test_get_object_meta(
         &self,

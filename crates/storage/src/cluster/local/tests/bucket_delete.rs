@@ -1,6 +1,161 @@
 use super::*;
 use crate::metadata_command::DeleteFinalizedBucketCommand;
+use crate::test_support::StorageClusterLifecycleTestSupport as _;
 use crate::BucketAclSummary;
+
+#[test]
+fn bucket_delete_progress_observation_binds_the_exact_bucket() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let target = crate::tests::bucket_name("delete-progress-target");
+    let canary = crate::tests::bucket_name("delete-progress-canary");
+    create_test_bucket(&cluster, &target);
+    create_test_bucket(&cluster, &canary);
+
+    cluster
+        .test_begin_durable_bucket_delete_drain(&target)
+        .unwrap();
+
+    assert_eq!(
+        cluster
+            .test_observe_bucket_delete_progress(&target)
+            .unwrap(),
+        crate::TestBucketDeleteProgress {
+            bucket_state: Some(crate::BucketState::Active),
+            has_durable_write_drain: true,
+            has_pending_metadata_command: false,
+        }
+    );
+    assert_eq!(
+        cluster
+            .test_observe_bucket_delete_progress(&canary)
+            .unwrap(),
+        crate::TestBucketDeleteProgress {
+            bucket_state: Some(crate::BucketState::Active),
+            has_durable_write_drain: false,
+            has_pending_metadata_command: false,
+        }
+    );
+}
+
+#[test]
+fn bucket_delete_subject_binds_incarnation_and_exactly_once_transition() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let target = crate::tests::bucket_name("delete-subject-target");
+    let canary = crate::tests::bucket_name("delete-subject-canary");
+    create_test_bucket(&cluster, &target);
+    create_test_bucket(&cluster, &canary);
+    let canary_subject = cluster
+        .test_capture_bucket_delete_begin_subject(&canary)
+        .unwrap();
+    let initial_generation = cluster
+        .test_head_bucket_raw(&target)
+        .unwrap()
+        .bucket_execution_generation;
+    assert!(!cluster
+        .test_bucket_execution_generation_is_newer_than(&target, initial_generation)
+        .unwrap());
+    cluster
+        .put_bucket_versioning_and_load_info(&target, crate::BucketVersioningState::Enabled)
+        .unwrap();
+    assert!(cluster
+        .test_bucket_execution_generation_is_newer_than(&target, initial_generation)
+        .unwrap());
+
+    let target_subject = cluster
+        .test_capture_bucket_delete_begin_subject(&target)
+        .unwrap();
+
+    cluster.test_begin_current_bucket_delete(&target).unwrap();
+
+    assert!(cluster
+        .test_current_bucket_delete_marked_once(&target_subject)
+        .unwrap());
+    assert!(!cluster
+        .test_current_bucket_delete_marked_once(&canary_subject)
+        .unwrap());
+    assert_eq!(
+        cluster.test_bucket_presence(&target).unwrap(),
+        crate::test_support::TestBucketPresence::Deleting
+    );
+    assert_eq!(
+        cluster.test_bucket_presence(&canary).unwrap(),
+        crate::test_support::TestBucketPresence::Active
+    );
+
+    assert_eq!(
+        cluster.try_finalize_bucket_delete(&target).unwrap(),
+        crate::BucketDeleteFinalizeOutcome::Finalized
+    );
+    create_test_bucket(&cluster, &target);
+    assert!(cluster
+        .test_current_bucket_is_distinct_active_incarnation(&target_subject)
+        .unwrap());
+    assert!(!cluster
+        .test_current_bucket_is_distinct_active_incarnation(&canary_subject)
+        .unwrap());
+}
+
+#[test]
+fn seeded_bucket_delete_subject_uses_the_acquired_drain_generation() {
+    let _serial = lock_bucket_scoped_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(map).unwrap());
+    let bucket = crate::tests::bucket_name("seeded-delete-subject");
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_ran_for_hook = Arc::clone(&hook_ran);
+    let cluster_for_hook = Arc::clone(&cluster);
+    let bucket_for_hook = bucket.clone();
+    let hook = crate::node::install_bucket_scoped_test_hooks(crate::node::BucketScopedTestHooks {
+        target: Some(bucket.clone()),
+        before_begin_bucket_delete_drain: Some(Arc::new(move || {
+            if !hook_ran_for_hook.swap(true, Ordering::SeqCst) {
+                cluster_for_hook
+                    .put_bucket_versioning_and_load_info(
+                        &bucket_for_hook,
+                        crate::BucketVersioningState::Enabled,
+                    )
+                    .unwrap();
+            }
+        })),
+        ..crate::node::BucketScopedTestHooks::default()
+    });
+
+    let subject = cluster
+        .test_seed_bucket_delete_attempt(
+            &bucket,
+            crate::TestBucketDeleteAttemptOutcomeKind::Retryable,
+            crate::TestBucketDeleteAttemptPhase::ReservationWait,
+            "seeded after generation change".to_string(),
+        )
+        .unwrap();
+    drop(hook);
+    assert!(hook_ran.load(Ordering::SeqCst));
+    let subject_debug = format!("{subject:?}");
+    assert!(subject_debug.contains(bucket.as_str()));
+    assert!(!subject_debug.contains("execution_generation"));
+    assert!(!subject_debug.contains("incarnation_generation"));
+
+    cluster.test_begin_current_bucket_delete(&bucket).unwrap();
+    assert!(cluster
+        .test_current_bucket_delete_marked_once(&subject)
+        .unwrap());
+}
 
 fn apply_delete_finalized_bucket_command_to_pg(
     pg: &crate::PgStore,

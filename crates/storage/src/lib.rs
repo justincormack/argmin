@@ -185,6 +185,8 @@ pub mod test_support {
     /// trait makes only storage-owned opaque snapshots and logical predicates
     /// available to downstream test code.
     pub trait StorageClusterPayloadTestSupport {
+        fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize;
+
         fn test_capture_object_payload(
             &self,
             bucket: &BucketName,
@@ -261,6 +263,10 @@ pub mod test_support {
     }
 
     impl StorageClusterPayloadTestSupport for StorageCluster {
+        fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
+            StorageCluster::test_ec_scratch_allocation_count(self, shape)
+        }
+
         fn test_capture_object_payload(
             &self,
             bucket: &BucketName,
@@ -441,6 +447,59 @@ pub mod test_support {
     /// entries, or timestamps. Storage owns the physical setup and projects
     /// only the worker state or semantic transition required by the caller.
     pub trait StorageClusterLifecycleTestSupport {
+        fn test_bucket_presence(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketPresence, BucketSnapshotLoadError>;
+
+        fn test_bucket_execution_generation_is_newer_than(
+            &self,
+            bucket: &BucketName,
+            generation: u64,
+        ) -> Result<bool, BucketSnapshotLoadError>;
+
+        fn test_capture_bucket_delete_begin_subject(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketDeleteBeginSubject, BucketSnapshotLoadError>;
+
+        fn test_begin_current_bucket_delete(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError>;
+
+        fn test_enqueue_bucket_delete_begin_subject(&self, subject: &TestBucketDeleteBeginSubject);
+
+        fn test_current_bucket_delete_marked_once(
+            &self,
+            subject: &TestBucketDeleteBeginSubject,
+        ) -> Result<bool, BucketSnapshotLoadError>;
+
+        fn test_current_bucket_is_distinct_active_incarnation(
+            &self,
+            subject: &TestBucketDeleteBeginSubject,
+        ) -> Result<bool, BucketSnapshotLoadError>;
+
+        fn test_seed_bucket_delete_attempt(
+            &self,
+            bucket: &BucketName,
+            outcome: TestBucketDeleteAttemptOutcomeKind,
+            phase: TestBucketDeleteAttemptPhase,
+            detail: String,
+        ) -> Result<TestBucketDeleteBeginSubject, BucketWriteDrainError>;
+
+        fn test_observe_bucket_delete_progress(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketDeleteProgress, BucketSnapshotLoadError>;
+
+        fn test_stream_upload_reservation_exists(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            session_id: &SessionId,
+        ) -> Result<bool, ObjectPgActionError>;
+
         fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize;
 
         fn test_object_payload_reclaim_outstanding_depth(&self) -> usize;
@@ -485,6 +544,132 @@ pub mod test_support {
     }
 
     impl StorageClusterLifecycleTestSupport for StorageCluster {
+        fn test_bucket_presence(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketPresence, BucketSnapshotLoadError> {
+            match StorageCluster::test_head_bucket_raw(self, bucket) {
+                Ok(info) => Ok(match info.state {
+                    BucketState::Active => TestBucketPresence::Active,
+                    BucketState::Deleting => TestBucketPresence::Deleting,
+                }),
+                Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
+                    ..
+                })) => Ok(TestBucketPresence::Missing),
+                Err(error) => Err(error),
+            }
+        }
+
+        fn test_bucket_execution_generation_is_newer_than(
+            &self,
+            bucket: &BucketName,
+            generation: u64,
+        ) -> Result<bool, BucketSnapshotLoadError> {
+            Ok(
+                StorageCluster::test_head_bucket_raw(self, bucket)?.bucket_execution_generation
+                    > generation,
+            )
+        }
+
+        fn test_capture_bucket_delete_begin_subject(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketDeleteBeginSubject, BucketSnapshotLoadError> {
+            let info = StorageCluster::test_head_bucket_raw(self, bucket)?;
+            Ok(TestBucketDeleteBeginSubject {
+                root: BucketDeleteBeginRoot {
+                    bucket: bucket.clone(),
+                    bucket_execution_generation: info.bucket_execution_generation,
+                    bucket_incarnation_generation: info.bucket_incarnation_generation,
+                },
+            })
+        }
+
+        fn test_begin_current_bucket_delete(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError> {
+            StorageCluster::test_begin_bucket_delete_if_current(self, bucket)
+        }
+
+        fn test_enqueue_bucket_delete_begin_subject(&self, subject: &TestBucketDeleteBeginSubject) {
+            StorageCluster::test_enqueue_bucket_delete_begin(
+                self,
+                &subject.root.bucket,
+                subject.root.bucket_execution_generation,
+                subject.root.bucket_incarnation_generation,
+            );
+        }
+
+        fn test_current_bucket_delete_marked_once(
+            &self,
+            subject: &TestBucketDeleteBeginSubject,
+        ) -> Result<bool, BucketSnapshotLoadError> {
+            let info = StorageCluster::test_head_bucket_raw(self, &subject.root.bucket)?;
+            let expected_execution_generation =
+                subject.root.bucket_execution_generation.checked_add(1);
+            Ok(info.state == BucketState::Deleting
+                && Some(info.bucket_execution_generation) == expected_execution_generation
+                && info.bucket_incarnation_generation == subject.root.bucket_incarnation_generation)
+        }
+
+        fn test_current_bucket_is_distinct_active_incarnation(
+            &self,
+            subject: &TestBucketDeleteBeginSubject,
+        ) -> Result<bool, BucketSnapshotLoadError> {
+            let info = StorageCluster::test_head_bucket_raw(self, &subject.root.bucket)?;
+            Ok(info.state == BucketState::Active
+                && info.bucket_incarnation_generation != subject.root.bucket_incarnation_generation)
+        }
+
+        fn test_seed_bucket_delete_attempt(
+            &self,
+            bucket: &BucketName,
+            outcome: TestBucketDeleteAttemptOutcomeKind,
+            phase: TestBucketDeleteAttemptPhase,
+            detail: String,
+        ) -> Result<TestBucketDeleteBeginSubject, BucketWriteDrainError> {
+            let post_reservation_next_object_pg_id = matches!(
+                phase,
+                TestBucketDeleteAttemptPhase::FinalVisibilityCheck
+                    | TestBucketDeleteAttemptPhase::FinalVisibilityProven
+            )
+            .then_some(0);
+            let root = StorageCluster::test_seed_bucket_delete_attempt_outcome(
+                self,
+                bucket,
+                outcome,
+                phase,
+                detail,
+                post_reservation_next_object_pg_id,
+            )?;
+            Ok(TestBucketDeleteBeginSubject { root })
+        }
+
+        fn test_observe_bucket_delete_progress(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketDeleteProgress, BucketSnapshotLoadError> {
+            StorageCluster::test_bucket_delete_progress(self, bucket)
+        }
+
+        fn test_stream_upload_reservation_exists(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            session_id: &SessionId,
+        ) -> Result<bool, ObjectPgActionError> {
+            match StorageCluster::test_object_generation_reservation_for(
+                self, bucket, key, session_id,
+            ) {
+                Ok(_) => Ok(true),
+                Err(ObjectPgActionError::Metadata(
+                    MetadataError::ObjectGenerationReservationNotFound { .. },
+                )) => Ok(false),
+                Err(error) => Err(error),
+            }
+        }
+
         fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize {
             StorageCluster::test_bucket_delete_finalize_outstanding_depth(self)
         }
@@ -2016,6 +2201,29 @@ pub mod test_support {
         pub bucket_state: Option<BucketState>,
         pub has_durable_write_drain: bool,
         pub has_pending_metadata_command: bool,
+    }
+
+    /// Logical visibility of one bucket while exercising deletion behavior.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TestBucketPresence {
+        Missing,
+        Active,
+        Deleting,
+    }
+
+    /// Opaque storage-issued identity for one bucket-delete-begin attempt.
+    #[derive(Clone)]
+    pub struct TestBucketDeleteBeginSubject {
+        root: BucketDeleteBeginRoot,
+    }
+
+    impl std::fmt::Debug for TestBucketDeleteBeginSubject {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestBucketDeleteBeginSubject")
+                .field("bucket", &self.root.bucket)
+                .finish_non_exhaustive()
+        }
     }
 
     /// Test-only durable bucket-deletion outcome fixture.

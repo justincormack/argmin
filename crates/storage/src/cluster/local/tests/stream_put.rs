@@ -1,5 +1,68 @@
 use super::*;
-use crate::test_support::StorageClusterTopologyTestSupport as _;
+use crate::test_support::{
+    StorageClusterLifecycleTestSupport as _, StorageClusterTopologyTestSupport as _,
+};
+
+#[test]
+fn stream_reservation_existence_observation_binds_bucket_key_and_session() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::tests::bucket_name("stream-reservation-observation");
+    let first_key = crate::tests::object_key("first");
+    let second_key = crate::tests::object_key("second");
+    let first_session = crate::tests::stream_session_id("reservation-one");
+    let second_session = crate::tests::stream_session_id("reservation-two");
+    let first_object_pg = cluster.test_object_pg_id_for(&bucket, &first_key);
+    let crossed_bucket = (0..10_000)
+        .map(|suffix| crate::tests::bucket_name(format!("reservation-crossed-{suffix:04}")))
+        .find(|candidate| cluster.test_object_pg_id_for(candidate, &first_key) == first_object_pg)
+        .expect("four object PGs must yield a distinct same-PG bucket candidate");
+    assert_ne!(crossed_bucket, bucket);
+    assert_eq!(
+        cluster.test_object_pg_id_for(&crossed_bucket, &first_key),
+        first_object_pg,
+        "crossed-bucket canary must isolate bucket binding from object-PG placement"
+    );
+    create_test_bucket(&cluster, &bucket);
+    create_test_bucket(&cluster, &crossed_bucket);
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &first_key,
+            &first_session,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &second_key,
+            &second_session,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+
+    assert!(cluster
+        .test_stream_upload_reservation_exists(&bucket, &first_key, &first_session)
+        .unwrap());
+    assert!(cluster
+        .test_stream_upload_reservation_exists(&bucket, &second_key, &second_session)
+        .unwrap());
+    assert!(!cluster
+        .test_stream_upload_reservation_exists(&bucket, &first_key, &second_session)
+        .unwrap());
+    assert!(!cluster
+        .test_stream_upload_reservation_exists(&bucket, &second_key, &first_session)
+        .unwrap());
+    assert!(!cluster
+        .test_stream_upload_reservation_exists(&crossed_bucket, &first_key, &first_session)
+        .unwrap());
+}
 
 #[test]
 fn topology_test_support_binds_stream_placement_to_exact_put_session() {

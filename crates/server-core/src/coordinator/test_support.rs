@@ -6,6 +6,7 @@ use ec::EcConfig;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage::test_support::StorageClusterLifecycleTestSupport as _;
 use storage::{
     NodeId, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
     StorageClusterRuntimeMapRefreshError,
@@ -494,8 +495,8 @@ pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
             Err(ServerError::BucketNotFound { .. })
         ) && coord
             .storage_node()
-            .test_head_bucket_raw(&trusted_bucket_name(name))
-            .is_err()
+            .test_bucket_presence(&trusted_bucket_name(name))
+            .is_ok_and(|presence| presence == storage::test_support::TestBucketPresence::Missing)
         {
             return;
         }

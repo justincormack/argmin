@@ -3010,7 +3010,7 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
     drop(hook);
     drop(admission);
     let progress = cluster
-        .test_bucket_delete_progress(&trusted_bucket_name("delete-drain"))
+        .test_observe_bucket_delete_progress(&trusted_bucket_name("delete-drain"))
         .unwrap();
     assert_eq!(progress.bucket_state, Some(BucketState::Active));
     assert!(!progress.has_durable_write_drain);
@@ -3034,7 +3034,7 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
     drop(hook);
     drop(admission);
     let progress = cluster
-        .test_bucket_delete_progress(&trusted_bucket_name("delete-mark"))
+        .test_observe_bucket_delete_progress(&trusted_bucket_name("delete-mark"))
         .unwrap();
     assert_eq!(progress.bucket_state, Some(BucketState::Active));
     assert!(progress.has_durable_write_drain);
@@ -5803,21 +5803,15 @@ fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
     let bucket = trusted_bucket_name("bucket");
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
-        match coord.storage_node().test_head_bucket_raw(&bucket) {
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => break,
-            Ok(info) if Instant::now() < deadline => {
-                assert_eq!(info.state, storage::BucketState::Deleting);
+        match coord.storage_node().test_bucket_presence(&bucket).unwrap() {
+            storage::test_support::TestBucketPresence::Missing => break,
+            storage::test_support::TestBucketPresence::Deleting if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(info) => {
+            presence => {
                 panic!(
-                    "reclaim worker did not finalize deleting bucket after runtime-map refresh: {info:?}"
+                    "reclaim worker did not finalize deleting bucket after runtime-map refresh: {presence:?}"
                 );
-            }
-            Err(err) => {
-                panic!("unexpected bucket metadata error while waiting for finalize: {err:?}")
             }
         }
     }
@@ -5891,9 +5885,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
     drop(direct_coord);
-    initial
-        .test_begin_bucket_delete_if_current(&bucket)
-        .unwrap();
+    initial.test_begin_current_bucket_delete(&bucket).unwrap();
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
     let root = initial
         .test_enqueue_current_bucket_delete_finalize(&bucket)
@@ -6138,12 +6130,9 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
             storage::MetadataError::StreamSessionNotFound { .. }
         ))
     ));
-    assert!(matches!(
-        refreshed.test_object_generation_reservation_for(&bucket, &key, &session_id),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectGenerationReservationNotFound { .. }
-        ))
-    ));
+    assert!(!refreshed
+        .test_stream_upload_reservation_exists(&bucket, &key, &session_id)
+        .unwrap());
 }
 
 #[test]
@@ -6338,7 +6327,9 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
-    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+    let bucket_subject = initial
+        .test_capture_bucket_delete_begin_subject(&bucket)
+        .unwrap();
 
     let expired = same_store_cluster_with_route_map_validity(
         &initial,
@@ -6348,17 +6339,12 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
-    expired.test_enqueue_bucket_delete_begin(
-        &bucket,
-        bucket_identity.bucket_execution_generation,
-        bucket_identity.bucket_incarnation_generation,
-    );
+    expired.test_enqueue_bucket_delete_begin_subject(&bucket_subject);
     thread::sleep(Duration::from_millis(350));
 
-    let active_before_refresh = initial.test_head_bucket_raw(&bucket).unwrap();
     assert_eq!(
-        active_before_refresh.state,
-        storage::BucketState::Active,
+        initial.test_bucket_presence(&bucket).unwrap(),
+        storage::test_support::TestBucketPresence::Active,
         "expired route map should make the first background begin retryable before it can mark deleting"
     );
 
@@ -6366,26 +6352,14 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
-        match initial.test_head_bucket_raw(&bucket) {
-            Ok(info) if info.state == storage::BucketState::Deleting => break,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => break,
-            Ok(info) if Instant::now() < deadline => {
-                assert_eq!(
-                    info.state,
-                    storage::BucketState::Active,
-                    "unexpected bucket state while waiting for background begin retry"
-                );
+        match initial.test_bucket_presence(&bucket).unwrap() {
+            storage::test_support::TestBucketPresence::Deleting
+            | storage::test_support::TestBucketPresence::Missing => break,
+            storage::test_support::TestBucketPresence::Active if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(info) => {
-                panic!(
-                    "reclaim worker did not retry BucketDeleteBegin after route refresh: {info:?}"
-                );
-            }
-            Err(err) => {
-                panic!("unexpected bucket metadata error while waiting for begin retry: {err:?}")
+            storage::test_support::TestBucketPresence::Active => {
+                panic!("reclaim worker did not retry BucketDeleteBegin after route refresh");
             }
         }
     }
@@ -6405,7 +6379,9 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
-    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+    let bucket_subject = initial
+        .test_capture_bucket_delete_begin_subject(&bucket)
+        .unwrap();
     let bucket_pg_id = PgId::new(initial.test_bucket_pg_id_for(&bucket));
     assert_eq!(
         initial
@@ -6435,7 +6411,7 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
     );
 
     initial
-        .test_begin_bucket_delete_if_current(&bucket)
+        .test_begin_current_bucket_delete(&bucket)
         .expect("pinned DeleteBucket begin should commit on retained route after runtime-map move");
     assert!(
         installed_next_epoch.load(Ordering::SeqCst),
@@ -6456,19 +6432,27 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
         NodeId::new(1),
         "current route should move the bucket PG primary away from the pinned route"
     );
-    let current_info = current
-        .test_head_bucket_raw(&bucket)
-        .expect("current route should observe the retained-route commit");
-    assert_eq!(current_info.state, storage::BucketState::Deleting);
-    assert_eq!(
-        current_info.bucket_execution_generation,
-        bucket_identity.bucket_execution_generation + 1,
-        "retained-route mark-deleting should apply exactly once to the same bucket generation"
-    );
-    assert_eq!(
-        current_info.bucket_incarnation_generation,
-        bucket_identity.bucket_incarnation_generation
-    );
+    assert!(current
+        .test_current_bucket_delete_marked_once(&bucket_subject)
+        .expect("current route should observe the retained-route commit"));
+}
+
+fn wait_until_bucket_deleting_or_missing(
+    cluster: &StorageCluster,
+    bucket: &BucketName,
+    context: &str,
+) {
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    loop {
+        match cluster.test_bucket_presence(bucket).unwrap() {
+            storage::test_support::TestBucketPresence::Deleting
+            | storage::test_support::TestBucketPresence::Missing => return,
+            storage::test_support::TestBucketPresence::Active if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            storage::test_support::TestBucketPresence::Active => panic!("{context}"),
+        }
+    }
 }
 
 #[test]
@@ -6512,7 +6496,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
 
     let err = initial
-        .test_begin_bucket_delete_if_current(&bucket)
+        .test_begin_current_bucket_delete(&bucket)
         .unwrap_err();
     assert!(
         matches!(
@@ -6528,24 +6512,14 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
-        match initial.test_head_bucket_raw(&bucket) {
-            Ok(info) if info.state == storage::BucketState::Deleting => break,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => break,
-            Ok(info) if Instant::now() < deadline => {
-                assert_eq!(
-                    info.state,
-                    storage::BucketState::Active,
-                    "unexpected bucket state while waiting for background begin adoption"
-                );
+        match initial.test_bucket_presence(&bucket).unwrap() {
+            storage::test_support::TestBucketPresence::Deleting
+            | storage::test_support::TestBucketPresence::Missing => break,
+            storage::test_support::TestBucketPresence::Active if Instant::now() < deadline => {
                 thread::sleep(Duration::from_millis(10));
             }
-            Ok(info) => {
-                panic!("reclaim worker did not adopt partial BucketDeleteBegin: {info:?}");
-            }
-            Err(err) => {
-                panic!("unexpected bucket metadata error while waiting for begin adoption: {err:?}")
+            storage::test_support::TestBucketPresence::Active => {
+                panic!("reclaim worker did not adopt partial BucketDeleteBegin");
             }
         }
     }
@@ -6563,15 +6537,12 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
-    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
-
-    initial
-        .test_seed_bucket_delete_attempt_outcome(
+    let bucket_subject = initial
+        .test_seed_bucket_delete_attempt(
             &bucket,
             storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
             storage::test_support::TestBucketDeleteAttemptPhase::StreamCleanup,
             "seeded stream-cleanup retryable attempt".to_string(),
-            None,
         )
         .unwrap();
 
@@ -6601,37 +6572,13 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
 
     let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.test_enqueue_bucket_delete_begin(
-        &bucket,
-        bucket_identity.bucket_execution_generation,
-        bucket_identity.bucket_incarnation_generation,
-    );
+    initial.test_enqueue_bucket_delete_begin_subject(&bucket_subject);
 
-    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
-    loop {
-        match initial.test_head_bucket_raw(&bucket) {
-            Ok(info) if info.state == storage::BucketState::Deleting => break,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => break,
-            Ok(info) if Instant::now() < deadline => {
-                assert_eq!(
-                    info.state,
-                    storage::BucketState::Active,
-                    "unexpected bucket state while waiting for stream-cleanup adoption"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(info) => {
-                panic!("reclaim worker did not adopt stream-cleanup BucketDeleteBegin: {info:?}");
-            }
-            Err(err) => {
-                panic!(
-                    "unexpected bucket metadata error while waiting for stream-cleanup adoption: {err:?}"
-                )
-            }
-        }
-    }
+    wait_until_bucket_deleting_or_missing(
+        &initial,
+        &bucket,
+        "reclaim worker did not adopt stream-cleanup BucketDeleteBegin",
+    );
 
     assert!(
         post_reservation_scan_ran.load(Ordering::SeqCst),
@@ -6655,15 +6602,12 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
-    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
-
-    initial
-        .test_seed_bucket_delete_attempt_outcome(
+    let bucket_subject = initial
+        .test_seed_bucket_delete_attempt(
             &bucket,
             storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
             storage::test_support::TestBucketDeleteAttemptPhase::ReservationWait,
             "seeded reservation-wait retryable attempt".to_string(),
-            None,
         )
         .unwrap();
 
@@ -6694,37 +6638,13 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
 
     let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.test_enqueue_bucket_delete_begin(
-        &bucket,
-        bucket_identity.bucket_execution_generation,
-        bucket_identity.bucket_incarnation_generation,
-    );
+    initial.test_enqueue_bucket_delete_begin_subject(&bucket_subject);
 
-    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
-    loop {
-        match initial.test_head_bucket_raw(&bucket) {
-            Ok(info) if info.state == storage::BucketState::Deleting => break,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => break,
-            Ok(info) if Instant::now() < deadline => {
-                assert_eq!(
-                    info.state,
-                    storage::BucketState::Active,
-                    "unexpected bucket state while waiting for reservation-wait adoption"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(info) => {
-                panic!("reclaim worker did not adopt reservation-wait BucketDeleteBegin: {info:?}");
-            }
-            Err(err) => {
-                panic!(
-                    "unexpected bucket metadata error while waiting for reservation-wait adoption: {err:?}"
-                )
-            }
-        }
-    }
+    wait_until_bucket_deleting_or_missing(
+        &initial,
+        &bucket,
+        "reclaim worker did not adopt reservation-wait BucketDeleteBegin",
+    );
 
     assert!(
         post_reservation_scan_ran.load(Ordering::SeqCst),
@@ -6748,15 +6668,12 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
-    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
-
-    initial
-        .test_seed_bucket_delete_attempt_outcome(
+    let bucket_subject = initial
+        .test_seed_bucket_delete_attempt(
             &bucket,
             storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
             storage::test_support::TestBucketDeleteAttemptPhase::FinalVisibilityCheck,
             "seeded final-visibility retryable attempt".to_string(),
-            Some(0),
         )
         .unwrap();
 
@@ -6776,37 +6693,13 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
 
     let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.test_enqueue_bucket_delete_begin(
-        &bucket,
-        bucket_identity.bucket_execution_generation,
-        bucket_identity.bucket_incarnation_generation,
-    );
+    initial.test_enqueue_bucket_delete_begin_subject(&bucket_subject);
 
-    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
-    loop {
-        match initial.test_head_bucket_raw(&bucket) {
-            Ok(info) if info.state == storage::BucketState::Deleting => break,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => break,
-            Ok(info) if Instant::now() < deadline => {
-                assert_eq!(
-                    info.state,
-                    storage::BucketState::Active,
-                    "unexpected bucket state while waiting for final-visibility adoption"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(info) => {
-                panic!("reclaim worker did not adopt final-visibility BucketDeleteBegin: {info:?}");
-            }
-            Err(err) => {
-                panic!(
-                    "unexpected bucket metadata error while waiting for final-visibility adoption: {err:?}"
-                )
-            }
-        }
-    }
+    wait_until_bucket_deleting_or_missing(
+        &initial,
+        &bucket,
+        "reclaim worker did not adopt final-visibility BucketDeleteBegin",
+    );
 
     assert!(
         !exact_drain_ran.load(Ordering::SeqCst),
@@ -6826,15 +6719,12 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
-    let bucket_identity = initial.test_head_bucket_raw(&bucket).unwrap();
-
-    initial
-        .test_seed_bucket_delete_attempt_outcome(
+    let bucket_subject = initial
+        .test_seed_bucket_delete_attempt(
             &bucket,
             storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
             storage::test_support::TestBucketDeleteAttemptPhase::FinalVisibilityProven,
             "seeded final-visibility-proven retryable attempt".to_string(),
-            Some(0),
         )
         .unwrap();
 
@@ -6851,39 +6741,13 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
 
     let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
-    initial.test_enqueue_bucket_delete_begin(
-        &bucket,
-        bucket_identity.bucket_execution_generation,
-        bucket_identity.bucket_incarnation_generation,
-    );
+    initial.test_enqueue_bucket_delete_begin_subject(&bucket_subject);
 
-    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
-    loop {
-        match initial.test_head_bucket_raw(&bucket) {
-            Ok(info) if info.state == storage::BucketState::Deleting => break,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => break,
-            Ok(info) if Instant::now() < deadline => {
-                assert_eq!(
-                    info.state,
-                    storage::BucketState::Active,
-                    "unexpected bucket state while waiting for final-visibility-proven adoption"
-                );
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(info) => {
-                panic!(
-                    "reclaim worker did not adopt final-visibility-proven BucketDeleteBegin: {info:?}"
-                );
-            }
-            Err(err) => {
-                panic!(
-                    "unexpected bucket metadata error while waiting for final-visibility-proven adoption: {err:?}"
-                )
-            }
-        }
-    }
+    wait_until_bucket_deleting_or_missing(
+        &initial,
+        &bucket,
+        "reclaim worker did not adopt final-visibility-proven BucketDeleteBegin",
+    );
 
     assert!(
         !visibility_check_ran.load(Ordering::SeqCst),
@@ -6903,7 +6767,9 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     direct_coord
         .create_bucket_for_owner("old-owner", bucket.as_str(), false)
         .unwrap();
-    let old_identity = initial.test_head_bucket_raw(&bucket).unwrap();
+    let old_subject = initial
+        .test_capture_bucket_delete_begin_subject(&bucket)
+        .unwrap();
 
     let expired = same_store_cluster_with_route_map_validity(
         &initial,
@@ -6913,39 +6779,33 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle.clone(), Arc::clone(&expired));
 
-    expired.test_enqueue_bucket_delete_begin(
-        &bucket,
-        old_identity.bucket_execution_generation,
-        old_identity.bucket_incarnation_generation,
-    );
+    expired.test_enqueue_bucket_delete_begin_subject(&old_subject);
     thread::sleep(Duration::from_millis(350));
 
-    initial
-        .test_begin_bucket_delete_if_current(&bucket)
-        .unwrap();
+    initial.test_begin_current_bucket_delete(&bucket).unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&initial, &bucket);
     direct_coord
         .create_bucket_for_owner("new-owner", bucket.as_str(), false)
         .unwrap();
-    let recreated = initial.test_head_bucket_raw(&bucket).unwrap();
-    assert_ne!(
-        recreated.bucket_incarnation_generation,
-        old_identity.bucket_incarnation_generation
-    );
+    assert!(initial
+        .test_current_bucket_is_distinct_active_incarnation(&old_subject)
+        .unwrap());
+    direct_coord
+        .head_bucket(&bucket_request_with_expected_owner(
+            bucket.as_str(),
+            test_helpers::requester("new-owner"),
+            None,
+        ))
+        .unwrap();
 
     install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
-        let current = initial.test_head_bucket_raw(&bucket).unwrap();
-        assert_eq!(current.owner_principal, "new-owner");
-        assert_eq!(
-            current.bucket_incarnation_generation,
-            recreated.bucket_incarnation_generation
-        );
-        assert_eq!(
-            current.state,
-            storage::BucketState::Active,
+        assert!(
+            initial
+                .test_current_bucket_is_distinct_active_incarnation(&old_subject)
+                .unwrap(),
             "stale BucketDeleteBegin must not delete the recreated bucket"
         );
         if Instant::now() >= deadline {
@@ -15585,7 +15445,7 @@ fn delete_bucket_authorizes_idempotent_retry_while_deleting() {
 
     let bucket_name = trusted_bucket_name(bucket);
     storage_cluster
-        .test_begin_bucket_delete_if_current(&bucket_name)
+        .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
 
     delete_bucket_test(&coord, bucket)
@@ -15603,12 +15463,11 @@ fn delete_bucket_authorization_adopts_active_preserved_attempt_without_drain_wai
         .unwrap();
     let bucket_name = trusted_bucket_name(bucket);
     storage_cluster
-        .test_seed_bucket_delete_attempt_outcome(
+        .test_seed_bucket_delete_attempt(
             &bucket_name,
             storage::test_support::TestBucketDeleteAttemptOutcomeKind::Retryable,
             storage::test_support::TestBucketDeleteAttemptPhase::ReservationWait,
             "seeded reservation-wait attempt for auth adoption".to_string(),
-            None,
         )
         .unwrap();
 
@@ -15627,13 +15486,11 @@ fn delete_bucket_authorization_adopts_active_preserved_attempt_without_drain_wai
     delete_bucket_test(&coord, bucket)
         .expect("DeleteBucket should authorize and adopt the preserved active attempt");
 
-    match storage_cluster.test_head_bucket_raw(&bucket_name) {
-        Ok(info) => assert_eq!(info.state, storage::BucketState::Deleting),
-        Err(storage::BucketSnapshotLoadError::Metadata(
-            storage::MetadataError::BucketNotFound { .. },
-        )) => {}
-        Err(err) => panic!("unexpected bucket state after adopted delete: {err:?}"),
-    }
+    assert!(matches!(
+        storage_cluster.test_bucket_presence(&bucket_name).unwrap(),
+        storage::test_support::TestBucketPresence::Deleting
+            | storage::test_support::TestBucketPresence::Missing
+    ));
 }
 
 #[test]
@@ -15670,7 +15527,7 @@ fn delete_bucket_stale_metadata_route_maps_to_slow_down() {
     let stale_cluster =
         same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster, tmp.path());
     let storage_err = stale_cluster
-        .test_begin_bucket_delete_if_current(&bucket_name)
+        .test_begin_current_bucket_delete(&bucket_name)
         .unwrap_err();
     assert!(
         matches!(
@@ -15748,7 +15605,7 @@ fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
 
     let bucket_name = trusted_bucket_name(bucket);
     storage_cluster
-        .test_begin_bucket_delete_if_current(&bucket_name)
+        .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
     let stale_authorized = coord
         .authorize_delete_bucket(&bucket_request_with_expected_owner(
@@ -16401,11 +16258,13 @@ fn head_object_reloads_after_boe_policy_mutation_rebuilds_fast_path() {
     let cached = reader
         .get_bucket_fast_path(&trusted_bucket_name(bucket))
         .expect("policy mutation should leave cached entry in place");
-    let raw = storage_cluster
-        .test_head_bucket_raw(&trusted_bucket_name(bucket))
-        .expect("policy mutation should leave bucket metadata readable");
     assert!(
-        raw.bucket_execution_generation > cached.bucket_execution_generation,
+        storage_cluster
+            .test_bucket_execution_generation_is_newer_than(
+                &trusted_bucket_name(bucket),
+                cached.bucket_execution_generation,
+            )
+            .expect("policy mutation should leave bucket metadata readable"),
         "bucket execution generation should advance on policy mutation"
     );
     assert_eq!(
@@ -17519,7 +17378,7 @@ fn head_object_rejects_old_incarnation_fast_path_after_delete_recreate() {
     );
 
     storage_cluster
-        .test_begin_bucket_delete_if_current(&bucket_name)
+        .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
@@ -17846,7 +17705,7 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
     );
 
     storage_cluster
-        .test_begin_bucket_delete_if_current(&bucket_name)
+        .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
@@ -17865,9 +17724,10 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
             },
         })
         .unwrap();
-    let recreated = storage_cluster.test_head_bucket_raw(&bucket_name).unwrap();
     assert!(
-        recreated.bucket_execution_generation > cached_generation,
+        storage_cluster
+            .test_bucket_execution_generation_is_newer_than(&bucket_name, cached_generation)
+            .unwrap(),
         "delete/recreate must advance authoritative bucket execution generation"
     );
 
@@ -17957,7 +17817,7 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
     );
 
     storage_cluster
-        .test_begin_bucket_delete_if_current(&bucket_name)
+        .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
     delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
 

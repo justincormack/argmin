@@ -6041,7 +6041,19 @@ Final Phase 5 audit (2026-08-04):
   live versions even when their owner matches. Owner-local positive,
   crossed-version, and crossed-owner canaries independently pin its principal
   and canonical-ID comparisons without creating an alternate live-object
-  inspection path.
+  inspection path; and
+- bucket-delete and promoted-stream cleanup tests no longer load raw bucket
+  records or object-generation reservation IDs. Storage issues an opaque
+  bucket-delete-begin subject derived from the acquired durable drain and its
+  fenced bucket incarnation, owns queued-root construction, and projects only
+  logical bucket presence, delete progress,
+  exactly-once marking, distinct-incarnation, reservation-existence, and
+  execution-generation ordering predicates. Crossed-bucket/key/session and
+  recreated-incarnation owner canaries pin those predicates. The raw
+  `StorageCluster` bucket record, current-delete-begin, queued-begin,
+  reservation-generation, delete-progress, and EC scratch-counter methods are
+  crate-private; downstream access is through the curated lifecycle or payload
+  test-support traits.
 
 The audited cross-crate support families are:
 
@@ -6085,7 +6097,9 @@ Remaining implementation order after this audit:
    semantic-fault family is consolidated behind
    `StorageClusterMultipartTestSupport`; its feature-gated trait methods remain
    downstream-callable while the corresponding inherent helpers are
-   crate-private; and
+   crate-private. Bucket-delete progress/current-incarnation scenarios,
+   stream-reservation existence, and EC scratch reuse are likewise behind the
+   lifecycle/payload traits; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

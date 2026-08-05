@@ -39,8 +39,8 @@ use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 #[cfg(test)]
 use storage::test_support::{
-    StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
-    StorageClusterRouteMapTestSupport as _,
+    StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
+    StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
 };
 use storage::{BucketName, SessionId};
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -5951,8 +5951,8 @@ Content-Length: {}\r\n\
             .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
             .unwrap());
         assert!(initial
-            .test_object_generation_reservation_for(&bucket, &key, &session_id,)
-            .is_ok());
+            .test_stream_upload_reservation_exists(&bucket, &key, &session_id)
+            .unwrap());
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
         let install_handle = runtime_handle.clone();
@@ -5992,12 +5992,9 @@ Content-Length: {}\r\n\
             &session_id,
         )
         .unwrap());
-        assert!(matches!(
-            initial.test_object_generation_reservation_for(&bucket, &key, &session_id,),
-            Err(storage::ObjectPgActionError::Metadata(
-                storage::MetadataError::ObjectGenerationReservationNotFound { .. }
-            ))
-        ));
+        assert!(!initial
+            .test_stream_upload_reservation_exists(&bucket, &key, &session_id)
+            .unwrap());
         assert!(initial
             .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
             .unwrap());
@@ -6467,12 +6464,9 @@ Connection: close\r\n\r\n",
             &session_id,
         )
         .unwrap());
-        assert!(matches!(
-            initial.test_object_generation_reservation_for(&bucket, &key, &session_id),
-            Err(storage::ObjectPgActionError::Metadata(
-                storage::MetadataError::ObjectGenerationReservationNotFound { .. }
-            ))
-        ));
+        assert!(!initial
+            .test_stream_upload_reservation_exists(&bucket, &key, &session_id)
+            .unwrap());
         assert!(initial
             .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
             .unwrap());
