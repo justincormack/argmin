@@ -18232,7 +18232,7 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     /// Seeds a storage-owned stale-incarnation lifecycle claim scenario.
-    pub fn test_seed_stale_lifecycle_sweep_claim(
+    pub(crate) fn test_seed_stale_lifecycle_sweep_claim(
         &self,
         bucket: &BucketName,
     ) -> Result<(), ObjectPgActionError> {
@@ -18253,7 +18253,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_begin_durable_bucket_delete_drain(
+    pub(crate) fn test_begin_durable_bucket_delete_drain(
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
@@ -18265,7 +18265,7 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     /// Seeds the storage-owned terminal state used to test abort recovery.
-    pub fn test_mark_multipart_upload_aborting(
+    pub(crate) fn test_mark_multipart_upload_aborting(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18276,7 +18276,7 @@ impl super::StorageCluster {
 
     /// Seeds the storage-owned terminal state used to test completion recovery.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_mark_multipart_upload_completing(
+    pub(crate) fn test_mark_multipart_upload_completing(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18384,7 +18384,7 @@ impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     /// Marks one logical stream upload stale without exposing its durable
     /// timestamp representation across the storage boundary.
-    pub fn test_mark_stream_upload_stale(
+    pub(crate) fn test_mark_stream_upload_stale(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

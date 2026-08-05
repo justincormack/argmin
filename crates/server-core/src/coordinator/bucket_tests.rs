@@ -10,8 +10,10 @@ use s3_types::{
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use storage::test_support::StorageClusterPayloadTestSupport as _;
 use storage::test_support::{install_bucket_scoped_test_hooks, BucketScopedTestHooks};
+use storage::test_support::{
+    StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
+};
 use storage::PutBucketSubresource;
 
 fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {

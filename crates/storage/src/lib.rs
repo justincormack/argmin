@@ -444,6 +444,100 @@ pub mod test_support {
         }
     }
 
+    /// Logical worker observations and storage-owned lifecycle setup for
+    /// cross-crate coordinator tests.
+    ///
+    /// These operations deliberately avoid exposing durable rows, queue
+    /// entries, or timestamps. Storage owns the physical setup and projects
+    /// only the worker state or semantic transition required by the caller.
+    pub trait StorageClusterLifecycleTestSupport {
+        fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize;
+
+        fn test_object_payload_reclaim_outstanding_depth(&self) -> usize;
+
+        fn test_seed_stale_lifecycle_sweep_claim(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), ObjectPgActionError>;
+
+        fn test_begin_durable_bucket_delete_drain(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError>;
+
+        fn test_mark_multipart_upload_aborting(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<(), ObjectPgActionError>;
+
+        fn test_mark_multipart_upload_completing(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<(), ObjectPgActionError>;
+
+        fn test_mark_stream_upload_stale(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            session_id: &SessionId,
+        ) -> Result<(), ObjectPgActionError>;
+    }
+
+    impl StorageClusterLifecycleTestSupport for StorageCluster {
+        fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize {
+            StorageCluster::test_bucket_delete_finalize_outstanding_depth(self)
+        }
+
+        fn test_object_payload_reclaim_outstanding_depth(&self) -> usize {
+            StorageCluster::test_object_payload_reclaim_outstanding_depth(self)
+        }
+
+        fn test_seed_stale_lifecycle_sweep_claim(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_seed_stale_lifecycle_sweep_claim(self, bucket)
+        }
+
+        fn test_begin_durable_bucket_delete_drain(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError> {
+            StorageCluster::test_begin_durable_bucket_delete_drain(self, bucket)
+        }
+
+        fn test_mark_multipart_upload_aborting(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_mark_multipart_upload_aborting(self, bucket, key, upload_id)
+        }
+
+        fn test_mark_multipart_upload_completing(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            upload_id: &UploadId,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_mark_multipart_upload_completing(self, bucket, key, upload_id)
+        }
+
+        fn test_mark_stream_upload_stale(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            session_id: &SessionId,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_mark_stream_upload_stale(self, bucket, key, session_id)
+        }
+    }
+
     mod retained_read;
     pub use retained_read::{TestRetainedReadPgMoveScenario, TestRetainedReadPgMoveScenarioError};
 

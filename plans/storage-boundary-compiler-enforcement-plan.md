@@ -5982,7 +5982,14 @@ Final Phase 5 audit (2026-08-04):
   methods remain intentionally callable by downstream tests; the corresponding
   inherent helper methods on the production route types are crate-private,
   keeping these allowed test-runtime lifecycle controls explicit in
-  `storage::test_support`; and
+  `storage::test_support`;
+- bucket-delete/reclaim worker depth observations and storage-owned lifecycle
+  setup for stale claims, durable delete drains, terminal multipart states,
+  and stale stream sessions are exposed only through
+  `StorageClusterLifecycleTestSupport`. These feature-gated trait methods
+  remain intentionally callable by downstream tests; their corresponding
+  inherent `StorageCluster` helpers are crate-private, and no durable claim,
+  queue, upload, or session record crosses the owner boundary; and
 
 The audited cross-crate support families are:
 
@@ -6019,7 +6026,10 @@ Remaining implementation order after this audit:
    crate-private. Route-map validity/lease controls and request/publication
    barriers are likewise consolidated behind owner-namespaced test-support
    traits whose feature-gated methods remain downstream-callable, while their
-   corresponding inherent helper methods are crate-private; and
+   corresponding inherent helper methods are crate-private. Logical worker
+   depth observations and storage-owned lifecycle setup are likewise
+   consolidated behind `StorageClusterLifecycleTestSupport`, with the raw
+   inherent helpers made crate-private; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the transitional raw-record seam and its plan exception are gone.
 

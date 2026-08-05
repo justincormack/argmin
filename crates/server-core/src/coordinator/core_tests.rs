@@ -16,8 +16,8 @@ use storage::test_support::{
     TestRetainedReadPgMoveScenario,
 };
 use storage::test_support::{
-    StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
-    StorageClusterRouteMapTestSupport as _,
+    StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
+    StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
 };
 use storage::{
     ClusterEpoch, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, NodeId, PgId, PgState,
