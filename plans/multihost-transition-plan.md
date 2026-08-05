@@ -12194,11 +12194,13 @@ Supported deployment modes, replicated topologies, and gating:
   identity/auth primitives where their role model fits, but data-plane storage
   authorization remains an explicit replicated-mode prerequisite rather than
   being implied by control-plane auth.
-- Keep process topology orthogonal to deployment safety. `frontend`,
-  `storage-node`, `control-plane`, and `combined` describe which roles a process
-  hosts; they do not by themselves establish standalone or replicated
-  guarantees, or select disk versus host failure domains. In particular,
-  `combined` must not become an implicit weaker deployment mode, and a
+- Keep process topology orthogonal to deployment safety. The supported
+  replicated process roles are `frontend`, `storage-node`, and `control-plane`;
+  they do not by themselves establish standalone or replicated guarantees, or
+  select disk versus host failure domains. Frontend and storage roles may be
+  colocated on one host but remain separate processes so credentials,
+  capabilities, admission, restart, and scaling boundaries stay independent.
+  Replicated `combined` is not a supported production topology. A
   multi-process layout on one host must not be described as host-redundant.
 - Do not Cargo-feature-gate the supported deployment modes. They must
   be available from the standard binary and exercised by standard CI so a mode
@@ -12245,6 +12247,17 @@ Supported deployment modes, replicated topologies, and gating:
   and Raft learners, relocate shards and promote voters under the existing disk
   failure-domain contract, then prepare a host-level policy only after every PG
   and the voter set satisfy the host-level `f` invariant.
+- Treat loss of an established authority or storage node's durable state as a
+  committed replicated replacement operation, not static manifest
+  initialization. The future replacement ceremony must allocate a fresh node
+  incarnation, authorize the exact old-to-new identity transition under the
+  active topology generation, preserve the configured failure-domain
+  guarantee throughout learner catch-up or shard repair, and fence the lost
+  identity before the replacement can serve. Ordinary startup and
+  `initialize-cluster-state` must continue to reject an empty destination under
+  an established identity. Replacement, dynamic membership, and storage
+  expansion are one topology-lifecycle surface and are deliberately outside
+  the completed version-1 static configuration plan.
 - Store the active failure-domain level/tolerance, monotonic topology generation,
   canonical topology manifest and digest, and activation membership certificate
   in replicated control-plane state. The manifest maps every configured storage
@@ -12374,7 +12387,7 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
 
 - The initial versioned manifest schema, validation contract, canonical digest
   boundaries, secret-reference model, and implementation slices are defined in
-  [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md).
+  [static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md).
   Treat that document as the normative config-file contract for the static
   TCP/reference-workload work below.
 - Resolve the critical control-plane write-amplification and history-size

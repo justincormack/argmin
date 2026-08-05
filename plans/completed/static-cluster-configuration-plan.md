@@ -1,13 +1,15 @@
 # Static Cluster Configuration Plan
 
-Status: core static split-role implementation complete; quantitative release
-qualification and deferred topology modes remain
+Status: complete as of 2026-08-05. Version 1 supports standalone `all-in-one`
+and replicated split-role `frontend`, `storage-node`, and `control-plane`
+processes. Replicated node replacement, topology changes, and storage expansion
+are future multihost lifecycle work rather than static-configuration work.
 
 Related plans:
 
-- [multihost-transition-plan.md](multihost-transition-plan.md)
-- [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
-- [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md)
+- [multihost-transition-plan.md](../multihost-transition-plan.md)
+- [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md)
+- [storage-boundary-compiler-enforcement-plan.md](../storage-boundary-compiler-enforcement-plan.md)
 
 ## Purpose
 
@@ -149,7 +151,7 @@ identity or PG verification and retains it for the complete local storage
 cluster lifetime. A second process selecting the same process identity and data
 directory therefore fails before opening mutable PG state.
 
-Replicated storage-node and combined processes use the same explicit command.
+Replicated storage-node processes use the same explicit command.
 It initializes every configured PG through the production storage-node engine
 with the manifest's node id, EC shape, and initial cluster epoch, binds the root
 and each PG database to the selected process identity, and publishes the root
@@ -164,8 +166,9 @@ now enforce mandatory storage-RPC authentication at the shared Unix/TLS-TCP
 dispatch boundary. Phase 3 of the storage-boundary compiler-enforcement plan
 completed the server-local capability requirement for stateful request paths;
 composed positive and adversarial tests cross both authentication and local
-capability layers. Phase 4 publisher typing is continuing hardening, not a
-prerequisite for the completed split-role functional integration gate.
+capability layers. Phase 4 publisher typing is complete. Phase 5 test-support
+isolation remains separate hardening and is not a prerequisite for the
+completed split-role functional integration gate.
 
 Replicated control-plane process identity is initialized through the same
 command, once per configured authority process id. This creates only the
@@ -406,7 +409,7 @@ Unknown keys, duplicate keys, and unknown enum values fail closed.
 - `all-in-one`;
 - `frontend`;
 - `storage-node`;
-- `combined`; or
+- `combined` (reserved and unsupported in version 1); or
 - `control-plane`.
 
 This is process topology, not the deployment guarantee.
@@ -417,8 +420,16 @@ The role matrix is exact:
   authority;
 - `frontend` hosts one frontend identity;
 - `storage-node` hosts one storage-node identity;
-- `combined` hosts one frontend and one storage-node identity; and
 - `control-plane` hosts one single authority or Raft voter.
+
+Replicated frontend and storage roles may be colocated on one host, but remain
+separate processes. Version 1 deliberately does not support a replicated
+`combined` process: separate processes preserve credential and capability
+separation, independent admission and restart boundaries, and the same runtime
+shape used by larger deployments. The existing fail-closed parser/runtime
+compatibility for `combined` is not a supported manifest contract and may be
+removed independently. Offline parsing of that reserved enum value does not
+imply that startup supports the topology.
 
 `frontend_instance_id`, `admin_instance_id`, and
 `maintenance_instance_id` are present only when the process performs the
@@ -534,7 +545,7 @@ hosted by a control-plane process.
 
 These configured roles and their permitted outbound protocol families are not
 the request-scoped storage route capabilities defined by
-[storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md),
+[storage-boundary-compiler-enforcement-plan.md](../storage-boundary-compiler-enforcement-plan.md),
 which are derived only from live local routing state and are never read from
 the manifest.
 
@@ -949,7 +960,7 @@ loaded.
 
 ## Implementation Slices
 
-Progress as of 2026-08-02:
+Final status as of 2026-08-05:
 
 - Slice 1 is implemented: the manifest has strict version-1 TOML input types,
   a 4 MiB bounded atomic no-follow regular-file loader, closed enums and
@@ -1007,7 +1018,8 @@ Progress as of 2026-08-02:
   mixed-host topology certifies its globally reachable TCP fallback. The same
   certified endpoint map now drives split-role storage/frontend clients and
   listeners over authenticated Unix or TLS/TCP transport. Migration of
-  remaining process fixtures to shared manifest builders remains open.
+  Remaining older process fixtures may migrate to shared manifest builders as
+  test-maintenance work; that is not part of the completed production contract.
 - Slice 4's standalone storage sub-slice is implemented: file-mode
   `all-in-one` configuration carries the process identity into runtime,
   `initialize-cluster-state` durably publishes identity only after complete PG
@@ -1022,7 +1034,7 @@ Progress as of 2026-08-02:
   outside durable identity, while empty, partial, wrong-cluster,
   wrong-generation, and wrong-process state is rejected.
 - Slice 4's replicated storage initialization sub-slice is implemented:
-  `initialize-cluster-state` prepares `storage-node` and `combined` process
+  `initialize-cluster-state` prepares `storage-node` process
   roots through the production storage-node engine, using the manifest's exact
   node id, complete PG set, EC shape, initial epoch, and process identity.
   Initialization is idempotent and crash-resumable under the same durable
@@ -1100,8 +1112,8 @@ Progress as of 2026-08-02:
   compatibility policy.
   Operational admin command builders now load static configuration and use its
   routed frame transport and scoped credential, matching the already
-  static-aware clock-recovery commands. Frontend-read command mapping remains
-  part of the explicit replicated frontend-process slice. A Linux process
+  static-aware clock-recovery commands. Frontend runtime-map reads use the
+  explicit replicated frontend process identity and signer. A Linux process
   smoke performs the explicit state initialization ceremony, starts three
   authenticated TLS/TCP Raft authorities, exercises ordinary admin and
   dedicated recovery routing, restarts a voter, transfers leadership to the
@@ -1176,9 +1188,10 @@ Progress as of 2026-08-02:
   authenticated TLS request/response through the real storage server, reject a
   TCP listener without application authentication, validate Unix and TCP
   manifest mappings, and prove TLS endpoint retention after refresh.
-  Replicated `combined` processes remain fail-closed until their embedded
-  workflows receive the same operation-scoped credential composition. The
-  first split-role three-host workload now composes static authorities,
+  Replicated `combined` processes remain fail-closed and are not part of the
+  supported version-1 topology. Colocated deployments use separate frontend
+  and storage-node processes. The first split-role three-host workload now
+  composes static authorities,
   storage nodes, and a frontend over authenticated TLS/TCP storage RPC. It
   verifies persistent S3 create/PUT/GET/HEAD/list traffic across Raft leader
   loss and authority restart, then restarts one storage node and verifies both
@@ -1198,8 +1211,8 @@ Progress as of 2026-08-02:
   valid shards without granting mutation authority. The multihost
   `storage-node-kill-fails-closed` smoke proves fresh GET, HEAD, and List remain
   available after a non-primary shard node is killed while a new PUT fails
-  closed. Quantitative sustained workload qualification remains separate from
-  these completed functional gates.
+  closed. Quantitative sustained workload qualification was subsequently
+  completed by the multihost release gate.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
   by explicit `initialize-cluster-state` while holding the same process state
@@ -1247,9 +1260,11 @@ Progress as of 2026-08-02:
   authority state and fixed sidecars, temporary filename prefixes, storage
   data directories, and Unix sockets; exact or ancestor collisions fail before
   filesystem mutation.
-  Replicated replacement, dynamic topology lifecycle, and replicated
-  `combined` activation remain open. Split-role storage/frontend process
-  mapping and authenticated Unix/TLS/TCP transport are implemented.
+  Split-role storage/frontend process mapping and authenticated Unix/TLS/TCP
+  transport are implemented. Replicated replacement and dynamic topology
+  lifecycle are explicitly delegated to the multihost transition plan; they do
+  not extend or block this completed static manifest contract. Replicated
+  `combined` activation is intentionally not supported.
 - The manifest no longer exposes an `internal_auth` policy switch.
   Authentication is derived from runtime topology: every activated replicated
   Unix or TLS/TCP internal endpoint requires scoped credentials, while the
@@ -1284,7 +1299,8 @@ Progress as of 2026-08-02:
      initial bootstrap command/membership (implemented for static initial
      establishment);
    - bind durable process-identity digest to local state/data sidecars;
-   - implement explicit initialization/relocation/replacement state lifecycle;
+   - implement explicit initialization and relocation state lifecycle
+     (implemented); replicated replacement is future multihost lifecycle work;
      and
    - add wrong-cluster, wrong-process, wrong-generation, changed-endpoint,
      empty-relocation, and incomplete-relocation restart tests.
@@ -1311,9 +1327,9 @@ Progress as of 2026-08-02:
      TLS material, and admin credential rather than deriving Unix paths
      (implemented);
    - make ordinary admin commands load the same static routed client endpoints,
-     TLS material, and role credential (implemented), then map frontend-read
-     commands from an explicit replicated frontend process rather than using
-     control-plane verifier credentials as a signing identity;
+     TLS material, and role credential, and map frontend reads from the explicit
+     replicated frontend process rather than using control-plane verifier
+     credentials as a signing identity (implemented);
    - enforce principal/role/operation/cluster/topology identity before dispatch
      and authenticate the selected endpoint through TLS (implemented for the
      activated control-plane families);
@@ -1321,9 +1337,10 @@ Progress as of 2026-08-02:
      (implemented through topology-bound application-auth scope);
      and
    - run a three-authority loopback process smoke for startup, routed admin,
-     restart, leadership transfer, and explicit clock recovery (implemented),
-     then run the production-shaped workload on three physical hosts with
-     independent durability devices before release-gate closure.
+     restart, leadership transfer, and explicit clock recovery, then run the
+     production-shaped workload on three physical hosts with independent
+     durability devices (implemented; the composed quantitative gate passed on
+     2026-08-03).
 7. **Storage RPC auth and TCP**
    - implement the transport-independent storage authorization slice over Unix.
      The bounded auth codec and authorization-policy foundation is implemented:
@@ -1356,8 +1373,8 @@ Progress as of 2026-08-02:
      frontend runtime activation); and
    - complete the server-local operation-capability gate and promote the
      cross-host workload to a complete functional data-plane integration gate
-     (implemented). Quantitative sustained release qualification remains in
-     the multihost plan.
+     (implemented). Quantitative sustained release qualification is owned by
+     the multihost plan and its first composed gate has passed.
 
 ## Required Tests
 

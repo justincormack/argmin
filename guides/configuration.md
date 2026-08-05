@@ -207,8 +207,8 @@ Closed enum values are:
 
 - `deployment.mode`: `standalone`, `replicated`
 - `deployment.failure_domain`: `none`, `disk`, `host`
-- `processes.kind`: `all-in-one`, `frontend`, `storage-node`, `combined`,
-  `control-plane`
+- `processes.kind`: `all-in-one`, `frontend`, `storage-node`, `control-plane`;
+  `combined` is a reserved compatibility value and is not supported
 - `authorities.kind`: `single`, `raft-voter`
 - `endpoints.protocol`: `raft-peer`, `control-plane`,
   `authority-clock-recovery`, `storage-rpc`
@@ -245,8 +245,13 @@ The process role matrix is exact:
   authority;
 - `frontend` contains one frontend;
 - `storage-node` contains one storage node;
-- `combined` contains one frontend and one storage node; and
 - `control-plane` contains one single authority or Raft voter.
+
+Replicated frontend and storage roles may run on the same host, but use
+separate processes. A replicated `combined` process is not a supported
+version-1 topology; this preserves distinct credentials, capabilities,
+admission limits, and restart boundaries. `all-in-one` remains exclusive to
+standalone mode.
 
 Standalone mode requires one host, one storage node, one `single` authority,
 EC 1+0, `failure_domain = "none"`, and `failure_tolerance = 0`. Its local Unix

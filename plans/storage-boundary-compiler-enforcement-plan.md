@@ -4,7 +4,7 @@ Status: active — Phases 0–4 complete; Phase 5 in progress
 
 Related plans:
 
-- [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
+- [static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md)
 - [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
 - [multihost-transition-plan.md](multihost-transition-plan.md)
 - [storage-upgrade-versioning-plan.md](storage-upgrade-versioning-plan.md)
@@ -162,8 +162,8 @@ Implementation may continue incrementally, but the sequence is explicit:
    storage-node processes, including operation-scoped frontend/maintenance
    signer selection, auth retention across map refresh/recovery, durable static
    storage identity verification under a lifetime lock, and a process-wide
-   pre-authentication allocation budget. `combined` remains fail-closed pending
-   equivalent workflow-specific credential composition;
+   pre-authentication allocation budget. Replicated `combined` remains
+   fail-closed and is not a supported static version-1 process topology;
 3. continue converting handlers and node-client APIs by complete workflow,
    adding a composed test that crosses both auth and local capability layers
    for each converted workflow;

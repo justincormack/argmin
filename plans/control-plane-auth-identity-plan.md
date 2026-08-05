@@ -120,7 +120,7 @@ authorization. The initial TCP configuration uses an explicit trust bundle,
 normally a private cluster CA but optionally an explicitly selected public-PKI
 bundle, rather than silently inheriting ambient roots. Certificate issuance,
 trust, and rotation are defined in
-[static-cluster-configuration-plan.md](static-cluster-configuration-plan.md).
+[static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md).
 
 The usable signing/verifying material should be scoped by principal and role.
 This is a credential-capability boundary, not a requirement to split roles into
@@ -193,7 +193,7 @@ the full TCP plus secret-distribution/rotation shape will outgrow flat env
 configuration. The TCP/configuration slice should introduce an optional
 configuration file, and production-shaped TCP mode may require one. That file
 uses the versioned manifest and validation contract in
-[static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
+[static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md)
 and should be able to describe:
 
 - cluster identity and transport listeners;
