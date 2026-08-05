@@ -18427,7 +18427,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_all_stream_uploads(
+    pub(crate) fn test_list_all_stream_uploads(
         &self,
     ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?

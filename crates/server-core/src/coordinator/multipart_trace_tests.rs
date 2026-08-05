@@ -1149,15 +1149,12 @@ impl SameKeyUploadHarness {
     }
 
     fn active_session_count(&self) -> usize {
-        self.coord
-            .storage_node()
-            .test_list_all_stream_uploads()
-            .unwrap()
-            .into_iter()
-            .filter(|session| {
-                session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
-            })
-            .count()
+        storage::test_support::stream_upload_session_count_for_object(
+            &self.coord.storage_node(),
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(TRACE_KEY),
+        )
+        .unwrap()
     }
 }
 
@@ -1388,15 +1385,12 @@ impl MultipartHeadTailHarness {
     }
 
     fn active_session_count(&self) -> usize {
-        self.coord
-            .storage_node()
-            .test_list_all_stream_uploads()
-            .unwrap()
-            .into_iter()
-            .filter(|session| {
-                session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
-            })
-            .count()
+        storage::test_support::stream_upload_session_count_for_object(
+            &self.coord.storage_node(),
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(TRACE_KEY),
+        )
+        .unwrap()
     }
 }
 
@@ -1547,15 +1541,12 @@ impl MultipartTraceHarness {
     }
 
     fn active_session_count(&self) -> usize {
-        self.coord
-            .storage_node()
-            .test_list_all_stream_uploads()
-            .unwrap()
-            .into_iter()
-            .filter(|session| {
-                session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
-            })
-            .count()
+        storage::test_support::stream_upload_session_count_for_object(
+            &self.coord.storage_node(),
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(TRACE_KEY),
+        )
+        .unwrap()
     }
 
     fn pending_upload_count(&self) -> usize {

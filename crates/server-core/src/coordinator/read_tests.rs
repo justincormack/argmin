@@ -682,11 +682,10 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         .storage_node()
         .test_object_payload_snapshot_places_each_shard_on_a_distinct_node(&payload)
         .unwrap());
-    assert!(coord
-        .storage_node()
-        .test_list_all_stream_uploads()
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        storage::test_support::stream_upload_session_count(&coord.storage_node()).unwrap(),
+        0
+    );
 
     let get = coord
         .get_object(&GetObjectRequest {
@@ -903,11 +902,10 @@ fn buffered_put_exact_segment_skips_stream_session_rows() {
     let layout = payload.layout();
     assert_eq!(layout.len(), 1);
     assert_eq!(layout[0].size, INTERNAL_SEGMENT_SIZE as u64);
-    assert!(coord
-        .storage_node()
-        .test_list_all_stream_uploads()
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        storage::test_support::stream_upload_session_count(&coord.storage_node()).unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -969,11 +967,10 @@ fn buffered_put_writes_object_segments() {
         assert_eq!(layout[1].size, INTERNAL_SEGMENT_SIZE as u64);
         assert_eq!(layout[2].segment_index, 2);
         assert_eq!(layout[2].size, 123);
-        assert!(coord
-            .storage_node()
-            .test_list_all_stream_uploads()
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            storage::test_support::stream_upload_session_count(&coord.storage_node()).unwrap(),
+            0
+        );
     }
 
     let get = coord

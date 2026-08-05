@@ -875,6 +875,46 @@ pub mod test_support {
         })
     }
 
+    /// Returns the logical number of durable stream-upload sessions without
+    /// exposing their storage-owned records to downstream crates.
+    pub fn stream_upload_session_count(
+        cluster: &StorageCluster,
+    ) -> Result<usize, ObjectPgActionError> {
+        cluster
+            .test_list_all_stream_uploads()
+            .map(|sessions| sessions.len())
+    }
+
+    /// Returns the number of sessions for one exact UploadPart target.
+    ///
+    /// Storage retains ownership of the durable session record and target
+    /// representation; callers supply only the S3-visible upload identity.
+    pub fn upload_part_stream_session_count(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+    ) -> Result<usize, ObjectPgActionError> {
+        cluster.test_list_all_stream_uploads().map(|sessions| {
+            sessions
+                .into_iter()
+                .filter(|session| {
+                    session.bucket == *bucket
+                        && session.key == *key
+                        && matches!(
+                            &session.target,
+                            StreamUploadTarget::UploadPart {
+                                upload_id: target_upload_id,
+                                part_number: target_part_number,
+                            } if target_upload_id == upload_id
+                                && *target_part_number == part_number
+                        )
+                })
+                .count()
+        })
+    }
+
     pub fn multipart_upload_count_for_object(
         cluster: &StorageCluster,
         bucket: &BucketName,

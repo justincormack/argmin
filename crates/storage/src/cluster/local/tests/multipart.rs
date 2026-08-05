@@ -1,6 +1,151 @@
 use super::*;
 
 #[test]
+fn logical_upload_part_stream_session_count_binds_the_complete_target() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let crossed_bucket = crate::BucketName::try_from("crossed-bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    let crossed_key = crate::ObjectKey::try_from("crossed-key".to_string()).unwrap();
+    let upload_id = upload_id_from_label("counttarget");
+    let crossed_upload_id = upload_id_from_label("crossedtarget");
+    create_test_bucket(&cluster, &bucket);
+    create_test_bucket(&cluster, &crossed_bucket);
+
+    let sessions = [
+        crate::CreateStreamUploadReq {
+            session_id: crate::SessionId::try_from("01".repeat(16)).unwrap(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+            },
+            encryption: crate::ObjectEncryption::None,
+        },
+        crate::CreateStreamUploadReq {
+            session_id: crate::SessionId::try_from("02".repeat(16)).unwrap(),
+            bucket: bucket.clone(),
+            key: crossed_key.clone(),
+            target: crate::StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+            },
+            encryption: crate::ObjectEncryption::None,
+        },
+        crate::CreateStreamUploadReq {
+            session_id: crate::SessionId::try_from("03".repeat(16)).unwrap(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::UploadPart {
+                upload_id: crossed_upload_id.clone(),
+                part_number: 1,
+            },
+            encryption: crate::ObjectEncryption::None,
+        },
+        crate::CreateStreamUploadReq {
+            session_id: crate::SessionId::try_from("04".repeat(16)).unwrap(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number: 2,
+            },
+            encryption: crate::ObjectEncryption::None,
+        },
+        crate::CreateStreamUploadReq {
+            session_id: crate::SessionId::try_from("05".repeat(16)).unwrap(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::PutObject,
+            encryption: crate::ObjectEncryption::None,
+        },
+        crate::CreateStreamUploadReq {
+            session_id: crate::SessionId::try_from("06".repeat(16)).unwrap(),
+            bucket: crossed_bucket.clone(),
+            key: key.clone(),
+            target: crate::StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number: 1,
+            },
+            encryption: crate::ObjectEncryption::None,
+        },
+    ];
+    for session in &sessions {
+        cluster.test_create_stream_upload(session).unwrap();
+    }
+
+    assert_eq!(
+        crate::test_support::stream_upload_session_count(&cluster).unwrap(),
+        6
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_count_for_object(&cluster, &bucket, &key)
+            .unwrap(),
+        4
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_count_for_object(
+            &cluster,
+            &bucket,
+            &crossed_key,
+        )
+        .unwrap(),
+        1
+    );
+    assert_eq!(
+        crate::test_support::stream_upload_session_count_for_object(
+            &cluster,
+            &crossed_bucket,
+            &key,
+        )
+        .unwrap(),
+        1
+    );
+    for (query_key, query_upload_id, query_part_number) in [
+        (&key, &upload_id, 1),
+        (&crossed_key, &upload_id, 1),
+        (&key, &crossed_upload_id, 1),
+        (&key, &upload_id, 2),
+    ] {
+        assert_eq!(
+            crate::test_support::upload_part_stream_session_count(
+                &cluster,
+                &bucket,
+                query_key,
+                query_upload_id,
+                query_part_number,
+            )
+            .unwrap(),
+            1
+        );
+    }
+    assert_eq!(
+        crate::test_support::upload_part_stream_session_count(
+            &cluster, &bucket, &key, &upload_id, 3,
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        crate::test_support::upload_part_stream_session_count(
+            &cluster,
+            &crossed_bucket,
+            &key,
+            &upload_id,
+            1,
+        )
+        .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn multipart_create_route_derives_the_object_subject_from_its_capability() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

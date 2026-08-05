@@ -5894,7 +5894,15 @@ Implementation update (2026-08-03):
   subjects select a generation above every durable object, reclaim, upload,
   and reservation reference on the acting set; and multipart state projection
   rejects a returned upload whose bucket/key differs from the requested
-  subject.
+  subject; and
+- removed the remaining cross-crate raw stream-session listing. Buffered PUT,
+  multipart, and state-machine tests now use storage-owned logical counts for
+  all sessions, one object, or one exact UploadPart target. The durable
+  `StreamUploadRecord` and `StreamUploadTarget` representation no longer cross
+  the storage boundary for observation, and the raw cluster listing is
+  crate-private. An owner-local positive matrix creates matching and crossed
+  bucket, key, upload-ID, part-number, and PutObject sessions and pins every
+  field in the per-object and exact-target predicates.
 
 Final Phase 5 audit (2026-08-04):
 
@@ -5926,7 +5934,8 @@ Final Phase 5 audit (2026-08-04):
   segmented-root scenario and a production-written no-root lease case. The
   multipart state-machine harness now uses exact logical session/upload counts
   and upload state. Other coordinator suites still consume the broad
-  multipart upload/session observations; narrow those remaining call sites so
+  multipart-upload observations; stream-session observation is now limited to
+  storage-owned logical counts. Narrow the remaining upload call sites so
   metadata blobs, encryption state, storage generation IDs, and other durable
   record fields do not cross the owner boundary;
 - the runtime-map validity, admission barriers, fault scheduling hooks, opaque
@@ -5964,9 +5973,9 @@ Remaining implementation order after this audit:
 2. **Completed:** retained-placement and shard-selection physical invariants
    are storage-owned; the genuinely cross-crate runtime-map case uses one
    opaque topology scenario, and the backfill migration is complete;
-3. narrow lifecycle/reclaim and multipart state-machine observations to
-   logical owner-defined values, and remove raw generation/record access from
-   the coordinator harnesses;
+3. narrow the remaining multipart-upload observations to logical owner-defined
+   values, and remove raw generation/record access from the coordinator
+   harnesses;
 4. consolidate the surviving guards, observations, and lifecycle controls
    under `storage::test_support`, remove obsolete inherent `StorageCluster`
    test methods, and remove `server-core/test-utils` forwarding of

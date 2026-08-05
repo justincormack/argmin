@@ -33,23 +33,14 @@ fn upload_part_stream_session_count(
     upload_id: &UploadId,
     part_number: u32,
 ) -> usize {
-    coord
-        .storage_node()
-        .test_list_all_stream_uploads()
-        .unwrap()
-        .into_iter()
-        .filter(|session| {
-            session.bucket == bucket
-                && session.key == key
-                && matches!(
-                    &session.target,
-                    StreamUploadTarget::UploadPart {
-                        upload_id: target_upload_id,
-                        part_number: target_part_number,
-                    } if target_upload_id == upload_id && *target_part_number == part_number
-                )
-        })
-        .count()
+    storage::test_support::upload_part_stream_session_count(
+        &coord.storage_node(),
+        &trusted_bucket_name(bucket),
+        &trusted_object_key(key),
+        upload_id,
+        part_number,
+    )
+    .unwrap()
 }
 
 #[test]

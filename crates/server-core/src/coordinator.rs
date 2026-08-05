@@ -31,8 +31,8 @@ use storage::{
 #[cfg(test)]
 use storage::{
     BucketObjectLockConfig, BucketOwnershipControls, BucketState, GenerationId,
-    ManagedEncryptionAlgorithm, PublicAccessBlockConfig, SessionId, StoredObject,
-    StreamUploadTarget, UploadId, UploadState,
+    ManagedEncryptionAlgorithm, PublicAccessBlockConfig, SessionId, StoredObject, UploadId,
+    UploadState,
 };
 
 use self::authz_results::*;
