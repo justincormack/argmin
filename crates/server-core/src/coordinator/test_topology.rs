@@ -1,44 +1,23 @@
 use super::*;
+use storage::test_support::StorageClusterTopologyTestSupport as _;
 
-pub(crate) fn bucket_pg_id(coord: &Coordinator, bucket: &str) -> u32 {
-    coord
-        .storage_node()
-        .test_bucket_pg_id_for(&trusted_bucket_name(bucket))
-}
-
-pub(crate) fn object_pg_id(coord: &Coordinator, bucket: &str, key: &str) -> u32 {
-    coord
-        .storage_node()
-        .test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(key))
-}
-
-pub(crate) fn object_data_pg_id(
+pub(crate) fn find_keys_on_distinct_object_metadata_pgs(
     coord: &Coordinator,
     bucket: &str,
-    key: &str,
-    generation_id: GenerationId,
-) -> u32 {
-    coord.storage_node().test_data_pg_id_for(
-        &trusted_bucket_name(bucket),
-        &trusted_object_key(key),
-        generation_id,
-    )
-}
-
-pub(crate) fn find_key_with_object_pg_distinct_from(
-    coord: &Coordinator,
-    bucket: &str,
-    prefix: &str,
-    excluded_pg_ids: &[u32],
-) -> String {
-    for index in 0..10_000 {
-        let key = format!("{prefix}-{index:04}");
-        let pg_id = object_pg_id(coord, bucket, &key);
-        if !excluded_pg_ids.contains(&pg_id) {
-            return key;
-        }
-    }
-    panic!("failed to find key for prefix {prefix}");
+    prefixes: &[&str],
+) -> Vec<String> {
+    coord
+        .storage_node()
+        .test_find_object_keys_on_distinct_metadata_pgs(&trusted_bucket_name(bucket), prefixes)
+        .unwrap_or_else(|| {
+            panic!(
+                "failed to find {} keys on distinct object metadata PGs",
+                prefixes.len()
+            )
+        })
+        .into_iter()
+        .map(ObjectKey::into_string)
+        .collect()
 }
 
 pub(crate) fn find_key_with_object_pg_ne_bucket_pg(
@@ -46,14 +25,16 @@ pub(crate) fn find_key_with_object_pg_ne_bucket_pg(
     bucket: &str,
     prefix: &str,
 ) -> String {
-    let bucket_pg_id = bucket_pg_id(coord, bucket);
-    for suffix in 0..1024 {
-        let key = format!("{prefix}-{suffix}");
-        if object_pg_id(coord, bucket, &key) != bucket_pg_id {
-            return key;
-        }
-    }
-    panic!("failed to find a key with object_pg_id != bucket_pg_id");
+    coord
+        .storage_node()
+        .test_find_object_key_on_metadata_pg_distinct_from_bucket(
+            &trusted_bucket_name(bucket),
+            prefix,
+        )
+        .unwrap_or_else(|| {
+            panic!("failed to find a key with object metadata PG distinct from bucket metadata PG")
+        })
+        .into_string()
 }
 
 pub(crate) fn find_key_with_object_pg_eq_bucket_pg(
@@ -61,14 +42,11 @@ pub(crate) fn find_key_with_object_pg_eq_bucket_pg(
     bucket: &str,
     prefix: &str,
 ) -> String {
-    let bucket_pg_id = bucket_pg_id(coord, bucket);
-    for suffix in 0..1024 {
-        let key = format!("{prefix}-{suffix}");
-        if object_pg_id(coord, bucket, &key) == bucket_pg_id {
-            return key;
-        }
-    }
-    panic!("failed to find a key with object_pg_id == bucket_pg_id");
+    coord
+        .storage_node()
+        .test_find_object_key_on_same_metadata_pg_as_bucket(&trusted_bucket_name(bucket), prefix)
+        .unwrap_or_else(|| panic!("failed to find a key sharing the bucket metadata PG"))
+        .into_string()
 }
 
 pub(crate) fn find_fresh_key_with_object_pg_gt_data_pg(
@@ -76,15 +54,16 @@ pub(crate) fn find_fresh_key_with_object_pg_gt_data_pg(
     bucket: &str,
     prefix: &str,
 ) -> String {
-    for suffix in 0..1024 {
-        let key = format!("{prefix}-{suffix}");
-        if object_pg_id(coord, bucket, &key)
-            > object_data_pg_id(coord, bucket, &key, GenerationId::MIN)
-        {
-            return key;
-        }
-    }
-    panic!("failed to find a key with object_pg_id > data_pg_id");
+    coord
+        .storage_node()
+        .test_find_fresh_object_key_with_metadata_pg_after_data_pg(
+            &trusted_bucket_name(bucket),
+            prefix,
+        )
+        .unwrap_or_else(|| {
+            panic!("failed to find a key with object metadata PG ordered after its data PG")
+        })
+        .into_string()
 }
 
 pub(crate) fn assert_object_maps_object_pg_gt_data_pg(
@@ -92,21 +71,15 @@ pub(crate) fn assert_object_maps_object_pg_gt_data_pg(
     bucket: &str,
     key: &str,
 ) {
-    let object_pg_id = object_pg_id(coord, bucket, key);
-    let generation_id = match coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name(bucket), &trusted_object_key(key))
-        .unwrap()
-    {
-        StoredObject::Live(record) => record.generation_id,
-        StoredObject::DeleteMarker(other) => {
-            panic!("expected live object for {bucket}/{key}, got {other:?}")
-        }
-    };
-    let data_pg_id = object_data_pg_id(coord, bucket, key, generation_id);
     assert!(
-        object_pg_id > data_pg_id,
-        "expected test object {bucket}/{key} to map to object/data cross-PG ordering: object_pg_id={object_pg_id} data_pg_id={data_pg_id}"
+        coord
+            .storage_node()
+            .test_current_object_has_metadata_pg_after_data_pg(
+                &trusted_bucket_name(bucket),
+                &trusted_object_key(key),
+            )
+            .unwrap(),
+        "expected test object {bucket}/{key} to preserve the selected object/data cross-PG ordering"
     );
 }
 
@@ -116,18 +89,12 @@ pub(crate) fn stream_put_session_has_cross_pg_segments(
     key: &str,
     session_id: &SessionId,
 ) -> bool {
-    let bucket_name = trusted_bucket_name(bucket);
-    let object_key = trusted_object_key(key);
-    let meta_pg_id = coord
+    coord
         .storage_node()
-        .test_object_pg_id_for(&bucket_name, &object_key);
-    let generation_id = coord
-        .storage_node()
-        .test_object_generation_reservation_for(&bucket_name, &object_key, session_id)
-        .unwrap();
-    let data_pg_id =
-        coord
-            .storage_node()
-            .test_data_pg_id_for(&bucket_name, &object_key, generation_id);
-    data_pg_id != meta_pg_id
+        .test_stream_put_session_crosses_metadata_and_data_pgs(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            session_id,
+        )
+        .unwrap()
 }

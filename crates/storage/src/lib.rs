@@ -716,6 +716,12 @@ pub mod test_support {
     mod retained_read;
     pub use retained_read::{TestRetainedReadPgMoveScenario, TestRetainedReadPgMoveScenarioError};
 
+    mod topology;
+    pub use topology::{
+        StorageClusterRuntimeMapTopologyTestSupport, StorageClusterTopologyTestSupport,
+        TestStorageTopologyScenarioError,
+    };
+
     /// Construct an opaque representative of an operation-level storage failure.
     ///
     /// Cross-crate tests use this to verify their protocol translation without

@@ -1,4 +1,54 @@
 use super::*;
+use crate::test_support::StorageClusterTopologyTestSupport as _;
+
+#[test]
+fn topology_test_support_selects_only_the_requested_opaque_placement_relations() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::tests::bucket_name("opaque-topology-bucket");
+    let bucket_pg_id = cluster.test_bucket_pg_id_for(&bucket);
+
+    let same = cluster
+        .test_find_object_key_on_same_metadata_pg_as_bucket(&bucket, "same")
+        .expect("four PGs must provide a key on the bucket metadata PG");
+    assert_eq!(cluster.test_object_pg_id_for(&bucket, &same), bucket_pg_id);
+
+    let distinct = cluster
+        .test_find_object_key_on_metadata_pg_distinct_from_bucket(&bucket, "distinct")
+        .expect("four PGs must provide a key outside the bucket metadata PG");
+    assert_ne!(
+        cluster.test_object_pg_id_for(&bucket, &distinct),
+        bucket_pg_id
+    );
+
+    let keys = cluster
+        .test_find_object_keys_on_distinct_metadata_pgs(&bucket, &["a", "b", "c", "d"])
+        .expect("four PGs must provide four distinct object placements");
+    let placements = keys
+        .iter()
+        .map(|key| cluster.test_object_pg_id_for(&bucket, key))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(placements.len(), 4);
+    assert!(cluster
+        .test_find_object_keys_on_distinct_metadata_pgs(
+            &bucket,
+            &["a", "b", "c", "d", "impossible"],
+        )
+        .is_none());
+
+    let ordered = cluster
+        .test_find_fresh_object_key_with_metadata_pg_after_data_pg(&bucket, "ordered")
+        .expect("four PGs must provide the requested metadata/data ordering");
+    assert!(
+        cluster.test_object_pg_id_for(&bucket, &ordered)
+            > cluster.test_data_pg_id_for(&bucket, &ordered, GenerationId::MIN)
+    );
+}
 
 #[test]
 fn storage_cluster_opens_local_node_map() {

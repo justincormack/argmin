@@ -4457,6 +4457,27 @@ impl StorageClusterRouteHandle {
         candidate: Arc<StorageCluster>,
         after_drain: impl FnOnce(),
     ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
+        self.install_if_current_with_after_drain(None, candidate, after_drain)
+            .map(|installed| {
+                debug_assert!(installed, "unconditional route publication must install");
+            })
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_install_if_current(
+        &self,
+        expected_current: &Arc<StorageCluster>,
+        candidate: Arc<StorageCluster>,
+    ) -> Result<bool, StorageClusterRuntimeMapRefreshError> {
+        self.install_if_current_with_after_drain(Some(expected_current), candidate, || {})
+    }
+
+    fn install_if_current_with_after_drain(
+        &self,
+        expected_current: Option<&Arc<StorageCluster>>,
+        candidate: Arc<StorageCluster>,
+        after_drain: impl FnOnce(),
+    ) -> Result<bool, StorageClusterRuntimeMapRefreshError> {
         let candidate_authority = candidate.route_authority.dynamic_proof()?;
         let _publication = self.route_admission.begin_publication();
         after_drain();
@@ -4465,6 +4486,9 @@ impl StorageClusterRouteHandle {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         current.route_authority.dynamic_proof()?;
+        if expected_current.is_some_and(|expected| !Arc::ptr_eq(expected, &current)) {
+            return Ok(false);
+        }
         if candidate.cluster_epoch() < current.cluster_epoch() {
             return Err(StorageClusterRuntimeMapRefreshError::EpochDowngrade {
                 current: current.cluster_epoch(),
@@ -4529,7 +4553,7 @@ impl StorageClusterRouteHandle {
             generations.push(Arc::downgrade(&candidate));
         }
         *current = candidate;
-        Ok(())
+        Ok(true)
     }
 
     fn renew_from_runtime_map_status(
@@ -5127,6 +5151,16 @@ impl StorageClusterRuntimeMapHandle {
         candidate: Arc<StorageCluster>,
     ) -> Result<(), StorageClusterRuntimeMapRefreshError> {
         self.route_handle.install(candidate)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_install_if_current(
+        &self,
+        expected_current: &Arc<StorageCluster>,
+        candidate: Arc<StorageCluster>,
+    ) -> Result<bool, StorageClusterRuntimeMapRefreshError> {
+        self.route_handle
+            .test_install_if_current(expected_current, candidate)
     }
 
     pub fn refresh_from_control_plane_runtime_map(

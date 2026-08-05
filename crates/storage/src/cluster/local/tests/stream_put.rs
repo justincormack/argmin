@@ -1,4 +1,69 @@
 use super::*;
+use crate::test_support::StorageClusterTopologyTestSupport as _;
+
+#[test]
+fn topology_test_support_binds_stream_placement_to_exact_put_session() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::tests::bucket_name("opaque-stream-topology-bucket");
+    create_test_bucket(&cluster, &bucket);
+
+    let mut selected = None;
+    for suffix in 0..10_000 {
+        let key = crate::tests::object_key(format!("opaque-stream-{suffix:04}"));
+        let session_id = crate::tests::stream_session_id(format!("opaque-{suffix:04}"));
+        cluster
+            .create_put_object_stream_session_record(
+                &bucket,
+                &key,
+                &session_id,
+                crate::ObjectEncryption::None,
+            )
+            .unwrap();
+        let crosses = cluster
+            .test_stream_put_session_crosses_metadata_and_data_pgs(&bucket, &key, &session_id)
+            .unwrap();
+        if selected.as_ref().is_some_and(
+            |(_, _, selected_crosses): &(crate::ObjectKey, crate::SessionId, bool)| {
+                *selected_crosses != crosses
+            },
+        ) {
+            let (other_key, other_session_id, _) = selected.unwrap();
+            let error = cluster
+                .test_stream_put_session_crosses_metadata_and_data_pgs(
+                    &bucket,
+                    &other_key,
+                    &session_id,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::ObjectPgActionError::InvalidRequest { ref reason }
+                    if reason == "topology observation requires the exact PutObject stream session"
+            ));
+            let error = cluster
+                .test_stream_put_session_crosses_metadata_and_data_pgs(
+                    &bucket,
+                    &key,
+                    &other_session_id,
+                )
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                crate::ObjectPgActionError::InvalidRequest { ref reason }
+                    if reason == "topology observation requires the exact PutObject stream session"
+            ));
+            return;
+        }
+        selected.get_or_insert((key, session_id, crosses));
+    }
+    panic!("failed to find both same-PG and cross-PG PutObject stream sessions");
+}
 
 #[test]
 fn stream_put_finalize_pending_install_race_reruns_precondition_action() {

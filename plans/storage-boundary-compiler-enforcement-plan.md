@@ -5926,8 +5926,8 @@ Final Phase 5 audit (2026-08-04):
   `server-core/test-utils` leaks into an ordinary package graph. The
   AWS-facing harnesses remain clean;
 - Phase 5 cannot yet be marked complete. `server-core` still has residual raw
-  storage test seams in `coordinator/core_tests.rs`,
-  `coordinator/test_topology.rs`, and `coordinator/test_support.rs`. These seams
+  storage test seams in `coordinator/core_tests.rs` and
+  `coordinator/test_support.rs`. These seams
   expose or reconstruct raw PG IDs, route snapshots, generation identities,
   EC shapes, shard keys, physical shard paths, shard acknowledgement rows,
   durable object/upload records, and backfill work records;
@@ -6013,6 +6013,18 @@ Final Phase 5 audit (2026-08-04):
   while the direct GetObject authorization tests now enter the same admitted
   authorization path as production. The raw object-read route variant and its
   raw bucket/object snapshot loaders have been removed from `server-core`;
+- `coordinator/test_topology.rs` no longer exposes PG IDs, generation
+  reservations, durable object records, or reconstructed route snapshots.
+  Storage now owns the semantic selection of same-PG, distinct-PG, and
+  metadata/data cross-PG keys and sessions, plus the opaque transition which
+  places one selected object's metadata PG into Peering. That transition is
+  owned by the exact runtime-map handle: it derives the current cluster and
+  local stores from the handle and conditionally publishes only if that
+  generation remains current. Crossed publication domains and an intervening
+  generation are storage-owner non-publication canaries. The coordinator tests
+  retain only object keys and logical placement predicates. Storage-owner
+  canaries also pin every key-selection relation and reject requests for more
+  distinct placements than the topology contains;
 - lifecycle and bucket-delete coordinator tests no longer load raw current or
   explicit-version object records. They assert visible namespace state through
   production `ListObjectVersions`, including requester authorization, while

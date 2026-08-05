@@ -18,7 +18,7 @@ use storage::test_support::{
 use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterObjectTestSupport as _,
     StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
-    StorageClusterRouteMapTestSupport as _,
+    StorageClusterRouteMapTestSupport as _, StorageClusterRuntimeMapTopologyTestSupport as _,
 };
 use storage::{
     ClusterEpoch, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, NodeId, PgId, PgState,
@@ -7619,73 +7619,6 @@ fn same_epoch_cluster_with_stale_current_pg_routes(
     StorageCluster::from_static_local_map(Arc::new(local_map)).unwrap()
 }
 
-fn install_same_store_next_epoch_runtime_map_with_peering_pg(
-    handle: &StorageClusterRuntimeMapHandle,
-    initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
-    peering_pg: u32,
-) -> ClusterEpoch {
-    let node_count = u32::from(initial.default_payload_ec_shape().k)
-        + u32::from(initial.default_payload_ec_shape().m);
-    let configs = (0..node_count)
-        .map(|node_id| {
-            LocalNodeStoreConfig::new(
-                NodeId::new(node_id),
-                node_root.join(format!("node-{node_id:04}")),
-            )
-        })
-        .collect::<Vec<_>>();
-    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
-    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
-    let routes = initial
-        .test_pg_ids()
-        .iter()
-        .map(|pg_id| {
-            let state = if *pg_id == peering_pg {
-                PgState::Peering
-            } else {
-                PgState::Active
-            };
-            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
-                next_epoch,
-                PgId::new(*pg_id),
-                NodeId::new(0),
-                acting_set.clone(),
-                state,
-            );
-            LocalPgRoute::from(&route)
-        })
-        .collect::<Vec<_>>();
-    let historical_routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs,
-        initial.test_pg_ids(),
-        initial.default_payload_ec_shape(),
-        next_epoch,
-        routes,
-    )
-    .unwrap();
-    candidate_map.test_install_historical_pg_routes(historical_routes);
-    candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let candidate =
-        StorageCluster::test_from_local_map_with_epoch(Arc::new(candidate_map), next_epoch)
-            .unwrap();
-    handle.install(candidate).unwrap();
-    next_epoch
-}
-
 fn find_key_for_object_metadata_pg_with_prefix(
     storage_cluster: &StorageCluster,
     bucket: &str,
@@ -9964,13 +9897,6 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
     let key = find_key_with_object_pg_ne_bucket_pg(&coord, bucket, "peering-key");
-    let peering_pg = object_pg_id(&coord, bucket, &key);
-    let bucket_pg = bucket_pg_id(&coord, bucket);
-    assert_ne!(
-        peering_pg, bucket_pg,
-        "test must keep the bucket PG active while the object metadata PG peers"
-    );
-
     test_helpers::put_object(
         &coord,
         &PutObjectRequest {
@@ -9988,25 +9914,17 @@ fn read_and_list_fail_closed_while_object_metadata_pg_is_peering() {
     )
     .unwrap();
 
-    let current_epoch = install_same_store_next_epoch_runtime_map_with_peering_pg(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-        peering_pg,
-    );
-    assert_eq!(
-        handle
-            .current()
-            .local_pg_route(PgId::new(peering_pg))
-            .unwrap()
-            .state(),
-        PgState::Peering
-    );
+    let current_epoch = runtime_handle
+        .test_install_next_epoch_with_object_metadata_pg_peering(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(&key),
+        )
+        .unwrap();
 
     let assert_pg_not_active = |operation: &str, error: ServerError| {
         assert!(
             matches!(error, ServerError::SlowDown),
-            "{operation} should fail closed with a retryable response on Peering object metadata PG {peering_pg} at epoch {current_epoch:?}, got {error:?}"
+            "{operation} should fail closed with a retryable response on the Peering object metadata PG at epoch {current_epoch:?}, got {error:?}"
         );
     };
 
@@ -14895,11 +14813,10 @@ fn list_object_versions_paginates_across_pgs() {
     )
     .unwrap();
 
-    let key_a = find_key_with_object_pg_distinct_from(&coord, "bucket", "a", &[]);
-    let pg_a = object_pg_id(&coord, "bucket", &key_a);
-    let key_b = find_key_with_object_pg_distinct_from(&coord, "bucket", "b", &[pg_a]);
-    let pg_b = object_pg_id(&coord, "bucket", &key_b);
-    let key_c = find_key_with_object_pg_distinct_from(&coord, "bucket", "c", &[pg_a, pg_b]);
+    let keys = find_keys_on_distinct_object_metadata_pgs(&coord, "bucket", &["a", "b", "c"]);
+    let [key_a, key_b, key_c]: [String; 3] = keys
+        .try_into()
+        .unwrap_or_else(|_| panic!("expected three object keys on distinct metadata PGs"));
 
     let older_a = test_helpers::put_object(
         &coord,
