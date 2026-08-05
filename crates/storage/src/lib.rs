@@ -930,6 +930,134 @@ pub mod test_support {
             })
     }
 
+    pub fn multipart_upload_count_for_bucket(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+    ) -> Result<usize, ObjectPgActionError> {
+        cluster
+            .test_list_multipart_uploads_for_bucket(bucket)
+            .map(|uploads| uploads.len())
+    }
+
+    pub fn multipart_upload_ids_for_object(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Vec<UploadId>, ObjectPgActionError> {
+        cluster
+            .test_list_multipart_uploads_for_bucket(bucket)
+            .map(|uploads| {
+                uploads
+                    .into_iter()
+                    .filter(|upload| upload.key == *key)
+                    .map(|upload| upload.upload_id)
+                    .collect()
+            })
+    }
+
+    pub fn multipart_upload_exists(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<bool, ObjectPgActionError> {
+        match cluster.test_get_multipart_upload(bucket, key, upload_id) {
+            Ok(_) => Ok(true),
+            Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn multipart_upload_initiated_at(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<u64, ObjectPgActionError> {
+        cluster
+            .test_get_multipart_upload(bucket, key, upload_id)
+            .map(|upload| upload.initiated_at)
+    }
+
+    pub fn multipart_upload_has_owners(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        expected_initiator: &OwnerIdentity,
+        expected_owner: &OwnerIdentity,
+    ) -> Result<bool, ObjectPgActionError> {
+        cluster
+            .test_get_multipart_upload(bucket, key, upload_id)
+            .map(|upload| {
+                upload.initiator == *expected_initiator && upload.owner == *expected_owner
+            })
+    }
+
+    pub fn multipart_upload_matches_creation_metadata(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        expected_tags: Option<&s3_types::TagSet>,
+        expected_metadata: &SerializedMetadataBlob,
+        expected_system_metadata: &SerializedSystemMetadataBlob,
+    ) -> Result<bool, ObjectPgActionError> {
+        cluster
+            .test_get_multipart_upload(bucket, key, upload_id)
+            .map(|upload| {
+                upload.tags.as_ref().map(SerializedTagSet::tag_set) == expected_tags
+                    && upload.metadata_blob == *expected_metadata
+                    && upload.system_metadata_blob == *expected_system_metadata
+            })
+    }
+
+    /// Opaque storage-owned identity for the generation reserved by one
+    /// multipart upload before it is completed and its durable upload row is
+    /// removed.
+    #[derive(Clone)]
+    pub struct TestMultipartUploadGenerationSubject {
+        bucket: BucketName,
+        key: ObjectKey,
+        generation_id: GenerationId,
+    }
+
+    impl std::fmt::Debug for TestMultipartUploadGenerationSubject {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter
+                .debug_struct("TestMultipartUploadGenerationSubject")
+                .field("bucket", &self.bucket)
+                .field("key", &self.key)
+                .finish_non_exhaustive()
+        }
+    }
+
+    pub fn capture_multipart_upload_generation_subject(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<TestMultipartUploadGenerationSubject, ObjectPgActionError> {
+        cluster
+            .test_get_multipart_upload(bucket, key, upload_id)
+            .map(|upload| TestMultipartUploadGenerationSubject {
+                bucket: upload.bucket,
+                key: upload.key,
+                generation_id: upload.object_generation_id,
+            })
+    }
+
+    pub fn completed_object_uses_multipart_upload_generation(
+        cluster: &StorageCluster,
+        subject: &TestMultipartUploadGenerationSubject,
+        version_id: VersionId,
+    ) -> Result<bool, ObjectPgActionError> {
+        let object = cluster.test_get_object_version(&subject.bucket, &subject.key, version_id)?;
+        Ok(object
+            .as_live()
+            .is_some_and(|live| live.generation_id == subject.generation_id))
+    }
+
     pub fn multipart_upload_state(
         cluster: &StorageCluster,
         bucket: &BucketName,
@@ -999,72 +1127,6 @@ pub mod test_support {
             Self {
                 bucket: root.bucket.clone(),
                 bucket_incarnation_generation: root.bucket_incarnation_generation,
-            }
-        }
-    }
-
-    /// Test-only logical observation of one durable multipart upload.
-    ///
-    /// The production record remains storage-private. This projection lets
-    /// cross-crate behavioral tests inspect the S3-visible state they established
-    /// without depending on the database/RPC record type.
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Clone, PartialEq, Eq)]
-    pub struct TestMultipartUploadRecord {
-        pub upload_id: UploadId,
-        pub bucket: BucketName,
-        pub key: ObjectKey,
-        pub initiated_at: u64,
-        pub state: UploadState,
-        pub tags: Option<s3_types::TagSet>,
-        pub metadata_blob: SerializedMetadataBlob,
-        pub system_metadata_blob: SerializedSystemMetadataBlob,
-        pub initiator: OwnerIdentity,
-        pub owner: OwnerIdentity,
-        pub acl_grants: AclGrants,
-        pub public_read: bool,
-        pub object_generation_id: GenerationId,
-        pub object_lock: ObjectLockState,
-        pub checksum: Option<MultipartChecksumConfig>,
-        pub encryption: ObjectEncryption,
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl std::fmt::Debug for TestMultipartUploadRecord {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter
-                .debug_struct("TestMultipartUploadRecord")
-                .field("upload_id", &self.upload_id)
-                .field("bucket", &self.bucket)
-                .field("key", &self.key)
-                .field("initiated_at", &self.initiated_at)
-                .field("state", &self.state)
-                .field("tag_count", &self.tags.as_ref().map(s3_types::TagSet::len))
-                .field("object_generation_id", &self.object_generation_id)
-                .finish_non_exhaustive()
-        }
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl From<types::MultipartUploadRecord> for TestMultipartUploadRecord {
-        fn from(upload: types::MultipartUploadRecord) -> Self {
-            Self {
-                upload_id: upload.upload_id,
-                bucket: upload.bucket,
-                key: upload.key,
-                initiated_at: upload.initiated_at,
-                state: upload.state,
-                tags: upload.tags.map(|tags| tags.tag_set().clone()),
-                metadata_blob: upload.metadata_blob,
-                system_metadata_blob: upload.system_metadata_blob,
-                initiator: upload.initiator,
-                owner: upload.owner,
-                acl_grants: upload.acl_grants,
-                public_read: upload.public_read,
-                object_generation_id: upload.object_generation_id,
-                object_lock: upload.object_lock,
-                checksum: upload.checksum,
-                encryption: upload.encryption,
             }
         }
     }
@@ -1459,8 +1521,7 @@ pub use storage_rpc_auth::{
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
-    TestMultipartUploadRecord, TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot,
-    TestStreamUploadPayloadSnapshot,
+    TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot, TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

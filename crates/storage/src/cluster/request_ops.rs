@@ -14719,27 +14719,6 @@ impl super::StorageCluster {
         )
     }
 
-    /// Test-only logical observation of one in-progress multipart upload.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_load_in_progress_multipart_upload(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<crate::TestMultipartUploadRecord, ObjectPgActionError> {
-        self.load_in_progress_multipart_upload_with_route_validation(
-            super::MultipartObjectMutationEffectRoute {
-                pg_id: self.object_metadata_pg(bucket, key),
-                bucket,
-                key,
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            upload_id,
-            || Ok(()),
-        )
-        .map(Into::into)
-    }
-
     /// Load an in-progress upload through the logical UploadPart authorization boundary.
     pub fn load_multipart_upload_for_part(
         &self,
@@ -17220,15 +17199,14 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_multipart_upload(
+    pub(crate) fn test_get_multipart_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<crate::TestMultipartUploadRecord, ObjectPgActionError> {
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_multipart_upload(bucket, key, upload_id)
-            .map(Into::into)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -17257,13 +17235,12 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_multipart_uploads_for_bucket(
+    pub(crate) fn test_list_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
-    ) -> Result<Vec<crate::TestMultipartUploadRecord>, ObjectPgActionError> {
+    ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_list_multipart_uploads_for_bucket(bucket)
-            .map(|uploads| uploads.into_iter().map(Into::into).collect())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

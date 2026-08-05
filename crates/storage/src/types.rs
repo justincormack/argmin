@@ -6719,36 +6719,6 @@ mod tests {
     }
 
     #[test]
-    fn multipart_upload_test_projection_is_logical_and_redacts_customer_state() {
-        let mut upload = management_lookup_test_upload(UploadState::InProgress);
-        let tags = s3_types::TagSet::from_pairs(
-            vec![(
-                "customer-secret-key".to_string(),
-                "customer-secret-value".to_string(),
-            )],
-            s3_types::MAX_OBJECT_TAGS,
-        )
-        .unwrap();
-        upload.tags = Some(SerializedTagSet::from_tag_set(tags.clone()).unwrap());
-        upload.metadata_blob = SerializedMetadataBlob::new(vec![11, 13]);
-        upload.system_metadata_blob = SerializedSystemMetadataBlob::new(vec![17, 19]);
-
-        let projected = crate::TestMultipartUploadRecord::from(upload);
-
-        assert_eq!(projected.tags.as_ref(), Some(&tags));
-        assert_eq!(projected.state, UploadState::InProgress);
-        assert_eq!(projected.key.as_str(), "private-durable-key");
-
-        let debug = format!("{projected:?}");
-        assert!(debug.contains("tag_count: Some(1)"));
-        assert!(!debug.contains("customer-secret-key"));
-        assert!(!debug.contains("customer-secret-value"));
-        assert!(!debug.contains("metadata_blob"));
-        assert!(!debug.contains("system_metadata_blob"));
-        assert!(!debug.contains("encryption"));
-    }
-
-    #[test]
     fn object_read_multipart_part_exposes_and_compares_only_logical_read_state() {
         let first_record = ObjectPartRecord {
             bucket: BucketName::try_from("private-first-bucket").unwrap(),

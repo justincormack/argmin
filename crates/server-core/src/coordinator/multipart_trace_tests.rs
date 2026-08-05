@@ -928,20 +928,18 @@ impl SameKeyUploadHarness {
         match op {
             SameKeyUploadTraceOp::CreateUpload => {
                 let create = create_basic_multipart_upload(&self.coord, TRACE_BUCKET, TRACE_KEY);
-                let upload = self
-                    .coord
-                    .storage_node()
-                    .test_get_multipart_upload(
-                        &trusted_bucket_name(TRACE_BUCKET),
-                        &trusted_object_key(TRACE_KEY),
-                        &create.upload_id,
-                    )
-                    .unwrap();
+                let initiated_at = storage::test_support::multipart_upload_initiated_at(
+                    &self.coord.storage_node(),
+                    &trusted_bucket_name(TRACE_BUCKET),
+                    &trusted_object_key(TRACE_KEY),
+                    &create.upload_id,
+                )
+                .unwrap();
                 let payload = format!("trace-part-{}", self.next_payload_id).into_bytes();
                 self.next_payload_id = self.next_payload_id.wrapping_add(1);
                 self.uploads.push(SameKeyUploadEntry {
                     upload_id: create.upload_id,
-                    initiated_at: upload.initiated_at,
+                    initiated_at,
                     part_etag: None,
                     payload,
                 });
@@ -1550,13 +1548,12 @@ impl MultipartTraceHarness {
     }
 
     fn pending_upload_count(&self) -> usize {
-        self.coord
-            .storage_node()
-            .test_list_multipart_uploads_for_bucket(&trusted_bucket_name(TRACE_BUCKET))
-            .unwrap()
-            .into_iter()
-            .filter(|upload| upload.key.as_str() == TRACE_KEY)
-            .count()
+        storage::test_support::multipart_upload_count_for_object(
+            &self.coord.storage_node(),
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(TRACE_KEY),
+        )
+        .unwrap()
     }
 }
 

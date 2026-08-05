@@ -1215,27 +1215,17 @@ fn create_multipart_upload_preserves_metadata() {
         })
         .unwrap();
 
-    // Verify we can retrieve the upload and its metadata blob is stored.
-    let record = coord
-        .storage_node()
-        .test_get_multipart_upload(
+    assert!(
+        storage::test_support::multipart_upload_matches_creation_metadata(
+            &coord.storage_node(),
             &trusted_bucket_name("bucket"),
             &trusted_object_key("photo.png"),
             &result.upload_id,
+            Some(&tags),
+            &storage::SerializedMetadataBlob::from(metadata.serialize().unwrap()),
+            &storage::SerializedSystemMetadataBlob::from(system_metadata.serialize().unwrap()),
         )
-        .unwrap();
-    assert_eq!(record.bucket, "bucket");
-    assert_eq!(record.key, "photo.png");
-    assert_eq!(record.tags.as_ref(), Some(&tags));
-
-    // Deserialize and verify the metadata blob.
-    let blob = MetadataBlob::deserialize(record.metadata_blob.as_slice()).unwrap();
-    assert_eq!(blob.get("x-amz-meta-author"), Some("test"));
-    let stored_system =
-        SystemMetadata::deserialize(record.system_metadata_blob.as_slice()).unwrap();
-    assert_eq!(
-        stored_system.content_type().map(|v| v.as_str()),
-        Some("image/png")
+        .unwrap()
     );
 }
 
@@ -1448,18 +1438,13 @@ fn no_such_upload_from_storage() {
         .unwrap();
 
     // Directly call get_multipart_upload on a PG with a bogus upload ID.
-    let err = coord
-        .storage_node()
-        .test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            &trusted_upload_id("nonexistent"),
-        )
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload { .. })
-    ));
+    assert!(!storage::test_support::multipart_upload_exists(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        &trusted_upload_id("nonexistent"),
+    )
+    .unwrap());
     let err = ServerError::NoSuchUpload {
         upload_id: "nonexistent".to_string(),
     };
@@ -2255,10 +2240,13 @@ fn complete_multipart_upload_happy_path() {
         create_upload_with_parts(&coord, "bucket", "key", &[(1, &big_part), (2, small_last)]);
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let upload = coord
-        .storage_node()
-        .test_get_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap();
+    let upload_generation = storage::test_support::capture_multipart_upload_generation_subject(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        &upload_id,
+    )
+    .unwrap();
 
     let result = coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -2298,7 +2286,14 @@ fn complete_multipart_upload_happy_path() {
         live_obj.size,
         big_part.len() as u64 + small_last.len() as u64
     );
-    assert_eq!(live_obj.generation_id, upload.object_generation_id);
+    assert!(
+        storage::test_support::completed_object_uses_multipart_upload_generation(
+            &coord.storage_node(),
+            &upload_generation,
+            result.version_id,
+        )
+        .unwrap()
+    );
 
     // object_parts should be committed.
     let committed = coord
@@ -2308,14 +2303,13 @@ fn complete_multipart_upload_happy_path() {
     assert_eq!(committed, [1, 2]);
 
     // Upload should be deleted.
-    let err = coord
-        .storage_node()
-        .test_get_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload { .. })
-    ));
+    assert!(!storage::test_support::multipart_upload_exists(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        &upload_id,
+    )
+    .unwrap());
 }
 
 #[test]

@@ -939,10 +939,14 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
                 &trusted_bucket_name("expired-create"),
             )
             .unwrap());
-        assert!(cluster
-            .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            storage::test_support::multipart_upload_count_for_bucket(
+                &cluster,
+                &trusted_bucket_name("bucket"),
+            )
+            .unwrap(),
+            0
+        );
     });
 }
 
@@ -1735,13 +1739,13 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
                 || session.key.as_str() != "late-part-copy-destination"),
         "failed UploadPartCopy must abort its destination stream session"
     );
-    cluster
-        .test_load_in_progress_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("late-part-copy-destination"),
-            &upload.upload_id,
-        )
-        .expect("failed UploadPartCopy must preserve the active multipart upload");
+    assert!(storage::test_support::multipart_upload_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("late-part-copy-destination"),
+        &upload.upload_id,
+    )
+    .expect("failed UploadPartCopy must preserve the active multipart upload"));
 }
 
 #[test]
@@ -1882,9 +1886,13 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         .list_stream_upload_sessions_best_effort()
         .into_iter()
         .all(|session| session.session_id != begin.session_id));
-    cluster
-        .test_load_in_progress_multipart_upload(&bucket, &key, &upload.upload_id)
-        .expect("failed ordinary UploadPart must preserve its multipart upload");
+    assert!(storage::test_support::multipart_upload_exists(
+        &cluster,
+        &bucket,
+        &key,
+        &upload.upload_id,
+    )
+    .expect("failed ordinary UploadPart must preserve its multipart upload"));
 }
 
 #[test]
@@ -2035,21 +2043,29 @@ fn multipart_creation_expires_at_pending_install_effect_boundary() {
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
-    assert!(cluster
-        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        storage::test_support::multipart_upload_count_for_bucket(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+        )
+        .unwrap(),
+        0
+    );
 
     clock.set(1_000);
     let fresh_admission = coord.admit_storage_route_for_request().unwrap();
     let created = coord
         .create_multipart_upload_on_admitted_route(&fresh_admission, &request)
         .unwrap();
-    let uploads = cluster
-        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
-        .unwrap();
-    assert_eq!(uploads.len(), 1);
-    assert_eq!(uploads[0].upload_id, created.upload_id);
+    assert_eq!(
+        storage::test_support::multipart_upload_ids_for_object(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("late-multipart"),
+        )
+        .unwrap(),
+        [created.upload_id]
+    );
 }
 
 #[test]
@@ -2113,33 +2129,26 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
-    assert_eq!(
-        cluster
-            .test_load_in_progress_multipart_upload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("late-abort"),
-                &upload_id,
-            )
-            .unwrap()
-            .upload_id,
-        upload_id
-    );
+    assert!(storage::test_support::multipart_upload_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("late-abort"),
+        &upload_id,
+    )
+    .unwrap());
 
     clock.set(1_000);
     let fresh_admission = coord.admit_storage_route_for_request().unwrap();
     coord
         .abort_multipart_upload_on_admitted_route(&fresh_admission, &request)
         .unwrap();
-    assert!(matches!(
-        cluster.test_load_in_progress_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("late-abort"),
-            &upload_id,
-        ),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::NoSuchUpload { .. }
-        ))
-    ));
+    assert!(!storage::test_support::multipart_upload_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("late-abort"),
+        &upload_id,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -2201,17 +2210,13 @@ fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
     assert!(pending_install_count.load(std::sync::atomic::Ordering::SeqCst) >= 2);
     drop(hook);
     drop(admission);
-    assert_eq!(
-        cluster
-            .test_load_in_progress_multipart_upload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("late-completion"),
-                &upload_id,
-            )
-            .unwrap()
-            .upload_id,
-        upload_id
-    );
+    assert!(storage::test_support::multipart_upload_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("late-completion"),
+        &upload_id,
+    )
+    .unwrap());
 
     clock.set(1_000);
     let fresh_admission = coord.admit_storage_route_for_request().unwrap();
@@ -2392,17 +2397,13 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(hook);
     drop(admission);
-    assert_eq!(
-        cluster
-            .test_load_in_progress_multipart_upload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("logs/listed"),
-                &upload_id,
-            )
-            .unwrap()
-            .upload_id,
-        upload_id
-    );
+    assert!(storage::test_support::multipart_upload_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("logs/listed"),
+        &upload_id,
+    )
+    .unwrap());
 
     clock.set(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
@@ -2485,17 +2486,13 @@ fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epo
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(admission);
-    assert_eq!(
-        cluster
-            .test_load_in_progress_multipart_upload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("complete-preflight"),
-                &upload_id,
-            )
-            .unwrap()
-            .upload_id,
-        upload_id
-    );
+    assert!(storage::test_support::multipart_upload_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("complete-preflight"),
+        &upload_id,
+    )
+    .unwrap());
 
     clock.set(1_000);
     let fresh_admission = coord.admit_storage_route_for_request().unwrap();
@@ -2670,11 +2667,15 @@ fn multipart_creation_uses_admitted_lifecycle_snapshot_after_commit_deadline() {
             .and_then(|headers| headers.rule_id.as_deref()),
         Some("abort-mpu")
     );
-    let uploads = cluster
-        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
-        .unwrap();
-    assert_eq!(uploads.len(), 1);
-    assert_eq!(uploads[0].upload_id, result.upload_id);
+    assert_eq!(
+        storage::test_support::multipart_upload_ids_for_object(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("logs/archive"),
+        )
+        .unwrap(),
+        [result.upload_id]
+    );
 }
 
 #[test]
@@ -4323,19 +4324,28 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         .create_multipart_upload_on_admitted_route(&foreign_admission, &request)
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
-    assert!(cluster
-        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
-        .unwrap()
-        .is_empty());
+    assert_eq!(
+        storage::test_support::multipart_upload_count_for_bucket(
+            &cluster,
+            &trusted_bucket_name("bucket"),
+        )
+        .unwrap(),
+        0
+    );
 
     let created = foreign
         .create_multipart_upload_on_admitted_route(&foreign_admission, &request)
         .unwrap();
-    let uploads = cluster
-        .test_list_multipart_uploads_for_bucket(&trusted_bucket_name("bucket"))
-        .unwrap();
-    assert_eq!(uploads.len(), 1);
-    assert_eq!(uploads[0].upload_id, created.upload_id);
+    let upload_ids = storage::test_support::multipart_upload_ids_for_object(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("foreign-domain-multipart"),
+    )
+    .unwrap();
+    assert_eq!(
+        upload_ids.as_slice(),
+        std::slice::from_ref(&created.upload_id)
+    );
 
     let complete_preflight_request = multipart_object_request_with_expected_owner(
         "bucket",
@@ -4542,17 +4552,13 @@ fn multipart_control_operations_reject_admission_from_an_unrelated_coordinator()
         .abort_multipart_upload_on_admitted_route(&foreign_admission, &abort_request)
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
-    assert_eq!(
-        cluster
-            .test_load_in_progress_multipart_upload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("foreign-domain-multipart"),
-                &created.upload_id,
-            )
-            .unwrap()
-            .upload_id,
-        created.upload_id
-    );
+    assert!(storage::test_support::multipart_upload_exists(
+        &cluster,
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("foreign-domain-multipart"),
+        &created.upload_id,
+    )
+    .unwrap());
     foreign
         .abort_multipart_upload_on_admitted_route(&foreign_admission, &abort_request)
         .unwrap();
@@ -14220,16 +14226,15 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
         })
         .unwrap();
 
-    let upload_record = coord
-        .storage_node()
-        .test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            &upload.upload_id,
-        )
-        .unwrap();
-    assert_eq!(upload_record.initiator, expected_owner.clone());
-    assert_eq!(upload_record.owner, expected_owner);
+    assert!(storage::test_support::multipart_upload_has_owners(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        &upload.upload_id,
+        &expected_owner,
+        &expected_owner,
+    )
+    .unwrap());
 
     test_helpers::upload_part(
         &coord,
@@ -14339,28 +14344,21 @@ fn create_multipart_upload_bucket_owner_preferred_promotes_bucket_owner_with_ful
         })
         .unwrap();
 
-    let upload_record = coord
-        .storage_node()
-        .test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            &upload.upload_id,
-        )
-        .unwrap();
-    assert_eq!(
-        upload_record.initiator,
-        OwnerIdentity::new(
+    assert!(storage::test_support::multipart_upload_has_owners(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        &upload.upload_id,
+        &OwnerIdentity::new(
             writer.principal().to_string(),
             writer.canonical_user_id().clone(),
-        )
-    );
-    assert_eq!(
-        upload_record.owner,
-        OwnerIdentity::new(
+        ),
+        &OwnerIdentity::new(
             bucket_owner.principal().to_string(),
             bucket_owner.canonical_user_id().clone(),
-        )
-    );
+        ),
+    )
+    .unwrap());
 }
 
 #[test]

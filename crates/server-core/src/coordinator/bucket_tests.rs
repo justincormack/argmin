@@ -3592,17 +3592,17 @@ fn lifecycle_sweep_aborts_due_incomplete_multipart_upload() {
     )
     .unwrap();
 
-    let deadline = {
-        let upload = coord
-            .storage_node()
-            .test_get_multipart_upload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("logs/app"),
-                &matching.upload_id,
-            )
-            .unwrap();
-        Coordinator::lifecycle_day_based_deadline(upload.initiated_at, 1).unwrap()
-    };
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        storage::test_support::multipart_upload_initiated_at(
+            &coord.storage_node(),
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("logs/app"),
+            &matching.upload_id,
+        )
+        .unwrap(),
+        1,
+    )
+    .unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.expired_current_objects, 0);
@@ -3610,16 +3610,13 @@ fn lifecycle_sweep_aborts_due_incomplete_multipart_upload() {
     assert_eq!(stats.expired_delete_markers, 0);
     assert_eq!(stats.aborted_multipart_uploads, 1);
 
-    assert!(matches!(
-        coord.storage_node().test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("logs/app"),
-            &matching.upload_id
-        ),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::NoSuchUpload { .. }
-        ))
-    ));
+    assert!(!storage::test_support::multipart_upload_exists(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("logs/app"),
+        &matching.upload_id,
+    )
+    .unwrap());
     assert!(coord
         .storage_node()
         .test_capture_multipart_upload_payload(
@@ -3630,14 +3627,13 @@ fn lifecycle_sweep_aborts_due_incomplete_multipart_upload() {
         .unwrap()
         .is_empty());
 
-    assert!(coord
-        .storage_node()
-        .test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("tmp/keep"),
-            &retained.upload_id
-        )
-        .is_ok());
+    assert!(storage::test_support::multipart_upload_exists(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("tmp/keep"),
+        &retained.upload_id,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -3675,17 +3671,17 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
         })
         .unwrap();
 
-    let deadline = {
-        let upload = coord
-            .storage_node()
-            .test_get_multipart_upload(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("logs/app"),
-                &upload.upload_id,
-            )
-            .unwrap();
-        Coordinator::lifecycle_day_based_deadline(upload.initiated_at, 1).unwrap()
-    };
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        storage::test_support::multipart_upload_initiated_at(
+            &coord.storage_node(),
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("logs/app"),
+            &upload.upload_id,
+        )
+        .unwrap(),
+        1,
+    )
+    .unwrap();
 
     delete_bucket_lifecycle_test(&coord, "bucket", test_requester(), None).unwrap();
     let bucket_incarnation_generation = coord
@@ -3705,14 +3701,13 @@ fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
         )
         .unwrap());
 
-    assert!(coord
-        .storage_node()
-        .test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("logs/app"),
-            &upload.upload_id
-        )
-        .is_ok());
+    assert!(storage::test_support::multipart_upload_exists(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("logs/app"),
+        &upload.upload_id,
+    )
+    .unwrap());
 }
 
 #[test]
@@ -3752,13 +3747,17 @@ fn lifecycle_abort_stops_when_delete_drain_starts_after_claim() {
         })
         .unwrap();
 
-    let deadline = {
-        let upload_record = coord
-            .storage_node()
-            .test_get_multipart_upload(&bucket, &key, &upload.upload_id)
-            .unwrap();
-        Coordinator::lifecycle_day_based_deadline(upload_record.initiated_at, 1).unwrap()
-    };
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        storage::test_support::multipart_upload_initiated_at(
+            &coord.storage_node(),
+            &bucket,
+            &key,
+            &upload.upload_id,
+        )
+        .unwrap(),
+        1,
+    )
+    .unwrap();
     let bucket_info = coord.storage_node().head_bucket_info(&bucket).unwrap();
     let claim = coord
         .storage_node()
@@ -3780,10 +3779,13 @@ fn lifecycle_abort_stops_when_delete_drain_starts_after_claim() {
             deadline,
         )
         .unwrap());
-    assert!(coord
-        .storage_node()
-        .test_get_multipart_upload(&bucket, &key, &upload.upload_id)
-        .is_ok());
+    assert!(storage::test_support::multipart_upload_exists(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        &upload.upload_id,
+    )
+    .unwrap());
 
     coord
         .storage_node()
@@ -4135,11 +4137,16 @@ fn lifecycle_aborting_upload_finish_stops_when_delete_drain_starts_after_claim()
             claim.bucket_incarnation_generation,
         )
         .unwrap());
-    let upload_record = coord
-        .storage_node()
-        .test_get_multipart_upload(&bucket, &key, &upload.upload_id)
-        .unwrap();
-    assert_eq!(upload_record.state, UploadState::Aborting);
+    assert_eq!(
+        storage::test_support::multipart_upload_state(
+            &coord.storage_node(),
+            &bucket,
+            &key,
+            &upload.upload_id,
+        )
+        .unwrap(),
+        UploadState::Aborting
+    );
 
     coord
         .storage_node()
@@ -4215,16 +4222,13 @@ fn lifecycle_sweep_finishes_aborting_multipart_upload_without_current_lifecycle_
     let stats = coord.run_lifecycle_sweep_at(0).unwrap();
     assert_eq!(stats.aborted_multipart_uploads, 1);
 
-    assert!(matches!(
-        coord.storage_node().test_get_multipart_upload(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("logs/app"),
-            &upload.upload_id
-        ),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::NoSuchUpload { .. }
-        ))
-    ));
+    assert!(!storage::test_support::multipart_upload_exists(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("logs/app"),
+        &upload.upload_id,
+    )
+    .unwrap());
 }
 
 #[test]

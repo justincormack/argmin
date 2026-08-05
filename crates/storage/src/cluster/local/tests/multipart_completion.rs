@@ -1,6 +1,93 @@
 use super::*;
 
 #[test]
+fn multipart_generation_subject_matches_only_its_completed_version() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let (bucket, key, _object_pg, _data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+
+    let (mut first_request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "firstgeneration");
+    first_request.versioning = crate::BucketVersioningState::Enabled;
+    let first_subject = crate::test_support::capture_multipart_upload_generation_subject(
+        &cluster,
+        &bucket,
+        &key,
+        &first_request.upload_id,
+    )
+    .unwrap();
+    let first_outcome = cluster
+        .complete_multipart_upload_commit_serialized(first_request)
+        .unwrap();
+
+    let (mut second_request, _) = seed_streamed_multipart_completion_with_existing(
+        &cluster,
+        &bucket,
+        &key,
+        "secondgeneration",
+        true,
+    );
+    second_request.versioning = crate::BucketVersioningState::Enabled;
+    let second_subject = crate::test_support::capture_multipart_upload_generation_subject(
+        &cluster,
+        &bucket,
+        &key,
+        &second_request.upload_id,
+    )
+    .unwrap();
+    let second_outcome = cluster
+        .complete_multipart_upload_commit_serialized(second_request)
+        .unwrap();
+
+    assert_ne!(first_outcome.version_id, second_outcome.version_id);
+    assert!(
+        crate::test_support::completed_object_uses_multipart_upload_generation(
+            &cluster,
+            &first_subject,
+            first_outcome.version_id,
+        )
+        .unwrap()
+    );
+    assert!(
+        !crate::test_support::completed_object_uses_multipart_upload_generation(
+            &cluster,
+            &first_subject,
+            second_outcome.version_id,
+        )
+        .unwrap()
+    );
+    assert!(
+        crate::test_support::completed_object_uses_multipart_upload_generation(
+            &cluster,
+            &second_subject,
+            second_outcome.version_id,
+        )
+        .unwrap()
+    );
+    assert!(
+        !crate::test_support::completed_object_uses_multipart_upload_generation(
+            &cluster,
+            &second_subject,
+            first_outcome.version_id,
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn multipart_completion_route_rejects_crossed_same_pg_request_before_mutation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
