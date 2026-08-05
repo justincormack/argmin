@@ -38,7 +38,10 @@ use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 #[cfg(test)]
-use storage::test_support::StorageClusterPayloadTestSupport as _;
+use storage::test_support::{
+    StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
+    StorageClusterRouteMapTestSupport as _,
+};
 use storage::{BucketName, SessionId};
 #[cfg(any(test, feature = "local-debug-endpoints"))]
 use storage::{ObjectKey, ObjectReadSnapshot, ObjectReadSnapshotMode, PgId};

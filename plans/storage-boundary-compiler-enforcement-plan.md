@@ -5975,6 +5975,14 @@ Final Phase 5 audit (2026-08-04):
   tests must explicitly import the owner namespace and cannot discover these
   operations on the ordinary production surface. The snapshot values remain
   opaque and expose only their existing logical projections; and
+- captured route-validity/lease mutation and deterministic
+  request-admission/publication barriers are now exposed only through the
+  curated `StorageClusterRouteMapTestSupport` and
+  `StorageClusterRouteHandleTestSupport` traits. Those feature-gated trait
+  methods remain intentionally callable by downstream tests; the corresponding
+  inherent helper methods on the production route types are crate-private,
+  keeping these allowed test-runtime lifecycle controls explicit in
+  `storage::test_support`; and
 
 The audited cross-crate support families are:
 
@@ -6008,7 +6016,10 @@ Remaining implementation order after this audit:
    helpers now compile over the production storage feature set. The opaque
    object, multipart-part, and stream-payload snapshot family is consolidated
    behind one curated test-support trait and its inherent implementations are
-   crate-private; and
+   crate-private. Route-map validity/lease controls and request/publication
+   barriers are likewise consolidated behind owner-namespaced test-support
+   traits whose feature-gated methods remain downstream-callable, while their
+   corresponding inherent helper methods are crate-private; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the transitional raw-record seam and its plan exception are gone.
 

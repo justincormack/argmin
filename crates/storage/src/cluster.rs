@@ -4401,12 +4401,12 @@ impl StorageClusterRouteHandle {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_wait_until_route_request_is_admitted(&self) {
+    pub(crate) fn test_wait_until_route_request_is_admitted(&self) {
         self.route_admission.wait_until_request_is_admitted();
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_wait_until_route_publication_is_pending(&self) {
+    pub(crate) fn test_wait_until_route_publication_is_pending(&self) {
         self.route_admission.wait_until_publication_is_pending();
     }
 
@@ -10077,7 +10077,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_clone_with_dynamic_route_map_validity(
+    pub(crate) fn test_clone_with_dynamic_route_map_validity(
         &self,
         validity: RouteMapValidity,
     ) -> Result<Arc<Self>, ClusterBuildError> {
@@ -10188,12 +10188,12 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
+    pub(crate) fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
         self.local_map.test_store_route_map_validity(validity);
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_store_route_map_lease(
+    pub(crate) fn test_store_route_map_lease(
         &self,
         validity: RouteMapValidity,
         local_valid_until_monotonic_ms: Option<u64>,

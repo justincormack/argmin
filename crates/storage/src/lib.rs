@@ -382,6 +382,68 @@ pub mod test_support {
         }
     }
 
+    /// Curated runtime-map validity controls for cross-crate tests.
+    ///
+    /// These operations let request-layer tests deterministically exercise
+    /// captured-deadline and same-epoch renewal behavior without exposing the
+    /// cluster's ordinary test-only implementation methods.
+    pub trait StorageClusterRouteMapTestSupport {
+        fn test_clone_with_dynamic_route_map_validity(
+            &self,
+            validity: RouteMapValidity,
+        ) -> Result<Arc<StorageCluster>, ClusterBuildError>;
+
+        fn test_store_route_map_validity(&self, validity: RouteMapValidity);
+
+        fn test_store_route_map_lease(
+            &self,
+            validity: RouteMapValidity,
+            local_valid_until_monotonic_ms: Option<u64>,
+        );
+    }
+
+    impl StorageClusterRouteMapTestSupport for StorageCluster {
+        fn test_clone_with_dynamic_route_map_validity(
+            &self,
+            validity: RouteMapValidity,
+        ) -> Result<Arc<StorageCluster>, ClusterBuildError> {
+            StorageCluster::test_clone_with_dynamic_route_map_validity(self, validity)
+        }
+
+        fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
+            StorageCluster::test_store_route_map_validity(self, validity);
+        }
+
+        fn test_store_route_map_lease(
+            &self,
+            validity: RouteMapValidity,
+            local_valid_until_monotonic_ms: Option<u64>,
+        ) {
+            StorageCluster::test_store_route_map_lease(
+                self,
+                validity,
+                local_valid_until_monotonic_ms,
+            );
+        }
+    }
+
+    /// Deterministic request/publication barrier controls for cross-crate
+    /// runtime-map tests.
+    pub trait StorageClusterRouteHandleTestSupport {
+        fn test_wait_until_route_request_is_admitted(&self);
+        fn test_wait_until_route_publication_is_pending(&self);
+    }
+
+    impl StorageClusterRouteHandleTestSupport for StorageClusterRouteHandle {
+        fn test_wait_until_route_request_is_admitted(&self) {
+            StorageClusterRouteHandle::test_wait_until_route_request_is_admitted(self);
+        }
+
+        fn test_wait_until_route_publication_is_pending(&self) {
+            StorageClusterRouteHandle::test_wait_until_route_publication_is_pending(self);
+        }
+    }
+
     mod retained_read;
     pub use retained_read::{TestRetainedReadPgMoveScenario, TestRetainedReadPgMoveScenarioError};
 
