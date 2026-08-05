@@ -95,6 +95,9 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
         #[cfg(target_arch = "aarch64")]
         // SAFETY: backend selection verified neon and aes support.
         PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(crc, data) },
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: backend selection verified Zbc support.
+        PureRustBackend::ZbcRiscv64 => unsafe { extend_zbc_riscv64(crc, data) },
     }
 }
 
@@ -111,6 +114,8 @@ enum PureRustBackend {
     PmullSha3Aarch64,
     #[cfg(target_arch = "aarch64")]
     PmullAarch64,
+    #[cfg(target_arch = "riscv64")]
+    ZbcRiscv64,
 }
 
 #[inline]
@@ -148,6 +153,11 @@ fn pure_rust_backend() -> PureRustBackend {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
+    if std::arch::is_riscv_feature_detected!("zbc") {
+        return PureRustBackend::ZbcRiscv64;
+    }
+
     PureRustBackend::Scalar
 }
 
@@ -179,6 +189,10 @@ fn bench_override_backend() -> Option<PureRustBackend> {
             #[cfg(target_arch = "aarch64")]
             Some("pmull") if std::arch::is_aarch64_feature_detected!("aes") => {
                 Some(PureRustBackend::PmullAarch64)
+            }
+            #[cfg(target_arch = "riscv64")]
+            Some("zbc") if std::arch::is_riscv_feature_detected!("zbc") => {
+                Some(PureRustBackend::ZbcRiscv64)
             }
             _ => None,
         }
@@ -254,6 +268,212 @@ fn extend_scalar(crc: u64, data: &[u8]) -> u64 {
         state = TABLES[0][idx] ^ (state >> 8);
     }
     !state
+}
+
+#[cfg(target_arch = "riscv64")]
+mod riscv64_zbc {
+    use core::arch::asm;
+
+    const P4_LOW: u64 = 0x0C32_CDB3_1E18_A84A;
+    const P4_HIGH: u64 = 0x6224_2240_ACE5_045A;
+    const P1_LOW: u64 = 0xEADC_41FD_2BA3_D420;
+    const P1_HIGH: u64 = 0x21E9_761E_2526_21AC;
+    const P0_LOW: u64 = 0x21E9_761E_2526_21AC;
+    const BR_LOW: u64 = 0x27EC_FA32_9AEF_9F77;
+    const BR_HIGH: u64 = 0x34D9_2653_5897_936B;
+
+    #[derive(Clone, Copy)]
+    struct Polynomial {
+        low: u64,
+        high: u64,
+    }
+
+    impl Polynomial {
+        #[inline]
+        fn xor(self, other: Self) -> Self {
+            Self {
+                low: self.low ^ other.low,
+                high: self.high ^ other.high,
+            }
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "zbc")]
+    unsafe fn clmul_low(lhs: u64, rhs: u64) -> u64 {
+        let result;
+        // SAFETY: the caller guarantees Zbc support. CLMUL accesses no memory and has no other
+        // architectural side effects.
+        unsafe {
+            asm!(
+                "clmul {result}, {lhs}, {rhs}",
+                result = out(reg) result,
+                lhs = in(reg) lhs,
+                rhs = in(reg) rhs,
+                options(pure, nomem, nostack),
+            );
+        }
+        result
+    }
+
+    #[inline]
+    #[target_feature(enable = "zbc")]
+    unsafe fn clmul_high(lhs: u64, rhs: u64) -> u64 {
+        let result;
+        // SAFETY: the caller guarantees Zbc support. CLMULH accesses no memory and has no other
+        // architectural side effects.
+        unsafe {
+            asm!(
+                "clmulh {result}, {lhs}, {rhs}",
+                result = out(reg) result,
+                lhs = in(reg) lhs,
+                rhs = in(reg) rhs,
+                options(pure, nomem, nostack),
+            );
+        }
+        result
+    }
+
+    #[inline]
+    #[target_feature(enable = "zbc")]
+    unsafe fn multiply(lhs: u64, rhs: u64) -> Polynomial {
+        Polynomial {
+            low: clmul_low(lhs, rhs),
+            high: clmul_high(lhs, rhs),
+        }
+    }
+
+    #[inline]
+    unsafe fn load_block(ptr: *const u8) -> Polynomial {
+        debug_assert_eq!(ptr.align_offset(core::mem::align_of::<u64>()), 0);
+        // SAFETY: extend aligns the accelerated prefix to u64 and callers keep both reads within
+        // that prefix.
+        let low = unsafe { ptr.cast::<u64>().read() };
+        // SAFETY: the second word has the same alignment and callers guarantee 16 readable bytes.
+        let high = unsafe { ptr.wrapping_add(8).cast::<u64>().read() };
+        Polynomial {
+            low: u64::from_le(low),
+            high: u64::from_le(high),
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "zbc")]
+    unsafe fn fold_without_next(value: Polynomial, constant: Polynomial) -> Polynomial {
+        multiply(value.low, constant.low).xor(multiply(value.high, constant.high))
+    }
+
+    #[inline]
+    #[target_feature(enable = "zbc")]
+    unsafe fn fold_block(value: Polynomial, next: Polynomial, constant: Polynomial) -> Polynomial {
+        fold_without_next(value, constant).xor(next)
+    }
+
+    #[inline]
+    #[target_feature(enable = "zbc")]
+    unsafe fn reduce_to_crc(value: Polynomial) -> u64 {
+        let folded = multiply(value.low, P0_LOW).xor(Polynomial {
+            low: value.high,
+            high: 0,
+        });
+        let quotient_low = clmul_low(folded.low, BR_LOW);
+        let reduced = multiply(quotient_low, BR_HIGH)
+            .xor(Polynomial {
+                low: 0,
+                high: quotient_low,
+            })
+            .xor(folded);
+        reduced.high
+    }
+
+    /// Extends a CRC using scalar RISC-V carry-less multiplication.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Zbc.
+    #[target_feature(enable = "zbc")]
+    pub unsafe fn extend(crc: u64, data: &[u8]) -> u64 {
+        let unaligned_len = data
+            .as_ptr()
+            .align_offset(core::mem::align_of::<u64>())
+            .min(data.len());
+        let (unaligned, aligned) = data.split_at(unaligned_len);
+        let aligned_crc = super::extend_scalar(crc, unaligned);
+
+        let prefix_len = aligned.len() & !0x3F;
+        if prefix_len < 64 {
+            return super::extend_scalar(aligned_crc, aligned);
+        }
+
+        let (prefix, tail) = aligned.split_at(prefix_len);
+        let prefix_crc = extend_blocks_only(aligned_crc, prefix);
+        super::extend_scalar(prefix_crc, tail)
+    }
+
+    /// Extends a CRC over whole 64-byte blocks using scalar RISC-V carry-less
+    /// multiplication.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support Zbc. `data` must be nonempty, its length must be a
+    /// multiple of 64, and its starting address must be aligned to `u64`. The structural
+    /// preconditions are asserted before any data is read.
+    #[target_feature(enable = "zbc")]
+    unsafe fn extend_blocks_only(crc: u64, data: &[u8]) -> u64 {
+        assert!(!data.is_empty(), "Zbc block input must not be empty");
+        assert_eq!(
+            data.len() & 0x3f,
+            0,
+            "Zbc block input length must be a multiple of 64"
+        );
+        assert_eq!(
+            data.as_ptr().align_offset(core::mem::align_of::<u64>()),
+            0,
+            "Zbc block input must be aligned to u64"
+        );
+
+        let p4 = Polynomial {
+            low: P4_LOW,
+            high: P4_HIGH,
+        };
+        let p1 = Polynomial {
+            low: P1_LOW,
+            high: P1_HIGH,
+        };
+        let mut ptr = data.as_ptr();
+        let end = ptr.wrapping_add(data.len());
+
+        let mut x0 = load_block(ptr).xor(Polynomial { low: !crc, high: 0 });
+        let mut x1 = load_block(ptr.wrapping_add(16));
+        let mut x2 = load_block(ptr.wrapping_add(32));
+        let mut x3 = load_block(ptr.wrapping_add(48));
+        ptr = ptr.wrapping_add(64);
+
+        while ptr < end {
+            x0 = fold_block(x0, load_block(ptr), p4);
+            x1 = fold_block(x1, load_block(ptr.wrapping_add(16)), p4);
+            x2 = fold_block(x2, load_block(ptr.wrapping_add(32)), p4);
+            x3 = fold_block(x3, load_block(ptr.wrapping_add(48)), p4);
+            ptr = ptr.wrapping_add(64);
+        }
+
+        x1 = x1.xor(fold_without_next(x0, p1));
+        x2 = x2.xor(fold_without_next(x1, p1));
+        x3 = x3.xor(fold_without_next(x2, p1));
+
+        !reduce_to_crc(x3)
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+/// Extends a CRC using scalar RISC-V carry-less multiplication.
+///
+/// # Safety
+///
+/// The current CPU must support Zbc.
+unsafe fn extend_zbc_riscv64(crc: u64, data: &[u8]) -> u64 {
+    riscv64_zbc::extend(crc, data)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1042,6 +1262,8 @@ pub fn backend_name() -> &'static str {
         PureRustBackend::PmullSha3Aarch64 => "aarch64-pmull+sha3",
         #[cfg(target_arch = "aarch64")]
         PureRustBackend::PmullAarch64 => "aarch64-pmull",
+        #[cfg(target_arch = "riscv64")]
+        PureRustBackend::ZbcRiscv64 => "riscv64-zbc",
     }
 }
 
@@ -1189,7 +1411,11 @@ mod tests {
 
     fn supported_backend_cases() -> Vec<BackendCase> {
         #[cfg_attr(
-            not(any(target_arch = "aarch64", target_arch = "x86_64")),
+            not(any(
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "x86_64"
+            )),
             allow(unused_mut)
         )]
         let mut cases = vec![BackendCase {
@@ -1237,6 +1463,14 @@ mod tests {
             }
         }
 
+        #[cfg(target_arch = "riscv64")]
+        if std::arch::is_riscv_feature_detected!("zbc") {
+            cases.push(BackendCase {
+                backend: PureRustBackend::ZbcRiscv64,
+                name: "riscv64-zbc",
+            });
+        }
+
         cases
     }
 
@@ -1258,6 +1492,9 @@ mod tests {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: supported_backends adds this case only after feature detection succeeds.
             PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(0, data) },
+            #[cfg(target_arch = "riscv64")]
+            // SAFETY: supported_backends adds this case only after feature detection succeeds.
+            PureRustBackend::ZbcRiscv64 => unsafe { extend_zbc_riscv64(0, data) },
         }
     }
 
@@ -1287,6 +1524,9 @@ mod tests {
                 PureRustBackend::PmullSha3Aarch64 => unsafe {
                     extend_pmull_sha3_aarch64(crc, chunk)
                 },
+                #[cfg(target_arch = "riscv64")]
+                // SAFETY: supported_backends adds this case only after feature detection succeeds.
+                PureRustBackend::ZbcRiscv64 => unsafe { extend_zbc_riscv64(crc, chunk) },
             };
         }
         crc
@@ -1607,6 +1847,55 @@ mod tests {
             let right = combine(crc_a, combine(crc_b, crc_c, c.len() as u64), (b.len() + c.len()) as u64);
             prop_assert_eq!(left, right);
             prop_assert_eq!(left, checksum(&data));
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    proptest! {
+        #[test]
+        fn prop_zbc_matches_scalar_oracle(
+            data in proptest::collection::vec(any::<u8>(), 0..=4096),
+            leading_offset in 0usize..8,
+            mut splits in proptest::collection::vec(0usize..=4096, 0..=32),
+            initial_crc in any::<u64>(),
+        ) {
+            if !std::arch::is_riscv_feature_detected!("zbc") {
+                return Ok(());
+            }
+
+            let word_count = (leading_offset + data.len()).div_ceil(8).max(1);
+            let mut backing = vec![0u64; word_count];
+            // SAFETY: every u8 bit pattern is valid, the byte slice covers exactly the initialized
+            // u64 allocation, and it does not outlive or alias another access to `backing`.
+            let backing_bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    backing.as_mut_ptr().cast::<u8>(),
+                    backing.len() * core::mem::size_of::<u64>(),
+                )
+            };
+            let end = leading_offset + data.len();
+            backing_bytes[leading_offset..end].copy_from_slice(&data);
+            let input = &backing_bytes[leading_offset..end];
+
+            let expected = extend_scalar(initial_crc, input);
+            // SAFETY: runtime feature detection above verified Zbc support.
+            let oneshot = unsafe { extend_zbc_riscv64(initial_crc, input) };
+            prop_assert_eq!(oneshot, expected);
+
+            splits.retain(|&split| split <= input.len());
+            splits.push(0);
+            splits.push(input.len());
+            splits.sort_unstable();
+            splits.dedup();
+
+            let mut streaming = initial_crc;
+            for boundary in splits.windows(2) {
+                // SAFETY: runtime feature detection above verified Zbc support.
+                streaming = unsafe {
+                    extend_zbc_riscv64(streaming, &input[boundary[0]..boundary[1]])
+                };
+            }
+            prop_assert_eq!(streaming, expected);
         }
     }
 }
