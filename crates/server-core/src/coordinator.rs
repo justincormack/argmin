@@ -19,12 +19,9 @@ use s3_types::{
     StoredLegalHoldStatus, VersionId,
 };
 #[cfg(test)]
-use storage::ObjectEncryption;
-#[cfg(test)]
 use storage::ObjectLockState;
 #[cfg(test)]
-#[cfg(test)]
-use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
+use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig};
 use storage::{
     BucketName, ObjectKey, ProcessLocalRegistryKey, StorageCluster, StorageClusterRouteHandle,
 };

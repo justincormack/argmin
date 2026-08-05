@@ -210,13 +210,11 @@ pub mod test_support {
         fn test_object_payload_snapshot_uses_generation_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-            generation_id: GenerationId,
         ) -> Result<bool, StoreError>;
 
         fn test_object_payload_snapshot_uses_transient_direct_put_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-            generation_id: GenerationId,
         ) -> Result<bool, StoreError>;
 
         fn test_capture_multipart_upload_payload(
@@ -298,24 +296,16 @@ pub mod test_support {
         fn test_object_payload_snapshot_uses_generation_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-            generation_id: GenerationId,
         ) -> Result<bool, StoreError> {
-            StorageCluster::test_object_payload_snapshot_uses_generation_layout(
-                self,
-                snapshot,
-                generation_id,
-            )
+            StorageCluster::test_object_payload_snapshot_uses_generation_layout(self, snapshot)
         }
 
         fn test_object_payload_snapshot_uses_transient_direct_put_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-            generation_id: GenerationId,
         ) -> Result<bool, StoreError> {
             StorageCluster::test_object_payload_snapshot_uses_transient_direct_put_layout(
-                self,
-                snapshot,
-                generation_id,
+                self, snapshot,
             )
         }
 
@@ -649,6 +639,35 @@ pub mod test_support {
                 key,
                 version_id,
                 part_number,
+            )
+        }
+    }
+
+    /// Narrow logical and at-rest observations for committed objects.
+    pub trait StorageClusterObjectTestSupport {
+        fn test_observe_stored_sse_customer_checksum(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            cleartext_checksum: &str,
+        ) -> Result<TestStoredSseCustomerChecksumObservation, ObjectPgActionError>;
+    }
+
+    impl StorageClusterObjectTestSupport for StorageCluster {
+        fn test_observe_stored_sse_customer_checksum(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            cleartext_checksum: &str,
+        ) -> Result<TestStoredSseCustomerChecksumObservation, ObjectPgActionError> {
+            StorageCluster::test_observe_stored_sse_customer_checksum(
+                self,
+                bucket,
+                key,
+                version_id,
+                cleartext_checksum,
             )
         }
     }
@@ -1683,6 +1702,15 @@ pub mod test_support {
         pub size: u64,
     }
 
+    /// Narrow observation of SSE-C checksum persistence for one committed
+    /// object version.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct TestStoredSseCustomerChecksumObservation {
+        pub has_encrypted_checksum: bool,
+        pub contains_supplied_cleartext: bool,
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     impl From<types::MultipartPartRecord> for TestMultipartPartObservation {
         fn from(part: types::MultipartPartRecord) -> Self {
@@ -2065,7 +2093,8 @@ pub use storage_rpc_auth::{
 pub(crate) use test_support::{
     TestBucketDeleteAttemptOutcomeKind, TestBucketDeleteAttemptPhase, TestBucketDeleteFinalizeRoot,
     TestBucketDeleteProgress, TestMultipartPartObservation, TestMultipartPartPayloadSnapshot,
-    TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot, TestStreamUploadPayloadSnapshot,
+    TestObjectPayloadRepairObservation, TestObjectPayloadSnapshot,
+    TestStoredSseCustomerChecksumObservation, TestStreamUploadPayloadSnapshot,
 };
 #[cfg(test)]
 pub(crate) use traits::PgMetadataStore;

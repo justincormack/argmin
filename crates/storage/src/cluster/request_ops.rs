@@ -17880,8 +17880,11 @@ impl super::StorageCluster {
     pub(crate) fn test_object_payload_snapshot_uses_generation_layout(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
-        generation_id: GenerationId,
     ) -> Result<bool, StoreError> {
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select committed object payload generation",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
         for segment in snapshot.segments() {
             let expected_hash = segment_key_hash(
                 segment.bucket.as_str(),
@@ -17909,8 +17912,11 @@ impl super::StorageCluster {
     pub(crate) fn test_object_payload_snapshot_uses_transient_direct_put_layout(
         &self,
         snapshot: &crate::TestObjectPayloadSnapshot,
-        generation_id: GenerationId,
     ) -> Result<bool, StoreError> {
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select transient direct PUT payload generation",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
         for segment in snapshot.segments() {
             let generation_hash = segment_key_hash(
                 segment.bucket.as_str(),
@@ -18009,6 +18015,45 @@ impl super::StorageCluster {
     ) -> Result<StoredObject, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_object_version(bucket, key, version_id)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_observe_stored_sse_customer_checksum(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        cleartext_checksum: &str,
+    ) -> Result<crate::TestStoredSseCustomerChecksumObservation, ObjectPgActionError> {
+        if cleartext_checksum.is_empty() {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "SSE-C checksum observation requires a nonempty cleartext value"
+                    .to_string(),
+            });
+        }
+        let stored = self.test_get_object_version(bucket, key, version_id)?;
+        let live = stored
+            .as_live()
+            .ok_or_else(|| ObjectPgActionError::InvalidRequest {
+                reason: "selected SSE-C checksum observation is not a live object".to_string(),
+            })?;
+        let ObjectEncryption::SseCustomer(encryption) = &live.encryption else {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "selected checksum observation is not SSE-C encrypted".to_string(),
+            });
+        };
+        let cleartext_checksum = cleartext_checksum.as_bytes();
+        let contains_supplied_cleartext =
+            live.system_metadata_blob.as_ref().is_some_and(|metadata| {
+                metadata
+                    .as_slice()
+                    .windows(cleartext_checksum.len())
+                    .any(|window| window == cleartext_checksum)
+            });
+        Ok(crate::TestStoredSseCustomerChecksumObservation {
+            has_encrypted_checksum: !encryption.encrypted_checksum_metadata().is_empty(),
+            contains_supplied_cleartext,
+        })
     }
 
     /// Observes only whether the durable segmented-payload reclaim root exists.

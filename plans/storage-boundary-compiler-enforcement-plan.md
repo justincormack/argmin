@@ -5997,6 +5997,17 @@ Final Phase 5 audit (2026-08-04):
   downstream tests; their corresponding inherent `StorageCluster` helpers are
   crate-private, so the production cluster surface no longer exposes these
   test-only multipart entry points; and
+- buffered/direct-PUT read-path tests no longer reload a raw `StoredObject` to
+  recover its generation. The opaque payload snapshot retains that provenance
+  inside storage, and the storage-owned transient-layout predicate consumes it
+  directly; `coordinator/read_tests.rs` no longer uses the raw object-record
+  test seam;
+- multipart tests now use production `HeadObject` results for response-visible
+  size and metadata, opaque payload evidence for generation/layout checks, and
+  a narrow storage-owned SSE-C at-rest checksum observation. They no longer
+  load raw current-object records. The feature-gated object-observation trait
+  remains intentionally downstream-callable, while its corresponding inherent
+  `StorageCluster` helper is crate-private.
 
 The audited cross-crate support families are:
 

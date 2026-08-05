@@ -6,7 +6,7 @@ use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
 use std::sync::Arc;
 use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterMultipartTestSupport as _,
-    StorageClusterPayloadTestSupport as _,
+    StorageClusterObjectTestSupport as _, StorageClusterPayloadTestSupport as _,
 };
 
 fn create_bucket_with_explicit_writer_grant(
@@ -2275,21 +2275,22 @@ fn complete_multipart_upload_happy_path() {
     // ETag should be composite format: "hex-2"
     assert!(result.etag.ends_with("-2\""), "etag = {}", result.etag);
 
-    // Object should be visible via get_object metadata.
-    let obj = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
+    // Object should be visible through the production read path with the
+    // completed manifest's total size.
+    let head = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                Some(result.version_id),
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
         .unwrap();
-    let live_obj = obj.as_live().expect("expected live object");
-    assert!(matches!(
-        live_obj.layout,
-        ObjectLayout::MultipartManifest { .. }
-    ));
-    assert_eq!(live_obj.layout.parts_count(), Some(2));
-    assert_eq!(
-        live_obj.size,
-        big_part.len() as u64 + small_last.len() as u64
-    );
+    assert_eq!(head.size, big_part.len() as u64 + small_last.len() as u64);
     assert!(
         storage::test_support::completed_object_uses_multipart_upload_generation(
             &coord.storage_node(),
@@ -2801,15 +2802,28 @@ fn complete_multipart_upload_overwrite_unversioned() {
     assert!(result2.etag.ends_with("-2\""));
     assert_ne!(result1.etag, result2.etag);
 
-    // Verify the object was overwritten — should have 2 parts now.
-    let obj = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+    // Verify through the production current-object path that the second
+    // completion became visible before inspecting its logical manifest rows.
+    let head = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
         .unwrap();
-    let live_obj = obj.as_live().expect("expected live object");
-    assert_eq!(live_obj.layout.parts_count(), Some(2));
+    assert_eq!(head.etag, result2.etag);
+    assert_eq!(
+        head.size,
+        big_part.len() as u64 + b"second-data-b".len() as u64
+    );
 
-    // Old manifest parts (from first upload) should be replaced.
+    // Verify the old manifest parts were replaced.
     let committed = coord
         .storage_node()
         .test_get_object_part_numbers(
@@ -6430,7 +6444,7 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
         "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=".to_string(),
     );
 
-    test_helpers::put_object(
+    let put = test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
@@ -6448,24 +6462,17 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
     )
     .unwrap();
 
-    {
-        let record = coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("obj"))
-            .unwrap();
-        let live = record.as_live().unwrap();
-        let stored_system =
-            SystemMetadata::deserialize(live.system_metadata_blob.as_ref().unwrap().as_slice())
-                .unwrap();
-        assert!(stored_system.checksum().is_none());
-        let stored_user =
-            Coordinator::deserialize_user_metadata(live.metadata_blob.as_ref()).unwrap();
-        assert_eq!(stored_user.get("x-amz-meta-owner"), Some("alice"));
-        let ObjectEncryption::SseCustomer(state) = &live.encryption else {
-            panic!("expected SSE-C encryption state");
-        };
-        assert!(!state.encrypted_checksum_metadata().is_empty());
-    }
+    let stored = coord
+        .storage_node()
+        .test_observe_stored_sse_customer_checksum(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("obj"),
+            put.version_id,
+            "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=",
+        )
+        .unwrap();
+    assert!(stored.has_encrypted_checksum);
+    assert!(!stored.contains_supplied_cleartext);
 
     let head = coord
         .head_object(&GetObjectRequest {
@@ -6483,6 +6490,7 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
     let checksum = head.system_metadata.checksum().unwrap();
     assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha256);
     assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
+    assert_eq!(head.metadata.get("x-amz-meta-owner"), Some("alice"));
     assert_eq!(
         checksum.value(),
         "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0="
@@ -7445,20 +7453,13 @@ fn stream_put_multiple_segments_correct_manifest() {
         )
         .unwrap();
     assert_eq!(committed.segment_count(), 3);
-    let live = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap()
-        .as_live()
-        .expect("stream put should create a live object")
-        .clone();
     for (i, segment) in committed.layout().iter().enumerate() {
         assert_eq!(segment.segment_index, i as u32);
         assert_eq!(segment.size, 3); // "aaa", "bbb", "ccc" are all 3 bytes
     }
     assert!(coord
         .storage_node()
-        .test_object_payload_snapshot_uses_generation_layout(&committed, live.generation_id)
+        .test_object_payload_snapshot_uses_generation_layout(&committed)
         .unwrap());
 }
 
@@ -9039,7 +9040,7 @@ fn object_segments_integrity_readback() {
         .unwrap();
     let full = b"chunk-0-chunk-1-";
     let crc = checksum::crc64::checksum(full);
-    coord
+    let finalized = coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", "verify", test_requester()),
             session_id: &session_id,
@@ -9057,19 +9058,12 @@ fn object_segments_integrity_readback() {
         .unwrap();
 
     // Read back via storage layer directly.
-    let record = coord
-        .storage_node()
-        .test_get_object_meta(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("verify"),
-        )
-        .unwrap();
     let payload = coord
         .storage_node()
         .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("verify"),
-            record.version_id(),
+            finalized.version_id,
         )
         .unwrap();
 

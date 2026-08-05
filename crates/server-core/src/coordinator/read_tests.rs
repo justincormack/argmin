@@ -5,7 +5,7 @@ use ec::EcConfig;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use storage::test_support::StorageClusterPayloadTestSupport as _;
-use storage::{GenerationId, StoreError};
+use storage::StoreError;
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -659,22 +659,10 @@ fn buffered_put_single_segment_skips_stream_session_rows() {
         )
         .unwrap();
     assert_eq!(payload.segment_count(), 1);
-    let live = coord
+    assert!(coord
         .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap()
-        .as_live()
-        .expect("buffered put should create a live object")
-        .clone();
-    assert!(
-        coord
-            .storage_node()
-            .test_object_payload_snapshot_uses_transient_direct_put_layout(
-                &payload,
-                live.generation_id,
-            )
-            .unwrap()
-    );
+        .test_object_payload_snapshot_uses_transient_direct_put_layout(&payload)
+        .unwrap());
     assert!(coord
         .storage_node()
         .test_object_payload_snapshot_is_fully_present(&payload)
@@ -831,20 +819,15 @@ fn buffered_put_post_publish_error_keeps_committed_shards() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let live = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .as_live()
-        .expect("post-publish failure should leave the object visible")
-        .clone();
-    assert_eq!(live.generation_id, GenerationId::MIN);
-
     let payload = coord
         .storage_node()
         .test_capture_object_payload(&bucket, &key, VersionId::Null)
         .unwrap();
     assert_eq!(payload.segment_count(), 1);
+    assert!(coord
+        .storage_node()
+        .test_object_payload_snapshot_uses_transient_direct_put_layout(&payload)
+        .unwrap());
     assert!(coord
         .storage_node()
         .test_object_payload_snapshot_is_fully_present(&payload)
