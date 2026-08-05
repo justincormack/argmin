@@ -187,19 +187,9 @@ struct AuthorizedObjectReadSnapshotRequest<'a> {
     snapshot_mode: ObjectReadSnapshotMode,
 }
 
-enum ObjectReadSnapshotRoute<'a> {
-    #[cfg(test)]
-    Raw {
-        storage_node: &'a Arc<StorageCluster>,
-        bucket: &'a BucketName,
-        key: &'a ObjectKey,
-        version_id: Option<VersionId>,
-        snapshot_mode: ObjectReadSnapshotMode,
-    },
-    Admitted {
-        route: storage::ActiveObjectReadRoute<'a>,
-        retain_payload: bool,
-    },
+struct ObjectReadSnapshotRoute<'a> {
+    route: storage::ActiveObjectReadRoute<'a>,
+    retain_payload: bool,
 }
 
 struct RoutedObjectReadSnapshotOutcome<T> {
@@ -213,27 +203,8 @@ impl ObjectReadSnapshotRoute<'_> {
         &self,
         action: impl FnMut(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<RoutedObjectReadSnapshotOutcome<T>, E>, storage::ObjectPgActionError> {
-        match self {
-            #[cfg(test)]
-            Self::Raw {
-                storage_node,
-                bucket,
-                key,
-                version_id,
-                snapshot_mode,
-            } => storage_node
-                .load_object_read_snapshot_if(bucket, key, *version_id, *snapshot_mode, action)
-                .map(|outcome| {
-                    outcome.map(|outcome| RoutedObjectReadSnapshotOutcome {
-                        value: outcome.value,
-                        snapshot: Arc::new(outcome.snapshot),
-                        payload_handoff: None,
-                    })
-                }),
-            Self::Admitted {
-                route,
-                retain_payload: true,
-            } => route
+        if self.retain_payload {
+            self.route
                 .load_leased_object_read_snapshot_if(action)
                 .map(|outcome| {
                     outcome.map(|outcome| {
@@ -244,32 +215,23 @@ impl ObjectReadSnapshotRoute<'_> {
                             payload_handoff: Some(payload_handoff),
                         }
                     })
-                }),
-            Self::Admitted {
-                route,
-                retain_payload: false,
-            } => route.load_object_read_snapshot_if(action).map(|outcome| {
-                outcome.map(|outcome| RoutedObjectReadSnapshotOutcome {
-                    value: outcome.value,
-                    snapshot: Arc::new(outcome.snapshot),
-                    payload_handoff: None,
                 })
-            }),
+        } else {
+            self.route
+                .load_object_read_snapshot_if(action)
+                .map(|outcome| {
+                    outcome.map(|outcome| RoutedObjectReadSnapshotOutcome {
+                        value: outcome.value,
+                        snapshot: Arc::new(outcome.snapshot),
+                        payload_handoff: None,
+                    })
+                })
         }
     }
 
     #[cfg(test)]
     fn try_probe_object_pg_available(&self) -> Result<bool, storage::ObjectPgActionError> {
-        match self {
-            Self::Raw {
-                storage_node,
-                bucket,
-                key,
-                version_id: _,
-                snapshot_mode: _,
-            } => storage_node.try_probe_object_pg_available(bucket, key),
-            Self::Admitted { route, .. } => route.try_probe_object_pg_available(),
-        }
+        self.route.try_probe_object_pg_available()
     }
 }
 
@@ -471,42 +433,6 @@ impl Coordinator {
         )
     }
 
-    #[cfg(test)]
-    fn authorize_object_read_snapshot_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        req: AuthorizedObjectReadSnapshotRequest<'_>,
-    ) -> Result<
-        (
-            BucketSummary,
-            Arc<storage::ObjectReadSnapshot>,
-            ObjectAttributePermissions,
-            Option<storage::LeasedObjectReadSnapshot>,
-        ),
-        ServerError,
-    > {
-        let bucket = self.load_bucket_handle_for_modern_object_read_with_storage_node(
-            storage_node,
-            req.bucket,
-            req.expected_bucket_owner,
-        )?;
-        let route = ObjectReadSnapshotRoute::Raw {
-            storage_node,
-            bucket: req.bucket,
-            key: req.key,
-            version_id: req.version_id,
-            snapshot_mode: req.snapshot_mode,
-        };
-        match ObjectAuthLoadedBucketHandle::classify(&bucket) {
-            ObjectAuthLoadedBucketHandle::Boe(bucket) => {
-                self.authorize_object_read_snapshot_boe(&route, req, bucket)
-            }
-            ObjectAuthLoadedBucketHandle::NonBoe(bucket) => {
-                self.authorize_object_read_snapshot_non_boe(&route, req, bucket)
-            }
-        }
-    }
-
     fn authorize_object_read_snapshot_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
@@ -526,7 +452,7 @@ impl Coordinator {
             req.bucket,
             req.expected_bucket_owner,
         )?;
-        let route = ObjectReadSnapshotRoute::Admitted {
+        let route = ObjectReadSnapshotRoute {
             route: admission
                 .active_object_read_route(req.bucket, req.key, req.version_id, req.snapshot_mode)
                 .map_err(super::map_store_error)?,
@@ -553,7 +479,7 @@ impl Coordinator {
             req.bucket,
             req.expected_bucket_owner,
         )?;
-        let route = ObjectReadSnapshotRoute::Admitted {
+        let route = ObjectReadSnapshotRoute {
             route: admission
                 .active_object_read_route(
                     req.bucket,
@@ -1918,20 +1844,6 @@ impl Coordinator {
             bucket,
             expected_bucket_owner,
             request,
-        )
-    }
-
-    #[cfg(test)]
-    fn load_bucket_handle_for_modern_object_read_with_storage_node(
-        &self,
-        storage_node: &Arc<StorageCluster>,
-        bucket: &BucketName,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<LoadedBucketHandle, ServerError> {
-        self.load_bucket_handle_for_modern_object_read_with_snapshot_loader(
-            bucket,
-            expected_bucket_owner,
-            |request| storage_node.load_bucket_snapshot(bucket, request),
         )
     }
 

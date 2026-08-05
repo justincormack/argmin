@@ -1,8 +1,4 @@
 use checksum::{ChecksumAlgorithm, ChecksumType};
-#[cfg(test)]
-use s3_types::VersionId;
-#[cfg(test)]
-use storage::{BucketName, ObjectKey, StoredObject};
 use storage::{
     ObjectEncryption, ObjectReadMultipartPart, SerializedMetadataBlob, SerializedSystemMetadataBlob,
 };
@@ -50,68 +46,6 @@ impl Coordinator {
             checksum,
         );
         system_metadata
-    }
-
-    #[cfg(test)]
-    pub(super) fn lookup_object_record(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-    ) -> Result<StoredObject, ServerError> {
-        match version_id {
-            Some(vid) => self
-                .storage_node()
-                .test_get_object_version(bucket, key, vid),
-            None => self.storage_node().test_get_object_meta(bucket, key),
-        }
-        .map_err(|e| match e {
-            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound)
-                if version_id.is_some() =>
-            {
-                ServerError::VersionNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    version_id: version_id.unwrap().to_string(),
-                }
-            }
-            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound) => {
-                ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                }
-            }
-            storage::ObjectPgActionError::Store(error) => super::map_store_error(error),
-            storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
-            storage::ObjectPgActionError::InvalidRequest { reason } => {
-                ServerError::InvalidRequest { reason }
-            }
-            storage::ObjectPgActionError::StaleObjectReadSubject => ServerError::InternalError {
-                reason: "stale object read subject escaped storage retry loop".to_string(),
-            },
-            storage::ObjectPgActionError::StaleDirectPutCommitSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale direct PUT commit snapshot escaped storage retry loop"
-                        .to_string(),
-                }
-            }
-            storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale stream finalize snapshot escaped storage retry loop".to_string(),
-                }
-            }
-            storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale multipart completion snapshot escaped storage retry loop"
-                        .to_string(),
-                }
-            }
-            storage::ObjectPgActionError::MultipartConditionalRequestConflict => {
-                ServerError::InternalError {
-                    reason: "multipart conditional conflict escaped object lookup".to_string(),
-                }
-            }
-        })
     }
 
     pub(super) fn deserialize_user_metadata(

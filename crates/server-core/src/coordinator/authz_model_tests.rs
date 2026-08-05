@@ -27,6 +27,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use storage::ObjectReadSnapshotMode;
 
 const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -2321,13 +2322,27 @@ mod harness {
             ExistingTarget::Current => None,
             ExistingTarget::Versioned => Some(object_version),
         };
-        let object = coord
-            .lookup_object_record(
-                &trusted_bucket_name(bucket),
-                &trusted_object_key(KEY),
+        let bucket_name = trusted_bucket_name(bucket);
+        let key = trusted_object_key(KEY);
+        let admission = coord
+            .admit_storage_route_for_request()
+            .unwrap_or_else(|err| {
+                panic!("failed to admit object record load for {scenario}: {err:?}")
+            });
+        let route = admission
+            .active_object_read_route(
+                &bucket_name,
+                &key,
                 version_id,
+                ObjectReadSnapshotMode::MetadataOnly,
             )
-            .unwrap_or_else(|err| panic!("failed to load object record for {scenario}: {err:?}"));
+            .unwrap_or_else(|err| {
+                panic!("failed to route object record load for {scenario}: {err:?}")
+            });
+        let object = route
+            .load_object_if(|object| Ok::<_, std::convert::Infallible>(object.clone()))
+            .unwrap_or_else(|err| panic!("failed to load object record for {scenario}: {err:?}"))
+            .unwrap_or_else(|never| match never {});
         let policy = policy_document(fixtures, bucket, scenario).map(|body| {
             auth::parse_bucket_policy(&body)
                 .unwrap_or_else(|err| panic!("failed to parse policy for {scenario}: {err:?}"))

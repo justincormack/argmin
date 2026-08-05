@@ -5927,8 +5927,7 @@ Final Phase 5 audit (2026-08-04):
   AWS-facing harnesses remain clean;
 - Phase 5 cannot yet be marked complete. `server-core` still has residual raw
   storage test seams in `coordinator/core_tests.rs`,
-  `coordinator/test_topology.rs`, `coordinator/test_support.rs`, and the
-  authorization-model fixture loader in `coordinator/object_state.rs`. These seams
+  `coordinator/test_topology.rs`, and `coordinator/test_support.rs`. These seams
   expose or reconstruct raw PG IDs, route snapshots, generation identities,
   EC shapes, shard keys, physical shard paths, shard acknowledgement rows,
   durable object/upload records, and backfill work records;
@@ -6008,6 +6007,12 @@ Final Phase 5 audit (2026-08-04):
   load raw current-object records. The feature-gated object-observation trait
   remains intentionally downstream-callable, while its corresponding inherent
   `StorageCluster` helper is crate-private.
+- the authorization model no longer loads raw object records through a
+  test-only `StorageCluster` adapter. It obtains its required immutable
+  `StoredObject` input through the production admitted metadata-read route,
+  while the direct GetObject authorization tests now enter the same admitted
+  authorization path as production. The raw object-read route variant and its
+  raw bucket/object snapshot loaders have been removed from `server-core`;
 - lifecycle and bucket-delete coordinator tests no longer load raw current or
   explicit-version object records. They assert visible namespace state through
   production `ListObjectVersions`, including requester authorization, while
@@ -6070,7 +6075,8 @@ Remaining implementation order after this audit:
    downstream-callable while the corresponding inherent helpers are
    crate-private; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
-   the transitional raw-record seam and its plan exception are gone.
+   the remaining raw topology/support seams and their plan exceptions are
+   gone.
 
 Completion:
 

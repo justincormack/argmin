@@ -1263,35 +1263,8 @@ impl Coordinator {
         &self,
         req: &GetObjectRequest<'_>,
     ) -> Result<AuthorizedObjectRead, ServerError> {
-        self.authorize_get_object_with_storage_node(&self.storage_node(), req)
-    }
-
-    #[cfg(test)]
-    pub(in crate::coordinator) fn authorize_get_object_with_storage_node(
-        &self,
-        storage_node: &Arc<storage::StorageCluster>,
-        req: &GetObjectRequest<'_>,
-    ) -> Result<AuthorizedObjectRead, ServerError> {
-        let (bucket, snapshot, attribute_permissions, payload_handoff) = self
-            .authorize_object_read_snapshot_with_storage_node(
-                storage_node,
-                AuthorizedObjectReadSnapshotRequest {
-                    requester: req.object.requester(),
-                    bucket: req.object.bucket_name_typed(),
-                    key: req.object.key_typed(),
-                    version_id: req.object.version_id,
-                    expected_bucket_owner: req.expected_bucket_owner(),
-                    missing_discovery: MissingObjectDiscovery::ReadBucket,
-                    modern_action: ModernReadAction::from_get_object_version(req.object.version_id),
-                    snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
-                },
-            )?;
-        Ok(AuthorizedObjectRead {
-            bucket,
-            snapshot,
-            attribute_permissions,
-            payload_handoff,
-        })
+        let admission = self.admit_storage_route_for_request()?;
+        self.authorize_get_object_on_admitted_route(&admission, req)
     }
 
     pub(in crate::coordinator) fn authorize_get_object_on_admitted_route(
