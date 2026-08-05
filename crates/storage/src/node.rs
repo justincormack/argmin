@@ -1374,7 +1374,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_force_became_noncurrent_at(
+    pub(crate) fn test_age_noncurrent_live_object(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1383,7 +1383,7 @@ impl SharedStorageNode {
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = self.test_object_pg_id_for(bucket, key);
         let pg = self.get_pg(pg_id)?;
-        pg.test_force_object_became_noncurrent_at(bucket, key, version_id, became_noncurrent_at)?;
+        pg.test_age_noncurrent_live_object(bucket, key, version_id, became_noncurrent_at)?;
         pg.refresh_metadata_command_state_digest()?;
         Ok(())
     }

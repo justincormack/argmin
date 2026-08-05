@@ -18213,7 +18213,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_force_became_noncurrent_at(
+    pub(crate) fn test_age_noncurrent_live_object(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18224,7 +18224,7 @@ impl super::StorageCluster {
         self.local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
             .test_node()
-            .test_force_became_noncurrent_at(bucket, key, version_id, became_noncurrent_at)
+            .test_age_noncurrent_live_object(bucket, key, version_id, became_noncurrent_at)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

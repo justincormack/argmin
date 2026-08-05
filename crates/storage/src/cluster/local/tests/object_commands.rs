@@ -1,4 +1,5 @@
 use super::*;
+use crate::test_support::StorageClusterLifecycleTestSupport;
 
 #[test]
 fn object_delete_metadata_command_applies_to_all_acting_object_pg_nodes() {
@@ -1949,6 +1950,106 @@ fn lifecycle_current_expiration_delete_command_applies_to_all_acting_object_pg_n
         )
         .unwrap());
     }
+}
+
+#[test]
+fn semantic_lifecycle_aging_rejects_current_live_and_delete_marker_without_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+    let current = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Enabled,
+        [91; 16],
+        [92; 16],
+        b"current lifecycle version",
+    );
+
+    let current_before = cluster
+        .test_get_object_version(&bucket, &key, current.version_id)
+        .unwrap();
+    let current_proof_before = cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    let current_err = cluster
+        .test_age_noncurrent_lifecycle_version(&bucket, &key, current.version_id)
+        .expect_err("a current live version must not be made artificially noncurrent");
+    assert!(matches!(
+        current_err,
+        crate::ObjectPgActionError::Store(StoreError::IntegrityError {
+            expected: 1,
+            actual: 0,
+        })
+    ));
+    assert_eq!(
+        cluster
+            .test_get_object_version(&bucket, &key, current.version_id)
+            .unwrap(),
+        current_before
+    );
+    assert_eq!(
+        cluster
+            .test_object_pg_metadata_proof(&bucket, &key)
+            .unwrap(),
+        current_proof_before,
+        "rejected current-version aging must not change durable metadata"
+    );
+
+    let marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            crate::OwnerIdentity::from_principal("owner"),
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+    let marker_before = cluster
+        .test_get_object_version(&bucket, &key, marker.version_id)
+        .unwrap();
+    let marker_proof_before = cluster
+        .test_object_pg_metadata_proof(&bucket, &key)
+        .unwrap();
+    let marker_err = cluster
+        .test_age_noncurrent_lifecycle_version(&bucket, &key, marker.version_id)
+        .expect_err("a delete marker must not be mutated by lifecycle aging");
+    assert!(matches!(
+        marker_err,
+        crate::ObjectPgActionError::Store(StoreError::IntegrityError {
+            expected: 1,
+            actual: 0,
+        })
+    ));
+    assert_eq!(
+        cluster
+            .test_get_object_version(&bucket, &key, marker.version_id)
+            .unwrap(),
+        marker_before
+    );
+    assert_eq!(
+        cluster
+            .test_object_pg_metadata_proof(&bucket, &key)
+            .unwrap(),
+        marker_proof_before,
+        "rejected delete-marker aging must not change durable metadata"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
 }
 
 #[test]

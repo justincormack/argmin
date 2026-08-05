@@ -52,7 +52,7 @@ impl PgStore {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn test_force_object_became_noncurrent_at(
+    pub(crate) fn test_age_noncurrent_live_object(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -60,9 +60,11 @@ impl PgStore {
         became_noncurrent_at: u64,
     ) -> Result<(), StoreError> {
         let changed = self.execute_cached(
-            "UPDATE objects SET became_noncurrent_at = ?1 WHERE bucket = ?2 AND key = ?3 AND version_id = ?4",
+            "UPDATE objects SET became_noncurrent_at = ?1 \
+             WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 \
+               AND status = 0 AND became_noncurrent_at IS NOT NULL",
             params![became_noncurrent_at, bucket, key, version_id.to_u64()],
-            "force object became_noncurrent_at for test",
+            "age noncurrent live object for test",
         )?;
         require_one_test_mutation(changed)
     }

@@ -450,6 +450,13 @@ pub mod test_support {
             bucket: &BucketName,
         ) -> Result<(), ObjectPgActionError>;
 
+        fn test_age_noncurrent_lifecycle_version(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<TestLifecycleObjectObservation, ObjectPgActionError>;
+
         fn test_begin_durable_bucket_delete_drain(
             &self,
             bucket: &BucketName,
@@ -491,6 +498,16 @@ pub mod test_support {
             bucket: &BucketName,
         ) -> Result<(), ObjectPgActionError> {
             StorageCluster::test_seed_stale_lifecycle_sweep_claim(self, bucket)
+        }
+
+        fn test_age_noncurrent_lifecycle_version(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+        ) -> Result<TestLifecycleObjectObservation, ObjectPgActionError> {
+            StorageCluster::test_age_noncurrent_live_object(self, bucket, key, version_id, 1)?;
+            capture_lifecycle_object_observation(self, bucket, key, version_id)
         }
 
         fn test_begin_durable_bucket_delete_drain(

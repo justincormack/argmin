@@ -143,6 +143,35 @@ fn delete_object_request_with_expected_owner<'a>(
     }
 }
 
+fn listed_key_versions(coord: &Coordinator, bucket: &str, key: &str) -> Vec<VersionEntry> {
+    listed_key_versions_as(coord, bucket, key, test_requester())
+}
+
+fn listed_key_versions_as(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    requester: Requester,
+) -> Vec<VersionEntry> {
+    let result = coord
+        .list_object_versions(&ListObjectVersionsRequest {
+            bucket: bucket_request_with_expected_owner(bucket, requester, None),
+            prefix: Some(key),
+            delimiter: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 100,
+            requested_max_keys: Some(100),
+        })
+        .unwrap();
+    assert!(!result.is_truncated);
+    result
+        .versions
+        .into_iter()
+        .filter(|version| version.key == key)
+        .collect()
+}
+
 fn put_bucket_versioning_test(
     coord: &Coordinator,
     name: &str,
@@ -2220,14 +2249,7 @@ fn lifecycle_sweep_expires_nonversioned_current_object() {
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 1);
 
-    assert!(matches!(
-        coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectNotFound
-        ))
-    ));
+    assert!(listed_key_versions(&coord, "bucket", "key").is_empty());
     assert!(storage::test_support::lifecycle_object_has_reclaim_root(
         &coord.storage_node(),
         &lifecycle_object,
@@ -2381,19 +2403,20 @@ fn lifecycle_sweep_old_incarnation_expired_claim_does_not_skip_current_root() {
     )
     .unwrap();
 
-    let last_modified = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .as_live()
-        .unwrap()
-        .last_modified;
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &bucket,
+        &key,
+        VersionId::Null,
+    )
+    .unwrap();
     coord
         .storage_node()
         .test_seed_stale_lifecycle_sweep_claim(&bucket)
         .unwrap();
 
-    let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+    let deadline =
+        Coordinator::lifecycle_day_based_deadline(lifecycle_object.last_modified(), 1).unwrap();
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 1);
@@ -2456,20 +2479,13 @@ fn lifecycle_sweep_expires_versioned_current_with_delete_marker() {
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 1);
 
-    let current = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    assert!(matches!(current, StoredObject::DeleteMarker(_)));
-    let original = coord
-        .storage_node()
-        .test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            put.version_id,
-        )
-        .unwrap();
-    assert!(matches!(original, StoredObject::Live(_)));
+    let versions = listed_key_versions(&coord, "bucket", "key");
+    assert_eq!(versions.len(), 2);
+    assert!(versions[0].is_latest);
+    assert!(versions[0].is_delete_marker);
+    assert_eq!(versions[1].version_id, put.version_id);
+    assert!(!versions[1].is_latest);
+    assert!(!versions[1].is_delete_marker);
     assert!(!storage::test_support::lifecycle_object_has_reclaim_root(
         &coord.storage_node(),
         &lifecycle_object,
@@ -2564,32 +2580,6 @@ fn lifecycle_sweep_expires_suspended_null_current_with_null_delete_marker() {
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 1);
 
-    let current = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    match current {
-        StoredObject::DeleteMarker(marker) => assert_eq!(marker.version_id, VersionId::Null),
-        other => panic!("expected current delete marker, got {other:?}"),
-    }
-    let older_version = coord
-        .storage_node()
-        .test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            older.version_id,
-        )
-        .unwrap();
-    assert!(matches!(older_version, StoredObject::Live(_)));
-    let null_version = coord
-        .storage_node()
-        .test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            VersionId::Null,
-        )
-        .unwrap();
-    assert!(matches!(null_version, StoredObject::DeleteMarker(_)));
     assert!(storage::test_support::lifecycle_object_has_reclaim_root(
         &coord.storage_node(),
         &lifecycle_object,
@@ -2700,21 +2690,11 @@ fn lifecycle_sweep_expires_noncurrent_versioned_live_object() {
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 1);
 
-    let latest = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    assert_eq!(latest.version_id(), current.version_id);
-    assert!(matches!(
-        coord.storage_node().test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            older.version_id
-        ),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectNotFound
-        ))
-    ));
+    let versions = listed_key_versions(&coord, "bucket", "key");
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id, current.version_id);
+    assert!(versions[0].is_latest);
+    assert!(!versions[0].is_delete_marker);
     assert!(storage::test_support::lifecycle_object_has_reclaim_root(
         &coord.storage_node(),
         &lifecycle_object,
@@ -2821,21 +2801,11 @@ fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 1);
 
-    let latest = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    assert_eq!(latest.version_id(), VersionId::Null);
-    assert!(matches!(
-        coord.storage_node().test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            numbered.version_id
-        ),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectNotFound
-        ))
-    ));
+    let versions = listed_key_versions(&coord, "bucket", "key");
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id, VersionId::Null);
+    assert!(versions[0].is_latest);
+    assert!(!versions[0].is_delete_marker);
     assert!(storage::test_support::lifecycle_object_has_reclaim_root(
         &coord.storage_node(),
         &lifecycle_object,
@@ -3066,29 +3036,13 @@ fn lifecycle_sweep_noncurrent_expiration_respects_newer_noncurrent_versions() {
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 1);
 
-    let latest = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    assert_eq!(latest.version_id(), current.version_id);
-    assert!(matches!(
-        coord.storage_node().test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            oldest.version_id
-        ),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectNotFound
-        ))
-    ));
-    assert!(matches!(
-        coord.storage_node().test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            middle.version_id
-        ),
-        Ok(StoredObject::Live(_))
-    ));
+    let versions = listed_key_versions(&coord, "bucket", "key");
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].version_id, current.version_id);
+    assert!(versions[0].is_latest);
+    assert_eq!(versions[1].version_id, middle.version_id);
+    assert!(!versions[1].is_latest);
+    assert!(versions.iter().all(|version| !version.is_delete_marker));
     assert!(storage::test_support::lifecycle_object_has_reclaim_root(
         &coord.storage_node(),
         &oldest_lifecycle,
@@ -3173,37 +3127,31 @@ fn lifecycle_sweep_skips_object_locked_noncurrent_version() {
     )
     .unwrap();
 
-    let became_noncurrent_at = {
-        let stored = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                older.version_id,
-            )
-            .unwrap();
-        stored.as_live().unwrap().became_noncurrent_at.unwrap()
-    };
-    let deadline = Coordinator::lifecycle_day_based_deadline(became_noncurrent_at, 1).unwrap();
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        older.version_id,
+    )
+    .unwrap();
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        lifecycle_object.became_noncurrent_at().unwrap(),
+        1,
+    )
+    .unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.scanned_buckets, 1);
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 0);
 
-    assert!(matches!(
-        coord.storage_node().test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            older.version_id
-        ),
-        Ok(StoredObject::Live(_))
-    ));
-    let latest = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    assert_eq!(latest.version_id(), current.version_id);
+    let versions = listed_key_versions_as(&coord, "bucket", "key", requester);
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].version_id, current.version_id);
+    assert!(versions[0].is_latest);
+    assert_eq!(versions[1].version_id, older.version_id);
+    assert!(!versions[1].is_latest);
+    assert!(versions.iter().all(|version| !version.is_delete_marker));
 }
 
 #[test]
@@ -3265,13 +3213,12 @@ fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_l
     )
     .unwrap();
 
-    coord
+    let aged_v1 = coord
         .storage_node()
-        .test_force_became_noncurrent_at(
+        .test_age_noncurrent_lifecycle_version(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("key"),
             v1.version_id,
-            1,
         )
         .unwrap();
 
@@ -3286,12 +3233,18 @@ fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_l
         ))
         .unwrap();
 
-    let current = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    assert_eq!(current.version_id(), v1.version_id);
-    assert_eq!(current.as_live().unwrap().became_noncurrent_at, None);
+    let repromoted = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        v1.version_id,
+    )
+    .unwrap();
+    assert_eq!(repromoted.became_noncurrent_at(), None);
+    let versions = listed_key_versions(&coord, "bucket", "key");
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id, v1.version_id);
+    assert!(versions[0].is_latest);
 
     test_helpers::put_object(
         &coord,
@@ -3310,19 +3263,16 @@ fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_l
     )
     .unwrap();
 
-    let old_deadline = Coordinator::lifecycle_day_based_deadline(1, 1).unwrap();
+    let old_deadline =
+        Coordinator::lifecycle_day_based_deadline(aged_v1.became_noncurrent_at().unwrap(), 1)
+            .unwrap();
     let stats = coord.run_lifecycle_sweep_at(old_deadline).unwrap();
     assert_eq!(stats.expired_current_objects, 0);
     assert_eq!(stats.expired_noncurrent_versions, 0);
 
-    assert!(matches!(
-        coord.storage_node().test_get_object_version(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            v1.version_id
-        ),
-        Ok(StoredObject::Live(_))
-    ));
+    assert!(listed_key_versions(&coord, "bucket", "key")
+        .iter()
+        .any(|version| version.version_id == v1.version_id && !version.is_delete_marker));
 }
 
 #[test]
@@ -3377,18 +3327,18 @@ fn lifecycle_sweep_expires_explicit_expired_object_delete_marker() {
         .unwrap();
     assert!(delete.delete_marker);
 
-    let deadline = {
-        let stored = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                put.version_id,
-            )
-            .unwrap();
-        let live = stored.as_live().unwrap();
-        Coordinator::lifecycle_day_based_deadline(live.became_noncurrent_at.unwrap(), 1).unwrap()
-    };
+    let lifecycle_object = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        put.version_id,
+    )
+    .unwrap();
+    let deadline = Coordinator::lifecycle_day_based_deadline(
+        lifecycle_object.became_noncurrent_at().unwrap(),
+        1,
+    )
+    .unwrap();
 
     let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
     assert_eq!(stats.expired_current_objects, 0);
@@ -3396,14 +3346,6 @@ fn lifecycle_sweep_expires_explicit_expired_object_delete_marker() {
     assert_eq!(stats.expired_delete_markers, 1);
     assert_eq!(stats.aborted_multipart_uploads, 0);
 
-    assert!(matches!(
-        coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectNotFound
-        ))
-    ));
     let versions = coord
         .list_object_versions(&ListObjectVersionsRequest {
             bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
@@ -3470,58 +3412,45 @@ fn lifecycle_sweep_expires_delete_marker_after_expiration_days_deadline() {
         .unwrap();
     assert!(delete.delete_marker);
 
-    let (noncurrent_deadline, marker_deadline) = {
-        let noncurrent = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                put.version_id,
-            )
-            .unwrap();
-        let marker = coord
-            .storage_node()
-            .test_get_object_version(
-                &trusted_bucket_name("bucket"),
-                &trusted_object_key("key"),
-                delete
-                    .version_id
-                    .expect("versioned delete marker must return a version ID"),
-            )
-            .unwrap();
-        (
-            Coordinator::lifecycle_day_based_deadline(
-                noncurrent.as_live().unwrap().became_noncurrent_at.unwrap(),
-                1,
-            )
-            .unwrap(),
-            Coordinator::lifecycle_day_based_deadline(marker.last_modified(), 2).unwrap(),
-        )
-    };
+    let live_lifecycle = storage::test_support::capture_lifecycle_object_observation(
+        &coord.storage_node(),
+        &trusted_bucket_name("bucket"),
+        &trusted_object_key("key"),
+        put.version_id,
+    )
+    .unwrap();
+    let marker_version_id = delete
+        .version_id
+        .expect("versioned delete marker must return a version ID");
+    let marker = listed_key_versions(&coord, "bucket", "key")
+        .into_iter()
+        .find(|version| version.version_id == marker_version_id)
+        .expect("current delete marker should be listed");
+    assert!(marker.is_delete_marker);
+    let noncurrent_deadline = Coordinator::lifecycle_day_based_deadline(
+        live_lifecycle.became_noncurrent_at().unwrap(),
+        1,
+    )
+    .unwrap();
+    let marker_deadline =
+        Coordinator::lifecycle_day_based_deadline(marker.last_modified, 2).unwrap();
 
     let first_stats = coord.run_lifecycle_sweep_at(noncurrent_deadline).unwrap();
     assert_eq!(first_stats.expired_noncurrent_versions, 1);
     assert_eq!(first_stats.expired_delete_markers, 0);
 
-    let current = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    assert!(matches!(current, StoredObject::DeleteMarker(_)));
+    let versions = listed_key_versions(&coord, "bucket", "key");
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id, marker_version_id);
+    assert!(versions[0].is_latest);
+    assert!(versions[0].is_delete_marker);
 
     let second_stats = coord.run_lifecycle_sweep_at(marker_deadline).unwrap();
     assert_eq!(second_stats.expired_noncurrent_versions, 0);
     assert_eq!(second_stats.expired_delete_markers, 1);
     assert_eq!(second_stats.aborted_multipart_uploads, 0);
 
-    assert!(matches!(
-        coord
-            .storage_node()
-            .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectNotFound
-        ))
-    ));
+    assert!(listed_key_versions(&coord, "bucket", "key").is_empty());
 }
 
 #[test]
@@ -3813,7 +3742,7 @@ fn lifecycle_current_expiry_stops_when_delete_drain_starts_after_claim() {
         None,
     )
     .unwrap();
-    test_helpers::put_object(
+    let put = test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
@@ -3834,13 +3763,7 @@ fn lifecycle_current_expiry_stops_when_delete_drain_starts_after_claim() {
         },
     )
     .unwrap();
-    let version_id = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .as_live()
-        .unwrap()
-        .version_id;
+    let version_id = put.version_id;
     let bucket_info = coord.storage_node().head_bucket_info(&bucket).unwrap();
     let claim = coord
         .storage_node()
@@ -3871,10 +3794,11 @@ fn lifecycle_current_expiry_stops_when_delete_drain_starts_after_claim() {
         outcome.is_none(),
         "lifecycle current expiry should stop behind DeleteBucket drain"
     );
-    assert!(coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .is_ok());
+    let versions = listed_key_versions(&coord, bucket.as_str(), key.as_str());
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].version_id, version_id);
+    assert!(versions[0].is_latest);
+    assert!(!versions[0].is_delete_marker);
 
     coord
         .storage_node()
@@ -3905,42 +3829,33 @@ fn lifecycle_noncurrent_expiry_stops_when_delete_drain_starts_after_claim() {
             state: BucketVersioningState::Enabled,
         })
         .unwrap();
+    let mut put_results = Vec::new();
     for data in [b"old".as_slice(), b"new".as_slice()] {
-        test_helpers::put_object(
-            &coord,
-            &PutObjectRequest {
-                encryption: WriteEncryptionRequest::none(),
-                policy_context: PutObjectPolicyContext::default(),
-                object_lock: ObjectLockState::default(),
-                object: object_request_with_expected_owner(
-                    bucket.as_str(),
-                    key.as_str(),
-                    test_requester(),
-                    None,
-                ),
-                data,
-                metadata: &MetadataBlob::default(),
-                system_metadata: &SystemMetadata::default(),
-                tags: None,
-                cond: NO_WRITE,
-                acl: NO_PUT_OBJECT_ACL.into(),
-            },
-        )
-        .unwrap();
+        put_results.push(
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        bucket.as_str(),
+                        key.as_str(),
+                        test_requester(),
+                        None,
+                    ),
+                    data,
+                    metadata: &MetadataBlob::default(),
+                    system_metadata: &SystemMetadata::default(),
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap(),
+        );
     }
-    let noncurrent_version_id = coord
-        .storage_node()
-        .list_all_object_versions_for_bucket(&bucket)
-        .unwrap()
-        .into_iter()
-        .filter(|stored| stored.key() == &key)
-        .find_map(|stored| {
-            let live = stored.as_live()?;
-            live.became_noncurrent_at
-                .is_some()
-                .then_some(live.version_id)
-        })
-        .expect("first version should be noncurrent");
+    let noncurrent_version_id = put_results[0].version_id;
     let bucket_info = coord.storage_node().head_bucket_info(&bucket).unwrap();
     let claim = coord
         .storage_node()
@@ -3970,10 +3885,13 @@ fn lifecycle_noncurrent_expiry_stops_when_delete_drain_starts_after_claim() {
         reclaimed.is_empty(),
         "lifecycle noncurrent expiry should stop behind DeleteBucket drain"
     );
-    assert!(coord
-        .storage_node()
-        .test_get_object_version(&bucket, &key, noncurrent_version_id)
-        .is_ok());
+    assert!(listed_key_versions(&coord, bucket.as_str(), key.as_str())
+        .iter()
+        .any(|version| {
+            version.version_id == noncurrent_version_id
+                && !version.is_latest
+                && !version.is_delete_marker
+        }));
 
     coord
         .storage_node()
@@ -4047,10 +3965,11 @@ fn lifecycle_delete_marker_cleanup_stops_when_delete_drain_starts_after_claim() 
         !deleted,
         "lifecycle delete-marker cleanup should stop behind DeleteBucket drain"
     );
-    assert!(coord
-        .storage_node()
-        .test_get_object_version(&bucket, &key, marker_version_id)
-        .is_ok());
+    assert!(listed_key_versions(&coord, bucket.as_str(), key.as_str())
+        .iter()
+        .any(|version| {
+            version.version_id == marker_version_id && version.is_latest && version.is_delete_marker
+        }));
 
     coord
         .storage_node()

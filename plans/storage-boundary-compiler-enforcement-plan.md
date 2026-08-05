@@ -5926,9 +5926,9 @@ Final Phase 5 audit (2026-08-04):
   `server-core/test-utils` leaks into an ordinary package graph. The
   AWS-facing harnesses remain clean;
 - Phase 5 cannot yet be marked complete. `server-core` still has residual raw
-  storage test seams in `coordinator/read_tests.rs`,
-  `coordinator/multipart_tests.rs`, `coordinator/bucket_tests.rs`,
-  `coordinator/core_tests.rs`, and `coordinator/test_support.rs`. These seams
+  storage test seams in `coordinator/core_tests.rs`,
+  `coordinator/test_topology.rs`, `coordinator/test_support.rs`, and the
+  authorization-model fixture loader in `coordinator/object_state.rs`. These seams
   expose or reconstruct raw PG IDs, route snapshots, generation identities,
   EC shapes, shard keys, physical shard paths, shard acknowledgement rows,
   durable object/upload records, and backfill work records;
@@ -6008,6 +6008,14 @@ Final Phase 5 audit (2026-08-04):
   load raw current-object records. The feature-gated object-observation trait
   remains intentionally downstream-callable, while its corresponding inherent
   `StorageCluster` helper is crate-private.
+- lifecycle and bucket-delete coordinator tests no longer load raw current or
+  explicit-version object records. They assert visible namespace state through
+  production `ListObjectVersions`, including requester authorization, while
+  deadline selection uses the narrow lifecycle observation. The one test which
+  must age a noncurrent version now invokes an owner-defined lifecycle scenario;
+  its crate-private mutation atomically requires an already-noncurrent live
+  version. Storage-owned regressions prove that current live versions and
+  delete markers are rejected without changing durable metadata.
 
 The audited cross-crate support families are:
 
