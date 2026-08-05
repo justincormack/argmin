@@ -16,8 +16,9 @@ use storage::test_support::{
     TestRetainedReadPgMoveScenario,
 };
 use storage::test_support::{
-    StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
-    StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
+    StorageClusterLifecycleTestSupport as _, StorageClusterObjectTestSupport as _,
+    StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
+    StorageClusterRouteMapTestSupport as _,
 };
 use storage::{
     ClusterEpoch, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, NodeId, PgId, PgState,
@@ -11779,7 +11780,7 @@ fn put_object_persists_explicit_object_owner_identity() {
         })
         .unwrap();
 
-    coord
+    let put = coord
         .put_object(&PutObjectRequest {
             object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
             data: b"hello",
@@ -11795,13 +11796,17 @@ fn put_object_persists_explicit_object_owner_identity() {
         })
         .unwrap();
 
-    let live = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    let live = live.into_live().expect("expected live object");
-    assert_eq!(live.owner.principal, owner.principal());
-    assert_eq!(live.owner.canonical_id, owner_canonical_id);
+    let acl = get_object_acl_test(
+        &coord,
+        "bucket",
+        "key",
+        Some(put.version_id),
+        requester,
+        None,
+    )
+    .unwrap();
+    assert_eq!(acl.owner_principal, owner.principal());
+    assert_eq!(acl.owner_canonical_id, owner_canonical_id);
 }
 
 #[test]
@@ -13933,7 +13938,7 @@ fn lifecycle_current_expiry_maps_command_log_conflict_to_slow_down() {
     .unwrap();
 
     let metadata = MetadataBlob::new();
-    test_helpers::put_object(
+    let put = test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
@@ -13952,13 +13957,7 @@ fn lifecycle_current_expiry_maps_command_log_conflict_to_slow_down() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let version_id = coord
-        .storage_node()
-        .test_get_object_meta(&bucket, &key)
-        .unwrap()
-        .as_live()
-        .unwrap()
-        .version_id;
+    let version_id = put.version_id;
     let bucket_incarnation_generation = coord
         .storage_node()
         .head_bucket_info(&bucket)
@@ -14207,7 +14206,7 @@ fn delete_marker_persists_explicit_owner_identity() {
         })
         .unwrap();
 
-    coord
+    let deleted = coord
         .delete_object(&delete_object_request(
             "bucket",
             "key",
@@ -14218,16 +14217,21 @@ fn delete_marker_persists_explicit_owner_identity() {
         ))
         .unwrap();
 
-    let marker = coord
+    let marker_version_id = deleted
+        .version_id
+        .expect("versioned delete should return the new marker version ID");
+    assert!(deleted.delete_marker);
+    let expected_owner =
+        OwnerIdentity::new(owner.principal().to_string(), owner_canonical_id.clone());
+    assert!(coord
         .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    let marker = match marker {
-        StoredObject::DeleteMarker(marker) => marker,
-        other => panic!("expected delete marker, got {other:?}"),
-    };
-    assert_eq!(marker.owner.principal, owner.principal());
-    assert_eq!(marker.owner.canonical_id, owner_canonical_id);
+        .test_delete_marker_version_has_owner(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            marker_version_id,
+            &expected_owner,
+        )
+        .unwrap());
 }
 
 #[test]
@@ -14295,7 +14299,7 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
     )
     .unwrap();
 
-    coord
+    let completed = coord
         .complete_multipart_upload(&CompleteMultipartUploadRequest {
             upload: multipart_object_request_with_expected_owner(
                 "bucket",
@@ -14316,13 +14320,17 @@ fn multipart_upload_and_complete_persist_explicit_owner_identity() {
         })
         .unwrap();
 
-    let live = coord
-        .storage_node()
-        .test_get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
-        .unwrap();
-    let live = live.into_live().expect("expected completed object");
-    assert_eq!(live.owner.principal, owner.principal());
-    assert_eq!(live.owner.canonical_id, owner_canonical_id);
+    let acl = get_object_acl_test(
+        &coord,
+        "bucket",
+        "key",
+        Some(completed.version_id),
+        requester,
+        None,
+    )
+    .unwrap();
+    assert_eq!(acl.owner_principal, owner.principal());
+    assert_eq!(acl.owner_canonical_id, owner_canonical_id);
 }
 
 #[test]

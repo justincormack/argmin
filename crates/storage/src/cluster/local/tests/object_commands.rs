@@ -1,5 +1,5 @@
 use super::*;
-use crate::test_support::StorageClusterLifecycleTestSupport;
+use crate::test_support::{StorageClusterLifecycleTestSupport, StorageClusterObjectTestSupport};
 
 #[test]
 fn object_delete_metadata_command_applies_to_all_acting_object_pg_nodes() {
@@ -2050,6 +2050,86 @@ fn semantic_lifecycle_aging_rejects_current_live_and_delete_marker_without_mutat
         "rejected delete-marker aging must not change durable metadata"
     );
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+}
+
+#[test]
+fn logical_delete_marker_owner_observation_rejects_live_and_binds_owner_fields() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let (bucket, key, _, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+    let live = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Enabled,
+        [93; 16],
+        [94; 16],
+        b"owner observation live version",
+    );
+    let live_owner = crate::OwnerIdentity::from_principal("owner");
+    let marker_owner = crate::OwnerIdentity::new(
+        "marker-owner",
+        s3_types::CanonicalUserId::from_principal("marker-canonical-source"),
+    );
+    let marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Enabled,
+            marker_owner.clone(),
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+
+    let matching_live_owner_err = cluster
+        .test_delete_marker_version_has_owner(&bucket, &key, live.version_id, &live_owner)
+        .expect_err("a live version must not pass through the delete-marker observation");
+    assert!(matches!(
+        matching_live_owner_err,
+        crate::ObjectPgActionError::InvalidRequest { reason }
+            if reason == "selected object version is not a delete marker"
+    ));
+    assert!(cluster
+        .test_delete_marker_version_has_owner(&bucket, &key, marker.version_id, &marker_owner)
+        .unwrap());
+    let crossed_live_version_err = cluster
+        .test_delete_marker_version_has_owner(&bucket, &key, live.version_id, &marker_owner)
+        .expect_err("a crossed live version must not be treated as a delete marker");
+    assert!(matches!(
+        crossed_live_version_err,
+        crate::ObjectPgActionError::InvalidRequest { reason }
+            if reason == "selected object version is not a delete marker"
+    ));
+    assert!(!cluster
+        .test_delete_marker_version_has_owner(&bucket, &key, marker.version_id, &live_owner)
+        .unwrap());
+
+    let wrong_principal =
+        crate::OwnerIdentity::new("other-marker-owner", marker_owner.canonical_id.clone());
+    assert!(!cluster
+        .test_delete_marker_version_has_owner(&bucket, &key, marker.version_id, &wrong_principal,)
+        .unwrap());
+    let wrong_canonical = crate::OwnerIdentity::new(
+        marker_owner.principal.clone(),
+        s3_types::CanonicalUserId::from_principal("other-marker-canonical-source"),
+    );
+    assert!(!cluster
+        .test_delete_marker_version_has_owner(&bucket, &key, marker.version_id, &wrong_canonical,)
+        .unwrap());
 }
 
 #[test]

@@ -6015,7 +6015,16 @@ Final Phase 5 audit (2026-08-04):
   must age a noncurrent version now invokes an owner-defined lifecycle scenario;
   its crate-private mutation atomically requires an already-noncurrent live
   version. Storage-owned regressions prove that current live versions and
-  delete markers are rejected without changing durable metadata.
+  delete markers are rejected without changing durable metadata; and
+- `coordinator/core_tests.rs` no longer loads raw object records. Live PUT and
+  completed-multipart owner persistence is asserted through production
+  `GetObjectAcl`, lifecycle conflict coverage retains the version ID returned
+  by production PUT, and the response-invisible delete-marker owner invariant
+  uses one delete-marker-specific logical storage-owned predicate. It rejects
+  live versions even when their owner matches. Owner-local positive,
+  crossed-version, and crossed-owner canaries independently pin its principal
+  and canonical-ID comparisons without creating an alternate live-object
+  inspection path.
 
 The audited cross-crate support families are:
 

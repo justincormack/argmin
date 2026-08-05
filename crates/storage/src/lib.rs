@@ -669,6 +669,14 @@ pub mod test_support {
             version_id: VersionId,
             cleartext_checksum: &str,
         ) -> Result<TestStoredSseCustomerChecksumObservation, ObjectPgActionError>;
+
+        fn test_delete_marker_version_has_owner(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            expected_owner: &OwnerIdentity,
+        ) -> Result<bool, ObjectPgActionError>;
     }
 
     impl StorageClusterObjectTestSupport for StorageCluster {
@@ -686,6 +694,22 @@ pub mod test_support {
                 version_id,
                 cleartext_checksum,
             )
+        }
+
+        fn test_delete_marker_version_has_owner(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            version_id: VersionId,
+            expected_owner: &OwnerIdentity,
+        ) -> Result<bool, ObjectPgActionError> {
+            let object = self.test_get_object_version(bucket, key, version_id)?;
+            let StoredObject::DeleteMarker(marker) = object else {
+                return Err(ObjectPgActionError::InvalidRequest {
+                    reason: "selected object version is not a delete marker".to_string(),
+                });
+            };
+            Ok(marker.owner == *expected_owner)
         }
     }
 
