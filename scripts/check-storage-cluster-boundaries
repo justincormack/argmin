@@ -5289,6 +5289,41 @@ fail_with_matches \
     "Backfill candidate cursor, scan summary, and enqueue transition are storage-owned; scheduling remains inside StorageShardScavengerSweeper" \
     "$backfill_candidate_scan_state_leaks"
 
+maintenance_sweeper_public_test_method_pattern='^[[:space:]]*pub[[:space:]]+fn[[:space:]]+test_(is_enabled|routes_to|stop|backfill_one_pending|repair_one_pending|sweep_once)\b'
+
+scan_public_maintenance_sweeper_test_methods() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$maintenance_sweeper_public_test_method_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+public_maintenance_sweeper_test_method_leaks=$(
+    scan_public_maintenance_sweeper_test_methods crates/storage/src
+)
+fail_with_matches \
+    "Maintenance sweeper test controls are available only through storage::test_support traits; inherent implementations must remain crate-private" \
+    "$public_maintenance_sweeper_test_method_leaks"
+
+maintenance_sweeper_public_test_method_fixture=$(
+    scan_public_maintenance_sweeper_test_methods \
+        scripts/fixtures/storage-boundary-maintenance-sweeper
+)
+expected_maintenance_sweeper_public_test_method_fixture='scripts/fixtures/storage-boundary-maintenance-sweeper/nested/unrelated-module.rs:6:    pub fn test_repair_one_pending(&self) -> bool {'
+maintenance_sweeper_public_test_method_fixture_failure=""
+if [[ "$maintenance_sweeper_public_test_method_fixture" != "$expected_maintenance_sweeper_public_test_method_fixture" ]]; then
+    maintenance_sweeper_public_test_method_fixture_failure=$maintenance_sweeper_public_test_method_fixture
+    if [[ -z "$maintenance_sweeper_public_test_method_fixture_failure" ]]; then
+        maintenance_sweeper_public_test_method_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Maintenance sweeper public-method source-root scan must find only the nested unrelated-module fixture" \
+    "$maintenance_sweeper_public_test_method_fixture_failure"
+
 shard_scavenger_maintenance_leaks=$(
     rg -n --color=never \
         '\b(StorageBackfillCandidateScanner|BackgroundWorkAdmission|BackgroundWorkClass|audit_shard_storage_for_scavenger|record_routine_metadata_command_checkpoints)\b|struct[[:space:]]+ShardScavengerSweeper\b' \

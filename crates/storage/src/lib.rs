@@ -466,6 +466,113 @@ pub mod test_support {
         }
     }
 
+    /// Logical lifecycle observations shared by the storage maintenance
+    /// sweepers.
+    ///
+    /// The production sweeper types deliberately expose no publicly callable
+    /// inherent test methods. Cross-crate tests must opt into this
+    /// owner-namespaced surface to observe whether a worker is active or which
+    /// runtime-map generation it currently follows.
+    #[cfg(feature = "test-hooks")]
+    pub trait StorageMaintenanceSweeperTestSupport {
+        fn test_is_enabled(&self) -> bool;
+        fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageMaintenanceSweeperTestSupport for StorageReclaimSweeper {
+        fn test_is_enabled(&self) -> bool {
+            StorageReclaimSweeper::test_is_enabled(self)
+        }
+
+        fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
+            StorageReclaimSweeper::test_routes_to(self, expected)
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageMaintenanceSweeperTestSupport for StorageShardScavengerSweeper {
+        fn test_is_enabled(&self) -> bool {
+            StorageShardScavengerSweeper::test_is_enabled(self)
+        }
+
+        fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
+            StorageShardScavengerSweeper::test_routes_to(self, expected)
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageMaintenanceSweeperTestSupport for StorageShardRepairSweeper {
+        fn test_is_enabled(&self) -> bool {
+            StorageShardRepairSweeper::test_is_enabled(self)
+        }
+
+        fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
+            StorageShardRepairSweeper::test_routes_to(self, expected)
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageMaintenanceSweeperTestSupport for StorageShardBackfillSweeper {
+        fn test_is_enabled(&self) -> bool {
+            StorageShardBackfillSweeper::test_is_enabled(self)
+        }
+
+        fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
+            StorageShardBackfillSweeper::test_routes_to(self, expected)
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageMaintenanceSweeperTestSupport for StorageStreamSessionSweeper {
+        fn test_is_enabled(&self) -> bool {
+            StorageStreamSessionSweeper::test_is_enabled(self)
+        }
+
+        fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
+            StorageStreamSessionSweeper::test_routes_to(self, expected)
+        }
+    }
+
+    /// Deterministic lifecycle control for the durable reclaim worker.
+    #[cfg(feature = "test-hooks")]
+    pub trait StorageReclaimSweeperTestSupport {
+        fn test_stop(&self);
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageReclaimSweeperTestSupport for StorageReclaimSweeper {
+        fn test_stop(&self) {
+            StorageReclaimSweeper::test_stop(self);
+        }
+    }
+
+    /// Deterministic execution of one queued shard-repair item.
+    #[cfg(feature = "test-hooks")]
+    pub trait StorageShardRepairSweeperTestSupport {
+        fn test_repair_one_pending(&self) -> bool;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageShardRepairSweeperTestSupport for StorageShardRepairSweeper {
+        fn test_repair_one_pending(&self) -> bool {
+            StorageShardRepairSweeper::test_repair_one_pending(self)
+        }
+    }
+
+    /// Deterministic execution of one abandoned stream-session sweep.
+    #[cfg(feature = "test-hooks")]
+    pub trait StorageStreamSessionSweeperTestSupport {
+        fn test_sweep_once(&self) -> StorageStreamSessionSweepTestSummary;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    impl StorageStreamSessionSweeperTestSupport for StorageStreamSessionSweeper {
+        fn test_sweep_once(&self) -> StorageStreamSessionSweepTestSummary {
+            StorageStreamSessionSweeper::test_sweep_once(self)
+        }
+    }
+
     /// Logical worker observations and storage-owned lifecycle setup for
     /// cross-crate coordinator tests.
     ///

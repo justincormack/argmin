@@ -493,13 +493,13 @@ impl StorageReclaimSweeper {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     #[must_use]
-    pub fn test_is_enabled(&self) -> bool {
+    pub(crate) fn test_is_enabled(&self) -> bool {
         !self.stop.load(Ordering::SeqCst)
     }
 
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_stop(&self) {
+    pub(crate) fn test_stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         self.storage_handle.current().wake_reclaim_workers();
         if let Some(handle) = self
@@ -514,7 +514,7 @@ impl StorageReclaimSweeper {
 
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
+    pub(crate) fn test_routes_to(&self, expected: &Arc<StorageCluster>) -> bool {
         Arc::ptr_eq(&self.storage_handle.current(), expected)
     }
 }

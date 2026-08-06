@@ -718,19 +718,19 @@ impl StorageShardBackfillSweeper {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     #[must_use]
-    pub fn test_is_enabled(&self) -> bool {
+    pub(crate) fn test_is_enabled(&self) -> bool {
         !self.stop.load(Ordering::SeqCst)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+    pub(crate) fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
         Arc::ptr_eq(&self.storage_handle.current(), expected)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     #[doc(hidden)]
-    pub fn test_backfill_one_pending(&self, owner_token: &str) {
+    pub(crate) fn test_backfill_one_pending(&self, owner_token: &str) {
         let admission = StorageMaintenanceAdmission::acquire_shared(&self.storage_handle);
         run_one_placed_segment_shard_backfill(
             &self.storage_handle.current(),
@@ -1218,13 +1218,13 @@ impl StorageShardScavengerSweeper {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     #[must_use]
-    pub fn test_is_enabled(&self) -> bool {
+    pub(crate) fn test_is_enabled(&self) -> bool {
         !self.stop.load(Ordering::SeqCst)
     }
 
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+    pub(crate) fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
         Arc::ptr_eq(&self.storage_handle.current(), expected)
     }
 }
@@ -1416,19 +1416,19 @@ impl StorageShardRepairSweeper {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     #[must_use]
-    pub fn test_is_enabled(&self) -> bool {
+    pub(crate) fn test_is_enabled(&self) -> bool {
         !self.stop.load(Ordering::SeqCst)
     }
 
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+    pub(crate) fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
         Arc::ptr_eq(&self.storage_handle.current(), expected)
     }
 
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_repair_one_pending(&self) -> bool {
+    pub(crate) fn test_repair_one_pending(&self) -> bool {
         let storage_cluster = self.storage_handle.current();
         emit_shard_repair_durable_scan(
             storage_cluster.enqueue_durable_placed_segment_shard_repair_work(),
@@ -1838,7 +1838,7 @@ impl StorageStreamSessionSweeper {
 
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_sweep_once(&self) -> StorageStreamSessionSweepTestSummary {
+    pub(crate) fn test_sweep_once(&self) -> StorageStreamSessionSweepTestSummary {
         let summary = sweep_abandoned_stream_sessions(&self.storage_handle, self.max_age_ms);
         StorageStreamSessionSweepTestSummary {
             discovered: summary.discovered,
@@ -1852,13 +1852,13 @@ impl StorageStreamSessionSweeper {
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     #[must_use]
-    pub fn test_is_enabled(&self) -> bool {
+    pub(crate) fn test_is_enabled(&self) -> bool {
         !self.stop.load(Ordering::SeqCst)
     }
 
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
-    pub fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
+    pub(crate) fn test_routes_to(&self, expected: &Arc<crate::StorageCluster>) -> bool {
         Arc::ptr_eq(&self.storage_handle.current(), expected)
     }
 }

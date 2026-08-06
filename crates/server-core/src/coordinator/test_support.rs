@@ -6,7 +6,9 @@ use ec::EcConfig;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use storage::test_support::StorageClusterLifecycleTestSupport as _;
+use storage::test_support::{
+    StorageClusterLifecycleTestSupport as _, StorageReclaimSweeperTestSupport as _,
+};
 use storage::{
     NodeId, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
     StorageClusterRuntimeMapRefreshError,

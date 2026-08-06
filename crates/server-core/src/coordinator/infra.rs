@@ -2,6 +2,8 @@
 use super::runtime::LifecycleSweepStats;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use storage::test_support::StorageMaintenanceSweeperTestSupport as _;
 
 use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::PayloadBufferPool;

@@ -6108,7 +6108,17 @@ Final Phase 5 audit (2026-08-04):
   a stronger scan-ordered selector, so their lexically smallest group is
   guaranteed to occupy the final metadata scan position. Owner-local canaries
   pin each placement relation and the exact sorted scan ordering. The obsolete
-  `StorageCluster::test_pg_ids` surface has been removed entirely.
+  `StorageCluster::test_pg_ids` surface has been removed entirely; and
+- maintenance-sweeper status, route-following observations, deterministic
+  reclaim shutdown, one-item shard repair, and one-pass stream-session cleanup
+  are now available cross-crate only through explicit
+  `storage::test_support` traits. The production sweeper types retain only
+  crate-private inherent implementations, unused deterministic backfill
+  execution remains owner-local, and the boundary checker scans every storage
+  source module to reject public reintroduction of the raw inherent methods.
+  The same source-root scan helper runs against production and a multi-module
+  fixture tree, pinning discovery of a nested unrelated-module inherent impl
+  while ignoring its crate-private control.
 
 The audited cross-crate support families are:
 
@@ -6163,7 +6173,10 @@ Remaining implementation order after this audit:
    Runtime-map refresh/primary-move/stale-route fixtures likewise use the
    curated storage-owned topology interface. Listing and reclaim fixtures
    likewise request only semantic same/distinct or scan-ordered metadata-
-   placement groups; raw PG enumeration has been removed; and
+   placement groups; raw PG enumeration has been removed. Maintenance worker
+   observations and deterministic actions are likewise consolidated behind
+   owner-namespaced test-support traits, with their inherent implementations
+   crate-private; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.
