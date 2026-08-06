@@ -57,6 +57,25 @@ pub trait StorageClusterTopologyTestSupport {
         prefixes: &[&str],
     ) -> Option<Vec<ObjectKey>>;
 
+    fn test_find_object_keys_on_metadata_pgs_in_scan_order(
+        &self,
+        bucket: &BucketName,
+        prefixes: &[&str],
+    ) -> Option<Vec<ObjectKey>>;
+
+    fn test_find_object_key_on_same_metadata_pg_as(
+        &self,
+        bucket: &BucketName,
+        reference: &ObjectKey,
+        prefix: &str,
+    ) -> Option<ObjectKey>;
+
+    fn test_find_object_keys_on_same_metadata_pg(
+        &self,
+        bucket: &BucketName,
+        prefixes: &[&str],
+    ) -> Option<Vec<ObjectKey>>;
+
     fn test_find_fresh_object_key_with_metadata_pg_after_data_pg(
         &self,
         bucket: &BucketName,
@@ -148,6 +167,55 @@ impl StorageClusterTopologyTestSupport for StorageCluster {
             })?;
             selected_pg_ids.push(self.test_object_pg_id_for(bucket, &key));
             keys.push(key);
+        }
+        Some(keys)
+    }
+
+    fn test_find_object_keys_on_metadata_pgs_in_scan_order(
+        &self,
+        bucket: &BucketName,
+        prefixes: &[&str],
+    ) -> Option<Vec<ObjectKey>> {
+        let scan_pg_ids = self.metadata_pg_ids();
+        if prefixes.len() > scan_pg_ids.len() {
+            return None;
+        }
+        prefixes
+            .iter()
+            .zip(scan_pg_ids)
+            .map(|(prefix, target_pg_id)| {
+                find_test_object_key(self, bucket, prefix, |object_pg_id, _| {
+                    object_pg_id == target_pg_id
+                })
+            })
+            .collect()
+    }
+
+    fn test_find_object_key_on_same_metadata_pg_as(
+        &self,
+        bucket: &BucketName,
+        reference: &ObjectKey,
+        prefix: &str,
+    ) -> Option<ObjectKey> {
+        let reference_pg_id = self.test_object_pg_id_for(bucket, reference);
+        find_test_object_key(self, bucket, prefix, |object_pg_id, _| {
+            object_pg_id == reference_pg_id
+        })
+    }
+
+    fn test_find_object_keys_on_same_metadata_pg(
+        &self,
+        bucket: &BucketName,
+        prefixes: &[&str],
+    ) -> Option<Vec<ObjectKey>> {
+        let Some((first_prefix, remaining_prefixes)) = prefixes.split_first() else {
+            return Some(Vec::new());
+        };
+        let first = find_test_object_key(self, bucket, first_prefix, |_, _| true)?;
+        let mut keys = Vec::with_capacity(prefixes.len());
+        keys.push(first.clone());
+        for prefix in remaining_prefixes {
+            keys.push(self.test_find_object_key_on_same_metadata_pg_as(bucket, &first, prefix)?);
         }
         Some(keys)
     }
@@ -547,6 +615,67 @@ mod tests {
         cluster
             .test_clone_with_pg_routes(next_epoch, routes, historical_routes)
             .unwrap()
+    }
+
+    #[test]
+    fn semantic_key_group_selection_pins_same_and_distinct_metadata_placement() {
+        let tmp = test_util::tempdir();
+        let cluster = dynamic_test_cluster(tmp.path());
+        let bucket = BucketName::try_from("semantic-key-placement").unwrap();
+
+        let distinct = cluster
+            .test_find_object_keys_on_distinct_metadata_pgs(&bucket, &["a/", "b/"])
+            .expect("two-PG topology must provide distinct key placements");
+        assert_ne!(
+            cluster.test_object_pg_id_for(&bucket, &distinct[0]),
+            cluster.test_object_pg_id_for(&bucket, &distinct[1])
+        );
+
+        let same = cluster
+            .test_find_object_keys_on_same_metadata_pg(&bucket, &["one/", "two/", "three/"])
+            .expect("topology must provide keys sharing one metadata PG");
+        let same_pg = cluster.test_object_pg_id_for(&bucket, &same[0]);
+        assert!(same
+            .iter()
+            .all(|key| cluster.test_object_pg_id_for(&bucket, key) == same_pg));
+
+        let matched = cluster
+            .test_find_object_key_on_same_metadata_pg_as(&bucket, &distinct[1], "matched/")
+            .expect("topology must provide a key matching the reference placement");
+        assert_eq!(
+            cluster.test_object_pg_id_for(&bucket, &matched),
+            cluster.test_object_pg_id_for(&bucket, &distinct[1])
+        );
+        assert!(matched.as_str().starts_with("matched/"));
+    }
+
+    #[test]
+    fn scan_order_key_selection_follows_sorted_metadata_pg_scan_order() {
+        let tmp = test_util::tempdir();
+        let cluster = StorageCluster::open_static_local_nodes(
+            tmp.path(),
+            &[NodeId::new(0), NodeId::new(1), NodeId::new(2)],
+            &[9, 2, 5],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap();
+        let bucket = BucketName::try_from("scan-ordered-key-placement").unwrap();
+
+        let keys = cluster
+            .test_find_object_keys_on_metadata_pgs_in_scan_order(
+                &bucket,
+                &["first/", "middle/", "last/"],
+            )
+            .expect("three-PG topology must provide one key per scan position");
+        let selected_pg_ids = keys
+            .iter()
+            .map(|key| cluster.test_object_pg_id_for(&bucket, key))
+            .collect::<Vec<_>>();
+
+        assert_eq!(selected_pg_ids, [2, 5, 9]);
+        assert!(keys[0].as_str().starts_with("first/"));
+        assert!(keys[1].as_str().starts_with("middle/"));
+        assert!(keys[2].as_str().starts_with("last/"));
     }
 
     #[test]

@@ -6358,8 +6358,10 @@ fn wait_until_bucket_deleting_or_missing(
 
 #[test]
 fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
+    const PG_COUNT: u32 = 32;
+
     let tmp = test_util::tempdir();
-    let pg_ids: Vec<u32> = (0..32).collect();
+    let pg_ids: Vec<u32> = (0..PG_COUNT).collect();
     let bucket = trusted_bucket_name("bucket-delete-begin-worker-frontier");
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
     let direct_coord =
@@ -6370,17 +6372,12 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
 
-    let pg_count = initial.test_pg_ids().len() as u32;
-    assert!(
-        pg_count >= 32,
-        "test requires several exact-bucket drain chunks"
-    );
     let fail_after_first_frontier = Arc::new(AtomicBool::new(true));
     let fail_after_first_frontier_for_hook = Arc::clone(&fail_after_first_frontier);
     let _progress_hook_guard = initial
         .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
             move |next_object_pg_id| {
-                if next_object_pg_id < pg_count
+                if next_object_pg_id < PG_COUNT
                     && fail_after_first_frontier_for_hook.swap(false, Ordering::SeqCst)
                 {
                     return Err(storage::StoreError::RouteMapExpired {
@@ -7106,23 +7103,6 @@ fn same_epoch_cluster_with_stale_current_pg_routes(
     initial: &Arc<StorageCluster>,
 ) -> Arc<StorageCluster> {
     initial.test_clone_with_stale_current_pg_routes().unwrap()
-}
-
-fn find_key_for_object_metadata_pg_with_prefix(
-    storage_cluster: &StorageCluster,
-    bucket: &str,
-    metadata_pg_id: u32,
-    key_prefix: &str,
-) -> String {
-    let bucket_name = trusted_bucket_name(bucket);
-    for key_suffix in 0..10_000 {
-        let key = format!("{key_prefix}{key_suffix:04}");
-        let object_key = trusted_object_key(&key);
-        if storage_cluster.test_object_pg_id_for(&bucket_name, &object_key) == metadata_pg_id {
-            return key;
-        }
-    }
-    panic!("failed to find key with prefix {key_prefix:?} on object metadata PG {metadata_pg_id}");
 }
 
 #[test]
@@ -8906,19 +8886,10 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let pg_ids = initial.test_pg_ids();
-    assert!(
-        pg_ids.len() >= 2,
-        "test requires at least two object metadata PGs"
-    );
-    let key_a = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "a/");
-    let key_b = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "b/");
-    let key_c = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "c/");
-    assert_ne!(
-        initial.test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key_a)),
-        initial.test_object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(&key_b)),
-        "test fixture must span multiple object metadata PGs"
-    );
+    let distinct_keys = find_keys_on_distinct_object_metadata_pgs(&coord, bucket, &["a/", "b/"]);
+    let key_a = distinct_keys[0].clone();
+    let key_b = distinct_keys[1].clone();
+    let key_c = find_key_on_same_object_metadata_pg_as(&coord, bucket, &key_a, "c/");
 
     for key in [&key_a, &key_b, &key_c] {
         test_helpers::put_object(
@@ -9069,7 +9040,6 @@ fn list_objects_paginates_global_order_when_smallest_keys_are_on_last_pg() {
     let bucket = "list-global-order-bucket";
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
-    let pg_ids = storage_cluster.test_pg_ids().to_vec();
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&storage_cluster),
     );
@@ -9077,15 +9047,11 @@ fn list_objects_paginates_global_order_when_smallest_keys_are_on_last_pg() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
+    let key_groups =
+        find_key_groups_in_object_metadata_scan_order(&coord, bucket, &["z/", "m/", "a/"], 4);
     let mut expected = Vec::new();
-    for (pg_id, lexical_prefix) in [(pg_ids[0], "z/"), (pg_ids[1], "m/"), (pg_ids[2], "a/")] {
-        for index in 0..4 {
-            let key = find_key_for_object_metadata_pg_with_prefix(
-                &storage_cluster,
-                bucket,
-                pg_id,
-                &format!("{lexical_prefix}{index}/"),
-            );
+    for group in key_groups {
+        for key in group {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
@@ -9142,7 +9108,6 @@ fn list_multipart_uploads_paginates_global_order_when_smallest_keys_are_on_last_
     let bucket = "mpu-list-global-order-bucket";
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
-    let pg_ids = storage_cluster.test_pg_ids().to_vec();
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&storage_cluster),
     );
@@ -9150,15 +9115,11 @@ fn list_multipart_uploads_paginates_global_order_when_smallest_keys_are_on_last_
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
+    let key_groups =
+        find_key_groups_in_object_metadata_scan_order(&coord, bucket, &["z/", "m/", "a/"], 4);
     let mut expected = Vec::new();
-    for (pg_id, lexical_prefix) in [(pg_ids[0], "z/"), (pg_ids[1], "m/"), (pg_ids[2], "a/")] {
-        for index in 0..4 {
-            let key = find_key_for_object_metadata_pg_with_prefix(
-                &storage_cluster,
-                bucket,
-                pg_id,
-                &format!("{lexical_prefix}{index}/"),
-            );
+    for group in key_groups {
+        for key in group {
             let upload = coord
                 .create_multipart_upload(&CreateMultipartUploadRequest {
                     object: object_request_with_expected_owner(
@@ -9235,16 +9196,11 @@ fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let pg_ids = initial.test_pg_ids();
-    assert!(
-        pg_ids.len() >= 2,
-        "test requires at least two object metadata PGs"
-    );
-    let key_a = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "a/");
-    let key_b = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "b/");
-    let key_c = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "c/");
-    let root_key =
-        find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "z-root-");
+    let distinct_keys = find_keys_on_distinct_object_metadata_pgs(&coord, bucket, &["a/", "b/"]);
+    let key_a = distinct_keys[0].clone();
+    let key_b = distinct_keys[1].clone();
+    let key_c = find_key_on_same_object_metadata_pg_as(&coord, bucket, &key_a, "c/");
+    let root_key = find_key_on_same_object_metadata_pg_as(&coord, bucket, &key_b, "z-root-");
 
     for key in [&key_a, &key_b, &key_c, &root_key] {
         test_helpers::put_object(
@@ -10884,15 +10840,11 @@ fn reclaim_worker_rediscovers_capacity_deferred_root_while_idle() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let metadata_pg_id = storage_cluster.test_pg_ids()[0];
-    let keys = ["first-", "second-", "capacity-deferred-"].map(|prefix| {
-        find_key_for_object_metadata_pg_with_prefix(
-            &storage_cluster,
-            bucket,
-            metadata_pg_id,
-            prefix,
-        )
-    });
+    let keys = find_keys_on_same_object_metadata_pg(
+        &coord,
+        bucket,
+        &["first-", "second-", "capacity-deferred-"],
+    );
     let bucket_name = trusted_bucket_name(bucket);
     let mut reclaim_roots = Vec::new();
     for key in &keys {
@@ -14380,13 +14332,9 @@ fn list_object_versions_continuation_survives_epoch_change_between_pages() {
     )
     .unwrap();
 
-    let pg_ids = initial.test_pg_ids();
-    assert!(
-        pg_ids.len() >= 2,
-        "test requires at least two object metadata PGs"
-    );
-    let key_a = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[0], "a/");
-    let key_b = find_key_for_object_metadata_pg_with_prefix(&initial, bucket, pg_ids[1], "b/");
+    let distinct_keys = find_keys_on_distinct_object_metadata_pgs(&coord, bucket, &["a/", "b/"]);
+    let key_a = distinct_keys[0].clone();
+    let key_b = distinct_keys[1].clone();
 
     let older_a = test_helpers::put_object(
         &coord,

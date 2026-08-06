@@ -6099,7 +6099,16 @@ Final Phase 5 audit (2026-08-04):
   owner-local canaries pin complete Peering route preservation, retained
   history, changed-primary selection, rejection when no alternate exists, and
   fallible epoch overflow. The raw route-clone constructor is now
-  crate-private.
+  crate-private; and
+- coordinator listing, version-pagination, bucket-delete-frontier, and reclaim
+  capacity tests no longer enumerate storage PG IDs or search for keys by a
+  caller-supplied raw PG. Storage-owned topology support selects keys on the
+  same metadata PG, on the same PG as an opaque reference key, or across
+  distinct PGs and returns only the keys. The DCC-3 global-listing fixtures use
+  a stronger scan-ordered selector, so their lexically smallest group is
+  guaranteed to occupy the final metadata scan position. Owner-local canaries
+  pin each placement relation and the exact sorted scan ordering. The obsolete
+  `StorageCluster::test_pg_ids` surface has been removed entirely.
 
 The audited cross-crate support families are:
 
@@ -6152,7 +6161,9 @@ Remaining implementation order after this audit:
    process-local route-authority clone rather than exporting local store paths,
    PG IDs, EC shape, or route snapshots, or opening a duplicate runtime.
    Runtime-map refresh/primary-move/stale-route fixtures likewise use the
-   curated storage-owned topology interface; and
+   curated storage-owned topology interface. Listing and reclaim fixtures
+   likewise request only semantic same/distinct or scan-ordered metadata-
+   placement groups; raw PG enumeration has been removed; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

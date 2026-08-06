@@ -3375,6 +3375,17 @@ fail_with_matches \
     "Environment initial-map construction, raw topology inspection, and direct bootstrap commands must remain owned by storage" \
     "$argmin_uncertified_initial_topology_representation_leaks"
 
+raw_test_pg_enumeration_leaks=$(
+    rg -n --color=never \
+        '\btest_pg_ids\b' \
+        crates \
+        -g '*.rs' \
+        || true
+)
+fail_with_matches \
+    "Tests must request storage-owned semantic placement scenarios rather than enumerating raw PG IDs" \
+    "$raw_test_pg_enumeration_leaks"
+
 uncertified_initial_topology_opaque_surface_leaks=$(
     awk '
     /pub struct UncertifiedInitialControlPlaneTopology[[:space:]]*\{/ {

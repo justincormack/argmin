@@ -1769,12 +1769,7 @@ impl super::StorageCluster {
         std::sync::Arc::as_ptr(&self.local_map) as usize
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_pg_ids(&self) -> &[u32] {
-        self.local_map.pg_ids()
-    }
-
-    fn metadata_pg_ids(&self) -> Vec<u32> {
+    pub(crate) fn metadata_pg_ids(&self) -> Vec<u32> {
         let mut pg_ids = self.local_map.pg_ids().to_vec();
         pg_ids.sort_unstable();
         pg_ids
