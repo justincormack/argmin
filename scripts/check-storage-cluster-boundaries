@@ -5426,6 +5426,54 @@ fail_with_matches \
     "Storage scheduling public-surface source-root scan must find only the nested unrelated-module fixture" \
     "$storage_scheduling_public_test_surface_fixture_failure"
 
+bucket_finalize_raw_test_symbol_leaks=$(
+    rg -n --color=never \
+        '\b(test_try_finalize_bucket_delete_root|test_reenqueue_bucket_delete_finalize|test_enqueue_current_bucket_delete_finalize|test_enqueue_missing_bucket_delete_finalize|test_create_and_enqueue_deleting_bucket_finalize|test_delete_bucket_metadata)\b' \
+        crates \
+        -g '*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Cross-crate bucket-finalization tests must use opaque storage::test_support lifecycle scenarios, not raw queue roots or metadata deletion helpers" \
+    "$bucket_finalize_raw_test_symbol_leaks"
+
+bucket_finalize_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+fn[[:space:]]+(test_try_finalize_bucket_delete_root|test_reenqueue_bucket_delete_finalize|test_enqueue_current_bucket_delete_finalize|test_enqueue_missing_bucket_delete_finalize|test_create_and_enqueue_deleting_bucket_finalize|test_delete_bucket_metadata)\b'
+
+scan_public_bucket_finalize_test_surface() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$bucket_finalize_public_test_surface_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+public_bucket_finalize_test_surface_leaks=$(
+    scan_public_bucket_finalize_test_surface crates/storage/src
+)
+fail_with_matches \
+    "Raw bucket-finalization queue and metadata helpers must remain crate-private behind storage::test_support" \
+    "$public_bucket_finalize_test_surface_leaks"
+
+bucket_finalize_public_test_surface_fixture=$(
+    scan_public_bucket_finalize_test_surface \
+        scripts/fixtures/storage-boundary-bucket-finalize
+)
+expected_bucket_finalize_public_test_surface_fixture='scripts/fixtures/storage-boundary-bucket-finalize/nested/unrelated-module.rs:2:    pub fn test_enqueue_current_bucket_delete_finalize(&self) {}
+scripts/fixtures/storage-boundary-bucket-finalize/nested/unrelated-module.rs:3:    pub fn test_delete_bucket_metadata(&self) {}'
+bucket_finalize_public_test_surface_fixture_failure=""
+if [[ "$bucket_finalize_public_test_surface_fixture" != "$expected_bucket_finalize_public_test_surface_fixture" ]]; then
+    bucket_finalize_public_test_surface_fixture_failure=$bucket_finalize_public_test_surface_fixture
+    if [[ -z "$bucket_finalize_public_test_surface_fixture_failure" ]]; then
+        bucket_finalize_public_test_surface_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Bucket-finalization public-surface source-root scan must find only the nested unrelated-module fixture" \
+    "$bucket_finalize_public_test_surface_fixture_failure"
+
 shard_scavenger_maintenance_leaks=$(
     rg -n --color=never \
         '\b(StorageBackfillCandidateScanner|BackgroundWorkAdmission|BackgroundWorkClass|audit_shard_storage_for_scavenger|record_routine_metadata_command_checkpoints)\b|struct[[:space:]]+ShardScavengerSweeper\b' \
@@ -5467,22 +5515,52 @@ fail_with_matches \
     "$shard_repair_maintenance_leaks"
 
 cross_crate_physical_shard_test_leaks=$(
-    {
-        rg -n --color=never \
-            '\btest_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_write_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)\b' \
-            crates \
-            -g '*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n --color=never \
-            '^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+test_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_write_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)|type[[:space:]]+PayloadShardWriteTestHook|struct[[:space:]]+PayloadShardWriteTestHookGuard)\b' \
-            crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
-            || true
-    }
+    rg -n --color=never \
+        '\btest_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_write_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)\b' \
+        crates \
+        -g '*.rs' \
+        -g '!crates/storage/**' \
+        || true
 )
 fail_with_matches \
     "Physical shard indices, mutation, files, and repair-row identities are storage-owned; cross-crate tests must use opaque role/count fault scenarios" \
     "$cross_crate_physical_shard_test_leaks"
+
+physical_shard_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+test_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_write_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)|type[[:space:]]+PayloadShardWriteTestHook|struct[[:space:]]+PayloadShardWriteTestHookGuard)\b'
+
+scan_public_physical_shard_test_surface() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$physical_shard_public_test_surface_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+public_physical_shard_test_surface_leaks=$(
+    scan_public_physical_shard_test_surface crates/storage/src
+)
+fail_with_matches \
+    "Raw physical-shard test methods and types must remain crate-private behind storage::test_support" \
+    "$public_physical_shard_test_surface_leaks"
+
+physical_shard_public_test_surface_fixture=$(
+    scan_public_physical_shard_test_surface \
+        scripts/fixtures/storage-boundary-physical-shard
+)
+expected_physical_shard_public_test_surface_fixture='scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:1:pub struct PayloadShardWriteTestHookGuard;
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:4:    pub fn test_install_before_placed_payload_shard_write_hook(&self) {}'
+physical_shard_public_test_surface_fixture_failure=""
+if [[ "$physical_shard_public_test_surface_fixture" != "$expected_physical_shard_public_test_surface_fixture" ]]; then
+    physical_shard_public_test_surface_fixture_failure=$physical_shard_public_test_surface_fixture
+    if [[ -z "$physical_shard_public_test_surface_fixture_failure" ]]; then
+        physical_shard_public_test_surface_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Physical-shard public-surface source-root scan must find only the nested unrelated-module fixture" \
+    "$physical_shard_public_test_surface_fixture_failure"
 
 shard_backfill_maintenance_leaks=$(
     {

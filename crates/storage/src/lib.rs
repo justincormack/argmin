@@ -187,6 +187,14 @@ pub mod test_support {
         _inner: super::node::DirectPutMetadataPublishTestHookGuard,
     }
 
+    /// Opaque guard for a deterministic action immediately before a payload
+    /// shard write. Physical shard identity remains storage-owned.
+    pub struct TestPayloadShardWriteActionGuard {
+        _inner: super::cluster::PayloadShardWriteTestHookGuard,
+    }
+
+    pub type TestPayloadShardWriteAction = Arc<dyn Fn() + Send + Sync>;
+
     /// Opaque guard holding the metadata serialization boundary for one
     /// bucket. The routed PG and storage lock remain storage-owned.
     pub struct TestBucketMetadataHoldGuard<'a> {
@@ -200,6 +208,11 @@ pub mod test_support {
     /// available to downstream test code.
     pub trait StorageClusterPayloadTestSupport {
         fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize;
+
+        fn test_install_before_payload_shard_write_action(
+            &self,
+            action: TestPayloadShardWriteAction,
+        ) -> TestPayloadShardWriteActionGuard;
 
         fn test_install_direct_put_post_publish_error(
             &self,
@@ -296,6 +309,21 @@ pub mod test_support {
     impl StorageClusterPayloadTestSupport for StorageCluster {
         fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
             StorageCluster::test_ec_scratch_allocation_count(self, shape)
+        }
+
+        fn test_install_before_payload_shard_write_action(
+            &self,
+            action: TestPayloadShardWriteAction,
+        ) -> TestPayloadShardWriteActionGuard {
+            TestPayloadShardWriteActionGuard {
+                _inner: StorageCluster::test_install_before_placed_payload_shard_write_hook(
+                    self,
+                    Arc::new(move |_, _| {
+                        action();
+                        Ok(())
+                    }),
+                ),
+            }
         }
 
         fn test_install_direct_put_post_publish_error(
@@ -916,6 +944,23 @@ pub mod test_support {
     /// entries, or timestamps. Storage owns the physical setup and projects
     /// only the worker state or semantic transition required by the caller.
     pub trait StorageClusterLifecycleTestSupport {
+        fn test_seed_missing_bucket_finalize_work(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError>;
+
+        fn test_seed_current_bucket_finalize_work(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketDeleteFinalizeRoot, BucketWriteDrainError>;
+
+        fn test_duplicate_bucket_finalize_work(&self, root: &TestBucketDeleteFinalizeRoot);
+
+        fn test_finalize_deleting_bucket_metadata_if_present(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError>;
+
         fn test_hold_bucket_metadata(
             &self,
             bucket: &BucketName,
@@ -1018,6 +1063,37 @@ pub mod test_support {
     }
 
     impl StorageClusterLifecycleTestSupport for StorageCluster {
+        fn test_seed_missing_bucket_finalize_work(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError> {
+            StorageCluster::test_enqueue_missing_bucket_delete_finalize(self, bucket)
+        }
+
+        fn test_seed_current_bucket_finalize_work(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketDeleteFinalizeRoot, BucketWriteDrainError> {
+            StorageCluster::test_enqueue_current_bucket_delete_finalize(self, bucket)
+        }
+
+        fn test_duplicate_bucket_finalize_work(&self, root: &TestBucketDeleteFinalizeRoot) {
+            StorageCluster::test_reenqueue_bucket_delete_finalize(self, root);
+        }
+
+        fn test_finalize_deleting_bucket_metadata_if_present(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<(), BucketWriteDrainError> {
+            match StorageCluster::test_delete_bucket_metadata(self, bucket) {
+                Ok(())
+                | Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { .. })) => {
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        }
+
         fn test_hold_bucket_metadata(
             &self,
             bucket: &BucketName,
@@ -2379,16 +2455,19 @@ pub mod test_support {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(Clone, PartialEq, Eq)]
     pub struct TestBucketDeleteFinalizeRoot {
         bucket: BucketName,
         bucket_incarnation_generation: u64,
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    impl TestBucketDeleteFinalizeRoot {
-        pub fn bucket(&self) -> &BucketName {
-            &self.bucket
+    impl fmt::Debug for TestBucketDeleteFinalizeRoot {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("TestBucketDeleteFinalizeRoot")
+                .field("subject", &"[redacted]")
+                .finish()
         }
     }
 

@@ -1222,7 +1222,7 @@ pub struct PayloadShardReadTestHookGuard {
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
-pub struct PayloadShardWriteTestHookGuard {
+pub(crate) struct PayloadShardWriteTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -12088,7 +12088,7 @@ impl StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    pub fn test_install_before_placed_payload_shard_write_hook(
+    pub(crate) fn test_install_before_placed_payload_shard_write_hook(
         &self,
         hook: PayloadShardWriteTestHook,
     ) -> PayloadShardWriteTestHookGuard {

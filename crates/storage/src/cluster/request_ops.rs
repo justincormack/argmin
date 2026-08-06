@@ -7713,14 +7713,6 @@ impl super::StorageCluster {
         })
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_try_finalize_bucket_delete_root(
-        &self,
-        root: &crate::TestBucketDeleteFinalizeRoot,
-    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        self.try_finalize_bucket_delete_root(&root.into())
-    }
-
     pub(crate) fn try_finalize_bucket_delete_root(
         &self,
         root: &BucketDeleteFinalizeRoot,
@@ -12534,7 +12526,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_reenqueue_bucket_delete_finalize(
+    pub(crate) fn test_reenqueue_bucket_delete_finalize(
         &self,
         root: &crate::TestBucketDeleteFinalizeRoot,
     ) {
@@ -12542,7 +12534,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_enqueue_current_bucket_delete_finalize(
+    pub(crate) fn test_enqueue_current_bucket_delete_finalize(
         &self,
         bucket: &BucketName,
     ) -> Result<crate::TestBucketDeleteFinalizeRoot, BucketWriteDrainError> {
@@ -12558,7 +12550,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_enqueue_missing_bucket_delete_finalize(
+    pub(crate) fn test_enqueue_missing_bucket_delete_finalize(
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
@@ -18251,8 +18243,8 @@ impl super::StorageCluster {
             .test_age_noncurrent_live_object(bucket, key, version_id, became_noncurrent_at)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_create_and_enqueue_deleting_bucket_finalize(
+    #[cfg(test)]
+    pub(crate) fn test_create_and_enqueue_deleting_bucket_finalize(
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
@@ -18280,7 +18272,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_delete_bucket_metadata(
+    pub(crate) fn test_delete_bucket_metadata(
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {

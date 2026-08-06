@@ -1623,14 +1623,12 @@ fn copy_object_heartbeats_destination_stream_reservation_before_finalize() {
         },
     ));
     let write_clock = Arc::clone(&clock);
-    let _write_hook = storage_cluster.test_install_before_placed_payload_shard_write_hook(
-        Arc::new(move |_, _| {
+    let _write_hook =
+        storage_cluster.test_install_before_payload_shard_write_action(Arc::new(move || {
             // Move the clock during destination shard writes. Lease maintenance
             // inside the write loop must renew before the next shard.
             write_clock.set(30_000);
-            Ok(())
-        }),
-    );
+        }));
     let append_clock = Arc::clone(&clock);
     let _append_hook =
         storage_cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
@@ -5878,7 +5876,7 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let bucket = trusted_bucket_name("reclaim-refresh-after-dequeue");
     initial
-        .test_enqueue_missing_bucket_delete_finalize(&bucket)
+        .test_seed_missing_bucket_finalize_work(&bucket)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
@@ -5930,7 +5928,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
     initial.test_begin_current_bucket_delete(&bucket).unwrap();
     let replacement = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
     let root = initial
-        .test_enqueue_current_bucket_delete_finalize(&bucket)
+        .test_seed_current_bucket_finalize_work(&bucket)
         .unwrap();
 
     assert_ne!(
@@ -5951,7 +5949,7 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
                 runtime_handle_for_hook
                     .install(Arc::clone(&replacement_for_hook))
                     .unwrap();
-                replacement_for_hook.test_reenqueue_bucket_delete_finalize(&duplicate_root);
+                replacement_for_hook.test_duplicate_bucket_finalize_work(&duplicate_root);
             }
         })),
         ..ReclamationTestHooks::default()
@@ -6801,7 +6799,7 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
     thread::sleep(Duration::from_millis(350));
 
     initial.test_begin_current_bucket_delete(&bucket).unwrap();
-    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&initial, &bucket);
+    finalize_deleting_bucket_metadata_for_test(&initial, &bucket);
     direct_coord
         .create_bucket_for_owner("new-owner", bucket.as_str(), false)
         .unwrap();
@@ -9955,17 +9953,13 @@ fn install_object_command_log_conflict_hook(
     storage_cluster.test_install_object_metadata_command_log_conflict(bucket, key, kind)
 }
 
-fn delete_bucket_metadata_or_accept_reclaim_worker_finalize(
+fn finalize_deleting_bucket_metadata_for_test(
     storage_cluster: &StorageCluster,
     bucket: &BucketName,
 ) {
-    match storage_cluster.test_delete_bucket_metadata(bucket) {
-        Ok(()) => {}
-        Err(storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotFound {
-            ..
-        })) => {}
-        Err(err) => panic!("failed to delete test bucket metadata: {err:?}"),
-    }
+    storage_cluster
+        .test_finalize_deleting_bucket_metadata_if_present(bucket)
+        .unwrap_or_else(|error| panic!("failed to finalize test bucket metadata: {error:?}"));
 }
 
 #[test]
@@ -15004,7 +14998,7 @@ fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
         ))
         .expect("idempotent retry should authorize against the deleting bucket incarnation");
 
-    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
+    finalize_deleting_bucket_metadata_for_test(&storage_cluster, &bucket_name);
     coord
         .create_bucket_for_owner("victim-owner", bucket, false)
         .unwrap();
@@ -16769,7 +16763,7 @@ fn head_object_rejects_old_incarnation_fast_path_after_delete_recreate() {
     storage_cluster
         .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
-    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
+    finalize_deleting_bucket_metadata_for_test(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
     storage_cluster
         .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
@@ -17096,7 +17090,7 @@ fn bucket_fast_path_watcher_observes_direct_storage_delete_recreate() {
     storage_cluster
         .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
-    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
+    finalize_deleting_bucket_metadata_for_test(&storage_cluster, &bucket_name);
     let recreated_owner = CanonicalUserId::from_principal("777788889999");
     storage_cluster
         .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
@@ -17208,7 +17202,7 @@ fn bucket_fast_path_watcher_recovers_after_observing_missing_bucket_before_recre
     storage_cluster
         .test_begin_current_bucket_delete(&bucket_name)
         .unwrap();
-    delete_bucket_metadata_or_accept_reclaim_worker_finalize(&storage_cluster, &bucket_name);
+    finalize_deleting_bucket_metadata_for_test(&storage_cluster, &bucket_name);
 
     let start = std::time::Instant::now();
     while reader.get_bucket_fast_path(&bucket_name).is_some() {

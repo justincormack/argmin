@@ -6203,7 +6203,15 @@ Remaining implementation order after this audit:
    underlying guard types, callback aliases, hook registries, and inherent
    hook/lock methods are crate-private or module-private, and a crate-wide
    source-root check with a nested-module fixture rejects their public or
-   cross-crate reintroduction; and
+   cross-crate reintroduction. The CopyObject lease-maintenance regression
+   likewise installs only an opaque pre-payload-write action; shard locations,
+   keys, and injected storage errors remain owner-private. Bucket-finalization
+   tests likewise create
+   missing/current work, duplicate an opaque storage-issued root, or finalize
+   deleting metadata only through lifecycle test-support semantics. The root's
+   durable incarnation is debug-redacted, the raw queue/finalization methods
+   are crate-private, and a matching crate-wide fixture check rejects their
+   public or cross-crate reintroduction; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.
