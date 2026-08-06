@@ -4,6 +4,7 @@ members = [
     "crates/observability",
     "crates/ec",
     "crates/checksum",
+    "crates/tls-provider",
     "crates/s3-types",
     "crates/placement",
     "crates/storage",

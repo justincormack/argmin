@@ -36,8 +36,8 @@ http-body-1x = { package = "http-body", version = "1" }
 
 # Async runtime (required by AWS SDK)
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

@@ -5,6 +5,7 @@ edition = "2021"
 
 [features]
 deep-tracing = ["observability/deep-tracing"]
+openssl-tls = ["tls-provider/openssl"]
 test-hooks = []
 
 [dependencies]
@@ -18,9 +19,10 @@ placement = { path = "../placement" }
 s3-types = { path = "../s3-types" }
 rapidhash = "4.4"
 ring = "0.17"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rusqlite = { version = "0.33", features = ["bundled", "functions", "trace"] }
 thiserror = "2"
+tls-provider = { path = "../tls-provider" }
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 
 [dev-dependencies]

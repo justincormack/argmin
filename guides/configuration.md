@@ -46,6 +46,21 @@ not required by storage-only or control-plane-only processes.
 both be unset. They configure the public S3 listener only. Internal TCP TLS is
 configured through the cluster manifest.
 
+### TLS cryptography provider
+
+Ring is the default cryptography provider for every rustls connection,
+including the public listener and internal TLS/TCP connections. A build can
+also use the system OpenSSL library:
+
+```bash
+cargo build --release -p argmin-s3 --features openssl-tls
+./target/release/argmin-s3
+```
+
+The `openssl-tls` feature selects OpenSSL for the whole build. Builds without
+it select ring. There is no runtime provider setting. This choice does not
+change the SigV4 cryptography implementation.
+
 Generate a wrapping or validator key with:
 
 ```bash

@@ -3,9 +3,14 @@ name = "auth"
 version = "0.1.0"
 edition = "2021"
 
+[[example]]
+name = "crypto_bench"
+required-features = ["crypto-bench"]
+
 [features]
-crypto-bench = ["checksum/bench-select"]
+crypto-bench = ["checksum/bench-select", "dep:tls-provider"]
 deep-tracing = ["observability/deep-tracing"]
+openssl-tls = ["crypto-bench", "tls-provider/openssl"]
 
 [dependencies]
 base64 = "0.22"
@@ -16,10 +21,11 @@ serde_json = "1"
 s3-types = { path = "../s3-types" }
 subtle = "2"
 thiserror = "2"
+tls-provider = { path = "../tls-provider", optional = true }
 
 [dev-dependencies]
 aws-credential-types = "1"
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 proptest = "1"
-rustls = { version = "0.23", features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

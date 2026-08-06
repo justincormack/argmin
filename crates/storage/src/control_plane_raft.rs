@@ -1614,13 +1614,12 @@ impl ControlPlaneRaftPeerClientEndpoint {
         let server_name = server_name.into();
         ServerName::try_from(server_name.clone())
             .map_err(|_| ControlPlaneRaftPeerClientEndpointError::InvalidServerName)?;
-        let mut tls_client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| ControlPlaneRaftPeerClientEndpointError::TlsProfileUnavailable)?
-        .with_root_certificates(trust_roots)
-        .with_no_client_auth();
+        let mut tls_client_config =
+            rustls::ClientConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|_| ControlPlaneRaftPeerClientEndpointError::TlsProfileUnavailable)?
+                .with_root_certificates(trust_roots)
+                .with_no_client_auth();
         tls_client_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
         Ok(Self {
             advertised_endpoint,
@@ -11022,13 +11021,12 @@ impl ControlPlaneRaftPeerServerListener {
             .set_nonblocking(false)
             .map_err(|_| ControlPlaneRaftPeerServerConfigError::ListenerConfigurationUnavailable)?;
         let resolver = ControlPlaneRaftPeerTlsCertificateResolver { certified_key };
-        let mut tls_server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .map_err(|_| ControlPlaneRaftPeerServerConfigError::TlsProfileUnavailable)?
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
+        let mut tls_server_config =
+            rustls::ServerConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .map_err(|_| ControlPlaneRaftPeerServerConfigError::TlsProfileUnavailable)?
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(resolver));
         tls_server_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
         Ok(Self {
             endpoint_id,

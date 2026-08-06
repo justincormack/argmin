@@ -694,7 +694,7 @@ impl ValidatedStaticClusterManifest {
             )
             .collect::<BTreeSet<_>>();
 
-        let provider = rustls::crypto::ring::default_provider();
+        let provider = tls_provider::configured_provider();
         let mut tls_identities = BTreeMap::new();
         for identity in self
             .manifest
@@ -798,7 +798,7 @@ impl ValidatedStaticClusterManifest {
                 .expect("selected-process TLS trust bundle was resolved");
             let verifier = WebPkiServerVerifier::builder_with_provider(
                 Arc::clone(&trust_bundle.roots),
-                Arc::new(provider.clone()),
+                Arc::clone(&provider),
             )
             .build()
             .map_err(|_| {

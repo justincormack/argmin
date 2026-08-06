@@ -271,18 +271,23 @@ impl StorageRpcClientEndpoint {
 pub(crate) fn storage_rpc_tls_client_config(
     trust_roots: Arc<rustls::RootCertStore>,
 ) -> io::Result<Arc<rustls::ClientConfig>> {
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "failed to select the storage RPC TLS protocol profile",
-        )
-    })?
-    .with_root_certificates((*trust_roots).clone())
-    .with_no_client_auth();
+    storage_rpc_tls_client_config_with_provider(trust_roots, tls_provider::configured_provider())
+}
+
+fn storage_rpc_tls_client_config_with_provider(
+    trust_roots: Arc<rustls::RootCertStore>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> io::Result<Arc<rustls::ClientConfig>> {
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to select the storage RPC TLS protocol profile",
+            )
+        })?
+        .with_root_certificates((*trust_roots).clone())
+        .with_no_client_auth();
     config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
     Ok(Arc::new(config))
 }
@@ -311,19 +316,24 @@ impl ResolvesServerCert for StorageRpcSingleCertificateResolver {
 pub(crate) fn storage_rpc_tls_server_config(
     certified_key: Arc<CertifiedKey>,
 ) -> io::Result<Arc<rustls::ServerConfig>> {
+    storage_rpc_tls_server_config_with_provider(certified_key, tls_provider::configured_provider())
+}
+
+fn storage_rpc_tls_server_config_with_provider(
+    certified_key: Arc<CertifiedKey>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> io::Result<Arc<rustls::ServerConfig>> {
     let resolver = StorageRpcSingleCertificateResolver { certified_key };
-    let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "failed to select the storage RPC TLS protocol profile",
-        )
-    })?
-    .with_no_client_auth()
-    .with_cert_resolver(Arc::new(resolver));
+    let mut config = rustls::ServerConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to select the storage RPC TLS protocol profile",
+            )
+        })?
+        .with_no_client_auth()
+        .with_cert_resolver(Arc::new(resolver));
     config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
     Ok(Arc::new(config))
 }
@@ -696,13 +706,14 @@ mod tests {
     }
 
     fn test_certified_key() -> Arc<CertifiedKey> {
+        test_certified_key_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+    }
+
+    fn test_certified_key_with_provider(
+        provider: Arc<rustls::crypto::CryptoProvider>,
+    ) -> Arc<CertifiedKey> {
         Arc::new(
-            CertifiedKey::from_der(
-                test_certificates(),
-                test_private_key(),
-                &rustls::crypto::ring::default_provider(),
-            )
-            .unwrap(),
+            CertifiedKey::from_der(test_certificates(), test_private_key(), &provider).unwrap(),
         )
     }
 
@@ -848,6 +859,66 @@ mod tests {
 
         assert_ne!(client_error.kind(), io::ErrorKind::TimedOut);
         assert_ne!(server_error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[cfg(feature = "openssl-tls")]
+    fn assert_tls_provider_interoperability(
+        client_provider: Arc<rustls::crypto::CryptoProvider>,
+        server_provider: Arc<rustls::crypto::CryptoProvider>,
+    ) {
+        let server_config = storage_rpc_tls_server_config_with_provider(
+            test_certified_key_with_provider(Arc::clone(&server_provider)),
+            server_provider,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = accepted_tls_tcp_stream(
+                stream,
+                server_config,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap();
+            let mut request = [0_u8; 4];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"ping");
+            stream.write_all(b"pong").unwrap();
+            stream.flush().unwrap();
+        });
+        let tls_client_config =
+            storage_rpc_tls_client_config_with_provider(test_trust_roots(), client_provider)
+                .unwrap();
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            tls_client_config,
+        )
+        .unwrap();
+        let mut stream = endpoint
+            .connect(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        stream.write_all(b"ping").unwrap();
+        stream.flush().unwrap();
+        let mut response = [0_u8; 4];
+        stream.read_exact(&mut response).unwrap();
+        assert_eq!(&response, b"pong");
+        server.join().unwrap();
+    }
+
+    #[cfg(feature = "openssl-tls")]
+    #[test]
+    fn openssl_and_ring_tls_providers_interoperate_in_both_directions() {
+        assert_tls_provider_interoperability(
+            tls_provider::configured_provider(),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        );
+        assert_tls_provider_interoperability(
+            Arc::new(rustls::crypto::ring::default_provider()),
+            tls_provider::configured_provider(),
+        );
     }
 
     #[test]

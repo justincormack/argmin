@@ -16,7 +16,17 @@ echo "size_mib=$SIZE_MIB warmup_iters=$WARMUP_ITERS sample_iters=$SAMPLE_ITERS s
 echo "sigv4_warmup_iters=$SIGV4_WARMUP_ITERS sigv4_sample_iters=$SIGV4_SAMPLE_ITERS"
 echo "sha256_backend_override=${ARGMIN_SHA256_BENCH_BACKEND:-auto}"
 
-cargo run --offline -p auth --example crypto_bench --release --features crypto-bench -- \
+FEATURES="crypto-bench"
+if [[ "${1:-}" == "--openssl" ]]; then
+  FEATURES="crypto-bench,openssl-tls"
+  shift
+fi
+if [[ "$#" -ne 0 ]]; then
+  echo "usage: $0 [--openssl]" >&2
+  exit 2
+fi
+
+cargo run --offline -p auth --example crypto_bench --release --features "$FEATURES" -- \
   --size-mib "$SIZE_MIB" \
   --warmup-iters "$WARMUP_ITERS" \
   --sample-iters "$SAMPLE_ITERS" \

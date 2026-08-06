@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [features]
 local-debug-endpoints = ["server-http/local-debug-endpoints"]
+openssl-tls = ["storage/openssl-tls", "tls-provider/openssl"]
 test-unauthenticated-internal-rpc = []
 deep-tracing = [
     "auth/deep-tracing",
@@ -27,9 +28,10 @@ observability = { path = "../observability" }
 server-core = { path = "../server-core", default-features = false }
 server-http = { path = "../server-http", default-features = false }
 storage = { path = "../storage", default-features = false }
+tls-provider = { path = "../tls-provider" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 x509-cert = { version = "0.3", default-features = false }

@@ -155,10 +155,13 @@ fn build_tls_acceptor(config: &ServerConfig) -> Result<Option<TlsAcceptor>, Stri
 
     let certs = load_certs(cert_path)?;
     let key = load_private_key(key_path)?;
-    let mut server_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("failed to build TLS config: {e}"))?;
+    let mut server_config =
+        rustls::ServerConfig::builder_with_provider(tls_provider::configured_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("failed to select TLS protocol versions: {e}"))?
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| format!("failed to build TLS config: {e}"))?;
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
 }
@@ -280,7 +283,13 @@ fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    tls_provider::install_default().unwrap_or_else(|error| {
+        eprintln!(
+            "failed to initialize {} TLS provider: {error}",
+            tls_provider::provider_name()
+        );
+        std::process::exit(1);
+    });
     if let Some(exit_code) = maybe_run_control_plane_admin_command() {
         std::process::exit(exit_code);
     }
@@ -3753,9 +3762,10 @@ async fn run_frontend_server(
     };
 
     process_info!(
-        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight effective {} in-flight, storage RPC admission {} bulk wait {} ms control wait {} ms, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
+        "argmin-s3 listening on {}://{} (TLS provider {}, EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight effective {} in-flight, storage RPC admission {} bulk wait {} ms control wait {} ms, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
         scheme,
         config.listen_addr,
+        tls_provider::provider_name(),
         config.ec_k,
         config.ec_m,
         config.pg_count,

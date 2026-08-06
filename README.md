@@ -25,8 +25,9 @@ This builds the production server binary without pulling in the full workspace
 test harness dependency set. The binary is at `target/release/argmin-s3`.
 
 Do not use `--all-features` for production artifacts. The normal production
-release build uses the default feature set. Optional features are for testing
-and debug only.
+release build uses the default feature set. There is a single production feature
+`--features openssl-tls` to dynamically link against OpenSSL as a TLS library, rather
+than the default `ring`.
 
 ## Run
 

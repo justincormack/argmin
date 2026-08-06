@@ -55,10 +55,11 @@ struct SignedRequest {
 
 fn main() -> Result<(), String> {
     let config = parse_args()?;
+    let tls_crypto_provider = tls_provider::configured_provider();
     let data = benchmark_data(config.block_size);
     let (provider, request) = signed_request()?;
 
-    println!("tls_crypto_provider=ring");
+    println!("tls_crypto_provider={}", tls_provider::provider_name());
     println!("hmac_provider=ring");
     println!(
         "sha256_backend_override={}",
@@ -108,7 +109,7 @@ fn main() -> Result<(), String> {
     );
     let request_median = print_rate_samples(&request_samples, config.sigv4_sample_iters);
 
-    let (mut seal_client, seal_server) = connected_tls_pair()?;
+    let (mut seal_client, seal_server) = connected_tls_pair(Arc::clone(&tls_crypto_provider))?;
     print_tls_connection(&seal_client, &seal_server)?;
     println!();
     println!("[peer tls13 seal]");
@@ -121,7 +122,7 @@ fn main() -> Result<(), String> {
     )?;
     let seal_median = print_bulk_samples(&seal_samples, config.block_size, config.sample_iters);
 
-    let (mut open_client, mut open_server) = connected_tls_pair()?;
+    let (mut open_client, mut open_server) = connected_tls_pair(tls_crypto_provider)?;
     println!();
     println!("[peer tls13 open]");
     let mut encrypted = Vec::with_capacity(config.block_size + config.block_size / 100);
@@ -295,7 +296,9 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
-fn connected_tls_pair() -> Result<(ClientConnection, ServerConnection), String> {
+fn connected_tls_pair(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+) -> Result<(ClientConnection, ServerConnection), String> {
     let certificates = CertificateDer::pem_slice_iter(include_bytes!(
         "../../s3-tests/testdata/localhost-cert.pem"
     ))
@@ -312,7 +315,6 @@ fn connected_tls_pair() -> Result<(ClientConnection, ServerConnection), String> 
     roots.add(ca).map_err(|error| error.to_string())?;
 
     // Keep this profile aligned with storage_rpc_tls_{client,server}_config.
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut client_config = ClientConfig::builder_with_provider(Arc::clone(&provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|error| error.to_string())?
