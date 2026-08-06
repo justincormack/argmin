@@ -298,7 +298,30 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::{EcShape, NodeId, RouteMapValidity};
+    use crate::{
+        AclGrants, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
+        BucketVersioningState, CanonicalUserId, CreateBucketConfig, EcShape, NodeId,
+        RouteMapValidity,
+    };
+
+    fn create_test_bucket(cluster: &StorageCluster, bucket: &BucketName) {
+        let owner = CanonicalUserId::from_principal("owner");
+        cluster
+            .create_bucket_with_config_and_load_info(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: "owner",
+                owner_canonical_id: &owner,
+                acl_grants: &AclGrants::default(),
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::ObjectWriter,
+                },
+            })
+            .unwrap();
+    }
 
     fn dynamic_test_cluster(root: &std::path::Path) -> Arc<StorageCluster> {
         StorageCluster::open_static_local_nodes(
@@ -349,6 +372,37 @@ mod tests {
         cluster
             .test_clone_with_pg_routes(next_epoch, routes, historical_routes)
             .unwrap()
+    }
+
+    #[test]
+    fn process_local_route_authority_clone_preserves_store_and_retained_route_history() {
+        let tmp = test_util::tempdir();
+        let initial = dynamic_test_cluster(tmp.path());
+        let initial_epoch = initial.cluster_epoch();
+        let retained_pg = initial.local_pg_routes().next().unwrap().pg_id();
+        let bucket = BucketName::try_from("process-local-route-clone").unwrap();
+        create_test_bucket(&initial, &bucket);
+        let current = next_epoch_active_clone(&initial);
+        let current_epoch = current.cluster_epoch();
+        let clone = crate::test_support::StorageClusterRouteMapTestSupport::test_clone_with_dynamic_route_map_validity(
+                current.as_ref(),
+                RouteMapValidity::until_ms(u64::MAX - 1).unwrap(),
+            )
+            .unwrap();
+        drop(initial);
+
+        assert_eq!(clone.cluster_epoch(), current_epoch);
+        assert_eq!(
+            clone.process_local_registry_key(),
+            current.process_local_registry_key(),
+            "the clone must share the source runtime instead of reopening its stores"
+        );
+        assert!(clone.head_bucket_info(&bucket).is_ok());
+        let retained = clone
+            .reconstructed_pg_route_at_epoch(retained_pg, initial_epoch)
+            .expect("process-local clone must retain the prior epoch route");
+        assert_eq!(retained.cluster_epoch(), initial_epoch);
+        assert_eq!(retained.pg_id(), retained_pg);
     }
 
     #[test]

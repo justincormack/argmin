@@ -6073,7 +6073,15 @@ Final Phase 5 audit (2026-08-04):
   committed-write/crossed-cluster canary pins attempt ordering, cluster
   binding, and proves the absence predicate is not vacuous. The raw physical
   write hook and file probe are crate-private and the boundary checker rejects
-  their cross-crate or public reintroduction.
+  their cross-crate or public reintroduction; and
+- request-deadline regressions no longer reconstruct local node paths, PG
+  lists, EC shape, or route snapshots in `server-core` merely to open a second
+  runtime over the same stores. They use a storage-owned process-local
+  route-authority clone which shares the exact installed runtime, topology, and
+  retained route history while binding the requested test validity. This makes
+  duplicate-runtime SQLite access and foreign-root substitution structurally
+  unavailable. An owner-local store/registry/retained-epoch canary pins those
+  provenance guarantees.
 
 The audited cross-crate support families are:
 
@@ -6122,7 +6130,9 @@ Remaining implementation order after this audit:
    lifecycle/payload traits. Committed-segment unknown-route and checksum
    faults are bound to opaque payload snapshots behind the payload trait.
    Staged shard-write effect tests use opaque attempt evidence and ordinal-only
-   failure hooks; and
+   failure hooks. Same-store deadline fixtures use a storage-owned
+   process-local route-authority clone rather than exporting local store paths,
+   PG IDs, EC shape, or route snapshots, or opening a duplicate runtime; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

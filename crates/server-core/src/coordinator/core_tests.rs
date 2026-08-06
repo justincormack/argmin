@@ -200,9 +200,8 @@ fn buffered_metadata_operations_recheck_request_admission_deadline_before_storag
     .unwrap();
 
     let (cluster, coord, admission) = storage::clock::with_time_override(1_000, || {
-        let cluster = same_store_cluster_with_route_map_validity(
+        let cluster = process_local_cluster_with_route_map_validity(
             &initial,
-            tmp.path(),
             RouteMapValidity::until_ms(5_000).unwrap(),
         );
         let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -984,13 +983,12 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
     .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1056,13 +1054,12 @@ fn direct_put_expires_at_generation_reservation_effect_boundary() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1129,13 +1126,12 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1210,13 +1206,12 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1289,13 +1284,12 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1388,13 +1382,12 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1496,13 +1489,12 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
     .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1624,13 +1616,12 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1753,13 +1744,12 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1877,13 +1867,12 @@ fn stream_put_finalization_expires_inside_command_build() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -1973,13 +1962,12 @@ fn multipart_creation_expires_at_pending_install_effect_boundary() {
         .unwrap();
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -2069,13 +2057,12 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
         .upload_id;
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -2138,13 +2125,12 @@ fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
         create_upload_with_parts(&initial_coord, "bucket", "late-completion", &[(1, b"part")]);
 
     let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let same_store_inputs = capture_same_store_cluster_inputs(&initial, tmp.path());
-    drop(initial_coord);
-    drop(initial);
-    let cluster = open_same_store_cluster_with_route_map_validity(
-        same_store_inputs,
+    let cluster = process_local_cluster_with_route_map_validity(
+        &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
+    drop(initial_coord);
+    drop(initial);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
@@ -3218,9 +3204,8 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
     .unwrap();
 
     let time = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let cluster = same_store_cluster_with_route_map_validity(
+    let cluster = process_local_cluster_with_route_map_validity(
         &initial,
-        tmp.path(),
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
@@ -6271,9 +6256,8 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
         .test_capture_bucket_delete_begin_subject(&bucket)
         .unwrap();
 
-    let expired = same_store_cluster_with_route_map_validity(
+    let expired = process_local_cluster_with_route_map_validity(
         &initial,
-        tmp.path(),
         RouteMapValidity::until_ms(1).unwrap(),
     );
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
@@ -6711,9 +6695,8 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
         .test_capture_bucket_delete_begin_subject(&bucket)
         .unwrap();
 
-    let expired = same_store_cluster_with_route_map_validity(
+    let expired = process_local_cluster_with_route_map_validity(
         &initial,
-        tmp.path(),
         RouteMapValidity::until_ms(1).unwrap(),
     );
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
@@ -7278,76 +7261,12 @@ fn install_same_store_next_epoch_runtime_map_with_primary(
     handle.install(candidate).unwrap();
 }
 
-fn same_store_cluster_with_route_map_validity(
+fn process_local_cluster_with_route_map_validity(
     initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
     route_map_validity: RouteMapValidity,
 ) -> Arc<StorageCluster> {
-    open_same_store_cluster_with_route_map_validity(
-        capture_same_store_cluster_inputs(initial, node_root),
-        route_map_validity,
-    )
-}
-
-struct SameStoreClusterInputs {
-    configs: Vec<LocalNodeStoreConfig>,
-    routes: Vec<LocalPgRoute>,
-    pg_ids: Vec<u32>,
-    ec_shape: storage::EcShape,
-    cluster_epoch: ClusterEpoch,
-}
-
-fn capture_same_store_cluster_inputs(
-    initial: &StorageCluster,
-    node_root: &std::path::Path,
-) -> SameStoreClusterInputs {
-    let node_count = u32::from(initial.default_payload_ec_shape().k)
-        + u32::from(initial.default_payload_ec_shape().m);
-    let configs = (0..node_count)
-        .map(|node_id| {
-            LocalNodeStoreConfig::new(
-                NodeId::new(node_id),
-                node_root.join(format!("node-{node_id:04}")),
-            )
-        })
-        .collect::<Vec<_>>();
-    let routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            );
-            LocalPgRoute::from(&route)
-        })
-        .collect::<Vec<_>>();
-    SameStoreClusterInputs {
-        configs,
-        routes,
-        pg_ids: initial.test_pg_ids().to_vec(),
-        ec_shape: initial.default_payload_ec_shape(),
-        cluster_epoch: initial.cluster_epoch(),
-    }
-}
-
-fn open_same_store_cluster_with_route_map_validity(
-    inputs: SameStoreClusterInputs,
-    route_map_validity: RouteMapValidity,
-) -> Arc<StorageCluster> {
-    let mut local_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        inputs.configs,
-        &inputs.pg_ids,
-        inputs.ec_shape,
-        inputs.cluster_epoch,
-        inputs.routes,
-    )
-    .unwrap();
-    local_map.test_set_route_map_validity(route_map_validity);
-    StorageCluster::test_from_local_map_with_epoch(Arc::new(local_map), inputs.cluster_epoch)
+    initial
+        .test_clone_with_dynamic_route_map_validity(route_map_validity)
         .unwrap()
 }
 
@@ -13519,9 +13438,8 @@ fn bucket_delete_finalizer_expired_route_map_maps_to_slow_down() {
     delete_bucket_test(&coord, "bucket").unwrap();
 
     let bucket = trusted_bucket_name("bucket");
-    let expired_cluster = same_store_cluster_with_route_map_validity(
+    let expired_cluster = process_local_cluster_with_route_map_validity(
         &storage_cluster,
-        tmp.path(),
         RouteMapValidity::until_ms(1).unwrap(),
     );
     let expired_coord =
@@ -13553,9 +13471,8 @@ fn bucket_delete_finalizer_route_map_expiry_after_claim_releases_claim() {
 
     let bucket_name = trusted_bucket_name(bucket);
     let valid_until = storage::clock::wall_time_millis().saturating_add(250);
-    let expiring_cluster = same_store_cluster_with_route_map_validity(
+    let expiring_cluster = process_local_cluster_with_route_map_validity(
         &storage_cluster,
-        tmp.path(),
         RouteMapValidity::until_ms(valid_until).unwrap(),
     );
     let expiring_coord =
@@ -15443,9 +15360,8 @@ fn delete_bucket_expired_route_map_maps_to_slow_down() {
         .create_bucket_for_owner("default-owner", bucket, false)
         .unwrap();
 
-    let expired_cluster = same_store_cluster_with_route_map_validity(
+    let expired_cluster = process_local_cluster_with_route_map_validity(
         &storage_cluster,
-        tmp.path(),
         RouteMapValidity::until_ms(1).unwrap(),
     );
     let expired_coord = setup_direct_coordinator_with_storage_cluster(expired_cluster);
@@ -15495,9 +15411,8 @@ fn delete_bucket_route_map_expiry_after_drain_maps_to_slow_down() {
         .unwrap();
 
     let valid_until = storage::clock::wall_time_millis().saturating_add(250);
-    let expiring_cluster = same_store_cluster_with_route_map_validity(
+    let expiring_cluster = process_local_cluster_with_route_map_validity(
         &storage_cluster,
-        tmp.path(),
         RouteMapValidity::until_ms(valid_until).unwrap(),
     );
     let expiring_coord =
@@ -18987,9 +18902,8 @@ fn retained_read_skips_repair_record_after_admitted_route_expiry_without_publica
     .unwrap();
 
     let time = storage::clock::test_time_override_guard(1_000);
-    let cluster = same_store_cluster_with_route_map_validity(
+    let cluster = process_local_cluster_with_route_map_validity(
         &initial,
-        tmp.path(),
         RouteMapValidity::until_ms(5_000).unwrap(),
     );
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
