@@ -136,6 +136,8 @@ fn extend_scalar(crc: u32, data: &[u8]) -> u32 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PureRustBackend {
     Scalar,
+    #[cfg(target_arch = "riscv64")]
+    ZbcRiscv64,
     #[cfg(target_arch = "aarch64")]
     CrcPmullAarch64,
     #[cfg(target_arch = "x86_64")]
@@ -169,6 +171,13 @@ fn pure_rust_backend() -> PureRustBackend {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
+    {
+        if has_zbc_riscv64() {
+            return PureRustBackend::ZbcRiscv64;
+        }
+    }
+
     PureRustBackend::Scalar
 }
 
@@ -184,6 +193,8 @@ fn bench_override_backend() -> Option<PureRustBackend> {
 
         match override_name.as_deref() {
             Some("scalar") => Some(PureRustBackend::Scalar),
+            #[cfg(target_arch = "riscv64")]
+            Some("zbc") if has_zbc_riscv64() => Some(PureRustBackend::ZbcRiscv64),
             #[cfg(target_arch = "aarch64")]
             Some("3crc") if has_crc_pmull_aarch64() => Some(PureRustBackend::CrcPmullAarch64),
             #[cfg(target_arch = "x86_64")]
@@ -193,6 +204,12 @@ fn bench_override_backend() -> Option<PureRustBackend> {
             _ => None,
         }
     })
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+fn has_zbc_riscv64() -> bool {
+    std::arch::is_riscv_feature_detected!("zbc")
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -219,8 +236,24 @@ fn has_vpclmul_x86_64() -> bool {
 
 #[inline]
 fn extend(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "riscv64")]
+    if data.len() < 64 {
+        return extend_scalar(crc, data);
+    }
+
     match pure_rust_backend() {
         PureRustBackend::Scalar => extend_scalar(crc, data),
+        #[cfg(target_arch = "riscv64")]
+        PureRustBackend::ZbcRiscv64 => {
+            let alignment_mask = core::mem::align_of::<u64>() - 1;
+            let unaligned_len = data.as_ptr().addr().wrapping_neg() & alignment_mask;
+            if data.len() - unaligned_len < 64 {
+                extend_scalar(crc, data)
+            } else {
+                // SAFETY: backend selection verified Zbc support.
+                unsafe { extend_zbc_riscv64(crc, data) }
+            }
+        }
         #[cfg(target_arch = "aarch64")]
         // SAFETY: backend selection verified crc, neon, and aes support.
         PureRustBackend::CrcPmullAarch64 => unsafe { extend_crc_pmull_aarch64(crc, data) },
@@ -231,6 +264,37 @@ fn extend(crc: u32, data: &[u8]) -> u32 {
         // SAFETY: backend selection verified sse4.1 and pclmulqdq support.
         PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
     }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+/// Extends a CRC using scalar RISC-V carry-less multiplication.
+///
+/// # Safety
+///
+/// The current CPU must support Zbc.
+unsafe fn extend_zbc_riscv64(crc: u32, data: &[u8]) -> u32 {
+    if data.len() < 64 {
+        return extend_scalar(crc, data);
+    }
+
+    let alignment_mask = core::mem::align_of::<u64>() - 1;
+    // For power-of-two alignment, `-address & mask` is the distance to the next boundary.
+    let unaligned_len = data.as_ptr().addr().wrapping_neg() & alignment_mask;
+    if data.len() - unaligned_len < 64 {
+        return extend_scalar(crc, data);
+    }
+
+    let (unaligned, aligned) = data.split_at(unaligned_len);
+    let aligned_crc = extend_scalar(crc, unaligned);
+
+    let prefix_len = aligned.len() & !0x3f;
+    let (prefix, tail) = aligned.split_at(prefix_len);
+    // SAFETY: the caller guarantees Zbc support, and `prefix` is nonempty, u64-aligned, and a
+    // multiple of 64 bytes.
+    let prefix_state =
+        unsafe { crate::riscv64_zbc_crc32::update_ieee_blocks(!aligned_crc, prefix) };
+    extend_scalar(!prefix_state, tail)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -659,6 +723,8 @@ unsafe fn extend_crc_pmull_aarch64(crc: u32, data: &[u8]) -> u32 {
 pub fn backend_name() -> &'static str {
     match pure_rust_backend() {
         PureRustBackend::Scalar => "scalar",
+        #[cfg(target_arch = "riscv64")]
+        PureRustBackend::ZbcRiscv64 => "riscv64-zbc",
         #[cfg(target_arch = "aarch64")]
         PureRustBackend::CrcPmullAarch64 => "aarch64-3crc-fold",
         #[cfg(target_arch = "x86_64")]
@@ -798,7 +864,11 @@ mod tests {
 
     fn supported_backend_cases() -> Vec<BackendCase> {
         #[cfg_attr(
-            not(any(target_arch = "aarch64", target_arch = "x86_64")),
+            not(any(
+                target_arch = "aarch64",
+                target_arch = "riscv64",
+                target_arch = "x86_64"
+            )),
             allow(unused_mut)
         )]
         let mut cases = vec![BackendCase {
@@ -812,6 +882,16 @@ mod tests {
                 cases.push(BackendCase {
                     backend: PureRustBackend::CrcPmullAarch64,
                     name: "aarch64-3crc-fold",
+                });
+            }
+        }
+
+        #[cfg(target_arch = "riscv64")]
+        {
+            if has_zbc_riscv64() {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::ZbcRiscv64,
+                    name: "riscv64-zbc",
                 });
             }
         }
@@ -839,6 +919,9 @@ mod tests {
     fn checksum_with_backend(backend: PureRustBackend, data: &[u8]) -> u32 {
         match backend {
             PureRustBackend::Scalar => extend_scalar(0, data),
+            #[cfg(target_arch = "riscv64")]
+            // SAFETY: supported_backends adds this case only after feature detection succeeds.
+            PureRustBackend::ZbcRiscv64 => unsafe { extend_zbc_riscv64(0, data) },
             #[cfg(target_arch = "aarch64")]
             // SAFETY: supported_backends adds this case only after feature detection succeeds.
             PureRustBackend::CrcPmullAarch64 => unsafe { extend_crc_pmull_aarch64(0, data) },
@@ -860,6 +943,9 @@ mod tests {
         for chunk in data.chunks(chunk_size.max(1)) {
             crc = match backend {
                 PureRustBackend::Scalar => extend_scalar(crc, chunk),
+                #[cfg(target_arch = "riscv64")]
+                // SAFETY: supported_backends adds this case only after feature detection succeeds.
+                PureRustBackend::ZbcRiscv64 => unsafe { extend_zbc_riscv64(crc, chunk) },
                 #[cfg(target_arch = "aarch64")]
                 // SAFETY: supported_backends adds this case only after feature detection succeeds.
                 PureRustBackend::CrcPmullAarch64 => unsafe { extend_crc_pmull_aarch64(crc, chunk) },
@@ -1044,6 +1130,55 @@ mod tests {
             let right = combine(crc_a, combine(crc_b, crc_c, c.len() as u64), (b.len() + c.len()) as u64);
             prop_assert_eq!(left, right);
             prop_assert_eq!(left, checksum(&data));
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    proptest! {
+        #[test]
+        fn prop_zbc_matches_scalar_oracle(
+            data in proptest::collection::vec(any::<u8>(), 0..=4096),
+            leading_offset in 0usize..8,
+            mut splits in proptest::collection::vec(0usize..=4096, 0..=32),
+            initial_crc in any::<u32>(),
+        ) {
+            if !std::arch::is_riscv_feature_detected!("zbc") {
+                return Ok(());
+            }
+
+            let word_count = (leading_offset + data.len()).div_ceil(8).max(1);
+            let mut backing = vec![0u64; word_count];
+            // SAFETY: every u8 bit pattern is valid, the byte slice covers exactly the initialized
+            // u64 allocation, and it does not outlive or alias another access to `backing`.
+            let backing_bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    backing.as_mut_ptr().cast::<u8>(),
+                    backing.len() * core::mem::size_of::<u64>(),
+                )
+            };
+            let end = leading_offset + data.len();
+            backing_bytes[leading_offset..end].copy_from_slice(&data);
+            let input = &backing_bytes[leading_offset..end];
+
+            let expected = extend_scalar(initial_crc, input);
+            // SAFETY: runtime feature detection above verified Zbc support.
+            let oneshot = unsafe { extend_zbc_riscv64(initial_crc, input) };
+            prop_assert_eq!(oneshot, expected);
+
+            splits.retain(|&split| split <= input.len());
+            splits.push(0);
+            splits.push(input.len());
+            splits.sort_unstable();
+            splits.dedup();
+
+            let mut streaming = initial_crc;
+            for boundary in splits.windows(2) {
+                // SAFETY: runtime feature detection above verified Zbc support.
+                streaming = unsafe {
+                    extend_zbc_riscv64(streaming, &input[boundary[0]..boundary[1]])
+                };
+            }
+            prop_assert_eq!(streaming, expected);
         }
     }
 }
