@@ -5598,7 +5598,7 @@ fail_with_matches \
     "Stream-route scheduling public-surface source-root scan must find only the nested unrelated-module fixture" \
     "$stream_route_scheduling_public_surface_fixture_failure"
 
-storage_scheduling_hook_public_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+test_install_(before_stream_abort_storage_hook|before_retained_stream_cleanup_capability_hook|after_retained_stream_cleanup_capability_hook|before_metadata_command_pending_install_hook|before_stream_append_command_id_hook|before_stream_put_create_pending_install_hook|before_stream_put_finalize_command_id_hook)|struct[[:space:]]+(StreamAbortTestHookGuard|RetainedStreamCleanupCapabilityTestHookGuard|AfterRetainedStreamCleanupCapabilityTestHookGuard|MetadataCommandPendingInstallHookGuard|StreamAppendCommandIdHookGuard|StreamPutCreatePendingInstallTestHookGuard|StreamPutFinalizeCommandIdTestHookGuard))\b'
+storage_scheduling_hook_public_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+test_install_(before_stream_abort_storage_hook|before_retained_stream_abort_hook|before_retained_stream_cleanup_capability_hook|after_retained_stream_cleanup_capability_hook|before_metadata_command_pending_install_hook|before_stream_append_command_id_hook|before_stream_put_create_pending_install_hook|before_stream_put_finalize_command_id_hook|before_reclaim_ownership_lookup_hook|after_reclaim_claim_acquired_hook|before_reclaim_claim_release_hook)|struct[[:space:]]+(StreamAbortTestHookGuard|RetainedStreamAbortTestHookGuard|RetainedStreamCleanupCapabilityTestHookGuard|AfterRetainedStreamCleanupCapabilityTestHookGuard|MetadataCommandPendingInstallHookGuard|StreamAppendCommandIdHookGuard|StreamPutCreatePendingInstallTestHookGuard|StreamPutFinalizeCommandIdTestHookGuard|ReclaimOwnershipLookupTestHookGuard|ReclaimClaimAcquiredTestHookGuard|ReclaimClaimReleaseTestHookGuard)|type[[:space:]]+(RetainedStreamAbortHook|ReclaimCoordinationTestHook))\b'
 
 scan_public_storage_scheduling_hook_surface() {
     local source_root=$1
@@ -5622,9 +5622,19 @@ storage_scheduling_hook_public_surface_fixture=$(
         scripts/fixtures/storage-boundary-scheduling-hooks
 )
 expected_storage_scheduling_hook_public_surface_fixture='scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:1:pub struct StreamAbortTestHookGuard;
-scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:6:    pub fn test_install_before_stream_abort_storage_hook(&self) {}
-scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:8:    pub fn test_install_before_metadata_command_pending_install_hook(&self) {}
-scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:10:    pub fn test_install_before_stream_put_finalize_command_id_hook(&self) {}'
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:2:pub struct RetainedStreamAbortTestHookGuard;
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:3:pub struct ReclaimOwnershipLookupTestHookGuard;
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:4:pub struct ReclaimClaimAcquiredTestHookGuard;
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:5:pub struct ReclaimClaimReleaseTestHookGuard;
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:6:pub type RetainedStreamAbortHook = fn();
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:7:pub type ReclaimCoordinationTestHook = fn();
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:12:    pub fn test_install_before_stream_abort_storage_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:14:    pub fn test_install_before_metadata_command_pending_install_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:16:    pub fn test_install_before_stream_put_finalize_command_id_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:18:    pub fn test_install_before_retained_stream_abort_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:20:    pub fn test_install_before_reclaim_ownership_lookup_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:22:    pub fn test_install_after_reclaim_claim_acquired_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:24:    pub fn test_install_before_reclaim_claim_release_hook(&self) {}'
 storage_scheduling_hook_public_surface_fixture_failure=""
 if [[ "$storage_scheduling_hook_public_surface_fixture" != "$expected_storage_scheduling_hook_public_surface_fixture" ]]; then
     storage_scheduling_hook_public_surface_fixture_failure=$storage_scheduling_hook_public_surface_fixture

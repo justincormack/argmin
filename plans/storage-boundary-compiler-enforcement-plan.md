@@ -6195,6 +6195,17 @@ open work because they require storage-owned semantic failures and opaque
 fault actions rather than merely republishing their existing raw callback
 signatures.
 
+The fallible stream-cleanup and reclaim coordination hooks now use
+`StorageClusterFailureTestSupport`. Cross-crate tests select only retryable
+retained-abort contention, post-claim route expiry, ownership-lookup failure,
+or claim-release failure, and receive an opaque guard with a logical invocation
+count. Storage owns construction of the corresponding errors and all route
+diagnostics. The raw fallible callbacks, operation-specific guards, and
+installers are crate-private and included in the crate-wide scheduling-hook
+fixture. Payload cleanup/read hooks remain the final part of closure item (b)
+because their existing callbacks expose physical shard identities and raw
+errors and therefore need opaque, operation-specific fault scenarios.
+
 The audited cross-crate support families are:
 
 | Surface family | Principal consumers | Durable mutation | Final disposition |
@@ -6275,8 +6286,9 @@ Remaining implementation order after this audit:
    public or cross-crate reintroduction. The closure audit leaves four bounded
    migrations in this item: (a) **completed:** admitted stream-route
    scheduling extensions, (b) **in progress:** the no-argument stream and
-   pending-install scheduling guards are consolidated; fallible reclaim and
-   payload cleanup/read guards remain, (c) the clock and static-topology logical test controls,
+   pending-install scheduling guards and semantic retained-cleanup/reclaim
+   failures are consolidated; payload cleanup/read guards remain, (c) the
+   clock and static-topology logical test controls,
    and (d) privatization plus crate-wide enforcement for the remaining unused
    public inherent test adapters; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when

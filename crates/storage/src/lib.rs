@@ -1466,6 +1466,9 @@ pub mod test_support {
         TestPayloadShardWriteAttemptHook, TestPayloadShardWriteAttempts,
     };
 
+    mod failure_scheduling;
+    pub use failure_scheduling::{StorageClusterFailureTestSupport, TestStorageFailureGuard};
+
     mod scheduling;
     pub use scheduling::{
         StorageClusterSchedulingTestSupport, TestStorageSchedulingAction,

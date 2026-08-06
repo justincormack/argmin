@@ -1126,7 +1126,7 @@ pub(crate) struct StreamAbortTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct RetainedStreamAbortTestHookGuard {
+pub(crate) struct RetainedStreamAbortTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1201,17 +1201,17 @@ pub struct MetadataListingPgCompleteHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct ReclaimOwnershipLookupTestHookGuard {
+pub(crate) struct ReclaimOwnershipLookupTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct ReclaimClaimAcquiredTestHookGuard {
+pub(crate) struct ReclaimClaimAcquiredTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct ReclaimClaimReleaseTestHookGuard {
+pub(crate) struct ReclaimClaimReleaseTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -11835,7 +11835,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_retained_stream_abort_hook(
+    pub(crate) fn test_install_before_retained_stream_abort_hook(
         &self,
         hook: RetainedStreamAbortHook,
     ) -> RetainedStreamAbortTestHookGuard {
@@ -11941,7 +11941,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_reclaim_ownership_lookup_hook(
+    pub(crate) fn test_install_before_reclaim_ownership_lookup_hook(
         &self,
         hook: ReclaimCoordinationTestHook,
     ) -> ReclaimOwnershipLookupTestHookGuard {
@@ -11955,7 +11955,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_reclaim_claim_acquired_hook(
+    pub(crate) fn test_install_after_reclaim_claim_acquired_hook(
         &self,
         hook: ReclaimCoordinationTestHook,
     ) -> ReclaimClaimAcquiredTestHookGuard {
@@ -11966,7 +11966,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_reclaim_claim_release_hook(
+    pub(crate) fn test_install_before_reclaim_claim_release_hook(
         &self,
         hook: ReclaimCoordinationTestHook,
     ) -> ReclaimClaimReleaseTestHookGuard {

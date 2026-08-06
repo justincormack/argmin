@@ -16,12 +16,13 @@ use storage::test_support::{
     TestRetainedReadPgMoveScenario,
 };
 use storage::test_support::{
-    StorageClusterLifecycleTestSupport as _, StorageClusterMetadataCommandTestSupport as _,
-    StorageClusterObjectTestSupport as _, StorageClusterPayloadTestSupport as _,
-    StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
-    StorageClusterRuntimeMapTopologyTestSupport as _, StorageClusterSchedulingTestSupport as _,
-    StorageClusterTopologyTestSupport as _, StorageMaintenanceSweeperTestSupport as _,
-    StorageShardRepairSweeperTestSupport as _, StorageStreamSessionSweeperTestSupport as _,
+    StorageClusterFailureTestSupport as _, StorageClusterLifecycleTestSupport as _,
+    StorageClusterMetadataCommandTestSupport as _, StorageClusterObjectTestSupport as _,
+    StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
+    StorageClusterRouteMapTestSupport as _, StorageClusterRuntimeMapTopologyTestSupport as _,
+    StorageClusterSchedulingTestSupport as _, StorageClusterTopologyTestSupport as _,
+    StorageMaintenanceSweeperTestSupport as _, StorageShardRepairSweeperTestSupport as _,
+    StorageStreamSessionSweeperTestSupport as _,
 };
 use storage::{
     ClusterEpoch, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
@@ -5183,16 +5184,7 @@ fn retained_stream_cleanup_does_not_retry_after_its_deadline() {
         .retained_stream_upload_cleanup(&admission, &bucket, &key)
         .unwrap();
 
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let hook_attempts = Arc::clone(&attempts);
-    let hook = cluster.test_install_before_retained_stream_abort_hook(Arc::new(move || {
-        hook_attempts.fetch_add(1, Ordering::SeqCst);
-        Err(storage::ObjectPgActionError::Store(
-            storage::StoreError::MetadataCommandContention {
-                context: "injected retained cleanup exhaustion",
-            },
-        ))
-    }));
+    let hook = cluster.test_fail_retained_stream_abort_with_contention();
     let error = coord
         .abort_stream_upload_with_retained_cleanup_for_test(
             &cleanup,
@@ -5203,7 +5195,7 @@ fn retained_stream_cleanup_does_not_retry_after_its_deadline() {
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     assert_eq!(
-        attempts.load(Ordering::SeqCst),
+        hook.invocation_count(),
         1,
         "the retry delay crosses the deadline, so no second RPC may begin"
     );
@@ -11859,29 +11851,13 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let abort_failures = Arc::new(AtomicUsize::new(2));
     let hook_guard = storage_cluster.test_install_object_metadata_command_log_conflict_once(
         &bucket,
         &key,
         MetadataCommandApplyTestKind::AppendStreamSegment,
     );
-    let hook_abort_failures = Arc::clone(&abort_failures);
     let retained_abort_guard =
-        storage_cluster.test_install_before_retained_stream_abort_hook(Arc::new(move || {
-            if hook_abort_failures
-                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
-                return Err(storage::ObjectPgActionError::Store(
-                    storage::StoreError::MetadataCommandContention {
-                        context: "injected retained CopyObject cleanup contention",
-                    },
-                ));
-            }
-            Ok(())
-        }));
+        storage_cluster.test_fail_retained_stream_abort_with_contention_for_attempts(2);
 
     let err = coord
         .copy_object(&CopyObjectRequest {
@@ -11908,12 +11884,12 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
         "expected CopyObject append conflict to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
-    drop(retained_abort_guard);
     assert_eq!(
-        abort_failures.load(Ordering::SeqCst),
-        0,
-        "CopyObject cleanup should retry transient abort conflicts"
+        retained_abort_guard.invocation_count(),
+        3,
+        "CopyObject cleanup should retry two transient abort conflicts and then succeed"
     );
+    drop(retained_abort_guard);
     assert_eq!(
         storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),
         0,
@@ -18917,26 +18893,15 @@ fn reclaim_route_failure_after_claim_acquisition_releases_claim() {
     let (_tmp, coord, _bucket, _key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-release-after-route-failure");
 
-    let admission_failed = Arc::new(AtomicBool::new(false));
-    let hook_admission_failed = Arc::clone(&admission_failed);
     let claim_guard = coord
         .storage_node()
-        .test_install_after_reclaim_claim_acquired_hook(Arc::new(move || {
-            hook_admission_failed.store(true, Ordering::SeqCst);
-            Err(storage::ObjectPgActionError::Store(
-                storage::StoreError::StaleMetadataOperation {
-                    pg_id: 0,
-                    operation_epoch: ClusterEpoch::INITIAL,
-                    current_epoch: ClusterEpoch::new(2).unwrap(),
-                },
-            ))
-        }));
+        .test_fail_route_after_reclaim_claim_acquired();
 
     let error = coord
         .read_runtime()
         .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
-    assert!(admission_failed.load(Ordering::SeqCst));
+    assert_eq!(claim_guard.invocation_count(), 1);
     assert!(
         matches!(error, ServerError::SlowDown),
         "post-claim route failure should remain retryable, got {error:?}"
@@ -18983,25 +18948,13 @@ fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
             &key,
             MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim,
         );
-    let ownership_lookup_failed = Arc::new(AtomicBool::new(false));
-    let hook_ownership_lookup_failed = Arc::clone(&ownership_lookup_failed);
-    let _lookup_guard = coord
-        .storage_node()
-        .test_install_before_reclaim_ownership_lookup_hook(Arc::new(move || {
-            hook_ownership_lookup_failed.store(true, Ordering::SeqCst);
-            Err(storage::ObjectPgActionError::Store(
-                storage::StoreError::Io {
-                    context: "injected reclaim ownership lookup failure",
-                    source: std::io::Error::other("injected reclaim ownership lookup failure"),
-                },
-            ))
-        }));
+    let lookup_guard = coord.storage_node().test_fail_reclaim_ownership_lookup();
 
     let error = coord
         .read_runtime()
         .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
-    assert!(ownership_lookup_failed.load(Ordering::SeqCst));
+    assert_eq!(lookup_guard.invocation_count(), 1);
     assert!(
         matches!(error, ServerError::SlowDown),
         "the original retryable apply error should be preserved, got {error:?}"
@@ -19039,25 +18992,13 @@ fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
             &key,
             MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim,
         );
-    let claim_release_failed = Arc::new(AtomicBool::new(false));
-    let hook_claim_release_failed = Arc::clone(&claim_release_failed);
-    let _release_guard = coord
-        .storage_node()
-        .test_install_before_reclaim_claim_release_hook(Arc::new(move || {
-            hook_claim_release_failed.store(true, Ordering::SeqCst);
-            Err(storage::ObjectPgActionError::Store(
-                storage::StoreError::Io {
-                    context: "injected reclaim claim release failure",
-                    source: std::io::Error::other("injected reclaim claim release failure"),
-                },
-            ))
-        }));
+    let release_guard = coord.storage_node().test_fail_reclaim_claim_release();
 
     let error = coord
         .read_runtime()
         .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
-    assert!(claim_release_failed.load(Ordering::SeqCst));
+    assert_eq!(release_guard.invocation_count(), 1);
     assert!(
         matches!(
             error,

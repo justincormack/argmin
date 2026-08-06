@@ -39,9 +39,9 @@ use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 #[cfg(test)]
 use storage::test_support::{
-    StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
-    StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
-    StorageClusterSchedulingTestSupport as _,
+    StorageClusterFailureTestSupport as _, StorageClusterLifecycleTestSupport as _,
+    StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
+    StorageClusterRouteMapTestSupport as _, StorageClusterSchedulingTestSupport as _,
 };
 use storage::{BucketName, SessionId};
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -6394,17 +6394,7 @@ Connection: close\r\n\r\n",
         });
         let abort_guard = StreamingAbortGuard::new(&state);
         abort_guard.arm_post(&ctx);
-        let retained_abort_attempts = Arc::new(AtomicUsize::new(0));
-        let hook_attempts = Arc::clone(&retained_abort_attempts);
-        let retained_abort_failure =
-            initial.test_install_before_retained_stream_abort_hook(Arc::new(move || {
-                hook_attempts.fetch_add(1, Ordering::SeqCst);
-                Err(storage::ObjectPgActionError::Store(
-                    storage::StoreError::MetadataCommandContention {
-                        context: "test retained cleanup handoff",
-                    },
-                ))
-            }));
+        let retained_abort_failure = initial.test_fail_retained_stream_abort_with_contention();
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
         let install_handle = runtime_handle.clone();
@@ -6433,7 +6423,7 @@ Connection: close\r\n\r\n",
         .unwrap();
         assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
         tokio::time::timeout(Duration::from_secs(3), async {
-            while retained_abort_attempts.load(Ordering::SeqCst) == 0 {
+            while retained_abort_failure.invocation_count() == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -6544,17 +6534,7 @@ Connection: close\r\n\r\n",
         });
         let abort_guard = StreamingAbortGuard::new(&state);
         abort_guard.arm_part(&ctx);
-        let retained_abort_attempts = Arc::new(AtomicUsize::new(0));
-        let hook_attempts = Arc::clone(&retained_abort_attempts);
-        let retained_abort_failure =
-            initial.test_install_before_retained_stream_abort_hook(Arc::new(move || {
-                hook_attempts.fetch_add(1, Ordering::SeqCst);
-                Err(storage::ObjectPgActionError::Store(
-                    storage::StoreError::MetadataCommandContention {
-                        context: "test retained UploadPart cleanup handoff",
-                    },
-                ))
-            }));
+        let retained_abort_failure = initial.test_fail_retained_stream_abort_with_contention();
 
         let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
         let install_handle = runtime_handle.clone();
@@ -6583,7 +6563,7 @@ Connection: close\r\n\r\n",
         .unwrap();
         assert!(Arc::ptr_eq(&storage_handle.current(), &candidate));
         tokio::time::timeout(Duration::from_secs(3), async {
-            while retained_abort_attempts.load(Ordering::SeqCst) == 0 {
+            while retained_abort_failure.invocation_count() == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
