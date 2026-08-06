@@ -4861,6 +4861,21 @@ impl PgRouteSnapshot {
         }
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_reconstructed_with_metadata_read_route(
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        acting_set: Vec<NodeId>,
+        state: PgState,
+        metadata_read_route: Option<PgMetadataReadRoute>,
+    ) -> Self {
+        let mut route =
+            Self::reconstructed(cluster_epoch, pg_id, primary_node_id, acting_set, state);
+        route.metadata_read_route = metadata_read_route;
+        route
+    }
+
     #[must_use]
     pub fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster_epoch

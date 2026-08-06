@@ -6081,7 +6081,25 @@ Final Phase 5 audit (2026-08-04):
   retained route history while binding the requested test validity. This makes
   duplicate-runtime SQLite access and foreign-root substitution structurally
   unavailable. An owner-local store/registry/retained-epoch canary pins those
-  provenance guarantees.
+  provenance guarantees; and
+- runtime-map refresh, retained-route publication, primary movement, and
+  deliberately stale-current-route fixtures no longer construct local node
+  configs, PG IDs, route snapshots, acting sets, or epochs in `server-core`.
+  They invoke storage-owned topology scenarios derived from the exact current
+  runtime-map handle and process-local cluster. The scenarios preserve the
+  process-local registry and all retained route history, conditionally publish
+  against the captured generation, choose alternate primaries internally, and
+  return only logical epochs or clusters. Same-epoch refreshes preserve the
+  complete local route state, including a certified Peering metadata-read
+  route, and Peering transitions retain every older historical epoch. The
+  deliberately stale scenario mutates the map before its route authority is
+  minted, so only the intended route/cluster-epoch mismatch is present.
+  An owner-local canary recomputes the final map digest and requires it to
+  match the minted authority, directly pinning that construction order. Other
+  owner-local canaries pin complete Peering route preservation, retained
+  history, changed-primary selection, rejection when no alternate exists, and
+  fallible epoch overflow. The raw route-clone constructor is now
+  crate-private.
 
 The audited cross-crate support families are:
 
@@ -6132,7 +6150,9 @@ Remaining implementation order after this audit:
    Staged shard-write effect tests use opaque attempt evidence and ordinal-only
    failure hooks. Same-store deadline fixtures use a storage-owned
    process-local route-authority clone rather than exporting local store paths,
-   PG IDs, EC shape, or route snapshots, or opening a duplicate runtime; and
+   PG IDs, EC shape, or route snapshots, or opening a duplicate runtime.
+   Runtime-map refresh/primary-move/stale-route fixtures likewise use the
+   curated storage-owned topology interface; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

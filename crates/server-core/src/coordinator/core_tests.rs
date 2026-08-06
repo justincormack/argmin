@@ -19,10 +19,11 @@ use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterObjectTestSupport as _,
     StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
     StorageClusterRouteMapTestSupport as _, StorageClusterRuntimeMapTopologyTestSupport as _,
+    StorageClusterTopologyTestSupport as _,
 };
 use storage::{
-    ClusterEpoch, LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, NodeId, PgId, PgState,
-    RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    ClusterEpoch, PgId, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
+    StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -5245,7 +5246,7 @@ fn maintenance_worker_operations_sample_epoch_refreshed_runtime_map() {
         .unwrap();
     let stale_lifecycle_runtime = coord.read_runtime();
 
-    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
     let refreshed = handle.current();
     assert!(refreshed.cluster_epoch() > initial.cluster_epoch());
 
@@ -5720,7 +5721,7 @@ fn reclaim_worker_follows_runtime_map_refresh_for_bucket_finalize() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    install_same_store_same_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_same_epoch_runtime_map(&runtime_handle);
     thread::sleep(Duration::from_millis(250));
 
     delete_bucket_test(&coord, "bucket").unwrap();
@@ -5776,12 +5777,7 @@ fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     let _gate_release_guard = gate.release_on_drop();
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
 
-    install_same_store_same_epoch_runtime_map_with_primary(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-        NodeId::new(1),
-    );
+    install_same_store_same_epoch_runtime_map_with_changed_primaries(&runtime_handle);
     let expected_cluster = handle.current();
     gate.release();
 
@@ -6022,7 +6018,7 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
         )
         .unwrap();
 
-    install_same_store_same_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_same_epoch_runtime_map(&runtime_handle);
     let refreshed = handle.current();
     assert!(!Arc::ptr_eq(&refreshed, &initial));
     let refreshed_session = refreshed
@@ -6272,7 +6268,7 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
         "expired route map should make the first background begin retryable before it can mark deleting"
     );
 
-    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
@@ -6306,28 +6302,13 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
     let bucket_subject = initial
         .test_capture_bucket_delete_begin_subject(&bucket)
         .unwrap();
-    let bucket_pg_id = PgId::new(initial.test_bucket_pg_id_for(&bucket));
-    assert_eq!(
-        initial
-            .local_pg_route(bucket_pg_id)
-            .expect("initial bucket PG route should exist")
-            .primary_node_id(),
-        NodeId::new(0),
-        "test assumes the pinned route starts on node 0"
-    );
-
     let installed_next_epoch = Arc::new(AtomicBool::new(false));
     let installed_next_epoch_for_hook = Arc::clone(&installed_next_epoch);
     let runtime_handle_for_hook = runtime_handle.clone();
-    let initial_for_hook = Arc::clone(&initial);
-    let node_root = tmp.path().to_path_buf();
     let _hook_guard = initial.test_install_after_bucket_delete_final_visibility_proven_hook(
         Arc::new(move || {
-            install_same_store_next_epoch_runtime_map_with_primary(
+            install_same_store_next_epoch_runtime_map_with_changed_primaries(
                 &runtime_handle_for_hook,
-                &initial_for_hook,
-                &node_root,
-                NodeId::new(1),
             );
             installed_next_epoch_for_hook.store(true, Ordering::SeqCst);
             Ok(())
@@ -6348,12 +6329,8 @@ fn bucket_delete_begin_marks_deleting_on_retained_route_after_runtime_map_primar
         initial.cluster_epoch().get() + 1,
         "runtime map should advance while the pinned operation is still running"
     );
-    assert_eq!(
-        current
-            .local_pg_route(bucket_pg_id)
-            .expect("current bucket PG route should exist")
-            .primary_node_id(),
-        NodeId::new(1),
+    assert!(
+        current.test_all_pg_primaries_differ_from(&initial),
         "current route should move the bucket PG primary away from the pinned route"
     );
     assert!(current
@@ -6721,7 +6698,7 @@ fn reclaim_worker_drops_stale_bucket_delete_begin_after_bucket_recreate() {
         ))
         .unwrap();
 
-    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
 
     let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
     loop {
@@ -7071,80 +7048,18 @@ fn put_object_pins_runtime_map_after_bucket_write_reservation() {
     );
 }
 
-fn install_next_epoch_runtime_map_with_historical_routes(
-    handle: &StorageClusterRuntimeMapHandle,
-    initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
-) {
-    let node_count = u32::from(initial.default_payload_ec_shape().k)
-        + u32::from(initial.default_payload_ec_shape().m);
-    let configs = (0..node_count)
-        .map(|node_id| {
-            LocalNodeStoreConfig::new(
-                NodeId::new(node_id),
-                node_root.join(format!("node-{node_id:04}")),
-            )
-        })
-        .collect::<Vec<_>>();
-    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
-    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
-    let routes = initial
-        .test_pg_ids()
-        .iter()
-        .map(|pg_id| {
-            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
-                next_epoch,
-                PgId::new(*pg_id),
-                NodeId::new(0),
-                acting_set.clone(),
-                PgState::Active,
-            );
-            LocalPgRoute::from(&route)
-        })
-        .collect::<Vec<_>>();
-    let historical_routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut candidate_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs,
-        initial.test_pg_ids(),
-        initial.default_payload_ec_shape(),
-        next_epoch,
-        routes,
-    )
-    .unwrap();
-    candidate_map.test_install_historical_pg_routes(historical_routes);
-    candidate_map.test_set_route_map_validity(long_lived_test_route_map_validity());
-    let candidate =
-        StorageCluster::test_from_local_map_with_epoch(Arc::new(candidate_map), next_epoch)
-            .unwrap();
-    handle.install(candidate).unwrap();
+fn install_next_epoch_runtime_map_with_historical_routes(handle: &StorageClusterRuntimeMapHandle) {
+    handle
+        .test_install_next_epoch_with_retained_routes()
+        .unwrap();
 }
 
 fn begin_next_epoch_runtime_map_publication_with_historical_routes(
     runtime_handle: &StorageClusterRuntimeMapHandle,
-    initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
 ) -> thread::JoinHandle<()> {
     let publishing_handle = runtime_handle.clone();
-    let publishing_initial = Arc::clone(initial);
-    let publishing_node_root = node_root.to_path_buf();
     let publication_thread = thread::spawn(move || {
-        install_next_epoch_runtime_map_with_historical_routes(
-            &publishing_handle,
-            &publishing_initial,
-            &publishing_node_root,
-        );
+        install_next_epoch_runtime_map_with_historical_routes(&publishing_handle);
     });
     runtime_handle
         .route_handle()
@@ -7152,113 +7067,30 @@ fn begin_next_epoch_runtime_map_publication_with_historical_routes(
     publication_thread
 }
 
-fn install_same_store_next_epoch_runtime_map(
-    handle: &StorageClusterRuntimeMapHandle,
-    initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
-) {
-    install_same_store_next_epoch_runtime_map_with_primary(
-        handle,
-        initial,
-        node_root,
-        NodeId::new(0),
-    );
-}
-
-fn install_same_store_same_epoch_runtime_map(
-    handle: &StorageClusterRuntimeMapHandle,
-    initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
-) {
-    install_same_store_same_epoch_runtime_map_with_primary(
-        handle,
-        initial,
-        node_root,
-        NodeId::new(0),
-    );
-}
-
-fn install_same_store_same_epoch_runtime_map_with_primary(
-    handle: &StorageClusterRuntimeMapHandle,
-    initial: &Arc<StorageCluster>,
-    _node_root: &std::path::Path,
-    primary_node_id: NodeId,
-) {
-    let node_count = u32::from(initial.default_payload_ec_shape().k)
-        + u32::from(initial.default_payload_ec_shape().m);
-    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
-    let routes = initial
-        .test_pg_ids()
-        .iter()
-        .map(|pg_id| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                initial.cluster_epoch(),
-                PgId::new(*pg_id),
-                primary_node_id,
-                acting_set.clone(),
-                PgState::Active,
-            )
-        })
-        .collect::<Vec<_>>();
-    let historical_routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let candidate = initial
-        .test_clone_with_pg_routes(initial.cluster_epoch(), routes, historical_routes)
+fn install_same_store_next_epoch_runtime_map(handle: &StorageClusterRuntimeMapHandle) {
+    handle
+        .test_install_next_epoch_with_retained_routes()
         .unwrap();
-    candidate.test_store_route_map_validity(long_lived_test_route_map_validity());
-    handle.install(candidate).unwrap();
 }
 
-fn install_same_store_next_epoch_runtime_map_with_primary(
+fn install_same_store_same_epoch_runtime_map(handle: &StorageClusterRuntimeMapHandle) {
+    handle.test_install_same_epoch_topology_refresh().unwrap();
+}
+
+fn install_same_store_same_epoch_runtime_map_with_changed_primaries(
     handle: &StorageClusterRuntimeMapHandle,
-    initial: &Arc<StorageCluster>,
-    _node_root: &std::path::Path,
-    primary_node_id: NodeId,
 ) {
-    let node_count = u32::from(initial.default_payload_ec_shape().k)
-        + u32::from(initial.default_payload_ec_shape().m);
-    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
-    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
-    let routes = initial
-        .test_pg_ids()
-        .iter()
-        .map(|pg_id| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                next_epoch,
-                PgId::new(*pg_id),
-                primary_node_id,
-                acting_set.clone(),
-                PgState::Active,
-            )
-        })
-        .collect::<Vec<_>>();
-    let historical_routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let candidate = initial
-        .test_clone_with_pg_routes(next_epoch, routes, historical_routes)
+    handle
+        .test_install_same_epoch_with_changed_primaries()
         .unwrap();
-    candidate.test_store_route_map_validity(long_lived_test_route_map_validity());
-    handle.install(candidate).unwrap();
+}
+
+fn install_same_store_next_epoch_runtime_map_with_changed_primaries(
+    handle: &StorageClusterRuntimeMapHandle,
+) {
+    handle
+        .test_install_next_epoch_with_changed_primaries()
+        .unwrap();
 }
 
 fn process_local_cluster_with_route_map_validity(
@@ -7272,70 +7104,8 @@ fn process_local_cluster_with_route_map_validity(
 
 fn same_epoch_cluster_with_stale_current_pg_routes(
     initial: &Arc<StorageCluster>,
-    node_root: &std::path::Path,
 ) -> Arc<StorageCluster> {
-    let node_count = u32::from(initial.default_payload_ec_shape().k)
-        + u32::from(initial.default_payload_ec_shape().m);
-    let configs = (0..node_count)
-        .map(|node_id| {
-            LocalNodeStoreConfig::new(
-                NodeId::new(node_id),
-                node_root.join(format!("node-{node_id:04}")),
-            )
-        })
-        .collect::<Vec<_>>();
-    let next_epoch = ClusterEpoch::new(initial.cluster_epoch().get() + 1).unwrap();
-    let acting_set = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
-    let routes = initial
-        .test_pg_ids()
-        .iter()
-        .map(|pg_id| {
-            let route = storage::control_plane::PgRouteSnapshot::reconstructed(
-                next_epoch,
-                PgId::new(*pg_id),
-                NodeId::new(0),
-                acting_set.clone(),
-                PgState::Active,
-            );
-            LocalPgRoute::from(&route)
-        })
-        .collect::<Vec<_>>();
-    let historical_routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut local_map = LocalClusterMap::open_frontend_with_configs_and_pg_routes(
-        NodeId::new(0),
-        configs,
-        initial.test_pg_ids(),
-        initial.default_payload_ec_shape(),
-        next_epoch,
-        routes,
-    )
-    .unwrap();
-    local_map.test_install_historical_pg_routes(historical_routes);
-    let stale_current_routes = initial
-        .local_pg_routes()
-        .map(|route| {
-            storage::control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            )
-        })
-        .collect::<Vec<_>>();
-    local_map.test_install_pg_routes(stale_current_routes);
-    StorageCluster::from_static_local_map(Arc::new(local_map)).unwrap()
+    initial.test_clone_with_stale_current_pg_routes().unwrap()
 }
 
 fn find_key_for_object_metadata_pg_with_prefix(
@@ -7429,11 +7199,8 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
         "direct PUT should have applied only the generation-reservation command before the pre-commit gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     let put_result = put_thread.join().unwrap().unwrap();
@@ -7567,11 +7334,8 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
         "overwrite should have applied only the generation-reservation command before the pre-commit gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     let put_result = put_thread.join().unwrap().unwrap();
@@ -7722,14 +7486,8 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
     );
 
     let publishing_handle = runtime_handle.clone();
-    let publishing_initial = Arc::clone(&initial);
-    let publishing_node_root = tmp.path().to_path_buf();
     let publication_thread = thread::spawn(move || {
-        install_next_epoch_runtime_map_with_historical_routes(
-            &publishing_handle,
-            &publishing_initial,
-            &publishing_node_root,
-        );
+        install_next_epoch_runtime_map_with_historical_routes(&publishing_handle);
     });
     handle.test_wait_until_route_publication_is_pending();
 
@@ -7856,11 +7614,8 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
         "delete should not apply the object-PG command before the pre-apply gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     delete_thread.join().unwrap().unwrap();
@@ -7972,11 +7727,8 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
         "multipart completion should not apply an object-PG command before the pre-commit gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     let complete_result = complete_thread.join().unwrap().unwrap();
@@ -8108,11 +7860,8 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
         "UploadPart finalization should not apply an object-PG command before the pre-commit gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     let part = finalize_thread.join().unwrap().unwrap();
@@ -8293,14 +8042,8 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     );
 
     let publishing_handle = runtime_handle.clone();
-    let publishing_initial = Arc::clone(&initial);
-    let publishing_node_root = tmp.path().to_path_buf();
     let publication_thread = thread::spawn(move || {
-        install_next_epoch_runtime_map_with_historical_routes(
-            &publishing_handle,
-            &publishing_initial,
-            &publishing_node_root,
-        );
+        install_next_epoch_runtime_map_with_historical_routes(&publishing_handle);
     });
     handle.test_wait_until_route_publication_is_pending();
 
@@ -8449,11 +8192,8 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
         "tag update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     tag_thread.join().unwrap().unwrap();
@@ -8578,11 +8318,8 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
         "legal-hold update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     legal_hold_thread.join().unwrap().unwrap();
@@ -8710,11 +8447,8 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
         "retention update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     retention_thread.join().unwrap().unwrap();
@@ -8838,11 +8572,8 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
         "ACL update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
-    let publication_thread = begin_next_epoch_runtime_map_publication_with_historical_routes(
-        &runtime_handle,
-        &initial,
-        tmp.path(),
-    );
+    let publication_thread =
+        begin_next_epoch_runtime_map_publication_with_historical_routes(&runtime_handle);
 
     gate.release();
     acl_thread.join().unwrap().unwrap();
@@ -8920,8 +8651,6 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
 
     let hook_handle = handle.clone();
     let hook_runtime_handle = runtime_handle.clone();
-    let hook_initial = Arc::clone(&initial);
-    let hook_node_root = tmp.path().to_path_buf();
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = RECLAMATION_TEST_SERIAL
@@ -8932,14 +8661,8 @@ fn get_object_epoch_change_after_read_snapshot_uses_pinned_route() {
         target: Some((bucket.to_string(), key.to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
             let publishing_handle = hook_runtime_handle.clone();
-            let publishing_initial = Arc::clone(&hook_initial);
-            let publishing_node_root = hook_node_root.clone();
             let thread = thread::spawn(move || {
-                install_next_epoch_runtime_map_with_historical_routes(
-                    &publishing_handle,
-                    &publishing_initial,
-                    &publishing_node_root,
-                );
+                install_next_epoch_runtime_map_with_historical_routes(&publishing_handle);
             });
             *hook_publication_thread.lock().unwrap() = Some(thread);
             hook_handle.test_wait_until_route_publication_is_pending();
@@ -9010,8 +8733,6 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
 
     let hook_handle = handle.clone();
     let hook_runtime_handle = runtime_handle.clone();
-    let hook_initial = Arc::clone(&initial);
-    let hook_node_root = tmp.path().to_path_buf();
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = RECLAMATION_TEST_SERIAL
@@ -9022,14 +8743,8 @@ fn head_object_epoch_change_after_read_snapshot_uses_pinned_route() {
         target: Some((bucket.to_string(), key.to_string())),
         after_object_read_snapshot: Some(Arc::new(move || {
             let publishing_handle = hook_runtime_handle.clone();
-            let publishing_initial = Arc::clone(&hook_initial);
-            let publishing_node_root = hook_node_root.clone();
             let thread = thread::spawn(move || {
-                install_next_epoch_runtime_map_with_historical_routes(
-                    &publishing_handle,
-                    &publishing_initial,
-                    &publishing_node_root,
-                );
+                install_next_epoch_runtime_map_with_historical_routes(&publishing_handle);
             });
             *hook_publication_thread.lock().unwrap() = Some(thread);
             hook_handle.test_wait_until_route_publication_is_pending();
@@ -9224,11 +8939,8 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
         .unwrap();
     }
 
-    let candidate_tmp = test_util::tempdir();
     let hook_handle = handle.clone();
     let hook_runtime_handle = runtime_handle.clone();
-    let hook_initial = Arc::clone(&initial);
-    let hook_node_root = candidate_tmp.path().to_path_buf();
     let publication_thread = Arc::new(Mutex::new(None));
     let hook_publication_thread = Arc::clone(&publication_thread);
     let _serial = LIST_OBJECTS_TEST_SERIAL
@@ -9239,14 +8951,8 @@ fn list_objects_epoch_change_before_storage_list_uses_pinned_route() {
         bucket: Some(bucket.to_string()),
         before_storage_list: Some(Arc::new(move || {
             let publishing_handle = hook_runtime_handle.clone();
-            let publishing_initial = Arc::clone(&hook_initial);
-            let publishing_node_root = hook_node_root.clone();
             let thread = thread::spawn(move || {
-                install_next_epoch_runtime_map_with_historical_routes(
-                    &publishing_handle,
-                    &publishing_initial,
-                    &publishing_node_root,
-                );
+                install_next_epoch_runtime_map_with_historical_routes(&publishing_handle);
             });
             *hook_publication_thread.lock().unwrap() = Some(thread);
             hook_handle.test_wait_until_route_publication_is_pending();
@@ -9336,7 +9042,7 @@ fn list_objects_continuation_survives_epoch_change_between_pages() {
     assert!(first.is_truncated);
     assert_eq!(first.next_continuation_token.as_deref(), Some("a/2"));
 
-    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
 
     let second = coord
         .list_objects_v2(&ListObjectsV2Request {
@@ -9574,7 +9280,7 @@ fn list_objects_delimiter_continuation_survives_epoch_change_between_pages() {
     assert!(first.is_truncated);
     assert_eq!(first.next_continuation_token.as_deref(), Some("b/"));
 
-    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
 
     let second = coord
         .list_objects_v2(&ListObjectsV2Request {
@@ -13526,8 +13232,7 @@ fn bucket_delete_finalizer_stale_metadata_route_maps_to_slow_down() {
     delete_bucket_test(&coord, "bucket").unwrap();
 
     let bucket = trusted_bucket_name("bucket");
-    let stale_cluster =
-        same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster, tmp.path());
+    let stale_cluster = same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster);
     let storage_err = stale_cluster
         .try_finalize_bucket_delete(&bucket)
         .unwrap_err();
@@ -14752,7 +14457,7 @@ fn list_object_versions_continuation_survives_epoch_change_between_pages() {
     assert_eq!(first_page.next_key_marker.as_deref(), Some(key_a.as_str()));
     assert_eq!(first_page.next_version_id_marker, Some(older_a.version_id));
 
-    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
 
     let second_page = coord
         .list_object_versions(&ListObjectVersionsRequest {
@@ -14972,7 +14677,7 @@ fn list_object_versions_delimiter_continuation_survives_epoch_change_between_pag
     assert_eq!(first_page.next_key_marker.as_deref(), Some("dir/"));
     assert_eq!(first_page.next_version_id_marker, None);
 
-    install_same_store_next_epoch_runtime_map(&runtime_handle, &initial, tmp.path());
+    install_same_store_next_epoch_runtime_map(&runtime_handle);
 
     let second_page = coord
         .list_object_versions(&ListObjectVersionsRequest {
@@ -15380,8 +15085,7 @@ fn delete_bucket_stale_metadata_route_maps_to_slow_down() {
         .unwrap();
 
     let bucket_name = trusted_bucket_name(bucket);
-    let stale_cluster =
-        same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster, tmp.path());
+    let stale_cluster = same_epoch_cluster_with_stale_current_pg_routes(&storage_cluster);
     let storage_err = stale_cluster
         .test_begin_current_bucket_delete(&bucket_name)
         .unwrap_err();

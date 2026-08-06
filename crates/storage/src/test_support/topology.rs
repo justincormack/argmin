@@ -1,9 +1,11 @@
 use std::fmt;
+use std::sync::Arc;
 
 use crate::control_plane;
 use crate::{
     BucketName, ClusterEpoch, GenerationId, ObjectKey, ObjectPgActionError, PgId, PgState,
-    SessionId, StorageCluster, StorageClusterRuntimeMapHandle, StoredObject, StreamUploadTarget,
+    RouteMapValidity, SessionId, StorageCluster, StorageClusterRuntimeMapHandle, StoredObject,
+    StreamUploadTarget,
 };
 
 /// Failure while constructing an opaque storage-topology test scenario.
@@ -73,6 +75,12 @@ pub trait StorageClusterTopologyTestSupport {
         key: &ObjectKey,
         session_id: &SessionId,
     ) -> Result<bool, ObjectPgActionError>;
+
+    fn test_clone_with_stale_current_pg_routes(
+        &self,
+    ) -> Result<Arc<StorageCluster>, TestStorageTopologyScenarioError>;
+
+    fn test_all_pg_primaries_differ_from(&self, previous: &StorageCluster) -> bool;
 }
 
 /// Storage-owned runtime-map transitions for cross-crate behavioral tests.
@@ -81,6 +89,22 @@ pub trait StorageClusterTopologyTestSupport {
 /// the current cluster, local stores, routes, and epoch from this exact
 /// publication domain.
 pub trait StorageClusterRuntimeMapTopologyTestSupport {
+    fn test_install_same_epoch_topology_refresh(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError>;
+
+    fn test_install_next_epoch_with_retained_routes(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError>;
+
+    fn test_install_same_epoch_with_changed_primaries(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError>;
+
+    fn test_install_next_epoch_with_changed_primaries(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError>;
+
     fn test_install_next_epoch_with_object_metadata_pg_peering(
         &self,
         bucket: &BucketName,
@@ -180,9 +204,64 @@ impl StorageClusterTopologyTestSupport for StorageCluster {
         Ok(self.test_object_pg_id_for(bucket, key)
             != self.test_data_pg_id_for(bucket, key, generation_id))
     }
+
+    fn test_clone_with_stale_current_pg_routes(
+        &self,
+    ) -> Result<Arc<StorageCluster>, TestStorageTopologyScenarioError> {
+        let next_epoch = next_cluster_epoch(self)?;
+        let next_routes = route_snapshots(self, next_epoch, PrimarySelection::Preserve)?;
+        let historical_routes = retained_route_snapshots(self);
+        let stale_routes = route_snapshots(self, self.cluster_epoch(), PrimarySelection::Preserve)?;
+        self.test_clone_with_stale_current_pg_routes_from_snapshots(
+            next_epoch,
+            next_routes,
+            historical_routes,
+            stale_routes,
+        )
+        .map_err(|error| {
+            TestStorageTopologyScenarioError::new(
+                "construct stale-current-route topology scenario",
+                error,
+            )
+        })
+    }
+
+    fn test_all_pg_primaries_differ_from(&self, previous: &StorageCluster) -> bool {
+        self.local_pg_routes().all(|route| {
+            previous
+                .local_pg_route(route.pg_id())
+                .is_some_and(|previous_route| {
+                    previous_route.primary_node_id() != route.primary_node_id()
+                })
+        })
+    }
 }
 
 impl StorageClusterRuntimeMapTopologyTestSupport for StorageClusterRuntimeMapHandle {
+    fn test_install_same_epoch_topology_refresh(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError> {
+        install_topology_refresh(self, EpochSelection::Preserve, PrimarySelection::Preserve)
+    }
+
+    fn test_install_next_epoch_with_retained_routes(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError> {
+        install_topology_refresh(self, EpochSelection::Advance, PrimarySelection::Preserve)
+    }
+
+    fn test_install_same_epoch_with_changed_primaries(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError> {
+        install_topology_refresh(self, EpochSelection::Preserve, PrimarySelection::Change)
+    }
+
+    fn test_install_next_epoch_with_changed_primaries(
+        &self,
+    ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError> {
+        install_topology_refresh(self, EpochSelection::Advance, PrimarySelection::Change)
+    }
+
     fn test_install_next_epoch_with_object_metadata_pg_peering(
         &self,
         bucket: &BucketName,
@@ -190,6 +269,117 @@ impl StorageClusterRuntimeMapTopologyTestSupport for StorageClusterRuntimeMapHan
     ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError> {
         install_next_epoch_with_object_metadata_pg_peering(self, bucket, key, || {})
     }
+}
+
+#[derive(Clone, Copy)]
+enum EpochSelection {
+    Preserve,
+    Advance,
+}
+
+#[derive(Clone, Copy)]
+enum PrimarySelection {
+    Preserve,
+    Change,
+}
+
+fn install_topology_refresh(
+    runtime_handle: &StorageClusterRuntimeMapHandle,
+    epoch_selection: EpochSelection,
+    primary_selection: PrimarySelection,
+) -> Result<ClusterEpoch, TestStorageTopologyScenarioError> {
+    let current = runtime_handle.current();
+    let target_epoch = match epoch_selection {
+        EpochSelection::Preserve => current.cluster_epoch(),
+        EpochSelection::Advance => next_cluster_epoch(&current)?,
+    };
+    let routes = route_snapshots(&current, target_epoch, primary_selection)?;
+    let historical_routes = retained_route_snapshots(&current);
+    let candidate = current
+        .test_clone_with_pg_routes(target_epoch, routes, historical_routes)
+        .map_err(|error| {
+            TestStorageTopologyScenarioError::new("construct topology refresh", error)
+        })?;
+    candidate.test_store_route_map_validity(
+        RouteMapValidity::until_ms(u64::MAX - 1)
+            .expect("maximum finite route-map validity is valid"),
+    );
+    let installed = runtime_handle
+        .test_install_if_current(&current, candidate)
+        .map_err(|error| {
+            TestStorageTopologyScenarioError::new("publish topology refresh", error)
+        })?;
+    if !installed {
+        return Err(TestStorageTopologyScenarioError::new(
+            "publish topology refresh",
+            "runtime-map generation changed while the scenario was being constructed",
+        ));
+    }
+    Ok(target_epoch)
+}
+
+fn next_cluster_epoch(
+    cluster: &StorageCluster,
+) -> Result<ClusterEpoch, TestStorageTopologyScenarioError> {
+    cluster
+        .cluster_epoch()
+        .get()
+        .checked_add(1)
+        .and_then(ClusterEpoch::new)
+        .ok_or_else(|| {
+            TestStorageTopologyScenarioError::new(
+                "advance topology scenario epoch",
+                "cluster epoch overflowed",
+            )
+        })
+}
+
+fn route_snapshots(
+    cluster: &StorageCluster,
+    target_epoch: ClusterEpoch,
+    primary_selection: PrimarySelection,
+) -> Result<Vec<control_plane::PgRouteSnapshot>, TestStorageTopologyScenarioError> {
+    cluster
+        .local_pg_routes()
+        .map(|route| {
+            let primary = match primary_selection {
+                PrimarySelection::Preserve => route.primary_node_id(),
+                PrimarySelection::Change => route
+                    .acting_set()
+                    .iter()
+                    .copied()
+                    .find(|node_id| *node_id != route.primary_node_id())
+                    .ok_or_else(|| {
+                        TestStorageTopologyScenarioError::new(
+                            "select changed-primary topology scenario route",
+                            format!("PG {} has no alternate acting-set node", route.pg_id()),
+                        )
+                    })?,
+            };
+            Ok(
+                control_plane::PgRouteSnapshot::test_reconstructed_with_metadata_read_route(
+                    target_epoch,
+                    route.pg_id(),
+                    primary,
+                    route.acting_set().to_vec(),
+                    route.state(),
+                    route.metadata_read_route(),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn retained_route_snapshots(cluster: &StorageCluster) -> Vec<control_plane::PgRouteSnapshot> {
+    let mut routes = cluster
+        .test_historical_pg_routes()
+        .cloned()
+        .collect::<Vec<_>>();
+    routes.extend(
+        route_snapshots(cluster, cluster.cluster_epoch(), PrimarySelection::Preserve)
+            .expect("preserving current topology cannot fail"),
+    );
+    routes
 }
 
 fn install_next_epoch_with_object_metadata_pg_peering(
@@ -206,16 +396,11 @@ fn install_next_epoch_with_object_metadata_pg_peering(
             "object and bucket metadata share one PG",
         ));
     }
-    let next_epoch = ClusterEpoch::new(current.cluster_epoch().get() + 1).ok_or_else(|| {
-        TestStorageTopologyScenarioError::new(
-            "advance topology scenario epoch",
-            "cluster epoch overflowed",
-        )
-    })?;
+    let next_epoch = next_cluster_epoch(&current)?;
     let routes = current
         .local_pg_routes()
         .map(|route| {
-            control_plane::PgRouteSnapshot::reconstructed(
+            control_plane::PgRouteSnapshot::test_reconstructed_with_metadata_read_route(
                 next_epoch,
                 route.pg_id(),
                 route.primary_node_id(),
@@ -225,21 +410,11 @@ fn install_next_epoch_with_object_metadata_pg_peering(
                 } else {
                     route.state()
                 },
+                route.metadata_read_route(),
             )
         })
         .collect::<Vec<_>>();
-    let historical_routes = current
-        .local_pg_routes()
-        .map(|route| {
-            control_plane::PgRouteSnapshot::reconstructed(
-                route.cluster_epoch(),
-                route.pg_id(),
-                route.primary_node_id(),
-                route.acting_set().to_vec(),
-                route.state(),
-            )
-        })
-        .collect::<Vec<_>>();
+    let historical_routes = retained_route_snapshots(&current);
     let candidate = current
         .test_clone_with_pg_routes(next_epoch, routes, historical_routes)
         .map_err(|error| {
@@ -462,5 +637,233 @@ mod tests {
             PgState::Active,
             "the stale Peering candidate must not replace the intervening generation"
         );
+    }
+
+    #[test]
+    fn same_epoch_refresh_preserves_certified_peering_read_route() {
+        let tmp = test_util::tempdir();
+        let initial = dynamic_test_cluster(tmp.path());
+        let peering_pg = initial.local_pg_routes().next().unwrap().pg_id();
+        let read_route = crate::control_plane::PgMetadataReadRoute::new(
+            initial
+                .local_pg_route(peering_pg)
+                .unwrap()
+                .primary_node_id(),
+            crate::control_plane::PgMetadataProof::empty(),
+        );
+        let routes = initial
+            .local_pg_routes()
+            .map(|route| {
+                control_plane::PgRouteSnapshot::test_reconstructed_with_metadata_read_route(
+                    route.cluster_epoch(),
+                    route.pg_id(),
+                    route.primary_node_id(),
+                    route.acting_set().to_vec(),
+                    if route.pg_id() == peering_pg {
+                        PgState::Peering
+                    } else {
+                        route.state()
+                    },
+                    (route.pg_id() == peering_pg).then_some(read_route),
+                )
+            })
+            .collect::<Vec<_>>();
+        let peering = initial
+            .test_clone_with_pg_routes(
+                initial.cluster_epoch(),
+                routes,
+                retained_route_snapshots(&initial),
+            )
+            .unwrap();
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&peering)).unwrap();
+
+        handle.test_install_same_epoch_topology_refresh().unwrap();
+
+        let refreshed = handle.current();
+        let refreshed_route = refreshed.local_pg_route(peering_pg).unwrap();
+        assert_eq!(refreshed_route.state(), PgState::Peering);
+        assert_eq!(refreshed_route.metadata_read_route(), Some(read_route));
+    }
+
+    #[test]
+    fn peering_transition_preserves_all_older_retained_epochs() {
+        let tmp = test_util::tempdir();
+        let initial = dynamic_test_cluster(tmp.path());
+        let initial_epoch = initial.cluster_epoch();
+        let retained_pg = initial.local_pg_routes().next().unwrap().pg_id();
+        let current = next_epoch_active_clone(&initial);
+        let current_epoch = current.cluster_epoch();
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&current)).unwrap();
+        let bucket = BucketName::try_from("peering-retained-history").unwrap();
+        let key = key_distinct_from_bucket_pg(&current, &bucket);
+
+        let installed_epoch = handle
+            .test_install_next_epoch_with_object_metadata_pg_peering(&bucket, &key)
+            .unwrap();
+
+        assert_eq!(installed_epoch.get(), current_epoch.get() + 1);
+        let installed = handle.current();
+        assert_eq!(
+            installed
+                .reconstructed_pg_route_at_epoch(retained_pg, initial_epoch)
+                .unwrap()
+                .cluster_epoch(),
+            initial_epoch
+        );
+        assert_eq!(
+            installed
+                .reconstructed_pg_route_at_epoch(retained_pg, current_epoch)
+                .unwrap()
+                .cluster_epoch(),
+            current_epoch
+        );
+    }
+
+    #[test]
+    fn next_epoch_scenarios_return_an_error_at_epoch_overflow() {
+        let tmp = test_util::tempdir();
+        let initial = dynamic_test_cluster(tmp.path());
+        let max_epoch = ClusterEpoch::new(u64::MAX).unwrap();
+        let max_epoch_cluster = initial
+            .test_clone_with_pg_routes(
+                max_epoch,
+                route_snapshots(&initial, max_epoch, PrimarySelection::Preserve).unwrap(),
+                retained_route_snapshots(&initial),
+            )
+            .unwrap();
+        let handle = StorageClusterRuntimeMapHandle::new(max_epoch_cluster).unwrap();
+        let bucket = BucketName::try_from("peering-overflow").unwrap();
+        let key = key_distinct_from_bucket_pg(&handle.current(), &bucket);
+
+        let refresh_error = handle
+            .test_install_next_epoch_with_retained_routes()
+            .unwrap_err();
+        assert_eq!(
+            refresh_error.to_string(),
+            "advance topology scenario epoch: cluster epoch overflowed"
+        );
+        let peering_error = handle
+            .test_install_next_epoch_with_object_metadata_pg_peering(&bucket, &key)
+            .unwrap_err();
+        assert_eq!(
+            peering_error.to_string(),
+            "advance topology scenario epoch: cluster epoch overflowed"
+        );
+    }
+
+    #[test]
+    fn topology_refresh_scenarios_preserve_runtime_identity_and_retained_routes() {
+        let tmp = test_util::tempdir();
+        let initial = dynamic_test_cluster(tmp.path());
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)).unwrap();
+        let initial_epoch = initial.cluster_epoch();
+        let retained_pg = initial.local_pg_routes().next().unwrap().pg_id();
+        let initial_registry = initial.process_local_registry_key();
+
+        let same_epoch = handle.test_install_same_epoch_topology_refresh().unwrap();
+        let refreshed = handle.current();
+        assert_eq!(same_epoch, initial_epoch);
+        assert_eq!(refreshed.cluster_epoch(), initial_epoch);
+        assert_eq!(refreshed.process_local_registry_key(), initial_registry);
+        assert!(!Arc::ptr_eq(&refreshed, &initial));
+        assert!(!refreshed.test_all_pg_primaries_differ_from(&initial));
+
+        let next_epoch = handle
+            .test_install_next_epoch_with_retained_routes()
+            .unwrap();
+        let advanced = handle.current();
+        assert_eq!(next_epoch.get(), initial_epoch.get() + 1);
+        assert_eq!(advanced.process_local_registry_key(), initial_registry);
+        let retained = advanced
+            .reconstructed_pg_route_at_epoch(retained_pg, initial_epoch)
+            .expect("next-epoch refresh must retain the prior route");
+        assert_eq!(retained.cluster_epoch(), initial_epoch);
+        assert_eq!(retained.pg_id(), retained_pg);
+    }
+
+    #[test]
+    fn changed_primary_scenarios_move_every_route_without_reopening_storage() {
+        let tmp = test_util::tempdir();
+        let initial = dynamic_test_cluster(tmp.path());
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)).unwrap();
+        let initial_registry = initial.process_local_registry_key();
+
+        handle
+            .test_install_same_epoch_with_changed_primaries()
+            .unwrap();
+        let same_epoch = handle.current();
+        assert_eq!(same_epoch.cluster_epoch(), initial.cluster_epoch());
+        assert_eq!(same_epoch.process_local_registry_key(), initial_registry);
+        assert!(same_epoch.test_all_pg_primaries_differ_from(&initial));
+
+        handle
+            .test_install_next_epoch_with_changed_primaries()
+            .unwrap();
+        let next_epoch = handle.current();
+        assert_eq!(
+            next_epoch.cluster_epoch().get(),
+            same_epoch.cluster_epoch().get() + 1
+        );
+        assert_eq!(next_epoch.process_local_registry_key(), initial_registry);
+        assert!(next_epoch.test_all_pg_primaries_differ_from(&same_epoch));
+    }
+
+    #[test]
+    fn changed_primary_scenario_rejects_a_single_node_acting_set() {
+        let tmp = test_util::tempdir();
+        let initial = StorageCluster::open_static_local_nodes(
+            tmp.path(),
+            &[NodeId::new(0)],
+            &[0],
+            EcShape { k: 1, m: 0 },
+        )
+        .unwrap()
+        .test_clone_with_dynamic_route_map_validity(
+            RouteMapValidity::until_ms(u64::MAX - 1).unwrap(),
+        )
+        .unwrap();
+        let handle = StorageClusterRuntimeMapHandle::new(Arc::clone(&initial)).unwrap();
+
+        let error = handle
+            .test_install_next_epoch_with_changed_primaries()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("has no alternate acting-set node"),
+            "unexpected scenario error: {error}"
+        );
+        assert!(Arc::ptr_eq(&handle.current(), &initial));
+    }
+
+    #[test]
+    fn stale_current_route_scenario_preserves_storage_but_crosses_route_epoch() {
+        let tmp = test_util::tempdir();
+        let initial = dynamic_test_cluster(tmp.path());
+        let bucket = BucketName::try_from("stale-current-route-authority").unwrap();
+        create_test_bucket(&initial, &bucket);
+        let stale = initial.test_clone_with_stale_current_pg_routes().unwrap();
+
+        assert_eq!(
+            stale.process_local_registry_key(),
+            initial.process_local_registry_key()
+        );
+        assert_eq!(
+            stale.cluster_epoch().get(),
+            initial.cluster_epoch().get() + 1
+        );
+        assert!(stale
+            .local_pg_routes()
+            .all(|route| route.cluster_epoch() == initial.cluster_epoch()));
+        assert!(
+            stale.test_route_authority_digest_matches_local_map(),
+            "stale routes must be installed before the route-authority digest is minted"
+        );
+        assert!(matches!(
+            stale.head_bucket_info(&bucket),
+            Err(crate::BucketSnapshotLoadError::Store(
+                crate::StoreError::StaleMetadataRoute { .. }
+            ))
+        ));
     }
 }

@@ -1109,7 +1109,7 @@ impl LocalPgRoute {
         self.acting_set.contains(&node_id)
     }
 
-    fn metadata_read_route(&self) -> Option<crate::control_plane::PgMetadataReadRoute> {
+    pub(crate) fn metadata_read_route(&self) -> Option<crate::control_plane::PgMetadataReadRoute> {
         self.metadata_read_route
     }
 }
@@ -3548,6 +3548,11 @@ impl LocalClusterMap {
 
     pub fn pg_routes(&self) -> impl Iterator<Item = &LocalPgRoute> + '_ {
         self.pg_routes.values()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_historical_pg_routes(&self) -> impl Iterator<Item = &PgRouteSnapshot> + '_ {
+        self.historical_pg_routes.values()
     }
 
     pub fn reconstructed_pg_route_at_epoch(

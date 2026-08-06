@@ -10919,7 +10919,23 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_clone_with_pg_routes(
+    pub(crate) fn test_historical_pg_routes(&self) -> impl Iterator<Item = &PgRouteSnapshot> + '_ {
+        self.local_map.test_historical_pg_routes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_route_authority_digest_matches_local_map(&self) -> bool {
+        let local_digest = self.local_map.static_route_map_content_digest();
+        match self.route_authority {
+            StorageClusterRouteAuthority::Static(proof) => proof.content_digest.0 == local_digest,
+            StorageClusterRouteAuthority::Dynamic(proof) => {
+                proof.content_digest == RuntimeMapContentDigest::from_bytes(local_digest)
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_clone_with_pg_routes(
         &self,
         cluster_epoch: ClusterEpoch,
         pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
@@ -10930,6 +10946,32 @@ impl StorageCluster {
             pg_routes,
             historical_pg_routes,
         )?;
+        self.test_clone_with_local_map(local_map, cluster_epoch)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_clone_with_stale_current_pg_routes_from_snapshots(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
+        historical_pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
+        stale_current_pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
+        let mut local_map = self.local_map.test_clone_with_pg_routes(
+            cluster_epoch,
+            pg_routes,
+            historical_pg_routes,
+        )?;
+        local_map.test_install_pg_routes(stale_current_pg_routes);
+        self.test_clone_with_local_map(local_map, cluster_epoch)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn test_clone_with_local_map(
+        &self,
+        local_map: LocalClusterMap,
+        cluster_epoch: ClusterEpoch,
+    ) -> Result<Arc<Self>, ClusterBuildError> {
         let route_authority = match self.route_authority {
             StorageClusterRouteAuthority::Static(_) => {
                 StorageClusterRouteAuthority::static_for(&local_map)?
