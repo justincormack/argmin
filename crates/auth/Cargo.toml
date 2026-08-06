@@ -20,3 +20,4 @@ aws-credential-types = "1"
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 proptest = "1"
+rustls = { version = "0.23", features = ["ring"] }

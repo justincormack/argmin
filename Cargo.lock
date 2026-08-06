@@ -82,6 +82,7 @@ dependencies = [
  "observability",
  "proptest",
  "ring",
+ "rustls",
  "s3-types",
  "serde_json",
  "subtle",

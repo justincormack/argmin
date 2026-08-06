@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+SIZE_MIB="${SIZE_MIB:-8}"
+WARMUP_ITERS="${WARMUP_ITERS:-4}"
+SAMPLE_ITERS="${SAMPLE_ITERS:-32}"
+SIGV4_WARMUP_ITERS="${SIGV4_WARMUP_ITERS:-10000}"
+SIGV4_SAMPLE_ITERS="${SIGV4_SAMPLE_ITERS:-100000}"
+SAMPLES="${SAMPLES:-5}"
+
+echo "cpu=$(uname -m)"
+echo "size_mib=$SIZE_MIB warmup_iters=$WARMUP_ITERS sample_iters=$SAMPLE_ITERS samples=$SAMPLES"
+echo "sigv4_warmup_iters=$SIGV4_WARMUP_ITERS sigv4_sample_iters=$SIGV4_SAMPLE_ITERS"
+
+cargo run --offline -p auth --example crypto_bench --release -- \
+  --size-mib "$SIZE_MIB" \
+  --warmup-iters "$WARMUP_ITERS" \
+  --sample-iters "$SAMPLE_ITERS" \
+  --sigv4-warmup-iters "$SIGV4_WARMUP_ITERS" \
+  --sigv4-sample-iters "$SIGV4_SAMPLE_ITERS" \
+  --samples "$SAMPLES"
