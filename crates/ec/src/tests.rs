@@ -651,6 +651,84 @@ mod prop_tests {
     use proptest::prelude::*;
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn supported_backends_match_scalar_for_arbitrary_unaligned_data(
+            (k, m, shard_size, leading_offset, data) in
+                (1usize..=6, 1usize..=3, 0usize..=1024, 0usize..=31)
+                    .prop_flat_map(|(k, m, shard_size, leading_offset)| {
+                        (
+                            Just(k),
+                            Just(m),
+                            Just(shard_size),
+                            Just(leading_offset),
+                            proptest::collection::vec(
+                                proptest::collection::vec(any::<u8>(), shard_size),
+                                k,
+                            ),
+                        )
+                    }),
+        ) {
+            prop_assume!(k + m <= MAX_TOTAL_SHARDS);
+
+            let config = EcConfig::new(k as u8, m as u8).unwrap();
+            let codec = ErasureCodec::new(config).unwrap();
+            let data_storage: Vec<Vec<u8>> = data
+                .into_iter()
+                .enumerate()
+                .map(|(index, shard)| {
+                    let offset = (leading_offset + index * 7) & 31;
+                    let mut storage = vec![0xa5; offset];
+                    storage.extend_from_slice(&shard);
+                    storage
+                })
+                .collect();
+            let data_refs: Vec<&[u8]> = data_storage
+                .iter()
+                .enumerate()
+                .map(|(index, shard)| &shard[((leading_offset + index * 7) & 31)..])
+                .collect();
+
+            let encode = |backend| {
+                let mut parity_storage: Vec<Vec<u8>> = (0..m)
+                    .map(|index| {
+                        let offset = (leading_offset + index * 11 + 3) & 31;
+                        vec![0x5a; offset + shard_size]
+                    })
+                    .collect();
+                let mut parity_refs: Vec<&mut [u8]> = parity_storage
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(index, shard)| {
+                        let offset = (leading_offset + index * 11 + 3) & 31;
+                        &mut shard[offset..]
+                    })
+                    .collect();
+                codec
+                    .encode_with_backend_for_test(&data_refs, &mut parity_refs, backend)
+                    .unwrap();
+                parity_storage
+            };
+
+            let scalar_parity = encode(Backend::Scalar);
+            for backend in supported_backends() {
+                let parity = encode(backend);
+                prop_assert_eq!(
+                    &parity,
+                    &scalar_parity,
+                    "backend={} k={} m={} shard_size={} leading_offset={}",
+                    backend_name_for(backend),
+                    k,
+                    m,
+                    shard_size,
+                    leading_offset,
+                );
+            }
+        }
+    }
+
+    proptest! {
         #[test]
         fn roundtrip_any_k_shards(
             k in 1usize..=6,

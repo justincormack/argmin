@@ -67,10 +67,28 @@ const fn build_all_nibble_tables() -> [[u8; 32]; 256] {
     tables
 }
 
+#[cfg(target_arch = "riscv64")]
+const fn build_rvv_nibble_tables() -> [u8; 256 * 32 + 16] {
+    let mut tables = [0u8; 256 * 32 + 16];
+    let mut coeff = 0usize;
+    while coeff < 256 {
+        let mut nibble = 0usize;
+        while nibble < 16 {
+            tables[coeff * 32 + nibble] = gf_mul_slow(coeff as u8, nibble as u8);
+            tables[coeff * 32 + 16 + nibble] = gf_mul_slow(coeff as u8, (nibble << 4) as u8);
+            nibble += 1;
+        }
+        coeff += 1;
+    }
+    tables
+}
+
 static GF_MUL_TABLE: [u8; GF_TABLE_SIZE] = build_mul_table();
 static GF_INV_TABLE: [u8; 256] = build_inv_table(&GF_MUL_TABLE);
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 static GF_NIBBLE_TABLES: [[u8; 32]; 256] = build_all_nibble_tables();
+#[cfg(target_arch = "riscv64")]
+static GF_RVV_NIBBLE_TABLES: [u8; 256 * 32 + 16] = build_rvv_nibble_tables();
 
 #[inline(always)]
 pub(crate) fn gf_mul(a: u8, b: u8) -> u8 {
@@ -307,6 +325,10 @@ pub(crate) fn encode_rows(
         // SAFETY: selected_backend verified AVX2 support, and codec validation established the
         // table and equal-shard-length invariants required by the backend.
         Backend::Avx2X86_64 => unsafe { x86_64_avx2::encode_rows(k, x86_tables, data, outputs) },
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: selected_backend verified VLEN >= 256, and codec validation established the
+        // table and equal-shard-length invariants required by the backend.
+        Backend::RvvRiscv64 => unsafe { riscv64_rvv::encode_rows(k, tables, data, outputs) },
     }
 }
 
@@ -364,6 +386,10 @@ pub(crate) fn apply_matrix_rows(
         // SAFETY: selected_backend verified AVX2 support, and reconstruction validation
         // established the row and equal-shard-length invariants required by the backend.
         Backend::Avx2X86_64 => unsafe { x86_64_avx2::apply_matrix_rows(k, rows, inputs, outputs) },
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: selected_backend verified VLEN >= 256, and reconstruction validation
+        // established the row and equal-shard-length invariants required by the backend.
+        Backend::RvvRiscv64 => unsafe { riscv64_rvv::apply_matrix_rows(k, rows, inputs, outputs) },
     }
 }
 
@@ -410,6 +436,277 @@ pub(crate) fn invert_matrix(input: &mut [u8], output: &mut [u8], n: usize) -> Re
     }
 
     Ok(())
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline]
+pub(crate) unsafe fn riscv64_vector_len_bytes() -> usize {
+    // SAFETY: the caller guarantees that the vector extension is present.
+    unsafe { riscv64_rvv::vector_len_bytes() }
+}
+
+#[cfg(target_arch = "riscv64")]
+mod riscv64_rvv {
+    use super::{GF_RVV_NIBBLE_TABLES, MAX_TOTAL_SHARDS};
+    use core::arch::global_asm;
+
+    global_asm!(
+        r#"
+        .pushsection .text.argmin_ec_rvv_dot_product_vlen256, "ax", @progbits
+        .balign 4
+        .globl argmin_ec_rvv_dot_product_vlen256
+        .hidden argmin_ec_rvv_dot_product_vlen256
+        .type argmin_ec_rvv_dot_product_vlen256, @function
+        .option push
+        .option arch, +v
+
+        .macro gf_mul_xor accumulator, source
+        vand.vi v10, \source, 15
+        vsrl.vi v11, \source, 4
+        vrgather.vv v12, v8, v10
+        vrgather.vv v13, v9, v11
+        vxor.vv v12, v12, v13
+        vxor.vv \accumulator, \accumulator, v12
+        .endm
+
+argmin_ec_rvv_dot_product_vlen256:
+        # a0: input count
+        # a1: first coefficient address
+        # a2: coefficient stride
+        # a3: input-pointer array
+        # a4: output address
+        # a5: byte length
+        # a6: packed nibble-table base
+        beqz a5, 9f
+        li a7, 0
+        li t6, 32
+        vsetvli zero, t6, e8, m1, ta, ma
+        li t6, 128
+        bltu a5, t6, 4f
+
+1:
+        vmv.v.i v0, 0
+        vmv.v.i v1, 0
+        vmv.v.i v2, 0
+        vmv.v.i v3, 0
+        li t0, 0
+        mv t1, a1
+        mv t2, a3
+
+2:
+        lbu t3, 0(t1)
+        beqz t3, 3f
+        ld t4, 0(t2)
+        add t4, t4, a7
+        vle8.v v4, (t4)
+        addi t5, t4, 32
+        vle8.v v5, (t5)
+        addi t5, t4, 64
+        vle8.v v6, (t5)
+        addi t5, t4, 96
+        vle8.v v7, (t5)
+
+        li t5, 1
+        beq t3, t5, 8f
+        slli t5, t3, 5
+        add t5, a6, t5
+        vle8.v v8, (t5)
+        addi t5, t5, 16
+        vle8.v v9, (t5)
+        gf_mul_xor v0, v4
+        gf_mul_xor v1, v5
+        gf_mul_xor v2, v6
+        gf_mul_xor v3, v7
+        j 3f
+
+8:
+        vxor.vv v0, v0, v4
+        vxor.vv v1, v1, v5
+        vxor.vv v2, v2, v6
+        vxor.vv v3, v3, v7
+
+3:
+        add t1, t1, a2
+        addi t2, t2, 8
+        addi t0, t0, 1
+        bltu t0, a0, 2b
+
+        vse8.v v0, (a4)
+        addi t5, a4, 32
+        vse8.v v1, (t5)
+        addi t5, a4, 64
+        vse8.v v2, (t5)
+        addi t5, a4, 96
+        vse8.v v3, (t5)
+        addi a4, a4, 128
+        addi a7, a7, 128
+        addi a5, a5, -128
+        li t6, 128
+        bgeu a5, t6, 1b
+        beqz a5, 9f
+
+4:
+        vsetvli t6, a5, e8, m1, ta, ma
+        vmv.v.i v0, 0
+        li t0, 0
+        mv t1, a1
+        mv t2, a3
+
+5:
+        lbu t3, 0(t1)
+        beqz t3, 6f
+        ld t4, 0(t2)
+        add t4, t4, a7
+        vle8.v v4, (t4)
+        li t5, 1
+        beq t3, t5, 7f
+
+        slli t5, t3, 5
+        add t5, a6, t5
+        vsetivli zero, 16, e8, m1, ta, ma
+        vle8.v v8, (t5)
+        addi t5, t5, 16
+        vle8.v v9, (t5)
+        vsetvli zero, t6, e8, m1, ta, ma
+        gf_mul_xor v0, v4
+        j 6f
+
+7:
+        vxor.vv v0, v0, v4
+
+6:
+        add t1, t1, a2
+        addi t2, t2, 8
+        addi t0, t0, 1
+        bltu t0, a0, 5b
+
+        vse8.v v0, (a4)
+        add a4, a4, t6
+        add a7, a7, t6
+        sub a5, a5, t6
+        bnez a5, 4b
+
+9:
+        ret
+        .purgem gf_mul_xor
+        .option pop
+        .size argmin_ec_rvv_dot_product_vlen256, .-argmin_ec_rvv_dot_product_vlen256
+        .popsection
+
+        .pushsection .text.argmin_ec_riscv64_vector_len_bytes, "ax", @progbits
+        .balign 4
+        .globl argmin_ec_riscv64_vector_len_bytes
+        .hidden argmin_ec_riscv64_vector_len_bytes
+        .type argmin_ec_riscv64_vector_len_bytes, @function
+        .option push
+        .option arch, +v
+argmin_ec_riscv64_vector_len_bytes:
+        csrr a0, vlenb
+        ret
+        .option pop
+        .size argmin_ec_riscv64_vector_len_bytes, .-argmin_ec_riscv64_vector_len_bytes
+        .popsection
+        "#,
+    );
+
+    unsafe extern "C" {
+        fn argmin_ec_rvv_dot_product_vlen256(
+            input_count: usize,
+            coefficients: *const u8,
+            coefficient_stride: usize,
+            inputs: *const *const u8,
+            output: *mut u8,
+            len: usize,
+            nibble_tables: *const u8,
+        );
+        fn argmin_ec_riscv64_vector_len_bytes() -> usize;
+    }
+
+    /// Returns the architectural vector register length in bytes.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support the RISC-V vector extension.
+    #[inline]
+    pub(super) unsafe fn vector_len_bytes() -> usize {
+        // SAFETY: the caller guarantees that the vector extension makes vlenb accessible.
+        unsafe { argmin_ec_riscv64_vector_len_bytes() }
+    }
+
+    fn input_pointers(k: usize, inputs: &[&[u8]]) -> [*const u8; MAX_TOTAL_SHARDS] {
+        let mut pointers = [core::ptr::null(); MAX_TOTAL_SHARDS];
+        for (slot, input) in pointers.iter_mut().zip(inputs.iter()).take(k) {
+            *slot = input.as_ptr();
+        }
+        pointers
+    }
+
+    /// Encodes output rows using RVV byte table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support V with VLEN >= 256 bits. `k` must be in
+    /// `1..=MAX_TOTAL_SHARDS`; `data` must contain at least `k` equally sized shards; every output
+    /// must have that same size; and `tables` must contain 256 bytes for every
+    /// output-row/input-column pair.
+    pub(super) unsafe fn encode_rows(
+        k: usize,
+        tables: &[u8],
+        data: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        assert!((1..=MAX_TOTAL_SHARDS).contains(&k));
+        let inputs = input_pointers(k, data);
+        for (row, output) in outputs.iter_mut().enumerate() {
+            let coefficient_offset = row * k * 256 + 1;
+            // SAFETY: the caller guarantees all shape and vector-feature invariants. Coefficients
+            // are the byte-at-index-one entries in consecutive 256-byte multiplication tables.
+            unsafe {
+                argmin_ec_rvv_dot_product_vlen256(
+                    k,
+                    tables.as_ptr().add(coefficient_offset),
+                    256,
+                    inputs.as_ptr(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    GF_RVV_NIBBLE_TABLES.as_ptr(),
+                );
+            }
+        }
+    }
+
+    /// Applies matrix rows using RVV byte table lookups.
+    ///
+    /// # Safety
+    ///
+    /// The current CPU must support V with VLEN >= 256 bits. `k` must be in
+    /// `1..=MAX_TOTAL_SHARDS`; `inputs` must contain at least `k` equally sized shards; every output
+    /// must be no longer than an input shard; and `rows` must contain `k` coefficients for every
+    /// output.
+    pub(super) unsafe fn apply_matrix_rows(
+        k: usize,
+        rows: &[u8],
+        inputs: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        assert!((1..=MAX_TOTAL_SHARDS).contains(&k));
+        let input_pointers = input_pointers(k, inputs);
+        for (row_index, output) in outputs.iter_mut().enumerate() {
+            // SAFETY: the caller guarantees all shape and vector-feature invariants. The selected
+            // row contains `k` contiguous coefficients.
+            unsafe {
+                argmin_ec_rvv_dot_product_vlen256(
+                    k,
+                    rows.as_ptr().add(row_index * k),
+                    1,
+                    input_pointers.as_ptr(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    GF_RVV_NIBBLE_TABLES.as_ptr(),
+                );
+            }
+        }
+    }
 }
 
 #[cfg(target_arch = "aarch64")]

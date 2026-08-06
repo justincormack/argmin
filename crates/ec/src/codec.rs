@@ -165,6 +165,8 @@ pub(crate) enum Backend {
     Avx512X86_64,
     #[cfg(target_arch = "x86_64")]
     Avx2X86_64,
+    #[cfg(target_arch = "riscv64")]
+    RvvRiscv64,
 }
 
 #[inline]
@@ -191,6 +193,13 @@ pub(crate) fn selected_backend() -> Backend {
         }
     }
 
+    #[cfg(target_arch = "riscv64")]
+    {
+        if has_rvv_riscv64() {
+            return Backend::RvvRiscv64;
+        }
+    }
+
     Backend::Scalar
 }
 
@@ -209,6 +218,8 @@ pub(crate) const fn backend_name_for(backend: Backend) -> &'static str {
         Backend::Avx512X86_64 => "x86_64-avx512",
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2X86_64 => "x86_64-avx2",
+        #[cfg(target_arch = "riscv64")]
+        Backend::RvvRiscv64 => "riscv64-rvv",
     }
 }
 
@@ -232,31 +243,160 @@ pub(crate) fn has_neon_aarch64() -> bool {
 }
 
 #[inline]
-fn bench_override_backend() -> Option<Backend> {
-    static OVERRIDE: OnceLock<Option<Backend>> = OnceLock::new();
+#[cfg(target_arch = "riscv64")]
+pub(crate) fn has_rvv_riscv64() -> bool {
+    static HAS_RVV_HARDWARE: OnceLock<bool> = OnceLock::new();
+    static HAS_RVV_VLEN256: OnceLock<bool> = OnceLock::new();
 
-    *OVERRIDE.get_or_init(|| {
-        let override_name = std::env::var("ARGMIN_EC_BENCH_BACKEND")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase());
+    if !*HAS_RVV_HARDWARE.get_or_init(riscv64_has_vector_hardware)
+        || !riscv64_vector_enabled_for_thread()
+    {
+        return false;
+    }
 
-        match override_name.as_deref() {
-            Some("scalar") => Some(Backend::Scalar),
-            #[cfg(target_arch = "aarch64")]
-            Some("neon") if has_neon_aarch64() => Some(Backend::NeonAarch64),
-            #[cfg(target_arch = "x86_64")]
-            Some("avx512") if has_avx512_x86_64() => Some(Backend::Avx512X86_64),
-            #[cfg(target_arch = "x86_64")]
-            Some("avx2") if has_avx2_x86_64() => Some(Backend::Avx2X86_64),
-            _ => None,
-        }
+    *HAS_RVV_VLEN256.get_or_init(|| {
+        // SAFETY: runtime feature detection verified that the process can use vector instructions,
+        // and the calling thread has vector state enabled, so vlenb is accessible.
+        unsafe { crate::gf::riscv64_vector_len_bytes() >= 32 }
     })
+}
+
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+fn riscv64_has_vector_hardware() -> bool {
+    use core::arch::asm;
+
+    #[repr(C)]
+    struct HwprobePair {
+        key: i64,
+        value: u64,
+    }
+
+    unsafe extern "C" {
+        fn getauxval(aux_type: usize) -> usize;
+    }
+
+    const RISCV_HWPROBE_SYSCALL: usize = 258;
+    const RISCV_HWPROBE_KEY_IMA_EXT_0: i64 = 4;
+    const RISCV_HWPROBE_IMA_V: u64 = 1 << 2;
+    const RISCV_HWPROBE_EXT_ZVE32X: u64 = 1 << 37;
+    const AT_HWCAP: usize = 16;
+    const HWCAP_ISA_V: usize = 1 << (b'v' - b'a');
+
+    let mut pair = HwprobePair {
+        key: RISCV_HWPROBE_KEY_IMA_EXT_0,
+        value: 0,
+    };
+    let mut result = (&raw mut pair).addr() as isize;
+    // SAFETY: this invokes Linux's riscv_hwprobe syscall with one writable pair and no CPU mask.
+    // The kernel validates the arguments before writing the pair.
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") result,
+            in("a1") 1usize,
+            in("a2") 0usize,
+            in("a3") 0usize,
+            in("a4") 0usize,
+            in("a7") RISCV_HWPROBE_SYSCALL,
+            options(nostack),
+        );
+    }
+    let hwprobe_has_vectors = result == 0
+        && pair.key == RISCV_HWPROBE_KEY_IMA_EXT_0
+        && pair.value & (RISCV_HWPROBE_IMA_V | RISCV_HWPROBE_EXT_ZVE32X) != 0;
+
+    // HWCAP has reported single-letter V since Linux first exposed vector support, so it also
+    // covers kernels whose hwprobe implementation does not populate the newer vector bits.
+    // SAFETY: getauxval reads the process's immutable ELF auxiliary vector.
+    let hwcap_has_vectors = unsafe { getauxval(AT_HWCAP) } & HWCAP_ISA_V != 0;
+    hwprobe_has_vectors || hwcap_has_vectors
+}
+
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+std::thread_local! {
+    static RISCV64_VECTOR_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+fn riscv64_vector_enabled_for_thread() -> bool {
+    unsafe extern "C" {
+        fn prctl(option: i32, ...) -> i32;
+    }
+
+    const EINVAL: i32 = 22;
+    const PR_RISCV_V_GET_CONTROL: i32 = 70;
+    const PR_RISCV_V_VSTATE_CTRL_CUR_MASK: i32 = 3;
+    const PR_RISCV_V_VSTATE_CTRL_ON: i32 = 2;
+
+    RISCV64_VECTOR_ENABLED.with(|enabled| {
+        if enabled.get() {
+            return true;
+        }
+
+        // Vector enablement is thread-local. A positive result may be cached because Linux does not
+        // allow a thread to disable vector state once it has been enabled. A negative result is not
+        // cached because the thread may enable vector state later.
+        // SAFETY: PR_RISCV_V_GET_CONTROL takes no additional pointer arguments; the zero variadic
+        // arguments are ignored.
+        let vector_control =
+            unsafe { prctl(PR_RISCV_V_GET_CONTROL, 0usize, 0usize, 0usize, 0usize) };
+        let is_enabled = if vector_control >= 0 {
+            vector_control & PR_RISCV_V_VSTATE_CTRL_CUR_MASK == PR_RISCV_V_VSTATE_CTRL_ON
+        } else {
+            // Kernels predating the vector-control interface report EINVAL. On those kernels the
+            // hardware capability bits are authoritative. Other errors, including seccomp EPERM,
+            // must conservatively disable this backend.
+            std::io::Error::last_os_error().raw_os_error() == Some(EINVAL)
+        };
+        if is_enabled {
+            enabled.set(true);
+        }
+        is_enabled
+    })
+}
+
+#[cfg(all(target_arch = "riscv64", not(target_os = "linux")))]
+fn riscv64_has_vector_hardware() -> bool {
+    false
+}
+
+#[cfg(all(target_arch = "riscv64", not(target_os = "linux")))]
+fn riscv64_vector_enabled_for_thread() -> bool {
+    false
+}
+
+#[inline]
+fn bench_override_backend() -> Option<Backend> {
+    static OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+
+    let override_name = OVERRIDE.get_or_init(|| {
+        std::env::var("ARGMIN_EC_BENCH_BACKEND")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+    });
+
+    match override_name.as_deref() {
+        Some("scalar") => Some(Backend::Scalar),
+        #[cfg(target_arch = "aarch64")]
+        Some("neon") if has_neon_aarch64() => Some(Backend::NeonAarch64),
+        #[cfg(target_arch = "x86_64")]
+        Some("avx512") if has_avx512_x86_64() => Some(Backend::Avx512X86_64),
+        #[cfg(target_arch = "x86_64")]
+        Some("avx2") if has_avx2_x86_64() => Some(Backend::Avx2X86_64),
+        #[cfg(target_arch = "riscv64")]
+        Some("rvv") if has_rvv_riscv64() => Some(Backend::RvvRiscv64),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 pub(crate) fn supported_backends() -> Vec<Backend> {
     #[cfg_attr(
-        not(any(target_arch = "aarch64", target_arch = "x86_64")),
+        not(any(
+            target_arch = "aarch64",
+            target_arch = "riscv64",
+            target_arch = "x86_64"
+        )),
         allow(unused_mut)
     )]
     let mut backends = vec![Backend::Scalar];
@@ -271,6 +411,10 @@ pub(crate) fn supported_backends() -> Vec<Backend> {
     #[cfg(target_arch = "x86_64")]
     if has_avx2_x86_64() {
         backends.push(Backend::Avx2X86_64);
+    }
+    #[cfg(target_arch = "riscv64")]
+    if has_rvv_riscv64() {
+        backends.push(Backend::RvvRiscv64);
     }
     backends
 }
