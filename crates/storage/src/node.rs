@@ -601,16 +601,17 @@ impl LocalNodeRuntime {
         self.node.data_pg(pg_id)
     }
 
-    pub(crate) fn write_erasure_coded_segment_shards_with<F>(
+    pub(crate) fn write_erasure_coded_segment_shards_with<F, E>(
         &self,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
         ec: EcShape,
         write_shards: F,
-    ) -> Result<Vec<crate::WrittenShardAck>, StoreError>
+    ) -> Result<Vec<crate::WrittenShardAck>, E>
     where
-        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, StoreError>,
+        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, E>,
+        E: From<StoreError>,
     {
         self.node.write_erasure_coded_segment_shards_with(
             segment_okh,

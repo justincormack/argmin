@@ -1221,7 +1221,8 @@ pub struct PayloadShardReadTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub(crate) struct PayloadShardWriteTestHookGuard {
+#[doc(hidden)]
+pub struct PayloadShardWriteTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -3384,6 +3385,25 @@ impl ActivePutObjectRoute<'_> {
                 input,
                 || self.admission.require_valid_now(),
                 || {},
+                || Ok(()),
+            )
+    }
+
+    /// Append one segment while maintaining a caller-owned reservation between
+    /// preparation, erasure-coded shard writes, and metadata commit.
+    pub fn append_stream_segment_with_lease_maintenance(
+        &self,
+        input: StreamSegmentAppendInput<'_>,
+        maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .append_stream_segment_with_route_validation(
+                self.effect_route(),
+                input,
+                || self.admission.require_valid_now(),
+                || {},
+                maintain_lease,
             )
     }
 
@@ -3401,6 +3421,26 @@ impl ActivePutObjectRoute<'_> {
                 input,
                 || self.admission.require_valid_now(),
                 after_prepare,
+                || Ok(()),
+            )
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn test_append_stream_segment_with_after_prepare_and_lease_maintenance(
+        &self,
+        input: StreamSegmentAppendInput<'_>,
+        after_prepare: impl FnMut(),
+        maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
+    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        self.admission
+            .cluster
+            .append_stream_segment_with_route_validation(
+                self.effect_route(),
+                input,
+                || self.admission.require_valid_now(),
+                after_prepare,
+                maintain_lease,
             )
     }
 
@@ -3759,6 +3799,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 input,
                 || self.admission.require_valid_now(),
                 || {},
+                || Ok(()),
             )
     }
 
@@ -3776,6 +3817,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 input,
                 || self.admission.require_valid_now(),
                 after_prepare,
+                || Ok(()),
             )
     }
 
@@ -12045,7 +12087,8 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn test_install_before_placed_payload_shard_write_hook(
+    #[doc(hidden)]
+    pub fn test_install_before_placed_payload_shard_write_hook(
         &self,
         hook: PayloadShardWriteTestHook,
     ) -> PayloadShardWriteTestHookGuard {
@@ -12382,6 +12425,7 @@ impl StorageCluster {
             },
             Some(effect_fence),
             &mut require_valid_route,
+            &mut || Ok(()),
         )?;
 
         Ok(DirectPutWrittenSegment {
@@ -12410,27 +12454,33 @@ impl StorageCluster {
             },
             None,
             &mut || Ok(()),
+            &mut || Ok(()),
         )
     }
 
-    fn write_placed_segment_payload_shards_with_route_validation(
+    fn write_placed_segment_payload_shards_with_route_validation<E>(
         &self,
         data_pg: DataPgId,
         ec: EcShape,
         write: PlacedSegmentPayloadWrite<'_>,
         effect_fence: Option<AdmittedRouteEffectFence>,
         require_valid_route: &mut impl FnMut() -> Result<(), StoreError>,
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        maintain_lease: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Vec<WrittenShardAck>, E>
+    where
+        E: From<StoreError>,
+    {
         let PlacedSegmentPayloadWrite {
             segment_okh,
             segment_vid,
             data,
         } = write;
-        require_valid_route()?;
+        require_valid_route().map_err(E::from)?;
         let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
         let locations = self
             .place_payload_shards(data_pg, ec, &placement_key)
-            .map_err(cluster_build_error_to_store)?;
+            .map_err(cluster_build_error_to_store)
+            .map_err(E::from)?;
         self.local_map.write_erasure_coded_segment_shards_with(
             segment_okh,
             segment_vid,
@@ -12443,7 +12493,7 @@ impl StorageCluster {
                 for (location, (shard_key, shard_payload)) in
                     locations.iter().zip(shard_batch.iter())
                 {
-                    if let Err(error) = require_valid_route() {
+                    if let Err(error) = maintain_lease() {
                         self.delete_payload_shard_keys_best_effort(
                             data_pg.get(),
                             ec,
@@ -12454,6 +12504,18 @@ impl StorageCluster {
                                 .map(|written| written.key.clone()),
                         );
                         return Err(error);
+                    }
+                    if let Err(error) = require_valid_route() {
+                        self.delete_payload_shard_keys_best_effort(
+                            data_pg.get(),
+                            ec,
+                            segment_okh,
+                            segment_vid,
+                            written_for_cleanup
+                                .iter()
+                                .map(|written| written.key.clone()),
+                        );
+                        return Err(E::from(error));
                     }
                     let write_result = effect_fence.map_or_else(
                         || self.write_payload_shard(*location, shard_key, shard_payload),
@@ -12484,7 +12546,7 @@ impl StorageCluster {
                                     .iter()
                                     .map(|written| written.key.clone()),
                             );
-                            return Err(shard_io_error_to_store(error));
+                            return Err(E::from(shard_io_error_to_store(error)));
                         }
                     }
                 }
@@ -15934,6 +15996,7 @@ impl StorageCluster {
             input,
             || Ok(()),
             || {},
+            || Ok(()),
         )
     }
 
@@ -15957,6 +16020,7 @@ impl StorageCluster {
             input,
             || Ok(()),
             after_prepare,
+            || Ok(()),
         )
     }
 
@@ -15966,6 +16030,7 @@ impl StorageCluster {
         input: StreamSegmentAppendInput<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut after_prepare: impl FnMut(),
+        mut maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
     ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
         require_valid_route().map_err(ObjectPgActionError::Store)?;
         let session = self.load_stream_upload_session_on_route(route, input.session_id)?;
@@ -15994,14 +16059,21 @@ impl StorageCluster {
             &mut require_valid_route,
         )?;
         after_prepare();
-        let written_shards = self
-            .write_stream_segment_payload_shards_with_route_validation(
+        maintain_lease()?;
+        let written_shards = self.write_stream_segment_payload_shards_with_route_validation(
+            &segment_record,
+            input.storage_bytes,
+            route.effect_fence,
+            &mut require_valid_route,
+            &mut maintain_lease,
+        )?;
+        if let Err(error) = maintain_lease() {
+            self.delete_stream_segment_payload_shard_keys_best_effort(
                 &segment_record,
-                input.storage_bytes,
-                route.effect_fence,
-                &mut require_valid_route,
-            )
-            .map_err(ObjectPgActionError::Store)?;
+                written_shards.iter().map(|written| written.key.clone()),
+            );
+            return Err(error);
+        }
         let shard_batch = written_shards
             .iter()
             .map(|written| (&written.key, written.ack))
@@ -16095,11 +16167,13 @@ impl StorageCluster {
         data: &[u8],
         effect_fence: AdmittedRouteEffectFence,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
-    ) -> Result<Vec<WrittenShardAck>, StoreError> {
+        maintain_lease: &mut impl FnMut() -> Result<(), ObjectPgActionError>,
+    ) -> Result<Vec<WrittenShardAck>, ObjectPgActionError> {
         if segment_record.placement_cluster_epoch != self.operation_epoch() {
             return Err(StoreError::RouteCapabilitySubjectMismatch {
                 operation: "write put object stream segment from another placement epoch",
-            });
+            }
+            .into());
         }
         let ec = EcShape {
             k: segment_record.ec_k,
@@ -16115,6 +16189,7 @@ impl StorageCluster {
             },
             Some(effect_fence),
             &mut require_valid_route,
+            maintain_lease,
         )
     }
 

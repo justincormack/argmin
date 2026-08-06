@@ -127,6 +127,26 @@ impl<'a> StreamSegmentAppendPayload<'a> {
     }
 }
 
+pub(crate) struct AdmittedStreamSegmentAppend<'a> {
+    pub(crate) session_id: &'a storage::SessionId,
+    pub(crate) segment_index: u32,
+    pub(crate) payload: StreamSegmentAppendPayload<'a>,
+}
+
+impl<'a> AdmittedStreamSegmentAppend<'a> {
+    pub(crate) fn new(
+        session_id: &'a storage::SessionId,
+        segment_index: u32,
+        payload: StreamSegmentAppendPayload<'a>,
+    ) -> Self {
+        Self {
+            session_id,
+            segment_index,
+            payload,
+        }
+    }
+}
+
 pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataError) -> bool {
     error.is_command_contention()
 }

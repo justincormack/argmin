@@ -4,16 +4,17 @@ use crate::{EcShape, WrittenShardAck};
 use crate::{PrepareStreamUploadSegmentAppendReq, StreamUploadRecord, StreamUploadSegmentRecord};
 
 impl SharedStorageNode {
-    pub(crate) fn write_erasure_coded_segment_shards_with<F>(
+    pub(crate) fn write_erasure_coded_segment_shards_with<F, E>(
         &self,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
         ec: EcShape,
         write_shards: F,
-    ) -> Result<Vec<WrittenShardAck>, StoreError>
+    ) -> Result<Vec<WrittenShardAck>, E>
     where
-        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, StoreError>,
+        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, E>,
+        E: From<StoreError>,
     {
         let state = self.ec_write_state(ec)?;
         let k = ec.k as usize;
@@ -274,18 +275,20 @@ mod tests {
                             .iter()
                             .map(|(_, shard_payload)| shard_payload.len())
                             .collect();
-                        Ok(shards
-                            .iter()
-                            .map(|(key, shard_payload)| {
-                                (
-                                    key.clone(),
-                                    WriteAck {
-                                        stored_size: shard_payload.len() as u64,
-                                        crc64: checksum::crc64::checksum(shard_payload),
-                                    },
-                                )
-                            })
-                            .collect())
+                        Ok::<_, StoreError>(
+                            shards
+                                .iter()
+                                .map(|(key, shard_payload)| {
+                                    (
+                                        key.clone(),
+                                        WriteAck {
+                                            stored_size: shard_payload.len() as u64,
+                                            crc64: checksum::crc64::checksum(shard_payload),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        )
                     },
                 )
                 .unwrap();

@@ -22,6 +22,11 @@ use super::{
 use crate::conditional::check_copy_source_conditions;
 use crate::error::ServerError;
 
+// A stream reservation lasts 15 seconds. Renew within four seconds so each
+// bounded append phase following a checkpoint retains at least one second of
+// lease margin beyond its 10-second retry budget.
+const COPY_OBJECT_STREAM_HEARTBEAT_INTERVAL_MILLIS: u64 = 4_000;
+
 fn copy_source_response_version_id(
     requested_version_id: Option<storage::VersionId>,
     selected_version_id: storage::VersionId,
@@ -31,6 +36,22 @@ fn copy_source_response_version_id(
 }
 
 impl Coordinator {
+    fn heartbeat_copy_object_stream_if_due(
+        route: &storage::ActivePutObjectRoute<'_>,
+        session_id: &storage::SessionId,
+        last_heartbeat_millis: &mut u64,
+    ) -> Result<(), storage::ObjectPgActionError> {
+        let now_millis = storage::clock::monotonic_time_millis();
+        if now_millis.saturating_sub(*last_heartbeat_millis)
+            < COPY_OBJECT_STREAM_HEARTBEAT_INTERVAL_MILLIS
+        {
+            return Ok(());
+        }
+        route.heartbeat_stream_session(session_id)?;
+        *last_heartbeat_millis = storage::clock::monotonic_time_millis();
+        Ok(())
+    }
+
     fn take_authorized_copy_source_snapshot(
         snapshot: Arc<storage::ObjectReadSnapshot>,
     ) -> Result<storage::ObjectReadSnapshot, ServerError> {
@@ -383,11 +404,24 @@ impl Coordinator {
             .map_err(Self::map_object_pg_action_error)?;
         let dst_write_encryption = &dst_authorized.write_encryption;
         let copy_result = (|| {
+            // Session creation has its own retry work and can consume much of
+            // the initial reservation. Renew before the first potentially slow
+            // source read rather than waiting for a checkpoint after that read.
+            destination_route
+                .heartbeat_stream_session(&session_id)
+                .map_err(Self::map_object_pg_action_error)?;
+            let mut last_heartbeat_millis = storage::clock::monotonic_time_millis();
             let mut crc64 = checksum::crc64::Hasher::new();
             let mut total_size = 0u64;
             let mut segment_index = 0u32;
 
             while let Some(chunk) = source_body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
+                Self::heartbeat_copy_object_stream_if_due(
+                    &destination_route,
+                    &session_id,
+                    &mut last_heartbeat_millis,
+                )
+                .map_err(Self::map_object_pg_action_error)?;
                 total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
                     ServerError::InternalError {
                         reason: "copy size overflow".to_string(),
@@ -398,15 +432,42 @@ impl Coordinator {
                     checksum.update(&chunk);
                 }
                 let chunk_crc64 = checksum::crc64::checksum(&chunk);
+                Self::heartbeat_copy_object_stream_if_due(
+                    &destination_route,
+                    &session_id,
+                    &mut last_heartbeat_millis,
+                )
+                .map_err(Self::map_object_pg_action_error)?;
                 let storage_chunk = dst_write_encryption.encrypt_segment(segment_index, &chunk)?;
-                self.append_stream_segment_on_admitted_put_route(
+                Self::heartbeat_copy_object_stream_if_due(
+                    &destination_route,
+                    &session_id,
+                    &mut last_heartbeat_millis,
+                )
+                .map_err(Self::map_object_pg_action_error)?;
+                self.append_stream_segment_on_admitted_put_route_with_lease_maintenance(
                     &destination_route,
                     req.destination.bucket.name_typed(),
                     req.destination.key_typed(),
-                    &session_id,
-                    segment_index,
-                    super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
+                    super::AdmittedStreamSegmentAppend::new(
+                        &session_id,
+                        segment_index,
+                        super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
+                    ),
+                    || {
+                        Self::heartbeat_copy_object_stream_if_due(
+                            &destination_route,
+                            &session_id,
+                            &mut last_heartbeat_millis,
+                        )
+                    },
                 )?;
+                Self::heartbeat_copy_object_stream_if_due(
+                    &destination_route,
+                    &session_id,
+                    &mut last_heartbeat_millis,
+                )
+                .map_err(Self::map_object_pg_action_error)?;
                 segment_index =
                     segment_index
                         .checked_add(1)
@@ -415,6 +476,12 @@ impl Coordinator {
                         })?;
             }
 
+            Self::heartbeat_copy_object_stream_if_due(
+                &destination_route,
+                &session_id,
+                &mut last_heartbeat_millis,
+            )
+            .map_err(Self::map_object_pg_action_error)?;
             if let Some(checksum) = replacement_checksum.take() {
                 use base64::Engine;
 

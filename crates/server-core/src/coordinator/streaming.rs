@@ -618,6 +618,63 @@ impl Coordinator {
         self.append_stream_segment_on_route(route, bucket, key, session_id, segment_index, payload)
     }
 
+    pub(super) fn append_stream_segment_on_admitted_put_route_with_lease_maintenance(
+        &self,
+        route: &storage::ActivePutObjectRoute<'_>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        append: super::AdmittedStreamSegmentAppend<'_>,
+        maintain_lease: impl FnMut() -> Result<(), storage::ObjectPgActionError>,
+    ) -> Result<(), ServerError> {
+        let super::AdmittedStreamSegmentAppend {
+            session_id,
+            segment_index,
+            payload,
+        } = append;
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::append_stream_segment",
+            "bucket={:?} key={:?} session_id={:?} segment_index={} bytes={}",
+            bucket,
+            key,
+            session_id,
+            segment_index,
+            payload.storage_bytes.len()
+        );
+        let input = StreamSegmentAppendInput {
+            session_id,
+            segment_index,
+            payload_crc64: payload.payload_crc64,
+            storage_bytes: payload.storage_bytes,
+        };
+
+        #[cfg(test)]
+        let outcome = route
+            .test_append_stream_segment_with_after_prepare_and_lease_maintenance(
+                input,
+                || {
+                    self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
+                },
+                maintain_lease,
+            )
+            .map_err(Self::map_object_pg_action_error)?;
+        #[cfg(not(test))]
+        let outcome = route
+            .append_stream_segment_with_lease_maintenance(input, maintain_lease)
+            .map_err(Self::map_object_pg_action_error)?;
+
+        Self::emit_stream_segment_layout(
+            &outcome.target,
+            bucket.as_str(),
+            key.as_str(),
+            session_id,
+            segment_index,
+            outcome.logical_size as usize,
+        );
+
+        Ok(())
+    }
+
     pub(super) fn append_stream_segment_on_admitted_multipart_route(
         &self,
         route: &storage::ActiveMultipartObjectRoute<'_>,

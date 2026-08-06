@@ -3689,16 +3689,17 @@ impl LocalClusterMap {
         .expect("installed multipart placement must select a configured data PG")
     }
 
-    pub(crate) fn write_erasure_coded_segment_shards_with<F>(
+    pub(crate) fn write_erasure_coded_segment_shards_with<F, E>(
         &self,
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
         data: &[u8],
         ec: EcShape,
         write_shards: F,
-    ) -> Result<Vec<WrittenShardAck>, StoreError>
+    ) -> Result<Vec<WrittenShardAck>, E>
     where
-        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, StoreError>,
+        F: FnOnce(&[(ShardKey, &[u8])]) -> Result<Vec<(ShardKey, WriteAck)>, E>,
+        E: From<StoreError>,
     {
         self.metadata_primary()
             .runtime()

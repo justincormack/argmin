@@ -1568,6 +1568,125 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
 }
 
 #[test]
+fn copy_object_heartbeats_destination_stream_reservation_before_finalize() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "copy-source",
+                test_requester(),
+                None,
+            ),
+            data: b"copy payload",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let _serial = STORAGE_TEST_HOOK_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let create_clock = Arc::clone(&clock);
+    let create_hook_pending = Arc::new(AtomicBool::new(true));
+    let create_hook_pending_for_hook = Arc::clone(&create_hook_pending);
+    let _create_hook = storage_cluster.test_install_before_metadata_command_pending_install_hook(
+        Arc::new(move || {
+            if create_hook_pending_for_hook.swap(false, Ordering::SeqCst) {
+                // Session creation consumed nine seconds of the original
+                // reservation. CopyObject must renew before reading source data.
+                create_clock.set(10_000);
+            }
+        }),
+    );
+    let read_clock = Arc::clone(&clock);
+    let _read_hook = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
+        move |_, _| {
+            // Model the first source read consuming another ten seconds.
+            read_clock.set(20_000);
+            Ok(())
+        },
+    ));
+    let write_clock = Arc::clone(&clock);
+    let _write_hook = storage_cluster.test_install_before_placed_payload_shard_write_hook(
+        Arc::new(move |_, _| {
+            // Move the clock during destination shard writes. Lease maintenance
+            // inside the write loop must renew before the next shard.
+            write_clock.set(30_000);
+            Ok(())
+        }),
+    );
+    let append_clock = Arc::clone(&clock);
+    let _append_hook =
+        storage_cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
+            // Model append commit consuming its separate ten-second budget.
+            append_clock.set(40_000);
+        }));
+    let finalize_clock = Arc::clone(&clock);
+    let _finalize_hook = storage_cluster.test_install_before_stream_put_finalize_command_id_hook(
+        Arc::new(move || {
+            // The post-append checkpoint must also renew the reservation for
+            // the remaining copy and finalization work.
+            finalize_clock.set(50_000);
+        }),
+    );
+    let admission = coord.admit_storage_route_for_request().unwrap();
+
+    let result = coord
+        .copy_object_on_admitted_route(
+            &admission,
+            &CopyObjectRequest {
+                source: copy_source("bucket", "copy-source", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "copy-destination",
+                    test_requester(),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                website_redirect_location: None,
+                tagging: TaggingDirective::Copy,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            },
+        )
+        .unwrap();
+    assert!(!create_hook_pending.load(Ordering::SeqCst));
+
+    assert_eq!(
+        result.etag,
+        format_etag(checksum::crc64::checksum(b"copy payload"))
+    );
+    let copied = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request("bucket", "copy-destination", None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(copied.body.read_all().unwrap(), b"copy payload");
+}
+
+#[test]
 fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() {
     let tmp = test_util::tempdir();
     let initial = open_test_storage_cluster(tmp.path(), &[0]);
