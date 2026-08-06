@@ -5562,6 +5562,80 @@ fail_with_matches \
     "Physical-shard public-surface source-root scan must find only the nested unrelated-module fixture" \
     "$physical_shard_public_test_surface_fixture_failure"
 
+stream_route_scheduling_public_surface_pattern='^[[:space:]]*pub[[:space:]]+fn[[:space:]]+test_append_stream_segment_with_after_prepare(_and_lease_maintenance)?\b'
+
+scan_public_stream_route_scheduling_surface() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$stream_route_scheduling_public_surface_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+public_stream_route_scheduling_surface_leaks=$(
+    scan_public_stream_route_scheduling_surface crates/storage/src
+)
+fail_with_matches \
+    "Admitted stream-route scheduling methods must remain crate-private behind storage::test_support extension traits" \
+    "$public_stream_route_scheduling_surface_leaks"
+
+stream_route_scheduling_public_surface_fixture=$(
+    scan_public_stream_route_scheduling_surface \
+        scripts/fixtures/storage-boundary-stream-route-scheduling
+)
+expected_stream_route_scheduling_public_surface_fixture='scripts/fixtures/storage-boundary-stream-route-scheduling/nested/unrelated-module.rs:3:    pub fn test_append_stream_segment_with_after_prepare(&self) {}
+scripts/fixtures/storage-boundary-stream-route-scheduling/nested/unrelated-module.rs:5:    pub fn test_append_stream_segment_with_after_prepare_and_lease_maintenance(&self) {}'
+stream_route_scheduling_public_surface_fixture_failure=""
+if [[ "$stream_route_scheduling_public_surface_fixture" != "$expected_stream_route_scheduling_public_surface_fixture" ]]; then
+    stream_route_scheduling_public_surface_fixture_failure=$stream_route_scheduling_public_surface_fixture
+    if [[ -z "$stream_route_scheduling_public_surface_fixture_failure" ]]; then
+        stream_route_scheduling_public_surface_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Stream-route scheduling public-surface source-root scan must find only the nested unrelated-module fixture" \
+    "$stream_route_scheduling_public_surface_fixture_failure"
+
+storage_scheduling_hook_public_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+test_install_(before_stream_abort_storage_hook|before_retained_stream_cleanup_capability_hook|after_retained_stream_cleanup_capability_hook|before_metadata_command_pending_install_hook|before_stream_append_command_id_hook|before_stream_put_create_pending_install_hook|before_stream_put_finalize_command_id_hook)|struct[[:space:]]+(StreamAbortTestHookGuard|RetainedStreamCleanupCapabilityTestHookGuard|AfterRetainedStreamCleanupCapabilityTestHookGuard|MetadataCommandPendingInstallHookGuard|StreamAppendCommandIdHookGuard|StreamPutCreatePendingInstallTestHookGuard|StreamPutFinalizeCommandIdTestHookGuard))\b'
+
+scan_public_storage_scheduling_hook_surface() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$storage_scheduling_hook_public_surface_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+public_storage_scheduling_hook_surface_leaks=$(
+    scan_public_storage_scheduling_hook_surface crates/storage/src
+)
+fail_with_matches \
+    "Raw storage scheduling hook methods and guards must remain crate-private behind storage::test_support" \
+    "$public_storage_scheduling_hook_surface_leaks"
+
+storage_scheduling_hook_public_surface_fixture=$(
+    scan_public_storage_scheduling_hook_surface \
+        scripts/fixtures/storage-boundary-scheduling-hooks
+)
+expected_storage_scheduling_hook_public_surface_fixture='scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:1:pub struct StreamAbortTestHookGuard;
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:6:    pub fn test_install_before_stream_abort_storage_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:8:    pub fn test_install_before_metadata_command_pending_install_hook(&self) {}
+scripts/fixtures/storage-boundary-scheduling-hooks/nested/unrelated-module.rs:10:    pub fn test_install_before_stream_put_finalize_command_id_hook(&self) {}'
+storage_scheduling_hook_public_surface_fixture_failure=""
+if [[ "$storage_scheduling_hook_public_surface_fixture" != "$expected_storage_scheduling_hook_public_surface_fixture" ]]; then
+    storage_scheduling_hook_public_surface_fixture_failure=$storage_scheduling_hook_public_surface_fixture
+    if [[ -z "$storage_scheduling_hook_public_surface_fixture_failure" ]]; then
+        storage_scheduling_hook_public_surface_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Storage scheduling-hook public-surface source-root scan must find only the nested unrelated-module fixture" \
+    "$storage_scheduling_hook_public_surface_fixture_failure"
+
 shard_backfill_maintenance_leaks=$(
     {
         rg -n --color=never \

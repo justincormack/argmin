@@ -4,7 +4,9 @@ use super::*;
 use ec::EcConfig;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
-use storage::test_support::StorageClusterPayloadTestSupport as _;
+use storage::test_support::{
+    StorageClusterPayloadTestSupport as _, StorageClusterSchedulingTestSupport as _,
+};
 use storage::StoreError;
 
 #[test]

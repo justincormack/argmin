@@ -6134,6 +6134,67 @@ Final Phase 5 audit (2026-08-04):
   boundary checker rejects cross-crate use or public reintroduction anywhere
   under the storage source tree.
 
+Phase 5 closure audit (2026-08-06):
+
+- the fail-closed normal/build feature inventory still passes with an empty
+  exception allowlist. `server-core/test-utils` does not enable
+  `storage/test-hooks`, the AWS-facing packages do not acquire either private
+  test feature, and the nested root-default fixture independently proves that
+  both forbidden root feature activations are detected;
+- the storage boundary checker, strict all-target/all-feature Clippy, and the
+  full parallel workspace suite pass. The latest full run completed all 8,097
+  tests;
+- Phase 5 is nevertheless not complete. The public-source audit found 89
+  downstream references to test-only storage entry points which remain
+  outside the curated namespace or resolve to public inherent methods. Fifty-
+  three are admitted-stream scheduling methods or raw storage hook installers
+  used by `server-core`/`server-http`, 32 use the test clock through the public
+  production `clock` module, and four inspect static-topology test state through
+  inherent methods;
+- the admitted PUT/UploadPart append hooks do execute the production admitted
+  route, so their tests should remain cross-crate, but the hook-bearing methods
+  must become `storage::test_support` extension traits and their inherent route
+  implementations must become crate-private. The same treatment is required
+  for retained-stream cleanup, pending-install, reclaim, payload-read/delete,
+  and cleanup-error hooks: preserve the deterministic scheduling semantics
+  while hiding shard identities, raw storage errors, and hook registries;
+- the clock override is an allowed deterministic test-runtime control, and the
+  static-topology values are logical observations. Move both behind
+  `storage::test_support` rather than leaving test-only methods in ordinary
+  production namespaces;
+- several additional `cfg(test-hooks)` methods remain public on re-exported
+  `StorageCluster` and `LocalClusterMap` types even though current downstream
+  callers reach equivalent curated traits or no longer call them. Make those
+  inherent implementations crate-private or owner-test-only and extend the
+  crate-wide nested-module checks so namespace enforcement does not depend on
+  current call sites; and
+- the authenticated process-level Raft/control-plane test servers remain the
+  deliberate process-boundary exception. Owner-local `cfg(test)` helpers and
+  public declarations trapped inside private storage modules are not
+  cross-crate API, although unnecessarily broad declarations should be reduced
+  when their containing slice is touched.
+
+The first closure slice moves the admitted PUT and UploadPart append
+scheduling methods behind `ActiveStreamRouteTestSupport` and
+`ActivePutObjectRouteTestSupport`. The callbacks still execute inside the
+production admitted route, including its immutable deadline and PUT lease
+maintenance, while the inherent route implementations are crate-private. A
+crate-wide source-root check, exercised against a nested-module fixture,
+rejects public reintroduction of either hook-bearing inherent method.
+
+The next closure slice consolidates the no-argument stream lifecycle and
+metadata-publication scheduling boundaries behind
+`StorageClusterSchedulingTestSupport`. The cross-crate tests can still move a
+clock, publish a replacement map, or coordinate another request at the exact
+production boundary, but the operation-specific guard types and hook
+registries are crate-private. The curated callback receives no PG, command,
+payload, or shard identity. A crate-wide nested-module fixture rejects public
+reintroduction of the seven migrated inherent installers and their raw guard
+types. Fallible reclaim hooks and payload cleanup/read hooks remain separate
+open work because they require storage-owned semantic failures and opaque
+fault actions rather than merely republishing their existing raw callback
+signatures.
+
 The audited cross-crate support families are:
 
 | Surface family | Principal consumers | Durable mutation | Final disposition |
@@ -6211,7 +6272,13 @@ Remaining implementation order after this audit:
    deleting metadata only through lifecycle test-support semantics. The root's
    durable incarnation is debug-redacted, the raw queue/finalization methods
    are crate-private, and a matching crate-wide fixture check rejects their
-   public or cross-crate reintroduction; and
+   public or cross-crate reintroduction. The closure audit leaves four bounded
+   migrations in this item: (a) **completed:** admitted stream-route
+   scheduling extensions, (b) **in progress:** the no-argument stream and
+   pending-install scheduling guards are consolidated; fallible reclaim and
+   payload cleanup/read guards remain, (c) the clock and static-topology logical test controls,
+   and (d) privatization plus crate-wide enforcement for the remaining unused
+   public inherent test adapters; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

@@ -1466,6 +1466,15 @@ pub mod test_support {
         TestPayloadShardWriteAttemptHook, TestPayloadShardWriteAttempts,
     };
 
+    mod scheduling;
+    pub use scheduling::{
+        StorageClusterSchedulingTestSupport, TestStorageSchedulingAction,
+        TestStorageSchedulingGuard,
+    };
+
+    mod stream_route;
+    pub use stream_route::{ActivePutObjectRouteTestSupport, ActiveStreamRouteTestSupport};
+
     mod topology;
     pub use topology::{
         StorageClusterRuntimeMapTopologyTestSupport, StorageClusterTopologyTestSupport,

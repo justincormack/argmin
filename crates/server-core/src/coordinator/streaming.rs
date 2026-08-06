@@ -4,6 +4,11 @@ use storage::{
     StreamSegmentAppendInput, StreamUploadTarget,
 };
 
+#[cfg(test)]
+use storage::test_support::{
+    ActivePutObjectRouteTestSupport as _, ActiveStreamRouteTestSupport as _,
+};
+
 #[cfg(feature = "deep-tracing")]
 use super::INTERNAL_SEGMENT_SIZE;
 #[cfg(test)]

@@ -19,9 +19,9 @@ use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterMetadataCommandTestSupport as _,
     StorageClusterObjectTestSupport as _, StorageClusterPayloadTestSupport as _,
     StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
-    StorageClusterRuntimeMapTopologyTestSupport as _, StorageClusterTopologyTestSupport as _,
-    StorageMaintenanceSweeperTestSupport as _, StorageShardRepairSweeperTestSupport as _,
-    StorageStreamSessionSweeperTestSupport as _,
+    StorageClusterRuntimeMapTopologyTestSupport as _, StorageClusterSchedulingTestSupport as _,
+    StorageClusterTopologyTestSupport as _, StorageMaintenanceSweeperTestSupport as _,
+    StorageShardRepairSweeperTestSupport as _, StorageStreamSessionSweeperTestSupport as _,
 };
 use storage::{
     ClusterEpoch, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,

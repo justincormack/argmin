@@ -41,6 +41,7 @@ use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
     StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
+    StorageClusterSchedulingTestSupport as _,
 };
 use storage::{BucketName, SessionId};
 #[cfg(any(test, feature = "local-debug-endpoints"))]

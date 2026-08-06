@@ -549,7 +549,7 @@ pub(crate) struct AbortMultipartPendingInstallTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct StreamPutCreatePendingInstallTestHookGuard {
+pub(crate) struct StreamPutCreatePendingInstallTestHookGuard {
     scope_id: usize,
 }
 
@@ -559,7 +559,7 @@ pub(crate) struct StreamPutCreateCommandIdTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct StreamPutFinalizeCommandIdTestHookGuard {
+pub(crate) struct StreamPutFinalizeCommandIdTestHookGuard {
     scope_id: usize,
 }
 
@@ -1557,7 +1557,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_stream_put_create_pending_install_hook(
+    pub(crate) fn test_install_before_stream_put_create_pending_install_hook(
         &self,
         hook: StreamPutCreatePendingInstallTestHook,
     ) -> StreamPutCreatePendingInstallTestHookGuard {
@@ -1585,7 +1585,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_stream_put_finalize_command_id_hook(
+    pub(crate) fn test_install_before_stream_put_finalize_command_id_hook(
         &self,
         hook: StreamPutFinalizeCommandIdTestHook,
     ) -> StreamPutFinalizeCommandIdTestHookGuard {

@@ -1121,7 +1121,7 @@ struct StorageClusterTestHooks {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct StreamAbortTestHookGuard {
+pub(crate) struct StreamAbortTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1131,17 +1131,17 @@ pub struct RetainedStreamAbortTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct RetainedStreamCleanupCapabilityTestHookGuard {
+pub(crate) struct RetainedStreamCleanupCapabilityTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct AfterRetainedStreamCleanupCapabilityTestHookGuard {
+pub(crate) struct AfterRetainedStreamCleanupCapabilityTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct MetadataCommandPendingInstallHookGuard {
+pub(crate) struct MetadataCommandPendingInstallHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1181,7 +1181,7 @@ pub struct ObjectVersionCommandIdHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct StreamAppendCommandIdHookGuard {
+pub(crate) struct StreamAppendCommandIdHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -3407,9 +3407,9 @@ impl ActivePutObjectRoute<'_> {
             )
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    pub fn test_append_stream_segment_with_after_prepare(
+    pub(crate) fn test_append_stream_segment_with_after_prepare(
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
@@ -3425,9 +3425,9 @@ impl ActivePutObjectRoute<'_> {
             )
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    pub fn test_append_stream_segment_with_after_prepare_and_lease_maintenance(
+    pub(crate) fn test_append_stream_segment_with_after_prepare_and_lease_maintenance(
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
@@ -3803,9 +3803,9 @@ impl ActiveMultipartObjectRoute<'_> {
             )
     }
 
-    #[cfg(feature = "test-hooks")]
+    #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
-    pub fn test_append_stream_segment_with_after_prepare(
+    pub(crate) fn test_append_stream_segment_with_after_prepare(
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
@@ -11824,7 +11824,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_stream_abort_storage_hook(
+    pub(crate) fn test_install_before_stream_abort_storage_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> StreamAbortTestHookGuard {
@@ -11846,7 +11846,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_retained_stream_cleanup_capability_hook(
+    pub(crate) fn test_install_before_retained_stream_cleanup_capability_hook(
         &self,
         hook: StreamAbortHook,
     ) -> RetainedStreamCleanupCapabilityTestHookGuard {
@@ -11860,7 +11860,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_retained_stream_cleanup_capability_hook(
+    pub(crate) fn test_install_after_retained_stream_cleanup_capability_hook(
         &self,
         hook: StreamAbortHook,
     ) -> AfterRetainedStreamCleanupCapabilityTestHookGuard {
@@ -11874,7 +11874,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_metadata_command_pending_install_hook(
+    pub(crate) fn test_install_before_metadata_command_pending_install_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> MetadataCommandPendingInstallHookGuard {
@@ -12030,7 +12030,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_stream_append_command_id_hook(
+    pub(crate) fn test_install_before_stream_append_command_id_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> StreamAppendCommandIdHookGuard {
@@ -16001,9 +16001,9 @@ impl StorageCluster {
         )
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     #[doc(hidden)]
-    pub fn test_append_stream_segment_with_after_prepare(
+    pub(crate) fn test_append_stream_segment_with_after_prepare(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
