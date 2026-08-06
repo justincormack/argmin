@@ -194,6 +194,24 @@ pub(crate) fn selected_backend() -> Backend {
     Backend::Scalar
 }
 
+/// Return the active erasure-coding backend name for this build and process.
+#[inline]
+pub fn backend_name() -> &'static str {
+    backend_name_for(selected_backend())
+}
+
+pub(crate) const fn backend_name_for(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Scalar => "scalar",
+        #[cfg(target_arch = "aarch64")]
+        Backend::NeonAarch64 => "aarch64-neon",
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512X86_64 => "x86_64-avx512",
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2X86_64 => "x86_64-avx2",
+    }
+}
+
 #[inline]
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_avx2_x86_64() -> bool {

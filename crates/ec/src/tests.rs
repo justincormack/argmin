@@ -1,4 +1,4 @@
-use crate::codec::{supported_backends, Backend};
+use crate::codec::{backend_name_for, supported_backends, Backend};
 use crate::self_test;
 use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};
 
@@ -28,18 +28,6 @@ fn encode_with_backend(codec: &ErasureCodec, data: &[Vec<u8>], backend: Backend)
         .encode_with_backend_for_test(&data_refs, &mut parity_refs, backend)
         .unwrap();
     parity
-}
-
-fn backend_name(backend: Backend) -> &'static str {
-    match backend {
-        Backend::Scalar => "scalar",
-        #[cfg(target_arch = "aarch64")]
-        Backend::NeonAarch64 => "aarch64-neon",
-        #[cfg(target_arch = "x86_64")]
-        Backend::Avx512X86_64 => "x86_64-avx512",
-        #[cfg(target_arch = "x86_64")]
-        Backend::Avx2X86_64 => "x86_64-avx2",
-    }
 }
 
 // Config validation
@@ -107,7 +95,7 @@ fn supported_backends_match_scalar_encode_and_verify() {
                 parity,
                 scalar_parity,
                 "backend={} shard_size={shard_size}",
-                backend_name(backend)
+                backend_name_for(backend)
             );
 
             let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
@@ -118,7 +106,7 @@ fn supported_backends_match_scalar_encode_and_verify() {
                     .unwrap(),
                 VerifyResult::Ok,
                 "backend={} shard_size={shard_size}",
-                backend_name(backend)
+                backend_name_for(backend)
             );
         }
     }
@@ -171,7 +159,7 @@ fn supported_backends_match_scalar_reconstruct() {
                         recovered[out_index],
                         all_shards[shard_index],
                         "backend={} shard_size={shard_size} shard={shard_index}",
-                        backend_name(backend)
+                        backend_name_for(backend)
                     );
                 }
             }

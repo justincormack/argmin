@@ -303,6 +303,11 @@ fn run_backend<B: Backend>(config: &Config) -> Result<(), String> {
     }
     println!("sample_iters={}", config.sample_iters);
     println!("samples={}", config.samples);
+    println!(
+        "backend_override={}",
+        std::env::var("ARGMIN_EC_BENCH_BACKEND").unwrap_or_else(|_| "auto".to_string())
+    );
+    println!("backend_selected={}", ec::backend_name());
 
     for _ in 0..config.warmup_iters {
         match config.mode {
