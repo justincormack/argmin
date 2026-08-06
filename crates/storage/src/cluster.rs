@@ -1071,11 +1071,11 @@ type MetadataListingPgCompleteHook = Arc<dyn Fn(u32) + Send + Sync>;
 type ReclaimCoordinationTestHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type PayloadShardCleanupTestHook =
+pub(crate) type PayloadShardCleanupTestHook =
     Arc<dyn Fn(&ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type PayloadShardReadTestHook =
+pub(crate) type PayloadShardReadTestHook =
     Arc<dyn Fn(&ShardLocation, &ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1083,7 +1083,7 @@ pub(crate) type PayloadShardWriteTestHook =
     Arc<dyn Fn(&ShardLocation, &ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + Send + Sync>;
+pub(crate) type PayloadCleanupErrorTestHook = Arc<dyn Fn(&'static str, &StoreError) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Default)]
@@ -1215,7 +1215,7 @@ pub(crate) struct ReclaimClaimReleaseTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct PayloadShardReadTestHookGuard {
+pub(crate) struct PayloadShardReadTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1233,7 +1233,7 @@ enum PayloadCleanupTestHookKind {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct PayloadCleanupTestHookGuard {
+pub(crate) struct PayloadCleanupTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
     kind: PayloadCleanupTestHookKind,
 }
@@ -12071,7 +12071,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_placed_payload_shard_delete_hook(
+    pub(crate) fn test_install_before_placed_payload_shard_delete_hook(
         &self,
         hook: PayloadShardCleanupTestHook,
     ) -> PayloadCleanupTestHookGuard {
@@ -12101,7 +12101,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_placed_payload_shard_read_hook(
+    pub(crate) fn test_install_before_placed_payload_shard_read_hook(
         &self,
         hook: PayloadShardReadTestHook,
     ) -> PayloadShardReadTestHookGuard {
@@ -12115,7 +12115,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_metadata_primary_payload_ack_delete_hook(
+    pub(crate) fn test_install_before_metadata_primary_payload_ack_delete_hook(
         &self,
         hook: PayloadShardCleanupTestHook,
     ) -> PayloadCleanupTestHookGuard {
@@ -12130,7 +12130,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_best_effort_payload_cleanup_error_hook(
+    pub(crate) fn test_install_best_effort_payload_cleanup_error_hook(
         &self,
         hook: PayloadCleanupErrorTestHook,
     ) -> PayloadCleanupTestHookGuard {

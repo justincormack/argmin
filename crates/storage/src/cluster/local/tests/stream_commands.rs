@@ -1,6 +1,7 @@
 use super::*;
 use crate::cluster::{segment_payload_placement_key, StreamAppendCommitRequest};
 use crate::metadata_command::ReleaseObjectGenerationCommand;
+use crate::test_support::StorageClusterFailureTestSupport as _;
 
 struct StreamPayloadCleanupFixture {
     _tmp: test_util::TempDir,
@@ -146,24 +147,7 @@ fn failed_stream_append_after_session_abort_removes_all_staged_payload() {
 fn failed_stream_append_placed_cleanup_failure_leaves_only_files() {
     let _serial = lock_payload_cleanup_hook_test();
     let fixture = stream_payload_cleanup_fixture("a2");
-    let cleanup_errors = Arc::new(Mutex::new(Vec::new()));
-    let cleanup_errors_for_hook = Arc::clone(&cleanup_errors);
-    let _error_guard = fixture
-        .cluster
-        .test_install_best_effort_payload_cleanup_error_hook(Arc::new(move |operation, error| {
-            cleanup_errors_for_hook
-                .lock()
-                .unwrap()
-                .push((operation, error.to_string()));
-        }));
-    let _cleanup_guard = fixture
-        .cluster
-        .test_install_before_placed_payload_shard_delete_hook(Arc::new(|_| {
-            Err(StoreError::Io {
-                context: "injected placed cleanup delete failure",
-                source: std::io::Error::other("injected placed cleanup delete failure"),
-            })
-        }));
+    let cleanup_failure = fixture.cluster.test_fail_placed_payload_shard_cleanup();
     let _trace = observability::AttachedTrace::new(observability::TraceContext::new_request());
 
     let error = fixture
@@ -186,16 +170,10 @@ fn failed_stream_append_placed_cleanup_failure_leaves_only_files() {
         )
         .unwrap_err();
     assert!(matches!(error, crate::ObjectPgActionError::Metadata(_)));
-    let cleanup_errors = cleanup_errors.lock().unwrap();
     assert_eq!(
-        cleanup_errors.len(),
+        cleanup_failure.invocation_count(),
         usize::from(fixture.ec.k + fixture.ec.m)
     );
-    assert!(cleanup_errors.iter().all(|(operation, error)| {
-        *operation == "delete placed payload shard"
-            && error.contains("injected placed cleanup delete failure")
-    }));
-    drop(cleanup_errors);
     assert_stream_payload_shard_state(&fixture, false, true);
 }
 
@@ -218,39 +196,17 @@ fn stream_abort_ack_cleanup_failure_removes_files_and_retains_acknowledgements()
         .unwrap();
     assert_stream_payload_shard_state(&fixture, true, true);
 
-    let cleanup_errors = Arc::new(Mutex::new(Vec::new()));
-    let cleanup_errors_for_hook = Arc::clone(&cleanup_errors);
-    let _error_guard = fixture
-        .cluster
-        .test_install_best_effort_payload_cleanup_error_hook(Arc::new(move |operation, error| {
-            cleanup_errors_for_hook
-                .lock()
-                .unwrap()
-                .push((operation, error.to_string()));
-        }));
-    let _cleanup_guard = fixture
-        .cluster
-        .test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(|_| {
-            Err(StoreError::Io {
-                context: "injected ack cleanup delete failure",
-                source: std::io::Error::other("injected ack cleanup delete failure"),
-            })
-        }));
+    let cleanup_failure = fixture.cluster.test_fail_payload_ack_cleanup();
     let _trace = observability::AttachedTrace::new(observability::TraceContext::new_request());
 
     fixture
         .cluster
         .abort_stream_upload_session(&fixture.bucket, &fixture.key, &fixture.session_id)
         .unwrap();
-    let cleanup_errors = cleanup_errors.lock().unwrap();
     assert_eq!(
-        cleanup_errors.len(),
+        cleanup_failure.invocation_count(),
         usize::from(fixture.ec.k + fixture.ec.m)
     );
-    assert!(cleanup_errors.iter().all(|(operation, error)| {
-        *operation == "delete payload ack" && error.contains("injected ack cleanup delete failure")
-    }));
-    drop(cleanup_errors);
     assert_stream_payload_shard_state(&fixture, true, false);
 }
 

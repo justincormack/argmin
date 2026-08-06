@@ -5516,7 +5516,7 @@ fail_with_matches \
 
 cross_crate_physical_shard_test_leaks=$(
     rg -n --color=never \
-        '\btest_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_write_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)\b' \
+        '\btest_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_(write|read|delete)_hook|install_before_metadata_primary_payload_ack_delete_hook|install_best_effort_payload_cleanup_error_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)\b' \
         crates \
         -g '*.rs' \
         -g '!crates/storage/**' \
@@ -5526,7 +5526,7 @@ fail_with_matches \
     "Physical shard indices, mutation, files, and repair-row identities are storage-owned; cross-crate tests must use opaque role/count fault scenarios" \
     "$cross_crate_physical_shard_test_leaks"
 
-physical_shard_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+test_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_write_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)|type[[:space:]]+PayloadShardWriteTestHook|struct[[:space:]]+PayloadShardWriteTestHookGuard)\b'
+physical_shard_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+test_(inject_object_payload_shard_(loss|corruption)|inject_first_object_segment_(unknown_data_pg|checksum_mismatch)|install_before_placed_payload_shard_(write|read|delete)_hook|install_before_metadata_primary_payload_ack_delete_hook|install_best_effort_payload_cleanup_error_hook|placed_payload_shard_file_exists|object_payload_shard_file_matches_ack|capture_object_payload_shard_file|object_payload_snapshot_uses_current_placement|object_payload_repair_observations|schedule_object_payload_repair_wake|take_object_payload_repair_wake)|type[[:space:]]+Payload(Shard(Write|Read|Cleanup)|CleanupError)TestHook|struct[[:space:]]+Payload(Shard(Write|Read)TestHookGuard|CleanupTestHookGuard))\b'
 
 scan_public_physical_shard_test_surface() {
     local source_root=$1
@@ -5550,7 +5550,17 @@ physical_shard_public_test_surface_fixture=$(
         scripts/fixtures/storage-boundary-physical-shard
 )
 expected_physical_shard_public_test_surface_fixture='scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:1:pub struct PayloadShardWriteTestHookGuard;
-scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:4:    pub fn test_install_before_placed_payload_shard_write_hook(&self) {}'
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:2:pub struct PayloadShardReadTestHookGuard;
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:3:pub struct PayloadCleanupTestHookGuard;
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:4:pub type PayloadShardWriteTestHook = fn();
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:5:pub type PayloadShardReadTestHook = fn();
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:6:pub type PayloadShardCleanupTestHook = fn();
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:7:pub type PayloadCleanupErrorTestHook = fn();
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:10:    pub fn test_install_before_placed_payload_shard_write_hook(&self) {}
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:11:    pub fn test_install_before_placed_payload_shard_read_hook(&self) {}
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:12:    pub fn test_install_before_placed_payload_shard_delete_hook(&self) {}
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:13:    pub fn test_install_before_metadata_primary_payload_ack_delete_hook(&self) {}
+scripts/fixtures/storage-boundary-physical-shard/nested/unrelated-module.rs:14:    pub fn test_install_best_effort_payload_cleanup_error_hook(&self) {}'
 physical_shard_public_test_surface_fixture_failure=""
 if [[ "$physical_shard_public_test_surface_fixture" != "$expected_physical_shard_public_test_surface_fixture" ]]; then
     physical_shard_public_test_surface_fixture_failure=$physical_shard_public_test_surface_fixture

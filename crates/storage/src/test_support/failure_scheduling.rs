@@ -49,6 +49,23 @@ pub trait StorageClusterFailureTestSupport {
 
     /// Fail reclaim claim release with a storage I/O error.
     fn test_fail_reclaim_claim_release(&self) -> TestStorageFailureGuard;
+
+    /// Fail every payload-shard read with storage-node resource exhaustion.
+    fn test_fail_payload_shard_reads_with_resource_exhaustion(&self) -> TestStorageFailureGuard;
+
+    /// Fail the next payload-shard read used by repair with storage-node
+    /// resource exhaustion, then allow later reads to proceed.
+    fn test_fail_next_repair_payload_shard_read_with_resource_exhaustion(
+        &self,
+    ) -> TestStorageFailureGuard;
+
+    /// Fail placed payload-shard deletion and observe the corresponding
+    /// best-effort cleanup diagnostic.
+    fn test_fail_placed_payload_shard_cleanup(&self) -> TestStorageFailureGuard;
+
+    /// Fail payload acknowledgement deletion and observe the corresponding
+    /// best-effort cleanup diagnostic.
+    fn test_fail_payload_ack_cleanup(&self) -> TestStorageFailureGuard;
 }
 
 fn retained_stream_contention() -> ObjectPgActionError {
@@ -62,6 +79,26 @@ fn injected_reclaim_io(context: &'static str) -> ObjectPgActionError {
         context,
         source: std::io::Error::other(context),
     })
+}
+
+fn injected_cleanup_io(context: &'static str) -> StoreError {
+    StoreError::Io {
+        context,
+        source: std::io::Error::other(context),
+    }
+}
+
+fn require_expected_cleanup_error(
+    operation: &'static str,
+    error: &StoreError,
+    expected_operation: &'static str,
+    expected_context: &'static str,
+) {
+    assert_eq!(operation, expected_operation);
+    match error {
+        StoreError::Io { context, .. } => assert_eq!(*context, expected_context),
+        other => panic!("expected injected cleanup I/O error, got {other:?}"),
+    }
 }
 
 impl StorageClusterFailureTestSupport for StorageCluster {
@@ -135,5 +172,90 @@ impl StorageClusterFailureTestSupport for StorageCluster {
             ))
         }));
         TestStorageFailureGuard::new(guard, invocations)
+    }
+
+    fn test_fail_payload_shard_reads_with_resource_exhaustion(&self) -> TestStorageFailureGuard {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let hook_invocations = Arc::clone(&invocations);
+        let guard = self.test_install_before_placed_payload_shard_read_hook(Arc::new(
+            move |location, _| {
+                hook_invocations.fetch_add(1, Ordering::SeqCst);
+                Err(StoreError::storage_node_resource_exhausted(
+                    location.node_id().as_u32(),
+                    "read payload shard",
+                ))
+            },
+        ));
+        TestStorageFailureGuard::new(guard, invocations)
+    }
+
+    fn test_fail_next_repair_payload_shard_read_with_resource_exhaustion(
+        &self,
+    ) -> TestStorageFailureGuard {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let hook_invocations = Arc::clone(&invocations);
+        let remaining = Arc::new(AtomicUsize::new(1));
+        let hook_remaining = Arc::clone(&remaining);
+        let guard = self.test_install_before_placed_payload_shard_read_hook(Arc::new(
+            move |location, _| {
+                hook_invocations.fetch_add(1, Ordering::SeqCst);
+                if hook_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    Err(StoreError::storage_node_resource_exhausted(
+                        location.node_id().as_u32(),
+                        "repair read payload shard",
+                    ))
+                } else {
+                    Ok(())
+                }
+            },
+        ));
+        TestStorageFailureGuard::new(guard, invocations)
+    }
+
+    fn test_fail_placed_payload_shard_cleanup(&self) -> TestStorageFailureGuard {
+        const OPERATION: &str = "delete placed payload shard";
+        const CONTEXT: &str = "injected placed cleanup delete failure";
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let observer_invocations = Arc::clone(&invocations);
+        let observer = self.test_install_best_effort_payload_cleanup_error_hook(Arc::new(
+            move |operation, error| {
+                require_expected_cleanup_error(operation, error, OPERATION, CONTEXT);
+                observer_invocations.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        let failure = self.test_install_before_placed_payload_shard_delete_hook(Arc::new(|_| {
+            Err(injected_cleanup_io(CONTEXT))
+        }));
+        // Tuple fields drop left-to-right. Remove the failure injector before
+        // its observer so concurrent cleanup cannot emit an unobserved
+        // injected error while this guard is being released.
+        TestStorageFailureGuard::new((failure, observer), invocations)
+    }
+
+    fn test_fail_payload_ack_cleanup(&self) -> TestStorageFailureGuard {
+        const OPERATION: &str = "delete payload ack";
+        const CONTEXT: &str = "injected ack cleanup delete failure";
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let observer_invocations = Arc::clone(&invocations);
+        let observer = self.test_install_best_effort_payload_cleanup_error_hook(Arc::new(
+            move |operation, error| {
+                require_expected_cleanup_error(operation, error, OPERATION, CONTEXT);
+                observer_invocations.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+        let failure =
+            self.test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(|_| {
+                Err(injected_cleanup_io(CONTEXT))
+            }));
+        // Keep the observer installed until after the failure injector has
+        // been removed; tuple fields drop left-to-right.
+        TestStorageFailureGuard::new((failure, observer), invocations)
     }
 }

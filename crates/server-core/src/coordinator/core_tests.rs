@@ -1616,13 +1616,11 @@ fn copy_object_heartbeats_destination_stream_reservation_before_finalize() {
         }),
     );
     let read_clock = Arc::clone(&clock);
-    let _read_hook = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
-        move |_, _| {
+    let _read_hook =
+        storage_cluster.test_install_before_payload_shard_read_action(Arc::new(move || {
             // Model the first source read consuming another ten seconds.
             read_clock.set(20_000);
-            Ok(())
-        },
-    ));
+        }));
     let write_clock = Arc::clone(&clock);
     let _write_hook =
         storage_cluster.test_install_before_payload_shard_write_action(Arc::new(move || {
@@ -10405,14 +10403,7 @@ fn get_object_payload_read_resource_exhaustion_maps_to_slow_down() {
     )
     .unwrap();
 
-    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
-        |location, _shard_key| {
-            Err(storage::StoreError::storage_node_resource_exhausted(
-                location.node_id().as_u32(),
-                "read payload shard",
-            ))
-        },
-    ));
+    let read_failure = storage_cluster.test_fail_payload_shard_reads_with_resource_exhaustion();
 
     let err = match coord.get_object(&GetObjectRequest {
         sse_customer: None,
@@ -10433,6 +10424,7 @@ fn get_object_payload_read_resource_exhaustion_maps_to_slow_down() {
         matches!(err, ServerError::SlowDown),
         "expected payload read overload to map to SlowDown, got {err:?}"
     );
+    assert!(read_failure.invocation_count() > 0);
 }
 
 #[test]
@@ -10462,14 +10454,7 @@ fn get_object_range_payload_read_resource_exhaustion_maps_to_slow_down() {
     )
     .unwrap();
 
-    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
-        |location, _shard_key| {
-            Err(storage::StoreError::storage_node_resource_exhausted(
-                location.node_id().as_u32(),
-                "read payload shard",
-            ))
-        },
-    ));
+    let read_failure = storage_cluster.test_fail_payload_shard_reads_with_resource_exhaustion();
 
     let err = match coord.get_object_range(&GetObjectRangeRequest {
         sse_customer: None,
@@ -10491,6 +10476,7 @@ fn get_object_range_payload_read_resource_exhaustion_maps_to_slow_down() {
         matches!(err, ServerError::SlowDown),
         "expected range payload read overload to map to SlowDown, got {err:?}"
     );
+    assert!(read_failure.invocation_count() > 0);
 }
 
 #[test]
@@ -10522,14 +10508,7 @@ fn get_object_part_payload_read_resource_exhaustion_maps_to_slow_down() {
         })
         .unwrap();
 
-    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
-        |location, _shard_key| {
-            Err(storage::StoreError::storage_node_resource_exhausted(
-                location.node_id().as_u32(),
-                "read payload shard",
-            ))
-        },
-    ));
+    let read_failure = storage_cluster.test_fail_payload_shard_reads_with_resource_exhaustion();
 
     let err = match coord.get_object_part(&GetObjectPartRequest {
         sse_customer: None,
@@ -10551,6 +10530,7 @@ fn get_object_part_payload_read_resource_exhaustion_maps_to_slow_down() {
         matches!(err, ServerError::SlowDown),
         "expected multipart part payload read overload to map to SlowDown, got {err:?}"
     );
+    assert!(read_failure.invocation_count() > 0);
 }
 
 #[test]
@@ -10580,14 +10560,7 @@ fn copy_object_source_payload_read_resource_exhaustion_maps_to_slow_down() {
     )
     .unwrap();
 
-    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
-        |location, _shard_key| {
-            Err(storage::StoreError::storage_node_resource_exhausted(
-                location.node_id().as_u32(),
-                "read payload shard",
-            ))
-        },
-    ));
+    let read_failure = storage_cluster.test_fail_payload_shard_reads_with_resource_exhaustion();
 
     let err = coord
         .copy_object(&CopyObjectRequest {
@@ -10614,6 +10587,7 @@ fn copy_object_source_payload_read_resource_exhaustion_maps_to_slow_down() {
         matches!(err, ServerError::SlowDown),
         "expected copy source read overload to map to SlowDown, got {err:?}"
     );
+    assert!(read_failure.invocation_count() > 0);
 }
 
 #[test]
@@ -10656,14 +10630,7 @@ fn upload_part_copy_source_payload_read_resource_exhaustion_maps_to_slow_down() 
         })
         .unwrap();
 
-    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
-        |location, _shard_key| {
-            Err(storage::StoreError::storage_node_resource_exhausted(
-                location.node_id().as_u32(),
-                "read payload shard",
-            ))
-        },
-    ));
+    let read_failure = storage_cluster.test_fail_payload_shard_reads_with_resource_exhaustion();
 
     let err = coord
         .upload_part_copy(&UploadPartCopyRequest {
@@ -10687,6 +10654,7 @@ fn upload_part_copy_source_payload_read_resource_exhaustion_maps_to_slow_down() 
         matches!(err, ServerError::SlowDown),
         "expected upload-part-copy source read overload to map to SlowDown, got {err:?}"
     );
+    assert!(read_failure.invocation_count() > 0);
 }
 
 #[test]
@@ -10729,14 +10697,7 @@ fn upload_part_copy_range_source_payload_read_resource_exhaustion_maps_to_slow_d
         })
         .unwrap();
 
-    let _hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(Arc::new(
-        |location, _shard_key| {
-            Err(storage::StoreError::storage_node_resource_exhausted(
-                location.node_id().as_u32(),
-                "read payload shard",
-            ))
-        },
-    ));
+    let read_failure = storage_cluster.test_fail_payload_shard_reads_with_resource_exhaustion();
 
     let err = coord
         .upload_part_copy(&UploadPartCopyRequest {
@@ -10760,6 +10721,7 @@ fn upload_part_copy_range_source_payload_read_resource_exhaustion_maps_to_slow_d
         matches!(err, ServerError::SlowDown),
         "expected ranged upload-part-copy source read overload to map to SlowDown, got {err:?}"
     );
+    assert!(read_failure.invocation_count() > 0);
 }
 
 #[test]
@@ -18522,22 +18484,8 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         .unwrap();
     assert_eq!(result.body.read_all().unwrap(), data);
 
-    let fail_once = Arc::new(AtomicBool::new(true));
-    let failure_injected = Arc::new(AtomicBool::new(false));
-    let hook_fail_once = Arc::clone(&fail_once);
-    let hook_failure_injected = Arc::clone(&failure_injected);
-    let _read_hook_guard = storage_cluster.test_install_before_placed_payload_shard_read_hook(
-        Arc::new(move |location, _shard_key| {
-            if hook_fail_once.swap(false, Ordering::SeqCst) {
-                hook_failure_injected.store(true, Ordering::SeqCst);
-                return Err(storage::StoreError::storage_node_resource_exhausted(
-                    location.node_id().as_u32(),
-                    "repair read payload shard",
-                ));
-            }
-            Ok(())
-        }),
-    );
+    let read_failure =
+        storage_cluster.test_fail_next_repair_payload_shard_read_with_resource_exhaustion();
     let repair = storage::StorageShardRepairSweeper::disabled(test_storage_route_handle(
         Arc::clone(&storage_cluster),
     ));
@@ -18552,7 +18500,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         "storage-node repair read payload shard on node 0 exhausted resources: \
          storage-node diagnostic redacted",
     ));
-    assert!(failure_injected.load(Ordering::SeqCst));
+    assert!(read_failure.invocation_count() > 0);
 
     time.set(2_001);
     assert!(repair.test_repair_one_pending());

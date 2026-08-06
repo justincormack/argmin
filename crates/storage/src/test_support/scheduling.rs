@@ -63,6 +63,12 @@ pub trait StorageClusterSchedulingTestSupport {
         &self,
         action: TestStorageSchedulingAction,
     ) -> TestStorageSchedulingGuard;
+
+    /// Run an identity-free action immediately before each payload-shard read.
+    fn test_install_before_payload_shard_read_action(
+        &self,
+        action: TestStorageSchedulingAction,
+    ) -> TestStorageSchedulingGuard;
 }
 
 impl StorageClusterSchedulingTestSupport for StorageCluster {
@@ -132,6 +138,21 @@ impl StorageClusterSchedulingTestSupport for StorageCluster {
     ) -> TestStorageSchedulingGuard {
         TestStorageSchedulingGuard::new(
             StorageCluster::test_install_before_stream_put_finalize_command_id_hook(self, action),
+        )
+    }
+
+    fn test_install_before_payload_shard_read_action(
+        &self,
+        action: TestStorageSchedulingAction,
+    ) -> TestStorageSchedulingGuard {
+        TestStorageSchedulingGuard::new(
+            StorageCluster::test_install_before_placed_payload_shard_read_hook(
+                self,
+                Arc::new(move |_, _| {
+                    action();
+                    Ok(())
+                }),
+            ),
         )
     }
 }

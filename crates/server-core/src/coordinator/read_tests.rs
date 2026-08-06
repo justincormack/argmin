@@ -2,12 +2,12 @@ use super::test_helpers;
 use super::test_support::*;
 use super::*;
 use ec::EcConfig;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use storage::test_support::{
-    StorageClusterPayloadTestSupport as _, StorageClusterSchedulingTestSupport as _,
+    StorageClusterFailureTestSupport as _, StorageClusterPayloadTestSupport as _,
+    StorageClusterSchedulingTestSupport as _,
 };
-use storage::StoreError;
 
 #[test]
 fn stream_put_get_object_readable() {
@@ -208,28 +208,9 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let observed_cleanup_errors = Arc::new(Mutex::new(Vec::new()));
-    let observed_cleanup_errors_for_hook = Arc::clone(&observed_cleanup_errors);
-    let _cleanup_error_guard = coord
+    let cleanup_failure = coord
         .storage_node()
-        .test_install_best_effort_payload_cleanup_error_hook(Arc::new(move |operation, error| {
-            let context = match error {
-                StoreError::Io { context, .. } => *context,
-                other => panic!("expected injected IO cleanup error, got {other:?}"),
-            };
-            observed_cleanup_errors_for_hook
-                .lock()
-                .unwrap()
-                .push((operation, context));
-        }));
-    let _placed_cleanup_guard = coord
-        .storage_node()
-        .test_install_before_placed_payload_shard_delete_hook(Arc::new(|_shard_key| {
-            Err(StoreError::Io {
-                context: "injected placed cleanup delete failure",
-                source: std::io::Error::other("injected placed cleanup delete failure"),
-            })
-        }));
+        .test_fail_placed_payload_shard_cleanup();
     let hook_storage = Arc::clone(&coord.storage_node());
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
@@ -252,15 +233,10 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
         "expected missing stream session after hook abort, got {err:?}"
     );
 
-    let observed_cleanup_errors = observed_cleanup_errors.lock().unwrap();
     assert!(
-        !observed_cleanup_errors.is_empty(),
+        cleanup_failure.invocation_count() > 0,
         "placed shard cleanup failure should emit typed cleanup context"
     );
-    assert!(observed_cleanup_errors.iter().all(|(operation, context)| {
-        *operation == "delete placed payload shard"
-            && *context == "injected placed cleanup delete failure"
-    }));
 }
 
 #[test]
@@ -280,42 +256,17 @@ fn stream_put_abort_ack_cleanup_failure_traces_after_placed_cleanup() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"cleanup-me")
         .unwrap();
 
-    let observed_cleanup_errors = Arc::new(Mutex::new(Vec::new()));
-    let observed_cleanup_errors_for_hook = Arc::clone(&observed_cleanup_errors);
-    let _cleanup_error_guard = coord
-        .storage_node()
-        .test_install_best_effort_payload_cleanup_error_hook(Arc::new(move |operation, error| {
-            let context = match error {
-                StoreError::Io { context, .. } => *context,
-                other => panic!("expected injected IO cleanup error, got {other:?}"),
-            };
-            observed_cleanup_errors_for_hook
-                .lock()
-                .unwrap()
-                .push((operation, context));
-        }));
-    let _ack_cleanup_guard = coord
-        .storage_node()
-        .test_install_before_metadata_primary_payload_ack_delete_hook(Arc::new(|_shard_key| {
-            Err(StoreError::Io {
-                context: "injected ack cleanup delete failure",
-                source: std::io::Error::other("injected ack cleanup delete failure"),
-            })
-        }));
+    let cleanup_failure = coord.storage_node().test_fail_payload_ack_cleanup();
 
     let _trace = observability::AttachedTrace::new(observability::TraceContext::new_request());
     coord
         .abort_stream_put("bucket", "key", &session_id)
         .unwrap();
 
-    let observed_cleanup_errors = observed_cleanup_errors.lock().unwrap();
     assert!(
-        !observed_cleanup_errors.is_empty(),
+        cleanup_failure.invocation_count() > 0,
         "ack cleanup failure should emit typed cleanup context"
     );
-    assert!(observed_cleanup_errors.iter().all(|(operation, context)| {
-        *operation == "delete payload ack" && *context == "injected ack cleanup delete failure"
-    }));
 }
 
 #[test]

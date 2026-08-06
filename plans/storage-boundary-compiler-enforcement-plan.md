@@ -6190,10 +6190,9 @@ production boundary, but the operation-specific guard types and hook
 registries are crate-private. The curated callback receives no PG, command,
 payload, or shard identity. A crate-wide nested-module fixture rejects public
 reintroduction of the seven migrated inherent installers and their raw guard
-types. Fallible reclaim hooks and payload cleanup/read hooks remain separate
-open work because they require storage-owned semantic failures and opaque
-fault actions rather than merely republishing their existing raw callback
-signatures.
+types. Fallible reclaim and payload cleanup/read hooks require storage-owned
+semantic failures and opaque fault actions rather than merely republishing
+their existing raw callback signatures.
 
 The fallible stream-cleanup and reclaim coordination hooks now use
 `StorageClusterFailureTestSupport`. Cross-crate tests select only retryable
@@ -6202,9 +6201,15 @@ or claim-release failure, and receive an opaque guard with a logical invocation
 count. Storage owns construction of the corresponding errors and all route
 diagnostics. The raw fallible callbacks, operation-specific guards, and
 installers are crate-private and included in the crate-wide scheduling-hook
-fixture. Payload cleanup/read hooks remain the final part of closure item (b)
-because their existing callbacks expose physical shard identities and raw
-errors and therefore need opaque, operation-specific fault scenarios.
+fixture. Payload cleanup/read hooks now use the same curated boundary.
+Cross-crate tests can select resource exhaustion for all payload reads or the
+next repair read, placed-shard or acknowledgement cleanup failure, and an
+identity-free action before a read. Storage derives the affected node from the
+actual placement, constructs the raw errors, and validates the typed
+best-effort cleanup diagnostic internally. The raw callbacks, shard
+locations/keys, error values, guards, and installers are crate-private. The
+crate-wide physical-shard fixture rejects their public or cross-crate
+reintroduction.
 
 The audited cross-crate support families are:
 
@@ -6285,10 +6290,10 @@ Remaining implementation order after this audit:
    are crate-private, and a matching crate-wide fixture check rejects their
    public or cross-crate reintroduction. The closure audit leaves four bounded
    migrations in this item: (a) **completed:** admitted stream-route
-   scheduling extensions, (b) **in progress:** the no-argument stream and
-   pending-install scheduling guards and semantic retained-cleanup/reclaim
-   failures are consolidated; payload cleanup/read guards remain, (c) the
-   clock and static-topology logical test controls,
+   scheduling extensions, (b) **completed:** the no-argument stream and
+   pending-install scheduling guards and semantic retained-cleanup, reclaim,
+   and payload cleanup/read failures are consolidated, (c) the clock and
+   static-topology logical test controls,
    and (d) privatization plus crate-wide enforcement for the remaining unused
    public inherent test adapters; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
