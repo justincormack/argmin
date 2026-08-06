@@ -235,6 +235,52 @@ impl ObjectPayloadLeaseRoute for PayloadLeaseUnavailableRoute<'_> {
 }
 
 #[test]
+fn opaque_payload_shard_write_attempts_bind_originating_cluster_and_pin_attempt_order() {
+    let tmp = test_util::tempdir();
+    let unrelated_tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let unrelated_map = Arc::new(
+        LocalClusterMap::open(
+            unrelated_tmp.path(),
+            &node_ids,
+            &[0],
+            EcShape { k: 2, m: 1 },
+        )
+        .unwrap(),
+    );
+    let unrelated_cluster = current_cluster(&unrelated_map);
+    let bucket = crate::tests::bucket_name("opaque-shard-write-attempts");
+    let key = crate::tests::object_key("committed");
+    let ordinals = Arc::new(Mutex::new(Vec::new()));
+    let ordinals_for_hook = Arc::clone(&ordinals);
+    let guard = crate::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(move |attempt| {
+            ordinals_for_hook.lock().unwrap().push(attempt);
+            Ok(())
+        }),
+    );
+
+    write_committed_direct_segment_for(&cluster, &bucket, &key, b"committed payload");
+    let attempts = guard.finish();
+
+    assert_eq!(attempts.count(), 3);
+    assert_eq!(*ordinals.lock().unwrap(), vec![1, 2, 3]);
+    assert!(unrelated_cluster
+        .load_existing_live_object(&bucket, &key)
+        .unwrap()
+        .is_none());
+    assert!(
+        !attempts.all_absent().unwrap(),
+        "evidence must inspect its originating cluster rather than an empty same-topology cluster"
+    );
+}
+
+#[test]
 fn opaque_object_segment_faults_bind_the_captured_payload_subject() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

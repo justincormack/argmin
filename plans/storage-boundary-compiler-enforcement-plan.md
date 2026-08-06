@@ -6062,7 +6062,18 @@ Final Phase 5 audit (2026-08-04):
   versions are supported, replaced null generations fail closed without
   modifying the current object, owner-local same-PG canaries pin crossed-key
   isolation and exact field mutation, and the former subject-argument mutation
-  methods are removed and mechanically prohibited outside storage.
+  methods are removed and mechanically prohibited outside storage; and
+- staged payload-write effect tests no longer receive shard locations, shard
+  keys, or call physical file probes from `server-core`. Storage now returns
+  opaque attempt evidence, exposes only the one-based attempt count needed for
+  deterministic expiry injection, and verifies both durable acknowledgement
+  rows and shard files are absent after cleanup. The evidence retains its exact
+  originating cluster and exposes a parameterless absence check, so callers
+  cannot substitute an empty same-topology cluster. An owner-local
+  committed-write/crossed-cluster canary pins attempt ordering, cluster
+  binding, and proves the absence predicate is not vacuous. The raw physical
+  write hook and file probe are crate-private and the boundary checker rejects
+  their cross-crate or public reintroduction.
 
 The audited cross-crate support families are:
 
@@ -6109,7 +6120,9 @@ Remaining implementation order after this audit:
    crate-private. Bucket-delete progress/current-incarnation scenarios,
    stream-reservation existence, and EC scratch reuse are likewise behind the
    lifecycle/payload traits. Committed-segment unknown-route and checksum
-   faults are bound to opaque payload snapshots behind the payload trait; and
+   faults are bound to opaque payload snapshots behind the payload trait.
+   Staged shard-write effect tests use opaque attempt evidence and ordinal-only
+   failure hooks; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

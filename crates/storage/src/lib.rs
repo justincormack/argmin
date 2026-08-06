@@ -927,6 +927,12 @@ pub mod test_support {
     mod retained_read;
     pub use retained_read::{TestRetainedReadPgMoveScenario, TestRetainedReadPgMoveScenarioError};
 
+    mod payload_write;
+    pub use payload_write::{
+        install_payload_shard_write_attempt_hook, TestPayloadShardWriteAttemptGuard,
+        TestPayloadShardWriteAttemptHook, TestPayloadShardWriteAttempts,
+    };
+
     mod topology;
     pub use topology::{
         StorageClusterRuntimeMapTopologyTestSupport, StorageClusterTopologyTestSupport,

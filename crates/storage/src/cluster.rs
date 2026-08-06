@@ -1080,7 +1080,7 @@ pub type PayloadShardReadTestHook =
     Arc<dyn Fn(&ShardLocation, &ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type PayloadShardWriteTestHook =
+pub(crate) type PayloadShardWriteTestHook =
     Arc<dyn Fn(&ShardLocation, &ShardKey) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1221,7 +1221,7 @@ pub struct PayloadShardReadTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct PayloadShardWriteTestHookGuard {
+pub(crate) struct PayloadShardWriteTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -12003,7 +12003,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_placed_payload_shard_write_hook(
+    pub(crate) fn test_install_before_placed_payload_shard_write_hook(
         &self,
         hook: PayloadShardWriteTestHook,
     ) -> PayloadShardWriteTestHookGuard {
@@ -19893,7 +19893,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_placed_payload_shard_file_exists(
+    pub(crate) fn test_placed_payload_shard_file_exists(
         &self,
         location: ShardLocation,
         key: &ShardKey,

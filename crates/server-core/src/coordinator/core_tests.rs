@@ -1144,15 +1144,13 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = Arc::clone(&clock);
-    let attempted_shard = Arc::new(Mutex::new(None));
-    let hook_attempted_shard = Arc::clone(&attempted_shard);
-    let hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
-        move |location, key| {
-            *hook_attempted_shard.lock().unwrap() = Some((*location, key.clone()));
+    let hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(move |_| {
             hook_clock.set(4_500);
             Ok(())
-        },
-    ));
+        }),
+    );
     let request = PutObjectRequest {
         encryption: WriteEncryptionRequest::none(),
         policy_context: PutObjectPolicyContext::default(),
@@ -1174,17 +1172,15 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
         .put_object_on_admitted_route(&admission, &request)
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
-    drop(hook);
+    let attempted = hook.finish();
     drop(admission);
 
-    let (attempted_location, attempted_key) = attempted_shard
-        .lock()
-        .unwrap()
-        .clone()
-        .expect("direct PUT must reach the first staged-shard effect boundary");
-    assert!(!cluster
-        .test_placed_payload_shard_file_exists(attempted_location, &attempted_key)
-        .unwrap());
+    assert_eq!(
+        attempted.count(),
+        1,
+        "direct PUT must reach the first staged-shard effect boundary"
+    );
+    assert!(attempted.all_absent().unwrap());
 
     assert!(cluster
         .load_existing_live_object(
@@ -1229,18 +1225,15 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
     let hook_clock = Arc::clone(&clock);
-    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
-    let hook_attempted_shards = Arc::clone(&attempted_shards);
-    let hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
-        move |location, key| {
-            let mut attempted = hook_attempted_shards.lock().unwrap();
-            attempted.push((*location, key.clone()));
-            if attempted.len() == 2 {
+    let hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(move |attempt| {
+            if attempt == 2 {
                 hook_clock.set(4_500);
             }
             Ok(())
-        },
-    ));
+        }),
+    );
     let request = PutObjectRequest {
         encryption: WriteEncryptionRequest::none(),
         policy_context: PutObjectPolicyContext::default(),
@@ -1262,23 +1255,18 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
         .put_object_on_admitted_route(&admission, &request)
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
-    drop(hook);
+    let attempted = hook.finish();
     drop(admission);
 
-    let attempted = attempted_shards.lock().unwrap().clone();
     assert_eq!(
-        attempted.len(),
+        attempted.count(),
         2,
         "the first shard must be written before the second write expires"
     );
-    for (location, key) in attempted {
-        assert!(
-            !cluster
-                .test_placed_payload_shard_file_exists(location, &key)
-                .unwrap(),
-            "route expiry must remove every partially written direct-PUT shard"
-        );
-    }
+    assert!(
+        attempted.all_absent().unwrap(),
+        "route expiry must remove every partially written direct-PUT shard"
+    );
     assert!(cluster
         .load_existing_live_object(
             &trusted_bucket_name("bucket"),
@@ -1414,17 +1402,10 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
-    let hook_attempted_shards = Arc::clone(&attempted_shards);
-    let shard_hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
-        move |location, key| {
-            hook_attempted_shards
-                .lock()
-                .unwrap()
-                .push((*location, key.clone()));
-            Ok(())
-        },
-    ));
+    let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(|_| Ok(())),
+    );
     let hook_clock = Arc::clone(&clock);
     let append_hook = cluster
         .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
@@ -1451,22 +1432,17 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
-    drop(shard_hook);
+    let attempted = shard_hook.finish();
     drop(admission);
 
-    let attempted = attempted_shards.lock().unwrap().clone();
     assert!(
-        !attempted.is_empty(),
+        attempted.count() > 0,
         "promoted PUT must stage shards before the append-publication hook"
     );
-    for (location, key) in attempted {
-        assert!(
-            !cluster
-                .test_placed_payload_shard_file_exists(location, &key)
-                .unwrap(),
-            "expired promoted PUT must remove staged shards"
-        );
-    }
+    assert!(
+        attempted.all_absent().unwrap(),
+        "expired promoted PUT must remove staged shards"
+    );
     assert!(cluster
         .load_existing_live_object(
             &trusted_bucket_name("bucket"),
@@ -1534,17 +1510,10 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
-    let hook_attempted_shards = Arc::clone(&attempted_shards);
-    let shard_hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
-        move |location, key| {
-            hook_attempted_shards
-                .lock()
-                .unwrap()
-                .push((*location, key.clone()));
-            Ok(())
-        },
-    ));
+    let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(|_| Ok(())),
+    );
     let hook_clock = Arc::clone(&clock);
     let append_hook = cluster
         .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
@@ -1573,22 +1542,17 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
-    drop(shard_hook);
+    let attempted = shard_hook.finish();
     drop(admission);
 
-    let attempted = attempted_shards.lock().unwrap().clone();
     assert!(
-        !attempted.is_empty(),
+        attempted.count() > 0,
         "CopyObject must stage destination shards before append publication"
     );
-    for (location, key) in attempted {
-        assert!(
-            !cluster
-                .test_placed_payload_shard_file_exists(location, &key)
-                .unwrap(),
-            "expired CopyObject must remove every staged destination shard"
-        );
-    }
+    assert!(
+        attempted.all_absent().unwrap(),
+        "expired CopyObject must remove every staged destination shard"
+    );
     assert!(cluster
         .load_existing_live_object(
             &trusted_bucket_name("bucket"),
@@ -1674,17 +1638,10 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
-    let hook_attempted_shards = Arc::clone(&attempted_shards);
-    let shard_hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
-        move |location, key| {
-            hook_attempted_shards
-                .lock()
-                .unwrap()
-                .push((*location, key.clone()));
-            Ok(())
-        },
-    ));
+    let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(|_| Ok(())),
+    );
     let hook_clock = Arc::clone(&clock);
     let hook_cluster = Arc::clone(&cluster);
     let append_hook =
@@ -1735,22 +1692,17 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
-    drop(shard_hook);
+    let attempted = shard_hook.finish();
     drop(admission);
 
-    let attempted = attempted_shards.lock().unwrap().clone();
     assert!(
-        !attempted.is_empty(),
+        attempted.count() > 0,
         "UploadPartCopy must stage destination shards before append publication"
     );
-    for (location, key) in attempted {
-        assert!(
-            !cluster
-                .test_placed_payload_shard_file_exists(location, &key)
-                .unwrap(),
-            "expired UploadPartCopy must remove every staged destination shard"
-        );
-    }
+    assert!(
+        attempted.all_absent().unwrap(),
+        "expired UploadPartCopy must remove every staged destination shard"
+    );
     assert_eq!(
         storage::test_support::stream_upload_session_count_for_object(
             &cluster,
@@ -1848,17 +1800,10 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
     );
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let attempted_shards = Arc::new(Mutex::new(Vec::new()));
-    let hook_attempted_shards = Arc::clone(&attempted_shards);
-    let shard_hook = cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(
-        move |location, key| {
-            hook_attempted_shards
-                .lock()
-                .unwrap()
-                .push((*location, key.clone()));
-            Ok(())
-        },
-    ));
+    let shard_hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &cluster,
+        Arc::new(|_| Ok(())),
+    );
     let hook_clock = Arc::clone(&clock);
     let append_hook = cluster
         .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
@@ -1879,21 +1824,16 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         .unwrap_err();
     assert!(matches!(error, ServerError::SlowDown), "{error:?}");
     drop(append_hook);
-    drop(shard_hook);
+    let attempted = shard_hook.finish();
 
-    let attempted = attempted_shards.lock().unwrap().clone();
     assert!(
-        !attempted.is_empty(),
+        attempted.count() > 0,
         "ordinary UploadPart must stage shards before append publication"
     );
-    for (location, key) in attempted {
-        assert!(
-            !cluster
-                .test_placed_payload_shard_file_exists(location, &key)
-                .unwrap(),
-            "expired ordinary UploadPart must remove every staged shard"
-        );
-    }
+    assert!(
+        attempted.all_absent().unwrap(),
+        "expired ordinary UploadPart must remove every staged shard"
+    );
     assert!(cluster
         .test_capture_stream_upload_payload(&bucket, &key, &begin.session_id)
         .unwrap()
@@ -10803,10 +10743,10 @@ fn direct_put_payload_stale_shard_location_maps_to_slow_down() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
-    let _hook =
-        storage_cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(|_, _| {
-            Err(injected_stale_shard_location())
-        }));
+    let _hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &storage_cluster,
+        Arc::new(|_| Err(injected_stale_shard_location())),
+    );
 
     let error = test_helpers::put_object(
         &coord,
@@ -10836,10 +10776,10 @@ fn stream_put_payload_stale_shard_location_maps_to_slow_down() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
     let session_id = begin_stream_put_test(&coord, "bucket", "stream").unwrap();
-    let hook =
-        storage_cluster.test_install_before_placed_payload_shard_write_hook(Arc::new(|_, _| {
-            Err(injected_stale_shard_location())
-        }));
+    let hook = storage::test_support::install_payload_shard_write_attempt_hook(
+        &storage_cluster,
+        Arc::new(|_| Err(injected_stale_shard_location())),
+    );
 
     let error = coord
         .append_plaintext_stream_segment_for_test(
