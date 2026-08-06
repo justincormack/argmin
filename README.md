@@ -11,9 +11,9 @@ Development has focused on correctness, security and data safety over raw perfor
 
 ## Prerequisites
 
-- Rust toolchain (2021 edition)
-- Unix/Linux runtime platform
-- amd64 or aarch64 architecture
+- Rust toolchain (2021 edition), 1.94.1 or later
+- Linux/Unix runtime platform
+- amd64, aarch64 or riscv64 architecture for accelerated crc and EC
 
 ## Build
 
@@ -25,12 +25,8 @@ This builds the production server binary without pulling in the full workspace
 test harness dependency set. The binary is at `target/release/argmin-s3`.
 
 Do not use `--all-features` for production artifacts. The normal production
-release build uses the default feature set. Optional features are diagnostic:
-
-| Feature | Production use |
-|---|---|
-| `deep-tracing` | Diagnostic tracing only; not part of the normal production build |
-| `local-debug-endpoints` | UAT/debug-only local diagnostics; release builds with this feature are rejected |
+release build uses the default feature set. Optional features are for testing
+and debug only.
 
 ## Run
 
