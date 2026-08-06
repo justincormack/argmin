@@ -175,6 +175,8 @@ pub use maintenance::{
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod test_support {
+    use std::fmt;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     use super::*;
@@ -463,6 +465,298 @@ pub mod test_support {
 
         fn test_wait_until_route_publication_is_pending(&self) {
             StorageClusterRouteHandle::test_wait_until_route_publication_is_pending(self);
+        }
+    }
+
+    /// Opaque evidence for one object's durable metadata-command state.
+    ///
+    /// Cross-crate tests can compare command progress and materialized-state
+    /// changes without learning the object's PG, primary node, or raw replica
+    /// proof. Comparisons fail closed across storage domains or subjects.
+    #[derive(Clone)]
+    pub struct TestObjectMetadataCommandState {
+        storage_domain: ProcessLocalRegistryKey,
+        bucket: BucketName,
+        key: ObjectKey,
+        proof: control_plane::PgMetadataProof,
+    }
+
+    impl TestObjectMetadataCommandState {
+        fn same_subject_as(&self, earlier: &Self) -> bool {
+            self.storage_domain == earlier.storage_domain
+                && self.bucket == earlier.bucket
+                && self.key == earlier.key
+        }
+
+        #[must_use]
+        pub fn is_same_position_as(&self, earlier: &Self) -> bool {
+            self.same_subject_as(earlier)
+                && self.proof.applied_log_index == earlier.proof.applied_log_index
+        }
+
+        #[must_use]
+        pub fn advanced_exactly_by(&self, earlier: &Self, command_count: u64) -> bool {
+            self.same_subject_as(earlier)
+                && earlier.proof.applied_log_index.checked_add(command_count)
+                    == Some(self.proof.applied_log_index)
+        }
+
+        #[must_use]
+        pub fn log_hash_changed_since(&self, earlier: &Self) -> bool {
+            self.same_subject_as(earlier)
+                && self.proof.applied_log_hash != earlier.proof.applied_log_hash
+        }
+
+        #[must_use]
+        pub fn state_digest_changed_since(&self, earlier: &Self) -> bool {
+            self.same_subject_as(earlier) && self.proof.state_digest != earlier.proof.state_digest
+        }
+    }
+
+    impl fmt::Debug for TestObjectMetadataCommandState {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("TestObjectMetadataCommandState")
+                .field("storage_domain", &"[redacted]")
+                .field("subject", &"[redacted]")
+                .field("command_state", &"[redacted]")
+                .finish()
+        }
+    }
+
+    pub type TestMetadataCommandApplyHook =
+        Arc<dyn Fn(MetadataCommandApplyTestKind) -> Result<(), StoreError> + Send + Sync>;
+    pub type TestMetadataCommandApplyHookGuard =
+        super::cluster::MetadataCommandApplyContextTestHookGuard;
+
+    /// Logical metadata-command evidence and deterministic faults for
+    /// cross-crate request tests.
+    ///
+    /// Storage owns subject routing, primary selection, and construction of
+    /// low-level command-log failures. Callers can select only a logical
+    /// bucket/object subject and command kind.
+    pub trait StorageClusterMetadataCommandTestSupport {
+        fn test_capture_object_metadata_command_state(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+        ) -> Result<TestObjectMetadataCommandState, StoreError>;
+
+        fn test_install_before_bucket_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandApplyHookGuard;
+
+        fn test_install_before_object_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandApplyHookGuard;
+
+        fn test_install_bucket_metadata_command_log_conflict(
+            &self,
+            bucket: &BucketName,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard;
+
+        fn test_install_object_metadata_command_log_conflict(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard;
+
+        fn test_install_object_metadata_command_log_conflict_once(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard;
+
+        fn test_install_object_metadata_command_stale_apply_once(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard;
+    }
+
+    impl StorageClusterMetadataCommandTestSupport for StorageCluster {
+        fn test_capture_object_metadata_command_state(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+        ) -> Result<TestObjectMetadataCommandState, StoreError> {
+            Ok(TestObjectMetadataCommandState {
+                storage_domain: self.process_local_registry_key(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                proof: self.test_object_pg_metadata_proof(bucket, key)?,
+            })
+        }
+
+        fn test_install_before_bucket_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandApplyHookGuard {
+            let pg_id = PgId::new(self.test_bucket_pg_id_for(bucket));
+            let primary_node = self
+                .local_pg_route(pg_id)
+                .expect("test bucket metadata route must exist")
+                .primary_node_id();
+            let bucket = bucket.clone();
+            self.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+                if context.node_id == primary_node
+                    && context.bucket.as_ref() == Some(&bucket)
+                    && context.key.is_none()
+                {
+                    hook(context.kind)?;
+                }
+                Ok(())
+            }))
+        }
+
+        fn test_install_before_object_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandApplyHookGuard {
+            let pg_id = PgId::new(self.test_object_pg_id_for(bucket, key));
+            let primary_node = self
+                .local_pg_route(pg_id)
+                .expect("test object metadata route must exist")
+                .primary_node_id();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            self.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+                if context.node_id == primary_node
+                    && context.bucket.as_ref() == Some(&bucket)
+                    && context.key.as_ref() == Some(&key)
+                {
+                    hook(context.kind)?;
+                }
+                Ok(())
+            }))
+        }
+
+        fn test_install_bucket_metadata_command_log_conflict(
+            &self,
+            bucket: &BucketName,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard {
+            let pg_id = self.test_bucket_pg_id_for(bucket);
+            let primary_node = self
+                .local_pg_route(PgId::new(pg_id))
+                .expect("test bucket metadata route must exist")
+                .primary_node_id();
+            let cluster_epoch = self.operation_epoch();
+            self.test_install_before_bucket_metadata_command_primary_apply_hook(
+                bucket,
+                Arc::new(move |observed_kind| {
+                    if observed_kind == kind {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id: primary_node.as_u32(),
+                            pg_id,
+                            cluster_epoch,
+                            log_index: 1,
+                        });
+                    }
+                    Ok(())
+                }),
+            )
+        }
+
+        fn test_install_object_metadata_command_log_conflict(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard {
+            let pg_id = self.test_object_pg_id_for(bucket, key);
+            let primary_node = self
+                .local_pg_route(PgId::new(pg_id))
+                .expect("test object metadata route must exist")
+                .primary_node_id();
+            let cluster_epoch = self.operation_epoch();
+            self.test_install_before_object_metadata_command_primary_apply_hook(
+                bucket,
+                key,
+                Arc::new(move |observed_kind| {
+                    if observed_kind == kind {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id: primary_node.as_u32(),
+                            pg_id,
+                            cluster_epoch,
+                            log_index: 1,
+                        });
+                    }
+                    Ok(())
+                }),
+            )
+        }
+
+        fn test_install_object_metadata_command_log_conflict_once(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard {
+            let pg_id = self.test_object_pg_id_for(bucket, key);
+            let primary_node = self
+                .local_pg_route(PgId::new(pg_id))
+                .expect("test object metadata route must exist")
+                .primary_node_id();
+            let cluster_epoch = self.operation_epoch();
+            let pending_failure = AtomicBool::new(true);
+            self.test_install_before_object_metadata_command_primary_apply_hook(
+                bucket,
+                key,
+                Arc::new(move |observed_kind| {
+                    if observed_kind == kind && pending_failure.swap(false, Ordering::SeqCst) {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id: primary_node.as_u32(),
+                            pg_id,
+                            cluster_epoch,
+                            log_index: 1,
+                        });
+                    }
+                    Ok(())
+                }),
+            )
+        }
+
+        fn test_install_object_metadata_command_stale_apply_once(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            kind: MetadataCommandApplyTestKind,
+        ) -> TestMetadataCommandApplyHookGuard {
+            let pg_id = self.test_object_pg_id_for(bucket, key);
+            let operation_epoch = self.operation_epoch();
+            let current_epoch = operation_epoch
+                .get()
+                .checked_add(1)
+                .and_then(ClusterEpoch::new)
+                .expect("test operation epoch must permit a successor");
+            let pending_failure = AtomicBool::new(true);
+            self.test_install_before_object_metadata_command_primary_apply_hook(
+                bucket,
+                key,
+                Arc::new(move |observed_kind| {
+                    if observed_kind == kind && pending_failure.swap(false, Ordering::SeqCst) {
+                        return Err(StoreError::StaleMetadataOperation {
+                            pg_id,
+                            operation_epoch,
+                            current_epoch,
+                        });
+                    }
+                    Ok(())
+                }),
+            )
         }
     }
 
@@ -1072,11 +1366,8 @@ pub mod test_support {
         }
     }
 
-    #[cfg(feature = "test-hooks")]
-    pub use super::cluster::{
-        MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
-        MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
-    };
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub use super::cluster::MetadataCommandApplyTestKind;
     #[cfg(feature = "test-hooks")]
     pub use super::maintenance::{
         install_reclaim_worker_test_hooks, StorageReclaimWorkerTestHookGuard,

@@ -6118,7 +6118,21 @@ Final Phase 5 audit (2026-08-04):
   source module to reject public reintroduction of the raw inherent methods.
   The same source-root scan helper runs against production and a multi-module
   fixture tree, pinning discovery of a nested unrelated-module inherent impl
-  while ignoring its crate-private control.
+  while ignoring its crate-private control; and
+- coordinator epoch-transition and metadata-command fault tests no longer
+  obtain object/bucket PG IDs, primary node IDs, raw replica proofs, or the
+  generic apply-context hook. `StorageClusterMetadataCommandTestSupport`
+  returns an opaque object-scoped command-state snapshot with exact-position,
+  bounded-advance, log-hash, and state-digest predicates, and installs
+  bucket/object primary hooks whose placement and subject filtering remain
+  inside storage. Storage also owns construction of deterministic command-log
+  conflicts and stale-apply failures. Owner-local canaries compare crossed keys
+  and crossed storage domains at equal command positions, pin exact command
+  advancement and redacted evidence, and use a three-replica acting set to
+  prove that subject-scoped hooks observe only the primary. The corresponding inherent raw
+  proof, PG-selection, and apply-context methods are crate-private, and the
+  boundary checker rejects cross-crate use or public reintroduction anywhere
+  under the storage source tree.
 
 The audited cross-crate support families are:
 
@@ -6176,7 +6190,10 @@ Remaining implementation order after this audit:
    placement groups; raw PG enumeration has been removed. Maintenance worker
    observations and deterministic actions are likewise consolidated behind
    owner-namespaced test-support traits, with their inherent implementations
-   crate-private; and
+   crate-private. Metadata-command transition evidence and fault injection are
+   likewise consolidated behind opaque state and subject-scoped hooks; raw
+   PG IDs, replica proofs, primary IDs, and apply contexts no longer cross into
+   `server-core`; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

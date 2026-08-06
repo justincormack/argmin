@@ -1,5 +1,81 @@
 use super::*;
-use crate::test_support::{StorageClusterLifecycleTestSupport, StorageClusterObjectTestSupport};
+use crate::test_support::{
+    MetadataCommandApplyTestKind, StorageClusterLifecycleTestSupport,
+    StorageClusterMetadataCommandTestSupport, StorageClusterObjectTestSupport,
+};
+
+#[test]
+fn opaque_metadata_command_state_and_hook_are_domain_and_subject_bound() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
+    let bucket = crate::BucketName::try_from("metadata-evidence".to_string()).unwrap();
+    let target_key = crate::ObjectKey::try_from("target".to_string()).unwrap();
+    let crossed_key = crate::ObjectKey::try_from("crossed".to_string()).unwrap();
+    ensure_test_bucket(&cluster, &bucket);
+
+    let target_before = cluster
+        .test_capture_object_metadata_command_state(&bucket, &target_key)
+        .unwrap();
+    let crossed_before = cluster
+        .test_capture_object_metadata_command_state(&bucket, &crossed_key)
+        .unwrap();
+    assert!(!target_before.is_same_position_as(&crossed_before));
+    assert!(!target_before.advanced_exactly_by(&crossed_before, 0));
+    let observed_commits = Arc::new(AtomicUsize::new(0));
+    let observed_commits_for_hook = Arc::clone(&observed_commits);
+    let _guard = cluster.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket,
+        &target_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::CommitDirectPutObject {
+                observed_commits_for_hook.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }),
+    );
+
+    write_committed_direct_segment_for(&cluster, &bucket, &crossed_key, b"crossed");
+    assert_eq!(observed_commits.load(Ordering::SeqCst), 0);
+    let target_after_crossed_commit = cluster
+        .test_capture_object_metadata_command_state(&bucket, &target_key)
+        .unwrap();
+    assert!(target_after_crossed_commit.advanced_exactly_by(&target_before, 2));
+
+    write_committed_direct_segment_for_with_okh(
+        &cluster,
+        &bucket,
+        &target_key,
+        [42; 16],
+        b"target",
+    );
+    assert_eq!(observed_commits.load(Ordering::SeqCst), 1);
+    let target_after = cluster
+        .test_capture_object_metadata_command_state(&bucket, &target_key)
+        .unwrap();
+    assert!(target_after.advanced_exactly_by(&target_after_crossed_commit, 2));
+    assert!(target_after.advanced_exactly_by(&target_before, 4));
+    assert!(target_after.log_hash_changed_since(&target_before));
+    assert!(target_after.state_digest_changed_since(&target_before));
+
+    let foreign_tmp = test_util::tempdir();
+    let foreign_map = Arc::new(
+        LocalClusterMap::open(foreign_tmp.path(), &node_ids, &[0], EcShape { k: 2, m: 1 }).unwrap(),
+    );
+    let foreign = crate::StorageCluster::from_static_local_map(foreign_map).unwrap();
+    ensure_test_bucket(&foreign, &bucket);
+    let foreign_state = foreign
+        .test_capture_object_metadata_command_state(&bucket, &target_key)
+        .unwrap();
+    assert!(foreign_state.is_same_position_as(&foreign_state.clone()));
+    assert!(!target_before.is_same_position_as(&foreign_state));
+    assert!(!format!("{target_after:?}").contains(bucket.as_str()));
+    assert!(!format!("{target_after:?}").contains(target_key.as_str()));
+}
 
 #[test]
 fn object_delete_metadata_command_applies_to_all_acting_object_pg_nodes() {

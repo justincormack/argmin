@@ -1752,7 +1752,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_metadata_command_apply_context_hook(
+    pub(crate) fn test_install_before_metadata_command_apply_context_hook(
         &self,
         hook: MetadataCommandApplyContextTestHook,
     ) -> MetadataCommandApplyContextTestHookGuard {
@@ -16935,7 +16935,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
+    pub(crate) fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
         self.bucket_metadata_pg_id(bucket)
     }
 
@@ -17290,7 +17290,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+    pub(crate) fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
         self.object_metadata_pg_id(bucket, key)
     }
 

@@ -674,7 +674,7 @@ pub(crate) enum ObjectPayloadReclaimAttempt {
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MetadataCommandApplyTestContext {
+pub(crate) struct MetadataCommandApplyTestContext {
     pub node_id: NodeId,
     pub kind: MetadataCommandApplyTestKind,
     pub bucket: Option<BucketName>,
@@ -682,7 +682,7 @@ pub struct MetadataCommandApplyTestContext {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type MetadataCommandApplyContextTestHook =
+pub(crate) type MetadataCommandApplyContextTestHook =
     Arc<dyn Fn(MetadataCommandApplyTestContext) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -11008,7 +11008,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_pg_metadata_proof(
+    pub(crate) fn test_object_pg_metadata_proof(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

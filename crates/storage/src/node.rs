@@ -1026,7 +1026,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
+    pub(crate) fn test_bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
         self.bucket_pg_id_for(bucket)
     }
 
@@ -1041,7 +1041,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+    pub(crate) fn test_object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
         self.pg_topology.object_pg_for(bucket, key)
     }
 

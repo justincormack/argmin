@@ -5324,6 +5324,55 @@ fail_with_matches \
     "Maintenance sweeper public-method source-root scan must find only the nested unrelated-module fixture" \
     "$maintenance_sweeper_public_test_method_fixture_failure"
 
+metadata_command_raw_test_symbol_leaks=$(
+    rg -n --color=never \
+        '\b(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for|MetadataCommandApplyTestContext|MetadataCommandApplyContextTestHook)\b' \
+        crates \
+        -g '*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Cross-crate metadata-command tests must use opaque command-state evidence and subject-scoped storage::test_support hooks, not raw PG IDs, replica proofs, nodes, or apply contexts" \
+    "$metadata_command_raw_test_symbol_leaks"
+
+metadata_command_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for)|struct[[:space:]]+MetadataCommandApplyTestContext|type[[:space:]]+MetadataCommandApplyContextTestHook)\b'
+
+scan_public_metadata_command_test_surface() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$metadata_command_public_test_surface_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+public_metadata_command_test_method_leaks=$(
+    scan_public_metadata_command_test_surface crates/storage/src
+)
+fail_with_matches \
+    "Raw metadata-command test helpers must remain crate-private behind storage::test_support" \
+    "$public_metadata_command_test_method_leaks"
+
+metadata_command_public_test_method_fixture=$(
+    scan_public_metadata_command_test_surface \
+        scripts/fixtures/storage-boundary-metadata-command
+)
+expected_metadata_command_public_test_method_fixture='scripts/fixtures/storage-boundary-metadata-command/nested/unrelated-module.rs:3:    pub fn test_object_pg_metadata_proof(&self) {}
+scripts/fixtures/storage-boundary-metadata-command/nested/unrelated-module.rs:6:pub struct MetadataCommandApplyTestContext;
+scripts/fixtures/storage-boundary-metadata-command/nested/unrelated-module.rs:7:pub type MetadataCommandApplyContextTestHook = ();'
+metadata_command_public_test_method_fixture_failure=""
+if [[ "$metadata_command_public_test_method_fixture" != "$expected_metadata_command_public_test_method_fixture" ]]; then
+    metadata_command_public_test_method_fixture_failure=$metadata_command_public_test_method_fixture
+    if [[ -z "$metadata_command_public_test_method_fixture_failure" ]]; then
+        metadata_command_public_test_method_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Metadata-command public-surface source-root scan must find the nested unrelated-module fixture" \
+    "$metadata_command_public_test_method_fixture_failure"
+
 shard_scavenger_maintenance_leaks=$(
     rg -n --color=never \
         '\b(StorageBackfillCandidateScanner|BackgroundWorkAdmission|BackgroundWorkClass|audit_shard_storage_for_scavenger|record_routine_metadata_command_checkpoints)\b|struct[[:space:]]+ShardScavengerSweeper\b' \

@@ -16,14 +16,15 @@ use storage::test_support::{
     TestRetainedReadPgMoveScenario,
 };
 use storage::test_support::{
-    StorageClusterLifecycleTestSupport as _, StorageClusterObjectTestSupport as _,
-    StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
-    StorageClusterRouteMapTestSupport as _, StorageClusterRuntimeMapTopologyTestSupport as _,
-    StorageClusterTopologyTestSupport as _, StorageMaintenanceSweeperTestSupport as _,
-    StorageShardRepairSweeperTestSupport as _, StorageStreamSessionSweeperTestSupport as _,
+    StorageClusterLifecycleTestSupport as _, StorageClusterMetadataCommandTestSupport as _,
+    StorageClusterObjectTestSupport as _, StorageClusterPayloadTestSupport as _,
+    StorageClusterRouteHandleTestSupport as _, StorageClusterRouteMapTestSupport as _,
+    StorageClusterRuntimeMapTopologyTestSupport as _, StorageClusterTopologyTestSupport as _,
+    StorageMaintenanceSweeperTestSupport as _, StorageShardRepairSweeperTestSupport as _,
+    StorageStreamSessionSweeperTestSupport as _,
 };
 use storage::{
-    ClusterEpoch, PgId, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
+    ClusterEpoch, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
     StorageClusterRuntimeMapHandle,
 };
 
@@ -7132,23 +7133,21 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::CommitDirectPutObject {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let put_coord = Arc::clone(&coord);
     let put_thread = thread::spawn(move || {
@@ -7172,11 +7171,10 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index,
-        before_object_pg_proof.applied_log_index + 1,
+    assert!(
+        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 1),
         "direct PUT should have applied only the generation-reservation command before the pre-commit gate"
     );
 
@@ -7188,19 +7186,18 @@ fn put_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route() 
     publication_thread.join().unwrap();
     assert_eq!(put_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "direct PUT crossing an epoch change should append exactly one commit command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "direct PUT command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "direct PUT command should change the object-PG materialized state digest"
     );
 
@@ -7267,23 +7264,21 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::CommitDirectPutObject {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let put_coord = Arc::clone(&coord);
     let put_thread = thread::spawn(move || {
@@ -7307,11 +7302,10 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index,
-        before_object_pg_proof.applied_log_index + 1,
+    assert!(
+        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 1),
         "overwrite should have applied only the generation-reservation command before the pre-commit gate"
     );
 
@@ -7323,19 +7317,18 @@ fn overwrite_object_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     publication_thread.join().unwrap();
     assert_eq!(put_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "overwrite crossing an epoch change should append exactly one commit command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "overwrite command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "overwrite command should change the object-PG materialized state digest"
     );
 
@@ -7399,31 +7392,28 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
     let bucket_name = trusted_bucket_name(bucket);
     let dst_object_key = trusted_object_key(dst_key);
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
     let pre_commit_kinds = Arc::new(Mutex::new(Vec::new()));
-    let hook_bucket = bucket_name.clone();
-    let hook_key = dst_object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
     let pre_commit_kinds_for_hook = Arc::clone(&pre_commit_kinds);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
-                if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject {
-                    gate_for_hook.wait_at(TOKEN);
-                } else {
-                    let mut kinds = pre_commit_kinds_for_hook.lock().unwrap();
-                    if kinds.last() != Some(&context.kind) {
-                        kinds.push(context.kind);
-                    }
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &dst_object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::CommitDirectPutObject {
+                gate_for_hook.wait_at(TOKEN);
+            } else {
+                let mut kinds = pre_commit_kinds_for_hook.lock().unwrap();
+                if kinds.last() != Some(&kind) {
+                    kinds.push(kind);
                 }
             }
             Ok(())
-        }));
+        }),
+    );
 
     let copy_coord = Arc::clone(&coord);
     let copy_thread = thread::spawn(move || {
@@ -7449,11 +7439,10 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index,
-        before_object_pg_proof.applied_log_index + 3,
+    assert!(
+        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 3),
         "copy should have applied generation reservation, stream-session create, and segment append before the destination commit gate"
     );
     assert_eq!(
@@ -7477,19 +7466,18 @@ fn copy_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route()
     publication_thread.join().unwrap();
     assert_eq!(copy_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "copy crossing an epoch change should append exactly one destination commit command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "copy destination commit should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "copy destination commit should change the object-PG materialized state digest"
     );
 
@@ -7556,23 +7544,21 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::DeleteObjectVersion
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::DeleteObjectVersion {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let delete_coord = Arc::clone(&coord);
     let delete_thread = thread::spawn(move || {
@@ -7588,10 +7574,10 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+    assert!(
+        paused_object_pg_proof.is_same_position_as(&before_object_pg_proof),
         "delete should not apply the object-PG command before the pre-apply gate"
     );
 
@@ -7602,19 +7588,18 @@ fn delete_object_epoch_change_before_metadata_apply_commits_once_on_pinned_route
     delete_thread.join().unwrap().unwrap();
     publication_thread.join().unwrap();
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        before_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 1),
         "delete crossing an epoch change should append exactly one delete command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "delete command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "delete command should change the object-PG materialized state digest"
     );
 
@@ -7663,23 +7648,21 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitMultipartObject
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::CommitMultipartObject {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let complete_coord = Arc::clone(&coord);
     let complete_thread = thread::spawn(move || {
@@ -7701,10 +7684,10 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+    assert!(
+        paused_object_pg_proof.is_same_position_as(&before_object_pg_proof),
         "multipart completion should not apply an object-PG command before the pre-commit gate"
     );
 
@@ -7716,19 +7699,18 @@ fn complete_multipart_epoch_change_before_metadata_apply_commits_once_on_pinned_
     publication_thread.join().unwrap();
     assert_eq!(complete_result.version_id, VersionId::Null);
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "multipart completion crossing an epoch change should append exactly one commit command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "multipart completion command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "multipart completion command should change the object-PG materialized state digest"
     );
 
@@ -7793,23 +7775,21 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitStreamPart
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::CommitStreamPart {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let finalize_coord = Arc::clone(&coord);
     let upload_id = upload.upload_id.clone();
@@ -7834,10 +7814,10 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+    assert!(
+        paused_object_pg_proof.is_same_position_as(&before_object_pg_proof),
         "UploadPart finalization should not apply an object-PG command before the pre-commit gate"
     );
 
@@ -7848,19 +7828,18 @@ fn upload_part_finalize_epoch_change_before_metadata_apply_commits_once_on_pinne
     let part = finalize_thread.join().unwrap().unwrap();
     publication_thread.join().unwrap();
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "UploadPart finalization crossing an epoch change should append exactly one part commit after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "UploadPart finalization command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "UploadPart finalization command should change the object-PG materialized state digest"
     );
 
@@ -7958,31 +7937,28 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     let bucket_name = trusted_bucket_name(bucket);
     let dst_object_key = trusted_object_key(dst_key);
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
     let pre_commit_kinds = Arc::new(Mutex::new(Vec::new()));
-    let hook_bucket = bucket_name.clone();
-    let hook_key = dst_object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
     let pre_commit_kinds_for_hook = Arc::clone(&pre_commit_kinds);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-            {
-                if context.kind == MetadataCommandApplyTestKind::CommitStreamPart {
-                    gate_for_hook.wait_at(TOKEN);
-                } else {
-                    let mut kinds = pre_commit_kinds_for_hook.lock().unwrap();
-                    if kinds.last() != Some(&context.kind) {
-                        kinds.push(context.kind);
-                    }
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &dst_object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::CommitStreamPart {
+                gate_for_hook.wait_at(TOKEN);
+            } else {
+                let mut kinds = pre_commit_kinds_for_hook.lock().unwrap();
+                if kinds.last() != Some(&kind) {
+                    kinds.push(kind);
                 }
             }
             Ok(())
-        }));
+        }),
+    );
 
     let copy_coord = Arc::clone(&coord);
     let upload_id = upload.upload_id.clone();
@@ -8006,11 +7982,10 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index,
-        before_object_pg_proof.applied_log_index + 2,
+    assert!(
+        paused_object_pg_proof.advanced_exactly_by(&before_object_pg_proof, 2),
         "UploadPartCopy should have created a destination stream and appended copied data before the part commit gate"
     );
     assert_eq!(
@@ -8032,19 +8007,18 @@ fn upload_part_copy_epoch_change_before_metadata_apply_commits_once_on_pinned_ro
     let part = copy_thread.join().unwrap().unwrap();
     publication_thread.join().unwrap();
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &dst_object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &dst_object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "UploadPartCopy crossing an epoch change should append exactly one part commit after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "UploadPartCopy part commit should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "UploadPartCopy part commit should change the object-PG materialized state digest"
     );
 
@@ -8126,30 +8100,22 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
 
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
-    let object_pg = initial.test_object_pg_id_for(&bucket_name, &object_key);
-    let primary_node = initial
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::PutObjectMetadata
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::PutObjectMetadata {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let tag_coord = Arc::clone(&coord);
     let tag_thread = thread::spawn(move || {
@@ -8166,10 +8132,10 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+    assert!(
+        paused_object_pg_proof.is_same_position_as(&before_object_pg_proof),
         "tag update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
@@ -8180,19 +8146,18 @@ fn put_object_tags_epoch_change_before_metadata_apply_commits_once_on_pinned_rou
     tag_thread.join().unwrap().unwrap();
     publication_thread.join().unwrap();
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "tag update crossing an epoch change should append exactly one object metadata command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "tag update command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "tag update command should change the object-PG materialized state digest"
     );
 
@@ -8253,30 +8218,22 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
 
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
-    let object_pg = initial.test_object_pg_id_for(&bucket_name, &object_key);
-    let primary_node = initial
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::PutObjectMetadata
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::PutObjectMetadata {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let legal_hold_coord = Arc::clone(&coord);
     let legal_hold_thread = thread::spawn(move || {
@@ -8292,10 +8249,10 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+    assert!(
+        paused_object_pg_proof.is_same_position_as(&before_object_pg_proof),
         "legal-hold update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
@@ -8306,19 +8263,18 @@ fn put_object_legal_hold_epoch_change_before_metadata_apply_commits_once_on_pinn
     legal_hold_thread.join().unwrap().unwrap();
     publication_thread.join().unwrap();
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "legal-hold update crossing an epoch change should append exactly one object metadata command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "legal-hold update command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "legal-hold update command should change the object-PG materialized state digest"
     );
 
@@ -8377,30 +8333,22 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
 
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
-    let object_pg = initial.test_object_pg_id_for(&bucket_name, &object_key);
-    let primary_node = initial
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::PutObjectMetadata
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::PutObjectMetadata {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let retention = ObjectRetention {
         mode: ObjectLockMode::Governance,
@@ -8421,10 +8369,10 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+    assert!(
+        paused_object_pg_proof.is_same_position_as(&before_object_pg_proof),
         "retention update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
@@ -8435,19 +8383,18 @@ fn put_object_retention_epoch_change_before_metadata_apply_commits_once_on_pinne
     retention_thread.join().unwrap().unwrap();
     publication_thread.join().unwrap();
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "retention update crossing an epoch change should append exactly one object metadata command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "retention update command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "retention update command should change the object-PG materialized state digest"
     );
 
@@ -8506,30 +8453,22 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
 
     let bucket_name = trusted_bucket_name(bucket);
     let object_key = trusted_object_key(key);
-    let object_pg = initial.test_object_pg_id_for(&bucket_name, &object_key);
-    let primary_node = initial
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let before_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
 
     let gate = DeterministicFaultGate::new(TOKEN);
-    let hook_bucket = bucket_name.clone();
-    let hook_key = object_key.clone();
     let gate_for_hook = Arc::clone(&gate);
-    let _hook_guard =
-        initial.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::PutObjectMetadata
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
+    let _hook_guard = initial.test_install_before_object_metadata_command_primary_apply_hook(
+        &bucket_name,
+        &object_key,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::PutObjectMetadata {
                 gate_for_hook.wait_at(TOKEN);
             }
             Ok(())
-        }));
+        }),
+    );
 
     let acl_coord = Arc::clone(&coord);
     let acl_thread = thread::spawn(move || {
@@ -8546,10 +8485,10 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
 
     gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
     let paused_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        paused_object_pg_proof.applied_log_index, before_object_pg_proof.applied_log_index,
+    assert!(
+        paused_object_pg_proof.is_same_position_as(&before_object_pg_proof),
         "ACL update should not apply the object-PG metadata command before the pre-apply gate"
     );
 
@@ -8560,19 +8499,18 @@ fn put_object_acl_epoch_change_before_metadata_apply_commits_once_on_pinned_rout
     acl_thread.join().unwrap().unwrap();
     publication_thread.join().unwrap();
     let after_object_pg_proof = initial
-        .test_object_pg_metadata_proof(&bucket_name, &object_key)
+        .test_capture_object_metadata_command_state(&bucket_name, &object_key)
         .unwrap();
-    assert_eq!(
-        after_object_pg_proof.applied_log_index,
-        paused_object_pg_proof.applied_log_index + 1,
+    assert!(
+        after_object_pg_proof.advanced_exactly_by(&paused_object_pg_proof, 1),
         "ACL update crossing an epoch change should append exactly one object metadata command after the gate"
     );
-    assert_ne!(
-        after_object_pg_proof.applied_log_hash, before_object_pg_proof.applied_log_hash,
+    assert!(
+        after_object_pg_proof.log_hash_changed_since(&before_object_pg_proof),
         "ACL update command should change the object-PG command-log hash"
     );
-    assert_ne!(
-        after_object_pg_proof.state_digest, before_object_pg_proof.state_digest,
+    assert!(
+        after_object_pg_proof.state_digest_changed_since(&before_object_pg_proof),
         "ACL update command should change the object-PG materialized state digest"
     );
 
@@ -9885,30 +9823,8 @@ fn install_bucket_command_log_conflict_hook(
     storage_cluster: &Arc<StorageCluster>,
     bucket: &BucketName,
     kind: MetadataCommandApplyTestKind,
-) -> storage::test_support::MetadataCommandApplyContextTestHookGuard {
-    let bucket_pg = storage_cluster.test_bucket_pg_id_for(bucket);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(bucket_pg))
-        .unwrap()
-        .primary_node_id();
-    let hook_bucket = bucket.clone();
-    storage_cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
-        move |context| {
-            if context.kind == kind
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.is_none()
-                && context.node_id == primary_node
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: bucket_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        },
-    ))
+) -> storage::test_support::TestMetadataCommandApplyHookGuard {
+    storage_cluster.test_install_bucket_metadata_command_log_conflict(bucket, kind)
 }
 
 fn install_object_command_log_conflict_hook(
@@ -9916,31 +9832,8 @@ fn install_object_command_log_conflict_hook(
     bucket: &BucketName,
     key: &ObjectKey,
     kind: MetadataCommandApplyTestKind,
-) -> storage::test_support::MetadataCommandApplyContextTestHookGuard {
-    let object_pg = storage_cluster.test_object_pg_id_for(bucket, key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    storage_cluster.test_install_before_metadata_command_apply_context_hook(Arc::new(
-        move |context| {
-            if context.kind == kind
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        },
-    ))
+) -> storage::test_support::TestMetadataCommandApplyHookGuard {
+    storage_cluster.test_install_object_metadata_command_log_conflict(bucket, key, kind)
 }
 
 fn delete_bucket_metadata_or_accept_reclaim_worker_finalize(
@@ -11116,33 +11009,15 @@ fn direct_put_request_maps_command_log_conflict_to_slow_down() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
-        Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        }),
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CommitDirectPutObject,
     );
 
     let metadata = MetadataBlob::new();
@@ -11312,33 +11187,15 @@ fn stream_put_begin_request_maps_command_log_conflict_to_slow_down() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
-        Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CreateStreamUpload
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        }),
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CreateStreamUpload,
     );
 
     let err = begin_stream_put_test(&coord, "bucket", "key").unwrap_err();
@@ -11391,33 +11248,15 @@ fn stream_put_finalize_request_maps_command_log_conflict_to_slow_down() {
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
-        Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        }),
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::CommitDirectPutObject,
     );
 
     let metadata = MetadataBlob::new();
@@ -11903,44 +11742,15 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("dst");
-    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let append_failures = Arc::new(AtomicUsize::new(1));
     let abort_failures = Arc::new(AtomicUsize::new(2));
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    let hook_append_failures = Arc::clone(&append_failures);
-    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
-        Arc::new(move |context| {
-            if context.bucket.as_ref() != Some(&hook_bucket)
-                || context.key.as_ref() != Some(&hook_key)
-                || context.node_id != primary_node
-            {
-                return Ok(());
-            }
-            if context.kind == MetadataCommandApplyTestKind::AppendStreamSegment
-                && hook_append_failures
-                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                        remaining.checked_sub(1)
-                    })
-                    .is_ok()
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        }),
+    let hook_guard = storage_cluster.test_install_object_metadata_command_log_conflict_once(
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::AppendStreamSegment,
     );
     let hook_abort_failures = Arc::clone(&abort_failures);
     let retained_abort_guard =
@@ -11986,11 +11796,6 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
     );
     drop(hook_guard);
     drop(retained_abort_guard);
-    assert_eq!(
-        append_failures.load(Ordering::SeqCst),
-        0,
-        "test must inject one CopyObject append conflict"
-    );
     assert_eq!(
         abort_failures.load(Ordering::SeqCst),
         0,
@@ -12326,33 +12131,15 @@ fn delete_object_version_request_maps_command_log_conflict_to_slow_down() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
-        Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::DeleteObjectVersion
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        }),
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::DeleteObjectVersion,
     );
 
     let err = coord
@@ -12453,33 +12240,15 @@ fn delete_object_marker_insert_request_maps_command_log_conflict_to_slow_down() 
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
-    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
-        Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::InsertDeleteMarker
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-            {
-                return Err(storage::StoreError::MetadataCommandLogConflict {
-                    node_id: primary_node.as_u32(),
-                    pg_id: object_pg,
-                    cluster_epoch: storage::ClusterEpoch::INITIAL,
-                    log_index: 1,
-                });
-            }
-            Ok(())
-        }),
+    let hook_guard = install_object_command_log_conflict_hook(
+        &storage_cluster,
+        &bucket,
+        &key,
+        MetadataCommandApplyTestKind::InsertDeleteMarker,
     );
 
     let err = coord
@@ -13364,37 +13133,30 @@ fn direct_put_retry_converges_pending_partial_metadata_command() {
 
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
-    let object_pg = storage_cluster.test_object_pg_id_for(&bucket, &key);
-    let primary_node = storage_cluster
-        .local_pg_route(PgId::new(object_pg))
-        .unwrap()
-        .primary_node_id();
     let _serial = STORAGE_TEST_HOOK_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
     let fail_once = Arc::new(AtomicBool::new(true));
-    let hook_bucket = bucket.clone();
-    let hook_key = key.clone();
     let fail_once_hook = Arc::clone(&fail_once);
-    let hook_guard = storage_cluster.test_install_before_metadata_command_apply_context_hook(
-        Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::CommitDirectPutObject
-                && context.bucket.as_ref() == Some(&hook_bucket)
-                && context.key.as_ref() == Some(&hook_key)
-                && context.node_id == primary_node
-                && fail_once_hook.swap(false, Ordering::SeqCst)
-            {
-                return Err(storage::StoreError::Io {
-                    context: "injected coordinator direct put metadata command apply failure",
-                    source: std::io::Error::other(
-                        "injected coordinator direct put metadata command apply failure",
-                    ),
-                });
-            }
-            Ok(())
-        }),
-    );
+    let hook_guard = storage_cluster
+        .test_install_before_object_metadata_command_primary_apply_hook(
+            &bucket,
+            &key,
+            Arc::new(move |kind| {
+                if kind == MetadataCommandApplyTestKind::CommitDirectPutObject
+                    && fail_once_hook.swap(false, Ordering::SeqCst)
+                {
+                    return Err(storage::StoreError::Io {
+                        context: "injected coordinator direct put metadata command apply failure",
+                        source: std::io::Error::other(
+                            "injected coordinator direct put metadata command apply failure",
+                        ),
+                    });
+                }
+                Ok(())
+            }),
+        );
 
     let metadata = MetadataBlob::new();
     let first_err = test_helpers::put_object(
@@ -18995,31 +18757,21 @@ fn reclaim_zero_apply_failure_releases_claim_after_pending_slot_cleanup() {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();
-    let (_tmp, coord, _bucket, _key, reclaim_subject) =
+    let (_tmp, coord, bucket, key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-release-after-zero-apply");
 
-    let failed_once = Arc::new(AtomicBool::new(false));
-    let hook_failed_once = Arc::clone(&failed_once);
     let apply_guard = coord
         .storage_node()
-        .test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim
-                && !hook_failed_once.swap(true, Ordering::SeqCst)
-            {
-                return Err(storage::StoreError::StaleMetadataOperation {
-                    pg_id: 0,
-                    operation_epoch: ClusterEpoch::INITIAL,
-                    current_epoch: ClusterEpoch::new(2).unwrap(),
-                });
-            }
-            Ok(())
-        }));
+        .test_install_object_metadata_command_stale_apply_once(
+            &bucket,
+            &key,
+            MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim,
+        );
 
     let error = coord
         .read_runtime()
         .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
-    assert!(failed_once.load(Ordering::SeqCst));
     assert!(
         matches!(error, ServerError::SlowDown),
         "zero-apply route failure should remain retryable, got {error:?}"
@@ -19108,25 +18860,16 @@ fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();
-    let (_tmp, coord, _bucket, _key, reclaim_subject) =
+    let (_tmp, coord, bucket, key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-ownership-lookup-failure");
 
-    let apply_failed = Arc::new(AtomicBool::new(false));
-    let hook_apply_failed = Arc::clone(&apply_failed);
     let _apply_guard = coord
         .storage_node()
-        .test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim
-                && !hook_apply_failed.swap(true, Ordering::SeqCst)
-            {
-                return Err(storage::StoreError::StaleMetadataOperation {
-                    pg_id: 0,
-                    operation_epoch: ClusterEpoch::INITIAL,
-                    current_epoch: ClusterEpoch::new(2).unwrap(),
-                });
-            }
-            Ok(())
-        }));
+        .test_install_object_metadata_command_stale_apply_once(
+            &bucket,
+            &key,
+            MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim,
+        );
     let ownership_lookup_failed = Arc::new(AtomicBool::new(false));
     let hook_ownership_lookup_failed = Arc::clone(&ownership_lookup_failed);
     let _lookup_guard = coord
@@ -19145,7 +18888,6 @@ fn reclaim_ownership_lookup_failure_clears_active_reclaim_slot() {
         .read_runtime()
         .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
-    assert!(apply_failed.load(Ordering::SeqCst));
     assert!(ownership_lookup_failed.load(Ordering::SeqCst));
     assert!(
         matches!(error, ServerError::SlowDown),
@@ -19174,25 +18916,16 @@ fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
         .unwrap();
-    let (_tmp, coord, _bucket, _key, reclaim_subject) =
+    let (_tmp, coord, bucket, key, reclaim_subject) =
         setup_deleted_object_reclaim_test(b"claim-release-failure");
 
-    let apply_failed = Arc::new(AtomicBool::new(false));
-    let hook_apply_failed = Arc::clone(&apply_failed);
     let _apply_guard = coord
         .storage_node()
-        .test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
-            if context.kind == MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim
-                && !hook_apply_failed.swap(true, Ordering::SeqCst)
-            {
-                return Err(storage::StoreError::StaleMetadataOperation {
-                    pg_id: 0,
-                    operation_epoch: ClusterEpoch::INITIAL,
-                    current_epoch: ClusterEpoch::new(2).unwrap(),
-                });
-            }
-            Ok(())
-        }));
+        .test_install_object_metadata_command_stale_apply_once(
+            &bucket,
+            &key,
+            MetadataCommandApplyTestKind::DeleteObjectPayloadReclaim,
+        );
     let claim_release_failed = Arc::new(AtomicBool::new(false));
     let hook_claim_release_failed = Arc::clone(&claim_release_failed);
     let _release_guard = coord
@@ -19211,7 +18944,6 @@ fn reclaim_claim_release_failure_clears_active_reclaim_slot() {
         .read_runtime()
         .try_reclaim_object_payload(&reclaim_subject)
         .unwrap_err();
-    assert!(apply_failed.load(Ordering::SeqCst));
     assert!(claim_release_failed.load(Ordering::SeqCst));
     assert!(
         matches!(
