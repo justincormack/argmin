@@ -10705,7 +10705,7 @@ impl super::StorageCluster {
                     )
                     .map_err(ObjectPgActionError::from)?;
                     self.after_object_metadata_command_applied(&command);
-                    #[cfg(any(test, feature = "test-hooks"))]
+                    #[cfg(test)]
                     crate::node::maybe_run_after_object_metadata_command_publish_hook(
                         self.metadata_primary_test_hook_node().test_hook_scope_id(),
                     )?;
@@ -18615,7 +18615,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_lock_bucket_pg(
+    pub(crate) fn test_lock_bucket_pg(
         &self,
         bucket: &BucketName,
     ) -> Result<crate::node::BucketPgTestGuard<'_>, StoreError> {

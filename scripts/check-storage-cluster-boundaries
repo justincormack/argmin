@@ -5373,6 +5373,59 @@ fail_with_matches \
     "Metadata-command public-surface source-root scan must find the nested unrelated-module fixture" \
     "$metadata_command_public_test_method_fixture_failure"
 
+storage_scheduling_raw_test_symbol_leaks=$(
+    rg -n --color=never \
+        '\b(test_lock_bucket_pg|BucketPgTestGuard|test_hook_scope_id|test_install_after_direct_put_metadata_publish_hook|DirectPutMetadataPublishHook|DirectPutMetadataPublishTestHookGuard|AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS|test_install_after_object_metadata_command_publish_hook|ObjectMetadataCommandPublishHook|ObjectMetadataCommandPublishTestHookGuard|AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS)\b' \
+        crates \
+        -g '*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Cross-crate scheduling tests must use opaque storage::test_support guards, not raw PG locks or arbitrary node publication hooks" \
+    "$storage_scheduling_raw_test_symbol_leaks"
+
+storage_scheduling_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+(test_lock_bucket_pg|test_hook_scope_id|test_install_after_direct_put_metadata_publish_hook|test_install_after_object_metadata_command_publish_hook)|struct[[:space:]]+(BucketPgTestGuard|DirectPutMetadataPublishTestHookGuard|ObjectMetadataCommandPublishTestHookGuard)|type[[:space:]]+(DirectPutMetadataPublishHook|ObjectMetadataCommandPublishHook)|static[[:space:]]+(AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS|AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS))\b'
+
+scan_public_storage_scheduling_test_surface() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$storage_scheduling_public_test_surface_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+public_storage_scheduling_test_surface_leaks=$(
+    scan_public_storage_scheduling_test_surface crates/storage/src
+)
+fail_with_matches \
+    "Raw storage scheduling test guards and hooks must remain crate-private behind storage::test_support" \
+    "$public_storage_scheduling_test_surface_leaks"
+
+storage_scheduling_public_test_surface_fixture=$(
+    scan_public_storage_scheduling_test_surface \
+        scripts/fixtures/storage-boundary-storage-scheduling
+)
+expected_storage_scheduling_public_test_surface_fixture='scripts/fixtures/storage-boundary-storage-scheduling/nested/unrelated-module.rs:1:pub struct BucketPgTestGuard;
+scripts/fixtures/storage-boundary-storage-scheduling/nested/unrelated-module.rs:3:pub type DirectPutMetadataPublishHook = ();
+scripts/fixtures/storage-boundary-storage-scheduling/nested/unrelated-module.rs:4:pub type ObjectMetadataCommandPublishHook = ();
+scripts/fixtures/storage-boundary-storage-scheduling/nested/unrelated-module.rs:5:pub static AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS: () = ();
+scripts/fixtures/storage-boundary-storage-scheduling/nested/unrelated-module.rs:6:pub static AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS: () = ();
+scripts/fixtures/storage-boundary-storage-scheduling/nested/unrelated-module.rs:9:    pub fn test_lock_bucket_pg(&self) {}
+scripts/fixtures/storage-boundary-storage-scheduling/nested/unrelated-module.rs:10:    pub fn test_install_after_direct_put_metadata_publish_hook(&self) {}'
+storage_scheduling_public_test_surface_fixture_failure=""
+if [[ "$storage_scheduling_public_test_surface_fixture" != "$expected_storage_scheduling_public_test_surface_fixture" ]]; then
+    storage_scheduling_public_test_surface_fixture_failure=$storage_scheduling_public_test_surface_fixture
+    if [[ -z "$storage_scheduling_public_test_surface_fixture_failure" ]]; then
+        storage_scheduling_public_test_surface_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Storage scheduling public-surface source-root scan must find only the nested unrelated-module fixture" \
+    "$storage_scheduling_public_test_surface_fixture_failure"
+
 shard_scavenger_maintenance_leaks=$(
     rg -n --color=never \
         '\b(StorageBackfillCandidateScanner|BackgroundWorkAdmission|BackgroundWorkClass|audit_shard_storage_for_scavenger|record_routine_metadata_command_checkpoints)\b|struct[[:space:]]+ShardScavengerSweeper\b' \

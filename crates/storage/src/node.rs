@@ -166,17 +166,17 @@ struct StorageEcWriteState {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketPgTestGuard<'a> {
+pub(crate) struct BucketPgTestGuard<'a> {
     guard: MutexGuard<'a, PgStore>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct DirectPutMetadataPublishTestHookGuard {
+pub(crate) struct DirectPutMetadataPublishTestHookGuard {
     scope_id: usize,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct ObjectMetadataCommandPublishTestHookGuard {
+#[cfg(test)]
+pub(crate) struct ObjectMetadataCommandPublishTestHookGuard {
     scope_id: usize,
 }
 
@@ -196,7 +196,7 @@ impl Drop for DirectPutMetadataPublishTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for ObjectMetadataCommandPublishTestHookGuard {
     fn drop(&mut self) {
         let hooks =
@@ -222,18 +222,19 @@ pub struct BucketScopedTestHooks {
 static BUCKET_SCOPED_TEST_HOOKS: OnceLock<Mutex<BucketScopedTestHooks>> = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
-type DirectPutMetadataPublishHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+pub(crate) type DirectPutMetadataPublishHook =
+    Arc<dyn Fn(&BucketName, &ObjectKey) -> Result<(), ObjectPgActionError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 static AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS: OnceLock<
     Mutex<HashMap<usize, DirectPutMetadataPublishHook>>,
 > = OnceLock::new();
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 type ObjectMetadataCommandPublishHook =
     Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 static AFTER_OBJECT_METADATA_COMMAND_PUBLISH_HOOKS: OnceLock<
     Mutex<HashMap<usize, ObjectMetadataCommandPublishHook>>,
 > = OnceLock::new();
@@ -336,6 +337,8 @@ pub(crate) fn maybe_run_after_bucket_delete_finalize_hook(_: &BucketName) {}
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook(
     scope_id: usize,
+    bucket: &BucketName,
+    key: &ObjectKey,
 ) -> Result<(), ObjectPgActionError> {
     let hook = AFTER_DIRECT_PUT_METADATA_PUBLISH_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -344,12 +347,12 @@ pub(crate) fn maybe_run_after_direct_put_metadata_publish_hook(
         .get(&scope_id)
         .cloned();
     if let Some(hook) = hook {
-        hook()?;
+        hook(bucket, key)?;
     }
     Ok(())
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 pub(crate) fn maybe_run_after_object_metadata_command_publish_hook(
     scope_id: usize,
 ) -> Result<(), ObjectPgActionError> {
@@ -1478,14 +1481,14 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_hook_scope_id(&self) -> usize {
+    pub(crate) fn test_hook_scope_id(&self) -> usize {
         std::ptr::from_ref(self).addr()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_direct_put_metadata_publish_hook(
+    pub(crate) fn test_install_after_direct_put_metadata_publish_hook(
         &self,
-        hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
+        hook: DirectPutMetadataPublishHook,
     ) -> DirectPutMetadataPublishTestHookGuard {
         let scope_id = self.test_hook_scope_id();
         let hooks =
@@ -1494,8 +1497,8 @@ impl SharedStorageNode {
         DirectPutMetadataPublishTestHookGuard { scope_id }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_object_metadata_command_publish_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_after_object_metadata_command_publish_hook(
         &self,
         hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
     ) -> ObjectMetadataCommandPublishTestHookGuard {
@@ -1517,7 +1520,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_lock_bucket_pg(
+    pub(crate) fn test_lock_bucket_pg(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketPgTestGuard<'_>, StoreError> {

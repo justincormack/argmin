@@ -12146,16 +12146,16 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_direct_put_metadata_publish_hook(
+    pub(crate) fn test_install_after_direct_put_metadata_publish_hook(
         &self,
-        hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
+        hook: crate::node::DirectPutMetadataPublishHook,
     ) -> crate::node::DirectPutMetadataPublishTestHookGuard {
         self.metadata_primary_test_hook_node()
             .test_install_after_direct_put_metadata_publish_hook(hook)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_object_metadata_command_publish_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_after_object_metadata_command_publish_hook(
         &self,
         hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
     ) -> crate::node::ObjectMetadataCommandPublishTestHookGuard {
@@ -15309,13 +15309,14 @@ impl StorageCluster {
             DirectPutPayloadOwnership::DurableCommand
         ));
 
-        #[cfg(any(test, feature = "test-hooks"))]
-        crate::node::maybe_run_after_direct_put_metadata_publish_hook(
-            self.metadata_primary_test_hook_node().test_hook_scope_id(),
-        )?;
-
         match command.payload() {
             MetadataCommandPayload::CommitDirectPutObject(commit) => {
+                #[cfg(any(test, feature = "test-hooks"))]
+                crate::node::maybe_run_after_direct_put_metadata_publish_hook(
+                    self.metadata_primary_test_hook_node().test_hook_scope_id(),
+                    &commit.object.bucket,
+                    &commit.object.key,
+                )?;
                 Ok(Ok(FinalizeDirectPutObjectOutcome {
                     version_id: commit.object.version_id,
                     encryption: commit.object.encryption.clone(),

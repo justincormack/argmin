@@ -181,6 +181,18 @@ pub mod test_support {
 
     use super::*;
 
+    /// Opaque guard for a deterministic Direct PUT failure after durable
+    /// metadata publication.
+    pub struct TestDirectPutPostPublishErrorGuard {
+        _inner: super::node::DirectPutMetadataPublishTestHookGuard,
+    }
+
+    /// Opaque guard holding the metadata serialization boundary for one
+    /// bucket. The routed PG and storage lock remain storage-owned.
+    pub struct TestBucketMetadataHoldGuard<'a> {
+        _inner: super::node::BucketPgTestGuard<'a>,
+    }
+
     /// Curated opaque payload observations for cross-crate tests.
     ///
     /// The underlying storage operations remain crate-private. Importing this
@@ -188,6 +200,13 @@ pub mod test_support {
     /// available to downstream test code.
     pub trait StorageClusterPayloadTestSupport {
         fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize;
+
+        fn test_install_direct_put_post_publish_error(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            reason: String,
+        ) -> TestDirectPutPostPublishErrorGuard;
 
         fn test_capture_object_payload(
             &self,
@@ -277,6 +296,29 @@ pub mod test_support {
     impl StorageClusterPayloadTestSupport for StorageCluster {
         fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
             StorageCluster::test_ec_scratch_allocation_count(self, shape)
+        }
+
+        fn test_install_direct_put_post_publish_error(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            reason: String,
+        ) -> TestDirectPutPostPublishErrorGuard {
+            let target_bucket = bucket.clone();
+            let target_key = key.clone();
+            let inner = StorageCluster::test_install_after_direct_put_metadata_publish_hook(
+                self,
+                Arc::new(move |actual_bucket, actual_key| {
+                    if actual_bucket == &target_bucket && actual_key == &target_key {
+                        Err(ObjectPgActionError::InvalidRequest {
+                            reason: reason.clone(),
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }),
+            );
+            TestDirectPutPostPublishErrorGuard { _inner: inner }
         }
 
         fn test_capture_object_payload(
@@ -874,6 +916,11 @@ pub mod test_support {
     /// entries, or timestamps. Storage owns the physical setup and projects
     /// only the worker state or semantic transition required by the caller.
     pub trait StorageClusterLifecycleTestSupport {
+        fn test_hold_bucket_metadata(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketMetadataHoldGuard<'_>, StoreError>;
+
         fn test_bucket_presence(
             &self,
             bucket: &BucketName,
@@ -971,6 +1018,15 @@ pub mod test_support {
     }
 
     impl StorageClusterLifecycleTestSupport for StorageCluster {
+        fn test_hold_bucket_metadata(
+            &self,
+            bucket: &BucketName,
+        ) -> Result<TestBucketMetadataHoldGuard<'_>, StoreError> {
+            Ok(TestBucketMetadataHoldGuard {
+                _inner: StorageCluster::test_lock_bucket_pg(self, bucket)?,
+            })
+        }
+
         fn test_bucket_presence(
             &self,
             bucket: &BucketName,

@@ -1222,11 +1222,12 @@ fn direct_put_committed_response_loss_retry_returns_existing_commit() {
     );
 
     let _serial = lock_metadata_command_apply_hook_test();
-    let hook_guard = cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
-        Err(crate::ObjectPgActionError::InvalidRequest {
-            reason: "injected direct PUT response loss".to_string(),
-        })
-    }));
+    let hook_guard =
+        cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|_, _| {
+            Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "injected direct PUT response loss".to_string(),
+            })
+        }));
 
     let first_err = cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
@@ -1355,11 +1356,12 @@ fn direct_put_overwrite_committed_response_loss_retry_preserves_reclaim_generati
     );
 
     let _serial = lock_metadata_command_apply_hook_test();
-    let hook_guard = cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
-        Err(crate::ObjectPgActionError::InvalidRequest {
-            reason: "injected direct PUT overwrite response loss".to_string(),
-        })
-    }));
+    let hook_guard =
+        cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|_, _| {
+            Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "injected direct PUT overwrite response loss".to_string(),
+            })
+        }));
 
     let first_err = cluster
         .commit_direct_put_object_from_payload_shards(
@@ -1468,11 +1470,12 @@ fn copy_object_destination_committed_response_loss_retry_returns_existing_commit
     );
 
     let _serial = lock_metadata_command_apply_hook_test();
-    let hook_guard = cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
-        Err(crate::ObjectPgActionError::InvalidRequest {
-            reason: "injected CopyObject destination response loss".to_string(),
-        })
-    }));
+    let hook_guard =
+        cluster.test_install_after_direct_put_metadata_publish_hook(Arc::new(|_, _| {
+            Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "injected CopyObject destination response loss".to_string(),
+            })
+        }));
 
     let first_err = cluster
         .commit_direct_put_object_from_payload_shards(

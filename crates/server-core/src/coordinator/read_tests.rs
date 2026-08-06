@@ -790,11 +790,33 @@ fn buffered_put_post_publish_error_keeps_committed_shards() {
 
     let _guard = coord
         .storage_node()
-        .test_install_after_direct_put_metadata_publish_hook(Arc::new(|| {
-            Err(storage::ObjectPgActionError::InvalidRequest {
-                reason: "post-publish direct put test failure".to_string(),
-            })
-        }));
+        .test_install_direct_put_post_publish_error(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            "post-publish direct put test failure".to_string(),
+        );
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "crossed-key",
+                test_requester(),
+                None,
+            ),
+            data: b"crossed-key-must-not-trigger",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .expect("subject-bound post-publish fault must ignore another key");
 
     let err = test_helpers::put_object(
         &coord,

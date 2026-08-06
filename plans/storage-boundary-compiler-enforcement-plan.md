@@ -6193,7 +6193,17 @@ Remaining implementation order after this audit:
    crate-private. Metadata-command transition evidence and fault injection are
    likewise consolidated behind opaque state and subject-scoped hooks; raw
    PG IDs, replica proofs, primary IDs, and apply contexts no longer cross into
-   `server-core`; and
+   `server-core`. The remaining bucket serialization and Direct PUT
+   post-publication scheduling seams now likewise expose only opaque
+   `storage::test_support` guards: coordinator tests can request a metadata
+   serialization hold from a logical bucket or a subject-bound fixed
+   post-publication error, but cannot name a bucket PG, node hook registry, or
+   arbitrary storage callback. A crossed-key canary proves that the Direct PUT
+   fault cannot contaminate another object on the same storage domain. The
+   underlying guard types, callback aliases, hook registries, and inherent
+   hook/lock methods are crate-private or module-private, and a crate-wide
+   source-root check with a nested-module fixture rejects their public or
+   cross-crate reintroduction; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

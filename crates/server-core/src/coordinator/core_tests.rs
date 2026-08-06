@@ -15106,7 +15106,7 @@ fn head_object_lazily_populates_bucket_fast_path_for_boe_bucket() {
 }
 
 #[test]
-fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
+fn head_object_waits_for_bucket_metadata_when_non_boe_bucket_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let bucket = "bucket-head-fast-no-pg";
     let pg_ids: Vec<u32> = (0..METADATA_FANOUT_TEST_PG_COUNT).collect();
@@ -15165,8 +15165,8 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
             panic!("non-BOE head_object should not use fast bucket path");
         })),
     });
-    let bucket_pg = storage_cluster
-        .test_lock_bucket_pg(&trusted_bucket_name(bucket))
+    let bucket_metadata = storage_cluster
+        .test_hold_bucket_metadata(&trusted_bucket_name(bucket))
         .unwrap();
     let (tx, rx) = mpsc::channel();
     let handle = thread::spawn(move || {
@@ -15187,12 +15187,12 @@ fn head_object_waits_for_bucket_pg_when_non_boe_bucket_fast_path_is_warm() {
     assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     assert!(
         rx.try_recv().is_err(),
-        "head_object returned before bucket pg released"
+        "head_object returned before bucket metadata hold was released"
     );
-    drop(bucket_pg);
+    drop(bucket_metadata);
     let head = rx
         .recv()
-        .expect("head_object should complete after bucket pg released")
+        .expect("head_object should complete after bucket metadata hold is released")
         .unwrap();
     assert_eq!(head.size, 4);
     handle.join().unwrap();
@@ -17448,8 +17448,8 @@ fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() 
             panic!("delete_object should not use ACL-free fast bucket path");
         })),
     });
-    let bucket_pg = storage_cluster
-        .test_lock_bucket_pg(&trusted_bucket_name(bucket))
+    let bucket_metadata = storage_cluster
+        .test_hold_bucket_metadata(&trusted_bucket_name(bucket))
         .unwrap();
     let (tx, rx) = mpsc::channel();
     let key_for_delete = key.clone();
@@ -17468,12 +17468,12 @@ fn delete_object_falls_back_to_storage_load_when_bucket_fast_path_is_acl_free() 
     assert_eq!(event_rx.recv().unwrap(), LockWaitEvent::Progress);
     assert!(
         rx.try_recv().is_err(),
-        "delete_object returned before bucket pg released"
+        "delete_object returned before bucket metadata hold was released"
     );
-    drop(bucket_pg);
+    drop(bucket_metadata);
     let deleted = rx
         .recv()
-        .expect("delete_object should complete after bucket pg released")
+        .expect("delete_object should complete after bucket metadata hold is released")
         .unwrap();
     assert!(!deleted.delete_marker);
     assert!(matches!(
