@@ -187,14 +187,12 @@ impl std::fmt::Debug for ControlPlaneAuthorityClockCheckpointBinding {
 impl ControlPlaneAuthorityClockCheckpointBinding {
     #[must_use]
     pub fn for_raft(cluster_name: &str, node_id: u64) -> Self {
-        let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+        let mut context = checksum::sha256::Sha256::new();
         context.update(b"argmin-control-plane-clock-checkpoint-raft-v1\0");
         context.update(&(cluster_name.len() as u64).to_be_bytes());
         context.update(cluster_name.as_bytes());
         context.update(&node_id.to_be_bytes());
-        let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
-        binding.copy_from_slice(context.finish().as_ref());
-        Self(binding)
+        Self(context.finalize())
     }
 
     fn generate_single_authority() -> Result<Self, ControlPlaneError> {

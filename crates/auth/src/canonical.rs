@@ -1,12 +1,9 @@
 /// Canonical request construction per AWS SigV4 spec.
-use ring::digest;
-
 use crate::encoding::{hex_encode_lower, hex_val, percent_decode_lossy};
 
 /// SHA-256 hash as lowercase hex string.
 pub fn sha256_hex(data: &[u8]) -> String {
-    let hash = digest::digest(&digest::SHA256, data);
-    hex_encode_lower(hash.as_ref())
+    hex_encode_lower(&checksum::sha256::digest(data))
 }
 
 /// Percent-encode a value per SigV4 rules (RFC 3986 unreserved chars only).

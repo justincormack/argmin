@@ -79,6 +79,7 @@ dependencies = [
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "base64",
+ "checksum",
  "observability",
  "proptest",
  "ring",
@@ -2171,8 +2172,8 @@ dependencies = [
 name = "s3-types"
 version = "0.1.0"
 dependencies = [
+ "checksum",
  "quick-xml",
- "ring",
  "thiserror",
  "unicode-general-category",
 ]

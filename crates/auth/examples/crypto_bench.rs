@@ -58,7 +58,13 @@ fn main() -> Result<(), String> {
     let data = benchmark_data(config.block_size);
     let (provider, request) = signed_request()?;
 
-    println!("crypto_provider=ring");
+    println!("tls_crypto_provider=ring");
+    println!("hmac_provider=ring");
+    println!(
+        "sha256_backend_override={}",
+        std::env::var("ARGMIN_SHA256_BENCH_BACKEND").unwrap_or_else(|_| "auto".to_string())
+    );
+    println!("sha256_backend={}", checksum::sha256::backend_name());
     println!("tls_profile=storage-rpc-tls13");
     println!("block_size_bytes={}", config.block_size);
     println!("sample_iters={}", config.sample_iters);

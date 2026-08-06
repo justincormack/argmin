@@ -4,10 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+crypto-bench = ["checksum/bench-select"]
 deep-tracing = ["observability/deep-tracing"]
 
 [dependencies]
 base64 = "0.22"
+checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
 ring = "0.17"
 serde_json = "1"

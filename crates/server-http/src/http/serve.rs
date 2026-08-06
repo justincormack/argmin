@@ -3056,7 +3056,7 @@ async fn presigned_streaming_body_error(
     };
 
     let mut provided = 0u64;
-    let mut hasher = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut hasher = checksum::sha256::Sha256::new();
     loop {
         match tokio::time::timeout(idle_timeout, body.frame()).await {
             Ok(Some(Ok(frame))) => {
@@ -3101,7 +3101,7 @@ async fn presigned_streaming_body_error(
     {
         return ServerError::PresignedStreamingContentSHA256Mismatch {
             client_hash: client_hash.to_string(),
-            server_hash: sha256_hex_from_digest(hasher.finish().as_ref()),
+            server_hash: sha256_hex_from_digest(&hasher.finalize()),
         };
     }
 
@@ -3209,7 +3209,7 @@ async fn handle_streaming_put(
     };
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
-        .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
+        .map(|_| checksum::sha256::Sha256::new());
     let mut content_md5_hasher = ctx.checksum.content_md5.map(|_| md5_legacy::Md5::new());
 
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
@@ -3365,7 +3365,7 @@ async fn handle_streaming_put(
     }
 
     if let (Some(claimed), Some(h)) = (claimed_payload_sha256.as_ref(), payload_sha256_hasher) {
-        let actual = sha256_hex_from_digest(h.finish().as_ref());
+        let actual = sha256_hex_from_digest(&h.finalize());
         if &actual != claimed {
             abort_streaming(&state, &ctx, session_id.clone()).await;
             return error_response(
@@ -3592,7 +3592,7 @@ async fn abort_streaming(
 
 struct StreamingPutIngestState<'a> {
     hasher: &'a mut checksum::crc64::Hasher,
-    payload_sha256_hasher: &'a mut Option<ring::digest::Context>,
+    payload_sha256_hasher: &'a mut Option<checksum::sha256::Sha256>,
     content_md5_hasher: &'a mut Option<md5_legacy::Md5>,
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,
@@ -4132,7 +4132,7 @@ async fn handle_streaming_part(
     };
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
-        .map(|_| ring::digest::Context::new(&ring::digest::SHA256));
+        .map(|_| checksum::sha256::Sha256::new());
     let mut content_md5_hasher = ctx.checksum.content_md5.map(|_| md5_legacy::Md5::new());
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let mut hasher = checksum::crc64::Hasher::new();
@@ -4292,7 +4292,7 @@ async fn handle_streaming_part(
     }
 
     if let (Some(claimed), Some(h)) = (claimed_payload_sha256.as_ref(), payload_sha256_hasher) {
-        let actual = sha256_hex_from_digest(h.finish().as_ref());
+        let actual = sha256_hex_from_digest(&h.finalize());
         if &actual != claimed {
             abort_streaming_part_ctx(&state, &ctx).await;
             return error_response(
@@ -4619,7 +4619,7 @@ async fn abort_streaming_part_ctx(
 
 struct StreamingPartIngestState<'a> {
     hasher: &'a mut checksum::crc64::Hasher,
-    payload_sha256_hasher: &'a mut Option<ring::digest::Context>,
+    payload_sha256_hasher: &'a mut Option<checksum::sha256::Sha256>,
     content_md5_hasher: &'a mut Option<md5_legacy::Md5>,
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,

@@ -6,7 +6,7 @@ use std::sync::{Arc, RwLock};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use ring::{aead, digest, rand};
+use ring::{aead, rand};
 
 use crate::credential::{
     valid_session_access_key_id, valid_session_secret_access_key, SESSION_ACCESS_KEY_ID_LEN,
@@ -167,12 +167,7 @@ struct KeyMaterialFingerprint([u8; 32]);
 
 impl KeyMaterialFingerprint {
     fn from_key_material(key_material: &[u8; KEY_LEN]) -> Self {
-        Self(
-            digest::digest(&digest::SHA256, key_material)
-                .as_ref()
-                .try_into()
-                .expect("SHA-256 output is 32 bytes"),
-        )
+        Self(checksum::sha256::digest(key_material))
     }
 }
 

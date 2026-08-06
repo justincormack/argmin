@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+checksum = { path = "../checksum", default-features = false }
 quick-xml = "0.41"
-ring = "0.17"
 thiserror = "2"
 unicode-general-category = "1.1"
 

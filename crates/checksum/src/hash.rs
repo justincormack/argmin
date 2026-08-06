@@ -11,7 +11,7 @@ pub enum ChecksumHasher {
     Crc64(crate::crc64::Hasher),
     Md5(md5_legacy::Md5),
     Sha1(ring::digest::Context),
-    Sha256(ring::digest::Context),
+    Sha256(crate::sha256::Sha256),
     Sha512(ring::digest::Context),
     XxHash64(twox_hash::XxHash64),
     XxHash3(twox_hash::XxHash3_64),
@@ -29,9 +29,7 @@ impl ChecksumHasher {
             ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
                 &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
             )),
-            ChecksumAlgorithm::Sha256 => {
-                Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256))
-            }
+            ChecksumAlgorithm::Sha256 => Self::Sha256(crate::sha256::Sha256::new()),
             ChecksumAlgorithm::Sha512 => {
                 Self::Sha512(ring::digest::Context::new(&ring::digest::SHA512))
             }
@@ -63,9 +61,10 @@ impl ChecksumHasher {
             Self::Crc32c(hasher) => hasher.update(data),
             Self::Crc64(hasher) => hasher.update(data),
             Self::Md5(hasher) => hasher.update(data),
-            Self::Sha1(hasher) | Self::Sha256(hasher) | Self::Sha512(hasher) => {
+            Self::Sha1(hasher) | Self::Sha512(hasher) => {
                 hasher.update(data);
             }
+            Self::Sha256(hasher) => hasher.update(data),
             Self::XxHash64(hasher) => hasher.write(data),
             Self::XxHash3(hasher) => hasher.write(data),
             Self::XxHash128(hasher) => hasher.write(data),
@@ -89,9 +88,7 @@ impl ChecksumHasher {
             Self::Sha1(hasher) => {
                 RawChecksum::new(ChecksumAlgorithm::Sha1, hasher.finish().as_ref())
             }
-            Self::Sha256(hasher) => {
-                RawChecksum::new(ChecksumAlgorithm::Sha256, hasher.finish().as_ref())
-            }
+            Self::Sha256(hasher) => RawChecksum::new(ChecksumAlgorithm::Sha256, hasher.finalize()),
             Self::Sha512(hasher) => {
                 RawChecksum::new(ChecksumAlgorithm::Sha512, hasher.finish().as_ref())
             }

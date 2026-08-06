@@ -16,6 +16,7 @@ pub mod crc64;
 mod hash;
 #[cfg(target_arch = "riscv64")]
 mod riscv64_zbc_crc32;
+pub mod sha256;
 mod types;
 
 pub use hash::{compute_checksum, ChecksumHasher};

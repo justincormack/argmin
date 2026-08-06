@@ -10,7 +10,7 @@
 /// \r\n
 /// ```
 use auth::StreamingSigningContext;
-use ring::{digest, hmac};
+use ring::hmac;
 
 use crate::error::ServerError;
 
@@ -260,7 +260,7 @@ pub struct IncrementalChunkedDecoder {
     chunk_number: usize,
     prev_chunk_size: Option<usize>,
     expected_decoded_remaining: Option<u64>,
-    current_chunk_hash: Option<digest::Context>,
+    current_chunk_hash: Option<checksum::sha256::Sha256>,
     buf: Vec<u8>,
     state: ChunkedDecoderState,
     trailers: Vec<(String, String)>,
@@ -402,7 +402,7 @@ impl IncrementalChunkedDecoder {
                     self.current_chunk_hash = self
                         .streaming
                         .as_ref()
-                        .map(|_| digest::Context::new(&digest::SHA256));
+                        .map(|_| checksum::sha256::Sha256::new());
                     self.state = ChunkedDecoderState::ReadingData {
                         chunk_size,
                         remaining: chunk_size,
@@ -439,8 +439,8 @@ impl IncrementalChunkedDecoder {
                             .current_chunk_hash
                             .take()
                             .expect("signed chunks must have hash context")
-                            .finish();
-                        let chunk_hash_hex = hex_encode(chunk_hash.as_ref());
+                            .finalize();
+                        let chunk_hash_hex = hex_encode(&chunk_hash);
                         verify_chunk_signature_hash(
                             ctx,
                             self.prev_sig.as_deref().unwrap(),

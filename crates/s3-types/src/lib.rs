@@ -631,9 +631,9 @@ impl CanonicalUserId {
     /// Deterministically derive a canonical user id from a stable principal.
     #[must_use]
     pub fn from_principal(principal: &str) -> Self {
-        let digest = ring::digest::digest(&ring::digest::SHA256, principal.as_bytes());
+        let digest = checksum::sha256::digest(principal.as_bytes());
         let mut out = String::with_capacity(CANONICAL_USER_ID_LEN);
-        for byte in digest.as_ref() {
+        for byte in digest {
             let _ = write!(out, "{byte:02x}");
         }
         Self(out)

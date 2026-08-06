@@ -1,11 +1,9 @@
-use ring::digest;
-
 use crate::types::{GenerationId, SessionId, UploadId};
 
 fn sha256_truncated_16(input: &[u8]) -> [u8; 16] {
-    let hash = digest::digest(&digest::SHA256, input);
+    let hash = checksum::sha256::digest(input);
     let mut result = [0u8; 16];
-    result.copy_from_slice(&hash.as_ref()[..16]);
+    result.copy_from_slice(&hash[..16]);
     result
 }
 

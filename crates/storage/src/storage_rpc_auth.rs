@@ -618,14 +618,11 @@ impl fmt::Debug for StorageRpcRequestTranscript {
 }
 
 fn storage_rpc_request_transcript(envelope_bytes: &[u8]) -> StorageRpcRequestTranscript {
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut context = checksum::sha256::Sha256::new();
     context.update(STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_DOMAIN);
     context.update(&(envelope_bytes.len() as u64).to_be_bytes());
     context.update(envelope_bytes);
-    let digest = context.finish();
-    let mut bytes = [0_u8; STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_LEN];
-    bytes.copy_from_slice(digest.as_ref());
-    StorageRpcRequestTranscript(bytes)
+    StorageRpcRequestTranscript(context.finalize())
 }
 
 pub(crate) fn write_storage_rpc_auth_transport_frame<W: Write>(

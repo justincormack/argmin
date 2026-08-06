@@ -11,12 +11,12 @@ use storage::{
 fn multipart_completion_fingerprint(
     parts: &[CompletePart],
 ) -> storage::MultipartCompletionFingerprint {
-    fn update_bytes(context: &mut ring::digest::Context, bytes: &[u8]) {
+    fn update_bytes(context: &mut checksum::sha256::Sha256, bytes: &[u8]) {
         context.update(&(bytes.len() as u64).to_be_bytes());
         context.update(bytes);
     }
 
-    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut context = checksum::sha256::Sha256::new();
     context.update(b"argmin complete multipart manifest v2\0");
     context.update(&(parts.len() as u64).to_be_bytes());
     for part in parts {
@@ -31,10 +31,7 @@ fn multipart_completion_fingerprint(
             }
         }
     }
-    let digest = context.finish();
-    let mut fingerprint = [0u8; 32];
-    fingerprint.copy_from_slice(digest.as_ref());
-    storage::MultipartCompletionFingerprint::from_bytes(fingerprint)
+    storage::MultipartCompletionFingerprint::from_bytes(context.finalize())
 }
 
 use super::authz_results::{
