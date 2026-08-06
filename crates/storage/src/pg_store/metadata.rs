@@ -155,6 +155,112 @@ impl PgStore {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
+    fn test_exact_live_object_segment_subject_exists_in_open_txn(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        generation_id: GenerationId,
+    ) -> Result<bool, MetadataError> {
+        self.query_row_cached_metadata(
+            "SELECT EXISTS( \
+                 SELECT 1 FROM objects \
+                 WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 \
+                   AND generation_id = ?4 AND status = ?5 \
+                   AND write_sequence = ( \
+                       SELECT MAX(write_sequence) FROM objects \
+                       WHERE bucket = ?1 AND key = ?2 \
+                   ) \
+             )",
+            params![
+                bucket,
+                key,
+                version_id.to_u64() as i64,
+                generation_id.get() as i64,
+                ObjectState::Live as u8,
+            ],
+            "validate exact live object segment subject for test",
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_set_exact_live_object_segment_data_pg(
+        &self,
+        segment: &ObjectSegmentRecord,
+        generation_id: GenerationId,
+        replacement_data_pg_id: u32,
+    ) -> Result<bool, MetadataError> {
+        self.with_immediate_txn(
+            "set exact live object segment data PG for test (begin txn)",
+            "set exact live object segment data PG for test (commit txn)",
+            |store| {
+                if !store.test_exact_live_object_segment_subject_exists_in_open_txn(
+                    &segment.bucket,
+                    &segment.key,
+                    segment.version_id,
+                    generation_id,
+                )? {
+                    return Ok(false);
+                }
+                let changed = store.execute_cached_metadata(
+                    "UPDATE object_segments SET data_pg_id = ?1 \
+                     WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 \
+                       AND segment_index = ?5 AND data_pg_id = ?6",
+                    params![
+                        replacement_data_pg_id,
+                        segment.bucket,
+                        segment.key,
+                        segment.version_id.to_u64() as i64,
+                        segment.segment_index,
+                        segment.data_pg_id,
+                    ],
+                    "set exact live object segment data PG for test",
+                )?;
+                Ok(changed == 1)
+            },
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_set_exact_live_object_segment_crc64(
+        &self,
+        segment: &ObjectSegmentRecord,
+        generation_id: GenerationId,
+        replacement_crc64: u64,
+    ) -> Result<bool, MetadataError> {
+        self.with_immediate_txn(
+            "set exact live object segment CRC64 for test (begin txn)",
+            "set exact live object segment CRC64 for test (commit txn)",
+            |store| {
+                if !store.test_exact_live_object_segment_subject_exists_in_open_txn(
+                    &segment.bucket,
+                    &segment.key,
+                    segment.version_id,
+                    generation_id,
+                )? {
+                    return Ok(false);
+                }
+                let changed = store.execute_cached_metadata(
+                    "UPDATE object_segments SET segment_crc64 = ?1 \
+                     WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 \
+                       AND segment_index = ?5 AND segment_crc64 = ?6",
+                    params![
+                        replacement_crc64 as i64,
+                        segment.bucket,
+                        segment.key,
+                        segment.version_id.to_u64() as i64,
+                        segment.segment_index,
+                        segment.segment_crc64 as i64,
+                    ],
+                    "set exact live object segment CRC64 for test",
+                )?;
+                Ok(changed == 1)
+            },
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_corrupt_object_part_payload_crc64(
         &self,
         bucket: &BucketName,

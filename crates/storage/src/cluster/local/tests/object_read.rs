@@ -234,6 +234,157 @@ impl ObjectPayloadLeaseRoute for PayloadLeaseUnavailableRoute<'_> {
     }
 }
 
+#[test]
+fn opaque_object_segment_faults_bind_the_captured_payload_subject() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("opaque-object-segment-faults");
+    let route_key = crate::tests::object_key("route-subject");
+    let route_pg = cluster.test_object_pg_id_for(&bucket, &route_key);
+    let mut same_pg_keys = (0..10_000)
+        .map(|index| crate::tests::object_key(format!("same-pg-subject-{index}")))
+        .filter(|key| cluster.test_object_pg_id_for(&bucket, key) == route_pg);
+    let checksum_key = same_pg_keys.next().expect("same-PG checksum key");
+    let untouched_key = same_pg_keys.next().expect("same-PG untouched key");
+    assert_ne!(checksum_key, untouched_key);
+    assert_eq!(
+        cluster.test_object_pg_id_for(&bucket, &checksum_key),
+        route_pg
+    );
+    assert_eq!(
+        cluster.test_object_pg_id_for(&bucket, &untouched_key),
+        route_pg
+    );
+
+    let route_object =
+        write_committed_direct_segment_for(&cluster, &bucket, &route_key, b"route payload");
+    let checksum_object = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &checksum_key,
+        crate::BucketVersioningState::Enabled,
+        [2; 16],
+        [42; 16],
+        b"checksum payload",
+    );
+    assert!(checksum_object.version_id.is_versioned());
+    let untouched_object = write_committed_direct_segment_for_with_okh(
+        &cluster,
+        &bucket,
+        &untouched_key,
+        [43; 16],
+        b"untouched payload",
+    );
+    let route_metadata_before = cluster
+        .test_get_object_version(&bucket, &route_key, route_object.version_id)
+        .unwrap();
+    let checksum_metadata_before = cluster
+        .test_get_object_version(&bucket, &checksum_key, checksum_object.version_id)
+        .unwrap();
+    let untouched_metadata_before = cluster
+        .test_get_object_version(&bucket, &untouched_key, untouched_object.version_id)
+        .unwrap();
+    let route_before = cluster
+        .test_capture_object_payload(&bucket, &route_key, route_object.version_id)
+        .unwrap();
+    let checksum_before = cluster
+        .test_capture_object_payload(&bucket, &checksum_key, checksum_object.version_id)
+        .unwrap();
+    let untouched_before = cluster
+        .test_capture_object_payload(&bucket, &untouched_key, untouched_object.version_id)
+        .unwrap();
+
+    cluster
+        .test_inject_object_payload_first_segment_unknown_data_pg(&route_before)
+        .unwrap();
+    cluster
+        .test_inject_object_payload_first_segment_checksum_mismatch(&checksum_before)
+        .unwrap();
+
+    let route_after = cluster
+        .test_capture_object_payload(&bucket, &route_key, route_object.version_id)
+        .unwrap();
+    let checksum_after = cluster
+        .test_capture_object_payload(&bucket, &checksum_key, checksum_object.version_id)
+        .unwrap();
+    let untouched_after = cluster
+        .test_capture_object_payload(&bucket, &untouched_key, untouched_object.version_id)
+        .unwrap();
+    let mut expected_route = route_before.segments().to_vec();
+    expected_route[0].data_pg_id = u32::MAX;
+    assert_eq!(route_after.segments(), expected_route);
+    let mut expected_checksum = checksum_before.segments().to_vec();
+    expected_checksum[0].segment_crc64 ^= 1;
+    assert_eq!(checksum_after.segments(), expected_checksum);
+    assert_eq!(untouched_after.segments(), untouched_before.segments());
+    assert_eq!(
+        cluster
+            .test_get_object_version(&bucket, &route_key, route_object.version_id)
+            .unwrap(),
+        route_metadata_before
+    );
+    assert_eq!(
+        cluster
+            .test_get_object_version(&bucket, &checksum_key, checksum_object.version_id)
+            .unwrap(),
+        checksum_metadata_before
+    );
+    assert_eq!(
+        cluster
+            .test_get_object_version(&bucket, &untouched_key, untouched_object.version_id)
+            .unwrap(),
+        untouched_metadata_before
+    );
+}
+
+#[test]
+fn opaque_object_segment_fault_rejects_a_replaced_null_generation_without_mutation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("opaque-object-segment-stale");
+    let key = crate::tests::object_key("null-replacement");
+    let first = write_committed_direct_segment_for(&cluster, &bucket, &key, b"first payload");
+    let stale = cluster
+        .test_capture_object_payload(&bucket, &key, first.version_id)
+        .unwrap();
+    let replacement = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [2; 16],
+        [44; 16],
+        b"replacement payload",
+    );
+    let current_before = cluster
+        .test_capture_object_payload(&bucket, &key, replacement.version_id)
+        .unwrap();
+
+    assert!(matches!(
+        cluster
+            .test_inject_object_payload_first_segment_checksum_mismatch(&stale)
+            .unwrap_err(),
+        ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
+            operation: "inject exact live object segment fault for test scenario",
+        })
+    ));
+
+    let current_after = cluster
+        .test_capture_object_payload(&bucket, &key, replacement.version_id)
+        .unwrap();
+    assert_eq!(current_after.segments(), current_before.segments());
+}
+
 fn retained_read_with_unavailable_lease_nodes(
     unavailable_node_ids: &[NodeId],
 ) -> Result<Vec<u8>, StoreError> {

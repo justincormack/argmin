@@ -116,9 +116,13 @@ fn get_object_payload_route_error_does_not_become_object_not_found() {
     .unwrap();
     let bucket = trusted_bucket_name("bucket");
     let key = trusted_object_key("key");
+    let payload = coord
+        .storage_node()
+        .test_capture_object_payload(&bucket, &key, put.version_id)
+        .unwrap();
     coord
         .storage_node()
-        .test_inject_first_object_segment_unknown_data_pg(&bucket, &key, put.version_id)
+        .test_inject_object_payload_first_segment_unknown_data_pg(&payload)
         .unwrap();
 
     let err = match coord.get_object(&GetObjectRequest {

@@ -6053,7 +6053,16 @@ Final Phase 5 audit (2026-08-04):
   `StorageCluster` bucket record, current-delete-begin, queued-begin,
   reservation-generation, delete-progress, and EC scratch-counter methods are
   crate-private; downstream access is through the curated lifecycle or payload
-  test-support traits.
+  test-support traits; and
+- the last coordinator callers of direct committed-segment metadata mutation
+  now use snapshot-bound storage-owned fault scenarios. Unknown data-PG and
+  checksum-mismatch faults derive the exact bucket, key, version, and payload
+  generation from opaque evidence. An immediate SQLite transaction validates
+  that subject and changes only the selected segment column. Current numbered
+  versions are supported, replaced null generations fail closed without
+  modifying the current object, owner-local same-PG canaries pin crossed-key
+  isolation and exact field mutation, and the former subject-argument mutation
+  methods are removed and mechanically prohibited outside storage.
 
 The audited cross-crate support families are:
 
@@ -6099,7 +6108,8 @@ Remaining implementation order after this audit:
    downstream-callable while the corresponding inherent helpers are
    crate-private. Bucket-delete progress/current-incarnation scenarios,
    stream-reservation existence, and EC scratch reuse are likewise behind the
-   lifecycle/payload traits; and
+   lifecycle/payload traits. Committed-segment unknown-route and checksum
+   faults are bound to opaque payload snapshots behind the payload trait; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

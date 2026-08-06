@@ -9128,13 +9128,17 @@ fn get_object_rejects_bad_segment_crc64() {
     )
     .unwrap();
 
-    coord
+    let payload = coord
         .storage_node()
-        .test_inject_first_object_segment_checksum_mismatch(
+        .test_capture_object_payload(
             &trusted_bucket_name("bucket"),
             &trusted_object_key("bad-segment-crc"),
             put.version_id,
         )
+        .unwrap();
+    coord
+        .storage_node()
+        .test_inject_object_payload_first_segment_checksum_mismatch(&payload)
         .unwrap();
 
     let result = coord

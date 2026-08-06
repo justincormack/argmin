@@ -219,6 +219,16 @@ pub mod test_support {
             snapshot: &TestObjectPayloadSnapshot,
         ) -> Result<bool, StoreError>;
 
+        fn test_inject_object_payload_first_segment_unknown_data_pg(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<(), ObjectPgActionError>;
+
+        fn test_inject_object_payload_first_segment_checksum_mismatch(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<(), ObjectPgActionError>;
+
         fn test_capture_multipart_upload_payload(
             &self,
             bucket: &BucketName,
@@ -311,6 +321,22 @@ pub mod test_support {
             snapshot: &TestObjectPayloadSnapshot,
         ) -> Result<bool, StoreError> {
             StorageCluster::test_object_payload_snapshot_uses_transient_direct_put_layout(
+                self, snapshot,
+            )
+        }
+
+        fn test_inject_object_payload_first_segment_unknown_data_pg(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_inject_object_payload_first_segment_unknown_data_pg(self, snapshot)
+        }
+
+        fn test_inject_object_payload_first_segment_checksum_mismatch(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+        ) -> Result<(), ObjectPgActionError> {
+            StorageCluster::test_inject_object_payload_first_segment_checksum_mismatch(
                 self, snapshot,
             )
         }

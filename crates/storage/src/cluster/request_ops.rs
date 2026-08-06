@@ -17970,28 +17970,30 @@ impl super::StorageCluster {
         Ok(true)
     }
 
-    /// Injects a storage-owned read-route failure into the first segment.
+    /// Injects a storage-owned read-route failure into the first segment of an
+    /// exact captured payload.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_first_object_segment_unknown_data_pg(
+    pub(crate) fn test_inject_object_payload_first_segment_unknown_data_pg(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
+        snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<(), ObjectPgActionError> {
+        let first = snapshot.segments().first().ok_or(StoreError::NotFound)?;
+        let generation_id = snapshot.generation_id().ok_or(StoreError::NotFound)?;
         self.metadata_primary_bridge_node()?
-            .test_inject_first_object_segment_unknown_data_pg(bucket, key, version_id)
+            .test_inject_exact_object_segment_unknown_data_pg(first, generation_id)
     }
 
-    /// Injects a storage-owned checksum mismatch into the first object segment.
+    /// Injects a storage-owned checksum mismatch into the first segment of an
+    /// exact captured payload.
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_first_object_segment_checksum_mismatch(
+    pub(crate) fn test_inject_object_payload_first_segment_checksum_mismatch(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
+        snapshot: &crate::TestObjectPayloadSnapshot,
     ) -> Result<(), ObjectPgActionError> {
+        let first = snapshot.segments().first().ok_or(StoreError::NotFound)?;
+        let generation_id = snapshot.generation_id().ok_or(StoreError::NotFound)?;
         self.metadata_primary_bridge_node()?
-            .test_inject_first_object_segment_checksum_mismatch(bucket, key, version_id)
+            .test_inject_exact_object_segment_checksum_mismatch(first, generation_id)
     }
 
     /// Returns the logical part numbers in one committed multipart manifest.

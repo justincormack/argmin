@@ -68,11 +68,11 @@ use crate::types::{
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
     CreateStreamUploadReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, PutLiveObjectReq,
-    SessionId, StreamUploadRecord, StreamUploadSegmentRecord, UploadId, UploadState,
+    MultipartUploadRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, SessionId,
+    StreamUploadRecord, StreamUploadSegmentRecord, UploadId, UploadState,
 };
 #[cfg(test)]
-use crate::types::{StreamUploadState, StreamUploadTarget};
+use crate::types::{PutLiveObjectReq, StreamUploadState, StreamUploadTarget};
 use crate::{ClusterEpoch, PgId, PgState};
 
 const TRACE_TARGET: &str = "storage";
@@ -1184,71 +1184,41 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_replace_live_object_segments(
+    pub(crate) fn test_inject_exact_object_segment_unknown_data_pg(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        segments: &[ObjectSegmentRecord],
+        segment: &ObjectSegmentRecord,
+        generation_id: GenerationId,
     ) -> Result<(), ObjectPgActionError> {
-        let pg_id = self.test_object_pg_id_for(bucket, key);
+        let pg_id = self.test_object_pg_id_for(&segment.bucket, &segment.key);
         let pg = self.get_pg(pg_id)?;
-        let live = match pg.get_object_meta(bucket, key)? {
-            StoredObject::Live(record) => record,
-            StoredObject::DeleteMarker(_) => return Err(StoreError::NotFound.into()),
-        };
-        assert_eq!(
-            live.version_id, version_id,
-            "test_replace_live_object_segments called for non-current live version"
-        );
-        pg.put_object_with_segments(
-            &PutLiveObjectReq {
-                bucket: live.bucket,
-                key: live.key,
-                version_id: live.version_id,
-                owner: live.owner,
-                acl_grants: live.acl_grants,
-                public_read: live.public_read,
-                generation_id: live.generation_id,
-                size: live.size,
-                etag: live.etag,
-                ec: live.ec,
-                layout: live.layout,
-                tags: live.tags,
-                metadata_blob: live.metadata_blob,
-                system_metadata_blob: live.system_metadata_blob,
-                object_lock: live.object_lock,
-                encryption: live.encryption,
-            },
-            segments,
-        )?;
+        if !pg.test_set_exact_live_object_segment_data_pg(segment, generation_id, u32::MAX)? {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "inject exact live object segment fault for test scenario",
+            }
+            .into());
+        }
         Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_first_object_segment_unknown_data_pg(
+    pub(crate) fn test_inject_exact_object_segment_checksum_mismatch(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
+        segment: &ObjectSegmentRecord,
+        generation_id: GenerationId,
     ) -> Result<(), ObjectPgActionError> {
-        let mut segments = self.test_get_object_segments(bucket, key, version_id)?;
-        let segment = segments.first_mut().ok_or(StoreError::NotFound)?;
-        segment.data_pg_id = u32::MAX;
-        self.test_replace_live_object_segments(bucket, key, version_id, &segments)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_inject_first_object_segment_checksum_mismatch(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-    ) -> Result<(), ObjectPgActionError> {
-        let mut segments = self.test_get_object_segments(bucket, key, version_id)?;
-        let segment = segments.first_mut().ok_or(StoreError::NotFound)?;
-        segment.segment_crc64 ^= 1;
-        self.test_replace_live_object_segments(bucket, key, version_id, &segments)
+        let pg_id = self.test_object_pg_id_for(&segment.bucket, &segment.key);
+        let pg = self.get_pg(pg_id)?;
+        if !pg.test_set_exact_live_object_segment_crc64(
+            segment,
+            generation_id,
+            segment.segment_crc64 ^ 1,
+        )? {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "inject exact live object segment fault for test scenario",
+            }
+            .into());
+        }
+        Ok(())
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
