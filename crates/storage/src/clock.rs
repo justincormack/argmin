@@ -1,4 +1,12 @@
 use std::cell::Cell;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::marker::PhantomData;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::rc::Rc;
+#[cfg(any(test, feature = "test-hooks"))]
+use std::sync::{Arc, Weak};
+#[cfg(any(test, feature = "test-hooks"))]
+use std::thread::{self, ThreadId};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CLOCK_HEALTH_SAMPLE_MAX_WINDOW_MS: u64 = 0;
@@ -65,7 +73,7 @@ pub fn with_time_override<T>(now_millis: u64, f: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub fn with_time_and_monotonic_override<T>(
+pub(crate) fn with_time_and_monotonic_override<T>(
     wall_time_millis: u64,
     monotonic_time_millis: u64,
     f: impl FnOnce() -> T,
@@ -88,28 +96,72 @@ pub fn with_time_and_monotonic_override<T>(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct TestTimeOverrideGuard {
+#[derive(Clone)]
+pub(crate) struct TestTimeOverrideControl {
+    origin_thread: ThreadId,
+    guard_liveness: Weak<()>,
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl TestTimeOverrideControl {
+    pub(crate) fn set(&self, now_millis: u64) {
+        assert!(
+            self.guard_liveness.upgrade().is_some(),
+            "test clock override control used after its guard was dropped"
+        );
+        assert_eq!(
+            thread::current().id(),
+            self.origin_thread,
+            "test clock override control used from a thread other than its origin"
+        );
+        TIME_OVERRIDE_MILLIS.with(|slot| slot.set(Some(now_millis)));
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) struct TestTimeOverrideGuard {
     previous: Option<u64>,
+    control: TestTimeOverrideControl,
+    _guard_liveness: Arc<()>,
+    not_send_or_sync: PhantomData<Rc<()>>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl TestTimeOverrideGuard {
-    pub fn set(&self, now_millis: u64) {
-        TIME_OVERRIDE_MILLIS.with(|slot| slot.set(Some(now_millis)));
+    pub(crate) fn set(&self, now_millis: u64) {
+        self.control.set(now_millis);
+    }
+
+    pub(crate) fn control(&self) -> TestTimeOverrideControl {
+        self.control.clone()
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Drop for TestTimeOverrideGuard {
     fn drop(&mut self) {
+        assert_eq!(
+            thread::current().id(),
+            self.control.origin_thread,
+            "test clock override guard dropped from a thread other than its origin"
+        );
         TIME_OVERRIDE_MILLIS.with(|slot| slot.set(self.previous));
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub fn test_time_override_guard(now_millis: u64) -> TestTimeOverrideGuard {
-    TIME_OVERRIDE_MILLIS.with(|slot| TestTimeOverrideGuard {
-        previous: slot.replace(Some(now_millis)),
+pub(crate) fn test_time_override_guard(now_millis: u64) -> TestTimeOverrideGuard {
+    TIME_OVERRIDE_MILLIS.with(|slot| {
+        let guard_liveness = Arc::new(());
+        TestTimeOverrideGuard {
+            previous: slot.replace(Some(now_millis)),
+            control: TestTimeOverrideControl {
+                origin_thread: thread::current().id(),
+                guard_liveness: Arc::downgrade(&guard_liveness),
+            },
+            _guard_liveness: guard_liveness,
+            not_send_or_sync: PhantomData,
+        }
     })
 }
 

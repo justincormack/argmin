@@ -10597,7 +10597,7 @@ mod tests {
 
     #[test]
     fn frontend_without_maintenance_auth_shares_refreshed_runtime_map_handle() {
-        storage::clock::with_time_and_monotonic_override(10_000_000, 5_000_000, || {
+        storage::test_support::with_time_and_monotonic_override(10_000_000, 5_000_000, || {
             frontend_without_maintenance_auth_shares_refreshed_runtime_map_handle_at_fixed_time();
         });
     }

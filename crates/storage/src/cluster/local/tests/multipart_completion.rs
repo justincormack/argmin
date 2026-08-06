@@ -168,7 +168,7 @@ fn multipart_completion_stale_retry_rechecks_expired_route_before_reload() {
     let (contender_request, _) =
         seed_streamed_multipart_completion(&cluster, &bucket, &key, "stalecontender");
 
-    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let clock = crate::clock::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(
         crate::RouteMapValidity::until_ms(5_000).unwrap(),
         Some(4_000),
@@ -194,7 +194,7 @@ fn multipart_completion_stale_retry_rechecks_expired_route_before_reload() {
     let stale_source_loads = Arc::new(AtomicUsize::new(0));
     let stale_source_loads_for_hook = Arc::clone(&stale_source_loads);
     let target_upload_id = request.upload_id.clone();
-    let clock_for_hook = Arc::clone(&clock);
+    let clock_for_hook = clock.control();
     let stale_retry_hook = cluster.test_install_multipart_completion_stale_retry_hook(Arc::new(
         move |event, upload_id| {
             if *upload_id != target_upload_id {

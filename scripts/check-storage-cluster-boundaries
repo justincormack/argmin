@@ -5656,6 +5656,62 @@ fail_with_matches \
     "Storage scheduling-hook public-surface source-root scan must find only the nested unrelated-module fixture" \
     "$storage_scheduling_hook_public_surface_fixture_failure"
 
+cross_crate_raw_runtime_test_control_leaks=$(
+    rg -n --color=never \
+        'storage::clock::(TestTimeOverrideGuard|test_time_override_guard|with_time_and_monotonic_override)\b' \
+        crates \
+        -g '*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Cross-crate tests must use storage::test_support clock controls rather than raw storage clock internals" \
+    "$cross_crate_raw_runtime_test_control_leaks"
+
+runtime_test_control_public_surface_pattern='^[[:space:]]*pub[[:space:]]+(static[[:space:]]+(TIME_OVERRIDE_MILLIS|MONOTONIC_TIME_OVERRIDE_MILLIS)|struct[[:space:]]+TestTimeOverride(Guard|Control)|fn[[:space:]]+(test_time_override_guard|with_time_and_monotonic_override|test_topology_generation|test_raft_voters|test_logical_acting_sets))\b'
+
+scan_public_runtime_test_control_surface() {
+    local source_root=$1
+
+    rg -n --color=never \
+        "$runtime_test_control_public_surface_pattern" \
+        "$source_root" \
+        -g '*.rs' \
+        -g '!**/test_support/**' \
+        || true
+}
+
+public_runtime_test_control_surface_leaks=$(
+    scan_public_runtime_test_control_surface crates/storage/src
+)
+fail_with_matches \
+    "Raw mutable-clock and static-topology observations must remain crate-private behind storage::test_support" \
+    "$public_runtime_test_control_surface_leaks"
+
+runtime_test_control_public_surface_fixture=$(
+    scan_public_runtime_test_control_surface \
+        scripts/fixtures/storage-boundary-runtime-test-controls
+)
+expected_runtime_test_control_public_surface_fixture='scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:1:pub static TIME_OVERRIDE_MILLIS: u64 = 0;
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:2:pub static MONOTONIC_TIME_OVERRIDE_MILLIS: u64 = 0;
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:3:pub struct TestTimeOverrideGuard;
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:4:pub struct TestTimeOverrideControl;
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:5:pub fn test_time_override_guard() {}
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:6:pub fn with_time_and_monotonic_override() {}
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:11:    pub fn test_topology_generation(&self) {}
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:12:    pub fn test_raft_voters(&self) {}
+scripts/fixtures/storage-boundary-runtime-test-controls/nested/unrelated-module.rs:13:    pub fn test_logical_acting_sets(&self) {}'
+runtime_test_control_public_surface_fixture_failure=""
+if [[ "$runtime_test_control_public_surface_fixture" != "$expected_runtime_test_control_public_surface_fixture" ]]; then
+    runtime_test_control_public_surface_fixture_failure=$runtime_test_control_public_surface_fixture
+    if [[ -z "$runtime_test_control_public_surface_fixture_failure" ]]; then
+        runtime_test_control_public_surface_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Runtime test-control public-surface source-root scan must find only the nested unrelated-module fixture" \
+    "$runtime_test_control_public_surface_fixture_failure"
+
 shard_backfill_maintenance_leaks=$(
     {
         rg -n --color=never \

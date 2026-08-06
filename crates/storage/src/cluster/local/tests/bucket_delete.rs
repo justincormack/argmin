@@ -3179,7 +3179,7 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let clock = crate::clock::test_time_override_guard(1_000);
     let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
         crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
         crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
@@ -3197,7 +3197,7 @@ fn begin_bucket_delete_adopts_active_delete_drain_after_reopen() {
         crate::StorageCluster::from_static_local_map(Arc::clone(&reopened)).unwrap();
     let advanced_during_proof = Arc::new(AtomicBool::new(false));
     let advanced_during_proof_for_hook = Arc::clone(&advanced_during_proof);
-    let clock_for_hook = Arc::clone(&clock);
+    let clock_for_hook = clock.control();
     let _progress_hook_guard = reopened_cluster
         .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
             move |_next_object_pg_id| {
@@ -3824,10 +3824,10 @@ fn begin_bucket_delete_renews_drain_after_final_visibility_proof_before_retryabl
     let map = Arc::new(map);
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
-    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let clock = crate::clock::test_time_override_guard(1_000);
     let advanced_during_visibility = Arc::new(AtomicBool::new(false));
     let advanced_during_visibility_for_hook = Arc::clone(&advanced_during_visibility);
-    let clock_for_visibility_hook = Arc::clone(&clock);
+    let clock_for_visibility_hook = clock.control();
     let visibility_hook_guard =
         cluster.test_install_before_bucket_delete_final_visibility_hook(Arc::new(move || {
             clock_for_visibility_hook.set(12_000);

@@ -1115,8 +1115,8 @@ fn object_payload_reclaim_claim_expiry_before_replacement_preserves_existing_cla
         .unwrap()
         .expect("initial worker should acquire claim");
 
-    let clock = std::sync::Arc::new(crate::clock::test_time_override_guard(1_000));
-    let hook_clock = std::sync::Arc::clone(&clock);
+    let clock = crate::clock::test_time_override_guard(1_000);
+    let hook_clock = clock.control();
     store.test_install_before_object_payload_reclaim_claim_effect_check_hook(move || {
         hook_clock.set(4_500);
     });

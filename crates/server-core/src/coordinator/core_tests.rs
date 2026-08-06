@@ -986,7 +986,7 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
     )
     .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1000,7 +1000,7 @@ fn object_metadata_mutation_expires_at_pending_install_effect_boundary() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -1057,7 +1057,7 @@ fn direct_put_expires_at_generation_reservation_effect_boundary() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1071,7 +1071,7 @@ fn direct_put_expires_at_generation_reservation_effect_boundary() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -1129,7 +1129,7 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1143,7 +1143,7 @@ fn direct_put_expiring_at_staged_shard_effect_writes_no_payload() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &cluster,
         Arc::new(move |_| {
@@ -1209,7 +1209,7 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1223,7 +1223,7 @@ fn direct_put_expiring_after_first_staged_shard_cleans_partial_payload() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &cluster,
         Arc::new(move |attempt| {
@@ -1287,7 +1287,7 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1300,7 +1300,7 @@ fn stream_put_creation_expires_at_pending_install_effect_boundary() {
     );
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_stream_put_create_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -1385,7 +1385,7 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1403,7 +1403,7 @@ fn promoted_put_expires_inside_stream_append_and_cleans_staged_payload() {
         &cluster,
         Arc::new(|_| Ok(())),
     );
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let append_hook = cluster
         .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
     let data = vec![0x5a; INTERNAL_SEGMENT_SIZE + 1];
@@ -1492,7 +1492,7 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
     )
     .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1510,7 +1510,7 @@ fn copy_object_expires_inside_destination_append_and_cleans_stream_state() {
         &cluster,
         Arc::new(|_| Ok(())),
     );
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let append_hook = cluster
         .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
     let error = coord
@@ -1602,8 +1602,8 @@ fn copy_object_heartbeats_destination_stream_reservation_before_finalize() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
-    let create_clock = Arc::clone(&clock);
+    let clock = storage::test_support::test_time_override_guard(1_000);
+    let create_clock = clock.control();
     let create_hook_pending = Arc::new(AtomicBool::new(true));
     let create_hook_pending_for_hook = Arc::clone(&create_hook_pending);
     let _create_hook = storage_cluster.test_install_before_metadata_command_pending_install_hook(
@@ -1615,26 +1615,26 @@ fn copy_object_heartbeats_destination_stream_reservation_before_finalize() {
             }
         }),
     );
-    let read_clock = Arc::clone(&clock);
+    let read_clock = clock.control();
     let _read_hook =
         storage_cluster.test_install_before_payload_shard_read_action(Arc::new(move || {
             // Model the first source read consuming another ten seconds.
             read_clock.set(20_000);
         }));
-    let write_clock = Arc::clone(&clock);
+    let write_clock = clock.control();
     let _write_hook =
         storage_cluster.test_install_before_payload_shard_write_action(Arc::new(move || {
             // Move the clock during destination shard writes. Lease maintenance
             // inside the write loop must renew before the next shard.
             write_clock.set(30_000);
         }));
-    let append_clock = Arc::clone(&clock);
+    let append_clock = clock.control();
     let _append_hook =
         storage_cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
             // Model append commit consuming its separate ten-second budget.
             append_clock.set(40_000);
         }));
-    let finalize_clock = Arc::clone(&clock);
+    let finalize_clock = clock.control();
     let _finalize_hook = storage_cluster.test_install_before_stream_put_finalize_command_id_hook(
         Arc::new(move || {
             // The post-append checkpoint must also renew the reservation for
@@ -1734,7 +1734,7 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
         })
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1752,7 +1752,7 @@ fn upload_part_copy_expires_inside_destination_append_and_cleans_stream_state() 
         &cluster,
         Arc::new(|_| Ok(())),
     );
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook_cluster = Arc::clone(&cluster);
     let append_hook =
         cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
@@ -1862,7 +1862,7 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         })
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -1913,7 +1913,7 @@ fn streamed_upload_part_expires_inside_append_and_cleans_staged_payload() {
         &cluster,
         Arc::new(|_| Ok(())),
     );
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let append_hook = cluster
         .test_install_before_stream_append_command_id_hook(Arc::new(move || hook_clock.set(4_500)));
     let error = coord
@@ -1985,7 +1985,7 @@ fn stream_put_finalization_expires_inside_command_build() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -2025,7 +2025,7 @@ fn stream_put_finalization_expires_inside_command_build() {
         )
         .unwrap();
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_stream_put_finalize_command_id_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2080,7 +2080,7 @@ fn multipart_creation_expires_at_pending_install_effect_boundary() {
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -2094,7 +2094,7 @@ fn multipart_creation_expires_at_pending_install_effect_boundary() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2175,7 +2175,7 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
         .unwrap()
         .upload_id;
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -2196,7 +2196,7 @@ fn multipart_abort_expires_at_pending_install_effect_boundary() {
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2243,7 +2243,7 @@ fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
     let (upload_id, parts) =
         create_upload_with_parts(&initial_coord, "bucket", "late-completion", &[(1, b"part")]);
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -2259,7 +2259,7 @@ fn multipart_completion_expires_at_final_pending_install_effect_boundary() {
 
     let pending_install_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let hook_count = Arc::clone(&pending_install_count);
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             if hook_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
@@ -2342,7 +2342,7 @@ fn multipart_completion_uses_captured_lifecycle_after_commit_deadline() {
     let (upload_id, parts) =
         create_upload_with_parts(&coord, "bucket", "logs/completed", &[(1, b"part")]);
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
@@ -2350,7 +2350,7 @@ fn multipart_completion_uses_captured_lifecycle_after_commit_deadline() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "logs/completed".to_string())),
         after_multipart_complete_commit: Some(Arc::new(move || hook_clock.set(4_500))),
@@ -2443,7 +2443,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
         .unwrap()
         .upload_id;
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
@@ -2462,7 +2462,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "logs/listed".to_string())),
         after_list_parts_authorized: Some(Arc::new(move || hook_clock.set(4_500))),
@@ -2486,7 +2486,7 @@ fn list_parts_expires_after_authorization_and_uses_admitted_lifecycle_route() {
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let lifecycle_admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let lifecycle_hook = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "logs/listed".to_string())),
         after_list_parts_storage_list: Some(Arc::new(move || hook_clock.set(4_500))),
@@ -2549,7 +2549,7 @@ fn multipart_upload_target_preflights_reject_an_expired_admission_after_same_epo
         None,
     );
 
-    let clock = storage::clock::test_time_override_guard(1_000);
+    let clock = storage::test_support::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
@@ -2702,14 +2702,14 @@ fn multipart_creation_uses_admitted_lifecycle_snapshot_after_commit_deadline() {
     )
     .unwrap();
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     let _serial = BUCKET_WRITE_HANDLE_TEST_SERIAL
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let _hook = coord.install_bucket_write_handle_test_hooks(BucketWriteHandleTestHooks {
         bucket: Some("bucket".to_string()),
         after_multipart_create_commit: Some(Arc::new(move || hook_clock.set(4_500))),
@@ -2770,12 +2770,12 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
             "<Tagging><TagSet><Tag><Key>late</Key><Value>write</Value></Tag></TagSet></Tagging>",
         ),
     };
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
 
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2812,7 +2812,7 @@ fn bucket_subresource_mutation_expires_at_pending_install_effect_boundary() {
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2848,7 +2848,7 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
             .create_bucket_for_owner("default-owner", bucket, false)
             .unwrap();
     }
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let public_access_block = PublicAccessBlockConfig {
         block_public_acls: true,
         ignore_public_acls: true,
@@ -2863,7 +2863,7 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2903,7 +2903,7 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2948,7 +2948,7 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
         .get_bucket_acl_on_admitted_route(&admission, &acl_request.bucket)
         .unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -2993,12 +2993,12 @@ fn create_bucket_expires_at_pending_install_effect_boundary() {
         ownership: BucketObjectOwnership::BucketOwnerEnforced,
         object_lock_enabled: false,
     };
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
 
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -3036,12 +3036,12 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
             .create_bucket_for_owner("default-owner", bucket, false)
             .unwrap();
     }
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
 
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
         target: Some(trusted_bucket_name("delete-drain")),
         before_begin_bucket_delete_drain: Some(Arc::new(move || hook_clock.set(4_500))),
@@ -3065,7 +3065,7 @@ fn delete_bucket_expires_at_drain_and_pending_install_effect_boundaries() {
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
         target: Some(trusted_bucket_name("delete-mark")),
         after_begin_bucket_delete_drain: Some(Arc::new(move || hook_clock.set(4_500))),
@@ -3128,7 +3128,7 @@ fn object_delete_mutations_expire_at_pending_install_effect_boundary() {
         .unwrap();
     }
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     let cluster = initial;
     let coord = initial_coord;
 
@@ -3154,7 +3154,7 @@ fn object_delete_mutations_expire_at_pending_install_effect_boundary() {
             )
             .unwrap();
         let delete_condition = DeleteCondition::IfMatch(baseline.etag.into());
-        let hook_clock = Arc::clone(&clock);
+        let hook_clock = clock.control();
         let hook_calls = Arc::new(AtomicUsize::new(0));
         let hook_calls_for_hook = Arc::clone(&hook_calls);
         let hook = cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(
@@ -3234,7 +3234,7 @@ fn object_delete_mutations_expire_at_pending_install_effect_boundary() {
             .unwrap()
             .etag
     });
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
             hook_clock.set(4_500)
@@ -3322,7 +3322,7 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
     )
     .unwrap();
 
-    let time = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let time = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -3330,7 +3330,7 @@ fn object_body_reads_recheck_admission_before_retaining_payload_authority() {
     let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
         Arc::clone(&cluster),
     );
-    let hook_time = Arc::clone(&time);
+    let hook_time = time.control();
     let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some(("bucket".to_string(), "key".to_string())),
         after_object_read_snapshot: Some(Arc::new(move || hook_time.set(6_000))),
@@ -3554,7 +3554,7 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
         Some(true)
     );
 
-    let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+    let clock = storage::test_support::test_time_override_guard(1_000);
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
     let admission = coord.admit_storage_route_for_request().unwrap();
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
@@ -3580,7 +3580,7 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
     ));
     clock.set(1_000);
 
-    let action_clock = Arc::clone(&clock);
+    let action_clock = clock.control();
     let snapshot_error = route
         .load_object_read_snapshot_if(move |_| {
             action_clock.set(6_000);
@@ -3593,7 +3593,7 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
     ));
     clock.set(1_000);
 
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let _hook_guard = install_bucket_policy_load_test_hooks(BucketPolicyLoadTestHooks {
         bucket: Some(bucket.to_string()),
         before_storage_load: None,
@@ -6101,7 +6101,7 @@ fn deferred_object_reclaim_clears_original_and_duplicate_runtime_map_queue_owner
 #[test]
 fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let tmp = test_util::tempdir();
-    let time = storage::clock::test_time_override_guard(1_000);
+    let time = storage::test_support::test_time_override_guard(1_000);
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
     initial.test_store_route_map_validity(long_lived_test_route_map_validity());
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
@@ -18367,7 +18367,7 @@ fn retained_read_skips_repair_record_after_admitted_route_expiry_without_publica
     )
     .unwrap();
 
-    let time = storage::clock::test_time_override_guard(1_000);
+    let time = storage::test_support::test_time_override_guard(1_000);
     let cluster = process_local_cluster_with_route_map_validity(
         &initial,
         RouteMapValidity::until_ms(5_000).unwrap(),
@@ -18418,7 +18418,7 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         return;
     }
     let tmp = test_util::tempdir();
-    let time = storage::clock::test_time_override_guard(1_000);
+    let time = storage::test_support::test_time_override_guard(1_000);
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = Coordinator::new_with_background_sweeper_factories_for_storage_cluster(
         Arc::clone(&storage_cluster),

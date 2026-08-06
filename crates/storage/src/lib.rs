@@ -1469,11 +1469,20 @@ pub mod test_support {
     mod failure_scheduling;
     pub use failure_scheduling::{StorageClusterFailureTestSupport, TestStorageFailureGuard};
 
+    mod clock;
+    pub use clock::{
+        test_time_override_guard, with_time_and_monotonic_override, TestClockOverrideControl,
+        TestClockOverrideGuard,
+    };
+
     mod scheduling;
     pub use scheduling::{
         StorageClusterSchedulingTestSupport, TestStorageSchedulingAction,
         TestStorageSchedulingGuard,
     };
+
+    mod static_topology;
+    pub use static_topology::StaticInitialControlPlaneTopologyTestSupport;
 
     mod stream_route;
     pub use stream_route::{ActivePutObjectRouteTestSupport, ActiveStreamRouteTestSupport};

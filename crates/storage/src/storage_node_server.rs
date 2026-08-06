@@ -25309,8 +25309,8 @@ mod tests {
 
         let server_node = Arc::clone(&node);
         let serving = thread::spawn(move || {
-            let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
-            let hook_clock = Arc::clone(&clock);
+            let clock = crate::clock::test_time_override_guard(1_000);
+            let hook_clock = clock.control();
             server_node
                 .get_pg(0)
                 .unwrap()

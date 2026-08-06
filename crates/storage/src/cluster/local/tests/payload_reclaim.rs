@@ -551,11 +551,11 @@ fn object_payload_reclaim_expiry_at_claim_insertion_preserves_retryable_root() {
 
     let pg_id = PgId::new(object_pg);
     let command_stream_before = collect_metadata_replay_snapshot(&map, &node_ids, &[object_pg]);
-    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let clock = crate::clock::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
 
     let hook_cluster = Arc::clone(&cluster);
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook_ran = Arc::new(AtomicBool::new(false));
     let hook_ran_for_hook = Arc::clone(&hook_ran);
     map.node(NodeId::new(1))
@@ -633,11 +633,11 @@ fn object_payload_reclaim_expiry_between_build_and_pending_install_preserves_roo
 
     let pg_id = PgId::new(object_pg);
     let command_stream_before = collect_metadata_replay_snapshot(&map, &node_ids, &[object_pg]);
-    let clock = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let clock = crate::clock::test_time_override_guard(1_000);
     cluster.test_store_route_map_lease(RouteMapValidity::until_ms(5_000).unwrap(), Some(4_000));
 
     let hook_cluster = Arc::clone(&cluster);
-    let hook_clock = Arc::clone(&clock);
+    let hook_clock = clock.control();
     let hook_ran = Arc::new(AtomicBool::new(false));
     let hook_ran_for_hook = Arc::clone(&hook_ran);
     let _hook_guard =

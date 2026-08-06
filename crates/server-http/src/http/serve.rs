@@ -5555,7 +5555,7 @@ mod tests {
     async fn request_policy_time_is_captured_before_admission_and_body_wait() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let clock = storage::clock::test_time_override_guard(1_000);
+        let clock = storage::test_support::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
         let frontend = setup_frontend(tmp.path());
         create_test_bucket(&frontend, "time-admission-bucket");
@@ -6184,7 +6184,7 @@ Connection: close\r\n\r\n",
 
     #[test]
     fn captured_admission_guards_put_post_and_upload_part_initial_mutations() {
-        let clock = Arc::new(storage::clock::test_time_override_guard(1_000));
+        let clock = storage::test_support::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
         let frontend = setup_dynamic_frontend(tmp.path());
         let storage_cluster = frontend.coordinator.storage_node_for_request();
@@ -6193,7 +6193,7 @@ Connection: close\r\n\r\n",
         storage_cluster
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
         let renewed = Arc::clone(&storage_cluster);
-        let hook_clock = Arc::clone(&clock);
+        let hook_clock = clock.control();
         let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
             Arc::new(move || {
                 renewed.test_store_route_map_validity(
@@ -6232,7 +6232,7 @@ Connection: close\r\n\r\n",
         storage_cluster
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
         let renewed = Arc::clone(&storage_cluster);
-        let hook_clock = Arc::clone(&clock);
+        let hook_clock = clock.control();
         let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
             Arc::new(move || {
                 renewed.test_store_route_map_validity(
@@ -6288,7 +6288,7 @@ Connection: close\r\n\r\n",
         storage_cluster
             .test_store_route_map_validity(storage::RouteMapValidity::until_ms(2_000).unwrap());
         let renewed = Arc::clone(&storage_cluster);
-        let hook_clock = Arc::clone(&clock);
+        let hook_clock = clock.control();
         let hook = storage_cluster.test_install_after_retained_stream_cleanup_capability_hook(
             Arc::new(move || {
                 renewed.test_store_route_map_validity(
@@ -9227,7 +9227,7 @@ Connection: close\r\n\r\n",
 
     #[test]
     fn same_epoch_renewal_does_not_extend_streaming_put_effect_authority() {
-        let clock = storage::clock::test_time_override_guard(1_000);
+        let clock = storage::test_support::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
         let frontend = setup_dynamic_frontend(tmp.path());
         create_test_bucket(&frontend, "captured-stream-effect-deadline");
@@ -9307,7 +9307,7 @@ Connection: close\r\n\r\n",
 
     #[test]
     fn same_epoch_renewal_does_not_extend_post_or_upload_part_effect_authority() {
-        let clock = storage::clock::test_time_override_guard(1_000);
+        let clock = storage::test_support::test_time_override_guard(1_000);
         let tmp = test_util::tempdir();
         let frontend = setup_dynamic_frontend(tmp.path());
         create_test_bucket(&frontend, "captured-post-effect-deadline");

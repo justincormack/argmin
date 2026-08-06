@@ -6288,12 +6288,29 @@ Remaining implementation order after this audit:
    deleting metadata only through lifecycle test-support semantics. The root's
    durable incarnation is debug-redacted, the raw queue/finalization methods
    are crate-private, and a matching crate-wide fixture check rejects their
-   public or cross-crate reintroduction. The closure audit leaves four bounded
+   public or cross-crate reintroduction. Mutable clock control is now likewise
+   owner-namespaced: the 32 downstream users receive an opaque, thread-bound
+   guard that can only set and restore its originating thread's logical wall
+   clock. The guard is statically neither `Send` nor `Sync`; callbacks whose
+   types require transfer use a separate cloneable controller that rejects
+   invocation from another thread or after its guard has restored the prior
+   clock. Cross-thread and stale-controller canaries pin both rejections,
+   while the raw guard,
+   its thread-local slot, and the coupled wall/monotonic implementation remain
+   crate-private. The one downstream coupled-clock test uses the curated
+   scoped action. Static initial-topology tests now observe only topology
+   generation, Raft voter IDs, and logical acting sets through a feature-gated
+   extension trait; the certificate and raw inherent observations remain
+   storage-private. Owner-local positive canaries and a crate-wide nested-
+   module fixture reject reintroduction of either raw surface, including the
+   underlying wall and monotonic thread-local slots. Production
+   clock readers and the separately used scoped wall-clock override are
+   unchanged by this slice. The closure audit leaves four bounded
    migrations in this item: (a) **completed:** admitted stream-route
    scheduling extensions, (b) **completed:** the no-argument stream and
    pending-install scheduling guards and semantic retained-cleanup, reclaim,
-   and payload cleanup/read failures are consolidated, (c) the clock and
-   static-topology logical test controls,
+   and payload cleanup/read failures are consolidated, (c) **completed:** the
+   clock and static-topology logical test controls,
    and (d) privatization plus crate-wide enforcement for the remaining unused
    public inherent test adapters; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when

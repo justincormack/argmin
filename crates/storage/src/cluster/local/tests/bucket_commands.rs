@@ -409,7 +409,7 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
     let cluster = Arc::new(crate::StorageCluster::from_static_local_map(map).unwrap());
     let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
     let handle = StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
-    let time = Arc::new(crate::clock::test_time_override_guard(1_000));
+    let time = crate::clock::test_time_override_guard(1_000);
     let prepare_scan = || {
         time.set(1_000);
         cluster.test_store_route_map_validity(RouteMapValidity::until_ms(5_000).unwrap());
@@ -417,7 +417,7 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
         // Renew the underlying same-generation route after admission. Every
         // scan must still stop at the immutable deadline captured above.
         cluster.test_store_route_map_validity(RouteMapValidity::until_ms(10_000).unwrap());
-        let hook_time = Arc::clone(&time);
+        let hook_time = time.control();
         let hook =
             cluster.test_install_after_metadata_listing_pg_complete_hook(Arc::new(move |pg_id| {
                 if pg_id == 0 {

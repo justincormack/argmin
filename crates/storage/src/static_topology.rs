@@ -191,19 +191,19 @@ impl StaticInitialControlPlaneTopology {
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
-    pub fn test_topology_generation(&self) -> u64 {
+    pub(crate) fn test_topology_generation(&self) -> u64 {
         self.certificate.topology_generation()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
-    pub fn test_raft_voters(&self) -> &[u64] {
+    pub(crate) fn test_raft_voters(&self) -> &[u64] {
         self.certificate.raft_voters()
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
-    pub fn test_logical_acting_sets(&self) -> Vec<Vec<u32>> {
+    pub(crate) fn test_logical_acting_sets(&self) -> Vec<Vec<u32>> {
         self.pg_acting_sets
             .iter()
             .map(|(_, acting_set)| {
@@ -896,7 +896,21 @@ mod tests {
 
     #[test]
     fn static_initial_topology_owns_bootstrap_and_validates_established_certificate() {
+        use crate::test_support::StaticInitialControlPlaneTopologyTestSupport;
+
         let topology = initial_topology(7);
+        assert_eq!(
+            StaticInitialControlPlaneTopologyTestSupport::test_topology_generation(&topology),
+            7
+        );
+        assert_eq!(
+            StaticInitialControlPlaneTopologyTestSupport::test_raft_voters(&topology),
+            &[101, 102, 103]
+        );
+        assert_eq!(
+            StaticInitialControlPlaneTopologyTestSupport::test_logical_acting_sets(&topology),
+            vec![vec![2], vec![1]]
+        );
         assert!(!topology
             .validate_snapshot(&ClusterControlSnapshot::empty())
             .unwrap());

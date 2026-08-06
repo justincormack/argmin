@@ -5754,6 +5754,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
     use std::os::unix::fs::symlink;
+    use storage::test_support::StaticInitialControlPlaneTopologyTestSupport as _;
 
     fn standalone_runtime_environment() -> BTreeMap<&'static str, String> {
         BTreeMap::from([
