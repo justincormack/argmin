@@ -2560,6 +2560,230 @@ impl std::fmt::Display for ObjectMetadataMutationFailure {
 
 impl std::error::Error for ObjectMetadataMutationFailure {}
 
+/// Exhaustive logical outcome of an admitted stream-upload operation.
+///
+/// Session state and the client-visible invalid-request reason are logical
+/// protocol inputs. PG, route, node, database, command-log, and RPC details
+/// remain owned by storage and are reduced to a bounded diagnostic label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamUploadFailureKind {
+    NoSuchUpload,
+    SessionNotFound,
+    SessionNotInProgress,
+    SegmentConflict,
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InvalidRequest,
+    InternalError,
+}
+
+/// Opaque failure returned by public admitted stream-upload capabilities.
+enum StreamUploadFailureOutcome {
+    NoSuchUpload { upload_id: String },
+    SessionNotFound,
+    SessionNotInProgress,
+    SegmentConflict,
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InvalidRequest { reason: String },
+    InternalError,
+}
+
+pub struct StreamUploadFailure {
+    outcome: StreamUploadFailureOutcome,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl StreamUploadFailure {
+    #[must_use]
+    pub const fn kind(&self) -> StreamUploadFailureKind {
+        match &self.outcome {
+            StreamUploadFailureOutcome::NoSuchUpload { .. } => {
+                StreamUploadFailureKind::NoSuchUpload
+            }
+            StreamUploadFailureOutcome::SessionNotFound => StreamUploadFailureKind::SessionNotFound,
+            StreamUploadFailureOutcome::SessionNotInProgress => {
+                StreamUploadFailureKind::SessionNotInProgress
+            }
+            StreamUploadFailureOutcome::SegmentConflict => StreamUploadFailureKind::SegmentConflict,
+            StreamUploadFailureOutcome::ResourceExhausted => {
+                StreamUploadFailureKind::ResourceExhausted
+            }
+            StreamUploadFailureOutcome::MetadataCommandContention => {
+                StreamUploadFailureKind::MetadataCommandContention
+            }
+            StreamUploadFailureOutcome::RetryableConvergence => {
+                StreamUploadFailureKind::RetryableConvergence
+            }
+            StreamUploadFailureOutcome::InvalidRequest { .. } => {
+                StreamUploadFailureKind::InvalidRequest
+            }
+            StreamUploadFailureOutcome::InternalError => StreamUploadFailureKind::InternalError,
+        }
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    #[must_use]
+    pub fn no_such_upload_id(&self) -> Option<&str> {
+        match &self.outcome {
+            StreamUploadFailureOutcome::NoSuchUpload { upload_id } => Some(upload_id),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn invalid_request_reason(&self) -> Option<&str> {
+        match &self.outcome {
+            StreamUploadFailureOutcome::InvalidRequest { reason } => Some(reason),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let diagnostic_category = match &error {
+            ObjectPgActionError::Store(error) => {
+                ObjectOperationFailureDiagnosticCategory::Operation(
+                    OperationFailureDiagnosticCategory::from_store(error),
+                )
+            }
+            ObjectPgActionError::Metadata(error) => {
+                ObjectOperationFailureDiagnosticCategory::Operation(
+                    OperationFailureDiagnosticCategory::from_metadata(error),
+                )
+            }
+            ObjectPgActionError::InvalidRequest { .. } => {
+                ObjectOperationFailureDiagnosticCategory::InvalidRequest
+            }
+            ObjectPgActionError::StaleObjectReadSubject => {
+                ObjectOperationFailureDiagnosticCategory::StaleObjectReadSubject
+            }
+            ObjectPgActionError::StaleDirectPutCommitSnapshot
+            | ObjectPgActionError::StaleStreamFinalizeSnapshot
+            | ObjectPgActionError::StaleMultipartCompletionSnapshot
+            | ObjectPgActionError::MultipartConditionalRequestConflict => {
+                ObjectOperationFailureDiagnosticCategory::UnexpectedObjectOperationOutcome
+            }
+        };
+        let outcome = match error {
+            ObjectPgActionError::Store(error) => match error.operation_failure_class() {
+                StoreOperationFailureClass::ResourceExhausted => {
+                    StreamUploadFailureOutcome::ResourceExhausted
+                }
+                StoreOperationFailureClass::MetadataCommandContention => {
+                    StreamUploadFailureOutcome::MetadataCommandContention
+                }
+                StoreOperationFailureClass::RetryableConvergence => {
+                    StreamUploadFailureOutcome::RetryableConvergence
+                }
+                StoreOperationFailureClass::Other => StreamUploadFailureOutcome::InternalError,
+            },
+            ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { upload_id }) => {
+                StreamUploadFailureOutcome::NoSuchUpload { upload_id }
+            }
+            ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound { .. }) => {
+                StreamUploadFailureOutcome::SessionNotFound
+            }
+            ObjectPgActionError::Metadata(MetadataError::StreamSessionNotInProgress { .. }) => {
+                StreamUploadFailureOutcome::SessionNotInProgress
+            }
+            ObjectPgActionError::Metadata(MetadataError::StreamSegmentConflict { .. }) => {
+                StreamUploadFailureOutcome::SegmentConflict
+            }
+            ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
+                StreamUploadFailureOutcome::MetadataCommandContention
+            }
+            ObjectPgActionError::InvalidRequest { reason } => {
+                StreamUploadFailureOutcome::InvalidRequest { reason }
+            }
+            ObjectPgActionError::Metadata(_)
+            | ObjectPgActionError::StaleObjectReadSubject
+            | ObjectPgActionError::StaleDirectPutCommitSnapshot
+            | ObjectPgActionError::StaleStreamFinalizeSnapshot
+            | ObjectPgActionError::StaleMultipartCompletionSnapshot
+            | ObjectPgActionError::MultipartConditionalRequestConflict => {
+                StreamUploadFailureOutcome::InternalError
+            }
+        };
+        Self {
+            outcome,
+            diagnostic_category,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn for_test(kind: StreamUploadFailureKind) -> Self {
+        let error = match kind {
+            StreamUploadFailureKind::NoSuchUpload => {
+                ObjectPgActionError::Metadata(MetadataError::NoSuchUpload {
+                    upload_id: "opaque-test-upload-id".to_string(),
+                })
+            }
+            StreamUploadFailureKind::SessionNotFound => {
+                ObjectPgActionError::Metadata(MetadataError::StreamSessionNotFound {
+                    session_id: "private-test-session-id".to_string(),
+                })
+            }
+            StreamUploadFailureKind::SessionNotInProgress => {
+                ObjectPgActionError::Metadata(MetadataError::StreamSessionNotInProgress {
+                    state: 7,
+                })
+            }
+            StreamUploadFailureKind::SegmentConflict => {
+                ObjectPgActionError::Metadata(MetadataError::StreamSegmentConflict {
+                    segment_index: 11,
+                })
+            }
+            StreamUploadFailureKind::ResourceExhausted => ObjectPgActionError::Store(
+                StoreError::storage_node_resource_exhausted(7, "private test operation"),
+            ),
+            StreamUploadFailureKind::MetadataCommandContention => {
+                ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                    context: "private test contention",
+                })
+            }
+            StreamUploadFailureKind::RetryableConvergence => {
+                ObjectPgActionError::Store(StoreError::RouteMapExpired {
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                })
+            }
+            StreamUploadFailureKind::InvalidRequest => ObjectPgActionError::InvalidRequest {
+                reason: "opaque test invalid request".to_string(),
+            },
+            StreamUploadFailureKind::InternalError => ObjectPgActionError::Store(StoreError::Io {
+                context: "private test stream operation",
+                source: std::io::Error::other("private test stream source"),
+            }),
+        };
+        Self::from_object_pg_action(error)
+    }
+}
+
+impl std::fmt::Debug for StreamUploadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StreamUploadFailure")
+            .field("kind", &self.kind())
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for StreamUploadFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("stream upload failed")
+    }
+}
+
+impl std::error::Error for StreamUploadFailure {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3237,6 +3461,61 @@ mod tests {
         assert!(!rendered.contains(SECRET_CONTEXT));
         assert!(!rendered.contains(SECRET_SOURCE));
         assert!(std::error::Error::source(&metadata).is_none());
+    }
+
+    #[test]
+    fn stream_upload_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| StreamUploadFailure::from_object_pg_action(error).kind();
+
+        for kind in [
+            StreamUploadFailureKind::NoSuchUpload,
+            StreamUploadFailureKind::SessionNotFound,
+            StreamUploadFailureKind::SessionNotInProgress,
+            StreamUploadFailureKind::SegmentConflict,
+            StreamUploadFailureKind::ResourceExhausted,
+            StreamUploadFailureKind::MetadataCommandContention,
+            StreamUploadFailureKind::RetryableConvergence,
+            StreamUploadFailureKind::InvalidRequest,
+            StreamUploadFailureKind::InternalError,
+        ] {
+            assert_eq!(StreamUploadFailure::for_test(kind).kind(), kind);
+        }
+
+        let no_such_upload = StreamUploadFailure::for_test(StreamUploadFailureKind::NoSuchUpload);
+        assert_eq!(
+            no_such_upload.no_such_upload_id(),
+            Some("opaque-test-upload-id")
+        );
+        let invalid = StreamUploadFailure::for_test(StreamUploadFailureKind::InvalidRequest);
+        assert_eq!(
+            invalid.invalid_request_reason(),
+            Some("opaque test invalid request")
+        );
+        assert_eq!(
+            convert(ObjectPgActionError::StaleStreamFinalizeSnapshot),
+            StreamUploadFailureKind::InternalError
+        );
+    }
+
+    #[test]
+    fn stream_upload_failure_discards_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret stream upload operation";
+        const SECRET_SOURCE: &str = "secret stream upload source";
+        let failure = StreamUploadFailure::from_object_pg_action(ObjectPgActionError::Store(
+            StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            },
+        ));
+
+        assert_eq!(failure.kind(), StreamUploadFailureKind::InternalError);
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "stream upload failed");
+        let rendered = format!("{failure:?} {failure}");
+        assert!(rendered.contains("store_io_failure"));
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&failure).is_none());
     }
 
     #[test]

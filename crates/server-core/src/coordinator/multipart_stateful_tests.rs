@@ -881,7 +881,8 @@ fn scavenging_stale_sessions_removes_abandoned_streaming_state() {
     assert!(
         matches!(
             err,
-            ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ServerError::StreamUpload(ref error)
+                if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
         ),
         "{invariant}: expected session-not-found after scavenging, got {err:?}"
     );

@@ -181,6 +181,36 @@ fn composite_checksum_value_from_complete_parts(
 }
 
 impl Coordinator {
+    pub(super) fn map_stream_upload_failure(error: storage::StreamUploadFailure) -> ServerError {
+        match error.kind() {
+            storage::StreamUploadFailureKind::ResourceExhausted
+            | storage::StreamUploadFailureKind::MetadataCommandContention
+            | storage::StreamUploadFailureKind::RetryableConvergence => ServerError::SlowDown,
+            storage::StreamUploadFailureKind::NoSuchUpload => {
+                let Some(upload_id) = error.no_such_upload_id() else {
+                    return ServerError::StreamUpload(error);
+                };
+                ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                }
+            }
+            storage::StreamUploadFailureKind::SegmentConflict => ServerError::InvalidRequest {
+                reason: "stream segment index already exists".to_string(),
+            },
+            storage::StreamUploadFailureKind::InvalidRequest => {
+                let Some(reason) = error.invalid_request_reason() else {
+                    return ServerError::StreamUpload(error);
+                };
+                ServerError::InvalidRequest {
+                    reason: reason.to_string(),
+                }
+            }
+            storage::StreamUploadFailureKind::SessionNotFound
+            | storage::StreamUploadFailureKind::SessionNotInProgress
+            | storage::StreamUploadFailureKind::InternalError => ServerError::StreamUpload(error),
+        }
+    }
+
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         if super::object_pg_action_error_is_metadata_command_contention(&error) {
             return ServerError::SlowDown;
@@ -230,18 +260,16 @@ impl Coordinator {
         }
     }
 
-    fn map_upload_part_stream_error(
+    pub(super) fn map_upload_part_stream_error(
         upload_id: &UploadId,
-        error: storage::ObjectPgActionError,
+        error: storage::StreamUploadFailure,
     ) -> ServerError {
-        match error {
-            storage::ObjectPgActionError::Metadata(
-                storage::MetadataError::StreamSessionNotFound { .. }
-                | storage::MetadataError::StreamSessionNotInProgress { .. },
-            ) => ServerError::NoSuchUpload {
+        match error.kind() {
+            storage::StreamUploadFailureKind::SessionNotFound
+            | storage::StreamUploadFailureKind::SessionNotInProgress => ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
             },
-            other => Self::map_object_pg_action_error(other),
+            _ => Self::map_stream_upload_failure(error),
         }
     }
 
@@ -263,41 +291,26 @@ impl Coordinator {
         let route = admission
             .active_multipart_object_route(&req.bucket, &req.key)
             .map_err(super::map_store_error)?;
-        let write_encryption = self
-            .load_stream_part_write_encryption_on_admitted_multipart_route(
-                &route,
-                req.session_id,
-                req.part_number,
-                req.sse_customer,
-            )
-            .map_err(|error| match error {
-                ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
-                | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
-                    ..
-                }) => ServerError::NoSuchUpload {
-                    upload_id: req.upload_id.to_string(),
-                },
-                other => other,
-            })?;
+        let write_encryption = self.load_stream_part_write_encryption_on_admitted_multipart_route(
+            &route,
+            req.upload_id,
+            req.session_id,
+            req.part_number,
+            req.sse_customer,
+        )?;
         let payload_crc64 = checksum::crc64::checksum(req.data);
         let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
         self.append_stream_segment_on_admitted_multipart_route(
             &route,
+            req.upload_id,
             &req.bucket,
             &req.key,
-            req.session_id,
-            req.segment_index,
-            super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
+            super::AdmittedStreamSegmentAppend::new(
+                req.session_id,
+                req.segment_index,
+                super::StreamSegmentAppendPayload::new(&storage_data, payload_crc64),
+            ),
         )
-        .map_err(|error| match error {
-            ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
-            | ServerError::Metadata(storage::MetadataError::StreamSessionNotInProgress {
-                ..
-            }) => ServerError::NoSuchUpload {
-                upload_id: req.upload_id.to_string(),
-            },
-            other => other,
-        })
     }
 
     /// Begin a streaming UploadPart session.
@@ -1452,7 +1465,7 @@ impl Coordinator {
             .active_multipart_object_route(bucket, key)
             .map_err(super::map_store_error)?
             .abort_stream_session(session_id)
-            .map_err(Self::map_object_pg_action_error)
+            .map_err(Self::map_stream_upload_failure)
     }
 }
 

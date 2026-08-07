@@ -1963,7 +1963,8 @@ fn abort_active_upload_with_live_stream_part_session_cleans_session() {
         .unwrap_err();
     assert!(matches!(
         err,
-        ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+        ServerError::StreamUpload(error)
+            if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
     ));
     assert_eq!(harness.active_session_count(), 0);
 }
@@ -2042,7 +2043,8 @@ fn completing_current_upload_with_live_replacement_stream_session_cleans_session
         .unwrap_err();
     assert!(matches!(
         err,
-        ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+        ServerError::StreamUpload(error)
+            if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
     ));
     assert_eq!(
         harness.active_session_count(),

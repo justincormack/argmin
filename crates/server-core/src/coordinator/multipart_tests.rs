@@ -7124,7 +7124,8 @@ fn stream_put_append_after_finalize_fails() {
     assert!(
         matches!(
             err,
-            ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ServerError::StreamUpload(ref error)
+                if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
         ),
         "expected StreamSessionNotFound, got {err:?}"
     );
@@ -7164,7 +7165,8 @@ fn stream_put_finalize_after_abort_fails() {
     assert!(
         matches!(
             err,
-            ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
+            ServerError::StreamUpload(ref error)
+                if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
         ),
         "expected StreamSessionNotFound, got {err:?}"
     );
@@ -7187,11 +7189,12 @@ fn stream_put_bucket_key_mismatch_append() {
     // The session lives on key1's metadata PG. If key2 maps to a different PG,
     // the session won't be found. If same PG, the bucket/key check catches it.
     assert!(
-        matches!(
-            err,
-            ServerError::InvalidRequest { .. }
-                | ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
-        ),
+        matches!(err, ServerError::InvalidRequest { .. })
+            || matches!(
+                &err,
+                ServerError::StreamUpload(error)
+                    if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
+            ),
         "expected mismatch error, got {err:?}"
     );
 }
@@ -7225,11 +7228,12 @@ fn stream_put_bucket_key_mismatch_finalize() {
         })
         .unwrap_err();
     assert!(
-        matches!(
-            err,
-            ServerError::InvalidRequest { .. }
-                | ServerError::Metadata(storage::MetadataError::StreamSessionNotFound { .. })
-        ),
+        matches!(err, ServerError::InvalidRequest { .. })
+            || matches!(
+                &err,
+                ServerError::StreamUpload(error)
+                    if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
+            ),
         "expected mismatch error, got {err:?}"
     );
 }

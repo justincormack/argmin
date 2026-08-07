@@ -4462,6 +4462,83 @@ fail_with_matches \
     "Object-metadata mutations must cross storage through ObjectMetadataMutationFailure rather than raw storage implementation errors" \
     "$raw_object_metadata_mutation_error_transit"
 
+raw_stream_upload_error_transit=$(
+    {
+        rg -n --color=never '\bObjectPgActionError\b|\bMetadataError\b|\bStoreError\b' \
+            crates/server-core/src/coordinator/streaming.rs \
+            crates/server-core/src/coordinator/copy.rs \
+            || true
+        awk '
+        /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_stream_upload_session|create_stream_session_record|create_upload_part_stream_session|load_stream_session|abort_stream_session|abort_stream_upload_session|append_stream_segment|append_stream_segment_with_lease_maintenance|heartbeat_stream_session|finalize_stream|finalize_stream_part)/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/cluster.rs
+        if ! rg -q -U \
+            'pub\(crate\) fn abort_stream_upload_session(?s:.{0,300})ObjectPgActionError' \
+            crates/storage/src/cluster.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster.rs: raw stream-upload abort primitive must remain crate-private'
+        fi
+        if ! rg -q -U \
+            'trait StorageClusterStreamSessionTestSupport(?s:.{0,500})fn test_abort_stream_upload_session(?s:.{0,300})StreamUploadFailure' \
+            crates/storage/src/test_support/stream_route.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/test_support/stream_route.rs: cross-crate stream abort test support must return StreamUploadFailure'
+        fi
+        if ! rg -q -U \
+            'fn map_stream_upload_failure(?s:.{0,300})error: storage::StreamUploadFailure' \
+            crates/server-core/src/coordinator/multipart.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/multipart.rs: stream-upload response mapping must accept StreamUploadFailure'
+        fi
+        if ! rg -q -U \
+            'fn map_upload_part_stream_error(?s:.{0,300})error: storage::StreamUploadFailure' \
+            crates/server-core/src/coordinator/multipart.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/multipart.rs: UploadPart stream response mapping must accept StreamUploadFailure'
+        fi
+        if ! rg -q -U \
+            'trait StreamPutFinalizationRoute(?s:.{0,600})fn finalize(?s:.{0,500})StreamUploadFailure' \
+            crates/server-core/src/coordinator/put.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/put.rs: stream finalization trait must return StreamUploadFailure'
+        fi
+        if ! rg -q -U \
+            'trait StreamSegmentMutationRoute(?s:.{0,700})StreamUploadFailure' \
+            crates/server-core/src/coordinator/streaming.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/streaming.rs: stream segment trait must return StreamUploadFailure'
+        fi
+    }
+)
+fail_with_matches \
+    "Admitted stream uploads must cross storage through StreamUploadFailure rather than raw storage implementation errors" \
+    "$raw_stream_upload_error_transit"
+
 http_storage_debug_representation_leaks=$(
     {
         rg -n --color=never \

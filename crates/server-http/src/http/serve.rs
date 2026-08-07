@@ -9328,10 +9328,10 @@ Connection: close\r\n\r\n",
 
         frontend.abort_streaming_put(&ctx, &session_id);
         assert!(matches!(
-            storage_cluster.load_stream_upload_session(ctx.bucket(), ctx.key(), &session_id),
-            Err(storage::ObjectPgActionError::Metadata(
-                storage::MetadataError::StreamSessionNotFound { .. }
-            ))
+            storage_cluster
+                .load_stream_upload_session(ctx.bucket(), ctx.key(), &session_id)
+                .map_err(|error| error.kind()),
+            Err(storage::StreamUploadFailureKind::SessionNotFound)
         ));
     }
 

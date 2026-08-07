@@ -3,7 +3,7 @@ use s3_types::VersionId;
 use storage::error::{
     BucketSnapshotLoadFailure, BucketWriteDrainFailure, MetadataError,
     ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
-    StoreOperationFailureClass,
+    StoreOperationFailureClass, StreamUploadFailure,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,6 +63,9 @@ pub enum ServerError {
 
     #[error("object metadata mutation error: {0}")]
     ObjectMetadataMutation(ObjectMetadataMutationFailure),
+
+    #[error("stream upload error: {0}")]
+    StreamUpload(StreamUploadFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -513,6 +516,7 @@ impl ServerError {
             Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
             Self::ObjectRead(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
+            Self::StreamUpload(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -557,6 +561,10 @@ impl ServerError {
             ),
             Self::ObjectMetadataMutation(error) => format!(
                 "server_error>object_metadata_mutation>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::StreamUpload(error) => format!(
+                "server_error>stream_upload>{}",
                 error.diagnostic_cause_label()
             ),
             Self::Metadata(error) => format!(
@@ -734,6 +742,7 @@ impl ServerError {
             Self::BucketSnapshotLoad(_) => "InternalError",
             Self::ObjectRead(_) => "InternalError",
             Self::ObjectMetadataMutation(_) => "InternalError",
+            Self::StreamUpload(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }
@@ -1158,6 +1167,19 @@ mod tests {
         for secret in secret_fragments {
             assert!(!rendered.contains(secret));
         }
+
+        let (stream_failure, secret_fragments) =
+            storage::test_support::stream_upload_failure_diagnostic_fixture();
+        let stream_upload = ServerError::StreamUpload(stream_failure);
+        assert_eq!(stream_upload.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            stream_upload.diagnostic_cause_chain(),
+            "server_error>stream_upload>store_io_failure"
+        );
+        let rendered = format!("{stream_upload:?} {stream_upload}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
     }
 
     #[test]
@@ -1565,6 +1587,15 @@ mod tests {
                 storage::ObjectMetadataMutationFailureKind::InternalError,
             ),
         );
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn s3_error_code_stream_upload() {
+        let err = ServerError::StreamUpload(storage::test_support::stream_upload_failure_for_kind(
+            storage::StreamUploadFailureKind::InternalError,
+        ));
         assert_eq!(err.s3_error_code(), "InternalError");
         assert_eq!(err.http_status(), 500);
     }

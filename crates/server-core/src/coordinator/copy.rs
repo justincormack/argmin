@@ -40,7 +40,7 @@ impl Coordinator {
         route: &storage::ActivePutObjectRoute<'_>,
         session_id: &storage::SessionId,
         last_heartbeat_millis: &mut u64,
-    ) -> Result<(), storage::ObjectPgActionError> {
+    ) -> Result<(), storage::StreamUploadFailure> {
         let now_millis = storage::clock::monotonic_time_millis();
         if now_millis.saturating_sub(*last_heartbeat_millis)
             < COPY_OBJECT_STREAM_HEARTBEAT_INTERVAL_MILLIS
@@ -401,7 +401,7 @@ impl Coordinator {
                 dst_authorized.write_encryption.object_encryption(),
                 admission.authority_valid_until_ms(),
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
         let dst_write_encryption = &dst_authorized.write_encryption;
         let copy_result = (|| {
             // Session creation has its own retry work and can consume much of
@@ -409,7 +409,7 @@ impl Coordinator {
             // source read rather than waiting for a checkpoint after that read.
             destination_route
                 .heartbeat_stream_session(&session_id)
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(Self::map_stream_upload_failure)?;
             let mut last_heartbeat_millis = storage::clock::monotonic_time_millis();
             let mut crc64 = checksum::crc64::Hasher::new();
             let mut total_size = 0u64;
@@ -421,7 +421,7 @@ impl Coordinator {
                     &session_id,
                     &mut last_heartbeat_millis,
                 )
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(Self::map_stream_upload_failure)?;
                 total_size = total_size.checked_add(chunk.len() as u64).ok_or_else(|| {
                     ServerError::InternalError {
                         reason: "copy size overflow".to_string(),
@@ -437,14 +437,14 @@ impl Coordinator {
                     &session_id,
                     &mut last_heartbeat_millis,
                 )
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(Self::map_stream_upload_failure)?;
                 let storage_chunk = dst_write_encryption.encrypt_segment(segment_index, &chunk)?;
                 Self::heartbeat_copy_object_stream_if_due(
                     &destination_route,
                     &session_id,
                     &mut last_heartbeat_millis,
                 )
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(Self::map_stream_upload_failure)?;
                 self.append_stream_segment_on_admitted_put_route_with_lease_maintenance(
                     &destination_route,
                     req.destination.bucket.name_typed(),
@@ -467,7 +467,7 @@ impl Coordinator {
                     &session_id,
                     &mut last_heartbeat_millis,
                 )
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(Self::map_stream_upload_failure)?;
                 segment_index =
                     segment_index
                         .checked_add(1)
@@ -481,7 +481,7 @@ impl Coordinator {
                 &session_id,
                 &mut last_heartbeat_millis,
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
             if let Some(checksum) = replacement_checksum.take() {
                 use base64::Engine;
 
@@ -676,7 +676,7 @@ impl Coordinator {
         let session_id = Self::random_session_id("failed to generate session ID")?;
         let session_id = multipart_route
             .create_upload_part_stream_session(upload, &session_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(|error| Self::map_upload_part_stream_error(&upload_id, error))?;
         #[cfg(test)]
         maybe_run_upload_part_copy_stream_session_hook(req.upload.bucket_name(), req.upload.key());
         let session = BeginStreamPartResult {
@@ -693,6 +693,7 @@ impl Coordinator {
             let write_encryption = self
                 .load_stream_part_write_encryption_on_admitted_multipart_route(
                     &multipart_route,
+                    &upload_id,
                     session_id,
                     part_number,
                     req.sse_customer,
@@ -718,11 +719,14 @@ impl Coordinator {
                 let storage_chunk = write_encryption.encrypt_segment(segment_index, &chunk)?;
                 self.append_stream_segment_on_admitted_multipart_route(
                     &multipart_route,
+                    &upload_id,
                     &bucket,
                     &key,
-                    session_id,
-                    segment_index,
-                    super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
+                    super::AdmittedStreamSegmentAppend::new(
+                        session_id,
+                        segment_index,
+                        super::StreamSegmentAppendPayload::new(&storage_chunk, chunk_crc64),
+                    ),
                 )?;
                 segment_index =
                     segment_index

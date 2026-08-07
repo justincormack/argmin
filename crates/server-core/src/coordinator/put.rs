@@ -28,7 +28,7 @@ trait StreamPutFinalizationRoute {
         >,
     ) -> Result<
         Result<storage::FinalizeStreamPutOutcome<SystemMetadata>, ServerError>,
-        storage::ObjectPgActionError,
+        storage::StreamUploadFailure,
     >;
 
     fn enqueue_object_payload_reclaim(&self, generation_id: storage::GenerationId);
@@ -50,7 +50,7 @@ impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
         >,
     ) -> Result<
         Result<storage::FinalizeStreamPutOutcome<SystemMetadata>, ServerError>,
-        storage::ObjectPgActionError,
+        storage::StreamUploadFailure,
     > {
         self.finalize_stream(session_id, total_size, action)
     }
@@ -518,7 +518,7 @@ impl Coordinator {
                 authorized.write_encryption.object_encryption(),
                 cleanup_after,
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
         Ok(session_id)
     }
 
@@ -542,7 +542,7 @@ impl Coordinator {
             .map_err(super::map_store_error)?;
         let session = route
             .load_stream_session(req.session_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
         let write_encryption = self.resume_write_encryption(
             &session.encryption,
             req.sse_customer,
@@ -610,7 +610,7 @@ impl Coordinator {
             .map_err(super::map_store_error)?;
         let session = route
             .load_stream_session(req.session_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
         let write_encryption = self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -818,7 +818,7 @@ impl Coordinator {
             };
             let outcome = route
                 .finalize(session_id, total_size, &mut prepare)
-                .map_err(Coordinator::map_object_pg_action_error)??;
+                .map_err(Coordinator::map_stream_upload_failure)??;
             let lifecycle_expiration = self
                 .current_object_write_lifecycle_expiration_for_loaded_bucket(
                     &bucket_handle,
@@ -857,7 +857,7 @@ impl Coordinator {
             .active_put_object_route(bucket, key)
             .map_err(super::map_store_error)?
             .abort_stream_session(session_id)
-            .map_err(Self::map_object_pg_action_error)
+            .map_err(Self::map_stream_upload_failure)
     }
 
     #[cfg(test)]
@@ -885,6 +885,6 @@ impl Coordinator {
             .active_put_object_route(bucket, key)
             .map_err(super::map_store_error)?
             .heartbeat_stream_session(session_id)
-            .map_err(Self::map_object_pg_action_error)
+            .map_err(Self::map_stream_upload_failure)
     }
 }

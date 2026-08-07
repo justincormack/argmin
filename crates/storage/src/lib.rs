@@ -156,6 +156,7 @@ pub use error::{
     BucketWriteDrainFailureKind, ClusterBuildError, MetadataError, ObjectMetadataMutationFailure,
     ObjectMetadataMutationFailureKind, ObjectPgActionError, ObjectReadFailure,
     ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
+    StreamUploadFailure, StreamUploadFailureKind,
 };
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
@@ -1518,7 +1519,10 @@ pub mod test_support {
     pub use static_topology::StaticInitialControlPlaneTopologyTestSupport;
 
     mod stream_route;
-    pub use stream_route::{ActivePutObjectRouteTestSupport, ActiveStreamRouteTestSupport};
+    pub use stream_route::{
+        ActivePutObjectRouteTestSupport, ActiveStreamRouteTestSupport,
+        StorageClusterStreamSessionTestSupport,
+    };
 
     mod topology;
     pub use topology::{
@@ -1589,6 +1593,30 @@ pub mod test_support {
         kind: ObjectMetadataMutationFailureKind,
     ) -> ObjectMetadataMutationFailure {
         ObjectMetadataMutationFailure::for_test(kind)
+    }
+
+    /// Construct an opaque stream-upload failure from its logical outcome.
+    #[must_use]
+    pub fn stream_upload_failure_for_kind(kind: StreamUploadFailureKind) -> StreamUploadFailure {
+        StreamUploadFailure::for_test(kind)
+    }
+
+    /// Construct an opaque stream-upload failure containing a bounded I/O
+    /// diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn stream_upload_failure_diagnostic_fixture(
+    ) -> (StreamUploadFailure, &'static [&'static str]) {
+        const SECRET_CONTEXT: &str = "secret stream upload fixture operation";
+        const SECRET_SOURCE: &str = "secret stream upload fixture source";
+        (
+            StreamUploadFailure::from_object_pg_action(ObjectPgActionError::Store(
+                StoreError::Io {
+                    context: SECRET_CONTEXT,
+                    source: std::io::Error::other(SECRET_SOURCE),
+                },
+            )),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
     }
 
     /// Construct an opaque object-metadata mutation failure containing a

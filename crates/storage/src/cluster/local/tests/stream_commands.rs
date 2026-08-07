@@ -183,7 +183,7 @@ fn stream_abort_ack_cleanup_failure_removes_files_and_retains_acknowledgements()
     let fixture = stream_payload_cleanup_fixture("a3");
     fixture
         .cluster
-        .append_stream_segment(
+        .test_append_stream_segment_with_after_prepare(
             &fixture.bucket,
             &fixture.key,
             crate::StreamSegmentAppendInput {
@@ -192,6 +192,7 @@ fn stream_abort_ack_cleanup_failure_removes_files_and_retains_acknowledgements()
                 payload_crc64: checksum::crc64::checksum(b"cleanup-me"),
                 storage_bytes: b"cleanup-me",
             },
+            || {},
         )
         .unwrap();
     assert_stream_payload_shard_state(&fixture, true, true);
@@ -3428,10 +3429,10 @@ fn stream_put_finalize_releases_only_its_session_write_proof() {
         Some(&second_proof)
     );
     assert!(matches!(
-        cluster.load_stream_upload_session(&bucket, &key, &first_session),
-        Err(crate::ObjectPgActionError::Metadata(
-            crate::MetadataError::StreamSessionNotFound { .. }
-        ))
+        cluster
+            .load_stream_upload_session(&bucket, &key, &first_session)
+            .map_err(|error| error.kind()),
+        Err(crate::StreamUploadFailureKind::SessionNotFound)
     ));
     let bucket_pg = bucket_primary.storage_node().get_pg(1).unwrap();
     let reservations =

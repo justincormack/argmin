@@ -29,14 +29,14 @@ trait StreamSegmentMutationRoute {
     fn append_segment(
         &self,
         input: StreamSegmentAppendInput<'_>,
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError>;
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure>;
 
     #[cfg(test)]
     fn append_segment_with_after_prepare(
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError>;
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure>;
 }
 
 impl StreamSegmentMutationRoute for storage::ActivePutObjectRoute<'_> {
@@ -44,7 +44,7 @@ impl StreamSegmentMutationRoute for storage::ActivePutObjectRoute<'_> {
     fn append_segment(
         &self,
         input: StreamSegmentAppendInput<'_>,
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
         self.append_stream_segment(input)
     }
 
@@ -53,7 +53,7 @@ impl StreamSegmentMutationRoute for storage::ActivePutObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
         self.test_append_stream_segment_with_after_prepare(input, after_prepare)
     }
 }
@@ -63,7 +63,7 @@ impl StreamSegmentMutationRoute for storage::ActiveMultipartObjectRoute<'_> {
     fn append_segment(
         &self,
         input: StreamSegmentAppendInput<'_>,
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
         self.append_stream_segment(input)
     }
 
@@ -72,7 +72,7 @@ impl StreamSegmentMutationRoute for storage::ActiveMultipartObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<storage::StreamSegmentAppendOutcome, storage::ObjectPgActionError> {
+    ) -> Result<storage::StreamSegmentAppendOutcome, storage::StreamUploadFailure> {
         self.test_append_stream_segment_with_after_prepare(input, after_prepare)
     }
 }
@@ -97,7 +97,7 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         cleanup
             .abort(session_id)
-            .map_err(Self::map_object_pg_action_error)
+            .map_err(Self::map_stream_upload_failure)
     }
 
     pub(super) fn abort_stream_upload_with_retained_cleanup_retrying(
@@ -123,7 +123,7 @@ impl Coordinator {
         loop {
             match cleanup
                 .abort(session_id)
-                .map_err(Self::map_object_pg_action_error)
+                .map_err(Self::map_stream_upload_failure)
             {
                 Ok(()) => return Ok(()),
                 Err(error @ (ServerError::OperationAborted | ServerError::SlowDown)) => {
@@ -299,7 +299,7 @@ impl Coordinator {
     ) -> Result<ActiveWriteEncryption, ServerError> {
         let session = storage_node
             .load_stream_upload_session(bucket, key, session_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
         self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -339,7 +339,7 @@ impl Coordinator {
     ) -> Result<ActiveWriteEncryption, ServerError> {
         let session = storage_node
             .load_stream_upload_session(bucket, key, session_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
         self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -351,13 +351,14 @@ impl Coordinator {
     pub(super) fn load_stream_part_write_encryption_on_admitted_multipart_route(
         &self,
         route: &storage::ActiveMultipartObjectRoute<'_>,
+        upload_id: &storage::UploadId,
         session_id: &SessionId,
         part_number: u32,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         let session = route
             .load_stream_session(session_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(|error| Self::map_upload_part_stream_error(upload_id, error))?;
         self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -377,7 +378,7 @@ impl Coordinator {
         let target = self
             .storage_node()
             .load_stream_upload_session(bucket, key, session_id)
-            .map_err(Self::map_object_pg_action_error)?
+            .map_err(Self::map_stream_upload_failure)?
             .target;
         match target {
             StreamUploadTarget::PutObject => {
@@ -609,6 +610,7 @@ impl Coordinator {
             .active_put_object_route(bucket, key)
             .map_err(super::map_store_error)?;
         self.append_stream_segment_on_route(&route, bucket, key, session_id, segment_index, payload)
+            .map_err(Self::map_stream_upload_failure)
     }
 
     pub(super) fn append_stream_segment_on_admitted_put_route(
@@ -621,6 +623,7 @@ impl Coordinator {
         payload: super::StreamSegmentAppendPayload<'_>,
     ) -> Result<(), ServerError> {
         self.append_stream_segment_on_route(route, bucket, key, session_id, segment_index, payload)
+            .map_err(Self::map_stream_upload_failure)
     }
 
     pub(super) fn append_stream_segment_on_admitted_put_route_with_lease_maintenance(
@@ -629,7 +632,7 @@ impl Coordinator {
         bucket: &BucketName,
         key: &ObjectKey,
         append: super::AdmittedStreamSegmentAppend<'_>,
-        maintain_lease: impl FnMut() -> Result<(), storage::ObjectPgActionError>,
+        maintain_lease: impl FnMut() -> Result<(), storage::StreamUploadFailure>,
     ) -> Result<(), ServerError> {
         let super::AdmittedStreamSegmentAppend {
             session_id,
@@ -662,11 +665,11 @@ impl Coordinator {
                 },
                 maintain_lease,
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
         #[cfg(not(test))]
         let outcome = route
             .append_stream_segment_with_lease_maintenance(input, maintain_lease)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_stream_upload_failure)?;
 
         Self::emit_stream_segment_layout(
             &outcome.target,
@@ -683,13 +686,18 @@ impl Coordinator {
     pub(super) fn append_stream_segment_on_admitted_multipart_route(
         &self,
         route: &storage::ActiveMultipartObjectRoute<'_>,
+        upload_id: &storage::UploadId,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &SessionId,
-        segment_index: u32,
-        payload: super::StreamSegmentAppendPayload<'_>,
+        append: super::AdmittedStreamSegmentAppend<'_>,
     ) -> Result<(), ServerError> {
+        let super::AdmittedStreamSegmentAppend {
+            session_id,
+            segment_index,
+            payload,
+        } = append;
         self.append_stream_segment_on_route(route, bucket, key, session_id, segment_index, payload)
+            .map_err(|error| Self::map_upload_part_stream_error(upload_id, error))
     }
 
     fn append_stream_segment_on_route(
@@ -700,7 +708,7 @@ impl Coordinator {
         session_id: &SessionId,
         segment_index: u32,
         payload: super::StreamSegmentAppendPayload<'_>,
-    ) -> Result<(), ServerError> {
+    ) -> Result<(), storage::StreamUploadFailure> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::append_stream_segment",
@@ -719,15 +727,11 @@ impl Coordinator {
         };
 
         #[cfg(test)]
-        let outcome = route
-            .append_segment_with_after_prepare(input, || {
-                self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
-            })
-            .map_err(Self::map_object_pg_action_error)?;
+        let outcome = route.append_segment_with_after_prepare(input, || {
+            self.maybe_run_stream_append_prepare_hook(session_id, segment_index);
+        })?;
         #[cfg(not(test))]
-        let outcome = route
-            .append_segment(input)
-            .map_err(Self::map_object_pg_action_error)?;
+        let outcome = route.append_segment(input)?;
 
         Self::emit_stream_segment_layout(
             &outcome.target,

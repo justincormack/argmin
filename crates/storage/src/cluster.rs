@@ -2701,7 +2701,7 @@ pub(crate) struct StreamSessionSweepSummary {
 }
 
 impl RetainedStreamUploadCleanup {
-    pub fn abort(&self, session_id: &SessionId) -> Result<(), ObjectPgActionError> {
+    pub fn abort(&self, session_id: &SessionId) -> Result<(), crate::StreamUploadFailure> {
         self.cluster
             .abort_stream_upload_session_with_retained_cleanup(
                 self.cluster_epoch,
@@ -2710,6 +2710,7 @@ impl RetainedStreamUploadCleanup {
                 &self.key,
                 session_id,
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 }
 
@@ -3258,6 +3259,23 @@ impl Drop for DirectPutPayloadWrite<'_> {
     }
 }
 
+enum AdmittedStreamAppendError {
+    Storage(ObjectPgActionError),
+    Maintenance(crate::StreamUploadFailure),
+}
+
+impl From<ObjectPgActionError> for AdmittedStreamAppendError {
+    fn from(error: ObjectPgActionError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<StoreError> for AdmittedStreamAppendError {
+    fn from(error: StoreError) -> Self {
+        Self::Storage(ObjectPgActionError::Store(error))
+    }
+}
+
 impl ActivePutObjectRoute<'_> {
     fn effect_route(&self) -> PutObjectMutationEffectRoute<'_> {
         PutObjectMutationEffectRoute {
@@ -3368,7 +3386,7 @@ impl ActivePutObjectRoute<'_> {
         session_id: &SessionId,
         encryption: ObjectEncryption,
         cleanup_after: Option<u64>,
-    ) -> Result<(), ObjectPgActionError> {
+    ) -> Result<(), crate::StreamUploadFailure> {
         self.admission
             .cluster
             .create_put_object_stream_session_record_with_route_validation(
@@ -3378,19 +3396,27 @@ impl ActivePutObjectRoute<'_> {
                 cleanup_after,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     pub fn load_stream_session(
         &self,
         session_id: &SessionId,
-    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        self.admission.require_valid_now()?;
+    ) -> Result<StreamUploadRecord, crate::StreamUploadFailure> {
+        self.admission
+            .require_valid_now()
+            .map_err(ObjectPgActionError::from)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
         self.admission
             .cluster
             .load_stream_upload_session_on_route(self.effect_route(), session_id)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
-    pub fn abort_stream_session(&self, session_id: &SessionId) -> Result<(), ObjectPgActionError> {
+    pub fn abort_stream_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), crate::StreamUploadFailure> {
         self.admission
             .cluster
             .abort_stream_upload_session_with_route_validation(
@@ -3398,12 +3424,13 @@ impl ActivePutObjectRoute<'_> {
                 session_id,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     pub fn append_stream_segment(
         &self,
         input: StreamSegmentAppendInput<'_>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
         self.admission
             .cluster
             .append_stream_segment_with_route_validation(
@@ -3413,6 +3440,7 @@ impl ActivePutObjectRoute<'_> {
                 || {},
                 || Ok(()),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     /// Append one segment while maintaining a caller-owned reservation between
@@ -3420,17 +3448,25 @@ impl ActivePutObjectRoute<'_> {
     pub fn append_stream_segment_with_lease_maintenance(
         &self,
         input: StreamSegmentAppendInput<'_>,
-        maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
-        self.admission
+        mut maintain_lease: impl FnMut() -> Result<(), crate::StreamUploadFailure>,
+    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
+        let result = self
+            .admission
             .cluster
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
                 || self.admission.require_valid_now(),
                 || {},
-                maintain_lease,
-            )
+                || maintain_lease().map_err(AdmittedStreamAppendError::Maintenance),
+            );
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(AdmittedStreamAppendError::Storage(error)) => {
+                Err(crate::StreamUploadFailure::from_object_pg_action(error))
+            }
+            Err(AdmittedStreamAppendError::Maintenance(error)) => Err(error),
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -3439,7 +3475,7 @@ impl ActivePutObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
         self.admission
             .cluster
             .append_stream_segment_with_route_validation(
@@ -3449,6 +3485,7 @@ impl ActivePutObjectRoute<'_> {
                 after_prepare,
                 || Ok(()),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -3457,23 +3494,31 @@ impl ActivePutObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-        maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
-        self.admission
+        mut maintain_lease: impl FnMut() -> Result<(), crate::StreamUploadFailure>,
+    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
+        let result = self
+            .admission
             .cluster
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
                 || self.admission.require_valid_now(),
                 after_prepare,
-                maintain_lease,
-            )
+                || maintain_lease().map_err(AdmittedStreamAppendError::Maintenance),
+            );
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(AdmittedStreamAppendError::Storage(error)) => {
+                Err(crate::StreamUploadFailure::from_object_pg_action(error))
+            }
+            Err(AdmittedStreamAppendError::Maintenance(error)) => Err(error),
+        }
     }
 
     pub fn heartbeat_stream_session(
         &self,
         session_id: &SessionId,
-    ) -> Result<(), ObjectPgActionError> {
+    ) -> Result<(), crate::StreamUploadFailure> {
         self.admission
             .cluster
             .heartbeat_put_object_stream_session_with_route_validation(
@@ -3481,6 +3526,7 @@ impl ActivePutObjectRoute<'_> {
                 session_id,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     pub fn finalize_stream<T, E>(
@@ -3488,7 +3534,7 @@ impl ActivePutObjectRoute<'_> {
         session_id: &SessionId,
         total_size: u64,
         action: impl FnMut(StreamPutFinalizeSnapshot) -> Result<PreparedStreamPutCommit<T>, E>,
-    ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<Result<FinalizeStreamPutOutcome<T>, E>, crate::StreamUploadFailure> {
         self.admission
             .cluster
             .finalize_put_object_stream_with_route_validation(
@@ -3498,6 +3544,7 @@ impl ActivePutObjectRoute<'_> {
                 || self.admission.require_valid_now(),
                 action,
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     pub fn write_direct_object_payload(
@@ -3781,7 +3828,7 @@ impl ActiveMultipartObjectRoute<'_> {
         &self,
         authorized_upload: crate::AuthorizedMultipartUploadPart,
         session_id: &SessionId,
-    ) -> Result<SessionId, ObjectPgActionError> {
+    ) -> Result<SessionId, crate::StreamUploadFailure> {
         let internal_authorized_upload =
             AuthorizedMultipartUploadRecord::assume_authorized(authorized_upload.record().clone());
         self.admission
@@ -3794,19 +3841,27 @@ impl ActiveMultipartObjectRoute<'_> {
                 self.admission.authority_valid_until_ms(),
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     pub fn load_stream_session(
         &self,
         session_id: &SessionId,
-    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        self.admission.require_valid_now()?;
+    ) -> Result<StreamUploadRecord, crate::StreamUploadFailure> {
+        self.admission
+            .require_valid_now()
+            .map_err(ObjectPgActionError::from)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
         self.admission
             .cluster
             .load_stream_upload_session_on_route(self.stream_effect_route(), session_id)
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
-    pub fn abort_stream_session(&self, session_id: &SessionId) -> Result<(), ObjectPgActionError> {
+    pub fn abort_stream_session(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), crate::StreamUploadFailure> {
         self.admission
             .cluster
             .abort_stream_upload_session_with_route_validation(
@@ -3814,12 +3869,13 @@ impl ActiveMultipartObjectRoute<'_> {
                 session_id,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     pub fn append_stream_segment(
         &self,
         input: StreamSegmentAppendInput<'_>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
         self.admission
             .cluster
             .append_stream_segment_with_route_validation(
@@ -3829,6 +3885,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 || {},
                 || Ok(()),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -3837,7 +3894,7 @@ impl ActiveMultipartObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+    ) -> Result<StreamSegmentAppendOutcome, crate::StreamUploadFailure> {
         self.admission
             .cluster
             .append_stream_segment_with_route_validation(
@@ -3847,13 +3904,14 @@ impl ActiveMultipartObjectRoute<'_> {
                 after_prepare,
                 || Ok(()),
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     pub fn finalize_stream_part<T, E>(
         &self,
         input: StreamPartFinalizeInput<'_>,
         action: impl FnMut(StreamPartFinalizeSnapshot) -> Result<PreparedStreamPartCommit<T>, E>,
-    ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<Result<FinalizeStreamPartOutcome<T>, E>, crate::StreamUploadFailure> {
         self.admission
             .cluster
             .finalize_upload_part_stream_with_route_validation(
@@ -3862,6 +3920,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 || self.admission.require_valid_now(),
                 action,
             )
+            .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     #[cfg(feature = "test-hooks")]
@@ -15974,18 +16033,21 @@ impl StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
-        let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
-        mutation_client
-            .open_stream_upload_session_metadata_route(
-                self.operation_epoch(),
-                object_pg_id,
-                bucket,
-                key,
-                session_id,
-            )?
-            .load_session()
+    ) -> Result<StreamUploadRecord, crate::StreamUploadFailure> {
+        (|| {
+            let object_pg_id = self.object_metadata_pg(bucket, key);
+            let mutation_client = self.object_mutation_metadata_primary_client(bucket, key)?;
+            mutation_client
+                .open_stream_upload_session_metadata_route(
+                    self.operation_epoch(),
+                    object_pg_id,
+                    bucket,
+                    key,
+                    session_id,
+                )?
+                .load_session()
+        })()
+        .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
 
     fn load_stream_upload_session_on_route(
@@ -16031,28 +16093,6 @@ impl StorageCluster {
         Ok((target, segment_record))
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn append_stream_segment(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        input: StreamSegmentAppendInput<'_>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
-        self.append_stream_segment_with_route_validation(
-            PutObjectMutationEffectRoute {
-                bucket_pg_id: self.bucket_metadata_pg(bucket),
-                object_pg_id: self.object_metadata_pg(bucket, key),
-                bucket,
-                key,
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            input,
-            || Ok(()),
-            || {},
-            || Ok(()),
-        )
-    }
-
     #[cfg(test)]
     #[doc(hidden)]
     pub(crate) fn test_append_stream_segment_with_after_prepare(
@@ -16077,16 +16117,21 @@ impl StorageCluster {
         )
     }
 
-    fn append_stream_segment_with_route_validation(
+    fn append_stream_segment_with_route_validation<E>(
         &self,
         route: PutObjectMutationEffectRoute<'_>,
         input: StreamSegmentAppendInput<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut after_prepare: impl FnMut(),
-        mut maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        mut maintain_lease: impl FnMut() -> Result<(), E>,
+    ) -> Result<StreamSegmentAppendOutcome, E>
+    where
+        E: From<ObjectPgActionError> + From<StoreError>,
+    {
         require_valid_route().map_err(ObjectPgActionError::Store)?;
-        let session = self.load_stream_upload_session_on_route(route, input.session_id)?;
+        let session = self
+            .load_stream_upload_session_on_route(route, input.session_id)
+            .map_err(E::from)?;
         let logical_size = if input.storage_bytes.is_empty() {
             0
         } else {
@@ -16096,21 +16141,24 @@ impl StorageCluster {
                 .checked_sub(session.encryption.segment_ciphertext_extra_len())
                 .ok_or_else(|| ObjectPgActionError::InvalidRequest {
                     reason: "encrypted stream segment shorter than authentication tag".to_string(),
-                })? as u64
+                })
+                .map_err(E::from)? as u64
         };
         let segment_okh = crate::stream_segment_key_hash(input.session_id, input.segment_index);
-        let (target, segment_record) = self.prepare_stream_segment_append_with_route_validation(
-            route,
-            &PrepareStreamUploadSegmentAppendReq {
-                session_id: input.session_id.clone(),
-                segment_index: input.segment_index,
-                size: logical_size,
-                segment_crc64: checksum::crc64::checksum(input.storage_bytes),
-                payload_crc64: input.payload_crc64,
-                segment_okh,
-            },
-            &mut require_valid_route,
-        )?;
+        let (target, segment_record) = self
+            .prepare_stream_segment_append_with_route_validation(
+                route,
+                &PrepareStreamUploadSegmentAppendReq {
+                    session_id: input.session_id.clone(),
+                    segment_index: input.segment_index,
+                    size: logical_size,
+                    segment_crc64: checksum::crc64::checksum(input.storage_bytes),
+                    payload_crc64: input.payload_crc64,
+                    segment_okh,
+                },
+                &mut require_valid_route,
+            )
+            .map_err(E::from)?;
         after_prepare();
         maintain_lease()?;
         let written_shards = self.write_stream_segment_payload_shards_with_route_validation(
@@ -16138,7 +16186,8 @@ impl StorageCluster {
             &segment_record,
             &shard_batch,
             require_valid_route,
-        )?;
+        )
+        .map_err(E::from)?;
         Ok(StreamSegmentAppendOutcome {
             target,
             logical_size,
@@ -16214,14 +16263,17 @@ impl StorageCluster {
         )
     }
 
-    fn write_stream_segment_payload_shards_with_route_validation(
+    fn write_stream_segment_payload_shards_with_route_validation<E>(
         &self,
         segment_record: &StreamUploadSegmentRecord,
         data: &[u8],
         effect_fence: AdmittedRouteEffectFence,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
-        maintain_lease: &mut impl FnMut() -> Result<(), ObjectPgActionError>,
-    ) -> Result<Vec<WrittenShardAck>, ObjectPgActionError> {
+        maintain_lease: &mut impl FnMut() -> Result<(), E>,
+    ) -> Result<Vec<WrittenShardAck>, E>
+    where
+        E: From<StoreError>,
+    {
         if segment_record.placement_cluster_epoch != self.operation_epoch() {
             return Err(StoreError::RouteCapabilitySubjectMismatch {
                 operation: "write put object stream segment from another placement epoch",
@@ -16233,7 +16285,8 @@ impl StorageCluster {
             m: segment_record.ec_m,
         };
         self.write_placed_segment_payload_shards_with_route_validation(
-            self.validated_data_pg(PgId::new(segment_record.data_pg_id))?,
+            self.validated_data_pg(PgId::new(segment_record.data_pg_id))
+                .map_err(E::from)?,
             ec,
             PlacedSegmentPayloadWrite {
                 segment_okh: &segment_record.segment_okh,
@@ -16995,7 +17048,7 @@ impl StorageCluster {
         Ok(())
     }
 
-    pub fn abort_stream_upload_session(
+    pub(crate) fn abort_stream_upload_session(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

@@ -6,7 +6,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use storage::test_support::{
     StorageClusterFailureTestSupport as _, StorageClusterPayloadTestSupport as _,
-    StorageClusterSchedulingTestSupport as _,
+    StorageClusterSchedulingTestSupport as _, StorageClusterStreamSessionTestSupport as _,
 };
 
 #[test]
@@ -175,7 +175,7 @@ fn failed_stream_put_append_commit_cleans_placed_shards() {
         target: Some((session_id.as_str().to_owned(), 0)),
         after_prepare: Some(Arc::new(move || {
             hook_storage
-                .abort_stream_upload_session(&hook_bucket, &hook_key, &hook_session_id)
+                .test_abort_stream_upload_session(&hook_bucket, &hook_key, &hook_session_id)
                 .unwrap();
         })),
     });
@@ -184,7 +184,11 @@ fn failed_stream_put_append_commit_cleans_placed_shards() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"orphan-me")
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::Metadata(_)),
+        matches!(
+            err,
+            ServerError::StreamUpload(ref error)
+                if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
+        ),
         "expected missing stream session after hook abort, got {err:?}"
     );
 }
@@ -219,7 +223,7 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
         target: Some((session_id.as_str().to_owned(), 0)),
         after_prepare: Some(Arc::new(move || {
             hook_storage
-                .abort_stream_upload_session(&hook_bucket, &hook_key, &hook_session_id)
+                .test_abort_stream_upload_session(&hook_bucket, &hook_key, &hook_session_id)
                 .unwrap();
         })),
     });
@@ -229,7 +233,11 @@ fn failed_stream_put_append_cleanup_failure_traces_allowed_orphan() {
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"orphan-me")
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::Metadata(_)),
+        matches!(
+            err,
+            ServerError::StreamUpload(ref error)
+                if error.kind() == storage::StreamUploadFailureKind::SessionNotFound
+        ),
         "expected missing stream session after hook abort, got {err:?}"
     );
 

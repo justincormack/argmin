@@ -1,7 +1,34 @@
 use crate::{
-    ActiveMultipartObjectRoute, ActivePutObjectRoute, ObjectPgActionError,
-    StreamSegmentAppendInput, StreamSegmentAppendOutcome,
+    ActiveMultipartObjectRoute, ActivePutObjectRoute, BucketName, ObjectKey, SessionId,
+    StorageCluster, StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadFailure,
 };
+
+/// Logical stream-session mutation support for cross-crate tests.
+///
+/// The raw abort operation and its storage implementation error remain
+/// storage-private. This capability exists only so deterministic higher-layer
+/// race tests can end a known session and observe the same opaque failure
+/// boundary used by production admitted routes.
+pub trait StorageClusterStreamSessionTestSupport {
+    fn test_abort_stream_upload_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), StreamUploadFailure>;
+}
+
+impl StorageClusterStreamSessionTestSupport for StorageCluster {
+    fn test_abort_stream_upload_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<(), StreamUploadFailure> {
+        StorageCluster::abort_stream_upload_session(self, bucket, key, session_id)
+            .map_err(StreamUploadFailure::from_object_pg_action)
+    }
+}
 
 /// Deterministic scheduling support for admitted stream-mutation routes.
 ///
@@ -14,7 +41,7 @@ pub trait ActiveStreamRouteTestSupport {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError>;
+    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure>;
 }
 
 impl ActiveStreamRouteTestSupport for ActivePutObjectRoute<'_> {
@@ -22,7 +49,7 @@ impl ActiveStreamRouteTestSupport for ActivePutObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure> {
         ActivePutObjectRoute::test_append_stream_segment_with_after_prepare(
             self,
             input,
@@ -36,7 +63,7 @@ impl ActiveStreamRouteTestSupport for ActiveMultipartObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure> {
         ActiveMultipartObjectRoute::test_append_stream_segment_with_after_prepare(
             self,
             input,
@@ -52,8 +79,8 @@ pub trait ActivePutObjectRouteTestSupport {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-        maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError>;
+        maintain_lease: impl FnMut() -> Result<(), StreamUploadFailure>,
+    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure>;
 }
 
 impl ActivePutObjectRouteTestSupport for ActivePutObjectRoute<'_> {
@@ -61,8 +88,8 @@ impl ActivePutObjectRouteTestSupport for ActivePutObjectRoute<'_> {
         &self,
         input: StreamSegmentAppendInput<'_>,
         after_prepare: impl FnMut(),
-        maintain_lease: impl FnMut() -> Result<(), ObjectPgActionError>,
-    ) -> Result<StreamSegmentAppendOutcome, ObjectPgActionError> {
+        maintain_lease: impl FnMut() -> Result<(), StreamUploadFailure>,
+    ) -> Result<StreamSegmentAppendOutcome, StreamUploadFailure> {
         ActivePutObjectRoute::test_append_stream_segment_with_after_prepare_and_lease_maintenance(
             self,
             input,

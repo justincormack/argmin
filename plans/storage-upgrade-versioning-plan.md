@@ -2105,6 +2105,25 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        authorized stored-object identity atomically. Because that removal changed the accepted
        message-kind grammar, storage RPC frame encoding advanced from 15 to 16 rather than leaving
        an incompatible grammar under the old marker.
+       The stream-upload sub-slice completed on 2026-08-07. Public admitted PutObject and
+       UploadPart stream-session creation, load, heartbeat, segment append, finalization, abort,
+       and retained-cleanup capabilities now return opaque `StreamUploadFailure` values. Its
+       exhaustive logical kind preserves multipart-upload and session absence/state, duplicate
+       segment, resource exhaustion, metadata contention, retryable convergence, client-visible
+       invalid-request, and internal outcomes; the wrapper retains only the upload ID or
+       client-visible validation reason needed for unchanged S3 translation plus a bounded private
+       diagnostic category. UploadPart continues to translate missing or terminal stream sessions
+       to `NoSuchUpload`, duplicate segments remain `InvalidRequest`, and general convergence
+       failures remain `SlowDown`. Lease maintenance during CopyObject segment writes now crosses
+       an internal generic error channel, so callback failure identity is preserved without adding
+       a forgeable raw-error sentinel. Internal failures remain typed through
+       `ServerError::StreamUpload`, including bounded request diagnostics and HTTP redaction. The
+       direct logical stream-session loader used by higher-layer tests also returns the opaque
+       failure. The raw stream-session abort primitive is crate-private; the sole cross-crate abort
+       test capability is feature-gated and returns the same opaque failure. Owner-local
+       classification/redaction tests, exhaustive cross-crate mapping tests,
+       HTTP sanitization coverage, and the boundary checker reject raw error transit through this
+       streaming seam.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces
@@ -2112,7 +2131,7 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        storage-owned semantic errors. Preserve only logical values required for S3 translation,
        such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
        other implementation detail behind the existing bounded opaque diagnostic. Continue with
-       object-PG operations and streaming. Remove
+       direct PutObject and multipart-management/completion object-PG operations. Remove
        `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
        public raw error exports once no public storage signature requires them. Tests that
        currently construct raw storage errors must use owner-provided semantic fixtures or move

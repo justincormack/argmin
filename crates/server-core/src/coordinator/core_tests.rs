@@ -5167,10 +5167,10 @@ fn retained_stream_cleanup_rejects_admission_from_an_unrelated_coordinator() {
         .abort_stream_upload_with_retained_cleanup(&cleanup, &session_id)
         .unwrap();
     assert!(matches!(
-        cluster.load_stream_upload_session(&bucket, &key, &session_id),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::StreamSessionNotFound { .. }
-        ))
+        cluster
+            .load_stream_upload_session(&bucket, &key, &session_id)
+            .map_err(|error| error.kind()),
+        Err(storage::StreamUploadFailureKind::SessionNotFound)
     ));
 }
 
@@ -5214,10 +5214,10 @@ fn retained_stream_cleanup_does_not_retry_after_its_deadline() {
         .abort_stream_upload_with_retained_cleanup(&cleanup, &session_id)
         .unwrap();
     assert!(matches!(
-        cluster.load_stream_upload_session(&bucket, &key, &session_id),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::StreamSessionNotFound { .. }
-        ))
+        cluster
+            .load_stream_upload_session(&bucket, &key, &session_id)
+            .map_err(|error| error.kind()),
+        Err(storage::StreamUploadFailureKind::SessionNotFound)
     ));
 }
 
@@ -6163,10 +6163,10 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
         "storage-owned cleanup must follow the refreshed route handle; summary={sweep_summary:?}"
     );
     assert!(matches!(
-        refreshed.load_stream_upload_session(&bucket, &key, &session_id),
-        Err(storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::StreamSessionNotFound { .. }
-        ))
+        refreshed
+            .load_stream_upload_session(&bucket, &key, &session_id)
+            .map_err(|error| error.kind()),
+        Err(storage::StreamUploadFailureKind::SessionNotFound)
     ));
     assert!(!refreshed
         .test_stream_upload_reservation_exists(&bucket, &key, &session_id)
@@ -10164,6 +10164,60 @@ fn object_metadata_mutation_failure_kinds_map_exhaustively_to_s3_outcomes() {
         ServerError::ObjectMetadataMutation(error)
             if error.diagnostic_cause_label() == "store_internal_failure"
     ));
+}
+
+#[test]
+fn stream_upload_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let map = |kind| {
+        Coordinator::map_stream_upload_failure(
+            storage::test_support::stream_upload_failure_for_kind(kind),
+        )
+    };
+
+    for kind in [
+        storage::StreamUploadFailureKind::ResourceExhausted,
+        storage::StreamUploadFailureKind::MetadataCommandContention,
+        storage::StreamUploadFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind), ServerError::SlowDown));
+    }
+    assert!(matches!(
+        map(storage::StreamUploadFailureKind::NoSuchUpload),
+        ServerError::NoSuchUpload { upload_id }
+            if upload_id == "opaque-test-upload-id"
+    ));
+    assert!(matches!(
+        map(storage::StreamUploadFailureKind::SegmentConflict),
+        ServerError::InvalidRequest { reason }
+            if reason == "stream segment index already exists"
+    ));
+    assert!(matches!(
+        map(storage::StreamUploadFailureKind::InvalidRequest),
+        ServerError::InvalidRequest { reason }
+            if reason == "opaque test invalid request"
+    ));
+    for kind in [
+        storage::StreamUploadFailureKind::SessionNotFound,
+        storage::StreamUploadFailureKind::SessionNotInProgress,
+        storage::StreamUploadFailureKind::InternalError,
+    ] {
+        assert!(matches!(map(kind), ServerError::StreamUpload(_)));
+    }
+
+    let upload_id = trusted_upload_id("upload-part-stream-mapping");
+    for kind in [
+        storage::StreamUploadFailureKind::SessionNotFound,
+        storage::StreamUploadFailureKind::SessionNotInProgress,
+    ] {
+        assert!(matches!(
+            Coordinator::map_upload_part_stream_error(
+                &upload_id,
+                storage::test_support::stream_upload_failure_for_kind(kind),
+            ),
+            ServerError::NoSuchUpload { upload_id: mapped }
+                if mapped.as_str() == upload_id.as_str()
+        ));
+    }
 }
 
 #[test]
