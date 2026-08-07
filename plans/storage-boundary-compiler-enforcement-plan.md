@@ -6310,9 +6310,21 @@ Remaining implementation order after this audit:
    scheduling extensions, (b) **completed:** the no-argument stream and
    pending-install scheduling guards and semantic retained-cleanup, reclaim,
    and payload cleanup/read failures are consolidated, (c) **completed:** the
-   clock and static-topology logical test controls,
-   and (d) privatization plus crate-wide enforcement for the remaining unused
-   public inherent test adapters; and
+   clock and static-topology logical test controls, and (d) **completed:** the
+   remaining storage-only inherent test adapters are crate-private, while six
+   obsolete no-caller helpers for raw object segments, reclaim insertion,
+   deleting-bucket construction, and shard-scavenger inspection were removed
+   rather than preserved as hidden APIs. A fail-closed source-root scan now
+   rejects every public `test_*` inherent adapter anywhere below
+   `crates/storage/src`, excluding only the curated `storage::test_support`
+   namespace. The last eight downstream-visible inherent methods now sit
+   behind existing logical support traits or opaque scheduling guards, so
+   there is no name-based exception inventory to become duplicated, stale, or
+   applicable to the wrong owner. Bucket-delete scheduling callbacks expose
+   only semantic fresh/resumed and more/final-frontier events; their raw PG
+   cursors remain storage-local. The same scanner runs against nested,
+   formerly allowlisted, async, const, unsafe, and extern fixtures to prove
+   crate-wide discovery across valid qualified function signatures; and
 5. rerun the public-export/feature audit and mark Phase 5 complete only when
    the remaining raw topology/support seams and their plan exceptions are
    gone.

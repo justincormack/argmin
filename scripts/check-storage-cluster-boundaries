@@ -5324,6 +5324,45 @@ fail_with_matches \
     "Maintenance sweeper public-method source-root scan must find only the nested unrelated-module fixture" \
     "$maintenance_sweeper_public_test_method_fixture_failure"
 
+scan_public_storage_test_adapters() {
+    local source_root=$1
+
+    rg -n --color=never --sort path \
+        '^[[:space:]]*pub[[:space:]]+((const|async|unsafe)[[:space:]]+)*(extern([[:space:]]+"[^"]*")?[[:space:]]+)?fn[[:space:]]+test_[A-Za-z0-9_]+' \
+        "$source_root" \
+        -g '*.rs' \
+        -g '!**/test_support/**' \
+        || true
+}
+
+public_storage_test_adapter_leaks=$(
+    scan_public_storage_test_adapters crates/storage/src
+)
+fail_with_matches \
+    "Storage inherent test adapters must remain crate-private and cross-crate controls must be exposed only through storage::test_support" \
+    "$public_storage_test_adapter_leaks"
+
+public_storage_test_adapter_fixture=$(
+    scan_public_storage_test_adapters \
+        scripts/fixtures/storage-boundary-unused-test-adapters
+)
+expected_public_storage_test_adapter_fixture='scripts/fixtures/storage-boundary-unused-test-adapters/nested/unrelated-module.rs:7:    pub fn test_unreviewed_storage_adapter(&self) {}
+scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:4:    pub fn test_ec_scratch_allocation_count(&self) {}
+scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:6:    pub async fn test_async_adapter(&self) {}
+scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:8:    pub const fn test_const_adapter(&self) {}
+scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:10:    pub unsafe fn test_unsafe_adapter(&self) {}
+scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:12:    pub extern "C" fn test_extern_adapter(&self) {}'
+public_storage_test_adapter_fixture_failure=""
+if [[ "$public_storage_test_adapter_fixture" != "$expected_public_storage_test_adapter_fixture" ]]; then
+    public_storage_test_adapter_fixture_failure=$public_storage_test_adapter_fixture
+    if [[ -z "$public_storage_test_adapter_fixture_failure" ]]; then
+        public_storage_test_adapter_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Storage test-adapter source-root scan must find ordinary, formerly allowlisted, and qualified public method fixtures" \
+    "$public_storage_test_adapter_fixture_failure"
+
 metadata_command_raw_test_symbol_leaks=$(
     rg -n --color=never \
         '\b(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for|MetadataCommandApplyTestContext|MetadataCommandApplyContextTestHook)\b' \

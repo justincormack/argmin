@@ -1477,8 +1477,10 @@ pub mod test_support {
 
     mod scheduling;
     pub use scheduling::{
-        StorageClusterSchedulingTestSupport, TestStorageSchedulingAction,
-        TestStorageSchedulingGuard,
+        StorageClusterSchedulingTestSupport, TestBucketDeleteExactDrainSchedulingAction,
+        TestBucketDeleteExactDrainStart, TestBucketDeletePostReservationProgress,
+        TestBucketDeletePostReservationProgressAction, TestStorageFallibleSchedulingAction,
+        TestStorageSchedulingAction, TestStorageSchedulingGuard,
     };
 
     mod static_topology;

@@ -1159,8 +1159,8 @@ pub(crate) struct MultipartCreateCommandInstallTestHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct DirectPutCommandIdHookGuard {
+#[cfg(test)]
+pub(crate) struct DirectPutCommandIdHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1169,13 +1169,13 @@ pub struct DirectPutAbandonedLogInspectionHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct ObjectGenerationCommandIdHookGuard {
+#[cfg(test)]
+pub(crate) struct ObjectGenerationCommandIdHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct ObjectVersionCommandIdHookGuard {
+#[cfg(test)]
+pub(crate) struct ObjectVersionCommandIdHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1189,13 +1189,13 @@ pub struct StreamAppendCommandIdAllocatedHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct ObjectMetadataReservationAcquiredHookGuard {
+#[cfg(test)]
+pub(crate) struct ObjectMetadataReservationAcquiredHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct MetadataListingPgCompleteHookGuard {
+#[cfg(test)]
+pub(crate) struct MetadataListingPgCompleteHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1309,7 +1309,7 @@ impl Drop for MultipartCreateCommandInstallTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for DirectPutCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_direct_put_command_id = None;
@@ -1326,7 +1326,7 @@ impl Drop for DirectPutAbandonedLogInspectionHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for ObjectGenerationCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks
@@ -1336,7 +1336,7 @@ impl Drop for ObjectGenerationCommandIdHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for ObjectVersionCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_object_version_command_id = None;
@@ -1360,7 +1360,7 @@ impl Drop for StreamAppendCommandIdAllocatedHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for ObjectMetadataReservationAcquiredHookGuard {
     fn drop(&mut self) {
         self.hooks
@@ -1370,7 +1370,7 @@ impl Drop for ObjectMetadataReservationAcquiredHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for MetadataListingPgCompleteHookGuard {
     fn drop(&mut self) {
         self.hooks
@@ -10139,7 +10139,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_from_local_map_with_epoch(
+    pub(crate) fn test_from_local_map_with_epoch(
         local_map: Arc<LocalClusterMap>,
         operation_epoch: ClusterEpoch,
     ) -> Result<Arc<Self>, ClusterBuildError> {
@@ -11076,15 +11076,15 @@ impl StorageCluster {
         self.local_map.process_local_registry_key()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_metadata_command_pg_lock_ptr(&self, pg_id: PgId) -> usize {
+    #[cfg(test)]
+    pub(crate) fn test_metadata_command_pg_lock_ptr(&self, pg_id: PgId) -> usize {
         self.local_map
             .runtime_state()
             .test_metadata_command_pg_lock_ptr(pg_id)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_metadata_command_recovery_flight_count(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn test_metadata_command_recovery_flight_count(&self) -> usize {
         self.local_map
             .runtime_state()
             .test_metadata_command_recovery_flight_count()
@@ -11925,8 +11925,8 @@ impl StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_metadata_listing_pg_complete_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_after_metadata_listing_pg_complete_hook(
         &self,
         hook: Arc<dyn Fn(u32) + Send + Sync>,
     ) -> MetadataListingPgCompleteHookGuard {
@@ -11975,8 +11975,8 @@ impl StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_direct_put_command_id_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_before_direct_put_command_id_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> DirectPutCommandIdHookGuard {
@@ -12000,8 +12000,8 @@ impl StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_object_generation_command_id_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_before_object_generation_command_id_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> ObjectGenerationCommandIdHookGuard {
@@ -12014,8 +12014,8 @@ impl StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_object_version_command_id_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_before_object_version_command_id_hook(
         &self,
         hook: Arc<dyn Fn() + Send + Sync>,
     ) -> ObjectVersionCommandIdHookGuard {
@@ -12056,8 +12056,8 @@ impl StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_object_metadata_reservation_acquired_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_after_object_metadata_reservation_acquired_hook(
         &self,
         hook: Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>,
     ) -> ObjectMetadataReservationAcquiredHookGuard {
@@ -12365,7 +12365,7 @@ impl StorageCluster {
 
     #[cfg(test)]
     #[doc(hidden)]
-    pub fn test_write_direct_put_segment_payload_shards(
+    pub(crate) fn test_write_direct_put_segment_payload_shards(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -16518,7 +16518,7 @@ impl StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn test_register_payload_shard_acks(
+    pub(crate) fn test_register_payload_shard_acks(
         &self,
         data_pg_id: u32,
         written_shards: &[WrittenShardAck],
@@ -16816,47 +16816,6 @@ impl StorageCluster {
         }
 
         Ok(observations)
-    }
-
-    #[cfg(feature = "test-hooks")]
-    #[doc(hidden)]
-    pub fn test_shard_scavenger_clean_check(&self, context: &str) -> Result<(), String> {
-        let observations = self.audit_shard_storage_for_scavenger().map_err(|error| {
-            format!("shard scavenger final audit failed for {context}: {error}")
-        })?;
-        let unresolved: Vec<_> = observations
-            .iter()
-            .filter(|observation| observation.resolved_at.is_none())
-            .collect();
-        if unresolved.is_empty() {
-            return Ok(());
-        }
-
-        let mut message = format!(
-            "shard scavenger final audit found {} unresolved observation(s) for {context}",
-            unresolved.len()
-        );
-        for observation in unresolved.iter().take(16) {
-            message.push_str(&format!(
-                "\n  node={} data_pg={} shard_index={} shard_key={} reason={:?} file_exists={} shard_row_exists={} count={} last_error={}",
-                observation.key.node_id,
-                observation.key.data_pg_id,
-                observation.key.shard_index.get(),
-                observation.key.shard_key.hex(),
-                observation.reason,
-                observation.file_exists,
-                observation.shard_row_exists,
-                observation.observation_count,
-                observation.last_error.as_deref().unwrap_or("<none>"),
-            ));
-        }
-        if unresolved.len() > 16 {
-            message.push_str(&format!(
-                "\n  ... {} more unresolved observation(s) omitted",
-                unresolved.len() - 16
-            ));
-        }
-        Err(message)
     }
 
     fn shard_scavenger_scan_incomplete_observation(
@@ -20044,7 +20003,7 @@ impl StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn test_payload_shard_file_path(
+    pub(crate) fn test_payload_shard_file_path(
         &self,
         data_pg_id: u32,
         ec: EcShape,
@@ -20086,7 +20045,7 @@ impl StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn test_payload_shard_file_exists(
+    pub(crate) fn test_payload_shard_file_exists(
         &self,
         data_pg_id: u32,
         ec: EcShape,
@@ -20097,19 +20056,6 @@ impl StorageCluster {
         Ok(self
             .test_payload_shard_file_path(data_pg_id, ec, segment_okh, segment_vid, shard_index)?
             .exists())
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_shard_scavenger_observations(
-        &self,
-        data_pg_id: u32,
-    ) -> Result<Vec<ShardScavengerObservation>, StoreError> {
-        let pg_id = PgId::new(data_pg_id);
-        self.local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .shard_scavenger_observation_client()
-            .open_shard_scavenger_observation_route(self.validated_data_pg(pg_id)?)?
-            .list_shard_scavenger_observations()
     }
 
     fn emit_best_effort_payload_cleanup_error(&self, operation: &'static str, error: &StoreError) {

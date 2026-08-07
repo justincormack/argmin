@@ -1,7 +1,7 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::StorageCluster;
+use crate::{StorageCluster, StoreError};
 
 /// A deterministic action invoked at a storage-owned scheduling boundary.
 ///
@@ -9,6 +9,27 @@ use crate::StorageCluster;
 /// Cross-crate tests can coordinate an interleaving while the hook registry,
 /// command IDs, PGs, and payload placement remain owned by storage.
 pub type TestStorageSchedulingAction = Arc<dyn Fn() + Send + Sync>;
+
+pub type TestStorageFallibleSchedulingAction =
+    Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestBucketDeletePostReservationProgress {
+    MoreFrontiersRemain,
+    FinalFrontierRecorded,
+}
+
+pub type TestBucketDeletePostReservationProgressAction =
+    Arc<dyn Fn(TestBucketDeletePostReservationProgress) -> Result<(), StoreError> + Send + Sync>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TestBucketDeleteExactDrainStart {
+    Fresh,
+    ResumedFromDurableProgress,
+}
+
+pub type TestBucketDeleteExactDrainSchedulingAction =
+    Arc<dyn Fn(TestBucketDeleteExactDrainStart) -> Result<(), StoreError> + Send + Sync>;
 
 /// Opaque lifetime guard for an installed storage scheduling action.
 pub struct TestStorageSchedulingGuard {
@@ -25,8 +46,9 @@ impl TestStorageSchedulingGuard {
 
 /// Curated deterministic scheduling boundaries for cross-crate tests.
 ///
-/// Each method installs a no-argument action at the named production boundary.
-/// The underlying hook registries and their operation-specific guards remain
+/// Most methods install a no-argument action. Bucket-delete progress methods
+/// expose only semantic phase/frontier state, never raw PG identities. The
+/// underlying hook registries and their operation-specific guards remain
 /// crate-private.
 pub trait StorageClusterSchedulingTestSupport {
     fn test_install_before_stream_abort_storage_hook(
@@ -62,6 +84,26 @@ pub trait StorageClusterSchedulingTestSupport {
     fn test_install_before_stream_put_finalize_command_id_hook(
         &self,
         action: TestStorageSchedulingAction,
+    ) -> TestStorageSchedulingGuard;
+
+    fn test_install_before_bucket_delete_final_visibility_hook(
+        &self,
+        action: TestStorageFallibleSchedulingAction,
+    ) -> TestStorageSchedulingGuard;
+
+    fn test_install_after_bucket_delete_final_visibility_proven_hook(
+        &self,
+        action: TestStorageFallibleSchedulingAction,
+    ) -> TestStorageSchedulingGuard;
+
+    fn test_install_after_bucket_delete_post_reservation_progress_hook(
+        &self,
+        action: TestBucketDeletePostReservationProgressAction,
+    ) -> TestStorageSchedulingGuard;
+
+    fn test_install_before_bucket_delete_exact_drain_hook(
+        &self,
+        action: TestBucketDeleteExactDrainSchedulingAction,
     ) -> TestStorageSchedulingGuard;
 
     /// Run an identity-free action immediately before each payload-shard read.
@@ -138,6 +180,64 @@ impl StorageClusterSchedulingTestSupport for StorageCluster {
     ) -> TestStorageSchedulingGuard {
         TestStorageSchedulingGuard::new(
             StorageCluster::test_install_before_stream_put_finalize_command_id_hook(self, action),
+        )
+    }
+
+    fn test_install_before_bucket_delete_final_visibility_hook(
+        &self,
+        action: TestStorageFallibleSchedulingAction,
+    ) -> TestStorageSchedulingGuard {
+        TestStorageSchedulingGuard::new(
+            StorageCluster::test_install_before_bucket_delete_final_visibility_hook(self, action),
+        )
+    }
+
+    fn test_install_after_bucket_delete_final_visibility_proven_hook(
+        &self,
+        action: TestStorageFallibleSchedulingAction,
+    ) -> TestStorageSchedulingGuard {
+        TestStorageSchedulingGuard::new(
+            StorageCluster::test_install_after_bucket_delete_final_visibility_proven_hook(
+                self, action,
+            ),
+        )
+    }
+
+    fn test_install_after_bucket_delete_post_reservation_progress_hook(
+        &self,
+        action: TestBucketDeletePostReservationProgressAction,
+    ) -> TestStorageSchedulingGuard {
+        TestStorageSchedulingGuard::new(
+            StorageCluster::test_install_after_bucket_delete_semantic_post_reservation_progress_hook(
+                self,
+                Arc::new(move |more_frontiers_remain| {
+                    let progress = if more_frontiers_remain {
+                        TestBucketDeletePostReservationProgress::MoreFrontiersRemain
+                    } else {
+                        TestBucketDeletePostReservationProgress::FinalFrontierRecorded
+                    };
+                    action(progress)
+                }),
+            ),
+        )
+    }
+
+    fn test_install_before_bucket_delete_exact_drain_hook(
+        &self,
+        action: TestBucketDeleteExactDrainSchedulingAction,
+    ) -> TestStorageSchedulingGuard {
+        TestStorageSchedulingGuard::new(
+            StorageCluster::test_install_before_bucket_delete_exact_drain_hook(
+                self,
+                Arc::new(move |has_durable_progress, _next_object_pg_id| {
+                    let start = if has_durable_progress {
+                        TestBucketDeleteExactDrainStart::ResumedFromDurableProgress
+                    } else {
+                        TestBucketDeleteExactDrainStart::Fresh
+                    };
+                    action(start)
+                }),
+            ),
         )
     }
 

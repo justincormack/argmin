@@ -407,11 +407,11 @@ pub type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type BucketDeleteFinalVisibilityStartTestHook =
+pub(crate) type BucketDeleteFinalVisibilityStartTestHook =
     Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type BucketDeleteFinalVisibilityProvenTestHook =
+pub(crate) type BucketDeleteFinalVisibilityProvenTestHook =
     Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -419,8 +419,12 @@ pub type BucketDeleteReservationWaitReadyTestHook =
     Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type BucketDeletePostReservationProgressTestHook =
+pub(crate) type BucketDeletePostReservationProgressTestHook =
     Arc<dyn Fn(u32) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) type BucketDeleteSemanticPostReservationProgressTestHook =
+    Arc<dyn Fn(bool) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub type BucketDeleteStreamCleanupProgressTestHook =
@@ -435,7 +439,7 @@ pub type BucketDeleteExactDrainProgressTestHook =
     Arc<dyn Fn(crate::TestBucketDeleteAttemptPhase, u32) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub type BucketDeleteExactDrainStartTestHook =
+pub(crate) type BucketDeleteExactDrainStartTestHook =
     Arc<dyn Fn(bool, u32) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -569,42 +573,42 @@ pub(crate) struct BucketDeleteCommandIdTestHookGuard {
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteFinalVisibilityStartTestHookGuard {
+pub(crate) struct BucketDeleteFinalVisibilityStartTestHookGuard {
     scope_id: usize,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteFinalVisibilityProvenTestHookGuard {
+pub(crate) struct BucketDeleteFinalVisibilityProvenTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeleteReservationWaitReadyTestHookGuard {
     scope_id: usize,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteReservationWaitReadyTestHookGuard {
+pub(crate) struct BucketDeletePostReservationProgressTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeleteStreamCleanupProgressTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeleteFinalVisibilityProgressTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeleteExactDrainProgressTestHookGuard {
     scope_id: usize,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeletePostReservationProgressTestHookGuard {
-    scope_id: usize,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteStreamCleanupProgressTestHookGuard {
-    scope_id: usize,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteFinalVisibilityProgressTestHookGuard {
-    scope_id: usize,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteExactDrainProgressTestHookGuard {
-    scope_id: usize,
-}
-
-#[cfg(any(test, feature = "test-hooks"))]
-pub struct BucketDeleteExactDrainStartTestHookGuard {
+pub(crate) struct BucketDeleteExactDrainStartTestHookGuard {
     scope_id: usize,
 }
 
@@ -713,7 +717,7 @@ impl Drop for BucketDeleteFinalVisibilityProvenTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for BucketDeleteReservationWaitReadyTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_RESERVATION_WAIT_READY_HOOKS
@@ -737,7 +741,7 @@ impl Drop for BucketDeletePostReservationProgressTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for BucketDeleteStreamCleanupProgressTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_STREAM_CLEANUP_PROGRESS_HOOKS
@@ -749,7 +753,7 @@ impl Drop for BucketDeleteStreamCleanupProgressTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for BucketDeleteFinalVisibilityProgressTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_FINAL_VISIBILITY_PROGRESS_HOOKS
@@ -761,7 +765,7 @@ impl Drop for BucketDeleteFinalVisibilityProgressTestHookGuard {
     }
 }
 
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(test)]
 impl Drop for BucketDeleteExactDrainProgressTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_BUCKET_DELETE_EXACT_DRAIN_PROGRESS_HOOKS
@@ -1612,7 +1616,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_bucket_delete_final_visibility_hook(
+    pub(crate) fn test_install_before_bucket_delete_final_visibility_hook(
         &self,
         hook: BucketDeleteFinalVisibilityStartTestHook,
     ) -> BucketDeleteFinalVisibilityStartTestHookGuard {
@@ -1626,7 +1630,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_bucket_delete_final_visibility_proven_hook(
+    pub(crate) fn test_install_after_bucket_delete_final_visibility_proven_hook(
         &self,
         hook: BucketDeleteFinalVisibilityProvenTestHook,
     ) -> BucketDeleteFinalVisibilityProvenTestHookGuard {
@@ -1639,8 +1643,8 @@ impl super::StorageCluster {
         BucketDeleteFinalVisibilityProvenTestHookGuard { scope_id }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_bucket_delete_reservation_wait_ready_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_after_bucket_delete_reservation_wait_ready_hook(
         &self,
         hook: BucketDeleteReservationWaitReadyTestHook,
     ) -> BucketDeleteReservationWaitReadyTestHookGuard {
@@ -1654,7 +1658,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_bucket_delete_post_reservation_progress_hook(
+    pub(crate) fn test_install_after_bucket_delete_post_reservation_progress_hook(
         &self,
         hook: BucketDeletePostReservationProgressTestHook,
     ) -> BucketDeletePostReservationProgressTestHookGuard {
@@ -1668,7 +1672,22 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_bucket_delete_stream_cleanup_progress_hook(
+    pub(crate) fn test_install_after_bucket_delete_semantic_post_reservation_progress_hook(
+        &self,
+        hook: BucketDeleteSemanticPostReservationProgressTestHook,
+    ) -> BucketDeletePostReservationProgressTestHookGuard {
+        let last_object_pg_id = self.metadata_pg_ids().into_iter().max();
+        self.test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
+            move |next_object_pg_id| {
+                let more_frontiers_remain = last_object_pg_id
+                    .is_some_and(|last_object_pg_id| next_object_pg_id <= last_object_pg_id);
+                hook(more_frontiers_remain)
+            },
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_after_bucket_delete_stream_cleanup_progress_hook(
         &self,
         hook: BucketDeleteStreamCleanupProgressTestHook,
     ) -> BucketDeleteStreamCleanupProgressTestHookGuard {
@@ -1681,8 +1700,8 @@ impl super::StorageCluster {
         BucketDeleteStreamCleanupProgressTestHookGuard { scope_id }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_bucket_delete_final_visibility_progress_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_after_bucket_delete_final_visibility_progress_hook(
         &self,
         hook: BucketDeleteFinalVisibilityProgressTestHook,
     ) -> BucketDeleteFinalVisibilityProgressTestHookGuard {
@@ -1695,8 +1714,8 @@ impl super::StorageCluster {
         BucketDeleteFinalVisibilityProgressTestHookGuard { scope_id }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_after_bucket_delete_exact_drain_progress_hook(
+    #[cfg(test)]
+    pub(crate) fn test_install_after_bucket_delete_exact_drain_progress_hook(
         &self,
         hook: BucketDeleteExactDrainProgressTestHook,
     ) -> BucketDeleteExactDrainProgressTestHookGuard {
@@ -1710,7 +1729,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_before_bucket_delete_exact_drain_hook(
+    pub(crate) fn test_install_before_bucket_delete_exact_drain_hook(
         &self,
         hook: BucketDeleteExactDrainStartTestHook,
     ) -> BucketDeleteExactDrainStartTestHookGuard {
@@ -17287,7 +17306,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_data_pg_id_for(
+    pub(crate) fn test_data_pg_id_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -17310,7 +17329,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_meta(
+    pub(crate) fn test_get_object_meta(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18023,7 +18042,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_version(
+    pub(crate) fn test_get_object_version(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -18579,8 +18598,8 @@ impl super::StorageCluster {
             .test_list_all_stream_uploads()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_create_stream_upload(
+    #[cfg(test)]
+    pub(crate) fn test_create_stream_upload(
         &self,
         req: &CreateStreamUploadReq,
     ) -> Result<(), ObjectPgActionError> {
@@ -18600,8 +18619,8 @@ impl super::StorageCluster {
             .test_force_stream_upload_cleanup_after(bucket, key, session_id, cleanup_after)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
+    #[cfg(test)]
+    pub(crate) fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
         self.metadata_primary_bridge_node()?
             .test_shard_exists(pg_id, key)
     }

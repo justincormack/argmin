@@ -1320,12 +1320,12 @@ impl LocalClusterRuntimeState {
         )
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(crate) fn test_metadata_command_pg_lock_ptr(&self, pg_id: PgId) -> usize {
         Arc::as_ptr(&self.metadata_command_pg_lock(pg_id)) as usize
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(crate) fn test_metadata_command_recovery_flight_count(&self) -> usize {
         self.metadata_command_recovery_flights
             .lock()
@@ -2163,7 +2163,7 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_clone_with_pg_routes(
+    pub(crate) fn test_clone_with_pg_routes(
         &self,
         cluster_epoch: ClusterEpoch,
         pg_routes: impl IntoIterator<Item = PgRouteSnapshot>,
@@ -3582,7 +3582,7 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_historical_pg_routes(
+    pub(crate) fn test_install_historical_pg_routes(
         &mut self,
         routes: impl IntoIterator<Item = PgRouteSnapshot>,
     ) {
@@ -3606,7 +3606,10 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_install_pg_routes(&mut self, routes: impl IntoIterator<Item = PgRouteSnapshot>) {
+    pub(crate) fn test_install_pg_routes(
+        &mut self,
+        routes: impl IntoIterator<Item = PgRouteSnapshot>,
+    ) {
         self.pg_routes = routes
             .into_iter()
             .map(|route| (route.pg_id(), LocalPgRoute::from(&route)))
@@ -3614,7 +3617,7 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_set_route_map_validity(&mut self, validity: RouteMapValidity) {
+    pub(crate) fn test_set_route_map_validity(&mut self, validity: RouteMapValidity) {
         self.route_map_lease = RwLock::new(LocalRouteMapLeaseSnapshot {
             validity,
             local_valid_until_monotonic_ms: test_process_local_route_map_deadline(validity),
@@ -3622,7 +3625,7 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
+    pub(crate) fn test_store_route_map_validity(&self, validity: RouteMapValidity) {
         self.replace_route_map_lease_snapshot(LocalRouteMapLeaseSnapshot {
             validity,
             local_valid_until_monotonic_ms: test_process_local_route_map_deadline(validity),
@@ -3630,7 +3633,7 @@ impl LocalClusterMap {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_store_route_map_lease(
+    pub(crate) fn test_store_route_map_lease(
         &self,
         validity: RouteMapValidity,
         local_valid_until_monotonic_ms: Option<u64>,

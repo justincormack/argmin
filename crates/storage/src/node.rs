@@ -14,7 +14,7 @@ use placement::NodeId;
 #[cfg(any(test, feature = "test-hooks"))]
 use s3_types::VersionId;
 #[cfg(test)]
-use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId};
+use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState};
 
 use super::clients::{
     BucketMetadataNodeClient, BucketWriteReservationNodeClient, DirectPutMetadataNodeClient,
@@ -67,9 +67,9 @@ use crate::types::{
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
-    CreateStreamUploadReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord, SessionId,
-    StreamUploadRecord, StreamUploadSegmentRecord, UploadId, UploadState,
+    CreateStreamUploadReq, MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, SessionId, StreamUploadRecord,
+    StreamUploadSegmentRecord, UploadId, UploadState,
 };
 #[cfg(test)]
 use crate::types::{PutLiveObjectReq, StreamUploadState, StreamUploadTarget};
@@ -982,7 +982,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
+    pub(crate) fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
         self.ec_write_states
             .lock()
             .unwrap()
@@ -1035,7 +1035,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_head_bucket_raw(
+    pub(crate) fn test_head_bucket_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
@@ -1050,7 +1050,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_data_pg_id_for(
+    pub(crate) fn test_data_pg_id_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1062,7 +1062,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_object_generation_reservation_for(
+    pub(crate) fn test_object_generation_reservation_for(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1074,7 +1074,7 @@ impl SharedStorageNode {
 
     #[cfg(any(test, feature = "test-hooks"))]
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_meta(
+    pub(crate) fn test_get_object_meta(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1085,7 +1085,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_multipart_upload(
+    pub(crate) fn test_get_multipart_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1105,7 +1105,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_multipart_part(
+    pub(crate) fn test_get_multipart_part(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1118,7 +1118,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_multipart_uploads_for_bucket(
+    pub(crate) fn test_list_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<MultipartUploadRecord>, ObjectPgActionError> {
@@ -1134,18 +1134,6 @@ impl SharedStorageNode {
             uploads.extend(listed.uploads);
         }
         Ok(uploads)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_segments(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-    ) -> Result<Vec<ObjectSegmentRecord>, ObjectPgActionError> {
-        let pg_id = self.test_object_pg_id_for(bucket, key);
-        let pg = self.get_pg(pg_id)?;
-        Ok(pg.get_object_segments(bucket, key, version_id)?)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1226,7 +1214,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_parts(
+    pub(crate) fn test_get_object_parts(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1238,7 +1226,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_corrupt_object_part_payload_crc64(
+    pub(crate) fn test_corrupt_object_part_payload_crc64(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1252,7 +1240,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_remove_object_part(
+    pub(crate) fn test_remove_object_part(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1266,7 +1254,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_version(
+    pub(crate) fn test_get_object_version(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1278,7 +1266,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_object_segments_reclaim(
+    pub(crate) fn test_get_object_segments_reclaim(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1290,31 +1278,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_put_object_segments_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reclaim: &ObjectSegmentsReclaimRecord,
-    ) -> Result<(), ObjectPgActionError> {
-        let pg_id = self.test_object_pg_id_for(bucket, key);
-        let pg = self.get_pg(pg_id)?;
-        Ok(pg.put_object_segments_reclaim(reclaim)?)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_put_multipart_reclaim(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        reclaim: &MultipartReclaimRecord,
-    ) -> Result<(), ObjectPgActionError> {
-        let pg_id = self.test_object_pg_id_for(bucket, key);
-        let pg = self.get_pg(pg_id)?;
-        Ok(pg.put_multipart_reclaim(reclaim)?)
-    }
-
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_payload_reclaim_exists(
+    pub(crate) fn test_payload_reclaim_exists(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1362,38 +1326,8 @@ impl SharedStorageNode {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub fn test_create_deleting_bucket(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<(), BucketWriteDrainError> {
-        let owner_canonical_id = CanonicalUserId::from_principal("default-owner");
-        let acl_grants = AclGrants::default();
-        let create = CreateBucketConfig {
-            name: bucket.as_str(),
-            owner_principal: "default-owner",
-            owner_canonical_id: &owner_canonical_id,
-            acl_grants: &acl_grants,
-            public_read: false,
-            public_write: false,
-            versioning: BucketVersioningState::Disabled,
-            object_lock: BucketObjectLockConfig::default(),
-            ownership_controls: crate::BucketOwnershipControls {
-                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
-            },
-        };
-        let _ = self
-            .create_bucket_with_config_and_load_info(&create)
-            .map_err(|err| match err {
-                BucketSnapshotLoadError::Store(err) => BucketWriteDrainError::Store(err),
-                BucketSnapshotLoadError::Metadata(err) => BucketWriteDrainError::Metadata(err),
-            })?;
-        self.mark_bucket_deleting(bucket)?;
-        Ok(())
-    }
-
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_get_all_multipart_part_segments_for_upload(
+    pub(crate) fn test_get_all_multipart_part_segments_for_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1405,7 +1339,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_set_upload_state(
+    pub(crate) fn test_set_upload_state(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1432,7 +1366,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_mark_stream_upload_stale(
+    pub(crate) fn test_mark_stream_upload_stale(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1445,7 +1379,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_list_all_stream_uploads(
+    pub(crate) fn test_list_all_stream_uploads(
         &self,
     ) -> Result<Vec<StreamUploadRecord>, ObjectPgActionError> {
         let mut sessions = Vec::new();
@@ -1457,7 +1391,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_create_stream_upload(
+    pub(crate) fn test_create_stream_upload(
         &self,
         req: &CreateStreamUploadReq,
     ) -> Result<(), ObjectPgActionError> {
@@ -1510,7 +1444,7 @@ impl SharedStorageNode {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
+    pub(crate) fn test_shard_exists(&self, pg_id: u32, key: &ShardKey) -> Result<bool, StoreError> {
         let pg = self.get_pg(pg_id)?;
         match pg.stat_shard(key) {
             Ok(_) => Ok(true),

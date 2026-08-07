@@ -6485,8 +6485,9 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
     let fail_after_first_frontier_for_hook = Arc::clone(&fail_after_first_frontier);
     let _progress_hook_guard = initial
         .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
-            move |next_object_pg_id| {
-                if next_object_pg_id < PG_COUNT
+            move |progress| {
+                if progress
+                    == storage::test_support::TestBucketDeletePostReservationProgress::MoreFrontiersRemain
                     && fail_after_first_frontier_for_hook.swap(false, Ordering::SeqCst)
                 {
                     return Err(storage::StoreError::RouteMapExpired {
@@ -6557,21 +6558,20 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
     let post_reservation_scan_ran_for_hook = Arc::clone(&post_reservation_scan_ran);
     let initial_scan_ran = Arc::new(AtomicBool::new(false));
     let initial_scan_ran_for_hook = Arc::clone(&initial_scan_ran);
-    let _exact_drain_hook_guard = initial.test_install_before_bucket_delete_exact_drain_hook(
-        Arc::new(move |has_progress, next_object_pg_id| {
-            if !has_progress {
+    let _exact_drain_hook_guard =
+        initial.test_install_before_bucket_delete_exact_drain_hook(Arc::new(move |start| {
+            if start == storage::test_support::TestBucketDeleteExactDrainStart::Fresh {
                 initial_scan_ran_for_hook.store(true, Ordering::SeqCst);
                 return Err(storage::StoreError::Io {
                     context: "unexpected initial exact-bucket drain during stream-cleanup adoption",
-                    source: std::io::Error::other(format!("next_object_pg_id={next_object_pg_id}")),
+                    source: std::io::Error::other("fresh exact-bucket drain"),
                 });
             }
             Ok(())
-        }),
-    );
+        }));
     let _progress_hook_guard = initial
         .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
-            move |_next_object_pg_id| {
+            move |_progress| {
                 post_reservation_scan_ran_for_hook.store(true, Ordering::SeqCst);
                 Ok(())
             },
@@ -6622,22 +6622,21 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
     let post_reservation_scan_ran_for_hook = Arc::clone(&post_reservation_scan_ran);
     let initial_scan_ran = Arc::new(AtomicBool::new(false));
     let initial_scan_ran_for_hook = Arc::clone(&initial_scan_ran);
-    let _exact_drain_hook_guard = initial.test_install_before_bucket_delete_exact_drain_hook(
-        Arc::new(move |has_progress, next_object_pg_id| {
-            if !has_progress {
+    let _exact_drain_hook_guard =
+        initial.test_install_before_bucket_delete_exact_drain_hook(Arc::new(move |start| {
+            if start == storage::test_support::TestBucketDeleteExactDrainStart::Fresh {
                 initial_scan_ran_for_hook.store(true, Ordering::SeqCst);
                 return Err(storage::StoreError::Io {
                     context:
                         "unexpected initial exact-bucket drain during reservation-wait adoption",
-                    source: std::io::Error::other(format!("next_object_pg_id={next_object_pg_id}")),
+                    source: std::io::Error::other("fresh exact-bucket drain"),
                 });
             }
             Ok(())
-        }),
-    );
+        }));
     let _progress_hook_guard = initial
         .test_install_after_bucket_delete_post_reservation_progress_hook(Arc::new(
-            move |_next_object_pg_id| {
+            move |_progress| {
                 post_reservation_scan_ran_for_hook.store(true, Ordering::SeqCst);
                 Ok(())
             },
@@ -6686,17 +6685,14 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
 
     let exact_drain_ran = Arc::new(AtomicBool::new(false));
     let exact_drain_ran_for_hook = Arc::clone(&exact_drain_ran);
-    let _exact_drain_hook_guard = initial.test_install_before_bucket_delete_exact_drain_hook(
-        Arc::new(move |has_progress, next_object_pg_id| {
+    let _exact_drain_hook_guard =
+        initial.test_install_before_bucket_delete_exact_drain_hook(Arc::new(move |start| {
             exact_drain_ran_for_hook.store(true, Ordering::SeqCst);
             Err(storage::StoreError::Io {
                 context: "unexpected exact-bucket drain during final-visibility adoption",
-                source: std::io::Error::other(format!(
-                    "has_progress={has_progress} next_object_pg_id={next_object_pg_id}"
-                )),
+                source: std::io::Error::other(format!("exact drain start={start:?}")),
             })
-        }),
-    );
+        }));
 
     let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let _coord = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
