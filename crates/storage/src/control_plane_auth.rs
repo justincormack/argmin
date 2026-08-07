@@ -1,6 +1,6 @@
 use crate::control_plane::ControlPlaneError;
+use argmin_crypto::hmac::Sha256Key;
 use placement::NodeId;
-use ring::hmac;
 use std::fmt;
 
 const CONTROL_PLANE_AUTH_MAGIC: &[u8; 8] = b"ARGCPAUT";
@@ -336,8 +336,8 @@ impl ControlPlaneScopedCredential {
             nonce: input.nonce,
         })?;
         let covered = header.encode_covered_bytes(&input.payload)?;
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.secret);
-        let authenticator = hmac::sign(&key, &covered).as_ref().to_vec();
+        let key = Sha256Key::new(&self.secret);
+        let authenticator = key.sign(&covered).to_vec();
         ControlPlaneAuthEnvelope::new(ControlPlaneAuthEnvelopeInput {
             header,
             payload: input.payload,
@@ -514,9 +514,10 @@ impl ControlPlaneScopedCredentialStore {
         let covered = header
             .encode_covered_bytes(input.envelope.payload())
             .map_err(|_| ControlPlaneAuthRejectionReason::Malformed)?;
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &credential.secret);
-        hmac::verify(&key, &covered, input.envelope.authenticator())
-            .map_err(|_| ControlPlaneAuthRejectionReason::AuthenticatorMismatch)?;
+        let key = Sha256Key::new(&credential.secret);
+        if !key.verify(&covered, input.envelope.authenticator()) {
+            return Err(ControlPlaneAuthRejectionReason::AuthenticatorMismatch);
+        }
         Ok((
             credential.credential_id.clone(),
             credential.credential_version,

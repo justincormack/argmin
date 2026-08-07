@@ -4,9 +4,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use argmin_crypto::aead::Aes256GcmKey;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use ring::{aead, rand};
 
 use crate::credential::{
     valid_session_access_key_id, valid_session_secret_access_key, SESSION_ACCESS_KEY_ID_LEN,
@@ -129,7 +129,7 @@ impl SessionTokenKeyRingStatus {
 }
 
 struct SessionTokenKey {
-    key: aead::LessSafeKey,
+    key: Aes256GcmKey,
     nonce_prefix: [u8; NONCE_PREFIX_LEN],
     next_nonce_counter: AtomicU64,
 }
@@ -139,10 +139,10 @@ impl SessionTokenKey {
         key_material: &[u8; KEY_LEN],
         nonce_prefix: [u8; NONCE_PREFIX_LEN],
     ) -> Result<Self, SessionTokenKeyRingInitError> {
-        let key = aead::UnboundKey::new(&aead::AES_256_GCM, key_material)
+        let key = Aes256GcmKey::new(key_material)
             .map_err(|_| SessionTokenKeyRingInitError::InvalidKeyMaterial)?;
         Ok(Self {
-            key: aead::LessSafeKey::new(key),
+            key,
             nonce_prefix,
             next_nonce_counter: AtomicU64::new(0),
         })
@@ -167,7 +167,7 @@ struct KeyMaterialFingerprint([u8; 32]);
 
 impl KeyMaterialFingerprint {
     fn from_key_material(key_material: &[u8; KEY_LEN]) -> Self {
-        Self(checksum::sha256::digest(key_material))
+        Self(argmin_crypto::sha256::digest(key_material))
     }
 }
 
@@ -222,7 +222,7 @@ impl SessionTokenKeyRing {
     /// credential domain together.
     pub fn new_process_local() -> Result<Self, SessionTokenKeyRingInitError> {
         let mut generated = [0_u8; CREDENTIAL_DOMAIN_LEN + KEY_ID_LEN + NONCE_PREFIX_LEN + KEY_LEN];
-        rand::SecureRandom::fill(&rand::SystemRandom::new(), &mut generated)
+        argmin_crypto::random::fill(&mut generated)
             .map_err(|_| SessionTokenKeyRingInitError::EntropyUnavailable)?;
         let mut offset = 0;
         let credential_domain =
@@ -301,11 +301,7 @@ impl SessionTokenKeyRing {
         let associated_data = associated_data(&self.credential_domain, &key_id, &nonce);
         let mut ciphertext = plaintext;
         key.key
-            .seal_in_place_append_tag(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(associated_data.as_slice()),
-                &mut ciphertext,
-            )
+            .seal_in_place_append_tag(nonce, associated_data.as_slice(), &mut ciphertext)
             .map_err(|_| SessionTokenSealError::IssuanceInvariant)?;
 
         let mut frame = Vec::with_capacity(KEY_ID_LEN + NONCE_LEN + ciphertext.len());
@@ -370,8 +366,8 @@ impl SessionTokenKeyRing {
         let plaintext = key
             .key
             .open_in_place(
-                aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(associated_data.as_slice()),
+                nonce,
+                associated_data.as_slice(),
                 &mut frame[ciphertext_offset..],
             )
             .map_err(|_| SessionTokenOpenError::InvalidToken)?;

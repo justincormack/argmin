@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/observability",
     "crates/ec",
+    "crates/crypto",
     "crates/checksum",
     "crates/tls-provider",
     "crates/s3-types",

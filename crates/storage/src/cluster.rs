@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use ec::{EcConfig, ErasureCodec};
 use placement::NodeId;
-use ring::rand::SecureRandom;
 
 pub use crate::node_client::LocalUnixStorageNodeClientAdmissionSettings;
 pub use local::{
@@ -609,17 +608,17 @@ fn jittered_metadata_contention_backoff_delay(cap: Duration) -> Duration {
         return Duration::ZERO;
     }
     let mut bytes = [0u8; 8];
-    if ring::rand::SystemRandom::new().fill(&mut bytes).is_err() {
+    if argmin_crypto::random::fill(&mut bytes).is_err() {
         return Duration::from_nanos((max_nanos / 2).max(1));
     }
     Duration::from_nanos((u64::from_le_bytes(bytes) % max_nanos.saturating_add(1)).max(1))
 }
 
-fn random_hex_identifier(prefix: &str) -> Result<String, ring::error::Unspecified> {
+fn random_hex_identifier(prefix: &str) -> Result<String, argmin_crypto::CryptoError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut id_bytes = [0u8; 16];
-    ring::rand::SystemRandom::new().fill(&mut id_bytes)?;
+    argmin_crypto::random::fill(&mut id_bytes)?;
 
     let mut encoded = String::with_capacity(prefix.len() + id_bytes.len() * 2);
     encoded.push_str(prefix);

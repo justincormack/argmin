@@ -78,9 +78,11 @@ trait SessionCredentialRandomSource {
     fn fill(&self, output: &mut [u8]) -> Result<(), SessionCredentialGenerationError>;
 }
 
-impl SessionCredentialRandomSource for ring::rand::SystemRandom {
+struct SystemRandom;
+
+impl SessionCredentialRandomSource for SystemRandom {
     fn fill(&self, output: &mut [u8]) -> Result<(), SessionCredentialGenerationError> {
-        ring::rand::SecureRandom::fill(self, output)
+        argmin_crypto::random::fill(output)
             .map_err(|_| SessionCredentialGenerationError::EntropyUnavailable)
     }
 }
@@ -88,7 +90,7 @@ impl SessionCredentialRandomSource for ring::rand::SystemRandom {
 /// Generate an Argmin-namespaced session access key and a 240-bit secret key.
 pub fn generate_session_credential_material(
 ) -> Result<GeneratedSessionCredentialMaterial, SessionCredentialGenerationError> {
-    generate_session_credential_material_with(&ring::rand::SystemRandom::new())
+    generate_session_credential_material_with(&SystemRandom)
 }
 
 fn generate_session_credential_material_with(

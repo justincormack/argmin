@@ -16,6 +16,7 @@ use crate::{
     MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SIGNED_HEADERS_LEN,
     MAX_SIGNED_HEADER_COUNT,
 };
+#[cfg(test)]
 use ring::hmac;
 
 const TRACE_TARGET: &str = "auth";
@@ -832,10 +833,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         credential.region,
         credential.service,
     );
-    let expected_sig = hmac::sign(
-        &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
-        sts.as_bytes(),
-    );
+    let expected_sig = argmin_crypto::hmac::sha256(signing_key.as_ref(), sts.as_bytes());
     // Constant-time comparison to prevent timing attacks on signature values.
     let expected_hex = hex_encode_lower(expected_sig.as_ref());
     if !crate::constant_time_eq(expected_hex.as_bytes(), signature.as_bytes()) {

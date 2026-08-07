@@ -45,6 +45,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "argmin-crypto"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "ring",
+]
+
+[[package]]
 name = "argmin-s3"
 version = "0.1.0"
 dependencies = [
@@ -76,6 +84,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "auth"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
@@ -537,9 +546,9 @@ dependencies = [
 name = "checksum"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "md-5 0.10.6",
  "proptest",
- "ring",
  "twox-hash",
 ]
 
@@ -2296,6 +2305,7 @@ dependencies = [
 name = "server-core"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "auth",
  "base64",
  "checksum",
@@ -2315,6 +2325,7 @@ dependencies = [
 name = "server-http"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "auth",
  "base64",
  "bytes",
@@ -2449,6 +2460,7 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "storage"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "checksum",
  "ec",
  "futures-util",
@@ -2458,7 +2470,6 @@ dependencies = [
  "placement",
  "proptest",
  "rapidhash",
- "ring",
  "rusqlite",
  "rustls",
  "s3-types",

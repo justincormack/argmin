@@ -1,0 +1,17 @@
+[package]
+name = "argmin-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[lints.clippy]
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[features]
+bench-select = []
+
+[dependencies]
+ring = "0.17"
+
+[dev-dependencies]
+proptest = "1"

@@ -1,5 +1,5 @@
 /// SigV4 signature verification.
-use ring::hmac;
+use argmin_crypto::hmac;
 
 use crate::canonical::{
     amz_date_matches_date_stamp, canonical_headers, canonical_query_string, canonical_request,
@@ -149,12 +149,7 @@ where
 ///
 /// SigningKey = HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(HMAC-SHA256(
 ///     "AWS4" + secret, date), region), service), "aws4_request")
-pub fn derive_signing_key(
-    secret: &SecretKey,
-    date: &str,
-    region: &str,
-    service: &str,
-) -> hmac::Tag {
+pub fn derive_signing_key(secret: &SecretKey, date: &str, region: &str, service: &str) -> [u8; 32] {
     let k_secret = format!("AWS4{}", secret.as_str());
     let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(k_date.as_ref(), region.as_bytes());
@@ -287,9 +282,8 @@ pub(crate) fn verify_request_credential<H: HeaderSource + ?Sized>(
     Ok(creq)
 }
 
-pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
-    let k = hmac::Key::new(hmac::HMAC_SHA256, key);
-    hmac::sign(&k, data)
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+    hmac::sha256(key, data)
 }
 
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {

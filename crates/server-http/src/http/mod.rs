@@ -91,18 +91,13 @@ fn should_dump_panic_on_500_flight_recorder() -> bool {
 }
 
 pub(crate) fn new_request_trace_context() -> observability::TraceContext {
-    use ring::rand::SecureRandom;
-
-    let rng = ring::rand::SystemRandom::new();
     let mut trace_bytes = [0u8; 16];
-    rng.fill(&mut trace_bytes)
-        .expect("system randomness is available");
+    argmin_crypto::random::fill(&mut trace_bytes).expect("system randomness is available");
 
     let mut request_id = String::with_capacity(16);
     let mut random_bytes = [0u8; 32];
     while request_id.len() < 16 {
-        rng.fill(&mut random_bytes)
-            .expect("system randomness is available");
+        argmin_crypto::random::fill(&mut random_bytes).expect("system randomness is available");
         for byte in random_bytes {
             if byte < 252 {
                 request_id.push(REQUEST_ID_ALPHABET[(byte % 36) as usize] as char);
@@ -128,12 +123,9 @@ pub(crate) fn new_request_trace_context() -> observability::TraceContext {
 #[must_use]
 pub fn new_host_id() -> String {
     use base64::Engine as _;
-    use ring::rand::SecureRandom;
 
-    let rng = ring::rand::SystemRandom::new();
     let mut bytes = [0u8; 32];
-    rng.fill(&mut bytes)
-        .expect("system randomness is available");
+    argmin_crypto::random::fill(&mut bytes).expect("system randomness is available");
     base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
 }
 
@@ -517,14 +509,11 @@ fn ensure_lifecycle_rule_ids(
 
 fn generate_lifecycle_rule_id() -> Result<String, ServerError> {
     use base64::Engine;
-    use ring::rand::SecureRandom;
 
     let mut bytes = [0u8; 16];
-    let rng = ring::rand::SystemRandom::new();
-    rng.fill(&mut bytes)
-        .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate lifecycle rule ID".to_string(),
-        })?;
+    argmin_crypto::random::fill(&mut bytes).map_err(|_| ServerError::InternalError {
+        reason: "failed to generate lifecycle rule ID".to_string(),
+    })?;
 
     // Format as UUIDv4, then base64-encode the textual UUID without padding.
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

@@ -4,8 +4,6 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use ring::rand::SecureRandom as _;
-
 use crate::cluster::{
     DurablePlacedSegmentShardRepairEnqueueSummary, MetadataCommandCheckpointScanCursor,
     PlacedSegmentShardBackfillCandidateEnqueueSummary,
@@ -1469,8 +1467,7 @@ fn random_storage_worker_identity() -> Result<String, std::io::Error> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let mut bytes = [0u8; 16];
-    ring::rand::SystemRandom::new()
-        .fill(&mut bytes)
+    argmin_crypto::random::fill(&mut bytes)
         .map_err(|_| std::io::Error::other("secure random generation failed"))?;
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {

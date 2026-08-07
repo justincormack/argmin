@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 
 use checksum::{ChecksumAlgorithm, ChecksumHasher};
 use placement::NodeId;
-use ring::rand::SecureRandom as _;
 use rustls::pki_types::ServerName;
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
@@ -197,16 +196,14 @@ impl ControlPlaneAuthorityClockCheckpointBinding {
 
     fn generate_single_authority() -> Result<Self, ControlPlaneError> {
         let mut binding = [0u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
-        ring::rand::SystemRandom::new()
-            .fill(&mut binding)
-            .map_err(|_| {
-                ControlPlaneError::io(
-                    "generate single-authority control-plane durable identity",
-                    std::io::Error::other(
-                        "secure random source failed while generating control-plane identity",
-                    ),
-                )
-            })?;
+        argmin_crypto::random::fill(&mut binding).map_err(|_| {
+            ControlPlaneError::io(
+                "generate single-authority control-plane durable identity",
+                std::io::Error::other(
+                    "secure random source failed while generating control-plane identity",
+                ),
+            )
+        })?;
         Ok(Self(binding))
     }
 }

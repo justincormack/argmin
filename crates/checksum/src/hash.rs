@@ -10,9 +10,9 @@ pub enum ChecksumHasher {
     Crc32c(crate::crc32c::Hasher),
     Crc64(crate::crc64::Hasher),
     Md5(md5_legacy::Md5),
-    Sha1(ring::digest::Context),
+    Sha1(argmin_crypto::digest::Sha1),
     Sha256(crate::sha256::Sha256),
-    Sha512(ring::digest::Context),
+    Sha512(argmin_crypto::digest::Sha512),
     XxHash64(twox_hash::XxHash64),
     XxHash3(twox_hash::XxHash3_64),
     XxHash128(twox_hash::XxHash3_128),
@@ -26,13 +26,9 @@ impl ChecksumHasher {
             ChecksumAlgorithm::Crc32c => Self::Crc32c(crate::crc32c::Hasher::new()),
             ChecksumAlgorithm::Crc64nvme => Self::Crc64(crate::crc64::Hasher::new()),
             ChecksumAlgorithm::Md5 => Self::Md5(md5_legacy::Md5::new()),
-            ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
-                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-            )),
+            ChecksumAlgorithm::Sha1 => Self::Sha1(argmin_crypto::digest::Sha1::new()),
             ChecksumAlgorithm::Sha256 => Self::Sha256(crate::sha256::Sha256::new()),
-            ChecksumAlgorithm::Sha512 => {
-                Self::Sha512(ring::digest::Context::new(&ring::digest::SHA512))
-            }
+            ChecksumAlgorithm::Sha512 => Self::Sha512(argmin_crypto::digest::Sha512::new()),
             ChecksumAlgorithm::XxHash64 => Self::XxHash64(twox_hash::XxHash64::with_seed(0)),
             ChecksumAlgorithm::XxHash3 => Self::XxHash3(twox_hash::XxHash3_64::new()),
             ChecksumAlgorithm::XxHash128 => Self::XxHash128(twox_hash::XxHash3_128::new()),
@@ -61,10 +57,9 @@ impl ChecksumHasher {
             Self::Crc32c(hasher) => hasher.update(data),
             Self::Crc64(hasher) => hasher.update(data),
             Self::Md5(hasher) => hasher.update(data),
-            Self::Sha1(hasher) | Self::Sha512(hasher) => {
-                hasher.update(data);
-            }
+            Self::Sha1(hasher) => hasher.update(data),
             Self::Sha256(hasher) => hasher.update(data),
+            Self::Sha512(hasher) => hasher.update(data),
             Self::XxHash64(hasher) => hasher.write(data),
             Self::XxHash3(hasher) => hasher.write(data),
             Self::XxHash128(hasher) => hasher.write(data),
@@ -85,13 +80,9 @@ impl ChecksumHasher {
                 hasher.finalize().to_be_bytes(),
             ),
             Self::Md5(hasher) => RawChecksum::new(ChecksumAlgorithm::Md5, hasher.finalize()),
-            Self::Sha1(hasher) => {
-                RawChecksum::new(ChecksumAlgorithm::Sha1, hasher.finish().as_ref())
-            }
+            Self::Sha1(hasher) => RawChecksum::new(ChecksumAlgorithm::Sha1, hasher.finalize()),
             Self::Sha256(hasher) => RawChecksum::new(ChecksumAlgorithm::Sha256, hasher.finalize()),
-            Self::Sha512(hasher) => {
-                RawChecksum::new(ChecksumAlgorithm::Sha512, hasher.finish().as_ref())
-            }
+            Self::Sha512(hasher) => RawChecksum::new(ChecksumAlgorithm::Sha512, hasher.finalize()),
             Self::XxHash64(hasher) => {
                 RawChecksum::new(ChecksumAlgorithm::XxHash64, hasher.finish().to_be_bytes())
             }

@@ -9,6 +9,7 @@ openssl-tls = ["tls-provider/openssl"]
 test-hooks = []
 
 [dependencies]
+argmin-crypto = { path = "../crypto" }
 checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
 futures-util = "0.3"
@@ -18,7 +19,6 @@ openraft = { version = "=0.10.0-alpha.30", default-features = false, features = 
 placement = { path = "../placement" }
 s3-types = { path = "../s3-types" }
 rapidhash = "4.4"
-ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 rusqlite = { version = "0.33", features = ["bundled", "functions", "trace"] }
 thiserror = "2"

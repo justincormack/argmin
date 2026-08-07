@@ -1,6 +1,6 @@
 /// Core types for the storage layer.
 use crate::error::StoreError;
-use ring::{hmac, rand::SecureRandom as _};
+use argmin_crypto::hmac::Sha256Key;
 use std::{num::NonZeroU64, str::FromStr};
 
 pub use checksum::{
@@ -378,8 +378,7 @@ impl MultipartUploadIdKey {
 
     pub(crate) fn generate() -> Result<Self, String> {
         let mut bytes = [0u8; MULTIPART_UPLOAD_ID_KEY_LEN];
-        ring::rand::SystemRandom::new()
-            .fill(&mut bytes)
+        argmin_crypto::random::fill(&mut bytes)
             .map_err(|_| "failed to generate multipart upload ID key".to_string())?;
         Ok(Self(bytes))
     }
@@ -399,8 +398,7 @@ impl MultipartUploadIdKey {
         initiator_principal: &str,
     ) -> Result<UploadId, String> {
         let mut random = [0u8; Self::NONCE_LEN];
-        ring::rand::SystemRandom::new()
-            .fill(&mut random)
+        argmin_crypto::random::fill(&mut random)
             .map_err(|_| "failed to generate multipart upload ID".to_string())?;
         let nonce: String = random
             .iter()
@@ -461,17 +459,14 @@ impl MultipartUploadIdKey {
         nonce: &[u8],
         initiator_claim: &[u8; 16],
     ) -> UploadId {
-        let tag = hmac::sign(
-            &hmac::Key::new(hmac::HMAC_SHA256, &self.0),
-            &multipart_upload_id_covered_bytes(
-                bucket,
-                key,
-                cluster_epoch,
-                log_index,
-                nonce,
-                initiator_claim,
-            ),
-        );
+        let tag = Sha256Key::new(&self.0).sign(&multipart_upload_id_covered_bytes(
+            bucket,
+            key,
+            cluster_epoch,
+            log_index,
+            nonce,
+            initiator_claim,
+        ));
         let mut encoded = String::with_capacity(UPLOAD_ID_LEN);
         use std::fmt::Write as _;
         write!(&mut encoded, "{cluster_epoch:016x}{log_index:016x}")
@@ -485,7 +480,7 @@ impl MultipartUploadIdKey {
             write!(&mut encoded, "{byte:02x}")
                 .expect("writing multipart upload ID into String cannot fail");
         }
-        for byte in &tag.as_ref()[..Self::AUTH_TAG_LEN] {
+        for byte in &tag[..Self::AUTH_TAG_LEN] {
             use std::fmt::Write as _;
             write!(&mut encoded, "{byte:02x}")
                 .expect("writing multipart upload ID into String cannot fail");
@@ -514,24 +509,19 @@ impl MultipartUploadIdKey {
         else {
             return false;
         };
-        let root_key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
-        let expected = hmac::sign(
-            &root_key,
-            &multipart_upload_id_covered_bytes(
-                bucket,
-                key,
-                cluster_epoch,
-                log_index,
-                nonce.as_bytes(),
-                &initiator_claim,
-            ),
-        );
-        let comparison_key_bytes =
-            hmac::sign(&root_key, b"argmin multipart upload id tag comparison v1\0");
-        let comparison_key = hmac::Key::new(hmac::HMAC_SHA256, comparison_key_bytes.as_ref());
-        let expected_comparison_tag =
-            hmac::sign(&comparison_key, &expected.as_ref()[..Self::AUTH_TAG_LEN]);
-        hmac::verify(&comparison_key, &tag, expected_comparison_tag.as_ref()).is_ok()
+        let root_key = Sha256Key::new(&self.0);
+        let expected = root_key.sign(&multipart_upload_id_covered_bytes(
+            bucket,
+            key,
+            cluster_epoch,
+            log_index,
+            nonce.as_bytes(),
+            &initiator_claim,
+        ));
+        let comparison_key_bytes = root_key.sign(b"argmin multipart upload id tag comparison v1\0");
+        let comparison_key = Sha256Key::new(&comparison_key_bytes);
+        let expected_comparison_tag = comparison_key.sign(&expected[..Self::AUTH_TAG_LEN]);
+        comparison_key.verify(&tag, &expected_comparison_tag)
     }
 
     pub(crate) fn was_issued_for_principal(
@@ -546,29 +536,26 @@ impl MultipartUploadIdKey {
             return false;
         };
         let expected = self.initiator_claim(initiator_principal);
-        // `ring` only exposes constant-time verification for full HMAC tags. Compare the
-        // fixed-size truncated claims by MACing both with a domain-separated derived key,
-        // then asking `ring` to verify the full tag.
-        let root_key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
-        let comparison_key_bytes = hmac::sign(
-            &root_key,
-            b"argmin multipart upload initiator claim comparison v1\0",
-        );
-        let comparison_key = hmac::Key::new(hmac::HMAC_SHA256, comparison_key_bytes.as_ref());
-        let claim_tag = hmac::sign(&comparison_key, &claim);
-        hmac::verify(&comparison_key, &expected, claim_tag.as_ref()).is_ok()
+        // Compare the fixed-size truncated claims by MACing both with a
+        // domain-separated derived key, then verifying the full tag.
+        let root_key = Sha256Key::new(&self.0);
+        let comparison_key_bytes =
+            root_key.sign(b"argmin multipart upload initiator claim comparison v1\0");
+        let comparison_key = Sha256Key::new(&comparison_key_bytes);
+        let claim_tag = comparison_key.sign(&claim);
+        comparison_key.verify(&expected, &claim_tag)
     }
 
     fn initiator_claim(&self, initiator_principal: &str) -> [u8; 16] {
         const DOMAIN: &[u8] = b"argmin multipart upload initiator v1\0";
-        let key = hmac::Key::new(hmac::HMAC_SHA256, &self.0);
-        let mut context = hmac::Context::with_key(&key);
+        let key = Sha256Key::new(&self.0);
+        let mut context = key.context();
         context.update(DOMAIN);
         context.update(&(initiator_principal.len() as u32).to_be_bytes());
         context.update(initiator_principal.as_bytes());
-        let tag = context.sign();
+        let tag = context.finalize();
         let mut claim = [0u8; 16];
-        claim.copy_from_slice(&tag.as_ref()[..16]);
+        claim.copy_from_slice(&tag[..16]);
         claim
     }
 }

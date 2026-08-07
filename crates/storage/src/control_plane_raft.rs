@@ -50,7 +50,6 @@ use openraft::ServerState;
 use openraft::StoredMembership;
 use openraft::{AnyError, Config, SnapshotPolicy};
 use placement::NodeId;
-use ring::rand::SecureRandom as _;
 use rustls::pki_types::ServerName;
 use rustls::sign::CertifiedKey;
 use thiserror::Error;
@@ -2760,14 +2759,12 @@ struct ControlPlaneRaftAuthorityInstanceId([u8; CONTROL_PLANE_RAFT_AUTHORITY_INS
 impl ControlPlaneRaftAuthorityInstanceId {
     fn generate() -> Result<Self, ControlPlaneError> {
         let mut bytes = [0u8; CONTROL_PLANE_RAFT_AUTHORITY_INSTANCE_ID_LEN];
-        ring::rand::SystemRandom::new()
-            .fill(&mut bytes)
-            .map_err(|_| {
-                ControlPlaneError::io(
-                    "generate process-local Raft authority identity",
-                    std::io::Error::other("secure random generation failed"),
-                )
-            })?;
+        argmin_crypto::random::fill(&mut bytes).map_err(|_| {
+            ControlPlaneError::io(
+                "generate process-local Raft authority identity",
+                std::io::Error::other("secure random generation failed"),
+            )
+        })?;
         Ok(Self(bytes))
     }
 }

@@ -1,6 +1,9 @@
 use std::fmt;
 
-use ring::{aead, hmac, rand::SecureRandom};
+use argmin_crypto::aead::Aes256GcmKey;
+use argmin_crypto::hmac::Sha256Key;
+#[cfg(test)]
+use ring::aead;
 #[cfg(test)]
 use storage::SSE_S3_CHECKSUM_NONCE_LEN;
 use storage::{
@@ -139,8 +142,8 @@ impl SseCustomerValidatorConfig {
         })
     }
 
-    fn hmac_key(&self) -> hmac::Key {
-        hmac::Key::new(hmac::HMAC_SHA256, &self.validator_key)
+    fn hmac_key(&self) -> Sha256Key {
+        Sha256Key::new(&self.validator_key)
     }
 }
 
@@ -422,30 +425,25 @@ pub fn prepare_sse_customer_write(
     validator: &SseCustomerValidatorConfig,
     request: &SseCustomerRequest,
 ) -> Result<SseCustomerWriteContext, ServerError> {
-    let rng = ring::rand::SystemRandom::new();
-
     let mut validator_salt = [0u8; SSE_C_VALIDATOR_SALT_LEN];
-    rng.fill(&mut validator_salt)
-        .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate SSE-C validator salt".to_string(),
-        })?;
+    argmin_crypto::random::fill(&mut validator_salt).map_err(|_| ServerError::InternalError {
+        reason: "failed to generate SSE-C validator salt".to_string(),
+    })?;
 
     let validator_hmac = compute_validator_hmac(validator, &validator_salt, request.customer_key());
 
     let mut wrap_salt = [0u8; SSE_C_WRAP_SALT_LEN];
-    rng.fill(&mut wrap_salt)
-        .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate SSE-C wrap salt".to_string(),
-        })?;
+    argmin_crypto::random::fill(&mut wrap_salt).map_err(|_| ServerError::InternalError {
+        reason: "failed to generate SSE-C wrap salt".to_string(),
+    })?;
 
     let mut wrap_nonce = [0u8; SSE_C_WRAP_NONCE_LEN];
-    rng.fill(&mut wrap_nonce)
-        .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate SSE-C wrap nonce".to_string(),
-        })?;
+    argmin_crypto::random::fill(&mut wrap_nonce).map_err(|_| ServerError::InternalError {
+        reason: "failed to generate SSE-C wrap nonce".to_string(),
+    })?;
 
     let mut dek = [0u8; SSE_C_DEK_LEN];
-    rng.fill(&mut dek).map_err(|_| ServerError::InternalError {
+    argmin_crypto::random::fill(&mut dek).map_err(|_| ServerError::InternalError {
         reason: "failed to generate SSE-C object DEK".to_string(),
     })?;
 
@@ -453,10 +451,11 @@ pub fn prepare_sse_customer_write(
     let wrapped_dek = wrap_managed_dek(&kek, &wrap_nonce, &dek, SSE_C_WRAP_AAD, "SSE-C")?;
 
     let mut segment_nonce_prefix = [0u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
-    rng.fill(&mut segment_nonce_prefix)
-        .map_err(|_| ServerError::InternalError {
+    argmin_crypto::random::fill(&mut segment_nonce_prefix).map_err(|_| {
+        ServerError::InternalError {
             reason: "failed to generate SSE-C segment nonce prefix".to_string(),
-        })?;
+        }
+    })?;
 
     Ok(SseCustomerWriteContext {
         request: request.clone(),
@@ -515,17 +514,15 @@ pub fn validate_sse_customer_read(
 pub fn prepare_managed_encryption_write(
     provider: &impl ManagedKeyProvider,
 ) -> Result<ManagedEncryptionWriteContext, ServerError> {
-    let rng = ring::rand::SystemRandom::new();
     let wrapping_key = provider.active_key();
 
     let mut wrap_nonce = [0u8; SSE_S3_WRAP_NONCE_LEN];
-    rng.fill(&mut wrap_nonce)
-        .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate managed wrap nonce".to_string(),
-        })?;
+    argmin_crypto::random::fill(&mut wrap_nonce).map_err(|_| ServerError::InternalError {
+        reason: "failed to generate managed wrap nonce".to_string(),
+    })?;
 
     let mut dek = [0u8; SSE_C_DEK_LEN];
-    rng.fill(&mut dek).map_err(|_| ServerError::InternalError {
+    argmin_crypto::random::fill(&mut dek).map_err(|_| ServerError::InternalError {
         reason: "failed to generate managed object DEK".to_string(),
     })?;
 
@@ -538,10 +535,11 @@ pub fn prepare_managed_encryption_write(
     )?;
 
     let mut segment_nonce_prefix = [0u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
-    rng.fill(&mut segment_nonce_prefix)
-        .map_err(|_| ServerError::InternalError {
+    argmin_crypto::random::fill(&mut segment_nonce_prefix).map_err(|_| {
+        ServerError::InternalError {
             reason: "failed to generate managed segment nonce prefix".to_string(),
-        })?;
+        }
+    })?;
 
     Ok(ManagedEncryptionWriteContext {
         encryption: ObjectEncryption::SseS3(SseS3ObjectState::new(
@@ -736,28 +734,18 @@ fn compute_validator_hmac(
     let mut msg = [0u8; SSE_C_VALIDATOR_SALT_LEN + SSE_C_CUSTOMER_KEY_LEN];
     msg[..SSE_C_VALIDATOR_SALT_LEN].copy_from_slice(validator_salt);
     msg[SSE_C_VALIDATOR_SALT_LEN..].copy_from_slice(customer_key);
-    let tag = hmac::sign(&key, &msg);
-    tag.as_ref()
-        .try_into()
-        .expect("HMAC-SHA256 output length should be 32 bytes")
+    key.sign(&msg)
 }
 
 fn derive_wrap_key(
     customer_key: &[u8; SSE_C_CUSTOMER_KEY_LEN],
     wrap_salt: &[u8; SSE_C_WRAP_SALT_LEN],
 ) -> Result<[u8; 32], ServerError> {
-    let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, wrap_salt);
-    let prk = salt.extract(customer_key);
-    let okm =
-        prk.expand(&[SSE_C_HKDF_INFO], Aes256GcmLen)
-            .map_err(|_| ServerError::InternalError {
-                reason: "failed to derive SSE-C wrapping key".to_string(),
-            })?;
-    let mut out = [0u8; 32];
-    okm.fill(&mut out).map_err(|_| ServerError::InternalError {
-        reason: "failed to fill SSE-C wrapping key".to_string(),
-    })?;
-    Ok(out)
+    argmin_crypto::hkdf::sha256(wrap_salt, customer_key, SSE_C_HKDF_INFO).map_err(|_| {
+        ServerError::InternalError {
+            reason: "failed to derive SSE-C wrapping key".to_string(),
+        }
+    })
 }
 
 fn wrap_managed_dek(
@@ -767,18 +755,12 @@ fn wrap_managed_dek(
     wrap_aad: &[u8],
     label: &str,
 ) -> Result<[u8; SSE_C_WRAPPED_DEK_LEN], ServerError> {
-    let unbound =
-        aead::UnboundKey::new(&aead::AES_256_GCM, kek).map_err(|_| ServerError::InternalError {
-            reason: format!("failed to create {label} wrapping key"),
-        })?;
-    let sealing_key = aead::LessSafeKey::new(unbound);
+    let sealing_key = Aes256GcmKey::new(kek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} wrapping key"),
+    })?;
     let mut buf = dek.to_vec();
     sealing_key
-        .seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(*wrap_nonce),
-            aead::Aad::from(wrap_aad),
-            &mut buf,
-        )
+        .seal_in_place_append_tag(*wrap_nonce, wrap_aad, &mut buf)
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to wrap {label} DEK"),
         })?;
@@ -794,18 +776,12 @@ fn unwrap_managed_dek(
     wrap_aad: &[u8],
     label: &str,
 ) -> Result<[u8; SSE_C_DEK_LEN], ServerError> {
-    let unbound =
-        aead::UnboundKey::new(&aead::AES_256_GCM, kek).map_err(|_| ServerError::InternalError {
-            reason: format!("failed to create {label} unwrap key"),
-        })?;
-    let opening_key = aead::LessSafeKey::new(unbound);
+    let opening_key = Aes256GcmKey::new(kek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} unwrap key"),
+    })?;
     let mut buf = wrapped_dek.to_vec();
     let plaintext = opening_key
-        .open_in_place(
-            aead::Nonce::assume_unique_for_key(*wrap_nonce),
-            aead::Aad::from(wrap_aad),
-            &mut buf,
-        )
+        .open_in_place(*wrap_nonce, wrap_aad, &mut buf)
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to unwrap {label} DEK"),
         })?;
@@ -844,16 +820,14 @@ fn encrypt_segment_with_dek_and_prefix(
     plaintext: &[u8],
     descriptor: AeadDescriptor<'_>,
 ) -> Result<Vec<u8>, ServerError> {
-    let unbound =
-        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: format!("failed to create {} segment sealing key", descriptor.label),
-        })?;
-    let sealing_key = aead::LessSafeKey::new(unbound);
+    let sealing_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {} segment sealing key", descriptor.label),
+    })?;
     let mut buf = plaintext.to_vec();
     sealing_key
         .seal_in_place_append_tag(
             segment_nonce(segment_nonce_prefix, segment_scope, segment_index),
-            aead::Aad::from(descriptor.aad),
+            descriptor.aad,
             &mut buf,
         )
         .map_err(|_| ServerError::InternalError {
@@ -871,16 +845,14 @@ fn decrypt_segment_with_dek_and_prefix(
     plaintext_len: usize,
     descriptor: AeadDescriptor<'_>,
 ) -> Result<Vec<u8>, ServerError> {
-    let unbound =
-        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: format!("failed to create {} segment opening key", descriptor.label),
-        })?;
-    let opening_key = aead::LessSafeKey::new(unbound);
+    let opening_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {} segment opening key", descriptor.label),
+    })?;
     let mut buf = ciphertext.to_vec();
     let plaintext = opening_key
         .open_in_place(
             segment_nonce(segment_nonce_prefix, segment_scope, segment_index),
-            aead::Aad::from(descriptor.aad),
+            descriptor.aad,
             &mut buf,
         )
         .map_err(|_| ServerError::InternalError {
@@ -903,14 +875,14 @@ fn segment_nonce(
     segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
-) -> aead::Nonce {
+) -> [u8; 12] {
     let mut nonce = [0u8; 12];
     nonce[..SSE_C_SEGMENT_NONCE_PREFIX_LEN].copy_from_slice(segment_nonce_prefix);
     let scope_start = SSE_C_SEGMENT_NONCE_PREFIX_LEN;
     let scope_end = scope_start + SSE_C_SEGMENT_NONCE_SCOPE_LEN;
     nonce[scope_start..scope_end].copy_from_slice(&segment_scope.encode());
     nonce[scope_end..].copy_from_slice(&segment_index.to_be_bytes());
-    aead::Nonce::assume_unique_for_key(nonce)
+    nonce
 }
 
 fn encode_checksum_metadata(checksum: &ObjectChecksumMetadata) -> Result<Vec<u8>, ServerError> {
@@ -977,24 +949,16 @@ fn encrypt_checksum_with_dek(
     let Some(checksum) = checksum else {
         return Ok(([0u8; SSE_C_CHECKSUM_NONCE_LEN], Vec::new()));
     };
-    let unbound =
-        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: format!("failed to create {label} checksum sealing key"),
-        })?;
-    let sealing_key = aead::LessSafeKey::new(unbound);
-    let rng = ring::rand::SystemRandom::new();
+    let sealing_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} checksum sealing key"),
+    })?;
     let mut nonce = [0u8; SSE_C_CHECKSUM_NONCE_LEN];
-    rng.fill(&mut nonce)
-        .map_err(|_| ServerError::InternalError {
-            reason: format!("failed to generate {label} checksum nonce"),
-        })?;
+    argmin_crypto::random::fill(&mut nonce).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to generate {label} checksum nonce"),
+    })?;
     let mut buf = encode_checksum_metadata(checksum)?;
     sealing_key
-        .seal_in_place_append_tag(
-            aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(aad),
-            &mut buf,
-        )
+        .seal_in_place_append_tag(nonce, aad, &mut buf)
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to encrypt {label} checksum metadata"),
         })?;
@@ -1011,30 +975,16 @@ fn decrypt_checksum_with_dek(
     if encrypted_checksum_metadata.is_empty() {
         return Ok(None);
     }
-    let unbound =
-        aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: format!("failed to create {label} checksum opening key"),
-        })?;
-    let opening_key = aead::LessSafeKey::new(unbound);
+    let opening_key = Aes256GcmKey::new(dek).map_err(|_| ServerError::InternalError {
+        reason: format!("failed to create {label} checksum opening key"),
+    })?;
     let mut buf = encrypted_checksum_metadata.to_vec();
     let plaintext = opening_key
-        .open_in_place(
-            aead::Nonce::assume_unique_for_key(*checksum_nonce),
-            aead::Aad::from(aad),
-            &mut buf,
-        )
+        .open_in_place(*checksum_nonce, aad, &mut buf)
         .map_err(|_| ServerError::InternalError {
             reason: format!("failed to decrypt {label} checksum metadata"),
         })?;
     Ok(Some(decode_checksum_metadata(plaintext)?))
-}
-
-struct Aes256GcmLen;
-
-impl ring::hkdf::KeyType for Aes256GcmLen {
-    fn len(&self) -> usize {
-        32
-    }
 }
 
 #[cfg(test)]

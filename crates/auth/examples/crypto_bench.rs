@@ -7,7 +7,6 @@ use auth::{
     authenticate_request, CredentialStore, ExpectedSigningRegion, IdentityProvider, SecretKey,
     SigningService,
 };
-use ring::hmac;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection};
@@ -60,7 +59,7 @@ fn main() -> Result<(), String> {
     let (provider, request) = signed_request()?;
 
     println!("tls_crypto_provider={}", tls_provider::provider_name());
-    println!("hmac_provider=ring");
+    println!("hmac_provider=argmin-crypto");
     println!(
         "sha256_backend_override={}",
         std::env::var("ARGMIN_SHA256_BENCH_BACKEND").unwrap_or_else(|_| "auto".to_string())
@@ -245,13 +244,10 @@ fn signed_request() -> Result<(IdentityProvider, SignedRequest), String> {
         &auth::canonical::sha256_hex(canonical_request.as_bytes()),
     );
     let signing_key = auth::sigv4::derive_signing_key(&secret, DATE, REGION, SERVICE);
-    let signature = hex_lower(
-        hmac::sign(
-            &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
-            string_to_sign.as_bytes(),
-        )
-        .as_ref(),
-    );
+    let signature = hex_lower(&argmin_crypto::hmac::sha256(
+        signing_key.as_ref(),
+        string_to_sign.as_bytes(),
+    ));
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={ACCESS_KEY_ID}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     );

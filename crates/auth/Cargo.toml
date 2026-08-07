@@ -13,10 +13,10 @@ deep-tracing = ["observability/deep-tracing"]
 openssl-tls = ["crypto-bench", "tls-provider/openssl"]
 
 [dependencies]
+argmin-crypto = { path = "../crypto" }
 base64 = "0.22"
 checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
-ring = "0.17"
 serde_json = "1"
 s3-types = { path = "../s3-types" }
 subtle = "2"
@@ -28,4 +28,5 @@ aws-credential-types = "1"
 aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 proptest = "1"
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -118,12 +118,9 @@ impl Coordinator {
     pub(super) fn random_session_id(error_reason: &'static str) -> Result<SessionId, ServerError> {
         const HEX: &[u8; 16] = b"0123456789abcdef";
 
-        let rng = ring::rand::SystemRandom::new();
         let mut id_bytes = [0u8; 16];
-        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
-            ServerError::InternalError {
-                reason: error_reason.to_string(),
-            }
+        argmin_crypto::random::fill(&mut id_bytes).map_err(|_| ServerError::InternalError {
+            reason: error_reason.to_string(),
         })?;
 
         let mut encoded = [0u8; storage::SESSION_ID_LEN];

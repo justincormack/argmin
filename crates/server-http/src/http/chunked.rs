@@ -9,7 +9,9 @@
 /// [trailer-key:trailer-value\r\n]*
 /// \r\n
 /// ```
+use argmin_crypto::hmac::Sha256Key;
 use auth::StreamingSigningContext;
+#[cfg(test)]
 use ring::hmac;
 
 use crate::error::ServerError;
@@ -152,9 +154,9 @@ fn verify_chunk_signature_hash(
         ctx.timestamp, ctx.scope, prev_sig, empty_hash, chunk_hash
     );
 
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &ctx.signing_key);
-    let expected = hmac::sign(&key, string_to_sign.as_bytes());
-    let expected_hex = hex_encode(expected.as_ref());
+    let key = Sha256Key::new(&ctx.signing_key);
+    let expected = key.sign(string_to_sign.as_bytes());
+    let expected_hex = hex_encode(&expected);
 
     if !auth::constant_time_eq(expected_hex.as_bytes(), claimed_sig.as_bytes()) {
         // AWS echoes the chunk string-to-sign and the seed request's
@@ -220,9 +222,9 @@ fn verify_trailer_signature(
         ctx.timestamp, ctx.scope, prev_sig, trailer_hash
     );
 
-    let key = hmac::Key::new(hmac::HMAC_SHA256, &ctx.signing_key);
-    let expected = hmac::sign(&key, string_to_sign.as_bytes());
-    let expected_hex = hex_encode(expected.as_ref());
+    let key = Sha256Key::new(&ctx.signing_key);
+    let expected = key.sign(string_to_sign.as_bytes());
+    let expected_hex = hex_encode(&expected);
 
     if !auth::constant_time_eq(expected_hex.as_bytes(), claimed_sig.as_bytes()) {
         // AWS echoes the chunk string-to-sign and the seed request's

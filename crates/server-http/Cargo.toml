@@ -18,6 +18,7 @@ deep-tracing = [
 ]
 
 [dependencies]
+argmin-crypto = { path = "../crypto" }
 auth = { path = "../auth" }
 checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
@@ -26,7 +27,6 @@ server-core = { path = "../server-core", default-features = false }
 s3-types = { path = "../s3-types" }
 storage = { path = "../storage", default-features = false }
 base64 = "0.22"
-ring = "0.17"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -38,6 +38,7 @@ md5_legacy = { package = "md-5", version = "0.10" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 
 [dev-dependencies]
+ring = "0.17"
 test-util = { path = "../test-util" }
 server-core = { path = "../server-core", default-features = false, features = ["test-utils"] }
 tokio = { version = "1", features = ["test-util"] }

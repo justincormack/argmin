@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+argmin-crypto = { path = "../crypto" }
 auth = { path = "../auth" }
 checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
@@ -12,7 +13,6 @@ storage = { path = "../storage", default-features = false }
 s3-types = { path = "../s3-types" }
 base64 = "0.22"
 rapidhash = "4.4"
-ring = "0.17"
 subtle = "2"
 thiserror = "2"
 
@@ -27,5 +27,6 @@ deep-tracing = [
 
 [dev-dependencies]
 proptest = "1"
+ring = "0.17"
 storage = { path = "../storage", default-features = false, features = ["test-hooks"] }
 test-util = { path = "../test-util" }
