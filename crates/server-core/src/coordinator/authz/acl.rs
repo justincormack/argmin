@@ -192,7 +192,7 @@ impl Coordinator {
         if self.should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = route
                 .try_probe_object_pg_available()
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(super::super::map_object_read_failure)?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before delete_object lookup"
@@ -229,9 +229,9 @@ impl Coordinator {
                         bucket_tags,
                     }),
                     Ok(Err(error)) => Err(error),
-                    Err(storage::ObjectPgActionError::Metadata(
-                        storage::MetadataError::ObjectNotFound,
-                    )) => {
+                    Err(error)
+                        if error.kind() == storage::ObjectReadFailureKind::ObjectNotFound =>
+                    {
                         let allowed = self.requester_can_delete_object_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
@@ -255,7 +255,7 @@ impl Coordinator {
                             bucket_tags,
                         })
                     }
-                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                    Err(other) => Err(super::super::map_object_read_failure(other)),
                 }
             }
             (_, Some(version_id)) => {
@@ -304,9 +304,9 @@ impl Coordinator {
                         bypass_governance,
                     }),
                     Ok(Err(error)) => Err(error),
-                    Err(storage::ObjectPgActionError::Metadata(
-                        storage::MetadataError::ObjectNotFound,
-                    )) => {
+                    Err(error)
+                        if error.kind() == storage::ObjectReadFailureKind::ObjectNotFound =>
+                    {
                         let allowed = self.requester_can_delete_object_version_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
@@ -336,7 +336,7 @@ impl Coordinator {
                         }
                         Ok(AuthorizedDeleteObject::SpecificVersionMissing { version_id })
                     }
-                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                    Err(other) => Err(super::super::map_object_read_failure(other)),
                 }
             }
             (_, None) => {
@@ -369,9 +369,9 @@ impl Coordinator {
                         bucket_tags,
                     }),
                     Ok(Err(error)) => Err(error),
-                    Err(storage::ObjectPgActionError::Metadata(
-                        storage::MetadataError::ObjectNotFound,
-                    )) => {
+                    Err(error)
+                        if error.kind() == storage::ObjectReadFailureKind::ObjectNotFound =>
+                    {
                         let allowed = self.requester_can_delete_object_with_bucket_policy(
                             BucketPolicyAccess {
                                 requester,
@@ -396,7 +396,7 @@ impl Coordinator {
                             bucket_tags,
                         })
                     }
-                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                    Err(other) => Err(super::super::map_object_read_failure(other)),
                 }
             }
         }
@@ -1235,10 +1235,10 @@ impl Coordinator {
         key: &ObjectKey,
         version_id: Option<VersionId>,
         can_discover_missing: bool,
-        error: storage::ObjectPgActionError,
+        error: storage::ObjectReadFailure,
     ) -> ServerError {
-        match error {
-            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound) => {
+        match error.kind() {
+            storage::ObjectReadFailureKind::ObjectNotFound => {
                 if !can_discover_missing {
                     ServerError::AccessDenied
                 } else if let Some(version_id) = version_id {
@@ -1254,7 +1254,12 @@ impl Coordinator {
                     }
                 }
             }
-            other => Self::map_object_pg_action_error(other),
+            storage::ObjectReadFailureKind::ResourceExhausted
+            | storage::ObjectReadFailureKind::MetadataCommandContention
+            | storage::ObjectReadFailureKind::RetryableConvergence
+            | storage::ObjectReadFailureKind::InternalError => {
+                super::super::map_object_read_failure(error)
+            }
         }
     }
 

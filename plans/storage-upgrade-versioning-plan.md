@@ -2072,6 +2072,20 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        impossible-state tests use crate-private owner helpers, cross-crate translation tests use
        owner-provided logical fixtures, and the boundary check rejects raw snapshot-error transit
        or re-export.
+       The object-read authorization sub-slice completed on 2026-08-07. Public admitted object-read
+       capabilities now return opaque `ObjectReadFailure` values whose exhaustive logical kind is
+       limited to object absence, resource exhaustion, metadata-command contention, retryable
+       convergence, or internal failure. Storage owns conversion from object-PG, metadata, route,
+       and payload-retention errors and preserves only a bounded diagnostic category. Missing-object
+       translation remains context-specific in `server-core`, including the AccessDenied,
+       NoSuchKey, and NoSuchVersion distinction, while all other outcomes are matched exhaustively.
+       Internal failures remain typed as `ServerError::ObjectRead`, so HTTP request diagnostics
+       retain the bounded storage category and cause chain without retaining implementation
+       errors. Unused direct unadmitted storage-cluster read helpers were removed and the leased
+       owner-test helper is test-only and crate-private. Cross-crate response tests use owner-provided logical
+       fixtures, and the boundary check rejects raw error return types from every synchronous,
+       leased, and payload-retention read entry point or their reintroduction into the
+       authorization seam.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces

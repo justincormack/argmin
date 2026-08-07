@@ -29,7 +29,9 @@ use crate::control_plane::{
     PgRouteSnapshot, RuntimeMapContentDigest, RuntimeMapFreshnessProof,
 };
 use crate::control_plane_lease::BoundRouteMapLease;
-use crate::error::{ClusterBuildError, PgMetadataTransferError, ShardIoError, StoreError};
+use crate::error::{
+    ClusterBuildError, ObjectReadFailure, PgMetadataTransferError, ShardIoError, StoreError,
+};
 use crate::metadata_command::{
     metadata_command_log_hash, AbortStreamUploadCommand, AppendStreamSegmentCommand,
     BucketPropertyMutation, BucketWriteReservationProof, CommitDirectPutObjectCommand,
@@ -2926,7 +2928,7 @@ impl ActiveObjectReadRoute<'_> {
     pub fn load_object_if<T, E>(
         &self,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
-    ) -> Result<Result<T, E>, ObjectPgActionError> {
+    ) -> Result<Result<T, E>, ObjectReadFailure> {
         let route = ObjectReadMetadataRoute {
             bucket: &self.bucket,
             key: &self.key,
@@ -2937,12 +2939,13 @@ impl ActiveObjectReadRoute<'_> {
         self.admission
             .cluster
             .load_object_if_on_route(&route, action, || self.admission.require_valid_now())
+            .map_err(ObjectReadFailure::from_object_pg_action)
     }
 
     pub fn load_object_read_snapshot_if<T, E>(
         &self,
         action: impl FnMut(&StoredObject) -> Result<T, E>,
-    ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectReadFailure> {
         let route = ObjectReadMetadataRoute {
             bucket: &self.bucket,
             key: &self.key,
@@ -2955,12 +2958,13 @@ impl ActiveObjectReadRoute<'_> {
             .load_object_read_snapshot_if_on_route(&route, action, || {
                 self.admission.require_valid_now()
             })
+            .map_err(ObjectReadFailure::from_object_pg_action)
     }
 
     pub fn load_leased_object_read_snapshot_if<T, E>(
         &self,
         action: impl FnMut(&StoredObject) -> Result<T, E>,
-    ) -> Result<Result<LeasedObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<Result<LeasedObjectReadSnapshotOutcome<T>, E>, ObjectReadFailure> {
         let route = ObjectReadMetadataRoute {
             bucket: &self.bucket,
             key: &self.key,
@@ -2973,7 +2977,8 @@ impl ActiveObjectReadRoute<'_> {
             .cluster
             .load_leased_object_read_snapshot_if_on_route(&route, action, || {
                 self.admission.require_valid_now()
-            })?;
+            })
+            .map_err(ObjectReadFailure::from_object_pg_action)?;
         Ok(outcome.map(|mut outcome| {
             outcome.leased_snapshot.repair_fence = Some(RetainedActiveRouteRepairFence {
                 gate: self.admission._permit.gate.clone(),
@@ -2993,7 +2998,7 @@ impl ActiveObjectReadRoute<'_> {
     pub fn retain_object_payload_read(
         &self,
         leased_snapshot: LeasedObjectReadSnapshot,
-    ) -> Result<Option<RetainedObjectPayloadRead>, StoreError> {
+    ) -> Result<Option<RetainedObjectPayloadRead>, ObjectReadFailure> {
         if !Arc::ptr_eq(&self.admission.cluster, &leased_snapshot.cluster)
             || leased_snapshot.bucket != self.bucket
             || leased_snapshot.key != self.key
@@ -3001,24 +3006,30 @@ impl ActiveObjectReadRoute<'_> {
             || leased_snapshot.snapshot_mode != self.snapshot_mode
             || leased_snapshot.pg_id != self.pg_id
         {
-            return Err(StoreError::PayloadShardSetMismatch {
-                reason: "leased object snapshot provenance does not match active read route"
-                    .to_string(),
-            });
+            return Err(ObjectReadFailure::from_store(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "leased object snapshot provenance does not match active read route"
+                        .to_string(),
+                },
+            ));
         }
         self.admission
             .cluster
             .retain_object_payload_read_from_leased_snapshot(leased_snapshot, || {
                 self.admission.require_valid_now()
             })
+            .map_err(ObjectReadFailure::from_store)
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
-        self.admission.require_valid_now()?;
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectReadFailure> {
+        self.admission
+            .require_valid_now()
+            .map_err(ObjectReadFailure::from_store)?;
         self.admission
             .cluster
             .try_probe_object_pg_available(&self.bucket, &self.key)
+            .map_err(ObjectReadFailure::from_object_pg_action)
     }
 }
 
@@ -7318,7 +7329,8 @@ impl StorageCluster {
         Ok(Some(retained))
     }
 
-    pub fn retain_object_payload_read(
+    #[cfg(test)]
+    pub(crate) fn retain_object_payload_read(
         self: &Arc<Self>,
         leased_snapshot: LeasedObjectReadSnapshot,
     ) -> Result<Option<RetainedObjectPayloadRead>, StoreError> {

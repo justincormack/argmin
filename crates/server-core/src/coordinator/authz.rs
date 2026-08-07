@@ -202,7 +202,7 @@ impl ObjectReadSnapshotRoute<'_> {
     fn load<T, E>(
         &self,
         action: impl FnMut(&StoredObject) -> Result<T, E>,
-    ) -> Result<Result<RoutedObjectReadSnapshotOutcome<T>, E>, storage::ObjectPgActionError> {
+    ) -> Result<Result<RoutedObjectReadSnapshotOutcome<T>, E>, storage::ObjectReadFailure> {
         if self.retain_payload {
             self.route
                 .load_leased_object_read_snapshot_if(action)
@@ -230,7 +230,7 @@ impl ObjectReadSnapshotRoute<'_> {
     }
 
     #[cfg(test)]
-    fn try_probe_object_pg_available(&self) -> Result<bool, storage::ObjectPgActionError> {
+    fn try_probe_object_pg_available(&self) -> Result<bool, storage::ObjectReadFailure> {
         self.route.try_probe_object_pg_available()
     }
 }

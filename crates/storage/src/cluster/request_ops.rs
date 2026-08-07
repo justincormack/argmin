@@ -10166,23 +10166,6 @@ impl super::StorageCluster {
         )
     }
 
-    pub fn load_object_if<T, E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        action: impl FnOnce(&StoredObject) -> Result<T, E>,
-    ) -> Result<Result<T, E>, ObjectPgActionError> {
-        let route = super::ObjectReadMetadataRoute {
-            bucket,
-            key,
-            version_id,
-            snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
-            pg_id: self.object_metadata_pg(bucket, key),
-        };
-        self.load_object_if_on_route(&route, action, || Ok(()))
-    }
-
     pub(super) fn load_object_if_on_route<T, E>(
         &self,
         route: &super::ObjectReadMetadataRoute<'_>,
@@ -10235,7 +10218,7 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn load_object_read_snapshot_if<T, E>(
+    pub(crate) fn load_object_read_snapshot_if<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -10307,7 +10290,8 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn load_leased_object_read_snapshot_if<T, E>(
+    #[cfg(test)]
+    pub(crate) fn load_leased_object_read_snapshot_if<T, E>(
         self: &Arc<Self>,
         bucket: &BucketName,
         key: &ObjectKey,

@@ -689,7 +689,7 @@ impl Coordinator {
         if self.should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = route
                 .try_probe_object_pg_available()
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(super::super::map_object_read_failure)?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before delete_object lookup"
@@ -724,9 +724,9 @@ impl Coordinator {
                         bucket_tags,
                     }),
                     Ok(Err(error)) => Err(error),
-                    Err(storage::ObjectPgActionError::Metadata(
-                        storage::MetadataError::ObjectNotFound,
-                    )) => {
+                    Err(error)
+                        if error.kind() == storage::ObjectReadFailureKind::ObjectNotFound =>
+                    {
                         let allowed = delete_object_authorization_with_bucket_policy(
                             requester,
                             modern_bucket,
@@ -748,7 +748,7 @@ impl Coordinator {
                             bucket_tags,
                         })
                     }
-                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                    Err(other) => Err(super::super::map_object_read_failure(other)),
                 }
             }
             (_, Some(version_id)) => {
@@ -794,9 +794,9 @@ impl Coordinator {
                         bypass_governance,
                     }),
                     Ok(Err(error)) => Err(error),
-                    Err(storage::ObjectPgActionError::Metadata(
-                        storage::MetadataError::ObjectNotFound,
-                    )) => {
+                    Err(error)
+                        if error.kind() == storage::ObjectReadFailureKind::ObjectNotFound =>
+                    {
                         let policy_context =
                             PutObjectPolicyContext::default().with_version_id(Some(version_id));
                         let allowed = delete_object_authorization_with_policy_context(
@@ -825,7 +825,7 @@ impl Coordinator {
                         }
                         Ok(AuthorizedDeleteObject::SpecificVersionMissing { version_id })
                     }
-                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                    Err(other) => Err(super::super::map_object_read_failure(other)),
                 }
             }
             (_, None) => {
@@ -856,9 +856,9 @@ impl Coordinator {
                         bucket_tags,
                     }),
                     Ok(Err(error)) => Err(error),
-                    Err(storage::ObjectPgActionError::Metadata(
-                        storage::MetadataError::ObjectNotFound,
-                    )) => {
+                    Err(error)
+                        if error.kind() == storage::ObjectReadFailureKind::ObjectNotFound =>
+                    {
                         let allowed = delete_object_authorization_with_bucket_policy(
                             requester,
                             modern_bucket,
@@ -881,7 +881,7 @@ impl Coordinator {
                             bucket_tags,
                         })
                     }
-                    Err(other) => Err(Self::map_object_pg_action_error(other)),
+                    Err(other) => Err(super::super::map_object_read_failure(other)),
                 }
             }
         }

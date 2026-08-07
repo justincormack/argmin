@@ -183,6 +183,7 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::Store(_)
         | ServerError::BucketWriteDrain(_)
         | ServerError::BucketSnapshotLoad(_)
+        | ServerError::ObjectRead(_)
         | ServerError::Metadata(_)
         | ServerError::Ec(_)
         | ServerError::MetadataBlobError { .. }
@@ -4971,6 +4972,7 @@ mod tests {
     fn error_response_internal_storage_and_implementation_errors_are_sanitized() {
         let internal_implementation_error =
             server_core::error::test_support::internal_implementation_error_redaction_fixture();
+        let object_read_error = storage::test_support::object_read_failure_diagnostic_fixture();
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
             (
                 ServerError::BucketWriteDrain(
@@ -4987,6 +4989,10 @@ mod tests {
                     ),
                 ),
                 vec!["bucket snapshot load failed"],
+            ),
+            (
+                ServerError::ObjectRead(object_read_error.0),
+                object_read_error.1.to_vec(),
             ),
             (
                 ServerError::Store(

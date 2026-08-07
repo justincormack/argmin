@@ -1,8 +1,8 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
 use storage::error::{
-    BucketSnapshotLoadFailure, BucketWriteDrainFailure, MetadataError, StoreError, StoreFailure,
-    StoreOperationFailureClass,
+    BucketSnapshotLoadFailure, BucketWriteDrainFailure, MetadataError, ObjectReadFailure,
+    StoreError, StoreFailure, StoreOperationFailureClass,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +56,9 @@ pub enum ServerError {
 
     #[error("bucket snapshot load error: {0}")]
     BucketSnapshotLoad(BucketSnapshotLoadFailure),
+
+    #[error("object read error: {0}")]
+    ObjectRead(ObjectReadFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -504,6 +507,7 @@ impl ServerError {
             Self::Store(error) => error.diagnostic_cause_label(),
             Self::BucketWriteDrain(error) => error.diagnostic_cause_label(),
             Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
+            Self::ObjectRead(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -540,6 +544,10 @@ impl ServerError {
             ),
             Self::BucketSnapshotLoad(error) => format!(
                 "server_error>bucket_snapshot_load>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::ObjectRead(error) => format!(
+                "server_error>object_read>{}",
                 error.diagnostic_cause_label()
             ),
             Self::Metadata(error) => format!(
@@ -715,6 +723,7 @@ impl ServerError {
             Self::Store(_) => "InternalError",
             Self::BucketWriteDrain(_) => "InternalError",
             Self::BucketSnapshotLoad(_) => "InternalError",
+            Self::ObjectRead(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }
@@ -1117,6 +1126,15 @@ mod tests {
             snapshot.diagnostic_cause_chain(),
             "server_error>bucket_snapshot_load>metadata_failure"
         );
+
+        let object_read = ServerError::ObjectRead(
+            storage::test_support::object_read_failure_diagnostic_fixture().0,
+        );
+        assert_eq!(object_read.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            object_read.diagnostic_cause_chain(),
+            "server_error>object_read>store_io_failure"
+        );
     }
 
     #[test]
@@ -1509,6 +1527,15 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_object_read() {
+        let err = ServerError::ObjectRead(storage::test_support::object_read_failure_for_kind(
+            storage::ObjectReadFailureKind::InternalError,
+        ));
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
     fn s3_error_code_metadata() {
         let err = ServerError::Metadata(MetadataError::ObjectNotFound);
         assert_eq!(err.s3_error_code(), "InternalError");
@@ -1640,6 +1667,13 @@ mod tests {
                     storage::BucketSnapshotLoadFailureKind::InternalError,
                 ),
             )
+            .http_status(),
+            500
+        );
+        assert_eq!(
+            ServerError::ObjectRead(storage::test_support::object_read_failure_for_kind(
+                storage::ObjectReadFailureKind::InternalError,
+            ))
             .http_status(),
             500
         );

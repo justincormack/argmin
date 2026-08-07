@@ -4345,6 +4345,61 @@ fail_with_matches \
     "BucketSnapshotLoadError is storage-private; callers must use BucketSnapshotLoadFailure and its exhaustive logical kind" \
     "$raw_bucket_snapshot_load_error_transit"
 
+raw_object_read_error_transit=$(
+    {
+        awk '
+        /^impl ActiveObjectReadRoute/ {
+            in_object_read_impl = 1
+            next
+        }
+        /^impl / {
+            in_object_read_impl = 0
+            collecting_signature = 0
+        }
+        in_object_read_impl && /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        in_object_read_impl && collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/cluster.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_object_if|load_object_read_snapshot_if|load_leased_object_read_snapshot_if|retain_object_payload_read)(?s:.{0,500})Result<[^;{]*(ObjectPgActionError|StoreError)' \
+            crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
+            || true
+        rg -n --color=never '\bObjectPgActionError\b|\bMetadataError\b|\bStoreError\b' \
+            crates/server-core/src/coordinator/authz.rs \
+            crates/server-core/src/coordinator/authz/acl.rs \
+            crates/server-core/src/coordinator/authz/modern.rs \
+            || true
+        if ! rg -q -U \
+            'fn map_object_read_snapshot_error(?s:.{0,300})error: storage::ObjectReadFailure' \
+            crates/server-core/src/coordinator/authz/acl.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/authz/acl.rs: object-read response mapping must accept ObjectReadFailure'
+        fi
+    }
+)
+fail_with_matches \
+    "Object-read authorization must cross storage through ObjectReadFailure rather than raw storage implementation errors" \
+    "$raw_object_read_error_transit"
+
 http_storage_debug_representation_leaks=$(
     {
         rg -n --color=never \

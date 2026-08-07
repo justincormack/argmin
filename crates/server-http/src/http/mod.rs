@@ -8223,6 +8223,58 @@ mod tests {
     }
 
     #[test]
+    fn object_read_failure_preserves_storage_diagnostic_in_http_telemetry() {
+        let mut trace = ResponseBodyTrace::new(
+            ResponseTraceMeta::new(
+                observability::TraceContext::from_ids(observability::TraceContextIds {
+                    trace_id: "object-read-diagnostic-trace".to_string(),
+                    request_id: "object-read-diagnostic-request".to_string(),
+                }),
+                Arc::<str>::from("stable-host-id"),
+                "GET",
+                "/bucket/key",
+                "",
+            ),
+            500,
+            0,
+            false,
+        );
+        let (failure, private_fragments) =
+            storage::test_support::object_read_failure_diagnostic_fixture();
+        trace.emit_error(&ServerError::ObjectRead(failure));
+
+        let records = observability::flight_recorder_snapshot();
+        let request_error = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "object-read-diagnostic-request"
+                    && record.event == "request_error"
+            })
+            .expect("object-read failure should record request diagnostics");
+        assert!(request_error
+            .detail
+            .contains("cause_label=store_io_failure"));
+
+        let cause_chain = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "object-read-diagnostic-request"
+                    && record.event == "request_500_cause_chain"
+            })
+            .expect("object-read failure should record its bounded cause chain");
+        assert!(cause_chain.detail.contains("cause_label=store_io_failure"));
+        assert!(cause_chain
+            .detail
+            .contains("cause_chain=\"server_error>object_read>store_io_failure\""));
+        for private_fragment in private_fragments {
+            assert!(!request_error.detail.contains(private_fragment));
+            assert!(!cause_chain.detail.contains(private_fragment));
+        }
+    }
+
+    #[test]
     fn s3_response_error_with_ids_embeds_explicit_request_and_host_ids() {
         let wire_ids =
             WireResponseIds::new("2VG1X5NNMZ52HKC0".to_string(), "stable-host-id".to_string());

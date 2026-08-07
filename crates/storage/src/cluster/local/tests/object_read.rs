@@ -433,7 +433,7 @@ fn opaque_object_segment_fault_rejects_a_replaced_null_generation_without_mutati
 
 fn retained_read_with_unavailable_lease_nodes(
     unavailable_node_ids: &[NodeId],
-) -> Result<Vec<u8>, StoreError> {
+) -> Result<Vec<u8>, crate::ObjectReadFailure> {
     let tmp = test_util::tempdir();
     let mut map = LocalClusterMap::open(
         tmp.path(),
@@ -507,7 +507,9 @@ fn retained_read_with_unavailable_lease_nodes(
             Ok(())
         }));
     let mut bytes = Vec::new();
-    retained.read_segment_payload_stored_bytes_into(&segment, &mut bytes)?;
+    retained
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+        .map_err(crate::ObjectReadFailure::from_store)?;
     drop(retained);
     assert_eq!(
         cluster.object_payload_lease_holder_node_count(&bucket, &key, generation_id),
@@ -535,7 +537,8 @@ fn retained_read_rejects_a_leased_node_subset_below_ec_k() {
         NodeId::new(2),
     ])
     .unwrap_err();
-    assert!(matches!(error, StoreError::NotFound));
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "store_not_found");
 }
 
 #[test]
@@ -697,7 +700,8 @@ fn retained_object_payload_read_rejects_an_omitted_snapshot_segment() {
         Err(error) => error,
     };
 
-    assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "store_integrity_failure");
 }
 
 #[test]
@@ -810,7 +814,8 @@ fn retained_object_payload_handoff_rejects_another_version_of_the_same_key() {
         Ok(_) => panic!("another version's payload handoff must be rejected"),
         Err(error) => error,
     };
-    assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "store_integrity_failure");
 }
 
 #[test]

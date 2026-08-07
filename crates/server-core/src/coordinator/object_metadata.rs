@@ -55,9 +55,37 @@ impl Coordinator {
         key: &ObjectKey,
         version_id: Option<VersionId>,
         can_discover_missing: bool,
-        error: storage::ObjectPgActionError,
+        error: storage::ObjectReadFailure,
     ) -> ServerError {
         Self::map_object_read_snapshot_error(bucket, key, version_id, can_discover_missing, error)
+    }
+
+    fn map_object_metadata_mutation_access_error(
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        can_discover_missing: bool,
+        error: storage::ObjectPgActionError,
+    ) -> ServerError {
+        match error {
+            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound) => {
+                if !can_discover_missing {
+                    ServerError::AccessDenied
+                } else if let Some(version_id) = version_id {
+                    ServerError::VersionNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        version_id: version_id.to_string(),
+                    }
+                } else {
+                    ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    }
+                }
+            }
+            other => Self::map_object_pg_action_error(other),
+        }
     }
 
     #[cfg(test)]
@@ -104,7 +132,7 @@ impl Coordinator {
             return Ok(());
         }
         let object_pg_ready = route.try_probe_object_pg_available().map_err(|error| {
-            Self::map_object_metadata_access_error(
+            Self::map_object_metadata_mutation_access_error(
                 bucket,
                 key,
                 version_id,
@@ -415,7 +443,7 @@ impl Coordinator {
                 if super::object_pg_action_error_is_metadata_command_contention(&error) {
                     ServerError::OperationAborted
                 } else {
-                    Self::map_object_metadata_access_error(
+                    Self::map_object_metadata_mutation_access_error(
                         bucket,
                         key,
                         req.object.version_id,
@@ -499,7 +527,7 @@ impl Coordinator {
                 Ok(live.version_id)
             })
             .map_err(|error| {
-                Self::map_object_metadata_access_error(
+                Self::map_object_metadata_mutation_access_error(
                     bucket,
                     key,
                     req.object.version_id,
@@ -645,7 +673,7 @@ impl Coordinator {
                 Ok(live.version_id)
             })
             .map_err(|error| {
-                Self::map_object_metadata_access_error(
+                Self::map_object_metadata_mutation_access_error(
                     bucket,
                     key,
                     req.object.version_id,
@@ -869,7 +897,7 @@ impl Coordinator {
                 Ok(stored.version_id())
             })
             .map_err(|error| {
-                Self::map_object_metadata_access_error(
+                Self::map_object_metadata_mutation_access_error(
                     bucket,
                     key,
                     req.version_id,
@@ -1063,7 +1091,7 @@ impl Coordinator {
                 Ok((live.version_id, acl_grants, public_read))
             })
             .map_err(|error| {
-                Self::map_object_metadata_access_error(
+                Self::map_object_metadata_mutation_access_error(
                     bucket,
                     key,
                     req.object.version_id,

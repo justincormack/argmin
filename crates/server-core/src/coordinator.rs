@@ -113,6 +113,16 @@ pub(super) fn map_store_error_with_metadata_contention(
     }
 }
 
+pub(super) fn map_object_read_failure(error: storage::ObjectReadFailure) -> ServerError {
+    match error.kind() {
+        storage::ObjectReadFailureKind::ResourceExhausted
+        | storage::ObjectReadFailureKind::MetadataCommandContention
+        | storage::ObjectReadFailureKind::RetryableConvergence => ServerError::SlowDown,
+        storage::ObjectReadFailureKind::ObjectNotFound
+        | storage::ObjectReadFailureKind::InternalError => ServerError::ObjectRead(error),
+    }
+}
+
 pub(crate) struct StreamSegmentAppendPayload<'a> {
     pub(crate) storage_bytes: &'a [u8],
     pub(crate) payload_crc64: u64,

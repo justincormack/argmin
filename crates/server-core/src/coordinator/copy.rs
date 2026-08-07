@@ -312,7 +312,7 @@ impl Coordinator {
                 .map_err(super::map_store_error)?;
             let retained = source_route
                 .retain_object_payload_read(source_payload_handoff)
-                .map_err(super::map_store_error)?
+                .map_err(super::map_object_read_failure)?
                 .ok_or_else(|| ServerError::InternalError {
                     reason: "live copy source did not produce retained payload authority"
                         .to_string(),
@@ -629,7 +629,7 @@ impl Coordinator {
                 .map_err(super::map_store_error)?;
             let retained = source_route
                 .retain_object_payload_read(source_payload_handoff)
-                .map_err(super::map_store_error)?
+                .map_err(super::map_object_read_failure)?
                 .ok_or_else(|| ServerError::InternalError {
                     reason: "live copy source did not produce retained payload authority"
                         .to_string(),

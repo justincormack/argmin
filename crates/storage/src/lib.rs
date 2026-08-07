@@ -154,7 +154,8 @@ pub(crate) use error::{
 pub use error::{
     BucketSnapshotLoadFailure, BucketSnapshotLoadFailureKind, BucketWriteDrainFailure,
     BucketWriteDrainFailureKind, ClusterBuildError, MetadataError, ObjectPgActionError,
-    ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
+    ObjectReadFailure, ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure,
+    StoreOperationFailureClass,
 };
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
@@ -1571,6 +1572,31 @@ pub mod test_support {
         kind: BucketSnapshotLoadFailureKind,
     ) -> BucketSnapshotLoadFailure {
         BucketSnapshotLoadFailure::for_test(kind)
+    }
+
+    /// Construct an opaque object-read failure from its logical outcome.
+    ///
+    /// This lets cross-crate response-mapping tests remain exhaustive without
+    /// constructing storage implementation errors.
+    #[must_use]
+    pub fn object_read_failure_for_kind(kind: ObjectReadFailureKind) -> ObjectReadFailure {
+        ObjectReadFailure::for_test(kind)
+    }
+
+    /// Construct an opaque object-read failure containing a bounded I/O
+    /// diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn object_read_failure_diagnostic_fixture() -> (ObjectReadFailure, &'static [&'static str])
+    {
+        const SECRET_CONTEXT: &str = "secret object read fixture operation";
+        const SECRET_SOURCE: &str = "secret object read fixture source";
+        (
+            ObjectReadFailure::from_store(StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            }),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

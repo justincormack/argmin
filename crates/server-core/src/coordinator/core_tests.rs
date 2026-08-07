@@ -3574,10 +3574,14 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
         .unwrap();
     clock.set(6_000);
     let metadata_error = route.load_object_if(|_| Ok::<(), ()>(())).unwrap_err();
-    assert!(matches!(
-        metadata_error,
-        storage::ObjectPgActionError::Store(storage::StoreError::RouteMapExpired { .. })
-    ));
+    assert_eq!(
+        metadata_error.kind(),
+        storage::ObjectReadFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        metadata_error.diagnostic_cause_label(),
+        "store_topology_failure"
+    );
     clock.set(1_000);
 
     let action_clock = clock.control();
@@ -3587,10 +3591,14 @@ fn object_snapshot_route_rechecks_deadline_after_warm_bucket_fast_path() {
             Ok::<(), ()>(())
         })
         .unwrap_err();
-    assert!(matches!(
-        snapshot_error,
-        storage::ObjectPgActionError::Store(storage::StoreError::RouteMapExpired { .. })
-    ));
+    assert_eq!(
+        snapshot_error.kind(),
+        storage::ObjectReadFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        snapshot_error.diagnostic_cause_label(),
+        "store_topology_failure"
+    );
     clock.set(1_000);
 
     let hook_clock = clock.control();
@@ -9993,17 +10001,6 @@ fn object_pg_command_contention_maps_to_slow_down() {
         ));
     }
 
-    fn assert_read_snapshot_maps_to_slow_down(
-        bucket: &BucketName,
-        key: &ObjectKey,
-        error: storage::ObjectPgActionError,
-    ) {
-        assert!(matches!(
-            Coordinator::map_object_read_snapshot_error(bucket, key, None, true, error),
-            ServerError::SlowDown
-        ));
-    }
-
     let epoch = storage::ClusterEpoch::INITIAL;
     assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
         storage::StoreError::MetadataCommandLogConflict {
@@ -10013,16 +10010,6 @@ fn object_pg_command_contention_maps_to_slow_down() {
             log_index: 3,
         },
     ));
-    assert_read_snapshot_maps_to_slow_down(
-        &bucket,
-        &key,
-        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandLogConflict {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: epoch,
-            log_index: 3,
-        }),
-    );
     assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
         storage::StoreError::MetadataCommandPendingConflict {
             pg_id: 2,
@@ -10031,58 +10018,22 @@ fn object_pg_command_contention_maps_to_slow_down() {
             candidate_log_index: 4,
         },
     ));
-    assert_read_snapshot_maps_to_slow_down(
-        &bucket,
-        &key,
-        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandPendingConflict {
-            pg_id: 2,
-            cluster_epoch: epoch,
-            existing_log_index: 3,
-            candidate_log_index: 4,
-        }),
-    );
     assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
         storage::StoreError::MetadataCommandContention {
             context: "pending command displaced during cleanup",
         },
     ));
-    assert_read_snapshot_maps_to_slow_down(
-        &bucket,
-        &key,
-        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandContention {
-            context: "pending command displaced during cleanup",
-        }),
-    );
     assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
         storage::MetadataError::ObjectGenerationReservationConflict {
             reservation_id: "reservation".to_string(),
             generation_id: 5,
         },
     ));
-    assert_read_snapshot_maps_to_slow_down(
-        &bucket,
-        &key,
-        storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectGenerationReservationConflict {
-                reservation_id: "reservation".to_string(),
-                generation_id: 5,
-            },
-        ),
-    );
     assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
         storage::MetadataError::ObjectVersionReservationConflict {
             version_id: storage::VersionId::from_u64(7),
         },
     ));
-    assert_read_snapshot_maps_to_slow_down(
-        &bucket,
-        &key,
-        storage::ObjectPgActionError::Metadata(
-            storage::MetadataError::ObjectVersionReservationConflict {
-                version_id: storage::VersionId::from_u64(7),
-            },
-        ),
-    );
     assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
         storage::MetadataError::StaleObjectWriteCommand {
             bucket: bucket.clone(),
@@ -10091,16 +10042,61 @@ fn object_pg_command_contention_maps_to_slow_down() {
             generation_id: None,
         },
     ));
-    assert_read_snapshot_maps_to_slow_down(
-        &bucket,
-        &key,
-        storage::ObjectPgActionError::Metadata(storage::MetadataError::StaleObjectWriteCommand {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            write_sequence: 12,
-            generation_id: Some(13),
-        }),
-    );
+}
+
+#[test]
+fn object_read_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let bucket = trusted_bucket_name("read-failure-bucket");
+    let key = trusted_object_key("read-failure-key");
+    let map = |kind, version_id, can_discover_missing| {
+        Coordinator::map_object_read_snapshot_error(
+            &bucket,
+            &key,
+            version_id,
+            can_discover_missing,
+            storage::test_support::object_read_failure_for_kind(kind),
+        )
+    };
+
+    for kind in [
+        storage::ObjectReadFailureKind::ResourceExhausted,
+        storage::ObjectReadFailureKind::MetadataCommandContention,
+        storage::ObjectReadFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind, None, true), ServerError::SlowDown));
+    }
+
+    assert!(matches!(
+        map(storage::ObjectReadFailureKind::ObjectNotFound, None, false),
+        ServerError::AccessDenied
+    ));
+    assert!(matches!(
+        map(storage::ObjectReadFailureKind::ObjectNotFound, None, true),
+        ServerError::ObjectNotFound {
+            bucket: missing_bucket,
+            key: missing_key,
+        } if missing_bucket == bucket.as_str() && missing_key == key.as_str()
+    ));
+    let version_id = storage::VersionId::from_u64(7);
+    assert!(matches!(
+        map(
+            storage::ObjectReadFailureKind::ObjectNotFound,
+            Some(version_id),
+            true,
+        ),
+        ServerError::VersionNotFound {
+            bucket: missing_bucket,
+            key: missing_key,
+            version_id: missing_version,
+        } if missing_bucket == bucket.as_str()
+            && missing_key == key.as_str()
+            && missing_version == version_id.to_string()
+    ));
+    assert!(matches!(
+        map(storage::ObjectReadFailureKind::InternalError, None, true),
+        ServerError::ObjectRead(error)
+            if error.diagnostic_cause_label() == "store_internal_failure"
+    ));
 }
 
 #[test]
