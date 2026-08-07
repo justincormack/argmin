@@ -6,7 +6,8 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header,
     delete_bucket_retrying_operation_aborted, err_status, eventually_raw_alt_object_status,
-    is_retryable_operation_contention, raw_bucket, raw_response_header, send_signed_request,
+    is_retryable_operation_contention, is_retryable_operation_contention_response, raw_bucket,
+    raw_response_header, send_signed_request,
     shape::{assert_body_with_unordered_blocks, assert_shape, id_headers, shape},
     unique_bucket, RawAltObjectRequest, SendRetryingOperationAborted, CTX,
 };
@@ -294,24 +295,20 @@ fn assert_tagging_count_header(response: &s3_tests::RawResponse, expected: Optio
     );
 }
 
-fn raw_response_is_operation_aborted(response: &s3_tests::RawResponse) -> bool {
-    response.status == 409 && response.body.contains("<Code>OperationAborted</Code>")
-}
-
 fn send_raw_retrying_operation_aborted<F>(description: &str, mut send: F) -> s3_tests::RawResponse
 where
     F: FnMut() -> s3_tests::RawResponse,
 {
     for attempt in 0..CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
         let response = send();
-        if !raw_response_is_operation_aborted(&response) {
+        if !is_retryable_operation_contention_response(response.status, &response.body) {
             return response;
         }
         if attempt + 1 < CONCURRENT_TAGGING_OPERATION_ATTEMPTS {
             std::thread::sleep(Duration::from_millis(10 * (attempt as u64 + 1)));
         }
     }
-    panic!("{description} did not complete without OperationAborted");
+    panic!("{description} did not complete without retryable operation contention");
 }
 
 fn put_bucket_tagging_raw(bucket: &str, body: &[u8]) -> s3_tests::RawResponse {

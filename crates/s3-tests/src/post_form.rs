@@ -3,13 +3,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
 
-use crate::helpers::SignedRequestCredentials;
+use crate::helpers::{is_retryable_operation_contention_response, SignedRequestCredentials};
 use crate::{build_test_agent, sse_c_header_values, RawResponse};
-
-fn is_retryable_operation_contention_response(status: u16, body: &str) -> bool {
-    (status == 409 && body.contains("<Code>OperationAborted</Code>"))
-        || (status == 503 && body.contains("<Code>SlowDown</Code>"))
-}
 
 fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
     let k_secret = format!("AWS4{}", secret);

@@ -6,8 +6,9 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_bucket_retrying_operation_aborted, delete_objects_retrying_operation_aborted,
-    err_status, get_object_body_retrying_operation_aborted, raw_bucket, raw_object,
-    raw_object_query, send_signed_request,
+    err_status, get_object_body_retrying_operation_aborted,
+    is_retryable_operation_contention_response, raw_bucket, raw_object, raw_object_query,
+    send_signed_request,
     shape::{
         assert_shape, error_response_headers, expected_error, id_headers, shape,
         xml_response_headers,
@@ -201,18 +202,13 @@ fn expected_raw_list_key(decoded_key: &str) -> String {
     format!("<Key>{escaped}</Key>")
 }
 
-fn raw_response_is_retryable_operation_contention(response: &RawResponse) -> bool {
-    (response.status == 409 && response.body.contains("<Code>OperationAborted</Code>"))
-        || (response.status == 503 && response.body.contains("<Code>SlowDown</Code>"))
-}
-
 fn send_raw_retrying_operation_aborted<F>(description: &str, mut send: F) -> RawResponse
 where
     F: FnMut() -> RawResponse,
 {
     for attempt in 0..CONCURRENT_VERSION_OPERATION_ATTEMPTS {
         let response = send();
-        if !raw_response_is_retryable_operation_contention(&response) {
+        if !is_retryable_operation_contention_response(response.status, &response.body) {
             return response;
         }
         if attempt + 1 < CONCURRENT_VERSION_OPERATION_ATTEMPTS {

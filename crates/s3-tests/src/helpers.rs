@@ -315,6 +315,13 @@ pub fn is_retryable_operation_contention<E: ProvideErrorMetadata>(
     OperationContentionRetryScope::OperationAbortedOrSlowDown.includes(s3_error_code(err))
 }
 
+pub fn is_retryable_operation_contention_response(status: u16, body: &str) -> bool {
+    matches!(
+        (status, crate::shape::xml_tag_text(body, "Code")),
+        (409, Some("OperationAborted")) | (503, Some("SlowDown"))
+    )
+}
+
 pub async fn retrying_operation_aborted<T, E, F, Fut>(context: &str, mut op: F) -> T
 where
     E: ProvideErrorMetadata + std::fmt::Debug,
@@ -3746,6 +3753,30 @@ mod tests {
         let contention = OperationContentionRetryScope::OperationAbortedOrSlowDown;
         assert!(contention.includes(Some("OperationAborted")));
         assert!(contention.includes(Some("SlowDown")));
+    }
+
+    #[test]
+    fn raw_operation_contention_retry_preserves_status_and_code_pairing() {
+        assert!(is_retryable_operation_contention_response(
+            409,
+            "<Error><Code>OperationAborted</Code></Error>"
+        ));
+        assert!(is_retryable_operation_contention_response(
+            503,
+            "<Error><Code>SlowDown</Code></Error>"
+        ));
+        assert!(!is_retryable_operation_contention_response(
+            503,
+            "<Error><Code>OperationAborted</Code></Error>"
+        ));
+        assert!(!is_retryable_operation_contention_response(
+            409,
+            "<Error><Code>SlowDown</Code></Error>"
+        ));
+        assert!(!is_retryable_operation_contention_response(
+            503,
+            "<Error><Code>InternalError</Code><Detail><Code>SlowDown</Code></Detail></Error>"
+        ));
     }
 
     #[test]

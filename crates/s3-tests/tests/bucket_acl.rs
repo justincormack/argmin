@@ -3,6 +3,7 @@
 //! Covers canned bucket ACLs, default ACL verification, grant revocation,
 //! and error handling for invalid grant targets.
 
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{
     AccessControlPolicy, BucketCannedAcl, Grant, Grantee, ObjectOwnership, Owner,
     OwnershipControls, OwnershipControlsRule, Permission, Type,
@@ -37,14 +38,14 @@ fn sdk_err_status<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> u
         .unwrap_or_else(|| panic!("error has no raw HTTP response: {err:?}"))
 }
 
-fn assert_sdk_err_code<E: std::fmt::Debug>(
+fn assert_sdk_err_code<E: ProvideErrorMetadata + std::fmt::Debug>(
     err: &aws_sdk_s3::error::SdkError<E>,
     expected_code: &str,
 ) {
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains(expected_code),
-        "expected error code '{expected_code}' in error: {msg}"
+    assert_eq!(
+        err.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some(expected_code),
+        "unexpected modeled error code: {err:?}"
     );
 }
 
@@ -1134,10 +1135,13 @@ fn test_bucket_concurrent_set_canned_acl() {
         for task in tasks {
             match task.await.unwrap() {
                 Ok(_) => success_count += 1,
-                Err(err) => {
-                    assert_eq!(sdk_err_status(&err), 409);
-                    assert_sdk_err_code(&err, "OperationAborted");
-                }
+                Err(err) => match sdk_err_status(&err) {
+                    409 => assert_sdk_err_code(&err, "OperationAborted"),
+                    503 => assert_sdk_err_code(&err, "SlowDown"),
+                    status => panic!(
+                        "concurrent PutBucketAcl returned unexpected status {status}: {err:?}"
+                    ),
+                },
             }
         }
         assert!(

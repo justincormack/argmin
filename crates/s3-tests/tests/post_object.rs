@@ -4,8 +4,8 @@ use auth::canonical::{canonical_request, sha256_hex, string_to_sign};
 use aws_sdk_s3::{primitives::ByteStream, types::ServerSideEncryption};
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, err_status, post_object_raw_to_test_endpoint_with_headers,
-    send_signed_request_with_credentials,
+    assert_s3_err_code, err_status, is_retryable_operation_contention_response,
+    post_object_raw_to_test_endpoint_with_headers, send_signed_request_with_credentials,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     sigv4_post_fields_for_credentials, sigv4_post_sse_c_fields_for_credentials,
     sse_c_header_values, test_sse_c_key, unique_bucket, RawResponse, SendRetryingOperationAborted,
@@ -503,8 +503,7 @@ fn post_object_to_endpoint(
 
         let status = resp.status().as_u16();
         let body_str = resp.body_mut().read_to_string().unwrap_or_default();
-        if ((status == 409 && body_str.contains("<Code>OperationAborted</Code>"))
-            || (status == 503 && body_str.contains("<Code>SlowDown</Code>")))
+        if is_retryable_operation_contention_response(status, &body_str)
             && Instant::now() < deadline
         {
             std::thread::sleep(Duration::from_millis(100));
