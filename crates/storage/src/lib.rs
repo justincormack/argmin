@@ -185,6 +185,24 @@ pub mod test_support {
 
     use super::*;
 
+    /// Open the storage-owned default cluster used by higher-layer unit tests.
+    ///
+    /// The physical topology is intentionally not configurable across the
+    /// crate boundary. Tests which need a particular node, PG, shard, or EC
+    /// arrangement belong in storage.
+    pub fn open_default_test_storage_cluster(data_dir: &std::path::Path) -> Arc<StorageCluster> {
+        let ec_config = ec::EcConfig::default();
+        let ec_shape = EcShape {
+            k: ec_config.data_shards(),
+            m: ec_config.parity_shards(),
+        };
+        let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
+        let node_ids = (0..node_count).map(NodeId::new).collect::<Vec<_>>();
+
+        StorageCluster::open_static_local_nodes(data_dir, &node_ids, &[0], ec_shape)
+            .expect("open default test storage cluster")
+    }
+
     /// Opaque guard for a deterministic Direct PUT failure after durable
     /// metadata publication.
     pub struct TestDirectPutPostPublishErrorGuard {

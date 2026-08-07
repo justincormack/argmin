@@ -2102,14 +2102,14 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        and storage checkpoint diagnostics to accept `selector: &str`, and rejects renewed public
        visibility for the private storage primitives.
 
-    3. **Remove HTTP's direct EC test dependency.** `server-http` no longer needs EC in production,
-       but its dev-dependency remains because three duplicated HTTP test-cluster constructors use
-       `ec::EcConfig` to select an EC shape and derive storage node count, while a response
-       redaction test constructs `ec::EcError` directly. Provide one storage-owned default test
-       cluster facility whose public signature exposes no PG, node, shard, or EC representation,
-       and a server-core-owned semantic error fixture for the HTTP redaction case. Remove the
-       direct `server-http` dev-dependency on `ec`; HTTP tests must not choose storage topology or
-       construct EC implementation errors.
+    3. **Complete — HTTP EC dependency containment.** Completed on 2026-08-07. The three
+       duplicated HTTP test-cluster constructors were replaced by one storage-owned default test
+       cluster facility whose signature exposes no PG, node, shard, or EC representation. The
+       response redaction test now consumes a server-core-owned semantic fixture which supplies
+       both the opaque internal failure and the private fragments that must remain redacted.
+       `server-http` no longer has a direct EC dev-dependency, chooses no storage topology, and
+       constructs no EC implementation error. The boundary checker rejects both a renewed direct
+       dependency and `ec::` source use anywhere under `server-http`.
 
     4. **Final enforcement.** Extend `check-storage-cluster-boundaries` to reject concrete
        `StoreError`/`MetadataError` and raw operation-wrapper use outside storage, their public
@@ -2117,9 +2117,10 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        dependency or `ec::` source use in `server-http`. Do not use an indiscriminate repository-wide
        representation text ban: enforce the actual non-owner production and feature-gated seams
        while retaining owner-local storage tests. The debug-PG portion now rejects the specific
-       HTTP escape hatches rather than owner-local storage uses. Item 14 completes only when crate visibility is the
-       primary representation boundary and the repository check prevents each removed escape hatch
-       from being reintroduced.
+       HTTP escape hatches rather than owner-local storage uses, and the HTTP EC portion rejects
+       both dependency and source-level representation use. Item 14 completes only when crate
+       visibility is the primary representation boundary and the repository check prevents each
+       removed escape hatch from being reintroduced.
 
 After items 9 through 14 are complete, work proceeds through the Phase 2 evidence gate rather than
 reopening containment opportunistically.

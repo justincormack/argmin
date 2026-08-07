@@ -5109,9 +5109,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use ring::hmac;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
-    use storage::{
-        NodeId, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
-    };
+    use storage::{StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle};
 
     use crate::metadata_blob::MetadataBlob;
 
@@ -5137,18 +5135,6 @@ mod tests {
         (runtime, route)
     }
 
-    fn open_test_storage_cluster(dir: &std::path::Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
-        let ec_config = ec::EcConfig::default();
-        let ec_shape = storage::EcShape {
-            k: ec_config.data_shards(),
-            m: ec_config.parity_shards(),
-        };
-        let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
-        let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
-        StorageCluster::open_static_local_nodes(dir, &node_ids, pg_ids, ec_shape)
-            .expect("open local storage cluster")
-    }
-
     fn long_lived_test_route_map_validity() -> storage::RouteMapValidity {
         storage::RouteMapValidity::until_ms(
             storage::clock::current_time_millis().saturating_add(3_600_000),
@@ -5156,11 +5142,8 @@ mod tests {
         .unwrap()
     }
 
-    fn open_dynamic_test_storage_cluster(
-        dir: &std::path::Path,
-        pg_ids: &[u32],
-    ) -> Arc<StorageCluster> {
-        open_test_storage_cluster(dir, pg_ids)
+    fn open_dynamic_test_storage_cluster(dir: &std::path::Path) -> Arc<StorageCluster> {
+        storage::test_support::open_default_test_storage_cluster(dir)
             .test_clone_with_dynamic_route_map_validity(long_lived_test_route_map_validity())
             .expect("build dynamic test storage cluster")
     }
@@ -5235,7 +5218,7 @@ mod tests {
     #[test]
     fn streaming_body_frame_timeout_uses_captured_route_deadline() {
         let tmp = test_util::tempdir();
-        let cluster = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
+        let cluster = open_dynamic_test_storage_cluster(tmp.path());
         let handle = test_storage_route_handle(Arc::clone(&cluster));
         let admission = storage::clock::with_time_override(1_000, || {
             cluster
@@ -5274,14 +5257,13 @@ mod tests {
     }
 
     fn setup_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
-        let pg_ids: Vec<u32> = (0..1).collect();
-        let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+        let storage_cluster = storage::test_support::open_default_test_storage_cluster(dir);
         let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
         setup_frontend_with_storage_handle(storage_handle)
     }
 
     fn setup_dynamic_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
-        let storage_cluster = open_dynamic_test_storage_cluster(dir, &[0]);
+        let storage_cluster = open_dynamic_test_storage_cluster(dir);
         let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
         setup_frontend_with_storage_handle(storage_handle)
     }
@@ -5686,7 +5668,7 @@ Connection: close\r\n\r\n\
     #[tokio::test(flavor = "multi_thread")]
     async fn buffered_invalid_signature_precedes_expired_route_admission() {
         let tmp = test_util::tempdir();
-        let storage_cluster = open_dynamic_test_storage_cluster(tmp.path(), &[0]);
+        let storage_cluster = open_dynamic_test_storage_cluster(tmp.path());
         let storage_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
         let frontend = setup_frontend_with_storage_handle(storage_handle);
         create_test_bucket(&frontend, "mybucket");
@@ -5756,7 +5738,7 @@ Connection: close\r\n\r\n",
         use tokio::io::AsyncWriteExt;
 
         let tmp = test_util::tempdir();
-        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"));
         let (runtime_handle, storage_handle) =
             test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
@@ -5804,7 +5786,7 @@ Connection: close\r\n\r\n",
         .await
         .unwrap();
 
-        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"));
         let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
@@ -5837,7 +5819,7 @@ Connection: close\r\n\r\n",
         const PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
 
         let tmp = test_util::tempdir();
-        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"));
         let (runtime_handle, storage_handle) =
             test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
@@ -5916,7 +5898,7 @@ Content-Length: {}\r\n\
             .test_stream_upload_reservation_exists(&bucket, &key, &session_id)
             .unwrap());
 
-        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"));
         let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
@@ -6056,7 +6038,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn post_and_upload_part_acquire_cleanup_authority_before_creating_sessions() {
         let tmp = test_util::tempdir();
-        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"));
         let storage_handle = test_storage_route_handle(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle);
         create_test_bucket(&frontend, "post-cleanup-authority-bucket");
@@ -6294,7 +6276,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn expired_promoted_post_cleanup_handoff_does_not_block_route_publication() {
         let tmp = test_util::tempdir();
-        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"));
         let (runtime_handle, storage_handle) =
             test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
@@ -6357,7 +6339,7 @@ Connection: close\r\n\r\n",
         abort_guard.arm_post(&ctx);
         let retained_abort_failure = initial.test_fail_retained_stream_abort_with_contention();
 
-        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"));
         let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {
@@ -6427,7 +6409,7 @@ Connection: close\r\n\r\n",
     #[tokio::test(flavor = "multi_thread")]
     async fn expired_promoted_upload_part_cleanup_handoff_does_not_block_publication() {
         let tmp = test_util::tempdir();
-        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
+        let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"));
         let (runtime_handle, storage_handle) =
             test_dynamic_storage_route_handles(Arc::clone(&initial));
         let frontend = setup_frontend_with_storage_handle(storage_handle.clone());
@@ -6497,7 +6479,7 @@ Connection: close\r\n\r\n",
         abort_guard.arm_part(&ctx);
         let retained_abort_failure = initial.test_fail_retained_stream_abort_with_contention();
 
-        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"), &[0]);
+        let candidate = open_dynamic_test_storage_cluster(&tmp.path().join("candidate"));
         let install_handle = runtime_handle.clone();
         let installed_candidate = Arc::clone(&candidate);
         let installer = std::thread::spawn(move || {

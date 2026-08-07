@@ -4968,7 +4968,9 @@ mod tests {
     }
 
     #[test]
-    fn error_response_internal_storage_and_ec_errors_are_sanitized() {
+    fn error_response_internal_storage_and_implementation_errors_are_sanitized() {
+        let internal_implementation_error =
+            server_core::error::test_support::internal_implementation_error_redaction_fixture();
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
             (
                 ServerError::BucketWriteDrain(
@@ -5010,10 +5012,8 @@ mod tests {
                 ],
             ),
             (
-                ServerError::Ec(ec::EcError::SmokeTestFailed {
-                    reason: "matrix inversion failed in /tmp/secret-ec".to_string(),
-                }),
-                vec!["matrix inversion failed", "/tmp/secret-ec"],
+                internal_implementation_error.0,
+                internal_implementation_error.1.to_vec(),
             ),
         ];
 

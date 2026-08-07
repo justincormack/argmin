@@ -902,6 +902,25 @@ impl From<checksum::InvalidChecksumConfig> for ServerError {
     }
 }
 
+/// Owner-provided semantic fixtures for cross-crate response tests.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub mod test_support {
+    use super::ServerError;
+
+    /// Return an internal implementation failure and the private diagnostic
+    /// fragments which must not appear in its protocol response.
+    pub fn internal_implementation_error_redaction_fixture(
+    ) -> (ServerError, &'static [&'static str]) {
+        (
+            ServerError::Ec(ec::EcError::SmokeTestFailed {
+                reason: "matrix inversion failed in /tmp/secret-ec".to_string(),
+            }),
+            &["matrix inversion failed", "/tmp/secret-ec"],
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

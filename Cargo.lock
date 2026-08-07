@@ -2329,7 +2329,6 @@ dependencies = [
  "base64",
  "bytes",
  "checksum",
- "ec",
  "http 1.4.2",
  "http-body-util",
  "hyper",

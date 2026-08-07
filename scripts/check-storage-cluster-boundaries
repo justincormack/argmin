@@ -4380,6 +4380,23 @@ fail_with_matches \
     "Local HTTP diagnostics must use opaque storage-owned operations rather than PG, checkpoint-summary, object-snapshot, or placement-error representations" \
     "$http_storage_debug_representation_leaks"
 
+http_ec_boundary_leaks=$(
+    {
+        rg -n --color=never \
+            '^[[:space:]]*ec[[:space:]]*=|package[[:space:]]*=[[:space:]]*"ec"|path[[:space:]]*=[[:space:]]*"\.\./ec"' \
+            crates/server-http/Cargo.toml \
+            || true
+        rg -n --color=never \
+            '\bec(::|[[:space:]]+as\b)' \
+            crates/server-http/src \
+            -g '*.rs' \
+            || true
+    }
+)
+fail_with_matches \
+    "server-http must use storage/server-core semantic test facilities rather than depend on or construct EC representations" \
+    "$http_ec_boundary_leaks"
+
 raw_storage_wrapper_diagnostic_formatting=$(
     {
         rg -n -U --color=never \

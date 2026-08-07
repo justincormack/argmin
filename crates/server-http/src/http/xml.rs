@@ -5519,26 +5519,11 @@ mod tests {
     use crate::metadata_blob::MetadataBlob;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
     use server_core::system_metadata::SystemMetadata;
-    use std::sync::Arc;
-    use storage::{NodeId, StorageCluster};
 
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
-    fn open_test_storage_cluster(dir: &std::path::Path, pg_ids: &[u32]) -> Arc<StorageCluster> {
-        let ec_config = ec::EcConfig::default();
-        let ec_shape = storage::EcShape {
-            k: ec_config.data_shards(),
-            m: ec_config.parity_shards(),
-        };
-        let node_count = u32::from(ec_shape.k) + u32::from(ec_shape.m);
-        let node_ids: Vec<NodeId> = (0..node_count).map(NodeId::new).collect();
-        StorageCluster::open_static_local_nodes(dir, &node_ids, pg_ids, ec_shape)
-            .expect("open local storage cluster")
-    }
-
     fn setup_coordinator(dir: &std::path::Path) -> Coordinator {
-        let pg_ids: Vec<u32> = (0..1).collect();
-        let storage_cluster = open_test_storage_cluster(dir, &pg_ids);
+        let storage_cluster = storage::test_support::open_default_test_storage_cluster(dir);
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );
