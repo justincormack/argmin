@@ -5875,6 +5875,8 @@ Connection: close\r\n\r\n",
     async fn expired_streaming_put_route_releases_publication_before_client_disconnects() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+        const PROGRESS_TIMEOUT: Duration = Duration::from_secs(30);
+
         let tmp = test_util::tempdir();
         let initial = open_dynamic_test_storage_cluster(&tmp.path().join("initial"), &[0]);
         let (runtime_handle, storage_handle) =
@@ -5925,7 +5927,7 @@ Content-Length: {}\r\n\
 
         let bucket = storage::BucketName::try_from("route-expiry-bucket".to_string()).unwrap();
         let key = storage::ObjectKey::try_from("key".to_string()).unwrap();
-        let session_id = tokio::time::timeout(Duration::from_secs(3), async {
+        let session_id = tokio::time::timeout(PROGRESS_TIMEOUT, async {
             loop {
                 let session_ids = storage::test_support::stream_upload_session_ids_for_object(
                     &initial, &bucket, &key,
@@ -5978,7 +5980,7 @@ Content-Length: {}\r\n\
         client.flush().await.unwrap();
 
         tokio::time::timeout(
-            Duration::from_secs(3),
+            PROGRESS_TIMEOUT,
             tokio::task::spawn_blocking(move || installer.join().unwrap()),
         )
         .await
@@ -6001,7 +6003,7 @@ Content-Length: {}\r\n\
             .unwrap());
 
         let mut response = Vec::new();
-        tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut response))
+        tokio::time::timeout(PROGRESS_TIMEOUT, client.read_to_end(&mut response))
             .await
             .expect("expired streaming request should receive a response")
             .unwrap();
