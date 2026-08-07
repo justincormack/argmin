@@ -4675,6 +4675,66 @@ fail_with_matches \
     "Admitted multipart management and completion must cross storage through opaque semantic failures" \
     "$raw_multipart_operation_error_transit"
 
+raw_object_metadata_listing_error_transit=$(
+    {
+        awk '
+        /^impl ActiveObjectMetadataScan/ {
+            in_listing_impl = 1
+            next
+        }
+        /^impl / {
+            in_listing_impl = 0
+            collecting_signature = 0
+        }
+        in_listing_impl && /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        in_listing_impl && collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/cluster.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(list_objects_for_bucket|list_object_versions_for_bucket|list_multipart_uploads_for_bucket)(?s:.{0,500})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/cluster/request_ops.rs \
+            || true
+        rg -n --color=never \
+            '\.map_err\(Self::map_object_pg_action_error\)' \
+            crates/server-core/src/coordinator/listing.rs \
+            || true
+        if ! rg -q -U \
+            'fn map_object_metadata_listing_failure(?s:.{0,300})error: storage::ObjectMetadataListingFailure' \
+            crates/server-core/src/coordinator/listing.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/listing.rs: object-metadata listing response mapping must accept ObjectMetadataListingFailure'
+        fi
+        if ! rg -q 'ObjectMetadataListing\(ObjectMetadataListingFailure\)' \
+            crates/server-core/src/error.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/error.rs: internal object-metadata listing failures must remain typed through ServerError'
+        fi
+    }
+)
+fail_with_matches \
+    "Bucket-wide object, version, and multipart listing scans must cross storage through ObjectMetadataListingFailure" \
+    "$raw_object_metadata_listing_error_transit"
+
 http_storage_debug_representation_leaks=$(
     {
         rg -n --color=never \

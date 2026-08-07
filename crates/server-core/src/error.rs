@@ -2,8 +2,9 @@
 use s3_types::VersionId;
 use storage::error::{
     BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure, MetadataError,
-    MultipartCompletionFailure, MultipartManagementFailure, ObjectMetadataMutationFailure,
-    ObjectReadFailure, StoreError, StoreFailure, StoreOperationFailureClass, StreamUploadFailure,
+    MultipartCompletionFailure, MultipartManagementFailure, ObjectMetadataListingFailure,
+    ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
+    StoreOperationFailureClass, StreamUploadFailure,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +61,9 @@ pub enum ServerError {
 
     #[error("object read error: {0}")]
     ObjectRead(ObjectReadFailure),
+
+    #[error("object metadata listing error: {0}")]
+    ObjectMetadataListing(ObjectMetadataListingFailure),
 
     #[error("object metadata mutation error: {0}")]
     ObjectMetadataMutation(ObjectMetadataMutationFailure),
@@ -524,6 +528,7 @@ impl ServerError {
             Self::BucketWriteDrain(error) => error.diagnostic_cause_label(),
             Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
             Self::ObjectRead(error) => error.diagnostic_cause_label(),
+            Self::ObjectMetadataListing(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
             Self::StreamUpload(error) => error.diagnostic_cause_label(),
             Self::DirectPut(error) => error.diagnostic_cause_label(),
@@ -569,6 +574,10 @@ impl ServerError {
             ),
             Self::ObjectRead(error) => format!(
                 "server_error>object_read>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::ObjectMetadataListing(error) => format!(
+                "server_error>object_metadata_listing>{}",
                 error.diagnostic_cause_label()
             ),
             Self::ObjectMetadataMutation(error) => format!(
@@ -764,6 +773,7 @@ impl ServerError {
             Self::BucketWriteDrain(_) => "InternalError",
             Self::BucketSnapshotLoad(_) => "InternalError",
             Self::ObjectRead(_) => "InternalError",
+            Self::ObjectMetadataListing(_) => "InternalError",
             Self::ObjectMetadataMutation(_) => "InternalError",
             Self::StreamUpload(_) => "InternalError",
             Self::DirectPut(_) => "InternalError",
@@ -1180,6 +1190,19 @@ mod tests {
             object_read.diagnostic_cause_chain(),
             "server_error>object_read>store_io_failure"
         );
+
+        let (listing_failure, secret_fragments) =
+            storage::test_support::object_metadata_listing_failure_diagnostic_fixture();
+        let listing = ServerError::ObjectMetadataListing(listing_failure);
+        assert_eq!(listing.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            listing.diagnostic_cause_chain(),
+            "server_error>object_metadata_listing>store_io_failure"
+        );
+        let rendered = format!("{listing:?} {listing}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
 
         let (object_mutation_failure, secret_fragments) =
             storage::test_support::object_metadata_mutation_failure_diagnostic_fixture();
@@ -1641,6 +1664,17 @@ mod tests {
         let err = ServerError::ObjectRead(storage::test_support::object_read_failure_for_kind(
             storage::ObjectReadFailureKind::InternalError,
         ));
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn s3_error_code_object_metadata_listing() {
+        let err = ServerError::ObjectMetadataListing(
+            storage::test_support::object_metadata_listing_failure_for_kind(
+                storage::ObjectMetadataListingFailureKind::InternalError,
+            ),
+        );
         assert_eq!(err.s3_error_code(), "InternalError");
         assert_eq!(err.http_status(), 500);
     }

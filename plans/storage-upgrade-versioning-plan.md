@@ -2154,6 +2154,17 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        Owner-local crossed-capability, route-expiry, exhaustive classification, and redaction
        tests; exhaustive coordinator mapping tests; the full multipart suites; HTTP sanitization;
        and the boundary checker reject raw errors on every public admitted multipart operation.
+       The bucket-wide object-metadata listing sub-slice completed on 2026-08-07. Admitted
+       ListObjectsV2, ListObjectVersions, and ListMultipartUploads scans now return the shared
+       opaque `ObjectMetadataListingFailure`; its exhaustive logical kind contains only resource
+       exhaustion, metadata-command contention, retryable convergence, and internal failure.
+       Storage owns conversion from every per-PG fan-out, route-validity, metadata, and RPC error,
+       while the coordinator preserves the existing `SlowDown` policy for all three retryable
+       classes and retains internal failures through a typed `ServerError` variant with bounded
+       diagnostics and HTTP redaction. The raw listing helpers are test-only and crate-private.
+       Owner-local exhaustive classification, route-expiry, and redaction tests; exhaustive
+       coordinator response mapping; HTTP sanitization; and the boundary checker reject raw error
+       transit through all three public admitted scans.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces
@@ -2161,8 +2172,7 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        storage-owned semantic errors. Preserve only logical values required for S3 translation,
        such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
        other implementation detail behind the existing bounded opaque diagnostic. Continue with
-       bucket-wide object/version/multipart listing scans next, followed by the remaining
-       storage-maintenance/runtime operation families. Remove
+       the remaining storage-maintenance/runtime operation families. Remove
        `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
        public raw error exports once no public storage signature requires them. Tests that
        currently construct raw storage errors must use owner-provided semantic fixtures or move

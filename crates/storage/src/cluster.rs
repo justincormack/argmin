@@ -4084,7 +4084,7 @@ impl ActiveObjectMetadataScan<'_> {
         delimiter: Option<&str>,
         continuation_token: Option<&ObjectKey>,
         max_keys: u32,
-    ) -> Result<ListedBucketObjects, ObjectPgActionError> {
+    ) -> Result<ListedBucketObjects, crate::ObjectMetadataListingFailure> {
         let require_valid_route = || self.admission.require_valid_now();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
@@ -4099,6 +4099,7 @@ impl ActiveObjectMetadataScan<'_> {
                 continuation_token,
                 max_keys,
             )
+            .map_err(crate::ObjectMetadataListingFailure::from_object_pg_action)
     }
 
     pub fn list_object_versions(
@@ -4108,7 +4109,7 @@ impl ActiveObjectMetadataScan<'_> {
         key_marker: Option<&ObjectKey>,
         version_id_marker: Option<VersionId>,
         max_keys: u32,
-    ) -> Result<ListedBucketObjectVersions, ObjectPgActionError> {
+    ) -> Result<ListedBucketObjectVersions, crate::ObjectMetadataListingFailure> {
         let require_valid_route = || self.admission.require_valid_now();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
@@ -4124,6 +4125,7 @@ impl ActiveObjectMetadataScan<'_> {
                 version_id_marker,
                 max_keys,
             )
+            .map_err(crate::ObjectMetadataListingFailure::from_object_pg_action)
     }
 
     pub fn list_multipart_uploads(
@@ -4133,7 +4135,7 @@ impl ActiveObjectMetadataScan<'_> {
         key_marker: Option<&ObjectKey>,
         upload_id_marker: Option<&crate::UploadId>,
         max_uploads: u32,
-    ) -> Result<ListedBucketMultipartUploads, ObjectPgActionError> {
+    ) -> Result<ListedBucketMultipartUploads, crate::ObjectMetadataListingFailure> {
         let require_valid_route = || self.admission.require_valid_now();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
@@ -4149,6 +4151,7 @@ impl ActiveObjectMetadataScan<'_> {
                 upload_id_marker,
                 max_uploads,
             )
+            .map_err(crate::ObjectMetadataListingFailure::from_object_pg_action)
     }
 }
 

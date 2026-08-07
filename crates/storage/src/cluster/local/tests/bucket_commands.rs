@@ -447,10 +447,14 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
         .unwrap()
         .list_objects(None, None, None, 100)
         .unwrap_err();
-    assert!(matches!(
-        object_error,
-        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
-    ));
+    assert_eq!(
+        object_error.kind(),
+        crate::ObjectMetadataListingFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        object_error.diagnostic_cause_label(),
+        "store_topology_failure"
+    );
     drop(object_hook);
     drop(object_admission);
 
@@ -460,10 +464,14 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
         .unwrap()
         .list_object_versions(None, None, None, None, 100)
         .unwrap_err();
-    assert!(matches!(
-        version_error,
-        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
-    ));
+    assert_eq!(
+        version_error.kind(),
+        crate::ObjectMetadataListingFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        version_error.diagnostic_cause_label(),
+        "store_topology_failure"
+    );
     drop(version_hook);
     drop(version_admission);
 
@@ -473,10 +481,14 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
         .unwrap()
         .list_multipart_uploads(None, None, None, None, 100)
         .unwrap_err();
-    assert!(matches!(
-        multipart_error,
-        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
-    ));
+    assert_eq!(
+        multipart_error.kind(),
+        crate::ObjectMetadataListingFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        multipart_error.diagnostic_cause_label(),
+        "store_topology_failure"
+    );
     drop(multipart_hook);
     drop(multipart_admission);
 }

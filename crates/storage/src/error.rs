@@ -2468,6 +2468,104 @@ impl std::fmt::Display for ObjectReadFailure {
 
 impl std::error::Error for ObjectReadFailure {}
 
+/// Exhaustive logical outcome of an admitted bucket-wide object-metadata scan.
+///
+/// Object, version, and multipart-upload listings share this failure contract.
+/// The scan's PG fan-out, route state, database errors, and RPC details remain
+/// private to storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectMetadataListingFailureKind {
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+/// Opaque failure returned by admitted object-metadata listing capabilities.
+pub struct ObjectMetadataListingFailure {
+    kind: ObjectMetadataListingFailureKind,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl ObjectMetadataListingFailure {
+    #[must_use]
+    pub const fn kind(&self) -> ObjectMetadataListingFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let (operation_kind, diagnostic_category) = classify_object_pg_action(error);
+        let kind = match operation_kind {
+            ObjectOperationFailureKind::ResourceExhausted => {
+                ObjectMetadataListingFailureKind::ResourceExhausted
+            }
+            ObjectOperationFailureKind::MetadataCommandContention => {
+                ObjectMetadataListingFailureKind::MetadataCommandContention
+            }
+            ObjectOperationFailureKind::RetryableConvergence => {
+                ObjectMetadataListingFailureKind::RetryableConvergence
+            }
+            ObjectOperationFailureKind::ObjectNotFound
+            | ObjectOperationFailureKind::InternalError => {
+                ObjectMetadataListingFailureKind::InternalError
+            }
+        };
+        Self {
+            kind,
+            diagnostic_category,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn from_store(error: StoreError) -> Self {
+        Self::from_object_pg_action(ObjectPgActionError::Store(error))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) const fn for_test(kind: ObjectMetadataListingFailureKind) -> Self {
+        let read_kind = match kind {
+            ObjectMetadataListingFailureKind::ResourceExhausted => {
+                ObjectReadFailureKind::ResourceExhausted
+            }
+            ObjectMetadataListingFailureKind::MetadataCommandContention => {
+                ObjectReadFailureKind::MetadataCommandContention
+            }
+            ObjectMetadataListingFailureKind::RetryableConvergence => {
+                ObjectReadFailureKind::RetryableConvergence
+            }
+            ObjectMetadataListingFailureKind::InternalError => ObjectReadFailureKind::InternalError,
+        };
+        let failure = ObjectReadFailure::for_test(read_kind);
+        Self {
+            kind,
+            diagnostic_category: failure.diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for ObjectMetadataListingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectMetadataListingFailure")
+            .field("kind", &self.kind)
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ObjectMetadataListingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("object metadata listing failed")
+    }
+}
+
+impl std::error::Error for ObjectMetadataListingFailure {}
+
 /// Exhaustive logical outcome of an object-metadata mutation.
 ///
 /// This deliberately omits PG, node, route, database, command-log, and RPC
@@ -3779,6 +3877,100 @@ mod tests {
             },
         ));
         assert_eq!(metadata.kind(), ObjectReadFailureKind::InternalError);
+        assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
+        let rendered = format!("{metadata:?} {metadata}");
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&metadata).is_none());
+    }
+
+    #[test]
+    fn object_metadata_listing_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| ObjectMetadataListingFailure::from_object_pg_action(error).kind();
+
+        for (class, expected) in [
+            (
+                StoreOperationFailureClass::ResourceExhausted,
+                ObjectMetadataListingFailureKind::ResourceExhausted,
+            ),
+            (
+                StoreOperationFailureClass::MetadataCommandContention,
+                ObjectMetadataListingFailureKind::MetadataCommandContention,
+            ),
+            (
+                StoreOperationFailureClass::RetryableConvergence,
+                ObjectMetadataListingFailureKind::RetryableConvergence,
+            ),
+            (
+                StoreOperationFailureClass::Other,
+                ObjectMetadataListingFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(
+                convert(ObjectPgActionError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                )),
+                expected
+            );
+            assert_eq!(
+                ObjectMetadataListingFailure::for_test(expected).kind(),
+                expected
+            );
+        }
+
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(
+                MetadataError::ObjectVersionReservationConflict {
+                    version_id: crate::VersionId::from_u64(7),
+                },
+            )),
+            ObjectMetadataListingFailureKind::MetadataCommandContention
+        );
+        for error in [
+            ObjectPgActionError::Metadata(MetadataError::ObjectNotFound),
+            ObjectPgActionError::InvalidRequest {
+                reason: "not valid for an admitted object listing".to_string(),
+            },
+            ObjectPgActionError::StaleObjectReadSubject,
+            ObjectPgActionError::StaleDirectPutCommitSnapshot,
+            ObjectPgActionError::StaleStreamFinalizeSnapshot,
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            ObjectPgActionError::MultipartConditionalRequestConflict,
+        ] {
+            assert_eq!(
+                convert(error),
+                ObjectMetadataListingFailureKind::InternalError
+            );
+        }
+    }
+
+    #[test]
+    fn object_metadata_listing_failure_discards_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret object listing operation";
+        const SECRET_SOURCE: &str = "secret object listing source";
+        let failure = ObjectMetadataListingFailure::from_store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+
+        assert_eq!(
+            failure.kind(),
+            ObjectMetadataListingFailureKind::InternalError
+        );
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "object metadata listing failed");
+        let rendered = format!("{failure:?} {failure}");
+        assert!(rendered.contains("store_io_failure"));
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&failure).is_none());
+
+        let metadata = ObjectMetadataListingFailure::from_object_pg_action(
+            ObjectPgActionError::Metadata(MetadataError::Db {
+                context: SECRET_CONTEXT,
+                source: DatabaseError::new(SECRET_SOURCE),
+            }),
+        );
         assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
         let rendered = format!("{metadata:?} {metadata}");
         assert!(!rendered.contains(SECRET_CONTEXT));

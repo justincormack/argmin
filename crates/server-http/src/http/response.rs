@@ -184,6 +184,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::BucketWriteDrain(_)
         | ServerError::BucketSnapshotLoad(_)
         | ServerError::ObjectRead(_)
+        | ServerError::ObjectMetadataListing(_)
         | ServerError::ObjectMetadataMutation(_)
         | ServerError::StreamUpload(_)
         | ServerError::DirectPut(_)
@@ -4978,6 +4979,8 @@ mod tests {
         let internal_implementation_error =
             server_core::error::test_support::internal_implementation_error_redaction_fixture();
         let object_read_error = storage::test_support::object_read_failure_diagnostic_fixture();
+        let object_listing_error =
+            storage::test_support::object_metadata_listing_failure_diagnostic_fixture();
         let object_mutation_error =
             storage::test_support::object_metadata_mutation_failure_diagnostic_fixture();
         let stream_upload_error = storage::test_support::stream_upload_failure_diagnostic_fixture();
@@ -5006,6 +5009,10 @@ mod tests {
             (
                 ServerError::ObjectRead(object_read_error.0),
                 object_read_error.1.to_vec(),
+            ),
+            (
+                ServerError::ObjectMetadataListing(object_listing_error.0),
+                object_listing_error.1.to_vec(),
             ),
             (
                 ServerError::ObjectMetadataMutation(object_mutation_error.0),

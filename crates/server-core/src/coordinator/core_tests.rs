@@ -10189,6 +10189,28 @@ fn direct_put_failure_kinds_map_exhaustively_to_s3_outcomes() {
 }
 
 #[test]
+fn object_metadata_listing_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let map = |kind| {
+        Coordinator::map_object_metadata_listing_failure(
+            storage::test_support::object_metadata_listing_failure_for_kind(kind),
+        )
+    };
+
+    for kind in [
+        storage::ObjectMetadataListingFailureKind::ResourceExhausted,
+        storage::ObjectMetadataListingFailureKind::MetadataCommandContention,
+        storage::ObjectMetadataListingFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind), ServerError::SlowDown));
+    }
+    assert!(matches!(
+        map(storage::ObjectMetadataListingFailureKind::InternalError),
+        ServerError::ObjectMetadataListing(error)
+            if error.diagnostic_cause_label() == "store_internal_failure"
+    ));
+}
+
+#[test]
 fn multipart_management_failure_kinds_map_exhaustively_to_s3_outcomes() {
     let upload_id = trusted_upload_id("multipart-management-mapping");
     let map = |kind| {

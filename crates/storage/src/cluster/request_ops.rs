@@ -9902,8 +9902,8 @@ impl super::StorageCluster {
         })
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn list_objects_for_bucket(
+    #[cfg(test)]
+    pub(crate) fn list_objects_for_bucket(
         &self,
         bucket: &BucketName,
         prefix: Option<&ObjectKey>,
@@ -10141,8 +10141,8 @@ impl super::StorageCluster {
         })
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn list_object_versions_for_bucket(
+    #[cfg(test)]
+    pub(crate) fn list_object_versions_for_bucket(
         &self,
         bucket: &BucketName,
         prefix: Option<&ObjectKey>,
@@ -16360,8 +16360,8 @@ impl super::StorageCluster {
         ))
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn list_multipart_uploads_for_bucket(
+    #[cfg(test)]
+    pub(crate) fn list_multipart_uploads_for_bucket(
         &self,
         bucket: &BucketName,
         prefix: Option<&ObjectKey>,

@@ -155,7 +155,8 @@ pub use error::{
     BucketSnapshotLoadFailure, BucketSnapshotLoadFailureKind, BucketWriteDrainFailure,
     BucketWriteDrainFailureKind, ClusterBuildError, DirectPutFailure, DirectPutFailureKind,
     MetadataError, MultipartCompletionFailure, MultipartCompletionFailureKind,
-    MultipartManagementFailure, MultipartManagementFailureKind, ObjectMetadataMutationFailure,
+    MultipartManagementFailure, MultipartManagementFailureKind, ObjectMetadataListingFailure,
+    ObjectMetadataListingFailureKind, ObjectMetadataMutationFailure,
     ObjectMetadataMutationFailureKind, ObjectPgActionError, ObjectReadFailure,
     ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
     StreamUploadFailure, StreamUploadFailureKind,
@@ -1589,6 +1590,14 @@ pub mod test_support {
         ObjectReadFailure::for_test(kind)
     }
 
+    /// Construct an opaque object-metadata listing failure from its logical outcome.
+    #[must_use]
+    pub fn object_metadata_listing_failure_for_kind(
+        kind: ObjectMetadataListingFailureKind,
+    ) -> ObjectMetadataListingFailure {
+        ObjectMetadataListingFailure::for_test(kind)
+    }
+
     /// Construct an opaque object-metadata mutation failure from its logical outcome.
     #[must_use]
     pub fn object_metadata_mutation_failure_for_kind(
@@ -1655,6 +1664,22 @@ pub mod test_support {
                     source: std::io::Error::other(SECRET_SOURCE),
                 },
             )),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
+    }
+
+    /// Construct an opaque object-metadata listing failure containing a bounded
+    /// I/O diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn object_metadata_listing_failure_diagnostic_fixture(
+    ) -> (ObjectMetadataListingFailure, &'static [&'static str]) {
+        const SECRET_CONTEXT: &str = "secret object listing fixture operation";
+        const SECRET_SOURCE: &str = "secret object listing fixture source";
+        (
+            ObjectMetadataListingFailure::from_store(StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            }),
             &[SECRET_CONTEXT, SECRET_SOURCE],
         )
     }

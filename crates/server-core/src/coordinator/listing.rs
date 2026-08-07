@@ -10,6 +10,21 @@ use super::{
 use crate::error::ServerError;
 
 impl Coordinator {
+    pub(super) fn map_object_metadata_listing_failure(
+        error: storage::ObjectMetadataListingFailure,
+    ) -> ServerError {
+        match error.kind() {
+            storage::ObjectMetadataListingFailureKind::ResourceExhausted
+            | storage::ObjectMetadataListingFailureKind::MetadataCommandContention
+            | storage::ObjectMetadataListingFailureKind::RetryableConvergence => {
+                ServerError::SlowDown
+            }
+            storage::ObjectMetadataListingFailureKind::InternalError => {
+                ServerError::ObjectMetadataListing(error)
+            }
+        }
+    }
+
     pub fn list_objects_v2_on_admitted_route(
         &self,
         admission: &storage::StorageClusterRouteAdmission,
@@ -58,7 +73,7 @@ impl Coordinator {
                 list_start_after.as_ref(),
                 max_keys,
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_object_metadata_listing_failure)?;
 
         let mut objects: Vec<ListEntry> = Vec::new();
         for obj in &listed.objects {
@@ -154,7 +169,7 @@ impl Coordinator {
                 version_id_marker,
                 max_keys,
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_object_metadata_listing_failure)?;
 
         let mut versions: Vec<VersionEntry> = Vec::new();
         let mut last_key: Option<&ObjectKey> = None;

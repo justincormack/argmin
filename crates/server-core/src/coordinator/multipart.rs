@@ -1289,7 +1289,7 @@ impl Coordinator {
                 upload_id_marker,
                 max_uploads,
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_object_metadata_listing_failure)?;
 
         let next_marker = match listed.next_marker() {
             Some(storage::MultipartUploadListMarker::Upload { key, upload_id }) => {
