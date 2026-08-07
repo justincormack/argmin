@@ -28,7 +28,8 @@ Do not use `--all-features` for production artifacts. The normal production
 release build uses the default feature set. There is a single alternative
 production feature, `openssl`, which dynamically links every cryptographic
 primitive and TLS connection against the system OpenSSL library rather than
-the default ring-based implementation:
+the default ring-based implementation. This alternative requires OpenSSL 3.0
+or later:
 
 ```bash
 cargo build -p argmin-s3 --release --no-default-features --features openssl

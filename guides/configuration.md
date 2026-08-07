@@ -50,7 +50,7 @@ configured through the cluster manifest.
 
 Ring is the default provider for cryptographic primitives and every rustls
 connection, including the public listener and internal TLS/TCP connections. A
-build can also use the system OpenSSL library:
+build can also use the system OpenSSL 3.0 or later library:
 
 ```bash
 cargo build --release -p argmin-s3 --no-default-features --features openssl

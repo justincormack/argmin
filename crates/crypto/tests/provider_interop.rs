@@ -5,7 +5,7 @@ use proptest::prelude::*;
 
 use argmin_crypto::aead::{Aes256GcmKey, AES_256_GCM_KEY_LEN, AES_GCM_NONCE_LEN};
 use argmin_crypto::digest::{Md5, Sha1, Sha512};
-use argmin_crypto::hmac::Sha256Key;
+use argmin_crypto::hmac::{self, Sha256Key};
 use argmin_crypto::sha256::Sha256;
 
 struct HkdfLength(usize);
@@ -87,6 +87,7 @@ proptest! {
         let expected_key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key);
         let expected = ring::hmac::sign(&expected_key, &data);
         let expected_bytes: [u8; 32] = expected.as_ref().try_into().unwrap();
+        prop_assert_eq!(hmac::sha256(&key, &data), expected_bytes);
         prop_assert_eq!(key_under_test.sign(&data), expected_bytes);
 
         let mut context = key_under_test.context();

@@ -93,10 +93,10 @@ The default invocation of [`bench-crypto`](../scripts/bench-crypto) uses the
 ring-based provider for cryptographic primitives and TLS, with the project's
 Rust MD5 compatibility implementation. The OpenSSL invocation disables default
 features and selects the same dynamically linked `openssl` provider used by a
-production OpenSSL build for both primitives and TLS. Provider selection is a
-build-time choice; there is no runtime environment-variable override. See the
-[configuration guide](configuration.md#cryptography-provider) for production
-build commands.
+production OpenSSL build for both primitives and TLS. OpenSSL 3.0 or later is
+required. Provider selection is a build-time choice; there is no runtime
+environment-variable override. See the [configuration
+guide](configuration.md#cryptography-provider) for production build commands.
 
 The workload can be adjusted with:
 

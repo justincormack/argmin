@@ -10,11 +10,12 @@ undocumented_unsafe_blocks = "deny"
 [features]
 default = ["ring"]
 ring = ["dep:md5_legacy", "dep:ring"]
-openssl = ["dep:openssl"]
+openssl = ["dep:openssl", "dep:openssl-sys"]
 
 [dependencies]
 md5_legacy = { package = "md-5", version = "0.10", optional = true }
 openssl = { version = "0.10", optional = true }
+openssl-sys = { version = "0.9", optional = true }
 ring = { version = "0.17", optional = true }
 
 [dev-dependencies]
