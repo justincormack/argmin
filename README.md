@@ -101,6 +101,13 @@ Key compatibility notes
 Currently operational observability and tooling remains weak. Functions such as adding storage are not
 yet implemented, hence the "do not use in production" notice.
 
+## Performance
+
+Focused checksum, erasure-coding, SigV4, and peer TLS benchmarks are documented
+in the [performance guide](guides/performance.md). The guide covers comparable
+benchmark environments, ring and OpenSSL builds, backend-selection checks, and
+architecture-specific notes for amd64, arm64, and riscv64.
+
 ## Testing
 
 ```bash
