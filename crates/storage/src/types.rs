@@ -4613,11 +4613,98 @@ pub struct ObjectReadSnapshot {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum ObjectPayloadPlacementDiagnosticError {
+pub(crate) enum ObjectPayloadPlacementDiagnosticError {
     #[error("current object is a delete marker")]
     DeleteMarker,
     #[error("current object has no standard payload segments")]
     NoStandardPayloadSegments,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectPayloadPlacementDiagnosticOutcome {
+    Success,
+    Conflict,
+}
+
+/// Bounded outcome selected by the storage-owned metadata-checkpoint
+/// diagnostic operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataCheckpointDiagnosticOutcome {
+    Success,
+    InvalidInput,
+    Conflict,
+}
+
+/// Opaque, storage-rendered object payload-placement diagnostics.
+pub struct ObjectPayloadPlacementDiagnostic {
+    outcome: ObjectPayloadPlacementDiagnosticOutcome,
+    text: String,
+}
+
+impl ObjectPayloadPlacementDiagnostic {
+    pub(crate) fn success(text: String) -> Self {
+        Self {
+            outcome: ObjectPayloadPlacementDiagnosticOutcome::Success,
+            text,
+        }
+    }
+
+    pub(crate) fn conflict(text: String) -> Self {
+        Self {
+            outcome: ObjectPayloadPlacementDiagnosticOutcome::Conflict,
+            text,
+        }
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> ObjectPayloadPlacementDiagnosticOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
+
+impl std::fmt::Debug for ObjectPayloadPlacementDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectPayloadPlacementDiagnostic")
+            .field("outcome", &self.outcome)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Opaque, storage-rendered metadata-checkpoint diagnostics.
+pub struct MetadataCheckpointDiagnostic {
+    outcome: MetadataCheckpointDiagnosticOutcome,
+    text: String,
+}
+
+impl MetadataCheckpointDiagnostic {
+    pub(crate) fn new(outcome: MetadataCheckpointDiagnosticOutcome, text: String) -> Self {
+        Self { outcome, text }
+    }
+
+    #[must_use]
+    pub fn outcome(&self) -> MetadataCheckpointDiagnosticOutcome {
+        self.outcome
+    }
+
+    #[must_use]
+    pub fn into_text(self) -> String {
+        self.text
+    }
+}
+
+impl std::fmt::Debug for MetadataCheckpointDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetadataCheckpointDiagnostic")
+            .field("outcome", &self.outcome)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ObjectReadSnapshot {
@@ -4698,7 +4785,7 @@ impl ObjectReadSnapshot {
     /// This diagnostic text is not a stable wire or persistence format. Keeping the
     /// rendering here prevents physical placement coordinates from becoming part of
     /// the object-read interface used by other crates.
-    pub fn payload_placement_diagnostic(
+    pub(crate) fn payload_placement_diagnostic(
         &self,
     ) -> Result<String, ObjectPayloadPlacementDiagnosticError> {
         use std::fmt::Write as _;

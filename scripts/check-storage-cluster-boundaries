@@ -4345,6 +4345,41 @@ fail_with_matches \
     "BucketSnapshotLoadError is storage-private; callers must use BucketSnapshotLoadFailure and its exhaustive logical kind" \
     "$raw_bucket_snapshot_load_error_transit"
 
+http_storage_debug_representation_leaks=$(
+    {
+        rg -n --color=never \
+            '\b(PgId|raw_pg_id|MetadataCommandCheckpointRecordSummary|ObjectReadSnapshotMode|ObjectPayloadPlacementDiagnosticError)\b|record_current_metadata_command_checkpoint_for_pg|load_object_read_snapshot_if|\.payload_placement_diagnostic[[:space:]]*\(' \
+            crates/server-http/src \
+            -g '*.rs' \
+            || true
+        rg -n -U --color=never \
+            '\bPgId\b|pub fn metadata_checkpoint_diagnostic(?s:.{0,160})(pg_id|u32)' \
+            crates/server-core/src/coordinator/infra.rs \
+            || true
+        rg -n -U --color=never \
+            'pub struct MetadataCommandCheckpointRecordSummary|^[[:space:]]*pub[[:space:]]+fn[[:space:]]+record_current_metadata_command_checkpoint_for_pg|pub enum ObjectPayloadPlacementDiagnosticError|^[[:space:]]*pub[[:space:]]+fn[[:space:]]+payload_placement_diagnostic' \
+            crates/storage/src/cluster.rs crates/storage/src/types.rs \
+            || true
+        if ! rg -q -U \
+            'pub fn metadata_checkpoint_diagnostic(?s:.{0,160})selector: &str' \
+            crates/storage/src/cluster/request_ops.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/request_ops.rs: metadata checkpoint diagnostic must accept an opaque selector string'
+        fi
+        if ! rg -q -U \
+            'pub fn metadata_checkpoint_diagnostic(?s:.{0,160})selector: &str' \
+            crates/server-core/src/coordinator/infra.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/infra.rs: metadata checkpoint diagnostic must forward an opaque selector string'
+        fi
+    }
+)
+fail_with_matches \
+    "Local HTTP diagnostics must use opaque storage-owned operations rather than PG, checkpoint-summary, object-snapshot, or placement-error representations" \
+    "$http_storage_debug_representation_leaks"
+
 raw_storage_wrapper_diagnostic_formatting=$(
     {
         rg -n -U --color=never \

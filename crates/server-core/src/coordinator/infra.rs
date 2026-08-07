@@ -23,7 +23,8 @@ use super::{
 use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 use storage::{
-    BucketFastPathInfo, BucketInfo, BucketName, BucketState, SessionId, StorageCluster,
+    BucketFastPathInfo, BucketInfo, BucketName, BucketState, MetadataCheckpointDiagnostic,
+    ObjectKey, ObjectPayloadPlacementDiagnostic, SessionId, StorageCluster,
     StorageClusterRouteAdmission, StorageClusterRouteHandle,
 };
 
@@ -702,6 +703,23 @@ impl Coordinator {
 
     pub fn storage_node_for_request(&self) -> Arc<StorageCluster> {
         self.storage_node()
+    }
+
+    /// Return storage-owned placement diagnostics without exposing an object
+    /// snapshot or physical placement representation to the HTTP adapter.
+    pub fn object_payload_placement_diagnostic(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> ObjectPayloadPlacementDiagnostic {
+        self.storage_node()
+            .object_payload_placement_diagnostic(bucket, key)
+    }
+
+    /// Forward an opaque local-diagnostic selector while keeping its grammar,
+    /// PG construction, and checkpoint representation inside storage.
+    pub fn metadata_checkpoint_diagnostic(&self, selector: &str) -> MetadataCheckpointDiagnostic {
+        self.storage_node().metadata_checkpoint_diagnostic(selector)
     }
 
     pub fn admit_storage_route_for_request(

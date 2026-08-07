@@ -44,7 +44,9 @@ use storage::test_support::{
 };
 use storage::{BucketName, SessionId};
 #[cfg(any(test, feature = "local-debug-endpoints"))]
-use storage::{ObjectKey, ObjectReadSnapshot, ObjectReadSnapshotMode, PgId};
+use storage::{
+    MetadataCheckpointDiagnosticOutcome, ObjectKey, ObjectPayloadPlacementDiagnosticOutcome,
+};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -1349,78 +1351,37 @@ fn local_debug_response(
                     "invalid object path\n".to_string(),
                 ));
             };
-            let storage = state
+            let diagnostic = state
                 .pool
                 .first()
                 .expect("server has at least one frontend")
                 .coordinator
-                .storage_node_for_request();
-            match storage.load_object_read_snapshot_if(
-                &bucket,
-                &key,
-                None,
-                ObjectReadSnapshotMode::StandardSegments,
-                |_| Ok::<(), Infallible>(()),
-            ) {
-                Ok(Ok(outcome)) => {
-                    match local_debug_object_payload_placement_body(&outcome.snapshot) {
-                        Ok(body) => Some(local_debug_text_response(200, body)),
-                        Err(error) => Some(local_debug_text_response(409, format!("{error}\n"))),
-                    }
-                }
-                Ok(Err(never)) => match never {},
-                Err(error) => Some(local_debug_text_response(409, format!("{error}\n"))),
-            }
+                .object_payload_placement_diagnostic(&bucket, &key);
+            let status_code = match diagnostic.outcome() {
+                ObjectPayloadPlacementDiagnosticOutcome::Success => 200,
+                ObjectPayloadPlacementDiagnosticOutcome::Conflict => 409,
+            };
+            Some(local_debug_text_response(
+                status_code,
+                diagnostic.into_text(),
+            ))
         }
         (&http::Method::POST, path)
             if path.starts_with("/__argmin/debug/metadata-checkpoint/record/") =>
         {
-            let raw_pg_id = path.trim_start_matches("/__argmin/debug/metadata-checkpoint/record/");
-            let Some(pg_id) = raw_pg_id.parse::<u32>().ok().map(PgId::new) else {
-                return Some(local_debug_text_response(
-                    400,
-                    "invalid pg id\n".to_string(),
-                ));
-            };
+            let selector = path.trim_start_matches("/__argmin/debug/metadata-checkpoint/record/");
             let result = state
                 .pool
                 .first()
                 .expect("server has at least one frontend")
                 .coordinator
-                .storage_node_for_request()
-                .record_current_metadata_command_checkpoint_for_pg(pg_id);
-            match result {
-                Ok(summary) => {
-                    let status_code = if summary.compaction_failed == 0 && summary.failed == 0 {
-                        200
-                    } else {
-                        409
-                    };
-                    Some(local_debug_text_response(
-                        status_code,
-                        format!(
-                            "pg_id={} scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} skipped_empty={} skipped_stale_epoch={} compacted={} compaction_deleted_entries={} compaction_noop={} compaction_no_checkpoint={} compaction_pending={} compaction_failed={} failed={} limit_reached={}\n",
-                            pg_id.get(),
-                            summary.scanned,
-                            summary.recorded,
-                            summary.already_current,
-                            summary.skipped_cadence,
-                            summary.skipped_inactive,
-                            summary.skipped_empty,
-                            summary.skipped_stale_epoch,
-                            summary.compacted,
-                            summary.compaction_deleted_entries,
-                            summary.compaction_noop,
-                            summary.compaction_no_checkpoint,
-                            summary.compaction_pending,
-                            summary.compaction_failed,
-                            summary.failed,
-                            summary.limit_reached
-                        ),
-                    ))
-                }
-                Err(error) => Some(local_debug_text_response(409, format!("{error}\n"))),
-            }
+                .metadata_checkpoint_diagnostic(selector);
+            let status_code = match result.outcome() {
+                MetadataCheckpointDiagnosticOutcome::Success => 200,
+                MetadataCheckpointDiagnosticOutcome::InvalidInput => 400,
+                MetadataCheckpointDiagnosticOutcome::Conflict => 409,
+            };
+            Some(local_debug_text_response(status_code, result.into_text()))
         }
         (_, path) if path.starts_with("/__argmin/debug/") || path == "/__argmin/debug" => {
             let body = b"not found\n".to_vec();
@@ -1459,13 +1420,6 @@ fn local_debug_text_response(status_code: u16, body: String) -> S3Response {
         error_diagnostic: None,
         include_wire_ids: true,
     }
-}
-
-#[cfg(any(test, feature = "local-debug-endpoints"))]
-fn local_debug_object_payload_placement_body(
-    snapshot: &ObjectReadSnapshot,
-) -> Result<String, storage::ObjectPayloadPlacementDiagnosticError> {
-    snapshot.payload_placement_diagnostic()
 }
 
 #[cfg(any(test, feature = "local-debug-endpoints"))]
@@ -6848,20 +6802,12 @@ Connection: close\r\n\r\n",
         let key = ObjectKey::try_from("nested/key".to_string()).unwrap();
         let expected = frontend
             .coordinator
-            .storage_node_for_request()
-            .load_object_read_snapshot_if(
-                &bucket,
-                &key,
-                None,
-                ObjectReadSnapshotMode::StandardSegments,
-                |_| Ok::<(), Infallible>(()),
-            )
-            .unwrap()
-            .unwrap()
-            .snapshot;
-        let expected_body = expected
-            .payload_placement_diagnostic()
-            .expect("test object should have standard payload placement");
+            .object_payload_placement_diagnostic(&bucket, &key);
+        assert_eq!(
+            expected.outcome(),
+            ObjectPayloadPlacementDiagnosticOutcome::Success
+        );
+        let expected_body = expected.into_text();
         let config = ServeConfig {
             local_debug_endpoint: true,
             ..ServeConfig::default()
@@ -6884,6 +6830,38 @@ Connection: close\r\n\r\n",
 
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.ends_with(&expected_body), "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_object_payload_placement_failure_is_owner_rendered() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "GET /__argmin/debug/object-payload-placement/missing-bucket/key HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(
+            response.ends_with("object payload placement unavailable: metadata_failure\n"),
+            "{response}"
+        );
+        assert!(!response.contains("bucket not found"), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6918,6 +6896,69 @@ Connection: close\r\n\r\n",
         assert!(response.contains("pg_id=0"), "{response}");
         assert!(response.contains("scanned=1"), "{response}");
         assert!(response.contains("skipped_empty=1"), "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_metadata_checkpoint_failure_is_owner_rendered() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "POST /__argmin/debug/metadata-checkpoint/record/4294967295 HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Length: 0\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+        assert!(
+            response
+                .ends_with("pg_id=4294967295 checkpoint_record_failed=store_topology_failure\n"),
+            "{response}"
+        );
+        assert!(!response.contains("cluster epoch"), "{response}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_debug_metadata_checkpoint_selector_grammar_is_storage_owned() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let config = ServeConfig {
+            local_debug_endpoint: true,
+            ..ServeConfig::default()
+        };
+        let (addr, _guard) = start_test_server_with_config(frontend, config, 0).await;
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        stream
+            .write_all(
+                concat!(
+                    "POST /__argmin/debug/metadata-checkpoint/record/not-a-number HTTP/1.1\r\n",
+                    "Host: localhost\r\n",
+                    "Content-Length: 0\r\n",
+                    "Connection: close\r\n",
+                    "\r\n",
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let response = read_http_response(&mut stream, Duration::from_secs(3));
+
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.ends_with("invalid pg id\n"), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

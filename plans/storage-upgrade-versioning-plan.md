@@ -435,7 +435,7 @@ Initial ownership assessment:
 | Storage-node RPC | `storage` | Complete containment: framing, wire errors, Unix/TLS transports, TLS 1.3 and private ALPN profile construction, authentication, dispatch, and malformed-wire/profile tests are storage-owned. The process supplies only deployment endpoint, trust-root, certificate-identity, listener, and lifecycle inputs. |
 | Control-plane durable state, RPC, and auth envelope | `storage` | Complete: client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Peer wire and durable representations are contained: raw frames, restart artifacts, WAL records/files, and layout helpers are private; process tests use logical clients and opaque semantic recovery inspection. |
-| PG topology, route state, and physical payload placement | `storage` | Production request, administration, placement, and maintenance paths are contained behind opaque storage-owned capabilities. Item 14 retains only the local debug endpoint's direct `PgId`/snapshot access and its final enforcement gate. |
+| PG topology, route state, and physical payload placement | `storage` | Complete containment: production request, administration, placement, maintenance, and local debug paths use opaque storage-owned capabilities or owner-rendered diagnostics. Direct `PgId`, checkpoint-summary, object-snapshot, and placement-error access is rejected in `server-http`. |
 | Physical storage maintenance workflows | `storage` | Complete: shard scavenging, repair, backfill, payload reclaim, accepted bucket-delete continuation/finalization, and abandoned stream-session cleanup run behind opaque storage-owned workers; their durable cursors, claims, work records, cleanup roots, and debug snapshots are private. |
 | Control-plane topology and metadata-transfer workflows | `storage` | Complete containment: topology commands, PG fencing, route/proof interpretation, metadata transfer, convergence, certification, durability publication, and retry classification are storage-owned. The process supplies logical operator or deployment inputs through opaque administration and host capabilities. |
 | Storage implementation-error taxonomy | `storage` | Policy and rendering containment are complete: storage exhaustively classifies operation failures, and `StoreFailure` retains only a semantic request class plus a bounded operator category rather than the implementation error. Structural transit of public `StoreError`, `MetadataError`, and raw operation wrappers remains item 14 work. |
@@ -2086,16 +2086,21 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        to storage; Phase 5 completion must not be used to keep the production representations
        public.
 
-    2. **Debug-PG containment.** The bucket-delete debug endpoint already follows the required
-       model: storage owns the diagnostic and returns owner-rendered opaque text. The metadata
-       checkpoint endpoint still parses and constructs `PgId` in `server-http`, obtains a raw
-       `StorageCluster`, invokes `record_current_metadata_command_checkpoint_for_pg`, interprets
-       `MetadataCommandCheckpointRecordSummary`, formats its fields, and receives `StoreError`.
-       Replace that path with a storage/coordinator diagnostic operation which accepts only the
-       logical operator input, constructs and interprets the PG operation inside storage, and
-       returns owner-rendered output plus a bounded semantic outcome. The object-payload-placement
-       endpoint must likewise request one owner-provided diagnostic instead of loading an object
-       snapshot directly in HTTP. Debug/test-only compilation does not waive this ownership rule.
+    2. **Complete — Debug-PG containment.** Completed on 2026-08-07. The bucket-delete,
+       metadata-checkpoint, and object-payload-placement endpoints now consume opaque,
+       storage-rendered diagnostics through coordinator methods. HTTP supplies only logical bucket,
+       key, or opaque storage-selector text and exhaustively maps each diagnostic's bounded outcome;
+       storage owns the selector grammar, constructs `PgId`, performs and interprets checkpoint
+       work, loads object snapshots, renders physical placement, and reduces failures to bounded
+       diagnostic labels. The coordinator contains no PG type, numeric selector, or PG-named value.
+       `MetadataCommandCheckpointRecordSummary`, its raw checkpoint method, placement rendering,
+       and placement errors are storage-private. Owner-local exact/redaction tests cover successful
+       checkpoint rendering and both diagnostic failure domains; HTTP tests cover successful and
+       owner-redacted conflict responses. The boundary checker rejects direct `PgId`, raw checkpoint
+       summary/method, snapshot loader, or placement renderer/error use in `server-http`, including
+       feature-gated debug code, rejects `PgId` in the coordinator seam, requires both coordinator
+       and storage checkpoint diagnostics to accept `selector: &str`, and rejects renewed public
+       visibility for the private storage primitives.
 
     3. **Remove HTTP's direct EC test dependency.** `server-http` no longer needs EC in production,
        but its dev-dependency remains because three duplicated HTTP test-cluster constructors use
@@ -2108,11 +2113,11 @@ Raft peer client and server transports are storage-owned and boundary-checked.
 
     4. **Final enforcement.** Extend `check-storage-cluster-boundaries` to reject concrete
        `StoreError`/`MetadataError` and raw operation-wrapper use outside storage, their public
-       export from storage after migration, direct `PgId` construction and raw storage diagnostic
-       calls in `server-http` (including `local-debug-endpoints` feature code), and a direct `ec`
+       export from storage after migration, and a direct `ec`
        dependency or `ec::` source use in `server-http`. Do not use an indiscriminate repository-wide
-       `PgId` text ban: enforce the actual non-owner production and feature-gated seams while
-       retaining owner-local storage tests. Item 14 completes only when crate visibility is the
+       representation text ban: enforce the actual non-owner production and feature-gated seams
+       while retaining owner-local storage tests. The debug-PG portion now rejects the specific
+       HTTP escape hatches rather than owner-local storage uses. Item 14 completes only when crate visibility is the
        primary representation boundary and the repository check prevents each removed escape hatch
        from being reintroduced.
 

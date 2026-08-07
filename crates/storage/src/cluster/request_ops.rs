@@ -9,8 +9,8 @@ use std::sync::{Mutex, OnceLock};
 use placement::NodeId;
 
 use super::{
-    LocalClusterRuntimeState, MetadataCommandExecutionRoute, MetadataCommandRecoveryProof,
-    MetadataCommandRouteMode,
+    LocalClusterRuntimeState, MetadataCommandCheckpointRecordSummary,
+    MetadataCommandExecutionRoute, MetadataCommandRecoveryProof, MetadataCommandRouteMode,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{
@@ -62,6 +62,7 @@ use crate::types::{
     BucketDeleteDebugPayloadReclaimClaim, BucketDeleteDebugPayloadReclaimClaimError,
     BucketDeleteDebugPayloadReclaimRoot, BucketDeleteDebugPayloadReclaimRootError,
     BucketDeleteDebugPendingCommand, BucketDeleteDebugSnapshot,
+    ObjectPayloadPlacementDiagnosticError,
 };
 #[cfg(test)]
 use crate::types::{
@@ -100,6 +101,71 @@ const BUCKET_WRITE_RESERVATION_LEASE_MILLIS: u64 = 15_000;
 // sessions stop blocking DeleteBucket well before common 30s client attempt
 // timeouts, while still allowing one delayed heartbeat under contention.
 const PUT_OBJECT_STREAM_CREATE_LEASE_MILLIS: u64 = BUCKET_WRITE_RESERVATION_LEASE_MILLIS;
+
+fn object_payload_placement_failure(
+    error: ObjectPgActionError,
+) -> ObjectPayloadPlacementDiagnostic {
+    ObjectPayloadPlacementDiagnostic::conflict(format!(
+        "object payload placement unavailable: {}\n",
+        error.diagnostic_cause_label()
+    ))
+}
+
+fn parse_metadata_checkpoint_selector(
+    selector: &str,
+) -> Result<PgId, MetadataCheckpointDiagnostic> {
+    selector.parse::<u32>().map(PgId::new).map_err(|_| {
+        MetadataCheckpointDiagnostic::new(
+            MetadataCheckpointDiagnosticOutcome::InvalidInput,
+            "invalid pg id\n".to_string(),
+        )
+    })
+}
+
+fn metadata_checkpoint_diagnostic_from_result(
+    pg_id: PgId,
+    result: Result<MetadataCommandCheckpointRecordSummary, StoreError>,
+) -> MetadataCheckpointDiagnostic {
+    match result {
+        Ok(summary) => {
+            let outcome = if summary.compaction_failed == 0 && summary.failed == 0 {
+                MetadataCheckpointDiagnosticOutcome::Success
+            } else {
+                MetadataCheckpointDiagnosticOutcome::Conflict
+            };
+            MetadataCheckpointDiagnostic::new(
+                outcome,
+                format!(
+                    "pg_id={} scanned={} recorded={} already_current={} skipped_cadence={} skipped_inactive={} skipped_empty={} skipped_stale_epoch={} compacted={} compaction_deleted_entries={} compaction_noop={} compaction_no_checkpoint={} compaction_pending={} compaction_failed={} failed={} limit_reached={}\n",
+                    pg_id.get(),
+                    summary.scanned,
+                    summary.recorded,
+                    summary.already_current,
+                    summary.skipped_cadence,
+                    summary.skipped_inactive,
+                    summary.skipped_empty,
+                    summary.skipped_stale_epoch,
+                    summary.compacted,
+                    summary.compaction_deleted_entries,
+                    summary.compaction_noop,
+                    summary.compaction_no_checkpoint,
+                    summary.compaction_pending,
+                    summary.compaction_failed,
+                    summary.failed,
+                    summary.limit_reached
+                ),
+            )
+        }
+        Err(error) => MetadataCheckpointDiagnostic::new(
+            MetadataCheckpointDiagnosticOutcome::Conflict,
+            format!(
+                "pg_id={} checkpoint_record_failed={}\n",
+                pg_id.get(),
+                error.diagnostic_cause_label()
+            ),
+        ),
+    }
+}
 
 fn metadata_command_terminal_cleanup_error_is_retryable(error: &StoreError) -> bool {
     matches!(
@@ -17185,6 +17251,57 @@ impl super::StorageCluster {
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
+    /// Render the current standard payload placement for one logical object.
+    ///
+    /// The snapshot and every physical placement value remain inside storage;
+    /// callers receive only owner-rendered text and a bounded outcome.
+    pub fn object_payload_placement_diagnostic(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> ObjectPayloadPlacementDiagnostic {
+        match self.load_object_read_snapshot_if(
+            bucket,
+            key,
+            None,
+            ObjectReadSnapshotMode::StandardSegments,
+            |_| Ok::<(), std::convert::Infallible>(()),
+        ) {
+            Ok(Ok(outcome)) => match outcome.snapshot.payload_placement_diagnostic() {
+                Ok(text) => ObjectPayloadPlacementDiagnostic::success(text),
+                Err(ObjectPayloadPlacementDiagnosticError::DeleteMarker) => {
+                    ObjectPayloadPlacementDiagnostic::conflict(
+                        "object payload placement unavailable: delete_marker\n".to_string(),
+                    )
+                }
+                Err(ObjectPayloadPlacementDiagnosticError::NoStandardPayloadSegments) => {
+                    ObjectPayloadPlacementDiagnostic::conflict(
+                        "object payload placement unavailable: no_standard_payload_segments\n"
+                            .to_string(),
+                    )
+                }
+            },
+            Ok(Err(never)) => match never {},
+            Err(error) => object_payload_placement_failure(error),
+        }
+    }
+
+    /// Record and render one metadata-command checkpoint diagnostic.
+    ///
+    /// The caller supplies only the opaque operator selector from the local
+    /// debug route. Storage owns its grammar, PG construction, checkpoint
+    /// interpretation, failure classification, and diagnostic representation.
+    pub fn metadata_checkpoint_diagnostic(&self, selector: &str) -> MetadataCheckpointDiagnostic {
+        let pg_id = match parse_metadata_checkpoint_selector(selector) {
+            Ok(pg_id) => pg_id,
+            Err(diagnostic) => return diagnostic,
+        };
+        metadata_checkpoint_diagnostic_from_result(
+            pg_id,
+            self.record_current_metadata_command_checkpoint_for_pg(pg_id),
+        )
+    }
+
     fn bucket_delete_diagnostic_internal(
         &self,
         bucket: &BucketName,
@@ -18840,6 +18957,103 @@ impl super::StorageCluster {
     ) -> Result<crate::node::BucketPgTestGuard<'_>, StoreError> {
         self.metadata_primary_bridge_node()?
             .test_lock_bucket_pg(bucket)
+    }
+}
+
+#[cfg(test)]
+mod local_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_checkpoint_diagnostic_is_exact_and_storage_owned() {
+        let summary = MetadataCommandCheckpointRecordSummary {
+            scanned: 1,
+            recorded: 2,
+            already_current: 3,
+            skipped_cadence: 4,
+            skipped_inactive: 5,
+            skipped_empty: 6,
+            skipped_stale_epoch: 7,
+            compacted: 8,
+            compaction_deleted_entries: 9,
+            compaction_noop: 10,
+            compaction_no_checkpoint: 11,
+            compaction_pending: 12,
+            compaction_failed: 0,
+            failed: 0,
+            limit_reached: true,
+        };
+
+        let diagnostic = metadata_checkpoint_diagnostic_from_result(PgId::new(13), Ok(summary));
+        assert_eq!(
+            diagnostic.outcome(),
+            MetadataCheckpointDiagnosticOutcome::Success
+        );
+        assert_eq!(
+            diagnostic.into_text(),
+            concat!(
+                "pg_id=13 scanned=1 recorded=2 already_current=3 skipped_cadence=4 ",
+                "skipped_inactive=5 skipped_empty=6 skipped_stale_epoch=7 compacted=8 ",
+                "compaction_deleted_entries=9 compaction_noop=10 compaction_no_checkpoint=11 ",
+                "compaction_pending=12 compaction_failed=0 failed=0 limit_reached=true\n",
+            )
+        );
+    }
+
+    #[test]
+    fn metadata_checkpoint_selector_grammar_is_storage_owned() {
+        assert_eq!(
+            parse_metadata_checkpoint_selector("13").unwrap(),
+            PgId::new(13)
+        );
+
+        let diagnostic = parse_metadata_checkpoint_selector("not-a-number").unwrap_err();
+        assert_eq!(
+            diagnostic.outcome(),
+            MetadataCheckpointDiagnosticOutcome::InvalidInput
+        );
+        assert_eq!(diagnostic.into_text(), "invalid pg id\n");
+    }
+
+    #[test]
+    fn local_diagnostic_failures_and_debug_are_redacted() {
+        let checkpoint = metadata_checkpoint_diagnostic_from_result(
+            PgId::new(17),
+            Err(StoreError::Io {
+                context: "secret checkpoint path",
+                source: std::io::Error::other("secret checkpoint source"),
+            }),
+        );
+        assert_eq!(
+            checkpoint.outcome(),
+            MetadataCheckpointDiagnosticOutcome::Conflict
+        );
+        let checkpoint_debug = format!("{checkpoint:?}");
+        let checkpoint_text = checkpoint.into_text();
+        assert_eq!(
+            checkpoint_text,
+            "pg_id=17 checkpoint_record_failed=store_io_failure\n"
+        );
+        assert!(!checkpoint_debug.contains("secret"));
+        assert!(!checkpoint_text.contains("secret"));
+
+        let placement =
+            object_payload_placement_failure(ObjectPgActionError::Store(StoreError::Io {
+                context: "secret placement path",
+                source: std::io::Error::other("secret placement source"),
+            }));
+        assert_eq!(
+            placement.outcome(),
+            ObjectPayloadPlacementDiagnosticOutcome::Conflict
+        );
+        let placement_debug = format!("{placement:?}");
+        let placement_text = placement.into_text();
+        assert_eq!(
+            placement_text,
+            "object payload placement unavailable: store_io_failure\n"
+        );
+        assert!(!placement_debug.contains("secret"));
+        assert!(!placement_text.contains("secret"));
     }
 }
 

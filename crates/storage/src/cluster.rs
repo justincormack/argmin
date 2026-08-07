@@ -455,22 +455,22 @@ pub struct TestDirectPutWrittenSegment {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct MetadataCommandCheckpointRecordSummary {
-    pub scanned: usize,
-    pub recorded: usize,
-    pub already_current: usize,
-    pub skipped_cadence: usize,
-    pub skipped_inactive: usize,
-    pub skipped_empty: usize,
-    pub skipped_stale_epoch: usize,
-    pub compacted: usize,
-    pub compaction_deleted_entries: u64,
-    pub compaction_noop: usize,
-    pub compaction_no_checkpoint: usize,
-    pub compaction_pending: usize,
-    pub compaction_failed: usize,
-    pub failed: usize,
-    pub limit_reached: bool,
+pub(crate) struct MetadataCommandCheckpointRecordSummary {
+    pub(crate) scanned: usize,
+    pub(crate) recorded: usize,
+    pub(crate) already_current: usize,
+    pub(crate) skipped_cadence: usize,
+    pub(crate) skipped_inactive: usize,
+    pub(crate) skipped_empty: usize,
+    pub(crate) skipped_stale_epoch: usize,
+    pub(crate) compacted: usize,
+    pub(crate) compaction_deleted_entries: u64,
+    pub(crate) compaction_noop: usize,
+    pub(crate) compaction_no_checkpoint: usize,
+    pub(crate) compaction_pending: usize,
+    pub(crate) compaction_failed: usize,
+    pub(crate) failed: usize,
+    pub(crate) limit_reached: bool,
 }
 
 /// Resume position for bounded routine metadata-command checkpoint scans.
@@ -11203,7 +11203,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn record_current_metadata_command_checkpoint_for_pg(
+    pub(crate) fn record_current_metadata_command_checkpoint_for_pg(
         &self,
         pg_id: PgId,
     ) -> Result<MetadataCommandCheckpointRecordSummary, StoreError> {
