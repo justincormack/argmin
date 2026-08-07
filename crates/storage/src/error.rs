@@ -2762,6 +2762,106 @@ impl std::fmt::Display for LifecycleMaintenanceFailure {
 
 impl std::error::Error for LifecycleMaintenanceFailure {}
 
+/// Exhaustive logical outcome of lifecycle mutation publication and recovery.
+///
+/// The policy callback remains a separate nested result so its higher-layer
+/// error is preserved unchanged. Command ownership, routing, database, and RPC
+/// representations remain private to storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LifecycleMutationFailureKind {
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+/// Opaque failure returned by lifecycle mutation capabilities.
+pub struct LifecycleMutationFailure {
+    kind: LifecycleMutationFailureKind,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl LifecycleMutationFailure {
+    #[must_use]
+    pub const fn kind(&self) -> LifecycleMutationFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let (operation_kind, diagnostic_category) = classify_object_pg_action(error);
+        let kind = match operation_kind {
+            ObjectOperationFailureKind::ResourceExhausted => {
+                LifecycleMutationFailureKind::ResourceExhausted
+            }
+            ObjectOperationFailureKind::MetadataCommandContention => {
+                LifecycleMutationFailureKind::MetadataCommandContention
+            }
+            ObjectOperationFailureKind::RetryableConvergence => {
+                LifecycleMutationFailureKind::RetryableConvergence
+            }
+            ObjectOperationFailureKind::ObjectNotFound
+            | ObjectOperationFailureKind::InternalError => {
+                LifecycleMutationFailureKind::InternalError
+            }
+        };
+        Self {
+            kind,
+            diagnostic_category,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn from_store(error: StoreError) -> Self {
+        Self::from_object_pg_action(ObjectPgActionError::Store(error))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) const fn for_test(kind: LifecycleMutationFailureKind) -> Self {
+        let maintenance_kind = match kind {
+            LifecycleMutationFailureKind::ResourceExhausted => {
+                LifecycleMaintenanceFailureKind::ResourceExhausted
+            }
+            LifecycleMutationFailureKind::MetadataCommandContention => {
+                LifecycleMaintenanceFailureKind::MetadataCommandContention
+            }
+            LifecycleMutationFailureKind::RetryableConvergence => {
+                LifecycleMaintenanceFailureKind::RetryableConvergence
+            }
+            LifecycleMutationFailureKind::InternalError => {
+                LifecycleMaintenanceFailureKind::InternalError
+            }
+        };
+        let failure = LifecycleMaintenanceFailure::for_test(maintenance_kind);
+        Self {
+            kind,
+            diagnostic_category: failure.diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for LifecycleMutationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LifecycleMutationFailure")
+            .field("kind", &self.kind)
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for LifecycleMutationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("lifecycle mutation failed")
+    }
+}
+
+impl std::error::Error for LifecycleMutationFailure {}
+
 /// Exhaustive logical outcome of an object-metadata mutation.
 ///
 /// This deliberately omits PG, node, route, database, command-log, and RPC
@@ -4342,6 +4442,95 @@ mod tests {
         assert!(std::error::Error::source(&failure).is_none());
 
         let metadata = LifecycleMaintenanceFailure::from_object_pg_action(
+            ObjectPgActionError::Metadata(MetadataError::Db {
+                context: SECRET_CONTEXT,
+                source: DatabaseError::new(SECRET_SOURCE),
+            }),
+        );
+        assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
+        let rendered = format!("{metadata:?} {metadata}");
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&metadata).is_none());
+    }
+
+    #[test]
+    fn lifecycle_mutation_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| LifecycleMutationFailure::from_object_pg_action(error).kind();
+
+        for (class, expected) in [
+            (
+                StoreOperationFailureClass::ResourceExhausted,
+                LifecycleMutationFailureKind::ResourceExhausted,
+            ),
+            (
+                StoreOperationFailureClass::MetadataCommandContention,
+                LifecycleMutationFailureKind::MetadataCommandContention,
+            ),
+            (
+                StoreOperationFailureClass::RetryableConvergence,
+                LifecycleMutationFailureKind::RetryableConvergence,
+            ),
+            (
+                StoreOperationFailureClass::Other,
+                LifecycleMutationFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(
+                convert(ObjectPgActionError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                )),
+                expected
+            );
+            assert_eq!(
+                LifecycleMutationFailure::for_test(expected).kind(),
+                expected
+            );
+        }
+
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(
+                MetadataError::ObjectGenerationReservationConflict {
+                    reservation_id: "opaque-reservation".to_string(),
+                    generation_id: 7,
+                },
+            )),
+            LifecycleMutationFailureKind::MetadataCommandContention
+        );
+        for error in [
+            ObjectPgActionError::Metadata(MetadataError::ObjectNotFound),
+            ObjectPgActionError::InvalidRequest {
+                reason: "not valid for lifecycle publication".to_string(),
+            },
+            ObjectPgActionError::StaleObjectReadSubject,
+            ObjectPgActionError::StaleDirectPutCommitSnapshot,
+            ObjectPgActionError::StaleStreamFinalizeSnapshot,
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            ObjectPgActionError::MultipartConditionalRequestConflict,
+        ] {
+            assert_eq!(convert(error), LifecycleMutationFailureKind::InternalError);
+        }
+    }
+
+    #[test]
+    fn lifecycle_mutation_failure_discards_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret lifecycle mutation operation";
+        const SECRET_SOURCE: &str = "secret lifecycle mutation source";
+        let failure = LifecycleMutationFailure::from_store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+
+        assert_eq!(failure.kind(), LifecycleMutationFailureKind::InternalError);
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "lifecycle mutation failed");
+        let rendered = format!("{failure:?} {failure}");
+        assert!(rendered.contains("store_io_failure"));
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&failure).is_none());
+
+        let metadata = LifecycleMutationFailure::from_object_pg_action(
             ObjectPgActionError::Metadata(MetadataError::Db {
                 context: SECRET_CONTEXT,
                 source: DatabaseError::new(SECRET_SOURCE),

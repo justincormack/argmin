@@ -2,9 +2,10 @@
 use s3_types::VersionId;
 use storage::error::{
     BucketListingFailure, BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure,
-    LifecycleMaintenanceFailure, MetadataError, MultipartCompletionFailure,
-    MultipartManagementFailure, ObjectMetadataListingFailure, ObjectMetadataMutationFailure,
-    ObjectReadFailure, StoreError, StoreFailure, StoreOperationFailureClass, StreamUploadFailure,
+    LifecycleMaintenanceFailure, LifecycleMutationFailure, MetadataError,
+    MultipartCompletionFailure, MultipartManagementFailure, ObjectMetadataListingFailure,
+    ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
+    StoreOperationFailureClass, StreamUploadFailure,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -64,6 +65,9 @@ pub enum ServerError {
 
     #[error("lifecycle maintenance error: {0}")]
     LifecycleMaintenance(LifecycleMaintenanceFailure),
+
+    #[error("lifecycle mutation error: {0}")]
+    LifecycleMutation(LifecycleMutationFailure),
 
     #[error("object read error: {0}")]
     ObjectRead(ObjectReadFailure),
@@ -535,6 +539,7 @@ impl ServerError {
             Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
             Self::BucketListing(error) => error.diagnostic_cause_label(),
             Self::LifecycleMaintenance(error) => error.diagnostic_cause_label(),
+            Self::LifecycleMutation(error) => error.diagnostic_cause_label(),
             Self::ObjectRead(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataListing(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
@@ -586,6 +591,10 @@ impl ServerError {
             ),
             Self::LifecycleMaintenance(error) => format!(
                 "server_error>lifecycle_maintenance>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::LifecycleMutation(error) => format!(
+                "server_error>lifecycle_mutation>{}",
                 error.diagnostic_cause_label()
             ),
             Self::ObjectRead(error) => format!(
@@ -790,6 +799,7 @@ impl ServerError {
             Self::BucketSnapshotLoad(_) => "InternalError",
             Self::BucketListing(_) => "InternalError",
             Self::LifecycleMaintenance(_) => "InternalError",
+            Self::LifecycleMutation(_) => "InternalError",
             Self::ObjectRead(_) => "InternalError",
             Self::ObjectMetadataListing(_) => "InternalError",
             Self::ObjectMetadataMutation(_) => "InternalError",
@@ -1222,6 +1232,22 @@ mod tests {
             "server_error>lifecycle_maintenance>store_io_failure"
         );
         let rendered = format!("{lifecycle:?} {lifecycle}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
+
+        let (lifecycle_mutation_failure, secret_fragments) =
+            storage::test_support::lifecycle_mutation_failure_diagnostic_fixture();
+        let lifecycle_mutation = ServerError::LifecycleMutation(lifecycle_mutation_failure);
+        assert_eq!(
+            lifecycle_mutation.diagnostic_cause_label(),
+            "store_io_failure"
+        );
+        assert_eq!(
+            lifecycle_mutation.diagnostic_cause_chain(),
+            "server_error>lifecycle_mutation>store_io_failure"
+        );
+        let rendered = format!("{lifecycle_mutation:?} {lifecycle_mutation}");
         for secret in secret_fragments {
             assert!(!rendered.contains(secret));
         }
@@ -1727,6 +1753,17 @@ mod tests {
         let err = ServerError::LifecycleMaintenance(
             storage::test_support::lifecycle_maintenance_failure_for_kind(
                 storage::LifecycleMaintenanceFailureKind::InternalError,
+            ),
+        );
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn s3_error_code_lifecycle_mutation() {
+        let err = ServerError::LifecycleMutation(
+            storage::test_support::lifecycle_mutation_failure_for_kind(
+                storage::LifecycleMutationFailureKind::InternalError,
             ),
         );
         assert_eq!(err.s3_error_code(), "InternalError");

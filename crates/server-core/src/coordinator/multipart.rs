@@ -260,6 +260,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         if super::object_pg_action_error_is_metadata_command_contention(&error) {
             return ServerError::SlowDown;

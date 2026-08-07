@@ -6098,7 +6098,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_current_expiry_marker() {
     ));
 
     let err = cluster
-        .expire_current_object_if_due(
+        .expire_current_object_if_due_raw(
             &bucket,
             &key,
             committed.version_id,
@@ -6226,7 +6226,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_noncurrent_expiry() {
     ));
 
     let err = cluster
-        .delete_noncurrent_live_versions_if_due(
+        .delete_noncurrent_live_versions_if_due_raw(
             &bucket,
             &key,
             current_bucket_incarnation(&cluster, &bucket),
@@ -6364,7 +6364,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() 
     ));
 
     let err = cluster
-        .delete_expired_delete_marker_if_due(
+        .delete_expired_delete_marker_if_due_raw(
             &bucket,
             &key,
             marker.version_id,

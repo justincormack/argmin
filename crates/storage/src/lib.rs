@@ -151,9 +151,10 @@ pub use error::{
     BucketListingFailure, BucketListingFailureKind, BucketSnapshotLoadFailure,
     BucketSnapshotLoadFailureKind, BucketWriteDrainFailure, BucketWriteDrainFailureKind,
     ClusterBuildError, DirectPutFailure, DirectPutFailureKind, LifecycleMaintenanceFailure,
-    LifecycleMaintenanceFailureKind, MetadataError, MultipartCompletionFailure,
-    MultipartCompletionFailureKind, MultipartManagementFailure, MultipartManagementFailureKind,
-    ObjectMetadataListingFailure, ObjectMetadataListingFailureKind, ObjectMetadataMutationFailure,
+    LifecycleMaintenanceFailureKind, LifecycleMutationFailure, LifecycleMutationFailureKind,
+    MetadataError, MultipartCompletionFailure, MultipartCompletionFailureKind,
+    MultipartManagementFailure, MultipartManagementFailureKind, ObjectMetadataListingFailure,
+    ObjectMetadataListingFailureKind, ObjectMetadataMutationFailure,
     ObjectMetadataMutationFailureKind, ObjectPgActionError, ObjectReadFailure,
     ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
     StreamUploadFailure, StreamUploadFailureKind,
@@ -1596,6 +1597,14 @@ pub mod test_support {
         LifecycleMaintenanceFailure::for_test(kind)
     }
 
+    /// Construct an opaque lifecycle-mutation failure from its logical outcome.
+    #[must_use]
+    pub fn lifecycle_mutation_failure_for_kind(
+        kind: LifecycleMutationFailureKind,
+    ) -> LifecycleMutationFailure {
+        LifecycleMutationFailure::for_test(kind)
+    }
+
     /// Construct an opaque object-read failure from its logical outcome.
     ///
     /// This lets cross-crate response-mapping tests remain exhaustive without
@@ -1724,6 +1733,22 @@ pub mod test_support {
         const SECRET_SOURCE: &str = "secret lifecycle maintenance fixture source";
         (
             LifecycleMaintenanceFailure::from_store(StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            }),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
+    }
+
+    /// Construct an opaque lifecycle-mutation failure containing a bounded I/O
+    /// diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn lifecycle_mutation_failure_diagnostic_fixture(
+    ) -> (LifecycleMutationFailure, &'static [&'static str]) {
+        const SECRET_CONTEXT: &str = "secret lifecycle mutation fixture operation";
+        const SECRET_SOURCE: &str = "secret lifecycle mutation fixture source";
+        (
+            LifecycleMutationFailure::from_store(StoreError::Io {
                 context: SECRET_CONTEXT,
                 source: std::io::Error::other(SECRET_SOURCE),
             }),

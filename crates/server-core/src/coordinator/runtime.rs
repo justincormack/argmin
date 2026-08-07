@@ -227,6 +227,19 @@ impl ReadRuntime {
         }
     }
 
+    pub(super) fn map_lifecycle_mutation_failure(
+        error: storage::LifecycleMutationFailure,
+    ) -> ServerError {
+        match error.kind() {
+            storage::LifecycleMutationFailureKind::ResourceExhausted
+            | storage::LifecycleMutationFailureKind::MetadataCommandContention
+            | storage::LifecycleMutationFailureKind::RetryableConvergence => ServerError::SlowDown,
+            storage::LifecycleMutationFailureKind::InternalError => {
+                ServerError::LifecycleMutation(error)
+            }
+        }
+    }
+
     pub(super) fn enqueue_object_payload_reclaim_for(
         &self,
         bucket: &BucketName,
@@ -665,7 +678,7 @@ impl ReadRuntime {
                     Ok::<bool, ServerError>(expiration.expiry_time_millis <= now_millis)
                 },
             )
-            .map_err(Coordinator::map_object_pg_action_error)??;
+            .map_err(Self::map_lifecycle_mutation_failure)??;
 
         let Some(outcome) = outcome else {
             return Ok(false);
@@ -722,7 +735,7 @@ impl ReadRuntime {
                     Ok::<HashSet<VersionId>, ServerError>(eligible_version_ids)
                 },
             )
-            .map_err(Coordinator::map_object_pg_action_error)??;
+            .map_err(Self::map_lifecycle_mutation_failure)??;
 
         for generation_id in &reclaimed_generation_ids {
             self.enqueue_object_payload_reclaim_for(bucket, key, *generation_id);
@@ -818,7 +831,7 @@ impl ReadRuntime {
                     Ok::<bool, ServerError>(expiration.version_id == expected_version_id)
                 },
             )
-            .map_err(Coordinator::map_object_pg_action_error)?
+            .map_err(Self::map_lifecycle_mutation_failure)?
     }
 
     fn abort_due_multipart_uploads_for_bucket(
@@ -916,7 +929,7 @@ impl ReadRuntime {
                     Ok::<bool, ServerError>(headers.abort_time_millis <= now_millis)
                 },
             )
-            .map_err(Coordinator::map_object_pg_action_error)?
+            .map_err(Self::map_lifecycle_mutation_failure)?
     }
 
     pub(super) fn abort_multipart_upload_for_lifecycle_sweep(
@@ -933,7 +946,7 @@ impl ReadRuntime {
                 upload_id,
                 expected_bucket_incarnation_generation,
             )
-            .map_err(Coordinator::map_object_pg_action_error)
+            .map_err(Self::map_lifecycle_mutation_failure)
     }
 
     pub(super) fn prepare_object_payload_read<'a>(

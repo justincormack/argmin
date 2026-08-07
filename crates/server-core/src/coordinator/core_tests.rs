@@ -10496,6 +10496,28 @@ fn lifecycle_maintenance_failure_kinds_map_exhaustively_to_runtime_outcomes() {
 }
 
 #[test]
+fn lifecycle_mutation_failure_kinds_map_exhaustively_to_runtime_outcomes() {
+    let map = |kind| {
+        ReadRuntime::map_lifecycle_mutation_failure(
+            storage::test_support::lifecycle_mutation_failure_for_kind(kind),
+        )
+    };
+
+    for kind in [
+        storage::LifecycleMutationFailureKind::ResourceExhausted,
+        storage::LifecycleMutationFailureKind::MetadataCommandContention,
+        storage::LifecycleMutationFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind), ServerError::SlowDown));
+    }
+    assert!(matches!(
+        map(storage::LifecycleMutationFailureKind::InternalError),
+        ServerError::LifecycleMutation(error)
+            if error.diagnostic_cause_label() == "store_internal_failure"
+    ));
+}
+
+#[test]
 fn bucket_write_drain_failure_flight_record_redacts_storage_diagnostic() {
     let request_id = "request-bucket-drain-diagnostic-redaction";
     let _attached = observability::AttachedTrace::new(observability::TraceContext::from_ids(

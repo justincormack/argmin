@@ -11788,6 +11788,25 @@ impl super::StorageCluster {
         key: &ObjectKey,
         expected_version_id: VersionId,
         expected_bucket_incarnation_generation: u64,
+        should_expire: impl FnMut(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
+    ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, crate::LifecycleMutationFailure>
+    {
+        self.expire_current_object_if_due_raw(
+            bucket,
+            key,
+            expected_version_id,
+            expected_bucket_incarnation_generation,
+            should_expire,
+        )
+        .map_err(crate::LifecycleMutationFailure::from_object_pg_action)
+    }
+
+    pub(crate) fn expire_current_object_if_due_raw<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        expected_bucket_incarnation_generation: u64,
         mut should_expire: impl FnMut(Option<&str>, &LiveObjectRecord) -> Result<bool, E>,
     ) -> Result<Result<Option<ExpireCurrentObjectOutcome>, E>, ObjectPgActionError> {
         let publisher =
@@ -12066,6 +12085,22 @@ impl super::StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         expected_bucket_incarnation_generation: u64,
+        select_versions: impl FnMut(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
+    ) -> Result<Result<Vec<GenerationId>, E>, crate::LifecycleMutationFailure> {
+        self.delete_noncurrent_live_versions_if_due_raw(
+            bucket,
+            key,
+            expected_bucket_incarnation_generation,
+            select_versions,
+        )
+        .map_err(crate::LifecycleMutationFailure::from_object_pg_action)
+    }
+
+    pub(crate) fn delete_noncurrent_live_versions_if_due_raw<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_bucket_incarnation_generation: u64,
         mut select_versions: impl FnMut(Option<&str>, &[StoredObject]) -> Result<HashSet<VersionId>, E>,
     ) -> Result<Result<Vec<GenerationId>, E>, ObjectPgActionError> {
         let publisher =
@@ -12241,6 +12276,24 @@ impl super::StorageCluster {
     }
 
     pub fn delete_expired_delete_marker_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        expected_version_id: VersionId,
+        expected_bucket_incarnation_generation: u64,
+        should_delete: impl FnMut(Option<&str>, &[StoredObject]) -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, crate::LifecycleMutationFailure> {
+        self.delete_expired_delete_marker_if_due_raw(
+            bucket,
+            key,
+            expected_version_id,
+            expected_bucket_incarnation_generation,
+            should_delete,
+        )
+        .map_err(crate::LifecycleMutationFailure::from_object_pg_action)
+    }
+
+    pub(crate) fn delete_expired_delete_marker_if_due_raw<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -16603,6 +16656,22 @@ impl super::StorageCluster {
         key: &ObjectKey,
         upload_id: &UploadId,
         expected_bucket_incarnation_generation: u64,
+    ) -> Result<bool, crate::LifecycleMutationFailure> {
+        self.abort_multipart_upload_for_lifecycle_sweep_raw(
+            bucket,
+            key,
+            upload_id,
+            expected_bucket_incarnation_generation,
+        )
+        .map_err(crate::LifecycleMutationFailure::from_object_pg_action)
+    }
+
+    fn abort_multipart_upload_for_lifecycle_sweep_raw(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        expected_bucket_incarnation_generation: u64,
     ) -> Result<bool, ObjectPgActionError> {
         let pg_id = self.object_metadata_pg(bucket, key);
         self.abort_multipart_upload_locked(
@@ -17002,6 +17071,24 @@ impl super::StorageCluster {
     }
 
     pub fn abort_multipart_upload_if_due<E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        expected_bucket_incarnation_generation: u64,
+        should_abort: impl FnOnce(Option<&str>, u64) -> Result<bool, E>,
+    ) -> Result<Result<bool, E>, crate::LifecycleMutationFailure> {
+        self.abort_multipart_upload_if_due_raw(
+            bucket,
+            key,
+            upload_id,
+            expected_bucket_incarnation_generation,
+            should_abort,
+        )
+        .map_err(crate::LifecycleMutationFailure::from_object_pg_action)
+    }
+
+    pub(crate) fn abort_multipart_upload_if_due_raw<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

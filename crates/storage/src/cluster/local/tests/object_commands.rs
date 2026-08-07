@@ -1983,6 +1983,24 @@ fn lifecycle_current_expiration_delete_command_applies_to_all_acting_object_pg_n
     put_test_lifecycle(&cluster, &bucket);
     let committed = write_committed_direct_segment_for(&cluster, &bucket, &key, b"expired current");
 
+    let callback_error = cluster
+        .expire_current_object_if_due(
+            &bucket,
+            &key,
+            committed.version_id,
+            current_bucket_incarnation(&cluster, &bucket),
+            |raw, record| {
+                assert_eq!(raw, Some("<LifecycleConfiguration/>"));
+                assert_eq!(record.generation_id, committed.generation_id);
+                Err::<bool, _>("policy callback failed")
+            },
+        )
+        .expect("storage publication should succeed")
+        .unwrap_err();
+    assert_eq!(callback_error, "policy callback failed");
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+
     let outcome = cluster
         .expire_current_object_if_due(
             &bucket,
