@@ -4795,6 +4795,39 @@ fail_with_matches \
     "Bucket-wide object, version, and multipart listing scans must cross storage through ObjectMetadataListingFailure" \
     "$raw_object_metadata_listing_error_transit"
 
+raw_lifecycle_maintenance_error_transit=$(
+    {
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(list_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim|list_all_objects_for_bucket|list_all_object_versions_for_bucket|list_all_multipart_uploads_for_bucket)(?s:[^;{]{0,500})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/cluster/request_ops.rs \
+            || true
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+list_lifecycle_sweep_buckets(?s:[^;{]{0,500})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/cluster/request_ops.rs \
+            || true
+        rg -n -U --color=never \
+            '(list_lifecycle_sweep_roots|acquire_lifecycle_sweep_claim|heartbeat_lifecycle_sweep_claim|record_lifecycle_sweep_claim_error|release_lifecycle_sweep_claim|list_all_objects_for_bucket|list_all_object_versions_for_bucket|list_all_multipart_uploads_for_bucket)\([^;]{0,500}map_err\((Self::|ReadRuntime::)?map_object_pg_action_error\)' \
+            crates/server-core/src/coordinator/runtime.rs \
+            || true
+        if ! rg -q -U \
+            'fn map_lifecycle_maintenance_failure(?s:.{0,300})error: storage::LifecycleMaintenanceFailure' \
+            crates/server-core/src/coordinator/runtime.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/runtime.rs: lifecycle-maintenance mapping must accept LifecycleMaintenanceFailure'
+        fi
+        if ! rg -q 'LifecycleMaintenance\(LifecycleMaintenanceFailure\)' \
+            crates/server-core/src/error.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/error.rs: internal lifecycle-maintenance failures must remain typed through ServerError'
+        fi
+    }
+)
+fail_with_matches \
+    "Lifecycle discovery, claim coordination, and candidate scans must cross storage through LifecycleMaintenanceFailure" \
+    "$raw_lifecycle_maintenance_error_transit"
+
 http_storage_debug_representation_leaks=$(
     {
         rg -n --color=never \

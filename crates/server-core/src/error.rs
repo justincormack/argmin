@@ -2,9 +2,9 @@
 use s3_types::VersionId;
 use storage::error::{
     BucketListingFailure, BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure,
-    MetadataError, MultipartCompletionFailure, MultipartManagementFailure,
-    ObjectMetadataListingFailure, ObjectMetadataMutationFailure, ObjectReadFailure, StoreError,
-    StoreFailure, StoreOperationFailureClass, StreamUploadFailure,
+    LifecycleMaintenanceFailure, MetadataError, MultipartCompletionFailure,
+    MultipartManagementFailure, ObjectMetadataListingFailure, ObjectMetadataMutationFailure,
+    ObjectReadFailure, StoreError, StoreFailure, StoreOperationFailureClass, StreamUploadFailure,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +61,9 @@ pub enum ServerError {
 
     #[error("bucket listing error: {0}")]
     BucketListing(BucketListingFailure),
+
+    #[error("lifecycle maintenance error: {0}")]
+    LifecycleMaintenance(LifecycleMaintenanceFailure),
 
     #[error("object read error: {0}")]
     ObjectRead(ObjectReadFailure),
@@ -531,6 +534,7 @@ impl ServerError {
             Self::BucketWriteDrain(error) => error.diagnostic_cause_label(),
             Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
             Self::BucketListing(error) => error.diagnostic_cause_label(),
+            Self::LifecycleMaintenance(error) => error.diagnostic_cause_label(),
             Self::ObjectRead(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataListing(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
@@ -578,6 +582,10 @@ impl ServerError {
             ),
             Self::BucketListing(error) => format!(
                 "server_error>bucket_listing>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::LifecycleMaintenance(error) => format!(
+                "server_error>lifecycle_maintenance>{}",
                 error.diagnostic_cause_label()
             ),
             Self::ObjectRead(error) => format!(
@@ -781,6 +789,7 @@ impl ServerError {
             Self::BucketWriteDrain(_) => "InternalError",
             Self::BucketSnapshotLoad(_) => "InternalError",
             Self::BucketListing(_) => "InternalError",
+            Self::LifecycleMaintenance(_) => "InternalError",
             Self::ObjectRead(_) => "InternalError",
             Self::ObjectMetadataListing(_) => "InternalError",
             Self::ObjectMetadataMutation(_) => "InternalError",
@@ -1200,6 +1209,19 @@ mod tests {
             "server_error>bucket_listing>store_io_failure"
         );
         let rendered = format!("{bucket_listing:?} {bucket_listing}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
+
+        let (lifecycle_failure, secret_fragments) =
+            storage::test_support::lifecycle_maintenance_failure_diagnostic_fixture();
+        let lifecycle = ServerError::LifecycleMaintenance(lifecycle_failure);
+        assert_eq!(lifecycle.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            lifecycle.diagnostic_cause_chain(),
+            "server_error>lifecycle_maintenance>store_io_failure"
+        );
+        let rendered = format!("{lifecycle:?} {lifecycle}");
         for secret in secret_fragments {
             assert!(!rendered.contains(secret));
         }
@@ -1696,6 +1718,17 @@ mod tests {
             ServerError::BucketListing(storage::test_support::bucket_listing_failure_for_kind(
                 storage::BucketListingFailureKind::InternalError,
             ));
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn s3_error_code_lifecycle_maintenance() {
+        let err = ServerError::LifecycleMaintenance(
+            storage::test_support::lifecycle_maintenance_failure_for_kind(
+                storage::LifecycleMaintenanceFailureKind::InternalError,
+            ),
+        );
         assert_eq!(err.s3_error_code(), "InternalError");
         assert_eq!(err.http_status(), 500);
     }

@@ -9368,7 +9368,7 @@ impl super::StorageCluster {
         Ok(())
     }
 
-    pub fn list_lifecycle_sweep_buckets(
+    pub(crate) fn list_lifecycle_sweep_buckets(
         &self,
     ) -> Result<LifecycleSweepBuckets, ObjectPgActionError> {
         let mut lifecycle_buckets = Vec::new();
@@ -9407,6 +9407,14 @@ impl super::StorageCluster {
     }
 
     pub fn list_lifecycle_sweep_roots(
+        &self,
+        now: u64,
+    ) -> Result<Vec<LifecycleSweepRoot>, crate::LifecycleMaintenanceFailure> {
+        self.list_lifecycle_sweep_roots_raw(now)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn list_lifecycle_sweep_roots_raw(
         &self,
         now: u64,
     ) -> Result<Vec<LifecycleSweepRoot>, ObjectPgActionError> {
@@ -9461,6 +9469,16 @@ impl super::StorageCluster {
         bucket: &BucketName,
         bucket_incarnation_generation: u64,
         now: u64,
+    ) -> Result<Option<LifecycleSweepClaimRecord>, crate::LifecycleMaintenanceFailure> {
+        self.acquire_lifecycle_sweep_claim_raw(bucket, bucket_incarnation_generation, now)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn acquire_lifecycle_sweep_claim_raw(
+        &self,
+        bucket: &BucketName,
+        bucket_incarnation_generation: u64,
+        now: u64,
     ) -> Result<Option<LifecycleSweepClaimRecord>, ObjectPgActionError> {
         let claim_id = self.next_lifecycle_sweep_claim_id()?;
         let owner_token = self.bucket_write_owner_token();
@@ -9490,6 +9508,15 @@ impl super::StorageCluster {
         &self,
         claim: &LifecycleSweepClaimRecord,
         now: u64,
+    ) -> Result<LifecycleSweepClaimRecord, crate::LifecycleMaintenanceFailure> {
+        self.heartbeat_lifecycle_sweep_claim_raw(claim, now)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn heartbeat_lifecycle_sweep_claim_raw(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+        now: u64,
     ) -> Result<LifecycleSweepClaimRecord, ObjectPgActionError> {
         let pg_id = self.bucket_metadata_pg_id(&claim.bucket);
         let node = self
@@ -9514,6 +9541,15 @@ impl super::StorageCluster {
         &self,
         claim: &LifecycleSweepClaimRecord,
         last_error: &str,
+    ) -> Result<LifecycleSweepClaimRecord, crate::LifecycleMaintenanceFailure> {
+        self.record_lifecycle_sweep_claim_error_raw(claim, last_error)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn record_lifecycle_sweep_claim_error_raw(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
+        last_error: &str,
     ) -> Result<LifecycleSweepClaimRecord, ObjectPgActionError> {
         let pg_id = self.bucket_metadata_pg_id(&claim.bucket);
         let node = self
@@ -9533,6 +9569,14 @@ impl super::StorageCluster {
     pub fn release_lifecycle_sweep_claim(
         &self,
         claim: &LifecycleSweepClaimRecord,
+    ) -> Result<(), crate::LifecycleMaintenanceFailure> {
+        self.release_lifecycle_sweep_claim_raw(claim)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn release_lifecycle_sweep_claim_raw(
+        &self,
+        claim: &LifecycleSweepClaimRecord,
     ) -> Result<(), ObjectPgActionError> {
         let pg_id = self.bucket_metadata_pg_id(&claim.bucket);
         let node = self
@@ -9549,6 +9593,14 @@ impl super::StorageCluster {
     }
 
     pub fn list_all_objects_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<StoredObject>, crate::LifecycleMaintenanceFailure> {
+        self.list_all_objects_for_bucket_raw(bucket)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn list_all_objects_for_bucket_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
@@ -9579,6 +9631,14 @@ impl super::StorageCluster {
     }
 
     pub fn list_all_object_versions_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<StoredObject>, crate::LifecycleMaintenanceFailure> {
+        self.list_all_object_versions_for_bucket_raw(bucket)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn list_all_object_versions_for_bucket_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<StoredObject>, ObjectPgActionError> {
@@ -9634,6 +9694,14 @@ impl super::StorageCluster {
     }
 
     pub fn list_all_multipart_uploads_for_bucket(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<Vec<crate::MultipartLifecycleUpload>, crate::LifecycleMaintenanceFailure> {
+        self.list_all_multipart_uploads_for_bucket_raw(bucket)
+            .map_err(crate::LifecycleMaintenanceFailure::from_object_pg_action)
+    }
+
+    fn list_all_multipart_uploads_for_bucket_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<Vec<crate::MultipartLifecycleUpload>, ObjectPgActionError> {

@@ -2175,6 +2175,19 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        Owner-local exhaustive classification, route-expiry, and redaction tests; exhaustive
        coordinator response mapping; HTTP sanitization; and the boundary checker reject raw error
        transit through all three public admitted scans.
+       The first lifecycle-maintenance sub-slice completed on 2026-08-07. Lifecycle root
+       discovery, claim acquisition, heartbeat, error recording, and release, plus bucket-wide
+       object, version, and multipart candidate scans, now return the opaque
+       `LifecycleMaintenanceFailure`. Its exhaustive logical kind contains only resource
+       exhaustion, metadata-command contention, retryable convergence, and internal failure.
+       Storage owns conversion from claim storage, per-PG fan-out, route-validity, metadata, and
+       RPC errors. The runtime preserves the existing `SlowDown` policy for all three retryable
+       classes and retains internal failures through a typed `ServerError` variant with bounded
+       diagnostics and HTTP redaction. The raw lifecycle bucket-inventory helper is crate-private.
+       Owner-local exhaustive classification and redaction tests, exhaustive runtime mapping,
+       HTTP sanitization, and the boundary checker reject raw errors through this discovery,
+       coordination, and candidate-scan seam. Lifecycle mutation publication remains the next
+       sub-slice because its command-ownership and callback outcomes require a separate contract.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces
@@ -2182,7 +2195,8 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        storage-owned semantic errors. Preserve only logical values required for S3 translation,
        such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
        other implementation detail behind the existing bounded opaque diagnostic. Continue with
-       the remaining storage-maintenance/runtime operation families. Remove
+       lifecycle mutation publication and then the remaining storage-maintenance/runtime
+       operation families. Remove
        `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
        public raw error exports once no public storage signature requires them. Tests that
        currently construct raw storage errors must use owner-provided semantic fixtures or move

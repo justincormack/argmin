@@ -184,6 +184,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::BucketWriteDrain(_)
         | ServerError::BucketSnapshotLoad(_)
         | ServerError::BucketListing(_)
+        | ServerError::LifecycleMaintenance(_)
         | ServerError::ObjectRead(_)
         | ServerError::ObjectMetadataListing(_)
         | ServerError::ObjectMetadataMutation(_)
@@ -4982,6 +4983,8 @@ mod tests {
         let object_read_error = storage::test_support::object_read_failure_diagnostic_fixture();
         let bucket_listing_error =
             storage::test_support::bucket_listing_failure_diagnostic_fixture();
+        let lifecycle_maintenance_error =
+            storage::test_support::lifecycle_maintenance_failure_diagnostic_fixture();
         let object_listing_error =
             storage::test_support::object_metadata_listing_failure_diagnostic_fixture();
         let object_mutation_error =
@@ -5016,6 +5019,10 @@ mod tests {
             (
                 ServerError::BucketListing(bucket_listing_error.0),
                 bucket_listing_error.1.to_vec(),
+            ),
+            (
+                ServerError::LifecycleMaintenance(lifecycle_maintenance_error.0),
+                lifecycle_maintenance_error.1.to_vec(),
             ),
             (
                 ServerError::ObjectMetadataListing(object_listing_error.0),

@@ -212,6 +212,21 @@ impl ReadRuntime {
         Coordinator::map_bucket_snapshot_load_error(error)
     }
 
+    pub(super) fn map_lifecycle_maintenance_failure(
+        error: storage::LifecycleMaintenanceFailure,
+    ) -> ServerError {
+        match error.kind() {
+            storage::LifecycleMaintenanceFailureKind::ResourceExhausted
+            | storage::LifecycleMaintenanceFailureKind::MetadataCommandContention
+            | storage::LifecycleMaintenanceFailureKind::RetryableConvergence => {
+                ServerError::SlowDown
+            }
+            storage::LifecycleMaintenanceFailureKind::InternalError => {
+                ServerError::LifecycleMaintenance(error)
+            }
+        }
+    }
+
     pub(super) fn enqueue_object_payload_reclaim_for(
         &self,
         bucket: &BucketName,
@@ -282,7 +297,7 @@ impl ReadRuntime {
         let sweep_roots = self
             .storage_node()
             .list_lifecycle_sweep_roots(claim_now_millis)
-            .map_err(Coordinator::map_object_pg_action_error)?;
+            .map_err(Self::map_lifecycle_maintenance_failure)?;
         stats.discovered_roots = sweep_roots.len() as u64;
         let _ = observability::event(
             TRACE_TARGET,
@@ -302,7 +317,7 @@ impl ReadRuntime {
                     root.bucket_incarnation_generation,
                     claim_now_millis,
                 )
-                .map_err(Coordinator::map_object_pg_action_error)?
+                .map_err(Self::map_lifecycle_maintenance_failure)?
             else {
                 stats.busy_claims += 1;
                 let _ = observability::event(
@@ -335,14 +350,14 @@ impl ReadRuntime {
             {
                 self.storage_node()
                     .release_lifecycle_sweep_claim(&claim)
-                    .map_err(Coordinator::map_object_pg_action_error)?;
+                    .map_err(Self::map_lifecycle_maintenance_failure)?;
                 stats.released_claims += 1;
                 continue;
             }
             let claim = self
                 .storage_node()
                 .heartbeat_lifecycle_sweep_claim(&claim, storage::clock::wall_time_millis())
-                .map_err(Coordinator::map_object_pg_action_error)?;
+                .map_err(Self::map_lifecycle_maintenance_failure)?;
 
             stats.scanned_buckets += 1;
             let result =
@@ -351,7 +366,7 @@ impl ReadRuntime {
                 Ok(()) => {
                     self.storage_node()
                         .release_lifecycle_sweep_claim(&claim)
-                        .map_err(Coordinator::map_object_pg_action_error)?;
+                        .map_err(Self::map_lifecycle_maintenance_failure)?;
                     stats.released_claims += 1;
                     let _ = observability::event(
                         TRACE_TARGET,
@@ -462,7 +477,7 @@ impl ReadRuntime {
         self.storage_node()
             .heartbeat_lifecycle_sweep_claim(claim, storage::clock::wall_time_millis())
             .map(drop)
-            .map_err(Coordinator::map_object_pg_action_error)
+            .map_err(Self::map_lifecycle_maintenance_failure)
     }
 
     fn expire_due_current_objects_for_bucket(
@@ -480,7 +495,7 @@ impl ReadRuntime {
         let objects = self
             .storage_node()
             .list_all_objects_for_bucket(&bucket_info.name)
-            .map_err(Coordinator::map_object_pg_action_error)?;
+            .map_err(Self::map_lifecycle_maintenance_failure)?;
         for (index, object) in objects.into_iter().enumerate() {
             if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
                 self.heartbeat_lifecycle_sweep_claim(claim)?;
@@ -531,7 +546,7 @@ impl ReadRuntime {
         let uploads = self
             .storage_node()
             .list_all_multipart_uploads_for_bucket(bucket)
-            .map_err(Coordinator::map_object_pg_action_error)?;
+            .map_err(Self::map_lifecycle_maintenance_failure)?;
         for (index, upload) in uploads.into_iter().enumerate() {
             if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
                 self.heartbeat_lifecycle_sweep_claim(claim)?;
@@ -570,7 +585,7 @@ impl ReadRuntime {
         let versions = self
             .storage_node()
             .list_all_object_versions_for_bucket(&bucket_info.name)
-            .map_err(Coordinator::map_object_pg_action_error)?;
+            .map_err(Self::map_lifecycle_maintenance_failure)?;
         let mut group_start = 0usize;
         let mut groups_seen = 0usize;
         while group_start < versions.len() {
@@ -731,7 +746,7 @@ impl ReadRuntime {
         let versions = self
             .storage_node()
             .list_all_object_versions_for_bucket(&bucket_info.name)
-            .map_err(Coordinator::map_object_pg_action_error)?;
+            .map_err(Self::map_lifecycle_maintenance_failure)?;
         let mut group_start = 0usize;
         let mut groups_seen = 0usize;
         while group_start < versions.len() {
@@ -821,7 +836,7 @@ impl ReadRuntime {
         let uploads = self
             .storage_node()
             .list_all_multipart_uploads_for_bucket(&bucket_info.name)
-            .map_err(Coordinator::map_object_pg_action_error)?;
+            .map_err(Self::map_lifecycle_maintenance_failure)?;
         for (index, upload) in uploads.into_iter().enumerate() {
             if index > 0 && index % LIFECYCLE_SWEEP_HEARTBEAT_INTERVAL_ITEMS == 0 {
                 self.heartbeat_lifecycle_sweep_claim(claim)?;
