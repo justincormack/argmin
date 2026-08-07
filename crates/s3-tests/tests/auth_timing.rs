@@ -43,6 +43,30 @@ enum TimingPutEncoding {
     PostObject,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimingPutOutcome {
+    AuthorizationResolved,
+    RetryableContention,
+}
+
+fn is_object_writer_timing_slow_down(status: u16, body: &[u8]) -> bool {
+    status == 503
+        && std::str::from_utf8(body)
+            .ok()
+            .and_then(|body| s3_tests::shape::xml_tag_text(body, "Code"))
+            == Some("SlowDown")
+}
+
+#[test]
+fn object_writer_timing_slow_down_classification_requires_status_and_code() {
+    let slow_down = b"<Error><Code>SlowDown</Code></Error>";
+    let operation_aborted = b"<Error><Code>OperationAborted</Code></Error>";
+
+    assert!(is_object_writer_timing_slow_down(503, slow_down));
+    assert!(!is_object_writer_timing_slow_down(409, slow_down));
+    assert!(!is_object_writer_timing_slow_down(503, operation_aborted));
+}
+
 impl TimingPutEncoding {
     fn label(self) -> &'static str {
         match self {
@@ -513,7 +537,7 @@ async fn assert_object_writer_timing_put_result(
     bucket: &str,
     case: &StagedObjectWriterPut,
     response: &FlushedResponse,
-) {
+) -> TimingPutOutcome {
     let current = timing_object_history(bucket, &case.key).await;
     match response.status() {
         status if status == case.success_status => {
@@ -538,6 +562,7 @@ async fn assert_object_writer_timing_put_result(
                 case.label
             );
             assert_baseline_history_retained_after_put(&case.label, &case.baseline, &current);
+            TimingPutOutcome::AuthorizationResolved
         }
         403 => {
             let response_body = std::str::from_utf8(response.body())
@@ -585,6 +610,15 @@ async fn assert_object_writer_timing_put_result(
                     );
                 }
             }
+            TimingPutOutcome::AuthorizationResolved
+        }
+        status if is_object_writer_timing_slow_down(status, response.body()) => {
+            assert_eq!(
+                current, case.baseline,
+                "{}: slowed object write mutated object version history",
+                case.label
+            );
+            TimingPutOutcome::RetryableContention
         }
         status => {
             let response_body = String::from_utf8_lossy(response.body());
@@ -1193,12 +1227,12 @@ fn test_boe_inflight_put_policy_grant_preserves_latched_outcome_state() {
     });
 }
 
-async fn run_object_writer_put_policy_transition(
+async fn run_object_writer_put_policy_transition_once(
     encoding: TimingPutEncoding,
     transition: &str,
     initial_effect: &str,
     final_effect: &str,
-) {
+) -> bool {
     let client = ordinary_alt_client();
     let bucket = create_acl_enabled_bucket(CTX.client(), ObjectOwnership::ObjectWriter).await;
     enable_bucket_versioning(CTX.client(), &bucket).await;
@@ -1253,6 +1287,7 @@ async fn run_object_writer_put_policy_transition(
         results.push(result.expect("finish staged ObjectWriter request task"));
     }
 
+    let mut saw_retryable_contention = false;
     for (case, response) in results {
         println!(
             "ObjectWriter {} {transition} {} status: {}",
@@ -1260,10 +1295,48 @@ async fn run_object_writer_put_policy_transition(
             case.label,
             response.status()
         );
-        assert_object_writer_timing_put_result(&bucket, &case, &response).await;
+        saw_retryable_contention |= matches!(
+            assert_object_writer_timing_put_result(&bucket, &case, &response).await,
+            TimingPutOutcome::RetryableContention
+        );
     }
 
     cleanup_versioned_auth_timing_bucket(&bucket).await;
+    !saw_retryable_contention
+}
+
+async fn run_object_writer_put_policy_transition(
+    encoding: TimingPutEncoding,
+    transition: &str,
+    initial_effect: &str,
+    final_effect: &str,
+) {
+    const MAX_ATTEMPTS: usize = 3;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        if run_object_writer_put_policy_transition_once(
+            encoding,
+            transition,
+            initial_effect,
+            final_effect,
+        )
+        .await
+        {
+            return;
+        }
+        if attempt < MAX_ATTEMPTS {
+            println!(
+                "ObjectWriter {} {transition} attempt {attempt}/{MAX_ATTEMPTS} encountered SlowDown; retrying the complete transition",
+                encoding.label()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    panic!(
+        "ObjectWriter {} {transition} did not produce complete authorization outcomes after {MAX_ATTEMPTS} attempts",
+        encoding.label()
+    );
 }
 
 #[test]
