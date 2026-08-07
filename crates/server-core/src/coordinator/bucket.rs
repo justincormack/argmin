@@ -22,34 +22,23 @@ use super::{
 };
 use crate::error::ServerError;
 
-pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
+pub(super) fn map_bucket_write_drain_failure(err: storage::BucketWriteDrainFailure) -> ServerError {
     let diagnostic_label = err.diagnostic_cause_label();
     let _ = observability::event(
         TRACE_TARGET,
         "bucket_write_drain_error",
         Some(format_args!("cause_label={diagnostic_label}")),
     );
-    match err {
-        storage::BucketWriteDrainError::Store(ref error)
-            if super::store_error_is_metadata_command_contention(error) =>
-        {
-            ServerError::OperationAborted
+    match err.kind().clone() {
+        storage::BucketWriteDrainFailureKind::OperationAborted => ServerError::OperationAborted,
+        storage::BucketWriteDrainFailureKind::SlowDown => ServerError::SlowDown,
+        storage::BucketWriteDrainFailureKind::BucketNotEmpty => ServerError::BucketNotEmpty,
+        storage::BucketWriteDrainFailureKind::BucketNotFound { name } => {
+            ServerError::BucketNotFound {
+                name: name.to_string(),
+            }
         }
-        storage::BucketWriteDrainError::Metadata(ref error)
-            if super::metadata_error_is_command_contention(error) =>
-        {
-            ServerError::OperationAborted
-        }
-        storage::BucketWriteDrainError::Store(other) => super::map_store_error(other),
-        storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotEmpty) => {
-            ServerError::BucketNotEmpty
-        }
-        storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotFound {
-            name,
-        }) => ServerError::BucketNotFound {
-            name: name.to_string(),
-        },
-        storage::BucketWriteDrainError::Metadata(other) => ServerError::Metadata(other),
+        storage::BucketWriteDrainFailureKind::InternalError => ServerError::BucketWriteDrain(err),
     }
 }
 
@@ -57,7 +46,7 @@ pub(super) fn emit_bucket_delete_begin_failed(
     name: &storage::BucketName,
     elapsed_us: u128,
     total_elapsed_us: u128,
-    error: &storage::BucketWriteDrainError,
+    error: &storage::BucketWriteDrainFailure,
 ) {
     let _ = observability::emit_flight_event(
         TRACE_TARGET,
@@ -117,8 +106,10 @@ impl Coordinator {
         self.observe_bucket_fast_path_generation(&info.name, info.bucket_execution_generation);
     }
 
-    pub(super) fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
-        map_bucket_write_drain_error(err)
+    pub(super) fn map_bucket_write_drain_failure(
+        err: storage::BucketWriteDrainFailure,
+    ) -> ServerError {
+        map_bucket_write_drain_failure(err)
     }
 
     pub fn create_bucket_on_admitted_route(
@@ -373,7 +364,7 @@ impl Coordinator {
                                 );
                                 return Err(ServerError::BucketAlreadyExists);
                             }
-                            Err(err) => return Err(Self::map_bucket_write_drain_error(err)),
+                            Err(err) => return Err(Self::map_bucket_write_drain_failure(err)),
                         }
                     }
                 },
@@ -508,7 +499,7 @@ impl Coordinator {
                 request_started.elapsed().as_micros(),
                 &err,
             );
-            return Err(Self::map_bucket_write_drain_error(err));
+            return Err(Self::map_bucket_write_drain_failure(err));
         }
         let _ = observability::emit_flight_event(
             TRACE_TARGET,

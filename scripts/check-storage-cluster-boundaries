@@ -4314,66 +4314,20 @@ fail_with_matches \
     "Production coordinator object-PG errors must use Coordinator::map_object_pg_action_error instead of ad hoc Store/Metadata mapping" \
     "$raw_coordinator_object_pg_error_mappers"
 
-raw_coordinator_bucket_write_drain_error_mappers=$(
-    awk '
-    FNR == 1 {
-        current_fn = ""
-        pending_test_cfg = 0
-        in_test_cfg = 0
-        in_raw_bucket_write_drain_arm = 0
-    }
-    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
-        pending_test_cfg = 1
-        next
-    }
-    /^[[:space:]]*#\[/ {
-        next
-    }
-    function update_function_context() {
-        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
-            current_fn = $0
-            sub(/^.*fn /, "", current_fn)
-            sub(/\(.*/, "", current_fn)
-            in_test_cfg = pending_test_cfg
-            pending_test_cfg = 0
-        } else if (pending_test_cfg \
-            && $0 !~ /^[[:space:]]*$/ \
-            && $0 !~ /^[[:space:]]*#\[/) {
-            pending_test_cfg = 0
-        }
-    }
+raw_bucket_write_drain_error_transit=$(
     {
-        update_function_context()
-        if (in_test_cfg || current_fn == "map_bucket_write_drain_error") {
-            in_raw_bucket_write_drain_arm = 0
-            next
-        }
-        if ($0 ~ /^[[:space:]]*storage::BucketWriteDrainError::[A-Za-z0-9_]+/ \
-            || $0 ~ /^[[:space:]]*BucketWriteDrainError::[A-Za-z0-9_]+/ \
-            || $0 ~ /^[[:space:]]*[|][[:space:]]*storage::BucketWriteDrainError::[A-Za-z0-9_]+/ \
-            || $0 ~ /^[[:space:]]*[|][[:space:]]*BucketWriteDrainError::[A-Za-z0-9_]+/) {
-            in_raw_bucket_write_drain_arm = 0
-        }
-        if ($0 ~ /BucketWriteDrainError::(Store|Metadata)[[:space:]]*\(/) {
-            in_raw_bucket_write_drain_arm = 1
-        }
-        if (in_raw_bucket_write_drain_arm && $0 ~ /ServerError::(Store|Metadata)[[:space:]]*\(/) {
-            print FILENAME ":" FNR ":" $0
-        }
-        if (in_raw_bucket_write_drain_arm \
-            && ($0 ~ /^[[:space:]]*}[,]?[[:space:]]*$/ \
-                || $0 ~ /^[[:space:]]*(other|_|[A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=>/)) {
-            in_raw_bucket_write_drain_arm = 0
-        }
+        rg -n --color=never '\bBucketWriteDrainError\b' \
+            crates/server-core crates/server-http crates/argmin-s3 \
+            || true
+        rg -n -U --color=never \
+            'pub enum BucketWriteDrainError|pub use error::(?s:[^;]*)\bBucketWriteDrainError\b' \
+            crates/storage/src/error.rs crates/storage/src/lib.rs \
+            || true
     }
-    ' $(find crates/server-core/src/coordinator -type f -name '*.rs' \
-        ! -name '*_tests.rs' \
-        ! -path '*/tests/*' \
-        | sort)
 )
 fail_with_matches \
-    "Production coordinator bucket-write drain errors must use Coordinator::map_bucket_write_drain_error instead of ad hoc Store/Metadata mapping" \
-    "$raw_coordinator_bucket_write_drain_error_mappers"
+    "BucketWriteDrainError is storage-private; callers must use BucketWriteDrainFailure and its exhaustive logical kind" \
+    "$raw_bucket_write_drain_error_transit"
 
 raw_storage_wrapper_diagnostic_formatting=$(
     {
@@ -4382,7 +4336,7 @@ raw_storage_wrapper_diagnostic_formatting=$(
             crates/server-core/src/coordinator/bucket.rs \
             || true
         rg -n -U --color=never \
-            '#\[derive\([^]]*(Debug|thiserror::Error)[^]]*\)\][[:space:]]*pub enum (BucketWriteDrainError|BucketSnapshotLoadError|ObjectPgActionError)' \
+            '#\[derive\([^]]*(Debug|thiserror::Error)[^]]*\)\][[:space:]]*pub enum (BucketSnapshotLoadError|ObjectPgActionError)' \
             crates/storage/src/error.rs \
             || true
         if ! rg -q -U \
@@ -4390,7 +4344,7 @@ raw_storage_wrapper_diagnostic_formatting=$(
             crates/server-core/src/coordinator/bucket.rs
         then
             printf '%s\n' \
-                'crates/server-core/src/coordinator/bucket.rs: bucket_delete_begin_failed must use BucketWriteDrainError::diagnostic_cause_label'
+                'crates/server-core/src/coordinator/bucket.rs: bucket_delete_begin_failed must use BucketWriteDrainFailure::diagnostic_cause_label'
         fi
     }
 )

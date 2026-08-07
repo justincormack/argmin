@@ -4079,8 +4079,11 @@ impl ActiveBucketRoute<'_> {
 
     pub fn try_finalize_bucket_delete(
         &self,
-    ) -> Result<crate::BucketDeleteFinalizeOutcome, crate::BucketWriteDrainError> {
-        self.admission.require_valid_now()?;
+    ) -> Result<crate::BucketDeleteFinalizeOutcome, crate::BucketWriteDrainFailure> {
+        self.admission
+            .require_valid_now()
+            .map_err(crate::BucketWriteDrainError::from)
+            .map_err(crate::BucketWriteDrainFailure::from)?;
         self.admission
             .cluster
             .try_finalize_bucket_delete(&self.bucket)
@@ -4089,7 +4092,7 @@ impl ActiveBucketRoute<'_> {
     pub fn begin_bucket_delete_if_current(
         &self,
         bucket_identity: crate::cluster::BucketIdentityGenerations,
-    ) -> Result<(), crate::BucketWriteDrainError> {
+    ) -> Result<(), crate::BucketWriteDrainFailure> {
         self.admission
             .cluster
             .begin_bucket_delete_if_current_with_route_validation(
@@ -4097,6 +4100,7 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 bucket_identity,
             )
+            .map_err(crate::BucketWriteDrainFailure::from)
     }
 
     pub fn enqueue_bucket_delete_finalize(&self, bucket_incarnation_generation: u64) {

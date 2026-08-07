@@ -2053,18 +2053,27 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     remaining work is the following bounded production and dependency cleanup:
 
     1. **Structural error containment.** `StoreError` and `MetadataError` remain public storage
-       exports. `BucketWriteDrainError`, `BucketSnapshotLoadError`, and `ObjectPgActionError`
-       publicly carry those implementation errors, `server-core::ServerError` retains a concrete
-       `MetadataError`, and coordinator translation adapters still destructure the raw operation
-       wrappers. Replace these surfaces one operation family at a time with exhaustive
+       exports. The bucket-write-drain sub-slice completed on 2026-08-07:
+       `BucketWriteDrainError` is crate-private, public bucket-delete operations return the opaque
+       `BucketWriteDrainFailure` and exhaustive logical `BucketWriteDrainFailureKind`, raw
+       classification tests are storage-owned, and a separate private bounded diagnostic category
+       preserves safe store and metadata failure domains without retaining implementation errors.
+       Cross-crate response tests use an owner-provided logical fixture, the stale-authorization
+       regression drives the admitted production mutation from the authorization result, and the
+       boundary check rejects raw drain-error transit or re-export.
+       `BucketSnapshotLoadError` and `ObjectPgActionError` still publicly carry implementation
+       errors, `server-core::ServerError` retains a concrete `MetadataError`, and coordinator
+       translation adapters still destructure those raw operation wrappers. Replace these
+       remaining surfaces one operation family at a time with exhaustive
        storage-owned semantic errors. Preserve only logical values required for S3 translation,
        such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
-       other implementation detail behind the existing bounded opaque diagnostic. Start with the
-       smaller bucket-write-drain family, then bucket-snapshot loading, then object-PG operations
-       and streaming. Remove `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters,
-       and the public raw error exports once no public storage signature requires them. Tests that
-       currently construct raw storage errors must use owner-provided semantic fixtures or move to
-       storage; Phase 5 completion must not be used to keep the production representations public.
+       other implementation detail behind the existing bounded opaque diagnostic. Continue with
+       bucket-snapshot loading, then object-PG operations and streaming. Remove
+       `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
+       public raw error exports once no public storage signature requires them. Tests that
+       currently construct raw storage errors must use owner-provided semantic fixtures or move
+       to storage; Phase 5 completion must not be used to keep the production representations
+       public.
 
     2. **Debug-PG containment.** The bucket-delete debug endpoint already follows the required
        model: storage owns the diagnostic and returns owner-rendered opaque text. The metadata

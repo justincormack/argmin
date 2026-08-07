@@ -991,7 +991,7 @@ impl ReadRuntime {
         match self
             .storage_node()
             .try_finalize_bucket_delete(bucket)
-            .map_err(super::bucket::map_bucket_write_drain_error)?
+            .map_err(super::bucket::map_bucket_write_drain_failure)?
         {
             storage::BucketDeleteFinalizeOutcome::NotFound
             | storage::BucketDeleteFinalizeOutcome::NotDeleting

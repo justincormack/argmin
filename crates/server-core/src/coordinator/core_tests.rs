@@ -6507,10 +6507,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
         .test_begin_current_bucket_delete(&bucket)
         .unwrap_err();
     assert!(
-        matches!(
-            err,
-            storage::BucketWriteDrainError::Store(storage::StoreError::RouteMapExpired { .. })
-        ),
+        matches!(err.kind(), storage::BucketWriteDrainFailureKind::SlowDown),
         "foreground DeleteBucket should preserve the attempt on injected route expiry, got {err:?}"
     );
     assert!(
@@ -10158,62 +10155,40 @@ fn bucket_snapshot_object_reservation_conflicts_map_to_slow_down() {
 }
 
 #[test]
-fn bucket_write_drain_contention_maps_to_operation_aborted() {
-    let bucket = trusted_bucket_name("bucket-write-drain-contention");
-    let epoch = storage::ClusterEpoch::INITIAL;
+fn bucket_write_drain_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let map = |kind| {
+        Coordinator::map_bucket_write_drain_failure(
+            storage::test_support::bucket_write_drain_failure_for_kind(kind),
+        )
+    };
+
     assert!(matches!(
-        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
-            storage::StoreError::MetadataCommandLogConflict {
-                node_id: 1,
-                pg_id: 2,
-                cluster_epoch: epoch,
-                log_index: 3,
-            },
-        )),
+        map(storage::BucketWriteDrainFailureKind::OperationAborted),
         ServerError::OperationAborted
     ));
     assert!(matches!(
-        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
-            storage::StoreError::MetadataCommandPendingConflict {
-                pg_id: 2,
-                cluster_epoch: epoch,
-                existing_log_index: 3,
-                candidate_log_index: 4,
-            },
-        )),
-        ServerError::OperationAborted
+        map(storage::BucketWriteDrainFailureKind::SlowDown),
+        ServerError::SlowDown
     ));
     assert!(matches!(
-        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
-            storage::StoreError::MetadataCommandContention {
-                context: "pending bucket command displaced during cleanup",
-            },
-        )),
-        ServerError::OperationAborted
+        map(storage::BucketWriteDrainFailureKind::BucketNotEmpty),
+        ServerError::BucketNotEmpty
+    ));
+    let name = trusted_bucket_name("missing-drain-bucket");
+    assert!(matches!(
+        map(storage::BucketWriteDrainFailureKind::BucketNotFound {
+            name: name.clone()
+        }),
+        ServerError::BucketNotFound { name: mapped } if mapped == name.as_str()
     ));
     assert!(matches!(
-        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Metadata(
-            storage::MetadataError::StaleBucketMetadataCommand {
-                name: bucket,
-                bucket_execution_generation: 5,
-            },
-        )),
-        ServerError::OperationAborted
-    ));
-    assert!(matches!(
-        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Metadata(
-            storage::MetadataError::ObjectVersionReservationConflict {
-                version_id: storage::VersionId::from_u64(11),
-            },
-        )),
-        ServerError::OperationAborted
+        map(storage::BucketWriteDrainFailureKind::InternalError),
+        ServerError::BucketWriteDrain(_)
     ));
 }
 
 #[test]
 fn bucket_write_drain_failure_flight_record_redacts_storage_diagnostic() {
-    const SECRET_CONTEXT: &str = "secret bucket drain operation";
-    const SECRET_SOURCE: &str = "secret bucket drain source";
     let request_id = "request-bucket-drain-diagnostic-redaction";
     let _attached = observability::AttachedTrace::new(observability::TraceContext::from_ids(
         observability::TraceContextIds {
@@ -10221,10 +10196,9 @@ fn bucket_write_drain_failure_flight_record_redacts_storage_diagnostic() {
             request_id: request_id.to_string(),
         },
     ));
-    let error = storage::BucketWriteDrainError::Store(storage::StoreError::Io {
-        context: SECRET_CONTEXT,
-        source: std::io::Error::other(SECRET_SOURCE),
-    });
+    let error = storage::test_support::bucket_write_drain_failure_for_kind(
+        storage::BucketWriteDrainFailureKind::InternalError,
+    );
 
     super::bucket::emit_bucket_delete_begin_failed(
         &trusted_bucket_name("bounded-diagnostic-bucket"),
@@ -10241,10 +10215,8 @@ fn bucket_write_drain_failure_flight_record_redacts_storage_diagnostic() {
             record.request_id == request_id && record.event == "bucket_delete_begin_failed"
         })
         .expect("bucket drain failure should be recorded");
-    assert!(record.detail.contains("cause_label=store_io_failure"));
+    assert!(record.detail.contains("cause_label=metadata_failure"));
     assert!(!record.detail.contains("error="));
-    assert!(!record.detail.contains(SECRET_CONTEXT));
-    assert!(!record.detail.contains(SECRET_SOURCE));
 }
 
 #[test]
@@ -10296,9 +10268,11 @@ fn semantic_storage_failure_classes_map_to_s3_outcomes() {
         ServerError::SlowDown
     ));
     assert!(matches!(
-        Coordinator::map_bucket_write_drain_error(storage::BucketWriteDrainError::Store(
-            resource_exhausted(),
-        )),
+        Coordinator::map_bucket_write_drain_failure(
+            storage::test_support::bucket_write_drain_failure_for_kind(
+                storage::BucketWriteDrainFailureKind::SlowDown,
+            ),
+        ),
         ServerError::SlowDown
     ));
 }
@@ -13007,8 +12981,8 @@ fn bucket_delete_finalizer_stale_metadata_route_maps_to_slow_down() {
         .unwrap_err();
     assert!(
         matches!(
-            storage_err,
-            storage::BucketWriteDrainError::Store(storage::StoreError::StaleMetadataRoute { .. })
+            storage_err.kind(),
+            storage::BucketWriteDrainFailureKind::SlowDown
         ),
         "fixture should exercise StaleMetadataRoute, got {storage_err:?}"
     );
@@ -14849,8 +14823,8 @@ fn delete_bucket_stale_metadata_route_maps_to_slow_down() {
         .unwrap_err();
     assert!(
         matches!(
-            storage_err,
-            storage::BucketWriteDrainError::Store(storage::StoreError::StaleMetadataRoute { .. })
+            storage_err.kind(),
+            storage::BucketWriteDrainFailureKind::SlowDown
         ),
         "fixture should exercise StaleMetadataRoute, got {storage_err:?}"
     );
@@ -14944,21 +14918,21 @@ fn delete_bucket_stale_raw_authorization_does_not_delete_recreated_bucket() {
         "recreated bucket must be a distinct incarnation"
     );
 
-    let err = storage_cluster
-        .begin_bucket_delete_if_current(
-            &stale_authorized.name,
-            storage::BucketIdentityGenerations {
-                bucket_execution_generation: stale_authorized.bucket_execution_generation,
-                bucket_incarnation_generation: stale_authorized.bucket_incarnation_generation,
-            },
-        )
+    let route_handle = test_storage_route_handle(Arc::clone(&storage_cluster));
+    let admission = route_handle.admit_current_route().unwrap();
+    let route = admission
+        .active_bucket_route(&stale_authorized.name)
+        .unwrap();
+    let err = route
+        .begin_bucket_delete_if_current(storage::BucketIdentityGenerations {
+            bucket_execution_generation: stale_authorized.bucket_execution_generation,
+            bucket_incarnation_generation: stale_authorized.bucket_incarnation_generation,
+        })
         .unwrap_err();
     assert!(
         matches!(
-            err,
-            storage::BucketWriteDrainError::Store(
-                storage::StoreError::MetadataCommandContention { .. }
-            )
+            err.kind(),
+            storage::BucketWriteDrainFailureKind::OperationAborted
         ),
         "stale authorization should return retryable contention, got {err:?}"
     );

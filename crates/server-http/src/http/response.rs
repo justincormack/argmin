@@ -181,6 +181,7 @@ fn client_error_message(err: &ServerError) -> String {
         }
         ServerError::VersionNotFound { .. } => "The specified version does not exist.".to_string(),
         ServerError::Store(_)
+        | ServerError::BucketWriteDrain(_)
         | ServerError::Metadata(_)
         | ServerError::Ec(_)
         | ServerError::MetadataBlobError { .. }
@@ -4968,6 +4969,14 @@ mod tests {
     #[test]
     fn error_response_internal_storage_and_ec_errors_are_sanitized() {
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
+            (
+                ServerError::BucketWriteDrain(
+                    storage::test_support::bucket_write_drain_failure_for_kind(
+                        storage::BucketWriteDrainFailureKind::InternalError,
+                    ),
+                ),
+                vec!["bucket write drain failed"],
+            ),
             (
                 ServerError::Store(
                     storage::StoreError::Io {

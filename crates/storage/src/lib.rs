@@ -148,10 +148,11 @@ pub use control_plane_service_client::{
     ControlPlaneStorageNodeClient,
 };
 pub use error::{
-    BucketSnapshotLoadError, BucketWriteDrainError, ClusterBuildError, MetadataError,
-    ObjectPgActionError, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
+    BucketSnapshotLoadError, BucketWriteDrainFailure, BucketWriteDrainFailureKind,
+    ClusterBuildError, MetadataError, ObjectPgActionError, ShardIoError, StoreError, StoreFailure,
+    StoreOperationFailureClass,
 };
-pub(crate) use error::{StorageNodeFailureClass, StorageNodeFailureDetail};
+pub(crate) use error::{BucketWriteDrainError, StorageNodeFailureClass, StorageNodeFailureDetail};
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
     LivePgMetadataTransferError, LivePgMetadataTransferFailpoint, LivePgMetadataTransferSummary,
@@ -949,19 +950,19 @@ pub mod test_support {
         fn test_seed_missing_bucket_finalize_work(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError>;
+        ) -> Result<(), BucketWriteDrainFailure>;
 
         fn test_seed_current_bucket_finalize_work(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketDeleteFinalizeRoot, BucketWriteDrainError>;
+        ) -> Result<TestBucketDeleteFinalizeRoot, BucketWriteDrainFailure>;
 
         fn test_duplicate_bucket_finalize_work(&self, root: &TestBucketDeleteFinalizeRoot);
 
         fn test_finalize_deleting_bucket_metadata_if_present(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError>;
+        ) -> Result<(), BucketWriteDrainFailure>;
 
         fn test_hold_bucket_metadata(
             &self,
@@ -987,7 +988,7 @@ pub mod test_support {
         fn test_begin_current_bucket_delete(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError>;
+        ) -> Result<(), BucketWriteDrainFailure>;
 
         fn test_enqueue_bucket_delete_begin_subject(&self, subject: &TestBucketDeleteBeginSubject);
 
@@ -1007,7 +1008,7 @@ pub mod test_support {
             outcome: TestBucketDeleteAttemptOutcomeKind,
             phase: TestBucketDeleteAttemptPhase,
             detail: String,
-        ) -> Result<TestBucketDeleteBeginSubject, BucketWriteDrainError>;
+        ) -> Result<TestBucketDeleteBeginSubject, BucketWriteDrainFailure>;
 
         fn test_observe_bucket_delete_progress(
             &self,
@@ -1040,7 +1041,7 @@ pub mod test_support {
         fn test_begin_durable_bucket_delete_drain(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError>;
+        ) -> Result<(), BucketWriteDrainFailure>;
 
         fn test_mark_multipart_upload_aborting(
             &self,
@@ -1068,15 +1069,17 @@ pub mod test_support {
         fn test_seed_missing_bucket_finalize_work(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError> {
+        ) -> Result<(), BucketWriteDrainFailure> {
             StorageCluster::test_enqueue_missing_bucket_delete_finalize(self, bucket)
+                .map_err(BucketWriteDrainFailure::from)
         }
 
         fn test_seed_current_bucket_finalize_work(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketDeleteFinalizeRoot, BucketWriteDrainError> {
+        ) -> Result<TestBucketDeleteFinalizeRoot, BucketWriteDrainFailure> {
             StorageCluster::test_enqueue_current_bucket_delete_finalize(self, bucket)
+                .map_err(BucketWriteDrainFailure::from)
         }
 
         fn test_duplicate_bucket_finalize_work(&self, root: &TestBucketDeleteFinalizeRoot) {
@@ -1086,13 +1089,13 @@ pub mod test_support {
         fn test_finalize_deleting_bucket_metadata_if_present(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError> {
+        ) -> Result<(), BucketWriteDrainFailure> {
             match StorageCluster::test_delete_bucket_metadata(self, bucket) {
                 Ok(())
                 | Err(BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { .. })) => {
                     Ok(())
                 }
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
             }
         }
 
@@ -1149,8 +1152,9 @@ pub mod test_support {
         fn test_begin_current_bucket_delete(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError> {
+        ) -> Result<(), BucketWriteDrainFailure> {
             StorageCluster::test_begin_bucket_delete_if_current(self, bucket)
+                .map_err(BucketWriteDrainFailure::from)
         }
 
         fn test_enqueue_bucket_delete_begin_subject(&self, subject: &TestBucketDeleteBeginSubject) {
@@ -1189,7 +1193,7 @@ pub mod test_support {
             outcome: TestBucketDeleteAttemptOutcomeKind,
             phase: TestBucketDeleteAttemptPhase,
             detail: String,
-        ) -> Result<TestBucketDeleteBeginSubject, BucketWriteDrainError> {
+        ) -> Result<TestBucketDeleteBeginSubject, BucketWriteDrainFailure> {
             let post_reservation_next_object_pg_id = matches!(
                 phase,
                 TestBucketDeleteAttemptPhase::FinalVisibilityCheck
@@ -1203,7 +1207,8 @@ pub mod test_support {
                 phase,
                 detail,
                 post_reservation_next_object_pg_id,
-            )?;
+            )
+            .map_err(BucketWriteDrainFailure::from)?;
             Ok(TestBucketDeleteBeginSubject { root })
         }
 
@@ -1259,8 +1264,9 @@ pub mod test_support {
         fn test_begin_durable_bucket_delete_drain(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), BucketWriteDrainError> {
+        ) -> Result<(), BucketWriteDrainFailure> {
             StorageCluster::test_begin_durable_bucket_delete_drain(self, bucket)
+                .map_err(BucketWriteDrainFailure::from)
         }
 
         fn test_mark_multipart_upload_aborting(
@@ -1521,6 +1527,17 @@ pub mod test_support {
             },
             StoreOperationFailureClass::Other => StoreError::NotFound,
         }
+    }
+
+    /// Construct an opaque bucket-write drain failure from its logical outcome.
+    ///
+    /// This lets cross-crate response-mapping tests remain exhaustive without
+    /// constructing storage implementation errors.
+    #[must_use]
+    pub fn bucket_write_drain_failure_for_kind(
+        kind: BucketWriteDrainFailureKind,
+    ) -> BucketWriteDrainFailure {
+        BucketWriteDrainFailure::for_test(kind)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

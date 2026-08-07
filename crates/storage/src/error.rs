@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[cfg(test)]
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::storage_rpc::{StorageNodeFailure, StorageRpcWireErrorCode};
-use crate::types::{ClusterEpoch, PgState, RouteMapValidity};
+use crate::types::{BucketName, ClusterEpoch, PgState, RouteMapValidity};
 
 /// Opaque diagnostic for a failure inside the metadata database implementation.
 ///
@@ -1787,7 +1787,74 @@ fn storage_node_failure_requires_metadata_transfer_route_refresh(
     }
 }
 
-pub enum BucketWriteDrainError {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BucketWriteDrainDiagnosticCategory {
+    Store(StoreFailureDiagnosticCategory),
+    MetadataBucketWriteDraining,
+    MetadataBucketWriteReservationConflict,
+    MetadataBucketWriteDrainConflict,
+    MetadataReclaimClaimConflict,
+    MetadataObjectGenerationReservationConflict,
+    MetadataObjectVersionReservationConflict,
+    MetadataStaleBucketCommand,
+    MetadataStaleObjectCommand,
+    MetadataDatabase,
+    MetadataOther,
+}
+
+impl BucketWriteDrainDiagnosticCategory {
+    fn from_error(error: &BucketWriteDrainError) -> Self {
+        match error {
+            BucketWriteDrainError::Store(error) => Self::Store(error.failure_diagnostic_category()),
+            BucketWriteDrainError::Metadata(MetadataError::BucketWriteDraining) => {
+                Self::MetadataBucketWriteDraining
+            }
+            BucketWriteDrainError::Metadata(MetadataError::BucketWriteReservationConflict {
+                ..
+            }) => Self::MetadataBucketWriteReservationConflict,
+            BucketWriteDrainError::Metadata(MetadataError::BucketWriteDrainConflict { .. }) => {
+                Self::MetadataBucketWriteDrainConflict
+            }
+            BucketWriteDrainError::Metadata(MetadataError::ReclaimClaimConflict { .. }) => {
+                Self::MetadataReclaimClaimConflict
+            }
+            BucketWriteDrainError::Metadata(
+                MetadataError::ObjectGenerationReservationConflict { .. },
+            ) => Self::MetadataObjectGenerationReservationConflict,
+            BucketWriteDrainError::Metadata(MetadataError::ObjectVersionReservationConflict {
+                ..
+            }) => Self::MetadataObjectVersionReservationConflict,
+            BucketWriteDrainError::Metadata(MetadataError::StaleBucketMetadataCommand {
+                ..
+            }) => Self::MetadataStaleBucketCommand,
+            BucketWriteDrainError::Metadata(MetadataError::StaleObjectWriteCommand { .. }) => {
+                Self::MetadataStaleObjectCommand
+            }
+            BucketWriteDrainError::Metadata(MetadataError::Db { .. }) => Self::MetadataDatabase,
+            BucketWriteDrainError::Metadata(_) => Self::MetadataOther,
+        }
+    }
+
+    const fn cause_label(self) -> &'static str {
+        match self {
+            Self::Store(category) => category.cause_label(),
+            Self::MetadataBucketWriteDraining => "bucket_write_draining",
+            Self::MetadataBucketWriteReservationConflict => "bucket_write_reservation_conflict",
+            Self::MetadataBucketWriteDrainConflict => "bucket_write_drain_conflict",
+            Self::MetadataReclaimClaimConflict => "reclaim_claim_conflict",
+            Self::MetadataObjectGenerationReservationConflict => {
+                "object_generation_reservation_conflict"
+            }
+            Self::MetadataObjectVersionReservationConflict => "object_version_reservation_conflict",
+            Self::MetadataStaleBucketCommand => "stale_bucket_metadata_command",
+            Self::MetadataStaleObjectCommand => "stale_object_write_command",
+            Self::MetadataDatabase => "metadata_db_error",
+            Self::MetadataOther => "metadata_failure",
+        }
+    }
+}
+
+pub(crate) enum BucketWriteDrainError {
     Store(StoreError),
     Metadata(MetadataError),
 }
@@ -1796,10 +1863,7 @@ impl BucketWriteDrainError {
     /// Return a bounded storage-owned label for operator diagnostics.
     #[must_use]
     pub fn diagnostic_cause_label(&self) -> &'static str {
-        match self {
-            Self::Store(error) => error.diagnostic_cause_label(),
-            Self::Metadata(_) => "metadata_failure",
-        }
+        BucketWriteDrainDiagnosticCategory::from_error(self).cause_label()
     }
 }
 
@@ -1831,6 +1895,106 @@ impl std::fmt::Display for BucketWriteDrainError {
 }
 
 impl std::error::Error for BucketWriteDrainError {}
+
+/// Logical response policy for a failed bucket-write drain operation.
+///
+/// This deliberately omits database, PG, route, command-log, RPC, and I/O
+/// representations. Adding an internal [`BucketWriteDrainError`] case requires
+/// an explicit decision in its conversion to [`BucketWriteDrainFailure`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BucketWriteDrainFailureKind {
+    OperationAborted,
+    SlowDown,
+    BucketNotEmpty,
+    BucketNotFound { name: BucketName },
+    InternalError,
+}
+
+/// Opaque failure returned by public bucket-write drain operations.
+///
+/// Callers may select an S3 response from [`Self::into_kind`] and may emit the
+/// bounded owner-provided diagnostic label. The underlying storage error is
+/// classified and discarded before this value crosses the crate boundary.
+pub struct BucketWriteDrainFailure {
+    kind: BucketWriteDrainFailureKind,
+    diagnostic_category: BucketWriteDrainDiagnosticCategory,
+}
+
+impl BucketWriteDrainFailure {
+    #[must_use]
+    pub fn kind(&self) -> &BucketWriteDrainFailureKind {
+        &self.kind
+    }
+
+    #[must_use]
+    pub fn into_kind(self) -> BucketWriteDrainFailureKind {
+        self.kind
+    }
+
+    /// Return a bounded storage-owned label for operator diagnostics.
+    #[must_use]
+    pub fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn for_test(kind: BucketWriteDrainFailureKind) -> Self {
+        Self {
+            kind,
+            diagnostic_category: BucketWriteDrainDiagnosticCategory::MetadataOther,
+        }
+    }
+}
+
+impl From<BucketWriteDrainError> for BucketWriteDrainFailure {
+    fn from(error: BucketWriteDrainError) -> Self {
+        let diagnostic_category = BucketWriteDrainDiagnosticCategory::from_error(&error);
+        let kind = match error {
+            BucketWriteDrainError::Store(error) => match error.operation_failure_class() {
+                StoreOperationFailureClass::MetadataCommandContention => {
+                    BucketWriteDrainFailureKind::OperationAborted
+                }
+                StoreOperationFailureClass::ResourceExhausted
+                | StoreOperationFailureClass::RetryableConvergence => {
+                    BucketWriteDrainFailureKind::SlowDown
+                }
+                StoreOperationFailureClass::Other => BucketWriteDrainFailureKind::InternalError,
+            },
+            BucketWriteDrainError::Metadata(error) if error.is_command_contention() => {
+                BucketWriteDrainFailureKind::OperationAborted
+            }
+            BucketWriteDrainError::Metadata(MetadataError::BucketNotEmpty) => {
+                BucketWriteDrainFailureKind::BucketNotEmpty
+            }
+            BucketWriteDrainError::Metadata(MetadataError::BucketNotFound { name }) => {
+                BucketWriteDrainFailureKind::BucketNotFound { name }
+            }
+            BucketWriteDrainError::Metadata(_) => BucketWriteDrainFailureKind::InternalError,
+        };
+        Self {
+            kind,
+            diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for BucketWriteDrainFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BucketWriteDrainFailure")
+            .field("kind", &self.kind)
+            .field("cause_label", &self.diagnostic_category.cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BucketWriteDrainFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bucket write drain failed")
+    }
+}
+
+impl std::error::Error for BucketWriteDrainFailure {}
 
 pub enum ObjectPgActionError {
     Store(StoreError),
@@ -2286,6 +2450,120 @@ mod tests {
         assert!(!debug.contains(SECRET_CONTEXT));
         assert!(!debug.contains(SECRET_SOURCE));
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn bucket_write_drain_errors_convert_to_exhaustive_logical_failures() {
+        let failure = |error| BucketWriteDrainFailure::from(error).into_kind();
+
+        for class in [
+            StoreOperationFailureClass::ResourceExhausted,
+            StoreOperationFailureClass::RetryableConvergence,
+        ] {
+            assert_eq!(
+                failure(BucketWriteDrainError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                )),
+                BucketWriteDrainFailureKind::SlowDown
+            );
+        }
+        assert_eq!(
+            failure(BucketWriteDrainError::Store(
+                crate::test_support::store_error_for_operation_failure_class(
+                    StoreOperationFailureClass::MetadataCommandContention,
+                ),
+            )),
+            BucketWriteDrainFailureKind::OperationAborted
+        );
+        assert_eq!(
+            failure(BucketWriteDrainError::Store(StoreError::NotFound)),
+            BucketWriteDrainFailureKind::InternalError
+        );
+
+        let bucket = BucketName::try_from("logical-drain-bucket").unwrap();
+        assert_eq!(
+            failure(BucketWriteDrainError::Metadata(
+                MetadataError::StaleBucketMetadataCommand {
+                    name: bucket.clone(),
+                    bucket_execution_generation: 9,
+                },
+            )),
+            BucketWriteDrainFailureKind::OperationAborted
+        );
+        assert_eq!(
+            failure(BucketWriteDrainError::Metadata(
+                MetadataError::BucketNotEmpty
+            )),
+            BucketWriteDrainFailureKind::BucketNotEmpty
+        );
+        assert_eq!(
+            failure(BucketWriteDrainError::Metadata(
+                MetadataError::BucketNotFound {
+                    name: bucket.clone(),
+                },
+            )),
+            BucketWriteDrainFailureKind::BucketNotFound { name: bucket }
+        );
+        assert_eq!(
+            failure(BucketWriteDrainError::Metadata(
+                MetadataError::ObjectNotFound
+            )),
+            BucketWriteDrainFailureKind::InternalError
+        );
+    }
+
+    #[test]
+    fn bucket_write_drain_failure_retains_bounded_metadata_diagnostic_category() {
+        let bucket = BucketName::try_from("diagnostic-drain-bucket").unwrap();
+        let cases = [
+            (
+                BucketWriteDrainError::Metadata(MetadataError::Db {
+                    context: "secret database operation",
+                    source: DatabaseError::new("secret database detail"),
+                }),
+                "metadata_db_error",
+            ),
+            (
+                BucketWriteDrainError::Metadata(MetadataError::StaleBucketMetadataCommand {
+                    name: bucket,
+                    bucket_execution_generation: 7,
+                }),
+                "stale_bucket_metadata_command",
+            ),
+            (
+                BucketWriteDrainError::Metadata(MetadataError::ObjectVersionReservationConflict {
+                    version_id: crate::VersionId::from_u64(9),
+                }),
+                "object_version_reservation_conflict",
+            ),
+        ];
+
+        for (error, expected_label) in cases {
+            let failure = BucketWriteDrainFailure::from(error);
+            assert_eq!(failure.diagnostic_cause_label(), expected_label);
+            let rendered = format!("{failure:?} {failure}");
+            assert!(!rendered.contains("secret"));
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+    }
+
+    #[test]
+    fn bucket_write_drain_failure_discards_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret bucket drain operation";
+        const SECRET_SOURCE: &str = "secret bucket drain source";
+        let failure = BucketWriteDrainFailure::from(BucketWriteDrainError::Store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        }));
+
+        assert_eq!(failure.kind(), &BucketWriteDrainFailureKind::InternalError);
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "bucket write drain failed");
+        let debug = format!("{failure:?}");
+        assert!(debug.contains("store_io_failure"));
+        assert!(!debug.contains(SECRET_CONTEXT));
+        assert!(!debug.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&failure).is_none());
     }
 
     #[test]

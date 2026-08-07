@@ -1,6 +1,8 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
-use storage::error::{MetadataError, StoreError, StoreFailure, StoreOperationFailureClass};
+use storage::error::{
+    BucketWriteDrainFailure, MetadataError, StoreError, StoreFailure, StoreOperationFailureClass,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ManagedEncryptionReadHeaderContext {
@@ -47,6 +49,9 @@ pub enum ServerError {
 
     #[error("storage error: {0}")]
     Store(StoreFailure),
+
+    #[error("bucket write drain error: {0}")]
+    BucketWriteDrain(BucketWriteDrainFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -493,6 +498,7 @@ impl ServerError {
     pub fn diagnostic_cause_label(&self) -> &'static str {
         match self {
             Self::Store(error) => error.diagnostic_cause_label(),
+            Self::BucketWriteDrain(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -521,6 +527,10 @@ impl ServerError {
         match self {
             Self::Store(error) => format!(
                 "server_error>store_error>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::BucketWriteDrain(error) => format!(
+                "server_error>bucket_write_drain>{}",
                 error.diagnostic_cause_label()
             ),
             Self::Metadata(error) => format!(
@@ -694,6 +704,7 @@ impl ServerError {
             Self::InternalError { .. } => "InternalError",
             Self::IntegrityError { .. } => "InternalError",
             Self::Store(_) => "InternalError",
+            Self::BucketWriteDrain(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }

@@ -151,15 +151,6 @@ pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataErro
     error.is_command_contention()
 }
 
-fn store_error_is_metadata_command_contention(error: &storage::StoreError) -> bool {
-    match error.operation_failure_class() {
-        storage::StoreOperationFailureClass::MetadataCommandContention => true,
-        storage::StoreOperationFailureClass::ResourceExhausted
-        | storage::StoreOperationFailureClass::RetryableConvergence
-        | storage::StoreOperationFailureClass::Other => false,
-    }
-}
-
 pub(super) fn object_pg_action_error_is_metadata_command_contention(
     error: &storage::ObjectPgActionError,
 ) -> bool {

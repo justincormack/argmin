@@ -76,7 +76,7 @@ impl ReclaimTraceRuntime {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
-        self.cluster.try_finalize_bucket_delete(bucket)
+        self.cluster.try_finalize_bucket_delete_internal(bucket)
     }
 
     fn try_finalize_bucket_delete_for_with_outcome(

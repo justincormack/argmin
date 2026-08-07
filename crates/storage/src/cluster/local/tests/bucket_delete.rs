@@ -534,7 +534,9 @@ fn bucket_delete_finalizer_resumes_bounded_pg_scan_after_reopen() {
         assert_eq!(progress.finalizer_next_object_pg_id, Some(16));
     }
     cluster.test_store_route_map_validity(RouteMapValidity::until_ms(0).unwrap());
-    let error = cluster.try_finalize_bucket_delete(&bucket).unwrap_err();
+    let error = cluster
+        .try_finalize_bucket_delete_internal(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             error,
@@ -2323,7 +2325,9 @@ fn finalized_bucket_delete_fails_closed_on_active_replica() {
     );
     drop(divergent_pg);
 
-    let err = cluster.try_finalize_bucket_delete(&bucket).unwrap_err();
+    let err = cluster
+        .try_finalize_bucket_delete_internal(&bucket)
+        .unwrap_err();
     assert!(
         matches!(
             err,

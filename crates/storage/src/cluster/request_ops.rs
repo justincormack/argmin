@@ -5919,7 +5919,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn begin_bucket_delete_if_current(
+    pub(crate) fn begin_bucket_delete_if_current(
         &self,
         bucket: &BucketName,
         bucket_identity: BucketIdentityGenerations,
@@ -7700,6 +7700,14 @@ impl super::StorageCluster {
     }
 
     pub fn try_finalize_bucket_delete(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainFailure> {
+        self.try_finalize_bucket_delete_internal(bucket)
+            .map_err(BucketWriteDrainFailure::from)
+    }
+
+    pub(crate) fn try_finalize_bucket_delete_internal(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
