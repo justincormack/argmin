@@ -5347,7 +5347,7 @@ public_storage_test_adapter_fixture=$(
         scripts/fixtures/storage-boundary-unused-test-adapters
 )
 expected_public_storage_test_adapter_fixture='scripts/fixtures/storage-boundary-unused-test-adapters/nested/unrelated-module.rs:7:    pub fn test_unreviewed_storage_adapter(&self) {}
-scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:4:    pub fn test_ec_scratch_allocation_count(&self) {}
+scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:4:    pub fn test_ordinary_adapter(&self) {}
 scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:6:    pub async fn test_async_adapter(&self) {}
 scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:8:    pub const fn test_const_adapter(&self) {}
 scripts/fixtures/storage-boundary-unused-test-adapters/reviewed.rs:10:    pub unsafe fn test_unsafe_adapter(&self) {}
@@ -5360,8 +5360,81 @@ if [[ "$public_storage_test_adapter_fixture" != "$expected_public_storage_test_a
     fi
 fi
 fail_with_matches \
-    "Storage test-adapter source-root scan must find ordinary, formerly allowlisted, and qualified public method fixtures" \
+    "Storage test-adapter source-root scan must find ordinary and qualified public method fixtures" \
     "$public_storage_test_adapter_fixture_failure"
+
+test_support_api_scanner=scripts/check-storage-test-support-api.awk
+
+scan_storage_test_support_api() {
+    local inline_root=$1
+    local module_root=$2
+    local source_root=$3
+    local -a sources=()
+
+    while IFS= read -r source; do
+        if [[ "$source" != "$inline_root" ]]; then
+            sources+=("$source")
+        fi
+    done < <(find "$source_root" -type f -name '*.rs' -print | sort)
+
+    awk -v inline_root="$inline_root" -v api_module_root="$module_root" \
+        -f "$test_support_api_scanner" \
+        "$inline_root" "${sources[@]}" | sort -u
+}
+
+test_support_physical_api_leaks=$(
+    scan_storage_test_support_api \
+        crates/storage/src/lib.rs \
+        crates/storage/src/test_support \
+        crates/storage/src
+)
+fail_with_matches \
+    "Curated storage::test_support public signatures must not expose physical PG, node, shard, route, proof, claim, durable-row, generation, or EC-shape types" \
+    "$test_support_physical_api_leaks"
+
+test_support_physical_api_fixture=$(
+    scan_storage_test_support_api \
+        scripts/fixtures/storage-boundary-test-support-api/lib.rs \
+        scripts/fixtures/storage-boundary-test-support-api/test_support \
+        scripts/fixtures/storage-boundary-test-support-api
+)
+expected_test_support_physical_api_fixture='scripts/fixtures/storage-boundary-test-support-api/lib.rs:18:HiddenRoute
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:18:PgRouteSnapshot
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:21:ExportedRoute
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:21:HiddenRoute
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:22:wildcard-import
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:25:ShardKey
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:29:LifecycleSweepClaimRecord
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:32:PgRouteSnapshot
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:32:RawRouteObservation
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:34:PgId
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:9:ImportedLayout
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:9:PayloadLayout
+scripts/fixtures/storage-boundary-test-support-api/lib.rs:9:RoutedPg
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/api.rs:3:NestedLayout
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:11:EcShape
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:15:CommentRenamed
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:15:EcShape
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:16:wildcard-import
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:17:CommentRenamed
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:1:EcShape
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:1:Renamed
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:25:PgId
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:31:Item
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:31:PgId
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:38:EcShape
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:4:wildcard-import
+scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:7:Renamed'
+test_support_physical_api_fixture_failure=""
+if [[ "$test_support_physical_api_fixture" != "$expected_test_support_physical_api_fixture" ]]; then
+    test_support_physical_api_fixture_failure=$test_support_physical_api_fixture
+    if [[ -z "$test_support_physical_api_fixture_failure" ]]; then
+        test_support_physical_api_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Curated test-support API scanner must resolve aliases and recursively reject physical types in nested storage::test_support modules" \
+    "$test_support_physical_api_fixture_failure"
 
 metadata_command_raw_test_symbol_leaks=$(
     rg -n --color=never \

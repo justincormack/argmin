@@ -19488,8 +19488,12 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
     .unwrap();
 
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 0);
-    let ec = coord.storage_node().default_payload_ec_shape();
-    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(
+        coord
+            .storage_node()
+            .test_default_payload_ec_scratch_allocation_count(),
+        1
+    );
 
     let first = coord
         .get_object(&GetObjectRequest {
@@ -19506,7 +19510,12 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
         .unwrap();
     assert_eq!(first.body.read_all().unwrap(), data);
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
-    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(
+        coord
+            .storage_node()
+            .test_default_payload_ec_scratch_allocation_count(),
+        1
+    );
 
     let second = coord
         .get_object(&GetObjectRequest {
@@ -19523,7 +19532,12 @@ fn ec_degraded_read_reuses_reconstruction_scratch() {
         .unwrap();
     assert_eq!(second.body.read_all().unwrap(), data);
     assert_eq!(coord.payload_buffer_pool.allocation_count(), 1);
-    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(
+        coord
+            .storage_node()
+            .test_default_payload_ec_scratch_allocation_count(),
+        1
+    );
 }
 
 #[test]

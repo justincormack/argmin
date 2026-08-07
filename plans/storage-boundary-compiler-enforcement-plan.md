@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–4 complete; Phase 5 in progress
+Status: active — Phases 0–5 complete; Phase 6 pending
 
 Related plans:
 
@@ -5605,14 +5605,12 @@ logical observations, and deterministic fault guards. A separate crate is
 appropriate only for composition helpers implemented entirely through the
 normal public logical API.
 
-The namespace is a migration boundary, not an automatic certification of each
-item placed in it. Until slice 3 is complete, the remaining physical
-observations and mutation helpers must be treated as explicit transitional
-exceptions and inventoried here. Moving a symbol under `test_support` does not
-make raw PG IDs, shard identities, EC layouts, durable rows, or generic
-mutation methods acceptable final APIs.
+The namespace is an enforced ownership boundary, not an automatic
+certification of each item placed in it. Moving a symbol under `test_support`
+does not make raw PG IDs, shard identities, EC layouts, durable rows, or
+generic mutation methods acceptable APIs.
 
-The audit found four remaining classes of work:
+The audit found and closed four classes of work:
 
 1. **Completed — raw or semantically different test execution paths.** The
    coordinator's raw stream segment/finalization adapters and storage-node-only
@@ -5625,7 +5623,7 @@ The audit found four remaining classes of work:
    must never depend on weaker route, deadline, or subject validation than
    production.
 
-2. **Substantially completed — owner-local impossible-state fixtures.** Logical
+2. **Completed — owner-local impossible-state fixtures.** Logical
    committed-object segment layout, storage identity, placement distribution,
    and exact payload presence/reclamation assertions now use an opaque
    storage-owned payload snapshot. Object-payload corruption and repair tests
@@ -5634,10 +5632,10 @@ The audit found four remaining classes of work:
    now storage-owner-local; the remaining coordinator lease-drop regressions
    observe only logical queue depth and opaque reclaim-root presence.
 
-   The final audit found older residual cases which predate those migrations,
-   so this item is not yet complete. The stream append/abort cleanup physical
-   assertions are now storage-owner-local; retained coordinator cases assert
-   only the selected error, cleanup trace, or opaque staged-payload outcome.
+   The final audit found and migrated the older residual cases which predated
+   those migrations. The stream append/abort cleanup physical assertions are
+   now storage-owner-local; retained coordinator cases assert only the selected
+   error, cleanup trace, or opaque staged-payload outcome.
    UploadPartCopy source loss now uses a storage-owned whole-segment-loss
    scenario rather than caller-reconstructed shard paths. The direct-PUT
    pre-storage failure path now serializes request-owned metadata before
@@ -5647,24 +5645,22 @@ The audit found four remaining classes of work:
    storage-owner-local. Backfill worker tests are now storage-owner-local and
    use the private work-item, route, shard-acknowledgement, health, and
    placed-file model directly. Retained-placement and shard-selection tests
-   still reconstruct physical routes or shard identities outside `storage`;
-   those remaining physical invariants must move to `storage`, while any
-   retained coordinator test should invoke an opaque owner scenario and
-   assert only the coordinator-visible error, trace, or cleanup outcome.
+   now use storage-owned opaque topology and fault scenarios; retained
+   coordinator tests assert only coordinator-visible results and cleanup.
 
    Tests whose assertion is about storage corruption, recovery, physical
    layout, claims, or queue invariants belong in `storage`. Where an
    S3/coordinator response to a storage failure genuinely requires a
    cross-crate test, expose an opaque scenario-level fault or logical
    observation rather than physical PG, shard, row, claim, or command records.
-   This work is the test-fixture portion of pending item 14 in
-   `storage-upgrade-versioning-plan.md`; that plan retains ownership of its
-   separate debug-PG containment work.
+   This completed the test-fixture portion formerly shared with pending item
+   14 in `storage-upgrade-versioning-plan.md`; that plan retains ownership of
+   its separate production error-wrapper and debug-PG containment work.
 
-3. **In progress — consolidated dev-only support.** Move retained cross-crate
-   test DTOs, observations, and hook installers out of the `storage` crate root
-   and off production types where practical, into `storage::test_support`.
-   Classify every exported item as one of:
+3. **Completed — consolidated dev-only support.** Retained cross-crate test
+   DTOs, observations, and hook installers are consolidated under
+   `storage::test_support` rather than ordinary production types. Every
+   exported item is classified as one of:
 
    - a logical read-only observation;
    - an opaque semantic fixture/scenario;
@@ -5680,7 +5676,7 @@ The audit found four remaining classes of work:
    hooks; local physical-invariant tests belong with the storage owner rather
    than behind an S3 harness abstraction.
 
-4. **Feature-graph enforcement complete; feature cleanup remains.** The stable
+4. **Completed — feature-graph enforcement and feature cleanup.** The stable
    CI/boundary check obtains the complete workspace-member set from Cargo
    metadata and examines every member's normal/build feature graph. The
    classification is fail closed: maintain one explicit, reviewed allowlist of
@@ -5694,11 +5690,9 @@ The audit found four remaining classes of work:
    `storage/test-hooks` nor `server-core/test-utils` is enabled. Dev-dependency
    edges may enable the features while compiling a package's tests, but do not
    exempt that package's normal/build graph from the check.
-   Review `server-core/test-utils` after the raw adapters are removed and stop
-   forwarding `storage/test-hooks` if its remaining cross-crate helpers no
-   longer require storage-private support. Keep all-feature compilation for
-   validating the test surface, but do not confuse that deliberately enabled
-   graph with a production dependency graph.
+   `server-core/test-utils` no longer forwards `storage/test-hooks`.
+   All-feature compilation continues to validate the deliberate test surface
+   without being confused with a production dependency graph.
 
 Implementation slices:
 
@@ -6325,9 +6319,55 @@ Remaining implementation order after this audit:
    cursors remain storage-local. The same scanner runs against nested,
    formerly allowlisted, async, const, unsafe, and extern fixtures to prove
    crate-wide discovery across valid qualified function signatures; and
-5. rerun the public-export/feature audit and mark Phase 5 complete only when
-   the remaining raw topology/support seams and their plan exceptions are
-   gone.
+5. **Completed:** the final public-export/feature audit found one remaining
+   physical parameter: the EC scratch-allocation observation accepted a raw
+   `EcShape`. It now observes only the configured payload scratch pool, with
+   storage deriving the shape internally. A recursive declaration-level
+   boundary scan rejects forbidden physical types in curated public traits,
+   functions, aliases, structs, and enums regardless of symbol name. It
+   resolves private aliases, renamed imports, and named reexports transitively,
+   and rejects public wildcard reexports rather than permitting an unresolved
+   public surface. A stateful lexical pass removes nested block comments, line
+   comments, and string/character contents before Rust visibility and
+   declaration tokens are accumulated across whitespace. Split public items
+   and split trait methods therefore reach the same classification path. Its
+   adversarial fixture uses a differently named `EcShape` method and a nested
+   directory-backed module inside `storage::test_support`, including
+   split-visibility aliases, wildcard reexports, functions, split trait items,
+   public union fields, public trait-implementation associated types, and
+   block-comment-separated declarations. Trait implementation headers and
+   top-level associated types/constants in implementation scopes are part of
+   the checked public surface. Brace-balanced impl parsing records the header
+   at its actual body boundary, including compact implementations, while
+   excluding method bodies and their local semicolons. Storage-local conversion
+   of private physical records into opaque observations uses crate-private
+   inherent methods rather than public trait implementations.
+   The curated support signatures now expose no PG IDs, node IDs, shard
+   identities, route snapshots, claims, durable rows, or EC layouts.
+
+Final Phase 5 completion audit (2026-08-07):
+
+- the exhaustive normal/build feature inventory passes with an empty
+  hook-enabled allowlist. `server-core/test-utils` is independent of
+  `storage/test-hooks`; AWS-facing packages do not enable either feature;
+- every public inherent storage `test_*` adapter outside
+  `storage::test_support` is rejected by the crate-wide source-root scan,
+  including nested modules and qualified Rust function forms. Retained public
+  support consists only of logical observations, opaque semantic scenarios,
+  deterministic fault/scheduling guards, and test-runtime lifecycle controls;
+- the final raw-identifier audit recursively found no public curated signature
+  containing a PG, node, shard, route-snapshot, metadata-proof, claim,
+  reclaim-root, durable-row, or EC-shape type, including through transitive
+  aliases or renamed/named reexports. Public wildcard reexports are forbidden
+  at this boundary. Ordinary production configuration types used to construct
+  test clusters are not test-support exceptions;
+- `cargo check -p storage --no-default-features`,
+  `cargo check -p server-core --features test-utils`, the fail-closed feature
+  graph, and the complete storage boundary checker pass. The affected scratch
+  reuse regressions also pass; and
+- Phase 5 is complete. The broader production `StoreError`/operation-wrapper
+  boundary and debug-PG containment remain owned by item 14 of
+  `storage-upgrade-versioning-plan.md`; they are not test-support work.
 
 Completion:
 

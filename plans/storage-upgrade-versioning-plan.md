@@ -2049,11 +2049,15 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     the crate boundary; contain local debug PG operations behind owner-provided opaque diagnostics;
     move impossible topology/route/claim fixtures into storage; and enforce the final structural
     boundary through crate visibility plus `check-storage-cluster-boundaries` coverage. The
-    2026-08-04 Phase 5 audit in `storage-boundary-compiler-enforcement-plan.md` records the
-    remaining shared test slice: raw stream/direct-PUT cleanup assertions, UploadPartCopy
-    shard-loss injection, backfill and retained-placement fixtures, lifecycle/reclaim generation
-    observations, and broad multipart state-model records must become storage-owner tests or
-    opaque/logical owner-defined scenarios.
+    Phase 5 test-support slice in
+    `storage-boundary-compiler-enforcement-plan.md` completed on 2026-08-07:
+    raw stream/direct-PUT cleanup assertions, UploadPartCopy shard-loss
+    injection, backfill and retained-placement fixtures, lifecycle/reclaim
+    generation observations, and broad multipart state-model records are now
+    storage-owner tests or opaque/logical owner-defined scenarios. This item
+    remains pending for the production concrete-error/operation-wrapper
+    transit and debug-PG containment described above; it no longer owns any
+    residual cross-crate test-fixture migration.
 
 After items 9 through 14 are complete, work proceeds through the Phase 2 evidence gate rather than
 reopening containment opportunistically.

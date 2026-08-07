@@ -12549,7 +12549,7 @@ impl super::StorageCluster {
         &self,
         root: &crate::TestBucketDeleteFinalizeRoot,
     ) {
-        self.enqueue_bucket_delete_finalize(root.into());
+        self.enqueue_bucket_delete_finalize(root.to_root());
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -12565,7 +12565,7 @@ impl super::StorageCluster {
             bucket_incarnation_generation: info.bucket_incarnation_generation,
         };
         self.enqueue_bucket_delete_finalize(root.clone());
-        Ok(root.into())
+        Ok(crate::TestBucketDeleteFinalizeRoot::from_root(root))
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -16939,7 +16939,8 @@ impl super::StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
+    pub(crate) fn test_default_payload_ec_scratch_allocation_count(&self) -> usize {
+        let shape = self.default_payload_ec_shape();
         self.metadata_primary_bridge_node()
             .expect("test hook requires a current storage cluster handle")
             .test_ec_scratch_allocation_count(shape)
@@ -17371,7 +17372,7 @@ impl super::StorageCluster {
     ) -> Result<crate::TestMultipartPartObservation, ObjectPgActionError> {
         self.metadata_primary_bridge_node()?
             .test_get_multipart_part(bucket, key, upload_id, part_number)
-            .map(Into::into)
+            .map(crate::TestMultipartPartObservation::from_record)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

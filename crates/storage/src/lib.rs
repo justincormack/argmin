@@ -207,7 +207,9 @@ pub mod test_support {
     /// trait makes only storage-owned opaque snapshots and logical predicates
     /// available to downstream test code.
     pub trait StorageClusterPayloadTestSupport {
-        fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize;
+        /// Return the allocation count for the configured payload EC scratch
+        /// pool without exposing its physical EC shape.
+        fn test_default_payload_ec_scratch_allocation_count(&self) -> usize;
 
         fn test_install_before_payload_shard_write_action(
             &self,
@@ -307,8 +309,8 @@ pub mod test_support {
     }
 
     impl StorageClusterPayloadTestSupport for StorageCluster {
-        fn test_ec_scratch_allocation_count(&self, shape: EcShape) -> usize {
-            StorageCluster::test_ec_scratch_allocation_count(self, shape)
+        fn test_default_payload_ec_scratch_allocation_count(&self) -> usize {
+            StorageCluster::test_default_payload_ec_scratch_allocation_count(self)
         }
 
         fn test_install_before_payload_shard_write_action(
@@ -2495,21 +2497,18 @@ pub mod test_support {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    impl From<BucketDeleteFinalizeRoot> for TestBucketDeleteFinalizeRoot {
-        fn from(root: BucketDeleteFinalizeRoot) -> Self {
+    impl TestBucketDeleteFinalizeRoot {
+        pub(crate) fn from_root(root: BucketDeleteFinalizeRoot) -> Self {
             Self {
                 bucket: root.bucket,
                 bucket_incarnation_generation: root.bucket_incarnation_generation,
             }
         }
-    }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    impl From<&TestBucketDeleteFinalizeRoot> for BucketDeleteFinalizeRoot {
-        fn from(root: &TestBucketDeleteFinalizeRoot) -> Self {
-            Self {
-                bucket: root.bucket.clone(),
-                bucket_incarnation_generation: root.bucket_incarnation_generation,
+        pub(crate) fn to_root(&self) -> BucketDeleteFinalizeRoot {
+            BucketDeleteFinalizeRoot {
+                bucket: self.bucket.clone(),
+                bucket_incarnation_generation: self.bucket_incarnation_generation,
             }
         }
     }
@@ -2532,8 +2531,8 @@ pub mod test_support {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    impl From<types::MultipartPartRecord> for TestMultipartPartObservation {
-        fn from(part: types::MultipartPartRecord) -> Self {
+    impl TestMultipartPartObservation {
+        pub(crate) fn from_record(part: types::MultipartPartRecord) -> Self {
             Self {
                 generation: part.generation,
                 size: part.size,

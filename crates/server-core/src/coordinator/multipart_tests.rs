@@ -8329,18 +8329,32 @@ fn stream_append_reuses_encode_scratch_for_aligned_segments() {
         .unwrap();
 
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
-    let ec = coord.storage_node().default_payload_ec_shape();
-    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 0);
+    assert_eq!(
+        coord
+            .storage_node()
+            .test_default_payload_ec_scratch_allocation_count(),
+        0
+    );
 
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"data")
         .unwrap();
-    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(
+        coord
+            .storage_node()
+            .test_default_payload_ec_scratch_allocation_count(),
+        1
+    );
 
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 1, b"more")
         .unwrap();
-    assert_eq!(coord.storage_node().test_ec_scratch_allocation_count(ec), 1);
+    assert_eq!(
+        coord
+            .storage_node()
+            .test_default_payload_ec_scratch_allocation_count(),
+        1
+    );
 }
 
 // ── Phase 3a: Streaming UploadPart tests ─────────────────────────
