@@ -248,7 +248,7 @@ impl Coordinator {
         let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(&dst_bucket_handle)?;
         let dst_upload = multipart_route
             .load_multipart_upload_for_part(upload_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?;
         let policy_context = Self::with_multipart_part_managed_encryption_policy_context(
             policy_context,
             &dst_upload,
@@ -369,7 +369,7 @@ impl Coordinator {
         let lookup = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
             let upload = multipart_route
                 .try_load_multipart_upload_for_completion(upload_id)
-                .map_err(Self::map_object_pg_action_error)?
+                .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?
                 .ok_or_else(|| ServerError::InternalError {
                     reason: "multipart complete auth lookup would block".to_string(),
                 })?;
@@ -377,12 +377,12 @@ impl Coordinator {
         } else {
             multipart_route
                 .lookup_multipart_upload_for_completion(upload_id)
-                .map_err(Self::map_object_pg_action_error)?
+                .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?
         };
         #[cfg(not(test))]
         let lookup = multipart_route
             .lookup_multipart_upload_for_completion(upload_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?;
         let upload = match lookup {
             storage::MultipartUploadCompletionLookup::InProgress(upload) => *upload,
             storage::MultipartUploadCompletionLookup::Replay(replay) => {

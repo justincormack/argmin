@@ -10189,6 +10189,73 @@ fn direct_put_failure_kinds_map_exhaustively_to_s3_outcomes() {
 }
 
 #[test]
+fn multipart_management_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let upload_id = trusted_upload_id("multipart-management-mapping");
+    let map = |kind| {
+        Coordinator::map_multipart_management_failure(
+            &upload_id,
+            storage::test_support::multipart_management_failure_for_kind(kind),
+        )
+    };
+
+    assert!(matches!(
+        map(storage::MultipartManagementFailureKind::NoSuchUpload),
+        ServerError::NoSuchUpload { upload_id: mapped }
+            if mapped == upload_id.as_str()
+    ));
+    for kind in [
+        storage::MultipartManagementFailureKind::ResourceExhausted,
+        storage::MultipartManagementFailureKind::MetadataCommandContention,
+        storage::MultipartManagementFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind), ServerError::SlowDown));
+    }
+    assert!(matches!(
+        map(storage::MultipartManagementFailureKind::InternalError),
+        ServerError::MultipartManagement(error)
+            if error.diagnostic_cause_label() == "store_internal_failure"
+    ));
+}
+
+#[test]
+fn multipart_completion_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let upload_id = trusted_upload_id("multipart-completion-mapping");
+    let map = |kind| {
+        Coordinator::map_multipart_completion_failure(
+            &upload_id,
+            storage::test_support::multipart_completion_failure_for_kind(kind),
+        )
+    };
+
+    assert!(matches!(
+        map(storage::MultipartCompletionFailureKind::NoSuchUpload),
+        ServerError::NoSuchUpload { upload_id: mapped }
+            if mapped == upload_id.as_str()
+    ));
+    assert!(matches!(
+        map(storage::MultipartCompletionFailureKind::PartNotFound),
+        ServerError::InvalidPart { part_number: 7 }
+    ));
+    assert!(matches!(
+        map(storage::MultipartCompletionFailureKind::StaleSnapshot),
+        ServerError::OperationAborted
+    ));
+    for kind in [
+        storage::MultipartCompletionFailureKind::ResourceExhausted,
+        storage::MultipartCompletionFailureKind::MetadataCommandContention,
+        storage::MultipartCompletionFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind), ServerError::SlowDown));
+    }
+    for kind in [
+        storage::MultipartCompletionFailureKind::ConditionalRequestConflict,
+        storage::MultipartCompletionFailureKind::InternalError,
+    ] {
+        assert!(matches!(map(kind), ServerError::MultipartCompletion(_)));
+    }
+}
+
+#[test]
 fn stream_upload_failure_kinds_map_exhaustively_to_s3_outcomes() {
     let map = |kind| {
         Coordinator::map_stream_upload_failure(

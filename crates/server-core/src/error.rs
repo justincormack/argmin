@@ -2,8 +2,8 @@
 use s3_types::VersionId;
 use storage::error::{
     BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure, MetadataError,
-    ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
-    StoreOperationFailureClass, StreamUploadFailure,
+    MultipartCompletionFailure, MultipartManagementFailure, ObjectMetadataMutationFailure,
+    ObjectReadFailure, StoreError, StoreFailure, StoreOperationFailureClass, StreamUploadFailure,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +69,12 @@ pub enum ServerError {
 
     #[error("direct PutObject error: {0}")]
     DirectPut(DirectPutFailure),
+
+    #[error("multipart management error: {0}")]
+    MultipartManagement(MultipartManagementFailure),
+
+    #[error("multipart completion error: {0}")]
+    MultipartCompletion(MultipartCompletionFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -521,6 +527,8 @@ impl ServerError {
             Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
             Self::StreamUpload(error) => error.diagnostic_cause_label(),
             Self::DirectPut(error) => error.diagnostic_cause_label(),
+            Self::MultipartManagement(error) => error.diagnostic_cause_label(),
+            Self::MultipartCompletion(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -574,6 +582,14 @@ impl ServerError {
             Self::DirectPut(error) => {
                 format!("server_error>direct_put>{}", error.diagnostic_cause_label())
             }
+            Self::MultipartManagement(error) => format!(
+                "server_error>multipart_management>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::MultipartCompletion(error) => format!(
+                "server_error>multipart_completion>{}",
+                error.diagnostic_cause_label()
+            ),
             Self::Metadata(error) => format!(
                 "server_error>metadata_error>{}",
                 metadata_error_diagnostic_cause_chain(error)
@@ -751,6 +767,8 @@ impl ServerError {
             Self::ObjectMetadataMutation(_) => "InternalError",
             Self::StreamUpload(_) => "InternalError",
             Self::DirectPut(_) => "InternalError",
+            Self::MultipartManagement(_) => "InternalError",
+            Self::MultipartCompletion(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }
@@ -1201,6 +1219,32 @@ mod tests {
         for secret in secret_fragments {
             assert!(!rendered.contains(secret));
         }
+
+        let (management_failure, secret_fragments) =
+            storage::test_support::multipart_management_failure_diagnostic_fixture();
+        let management = ServerError::MultipartManagement(management_failure);
+        assert_eq!(management.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            management.diagnostic_cause_chain(),
+            "server_error>multipart_management>store_io_failure"
+        );
+        let rendered = format!("{management:?} {management}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
+
+        let (completion_failure, secret_fragments) =
+            storage::test_support::multipart_completion_failure_diagnostic_fixture();
+        let completion = ServerError::MultipartCompletion(completion_failure);
+        assert_eq!(completion.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            completion.diagnostic_cause_chain(),
+            "server_error>multipart_completion>store_io_failure"
+        );
+        let rendered = format!("{completion:?} {completion}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
     }
 
     #[test]
@@ -1626,6 +1670,28 @@ mod tests {
         let err = ServerError::DirectPut(storage::test_support::direct_put_failure_for_kind(
             storage::DirectPutFailureKind::InternalError,
         ));
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn s3_error_code_multipart_management() {
+        let err = ServerError::MultipartManagement(
+            storage::test_support::multipart_management_failure_for_kind(
+                storage::MultipartManagementFailureKind::InternalError,
+            ),
+        );
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn s3_error_code_multipart_completion() {
+        let err = ServerError::MultipartCompletion(
+            storage::test_support::multipart_completion_failure_for_kind(
+                storage::MultipartCompletionFailureKind::InternalError,
+            ),
+        );
         assert_eq!(err.s3_error_code(), "InternalError");
         assert_eq!(err.http_status(), 500);
     }

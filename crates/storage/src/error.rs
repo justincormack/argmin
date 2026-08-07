@@ -2260,6 +2260,8 @@ enum ObjectOperationFailureDiagnosticCategory {
     Operation(OperationFailureDiagnosticCategory),
     InvalidRequest,
     StaleObjectReadSubject,
+    StaleMultipartCompletionSnapshot,
+    MultipartConditionalRequestConflict,
     UnexpectedObjectOperationOutcome,
 }
 
@@ -2269,7 +2271,40 @@ impl ObjectOperationFailureDiagnosticCategory {
             Self::Operation(category) => category.cause_label(),
             Self::InvalidRequest => "invalid_request",
             Self::StaleObjectReadSubject => "stale_object_read_subject",
+            Self::StaleMultipartCompletionSnapshot => "stale_multipart_completion_snapshot",
+            Self::MultipartConditionalRequestConflict => "multipart_conditional_request_conflict",
             Self::UnexpectedObjectOperationOutcome => "unexpected_object_operation_outcome",
+        }
+    }
+}
+
+fn object_pg_action_diagnostic_category(
+    error: &ObjectPgActionError,
+) -> ObjectOperationFailureDiagnosticCategory {
+    match error {
+        ObjectPgActionError::Store(error) => ObjectOperationFailureDiagnosticCategory::Operation(
+            OperationFailureDiagnosticCategory::from_store(error),
+        ),
+        ObjectPgActionError::Metadata(error) => {
+            ObjectOperationFailureDiagnosticCategory::Operation(
+                OperationFailureDiagnosticCategory::from_metadata(error),
+            )
+        }
+        ObjectPgActionError::InvalidRequest { .. } => {
+            ObjectOperationFailureDiagnosticCategory::InvalidRequest
+        }
+        ObjectPgActionError::StaleObjectReadSubject => {
+            ObjectOperationFailureDiagnosticCategory::StaleObjectReadSubject
+        }
+        ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+            ObjectOperationFailureDiagnosticCategory::StaleMultipartCompletionSnapshot
+        }
+        ObjectPgActionError::MultipartConditionalRequestConflict => {
+            ObjectOperationFailureDiagnosticCategory::MultipartConditionalRequestConflict
+        }
+        ObjectPgActionError::StaleDirectPutCommitSnapshot
+        | ObjectPgActionError::StaleStreamFinalizeSnapshot => {
+            ObjectOperationFailureDiagnosticCategory::UnexpectedObjectOperationOutcome
         }
     }
 }
@@ -2289,28 +2324,7 @@ fn classify_object_pg_action(
     ObjectOperationFailureKind,
     ObjectOperationFailureDiagnosticCategory,
 ) {
-    let diagnostic_category = match &error {
-        ObjectPgActionError::Store(error) => ObjectOperationFailureDiagnosticCategory::Operation(
-            OperationFailureDiagnosticCategory::from_store(error),
-        ),
-        ObjectPgActionError::Metadata(error) => {
-            ObjectOperationFailureDiagnosticCategory::Operation(
-                OperationFailureDiagnosticCategory::from_metadata(error),
-            )
-        }
-        ObjectPgActionError::InvalidRequest { .. } => {
-            ObjectOperationFailureDiagnosticCategory::InvalidRequest
-        }
-        ObjectPgActionError::StaleObjectReadSubject => {
-            ObjectOperationFailureDiagnosticCategory::StaleObjectReadSubject
-        }
-        ObjectPgActionError::StaleDirectPutCommitSnapshot
-        | ObjectPgActionError::StaleStreamFinalizeSnapshot
-        | ObjectPgActionError::StaleMultipartCompletionSnapshot
-        | ObjectPgActionError::MultipartConditionalRequestConflict => {
-            ObjectOperationFailureDiagnosticCategory::UnexpectedObjectOperationOutcome
-        }
-    };
+    let diagnostic_category = object_pg_action_diagnostic_category(&error);
     let kind = match &error {
         ObjectPgActionError::Store(error) => match error.operation_failure_class() {
             StoreOperationFailureClass::ResourceExhausted => {
@@ -2655,6 +2669,314 @@ impl std::fmt::Display for DirectPutFailure {
 }
 
 impl std::error::Error for DirectPutFailure {}
+
+/// Exhaustive logical outcome of an admitted multipart-management operation.
+///
+/// This covers upload lookup, target validation, ListParts, and abort. Durable
+/// records, PG routing, command-log state, and implementation errors remain
+/// owned by storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MultipartManagementFailureKind {
+    NoSuchUpload,
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+/// Opaque failure returned by admitted multipart-management capabilities.
+pub struct MultipartManagementFailure {
+    kind: MultipartManagementFailureKind,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl MultipartManagementFailure {
+    #[must_use]
+    pub const fn kind(&self) -> MultipartManagementFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let diagnostic_category = object_pg_action_diagnostic_category(&error);
+        let kind = match &error {
+            ObjectPgActionError::Store(error) => match error.operation_failure_class() {
+                StoreOperationFailureClass::ResourceExhausted => {
+                    MultipartManagementFailureKind::ResourceExhausted
+                }
+                StoreOperationFailureClass::MetadataCommandContention => {
+                    MultipartManagementFailureKind::MetadataCommandContention
+                }
+                StoreOperationFailureClass::RetryableConvergence => {
+                    MultipartManagementFailureKind::RetryableConvergence
+                }
+                StoreOperationFailureClass::Other => MultipartManagementFailureKind::InternalError,
+            },
+            ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. }) => {
+                MultipartManagementFailureKind::NoSuchUpload
+            }
+            ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
+                MultipartManagementFailureKind::MetadataCommandContention
+            }
+            ObjectPgActionError::Metadata(_)
+            | ObjectPgActionError::InvalidRequest { .. }
+            | ObjectPgActionError::StaleObjectReadSubject
+            | ObjectPgActionError::StaleDirectPutCommitSnapshot
+            | ObjectPgActionError::StaleStreamFinalizeSnapshot
+            | ObjectPgActionError::StaleMultipartCompletionSnapshot
+            | ObjectPgActionError::MultipartConditionalRequestConflict => {
+                MultipartManagementFailureKind::InternalError
+            }
+        };
+        Self {
+            kind,
+            diagnostic_category,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn from_store(error: StoreError) -> Self {
+        Self::from_object_pg_action(ObjectPgActionError::Store(error))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) const fn for_test(kind: MultipartManagementFailureKind) -> Self {
+        let operation_kind = match kind {
+            MultipartManagementFailureKind::NoSuchUpload
+            | MultipartManagementFailureKind::InternalError => {
+                ObjectMetadataMutationFailureKind::InternalError
+            }
+            MultipartManagementFailureKind::ResourceExhausted => {
+                ObjectMetadataMutationFailureKind::ResourceExhausted
+            }
+            MultipartManagementFailureKind::MetadataCommandContention => {
+                ObjectMetadataMutationFailureKind::MetadataCommandContention
+            }
+            MultipartManagementFailureKind::RetryableConvergence => {
+                ObjectMetadataMutationFailureKind::RetryableConvergence
+            }
+        };
+        let failure = ObjectMetadataMutationFailure::for_test(operation_kind);
+        Self {
+            kind,
+            diagnostic_category: failure.diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for MultipartManagementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartManagementFailure")
+            .field("kind", &self.kind)
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for MultipartManagementFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("multipart management failed")
+    }
+}
+
+impl std::error::Error for MultipartManagementFailure {}
+
+/// Exhaustive logical outcome of an admitted multipart-completion operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MultipartCompletionFailureKind {
+    NoSuchUpload,
+    PartNotFound,
+    StaleSnapshot,
+    ConditionalRequestConflict,
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+enum MultipartCompletionFailureOutcome {
+    NoSuchUpload,
+    PartNotFound { part_number: u32 },
+    StaleSnapshot,
+    ConditionalRequestConflict,
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+/// Opaque failure returned by admitted multipart-completion capabilities.
+pub struct MultipartCompletionFailure {
+    outcome: MultipartCompletionFailureOutcome,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl MultipartCompletionFailure {
+    #[must_use]
+    pub const fn kind(&self) -> MultipartCompletionFailureKind {
+        match self.outcome {
+            MultipartCompletionFailureOutcome::NoSuchUpload => {
+                MultipartCompletionFailureKind::NoSuchUpload
+            }
+            MultipartCompletionFailureOutcome::PartNotFound { .. } => {
+                MultipartCompletionFailureKind::PartNotFound
+            }
+            MultipartCompletionFailureOutcome::StaleSnapshot => {
+                MultipartCompletionFailureKind::StaleSnapshot
+            }
+            MultipartCompletionFailureOutcome::ConditionalRequestConflict => {
+                MultipartCompletionFailureKind::ConditionalRequestConflict
+            }
+            MultipartCompletionFailureOutcome::ResourceExhausted => {
+                MultipartCompletionFailureKind::ResourceExhausted
+            }
+            MultipartCompletionFailureOutcome::MetadataCommandContention => {
+                MultipartCompletionFailureKind::MetadataCommandContention
+            }
+            MultipartCompletionFailureOutcome::RetryableConvergence => {
+                MultipartCompletionFailureKind::RetryableConvergence
+            }
+            MultipartCompletionFailureOutcome::InternalError => {
+                MultipartCompletionFailureKind::InternalError
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn part_number(&self) -> Option<u32> {
+        match self.outcome {
+            MultipartCompletionFailureOutcome::PartNotFound { part_number } => Some(part_number),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let diagnostic_category = object_pg_action_diagnostic_category(&error);
+        let outcome = match error {
+            ObjectPgActionError::Store(error) => match error.operation_failure_class() {
+                StoreOperationFailureClass::ResourceExhausted => {
+                    MultipartCompletionFailureOutcome::ResourceExhausted
+                }
+                StoreOperationFailureClass::MetadataCommandContention => {
+                    MultipartCompletionFailureOutcome::MetadataCommandContention
+                }
+                StoreOperationFailureClass::RetryableConvergence => {
+                    MultipartCompletionFailureOutcome::RetryableConvergence
+                }
+                StoreOperationFailureClass::Other => {
+                    MultipartCompletionFailureOutcome::InternalError
+                }
+            },
+            ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. }) => {
+                MultipartCompletionFailureOutcome::NoSuchUpload
+            }
+            ObjectPgActionError::Metadata(MetadataError::PartNotFound { part_number, .. }) => {
+                MultipartCompletionFailureOutcome::PartNotFound { part_number }
+            }
+            ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
+                MultipartCompletionFailureOutcome::MetadataCommandContention
+            }
+            ObjectPgActionError::StaleMultipartCompletionSnapshot => {
+                MultipartCompletionFailureOutcome::StaleSnapshot
+            }
+            ObjectPgActionError::MultipartConditionalRequestConflict => {
+                MultipartCompletionFailureOutcome::ConditionalRequestConflict
+            }
+            ObjectPgActionError::Metadata(_)
+            | ObjectPgActionError::InvalidRequest { .. }
+            | ObjectPgActionError::StaleObjectReadSubject
+            | ObjectPgActionError::StaleDirectPutCommitSnapshot
+            | ObjectPgActionError::StaleStreamFinalizeSnapshot => {
+                MultipartCompletionFailureOutcome::InternalError
+            }
+        };
+        Self {
+            outcome,
+            diagnostic_category,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) const fn for_test(kind: MultipartCompletionFailureKind) -> Self {
+        let outcome = match kind {
+            MultipartCompletionFailureKind::NoSuchUpload => {
+                MultipartCompletionFailureOutcome::NoSuchUpload
+            }
+            MultipartCompletionFailureKind::PartNotFound => {
+                MultipartCompletionFailureOutcome::PartNotFound { part_number: 7 }
+            }
+            MultipartCompletionFailureKind::StaleSnapshot => {
+                MultipartCompletionFailureOutcome::StaleSnapshot
+            }
+            MultipartCompletionFailureKind::ConditionalRequestConflict => {
+                MultipartCompletionFailureOutcome::ConditionalRequestConflict
+            }
+            MultipartCompletionFailureKind::ResourceExhausted => {
+                MultipartCompletionFailureOutcome::ResourceExhausted
+            }
+            MultipartCompletionFailureKind::MetadataCommandContention => {
+                MultipartCompletionFailureOutcome::MetadataCommandContention
+            }
+            MultipartCompletionFailureKind::RetryableConvergence => {
+                MultipartCompletionFailureOutcome::RetryableConvergence
+            }
+            MultipartCompletionFailureKind::InternalError => {
+                MultipartCompletionFailureOutcome::InternalError
+            }
+        };
+        let management_kind = match kind {
+            MultipartCompletionFailureKind::ResourceExhausted => {
+                MultipartManagementFailureKind::ResourceExhausted
+            }
+            MultipartCompletionFailureKind::MetadataCommandContention => {
+                MultipartManagementFailureKind::MetadataCommandContention
+            }
+            MultipartCompletionFailureKind::RetryableConvergence => {
+                MultipartManagementFailureKind::RetryableConvergence
+            }
+            MultipartCompletionFailureKind::NoSuchUpload
+            | MultipartCompletionFailureKind::PartNotFound
+            | MultipartCompletionFailureKind::StaleSnapshot
+            | MultipartCompletionFailureKind::ConditionalRequestConflict
+            | MultipartCompletionFailureKind::InternalError => {
+                MultipartManagementFailureKind::InternalError
+            }
+        };
+        let management = MultipartManagementFailure::for_test(management_kind);
+        Self {
+            outcome,
+            diagnostic_category: management.diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for MultipartCompletionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MultipartCompletionFailure")
+            .field("kind", &self.kind())
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for MultipartCompletionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("multipart completion failed")
+    }
+}
+
+impl std::error::Error for MultipartCompletionFailure {}
 
 /// Exhaustive logical outcome of an admitted stream-upload operation.
 ///
@@ -3639,6 +3961,175 @@ mod tests {
         assert!(!rendered.contains(SECRET_CONTEXT));
         assert!(!rendered.contains(SECRET_SOURCE));
         assert!(std::error::Error::source(&metadata).is_none());
+    }
+
+    #[test]
+    fn multipart_management_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| MultipartManagementFailure::from_object_pg_action(error).kind();
+
+        for (class, expected) in [
+            (
+                StoreOperationFailureClass::ResourceExhausted,
+                MultipartManagementFailureKind::ResourceExhausted,
+            ),
+            (
+                StoreOperationFailureClass::MetadataCommandContention,
+                MultipartManagementFailureKind::MetadataCommandContention,
+            ),
+            (
+                StoreOperationFailureClass::RetryableConvergence,
+                MultipartManagementFailureKind::RetryableConvergence,
+            ),
+            (
+                StoreOperationFailureClass::Other,
+                MultipartManagementFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(
+                convert(ObjectPgActionError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                )),
+                expected
+            );
+            assert_eq!(
+                MultipartManagementFailure::for_test(expected).kind(),
+                expected
+            );
+        }
+
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload {
+                upload_id: "opaque-upload".to_string(),
+            })),
+            MultipartManagementFailureKind::NoSuchUpload
+        );
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(
+                MetadataError::ObjectGenerationReservationConflict {
+                    reservation_id: "opaque-reservation".to_string(),
+                    generation_id: 7,
+                },
+            )),
+            MultipartManagementFailureKind::MetadataCommandContention
+        );
+        for error in [
+            ObjectPgActionError::Metadata(MetadataError::PartNotFound {
+                upload_id: "opaque-upload".to_string(),
+                part_number: 3,
+            }),
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            ObjectPgActionError::MultipartConditionalRequestConflict,
+        ] {
+            assert_eq!(
+                convert(error),
+                MultipartManagementFailureKind::InternalError
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_completion_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| MultipartCompletionFailure::from_object_pg_action(error);
+
+        let no_such = convert(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload {
+            upload_id: "opaque-upload".to_string(),
+        }));
+        assert_eq!(no_such.kind(), MultipartCompletionFailureKind::NoSuchUpload);
+
+        let missing_part = convert(ObjectPgActionError::Metadata(MetadataError::PartNotFound {
+            upload_id: "opaque-upload".to_string(),
+            part_number: 19,
+        }));
+        assert_eq!(
+            missing_part.kind(),
+            MultipartCompletionFailureKind::PartNotFound
+        );
+        assert_eq!(missing_part.part_number(), Some(19));
+
+        for (error, expected) in [
+            (
+                ObjectPgActionError::StaleMultipartCompletionSnapshot,
+                MultipartCompletionFailureKind::StaleSnapshot,
+            ),
+            (
+                ObjectPgActionError::MultipartConditionalRequestConflict,
+                MultipartCompletionFailureKind::ConditionalRequestConflict,
+            ),
+            (
+                ObjectPgActionError::Metadata(MetadataError::ObjectGenerationReservationConflict {
+                    reservation_id: "opaque-reservation".to_string(),
+                    generation_id: 7,
+                }),
+                MultipartCompletionFailureKind::MetadataCommandContention,
+            ),
+            (
+                ObjectPgActionError::InvalidRequest {
+                    reason: "crossed multipart capability".to_string(),
+                },
+                MultipartCompletionFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(convert(error).kind(), expected);
+        }
+
+        for (class, expected) in [
+            (
+                StoreOperationFailureClass::ResourceExhausted,
+                MultipartCompletionFailureKind::ResourceExhausted,
+            ),
+            (
+                StoreOperationFailureClass::MetadataCommandContention,
+                MultipartCompletionFailureKind::MetadataCommandContention,
+            ),
+            (
+                StoreOperationFailureClass::RetryableConvergence,
+                MultipartCompletionFailureKind::RetryableConvergence,
+            ),
+            (
+                StoreOperationFailureClass::Other,
+                MultipartCompletionFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(
+                convert(ObjectPgActionError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                ))
+                .kind(),
+                expected
+            );
+            assert_eq!(
+                MultipartCompletionFailure::for_test(expected).kind(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn multipart_failures_discard_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret multipart operation";
+        const SECRET_SOURCE: &str = "secret multipart source";
+        let management = MultipartManagementFailure::from_store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+        let completion = MultipartCompletionFailure::from_object_pg_action(
+            ObjectPgActionError::Metadata(MetadataError::Db {
+                context: SECRET_CONTEXT,
+                source: DatabaseError::new(SECRET_SOURCE),
+            }),
+        );
+
+        assert_eq!(management.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(completion.diagnostic_cause_label(), "metadata_db_error");
+        for rendered in [
+            format!("{management:?} {management}"),
+            format!("{completion:?} {completion}"),
+        ] {
+            assert!(!rendered.contains(SECRET_CONTEXT));
+            assert!(!rendered.contains(SECRET_SOURCE));
+        }
+        assert!(std::error::Error::source(&management).is_none());
+        assert!(std::error::Error::source(&completion).is_none());
     }
 
     #[test]

@@ -626,12 +626,11 @@ fn multipart_abort_route_rejects_a_crossed_object_subject_before_mutation() {
             &crate::AuthorizedMultipartUploadAbort::assume_authorized(upload.clone()),
         )
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
-            operation: "abort multipart upload",
-        })
-    ));
+    assert_eq!(
+        error.kind(),
+        crate::MultipartManagementFailureKind::InternalError
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
     assert_eq!(
         cluster
             .load_in_progress_multipart_upload(&bucket, &crossed_key, &upload_id)
@@ -1154,6 +1153,13 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
             crate::MetadataError::NoSuchUpload { .. }
         ))
     ));
+    let missing_part_upload = route
+        .load_multipart_upload_for_part(&upload_id)
+        .unwrap_err();
+    assert_eq!(
+        missing_part_upload.kind(),
+        crate::MultipartManagementFailureKind::NoSuchUpload
+    );
     let authorized_part = crossed_route
         .load_multipart_upload_for_part(&upload_id)
         .unwrap()
@@ -1167,21 +1173,19 @@ fn multipart_routes_bind_crossed_same_pg_upload_subjects() {
     let error = route
         .list_parts_for_authorized_upload(&authorized_list_parts, None, 1_000)
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
-            operation: "list multipart parts",
-        })
-    ));
+    assert_eq!(
+        error.kind(),
+        crate::MultipartManagementFailureKind::InternalError
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
     let error = route
         .load_multipart_completion_snapshot(authorized_completion, &[])
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
-            operation: "load multipart completion snapshot",
-        })
-    ));
+    assert_eq!(
+        error.kind(),
+        crate::MultipartCompletionFailureKind::InternalError
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
 }
 
 #[test]

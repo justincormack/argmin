@@ -3751,7 +3751,7 @@ impl ActiveMultipartObjectRoute<'_> {
     pub fn lookup_multipart_upload_for_abort(
         &self,
         upload_id: &UploadId,
-    ) -> Result<crate::MultipartUploadAbortLookup, ObjectPgActionError> {
+    ) -> Result<crate::MultipartUploadAbortLookup, crate::MultipartManagementFailure> {
         self.admission
             .cluster
             .lookup_multipart_upload_management_with_route_validation(
@@ -3760,13 +3760,14 @@ impl ActiveMultipartObjectRoute<'_> {
                 || self.admission.require_valid_now(),
             )
             .map(crate::MultipartUploadAbortLookup::from_management_lookup)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     /// Classify one multipart upload through the logical ListParts authorization boundary.
     pub fn lookup_multipart_upload_for_list_parts(
         &self,
         upload_id: &UploadId,
-    ) -> Result<crate::MultipartUploadListPartsLookup, ObjectPgActionError> {
+    ) -> Result<crate::MultipartUploadListPartsLookup, crate::MultipartManagementFailure> {
         self.admission
             .cluster
             .lookup_multipart_upload_management_with_route_validation(
@@ -3775,13 +3776,14 @@ impl ActiveMultipartObjectRoute<'_> {
                 || self.admission.require_valid_now(),
             )
             .map(crate::MultipartUploadListPartsLookup::from_management_lookup)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     /// Classify one multipart upload through the logical completion-authorization boundary.
     pub fn lookup_multipart_upload_for_completion(
         &self,
         upload_id: &UploadId,
-    ) -> Result<crate::MultipartUploadCompletionLookup, ObjectPgActionError> {
+    ) -> Result<crate::MultipartUploadCompletionLookup, crate::MultipartManagementFailure> {
         self.admission
             .cluster
             .lookup_multipart_upload_management_with_route_validation(
@@ -3790,13 +3792,14 @@ impl ActiveMultipartObjectRoute<'_> {
                 || self.admission.require_valid_now(),
             )
             .map(crate::MultipartUploadCompletionLookup::from_management_lookup)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     /// Load an in-progress upload through the logical UploadPart authorization boundary.
     pub fn load_multipart_upload_for_part(
         &self,
         upload_id: &UploadId,
-    ) -> Result<crate::MultipartUploadPartCandidate, ObjectPgActionError> {
+    ) -> Result<crate::MultipartUploadPartCandidate, crate::MultipartManagementFailure> {
         self.admission
             .cluster
             .load_in_progress_multipart_upload_with_route_validation(
@@ -3805,6 +3808,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 || self.admission.require_valid_now(),
             )
             .map(crate::MultipartUploadPartCandidate::from_record)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     /// Require an in-progress upload on this exact admitted object route without
@@ -3812,7 +3816,7 @@ impl ActiveMultipartObjectRoute<'_> {
     pub fn require_in_progress_multipart_upload(
         &self,
         upload_id: &UploadId,
-    ) -> Result<(), ObjectPgActionError> {
+    ) -> Result<(), crate::MultipartManagementFailure> {
         self.admission
             .cluster
             .load_in_progress_multipart_upload_with_route_validation(
@@ -3821,6 +3825,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 || self.admission.require_valid_now(),
             )
             .map(drop)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     /// Load an in-progress upload for storage-owned tests.
@@ -3940,29 +3945,36 @@ impl ActiveMultipartObjectRoute<'_> {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
-        self.admission.require_valid_now()?;
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, crate::MultipartManagementFailure> {
+        self.admission
+            .require_valid_now()
+            .map_err(crate::MultipartManagementFailure::from_store)?;
         self.admission
             .cluster
             .try_probe_object_pg_available(&self.bucket, &self.key)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     #[cfg(feature = "test-hooks")]
     fn try_load_in_progress_multipart_upload(
         &self,
         upload_id: &UploadId,
-    ) -> Result<Option<MultipartUploadRecord>, ObjectPgActionError> {
-        self.admission.require_valid_now()?;
+    ) -> Result<Option<MultipartUploadRecord>, crate::MultipartManagementFailure> {
+        self.admission
+            .require_valid_now()
+            .map_err(crate::MultipartManagementFailure::from_store)?;
         self.admission
             .cluster
             .try_load_in_progress_multipart_upload(&self.bucket, &self.key, upload_id)
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     #[cfg(feature = "test-hooks")]
     pub fn try_load_multipart_upload_for_completion(
         &self,
         upload_id: &UploadId,
-    ) -> Result<Option<crate::MultipartUploadCompletionCandidate>, ObjectPgActionError> {
+    ) -> Result<Option<crate::MultipartUploadCompletionCandidate>, crate::MultipartManagementFailure>
+    {
         self.try_load_in_progress_multipart_upload(upload_id)
             .map(|upload| upload.map(crate::MultipartUploadCompletionCandidate::from_record))
     }
@@ -3974,7 +3986,7 @@ impl ActiveMultipartObjectRoute<'_> {
         authorized_upload: &crate::AuthorizedMultipartUploadListParts,
         part_number_marker: Option<u32>,
         max_parts: u32,
-    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+    ) -> Result<ListedMultipartParts, crate::MultipartManagementFailure> {
         self.admission
             .cluster
             .list_multipart_parts_for_authorized_upload_with_route_validation(
@@ -3984,6 +3996,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 max_parts,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 
     /// Load the completion snapshot for the exact upload authorized through
@@ -3992,7 +4005,8 @@ impl ActiveMultipartObjectRoute<'_> {
         &self,
         authorized_upload: crate::AuthorizedMultipartUploadCompletion,
         requested_part_numbers: &[u32],
-    ) -> Result<crate::AuthorizedMultipartCompletionSnapshot, ObjectPgActionError> {
+    ) -> Result<crate::AuthorizedMultipartCompletionSnapshot, crate::MultipartCompletionFailure>
+    {
         let upload = authorized_upload.into_record();
         let internal_authorized_upload =
             AuthorizedMultipartUploadRecord::assume_authorized(upload.clone());
@@ -4004,7 +4018,8 @@ impl ActiveMultipartObjectRoute<'_> {
                 &internal_authorized_upload,
                 requested_part_numbers,
                 || self.admission.require_valid_now(),
-            )?;
+            )
+            .map_err(crate::MultipartCompletionFailure::from_object_pg_action)?;
         Ok(crate::AuthorizedMultipartCompletionSnapshot::new(
             snapshot, upload,
         ))
@@ -4014,7 +4029,7 @@ impl ActiveMultipartObjectRoute<'_> {
     pub fn complete_multipart_upload_commit_serialized(
         &self,
         request: CompleteMultipartCommitRequest,
-    ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
+    ) -> Result<CompleteMultipartCommitOutcome, crate::MultipartCompletionFailure> {
         self.admission
             .cluster
             .complete_multipart_upload_commit_serialized_with_route_validation(
@@ -4022,6 +4037,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 request,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::MultipartCompletionFailure::from_object_pg_action)
     }
 
     /// Schedule reclaim for a generation displaced by a completion on this
@@ -4038,7 +4054,7 @@ impl ActiveMultipartObjectRoute<'_> {
     pub fn abort_authorized_multipart_upload(
         &self,
         authorized_upload: &crate::AuthorizedMultipartUploadAbort,
-    ) -> Result<bool, ObjectPgActionError> {
+    ) -> Result<bool, crate::MultipartManagementFailure> {
         self.admission
             .cluster
             .abort_authorized_multipart_upload_locked(
@@ -4046,6 +4062,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 authorized_upload,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
 }
 

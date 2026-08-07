@@ -187,6 +187,8 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::ObjectMetadataMutation(_)
         | ServerError::StreamUpload(_)
         | ServerError::DirectPut(_)
+        | ServerError::MultipartManagement(_)
+        | ServerError::MultipartCompletion(_)
         | ServerError::Metadata(_)
         | ServerError::Ec(_)
         | ServerError::MetadataBlobError { .. }
@@ -4980,6 +4982,10 @@ mod tests {
             storage::test_support::object_metadata_mutation_failure_diagnostic_fixture();
         let stream_upload_error = storage::test_support::stream_upload_failure_diagnostic_fixture();
         let direct_put_error = storage::test_support::direct_put_failure_diagnostic_fixture();
+        let multipart_management_error =
+            storage::test_support::multipart_management_failure_diagnostic_fixture();
+        let multipart_completion_error =
+            storage::test_support::multipart_completion_failure_diagnostic_fixture();
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
             (
                 ServerError::BucketWriteDrain(
@@ -5012,6 +5018,14 @@ mod tests {
             (
                 ServerError::DirectPut(direct_put_error.0),
                 direct_put_error.1.to_vec(),
+            ),
+            (
+                ServerError::MultipartManagement(multipart_management_error.0),
+                multipart_management_error.1.to_vec(),
+            ),
+            (
+                ServerError::MultipartCompletion(multipart_completion_error.0),
+                multipart_completion_error.1.to_vec(),
             ),
             (
                 ServerError::Store(

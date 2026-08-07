@@ -4606,6 +4606,75 @@ fail_with_matches \
     "Direct PutObject must cross storage through DirectPutFailure rather than raw storage implementation errors" \
     "$raw_direct_put_error_transit"
 
+raw_multipart_operation_error_transit=$(
+    {
+        awk '
+        /^impl ActiveMultipartObjectRoute/ {
+            in_multipart_impl = 1
+            next
+        }
+        /^impl / {
+            in_multipart_impl = 0
+            collecting_signature = 0
+        }
+        in_multipart_impl && /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        in_multipart_impl && collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/cluster.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_multipart_upload_for_part|lookup_multipart_upload_for_abort|lookup_multipart_upload_for_list_parts|lookup_multipart_upload_for_completion|require_in_progress_multipart_upload|list_parts_for_authorized_upload|load_multipart_completion_snapshot|complete_multipart_upload_commit_serialized|abort_authorized_multipart_upload)(?s:.{0,500})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
+            || true
+        if ! rg -q -U \
+            'fn map_multipart_management_failure(?s:.{0,300})error: storage::MultipartManagementFailure' \
+            crates/server-core/src/coordinator/multipart.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/multipart.rs: multipart-management response mapping must accept MultipartManagementFailure'
+        fi
+        if ! rg -q -U \
+            'fn map_multipart_completion_failure(?s:.{0,300})error: storage::MultipartCompletionFailure' \
+            crates/server-core/src/coordinator/multipart.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/multipart.rs: multipart-completion response mapping must accept MultipartCompletionFailure'
+        fi
+        if ! rg -q 'MultipartManagement\(MultipartManagementFailure\)' \
+            crates/server-core/src/error.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/error.rs: internal multipart-management failures must remain typed through ServerError'
+        fi
+        if ! rg -q 'MultipartCompletion\(MultipartCompletionFailure\)' \
+            crates/server-core/src/error.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/error.rs: internal multipart-completion failures must remain typed through ServerError'
+        fi
+    }
+)
+fail_with_matches \
+    "Admitted multipart management and completion must cross storage through opaque semantic failures" \
+    "$raw_multipart_operation_error_transit"
+
 http_storage_debug_representation_leaks=$(
     {
         rg -n --color=never \

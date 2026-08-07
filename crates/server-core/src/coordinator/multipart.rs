@@ -211,6 +211,55 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn map_multipart_management_failure(
+        upload_id: &UploadId,
+        error: storage::MultipartManagementFailure,
+    ) -> ServerError {
+        match error.kind() {
+            storage::MultipartManagementFailureKind::NoSuchUpload => ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            },
+            storage::MultipartManagementFailureKind::ResourceExhausted
+            | storage::MultipartManagementFailureKind::MetadataCommandContention
+            | storage::MultipartManagementFailureKind::RetryableConvergence => {
+                ServerError::SlowDown
+            }
+            storage::MultipartManagementFailureKind::InternalError => {
+                ServerError::MultipartManagement(error)
+            }
+        }
+    }
+
+    pub(super) fn map_multipart_completion_failure(
+        upload_id: &UploadId,
+        error: storage::MultipartCompletionFailure,
+    ) -> ServerError {
+        match error.kind() {
+            storage::MultipartCompletionFailureKind::NoSuchUpload => ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            },
+            storage::MultipartCompletionFailureKind::PartNotFound => {
+                let Some(part_number) = error.part_number() else {
+                    return ServerError::MultipartCompletion(error);
+                };
+                ServerError::InvalidPart { part_number }
+            }
+            storage::MultipartCompletionFailureKind::StaleSnapshot => ServerError::OperationAborted,
+            storage::MultipartCompletionFailureKind::ResourceExhausted
+            | storage::MultipartCompletionFailureKind::MetadataCommandContention
+            | storage::MultipartCompletionFailureKind::RetryableConvergence => {
+                // Snapshot/preflight contention is retryable as SlowDown. The
+                // commit path overrides metadata-command contention to
+                // OperationAborted after publication has been attempted.
+                ServerError::SlowDown
+            }
+            storage::MultipartCompletionFailureKind::ConditionalRequestConflict
+            | storage::MultipartCompletionFailureKind::InternalError => {
+                ServerError::MultipartCompletion(error)
+            }
+        }
+    }
+
     pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         if super::object_pg_action_error_is_metadata_command_contention(&error) {
             return ServerError::SlowDown;
@@ -355,15 +404,17 @@ impl Coordinator {
             |bucket_handle| {
                 let upload = route
                     .load_multipart_upload_for_part(req.upload.upload_id())
-                    .map_err(Self::map_object_pg_action_error)?;
+                    .map_err(|error| {
+                        Self::map_multipart_management_failure(req.upload.upload_id(), error)
+                    })?;
                 self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)
             },
         )?;
         #[cfg(test)]
         if self.should_probe_begin_stream_part_session(req.upload.bucket_name()) {
-            let object_pg_ready = route
-                .try_probe_object_pg_available()
-                .map_err(Coordinator::map_object_pg_action_error)?;
+            let object_pg_ready = route.try_probe_object_pg_available().map_err(|error| {
+                Self::map_multipart_management_failure(req.upload.upload_id(), error)
+            })?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before begin_stream_part session"
@@ -602,9 +653,10 @@ impl Coordinator {
                 .load_multipart_completion_snapshot(*upload, &requested_part_numbers)
             {
                 Ok(snapshot) => snapshot,
-                Err(storage::ObjectPgActionError::Metadata(
-                    storage::MetadataError::NoSuchUpload { .. },
-                )) if terminal_race_retries < COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES => {
+                Err(error)
+                    if error.kind() == storage::MultipartCompletionFailureKind::NoSuchUpload
+                        && terminal_race_retries < COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES =>
+                {
                     // Another completion can publish after authorization but
                     // before this snapshot lookup. Restart authorization so an
                     // identical completion resolves through terminal replay,
@@ -613,9 +665,12 @@ impl Coordinator {
                     terminal_race_retries += 1;
                     continue 'retry_stale_commit_snapshot;
                 }
-                Err(storage::ObjectPgActionError::Metadata(
-                    storage::MetadataError::PartNotFound { part_number, .. },
-                )) => {
+                Err(error)
+                    if error.kind() == storage::MultipartCompletionFailureKind::PartNotFound =>
+                {
+                    let Some(part_number) = error.part_number() else {
+                        return Err(ServerError::MultipartCompletion(error));
+                    };
                     // For composite-checksum uploads AWS can reject an object-level
                     // checksum using only the completion XML, before reporting that
                     // a requested part does not exist.
@@ -638,7 +693,12 @@ impl Coordinator {
                     }
                     return Err(ServerError::InvalidPart { part_number });
                 }
-                Err(other) => return Err(Coordinator::map_object_pg_action_error(other)),
+                Err(other) => {
+                    return Err(Coordinator::map_multipart_completion_failure(
+                        req.upload.upload_id(),
+                        other,
+                    ));
+                }
             };
 
             let stores_unconfigured_crc64nvme_checksum_claim = checksum_config.is_none()
@@ -890,7 +950,9 @@ impl Coordinator {
                     ),
                 ) {
                 Ok(outcome) => outcome,
-                Err(storage::ObjectPgActionError::StaleMultipartCompletionSnapshot) => {
+                Err(error)
+                    if error.kind() == storage::MultipartCompletionFailureKind::StaleSnapshot =>
+                {
                     let deadline = stale_snapshot_retry_deadline.get_or_insert_with(|| {
                         Instant::now() + COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET
                     });
@@ -899,9 +961,10 @@ impl Coordinator {
                     }
                     return Err(ServerError::OperationAborted);
                 }
-                Err(storage::ObjectPgActionError::Metadata(
-                    storage::MetadataError::NoSuchUpload { .. },
-                )) if terminal_race_retries < COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES => {
+                Err(error)
+                    if error.kind() == storage::MultipartCompletionFailureKind::NoSuchUpload
+                        && terminal_race_retries < COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES =>
+                {
                     // The upload can disappear after the validated snapshot if
                     // another completion or abort publishes first. Reauthorize
                     // to distinguish an identical terminal replay from a
@@ -909,7 +972,10 @@ impl Coordinator {
                     terminal_race_retries += 1;
                     continue 'retry_stale_commit_snapshot;
                 }
-                Err(storage::ObjectPgActionError::MultipartConditionalRequestConflict) => {
+                Err(error)
+                    if error.kind()
+                        == storage::MultipartCompletionFailureKind::ConditionalRequestConflict =>
+                {
                     let condition = match req.cond {
                         WriteCondition::IfMatch(_) => "If-Match",
                         WriteCondition::IfNoneMatchStar => "If-None-Match",
@@ -926,11 +992,17 @@ impl Coordinator {
                     });
                 }
                 Err(error)
-                    if super::object_pg_action_error_is_metadata_command_contention(&error) =>
+                    if error.kind()
+                        == storage::MultipartCompletionFailureKind::MetadataCommandContention =>
                 {
                     return Err(ServerError::OperationAborted);
                 }
-                Err(error) => return Err(Coordinator::map_object_pg_action_error(error)),
+                Err(error) => {
+                    return Err(Coordinator::map_multipart_completion_failure(
+                        req.upload.upload_id(),
+                        error,
+                    ));
+                }
             };
             let version_id = completion_outcome.version_id();
             let stale_payload_generation_id = completion_outcome.stale_payload_generation_id();
@@ -982,9 +1054,7 @@ impl Coordinator {
             .map_err(super::map_store_error)?;
         match multipart_route.require_in_progress_multipart_upload(upload.upload_id()) {
             Ok(()) => Ok(()),
-            Err(storage::ObjectPgActionError::Metadata(storage::MetadataError::NoSuchUpload {
-                ..
-            })) => {
+            Err(error) if error.kind() == storage::MultipartManagementFailureKind::NoSuchUpload => {
                 let bucket_info = self.checked_active_bucket_summary_for_admitted_route(
                     admission,
                     upload.bucket_name_typed(),
@@ -1002,7 +1072,10 @@ impl Coordinator {
                     })
                 }
             }
-            Err(error) => Err(Self::map_object_pg_action_error(error)),
+            Err(error) => Err(Self::map_multipart_management_failure(
+                upload.upload_id(),
+                error,
+            )),
         }
     }
 
@@ -1029,7 +1102,7 @@ impl Coordinator {
             .active_multipart_object_route(upload.bucket_name_typed(), upload.key_typed())
             .map_err(super::map_store_error)?
             .require_in_progress_multipart_upload(upload.upload_id())
-            .map_err(Self::map_object_pg_action_error)
+            .map_err(|error| Self::map_multipart_management_failure(upload.upload_id(), error))
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1067,7 +1140,9 @@ impl Coordinator {
             AuthorizedAbortMultipartUpload::InProgress { upload } => {
                 if multipart_route
                     .abort_authorized_multipart_upload(&upload)
-                    .map_err(Self::map_object_pg_action_error)?
+                    .map_err(|error| {
+                        Self::map_multipart_management_failure(upload.upload_id(), error)
+                    })?
                 {
                     Ok(())
                 } else {
@@ -1116,7 +1191,9 @@ impl Coordinator {
                 req.part_number_marker,
                 req.max_parts,
             )
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(|error| {
+                Self::map_multipart_management_failure(req.upload.upload_id(), error)
+            })?;
         #[cfg(test)]
         super::maybe_run_list_parts_storage_list_hook(req.upload.bucket_name(), req.upload.key());
         let upload_initiated_at = listed.initiated_at();
@@ -1303,9 +1380,9 @@ impl Coordinator {
         let computed_checksum = req.computed_checksum;
         #[cfg(test)]
         if self.should_probe_finalize_stream_part_commit(req.upload.bucket_name()) {
-            let object_pg_ready = route
-                .try_probe_object_pg_available()
-                .map_err(Coordinator::map_object_pg_action_error)?;
+            let object_pg_ready = route.try_probe_object_pg_available().map_err(|error| {
+                Self::map_multipart_management_failure(req.upload.upload_id(), error)
+            })?;
             if !object_pg_ready {
                 return Err(ServerError::InternalError {
                     reason: "test probe: object pg still locked before finalize_stream_part commit"

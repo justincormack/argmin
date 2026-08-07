@@ -603,7 +603,7 @@ impl Coordinator {
         let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(&dst_bucket_handle)?;
         let dst_upload = multipart_route
             .load_multipart_upload_for_part(upload_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?;
         let policy_context = Self::with_multipart_part_managed_encryption_policy_context(
             policy_context,
             &dst_upload,
@@ -709,13 +709,21 @@ impl Coordinator {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
-        self.with_bucket_write_handle_for(&req.upload, request, |bucket_handle| {
-            let upload = self
-                .storage_node()
-                .load_multipart_upload_for_part(bucket, key, upload_id)
-                .map_err(Self::map_object_pg_action_error)?;
-            self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)
-        })
+        let admission = self.admit_storage_route_for_request()?;
+        let route = admission
+            .active_multipart_object_route(bucket, key)
+            .map_err(super::super::map_store_error)?;
+        self.with_bucket_write_handle_on_admitted_route(
+            &admission,
+            &req.upload,
+            request,
+            |bucket_handle| {
+                let upload = route
+                    .load_multipart_upload_for_part(upload_id)
+                    .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?;
+                self.authorize_begin_stream_part_with_upload(req, &bucket_handle, upload)
+            },
+        )
     }
 
     pub(in crate::coordinator) fn authorize_complete_multipart_upload_non_boe_on_admitted_route(
@@ -737,7 +745,7 @@ impl Coordinator {
         let lookup = if should_probe_multipart_complete_auth_lookup(bucket.as_str(), key.as_str()) {
             let upload = multipart_route
                 .try_load_multipart_upload_for_completion(upload_id)
-                .map_err(Self::map_object_pg_action_error)?
+                .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?
                 .ok_or_else(|| ServerError::InternalError {
                     reason: "multipart complete auth lookup would block".to_string(),
                 })?;
@@ -745,12 +753,12 @@ impl Coordinator {
         } else {
             multipart_route
                 .lookup_multipart_upload_for_completion(upload_id)
-                .map_err(Self::map_object_pg_action_error)?
+                .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?
         };
         #[cfg(not(test))]
         let lookup = multipart_route
             .lookup_multipart_upload_for_completion(upload_id)
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?;
         let upload = match lookup {
             storage::MultipartUploadCompletionLookup::InProgress(upload) => *upload,
             storage::MultipartUploadCompletionLookup::Replay(replay) => {
@@ -885,7 +893,7 @@ impl Coordinator {
         super::maybe_run_abort_multipart_bucket_summary_hook(bucket.as_str(), key.as_str());
         let authorized = match multipart_route
             .lookup_multipart_upload_for_abort(upload_id)
-            .map_err(Self::map_object_pg_action_error)?
+            .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?
         {
             storage::MultipartUploadAbortLookup::InProgress(upload) => {
                 if !Self::requester_can_manage_multipart_upload_identity(
@@ -975,7 +983,7 @@ impl Coordinator {
         )?;
         match multipart_route
             .lookup_multipart_upload_for_list_parts(upload_id)
-            .map_err(Self::map_object_pg_action_error)?
+            .map_err(|error| Self::map_multipart_management_failure(upload_id, error))?
         {
             storage::MultipartUploadListPartsLookup::InProgress(upload) => {
                 if !Self::requester_can_manage_multipart_upload_identity(

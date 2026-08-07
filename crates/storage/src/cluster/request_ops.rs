@@ -14992,26 +14992,6 @@ impl super::StorageCluster {
         )
     }
 
-    /// Load an in-progress upload through the logical UploadPart authorization boundary.
-    pub fn load_multipart_upload_for_part(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-    ) -> Result<crate::MultipartUploadPartCandidate, ObjectPgActionError> {
-        self.load_in_progress_multipart_upload_with_route_validation(
-            super::MultipartObjectMutationEffectRoute {
-                pg_id: self.object_metadata_pg(bucket, key),
-                bucket,
-                key,
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            upload_id,
-            || Ok(()),
-        )
-        .map(crate::MultipartUploadPartCandidate::from_record)
-    }
-
     pub(super) fn load_in_progress_multipart_upload_with_route_validation(
         &self,
         route: super::MultipartObjectMutationEffectRoute<'_>,
@@ -15378,8 +15358,8 @@ impl super::StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn complete_multipart_upload_commit_serialized(
+    #[cfg(test)]
+    pub(crate) fn complete_multipart_upload_commit_serialized(
         &self,
         req: CompleteMultipartCommitRequest,
     ) -> Result<CompleteMultipartCommitOutcome, ObjectPgActionError> {
@@ -16721,8 +16701,8 @@ impl super::StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn abort_authorized_multipart_upload(
+    #[cfg(test)]
+    pub(crate) fn abort_authorized_multipart_upload(
         &self,
         authorized_upload: &crate::AuthorizedMultipartUploadAbort,
     ) -> Result<bool, ObjectPgActionError> {

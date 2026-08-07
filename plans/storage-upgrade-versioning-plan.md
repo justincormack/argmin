@@ -2138,6 +2138,22 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        object loader reuses `ObjectReadFailure`. Owner-local direct-PUT state-machine tests,
        exhaustive classification and response-mapping tests, HTTP redaction coverage, and the
        boundary checker reject raw error transit or renewed public low-level mutation entry points.
+       The admitted multipart-management and completion sub-slice completed on 2026-08-07.
+       Multipart upload lookup for UploadPart, completion, abort, and ListParts; in-progress target
+       validation; authorized part listing and abort; and test-only route probes now return opaque
+       `MultipartManagementFailure`. Its exhaustive logical kind contains only upload absence,
+       resource exhaustion, metadata-command contention, retryable convergence, and internal
+       failure. Completion snapshot loading and publication return the separate opaque
+       `MultipartCompletionFailure`, whose exhaustive kind additionally preserves missing-part,
+       stale-snapshot, and conditional-conflict outcomes required by the completion retry and S3
+       response policy. Only the logical missing part number crosses with that failure; upload IDs
+       are taken from the already-authorized request rather than retained from implementation
+       errors. Internal failures remain typed through distinct `ServerError` variants, preserving
+       bounded storage diagnostics and HTTP redaction. The former unadmitted UploadPart lookup was
+       removed, and raw owner-test completion/abort helpers are test-only and crate-private.
+       Owner-local crossed-capability, route-expiry, exhaustive classification, and redaction
+       tests; exhaustive coordinator mapping tests; the full multipart suites; HTTP sanitization;
+       and the boundary checker reject raw errors on every public admitted multipart operation.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces
@@ -2145,7 +2161,8 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        storage-owned semantic errors. Preserve only logical values required for S3 translation,
        such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
        other implementation detail behind the existing bounded opaque diagnostic. Continue with
-       multipart-management/completion object-PG operations next. Remove
+       bucket-wide object/version/multipart listing scans next, followed by the remaining
+       storage-maintenance/runtime operation families. Remove
        `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
        public raw error exports once no public storage signature requires them. Tests that
        currently construct raw storage errors must use owner-provided semantic fixtures or move

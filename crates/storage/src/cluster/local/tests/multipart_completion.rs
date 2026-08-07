@@ -127,12 +127,11 @@ fn multipart_completion_route_rejects_crossed_same_pg_request_before_mutation() 
     let error = crossed_route
         .complete_multipart_upload_commit_serialized(request.clone())
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {
-            operation: "complete multipart upload",
-        })
-    ));
+    assert_eq!(
+        error.kind(),
+        crate::MultipartCompletionFailureKind::InternalError
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
     assert_eq!(
         cluster
             .load_in_progress_multipart_upload(&bucket, &key, &request.upload_id)
@@ -218,10 +217,11 @@ fn multipart_completion_stale_retry_rechecks_expired_route_before_reload() {
     let error = route
         .complete_multipart_upload_commit_serialized(request.clone())
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
-    ));
+    assert_eq!(
+        error.kind(),
+        crate::MultipartCompletionFailureKind::RetryableConvergence
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
     assert!(!replace_once.load(Ordering::SeqCst));
     assert_eq!(stale_builds.load(Ordering::SeqCst), 1);
     assert_eq!(
