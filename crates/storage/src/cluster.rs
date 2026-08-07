@@ -2762,12 +2762,13 @@ pub struct ActiveBucketMetadataScan<'admission> {
 }
 
 impl ActiveBucketMetadataScan<'_> {
-    pub fn list_buckets_for_owner(&self) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
+    pub fn list_buckets_for_owner(&self) -> Result<Vec<BucketInfo>, crate::BucketListingFailure> {
         self.admission
             .cluster
             .list_buckets_for_owner_with_route_validation(self.owner_canonical_id.as_str(), || {
                 self.admission.require_valid_now()
             })
+            .map_err(crate::BucketListingFailure::from_object_pg_action)
     }
 }
 

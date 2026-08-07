@@ -1,10 +1,10 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
 use storage::error::{
-    BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure, MetadataError,
-    MultipartCompletionFailure, MultipartManagementFailure, ObjectMetadataListingFailure,
-    ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
-    StoreOperationFailureClass, StreamUploadFailure,
+    BucketListingFailure, BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure,
+    MetadataError, MultipartCompletionFailure, MultipartManagementFailure,
+    ObjectMetadataListingFailure, ObjectMetadataMutationFailure, ObjectReadFailure, StoreError,
+    StoreFailure, StoreOperationFailureClass, StreamUploadFailure,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +58,9 @@ pub enum ServerError {
 
     #[error("bucket snapshot load error: {0}")]
     BucketSnapshotLoad(BucketSnapshotLoadFailure),
+
+    #[error("bucket listing error: {0}")]
+    BucketListing(BucketListingFailure),
 
     #[error("object read error: {0}")]
     ObjectRead(ObjectReadFailure),
@@ -527,6 +530,7 @@ impl ServerError {
             Self::Store(error) => error.diagnostic_cause_label(),
             Self::BucketWriteDrain(error) => error.diagnostic_cause_label(),
             Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
+            Self::BucketListing(error) => error.diagnostic_cause_label(),
             Self::ObjectRead(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataListing(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
@@ -570,6 +574,10 @@ impl ServerError {
             ),
             Self::BucketSnapshotLoad(error) => format!(
                 "server_error>bucket_snapshot_load>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::BucketListing(error) => format!(
+                "server_error>bucket_listing>{}",
                 error.diagnostic_cause_label()
             ),
             Self::ObjectRead(error) => format!(
@@ -772,6 +780,7 @@ impl ServerError {
             Self::Store(_) => "InternalError",
             Self::BucketWriteDrain(_) => "InternalError",
             Self::BucketSnapshotLoad(_) => "InternalError",
+            Self::BucketListing(_) => "InternalError",
             Self::ObjectRead(_) => "InternalError",
             Self::ObjectMetadataListing(_) => "InternalError",
             Self::ObjectMetadataMutation(_) => "InternalError",
@@ -1181,6 +1190,19 @@ mod tests {
             snapshot.diagnostic_cause_chain(),
             "server_error>bucket_snapshot_load>metadata_failure"
         );
+
+        let (bucket_listing_failure, secret_fragments) =
+            storage::test_support::bucket_listing_failure_diagnostic_fixture();
+        let bucket_listing = ServerError::BucketListing(bucket_listing_failure);
+        assert_eq!(bucket_listing.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            bucket_listing.diagnostic_cause_chain(),
+            "server_error>bucket_listing>store_io_failure"
+        );
+        let rendered = format!("{bucket_listing:?} {bucket_listing}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
 
         let object_read = ServerError::ObjectRead(
             storage::test_support::object_read_failure_diagnostic_fixture().0,
@@ -1664,6 +1686,16 @@ mod tests {
         let err = ServerError::ObjectRead(storage::test_support::object_read_failure_for_kind(
             storage::ObjectReadFailureKind::InternalError,
         ));
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
+    fn s3_error_code_bucket_listing() {
+        let err =
+            ServerError::BucketListing(storage::test_support::bucket_listing_failure_for_kind(
+                storage::BucketListingFailureKind::InternalError,
+            ));
         assert_eq!(err.s3_error_code(), "InternalError");
         assert_eq!(err.http_status(), 500);
     }

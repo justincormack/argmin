@@ -9335,8 +9335,8 @@ impl super::StorageCluster {
         Ok(buckets)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn list_buckets_for_owner(
+    #[cfg(test)]
+    pub(crate) fn list_buckets_for_owner(
         &self,
         owner_canonical_id: &str,
     ) -> Result<Vec<BucketInfo>, ObjectPgActionError> {

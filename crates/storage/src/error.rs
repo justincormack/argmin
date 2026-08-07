@@ -2468,6 +2468,103 @@ impl std::fmt::Display for ObjectReadFailure {
 
 impl std::error::Error for ObjectReadFailure {}
 
+/// Exhaustive logical outcome of an admitted account-wide bucket listing.
+///
+/// The bucket-PG fan-out, route state, database errors, and RPC details remain
+/// private to storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BucketListingFailureKind {
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+/// Opaque failure returned by admitted bucket-listing capabilities.
+pub struct BucketListingFailure {
+    kind: BucketListingFailureKind,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl BucketListingFailure {
+    #[must_use]
+    pub const fn kind(&self) -> BucketListingFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let (operation_kind, diagnostic_category) = classify_object_pg_action(error);
+        let kind = match operation_kind {
+            ObjectOperationFailureKind::ResourceExhausted => {
+                BucketListingFailureKind::ResourceExhausted
+            }
+            ObjectOperationFailureKind::MetadataCommandContention => {
+                BucketListingFailureKind::MetadataCommandContention
+            }
+            ObjectOperationFailureKind::RetryableConvergence => {
+                BucketListingFailureKind::RetryableConvergence
+            }
+            ObjectOperationFailureKind::ObjectNotFound
+            | ObjectOperationFailureKind::InternalError => BucketListingFailureKind::InternalError,
+        };
+        Self {
+            kind,
+            diagnostic_category,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn from_store(error: StoreError) -> Self {
+        Self::from_object_pg_action(ObjectPgActionError::Store(error))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) const fn for_test(kind: BucketListingFailureKind) -> Self {
+        let listing_kind = match kind {
+            BucketListingFailureKind::ResourceExhausted => {
+                ObjectMetadataListingFailureKind::ResourceExhausted
+            }
+            BucketListingFailureKind::MetadataCommandContention => {
+                ObjectMetadataListingFailureKind::MetadataCommandContention
+            }
+            BucketListingFailureKind::RetryableConvergence => {
+                ObjectMetadataListingFailureKind::RetryableConvergence
+            }
+            BucketListingFailureKind::InternalError => {
+                ObjectMetadataListingFailureKind::InternalError
+            }
+        };
+        let failure = ObjectMetadataListingFailure::for_test(listing_kind);
+        Self {
+            kind,
+            diagnostic_category: failure.diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for BucketListingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BucketListingFailure")
+            .field("kind", &self.kind)
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for BucketListingFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("bucket listing failed")
+    }
+}
+
+impl std::error::Error for BucketListingFailure {}
+
 /// Exhaustive logical outcome of an admitted bucket-wide object-metadata scan.
 ///
 /// Object, version, and multipart-upload listings share this failure contract.
@@ -3877,6 +3974,91 @@ mod tests {
             },
         ));
         assert_eq!(metadata.kind(), ObjectReadFailureKind::InternalError);
+        assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
+        let rendered = format!("{metadata:?} {metadata}");
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&metadata).is_none());
+    }
+
+    #[test]
+    fn bucket_listing_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| BucketListingFailure::from_object_pg_action(error).kind();
+
+        for (class, expected) in [
+            (
+                StoreOperationFailureClass::ResourceExhausted,
+                BucketListingFailureKind::ResourceExhausted,
+            ),
+            (
+                StoreOperationFailureClass::MetadataCommandContention,
+                BucketListingFailureKind::MetadataCommandContention,
+            ),
+            (
+                StoreOperationFailureClass::RetryableConvergence,
+                BucketListingFailureKind::RetryableConvergence,
+            ),
+            (
+                StoreOperationFailureClass::Other,
+                BucketListingFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(
+                convert(ObjectPgActionError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                )),
+                expected
+            );
+            assert_eq!(BucketListingFailure::for_test(expected).kind(), expected);
+        }
+
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(
+                MetadataError::BucketWriteReservationConflict {
+                    reservation_id: "opaque-reservation".to_string(),
+                },
+            )),
+            BucketListingFailureKind::MetadataCommandContention
+        );
+        for error in [
+            ObjectPgActionError::Metadata(MetadataError::ObjectNotFound),
+            ObjectPgActionError::InvalidRequest {
+                reason: "not valid for an admitted bucket listing".to_string(),
+            },
+            ObjectPgActionError::StaleObjectReadSubject,
+            ObjectPgActionError::StaleDirectPutCommitSnapshot,
+            ObjectPgActionError::StaleStreamFinalizeSnapshot,
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            ObjectPgActionError::MultipartConditionalRequestConflict,
+        ] {
+            assert_eq!(convert(error), BucketListingFailureKind::InternalError);
+        }
+    }
+
+    #[test]
+    fn bucket_listing_failure_discards_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret bucket listing operation";
+        const SECRET_SOURCE: &str = "secret bucket listing source";
+        let failure = BucketListingFailure::from_store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+
+        assert_eq!(failure.kind(), BucketListingFailureKind::InternalError);
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "bucket listing failed");
+        let rendered = format!("{failure:?} {failure}");
+        assert!(rendered.contains("store_io_failure"));
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&failure).is_none());
+
+        let metadata = BucketListingFailure::from_object_pg_action(ObjectPgActionError::Metadata(
+            MetadataError::Db {
+                context: SECRET_CONTEXT,
+                source: DatabaseError::new(SECRET_SOURCE),
+            },
+        ));
         assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
         let rendered = format!("{metadata:?} {metadata}");
         assert!(!rendered.contains(SECRET_CONTEXT));

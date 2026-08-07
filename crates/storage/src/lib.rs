@@ -147,19 +147,19 @@ pub use control_plane_service_client::{
     ControlPlaneFrontendClient, ControlPlaneServiceClientBootstrapError,
     ControlPlaneStorageNodeClient,
 };
+pub use error::{
+    BucketListingFailure, BucketListingFailureKind, BucketSnapshotLoadFailure,
+    BucketSnapshotLoadFailureKind, BucketWriteDrainFailure, BucketWriteDrainFailureKind,
+    ClusterBuildError, DirectPutFailure, DirectPutFailureKind, MetadataError,
+    MultipartCompletionFailure, MultipartCompletionFailureKind, MultipartManagementFailure,
+    MultipartManagementFailureKind, ObjectMetadataListingFailure, ObjectMetadataListingFailureKind,
+    ObjectMetadataMutationFailure, ObjectMetadataMutationFailureKind, ObjectPgActionError,
+    ObjectReadFailure, ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure,
+    StoreOperationFailureClass, StreamUploadFailure, StreamUploadFailureKind,
+};
 pub(crate) use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, StorageNodeFailureClass,
     StorageNodeFailureDetail,
-};
-pub use error::{
-    BucketSnapshotLoadFailure, BucketSnapshotLoadFailureKind, BucketWriteDrainFailure,
-    BucketWriteDrainFailureKind, ClusterBuildError, DirectPutFailure, DirectPutFailureKind,
-    MetadataError, MultipartCompletionFailure, MultipartCompletionFailureKind,
-    MultipartManagementFailure, MultipartManagementFailureKind, ObjectMetadataListingFailure,
-    ObjectMetadataListingFailureKind, ObjectMetadataMutationFailure,
-    ObjectMetadataMutationFailureKind, ObjectPgActionError, ObjectReadFailure,
-    ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
-    StreamUploadFailure, StreamUploadFailureKind,
 };
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
@@ -1581,6 +1581,12 @@ pub mod test_support {
         BucketSnapshotLoadFailure::for_test(kind)
     }
 
+    /// Construct an opaque bucket-listing failure from its logical outcome.
+    #[must_use]
+    pub fn bucket_listing_failure_for_kind(kind: BucketListingFailureKind) -> BucketListingFailure {
+        BucketListingFailure::for_test(kind)
+    }
+
     /// Construct an opaque object-read failure from its logical outcome.
     ///
     /// This lets cross-crate response-mapping tests remain exhaustive without
@@ -1677,6 +1683,22 @@ pub mod test_support {
         const SECRET_SOURCE: &str = "secret object listing fixture source";
         (
             ObjectMetadataListingFailure::from_store(StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            }),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
+    }
+
+    /// Construct an opaque bucket-listing failure containing a bounded I/O
+    /// diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn bucket_listing_failure_diagnostic_fixture(
+    ) -> (BucketListingFailure, &'static [&'static str]) {
+        const SECRET_CONTEXT: &str = "secret bucket listing fixture operation";
+        const SECRET_SOURCE: &str = "secret bucket listing fixture source";
+        (
+            BucketListingFailure::from_store(StoreError::Io {
                 context: SECRET_CONTEXT,
                 source: std::io::Error::other(SECRET_SOURCE),
             }),

@@ -434,10 +434,14 @@ fn composite_bucket_listings_fail_closed_when_route_map_expires_during_pg_scan()
         .unwrap()
         .list_buckets_for_owner()
         .unwrap_err();
-    assert!(matches!(
-        bucket_error,
-        crate::ObjectPgActionError::Store(StoreError::RouteMapExpired { .. })
-    ));
+    assert_eq!(
+        bucket_error.kind(),
+        crate::BucketListingFailureKind::RetryableConvergence
+    );
+    assert_eq!(
+        bucket_error.diagnostic_cause_label(),
+        "store_topology_failure"
+    );
     drop(bucket_hook);
     drop(bucket_admission);
 

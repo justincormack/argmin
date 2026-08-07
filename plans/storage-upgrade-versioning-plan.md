@@ -2154,6 +2154,16 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        Owner-local crossed-capability, route-expiry, exhaustive classification, and redaction
        tests; exhaustive coordinator mapping tests; the full multipart suites; HTTP sanitization;
        and the boundary checker reject raw errors on every public admitted multipart operation.
+       The account-wide bucket-listing sub-slice completed on 2026-08-07. Admitted ListBuckets
+       scans now return the opaque `BucketListingFailure`; its exhaustive logical kind contains
+       only resource exhaustion, metadata-command contention, retryable convergence, and internal
+       failure. Storage owns conversion from every bucket-PG fan-out, route-validity, metadata,
+       and RPC error, while the coordinator preserves the existing `SlowDown` policy for the three
+       retryable classes and retains internal failures through a typed `ServerError` variant with
+       bounded diagnostics and HTTP redaction. The raw owner-local listing helper is test-only and
+       crate-private. Owner-local exhaustive classification, route-expiry, and redaction tests;
+       exhaustive coordinator response mapping; HTTP sanitization; and the boundary checker reject
+       raw error transit through the public admitted bucket scan.
        The bucket-wide object-metadata listing sub-slice completed on 2026-08-07. Admitted
        ListObjectsV2, ListObjectVersions, and ListMultipartUploads scans now return the shared
        opaque `ObjectMetadataListingFailure`; its exhaustive logical kind contains only resource

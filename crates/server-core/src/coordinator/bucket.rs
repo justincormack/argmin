@@ -59,6 +59,15 @@ pub(super) fn emit_bucket_delete_begin_failed(
 }
 
 impl Coordinator {
+    pub(super) fn map_bucket_listing_failure(error: storage::BucketListingFailure) -> ServerError {
+        match error.kind() {
+            storage::BucketListingFailureKind::ResourceExhausted
+            | storage::BucketListingFailureKind::MetadataCommandContention
+            | storage::BucketListingFailureKind::RetryableConvergence => ServerError::SlowDown,
+            storage::BucketListingFailureKind::InternalError => ServerError::BucketListing(error),
+        }
+    }
+
     pub(super) fn map_bucket_snapshot_load_error(
         err: storage::BucketSnapshotLoadFailure,
     ) -> ServerError {
@@ -613,7 +622,7 @@ impl Coordinator {
             .active_bucket_metadata_scan(&owner_canonical_id)
             .map_err(super::map_store_error)?
             .list_buckets_for_owner()
-            .map_err(Self::map_object_pg_action_error)?;
+            .map_err(Self::map_bucket_listing_failure)?;
         Ok(buckets.into_iter().map(Self::bucket_summary).collect())
     }
 

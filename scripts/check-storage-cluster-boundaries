@@ -4675,6 +4675,66 @@ fail_with_matches \
     "Admitted multipart management and completion must cross storage through opaque semantic failures" \
     "$raw_multipart_operation_error_transit"
 
+raw_bucket_listing_error_transit=$(
+    {
+        awk '
+        /^impl ActiveBucketMetadataScan/ {
+            in_listing_impl = 1
+            next
+        }
+        /^impl / {
+            in_listing_impl = 0
+            collecting_signature = 0
+        }
+        in_listing_impl && /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        in_listing_impl && collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/cluster.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+list_buckets_for_owner(?s:.{0,500})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/cluster/request_ops.rs \
+            || true
+        rg -n -U --color=never \
+            'list_buckets_for_owner\(\)(?s:.{0,200})map_err\(Self::map_object_pg_action_error\)' \
+            crates/server-core/src/coordinator/bucket.rs \
+            || true
+        if ! rg -q -U \
+            'fn map_bucket_listing_failure(?s:.{0,300})error: storage::BucketListingFailure' \
+            crates/server-core/src/coordinator/bucket.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/bucket.rs: bucket-listing response mapping must accept BucketListingFailure'
+        fi
+        if ! rg -q 'BucketListing\(BucketListingFailure\)' \
+            crates/server-core/src/error.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/error.rs: internal bucket-listing failures must remain typed through ServerError'
+        fi
+    }
+)
+fail_with_matches \
+    "Account-wide bucket listing scans must cross storage through BucketListingFailure" \
+    "$raw_bucket_listing_error_transit"
+
 raw_object_metadata_listing_error_transit=$(
     {
         awk '
