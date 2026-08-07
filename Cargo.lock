@@ -2312,11 +2312,9 @@ dependencies = [
  "ec",
  "observability",
  "proptest",
- "rapidhash",
  "ring",
  "s3-types",
  "storage",
- "subtle",
  "test-util",
  "thiserror",
 ]
