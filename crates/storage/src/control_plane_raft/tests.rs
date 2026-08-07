@@ -1322,7 +1322,7 @@ impl RaftNetworkV2<ControlPlaneRaftTypeConfig> for InMemoryRaftNetwork {
         let max_snapshot_bytes = self
             .policy
             .as_ref()
-            .map_or(usize::MAX, |policy| policy.limits.max_snapshot_bytes);
+            .map_or(usize::MAX, |policy| policy.limits().max_snapshot_bytes);
         let request = ControlPlaneRaftPeerSnapshotRequest { vote, snapshot };
         let request_identity = self.snapshot_request_identity()?;
         let encoded = request
