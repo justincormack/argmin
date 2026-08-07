@@ -496,7 +496,7 @@ fn metadata_write_fails_closed_when_required_replica_is_missing() {
     };
 
     let err = cluster
-        .create_bucket_with_config_and_load_info(&config)
+        .create_bucket_with_config_and_load_info_raw(&config)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -529,7 +529,7 @@ fn metadata_write_fails_closed_when_required_replica_is_missing() {
     }
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     cluster
-        .create_bucket_with_config_and_load_info(&config)
+        .create_bucket_with_config_and_load_info_raw(&config)
         .unwrap();
     assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
     for node_id in node_ids {
@@ -616,7 +616,7 @@ fn create_bucket_rehydrates_durable_pending_slot_after_reopen() {
 
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     cluster
-        .create_bucket_with_config_and_load_info(&config)
+        .create_bucket_with_config_and_load_info_raw(&config)
         .unwrap();
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
     for node_id in node_ids {
@@ -696,7 +696,7 @@ fn bucket_acl_rehydration_preserves_multipart_completion_barrier_sequence_after_
     let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap());
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     let info = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -2534,7 +2534,7 @@ fn metadata_command_log_index_allocator_drains_unresolved_durable_pending_slot()
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: blocked_bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,

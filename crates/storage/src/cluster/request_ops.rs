@@ -1843,7 +1843,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_probe_bucket_pg_available(
+    pub(crate) fn try_probe_bucket_pg_available(
         &self,
         bucket: &BucketName,
     ) -> Result<bool, BucketSnapshotLoadError> {
@@ -1869,6 +1869,15 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_bucket_with_config_and_load_info(
+        &self,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<BucketCreateAttemptOutcome, crate::BucketSnapshotLoadFailure> {
+        self.create_bucket_with_config_and_load_info_raw(config)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn create_bucket_with_config_and_load_info_raw(
         &self,
         config: &CreateBucketConfig<'_>,
     ) -> Result<BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
@@ -3789,6 +3798,15 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, crate::BucketSnapshotLoadFailure> {
+        self.load_bucket_snapshot_internal(bucket, request)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    pub(crate) fn load_bucket_snapshot_internal(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node = self
@@ -3803,33 +3821,6 @@ impl super::StorageCluster {
                 node.authorization(),
             )?;
         route.load_bucket_snapshot(request)
-    }
-
-    /// Load the raw authorization snapshot used only by DeleteBucket retries
-    /// after normal write-snapshot authorization found no visible bucket.
-    ///
-    /// DeleteBucket itself installs or observes the bucket write drain. Once a
-    /// previous request has marked the bucket `Deleting`, normal bucket
-    /// snapshots intentionally hide it as not found, but an idempotent retry
-    /// still needs enough metadata to perform authorization and reach
-    /// `begin_bucket_delete`, where `AlreadyDeleting` is handled. Callers must
-    /// only accept this raw snapshot for an already-`Deleting` bucket; use
-    /// `load_active_bucket_delete_attempt_authorization_snapshot` for the
-    /// narrower active-bucket preserved-attempt path.
-    pub fn load_bucket_delete_authorization_snapshot(
-        &self,
-        bucket: &BucketName,
-        request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
-        self.load_bucket_delete_authorization_snapshot_with_route_validation(
-            super::BucketMetadataMutationEffectRoute {
-                pg_id: self.bucket_metadata_pg(bucket),
-                bucket,
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            || Ok(()),
-            request,
-        )
     }
 
     pub(super) fn load_bucket_delete_authorization_snapshot_with_route_validation(
@@ -3894,7 +3885,8 @@ impl super::StorageCluster {
     /// before reading policy/tag authorization inputs. Once the live drain is in
     /// place and the reservation list is empty, new bucket writes cannot acquire
     /// a reservation and older writes cannot commit after the snapshot.
-    pub fn load_active_bucket_delete_attempt_authorization_snapshot(
+    #[cfg(test)]
+    pub(crate) fn load_active_bucket_delete_attempt_authorization_snapshot(
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
@@ -4045,6 +4037,14 @@ impl super::StorageCluster {
     pub fn load_bucket_fast_path_identity(
         &self,
         bucket: &BucketName,
+    ) -> Result<Option<BucketFastPathIdentity>, crate::BucketSnapshotLoadFailure> {
+        self.load_bucket_fast_path_identity_internal(bucket)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    fn load_bucket_fast_path_identity_internal(
+        &self,
+        bucket: &BucketName,
     ) -> Result<Option<BucketFastPathIdentity>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node = self
@@ -4061,6 +4061,16 @@ impl super::StorageCluster {
     }
 
     pub fn with_bucket_write_snapshot<T, E>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+    ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
+        self.with_bucket_write_snapshot_internal(bucket, request, action)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    fn with_bucket_write_snapshot_internal<T, E>(
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
@@ -4093,7 +4103,8 @@ impl super::StorageCluster {
         )
     }
 
-    pub fn with_bucket_write_snapshot_for_command<T, E>(
+    #[cfg(test)]
+    pub(crate) fn with_bucket_write_snapshot_for_command<T, E>(
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
@@ -8329,6 +8340,14 @@ impl super::StorageCluster {
     pub fn head_bucket_info(
         &self,
         bucket: &BucketName,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.head_bucket_info_internal(bucket)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    pub(crate) fn head_bucket_info_internal(
+        &self,
+        bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node = self
@@ -8343,6 +8362,15 @@ impl super::StorageCluster {
     }
 
     pub fn get_bucket_subresource(
+        &self,
+        bucket: &BucketName,
+        kind: OpaqueBucketSubresourceKind,
+    ) -> Result<Option<String>, crate::BucketSnapshotLoadFailure> {
+        self.get_bucket_subresource_internal(bucket, kind)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    fn get_bucket_subresource_internal(
         &self,
         bucket: &BucketName,
         kind: OpaqueBucketSubresourceKind,
@@ -8362,6 +8390,14 @@ impl super::StorageCluster {
     pub fn get_bucket_tags(
         &self,
         bucket: &BucketName,
+    ) -> Result<Option<SerializedBucketTagSet>, crate::BucketSnapshotLoadFailure> {
+        self.get_bucket_tags_internal(bucket)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    fn get_bucket_tags_internal(
+        &self,
+        bucket: &BucketName,
     ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
         let pg_id = PgId::new(self.bucket_metadata_pg_id(bucket));
         let node = self
@@ -8377,6 +8413,16 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_versioning_and_load_info(
+        &self,
+        bucket: &BucketName,
+        state: BucketVersioningState,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_versioning_and_load_info_raw(bucket, state)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_versioning_and_load_info_raw(
         &self,
         bucket: &BucketName,
         state: BucketVersioningState,
@@ -8532,6 +8578,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         config: BucketObjectLockConfig,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_object_lock_and_load_info_raw(bucket, config)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_object_lock_and_load_info_raw(
+        &self,
+        bucket: &BucketName,
+        config: BucketObjectLockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.put_bucket_property_command_and_load_info(
             bucket,
@@ -8541,6 +8597,16 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_encryption_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: BucketEncryptionConfig,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_encryption_and_load_info_raw(bucket, config)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_encryption_and_load_info_raw(
         &self,
         bucket: &BucketName,
         config: BucketEncryptionConfig,
@@ -8556,6 +8622,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         config: PublicAccessBlockConfig,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_public_access_block_and_load_info_raw(bucket, config)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_public_access_block_and_load_info_raw(
+        &self,
+        bucket: &BucketName,
+        config: PublicAccessBlockConfig,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.put_bucket_property_command_and_load_info(
             bucket,
@@ -8565,6 +8641,15 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn delete_bucket_public_access_block_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.delete_bucket_public_access_block_and_load_info_raw(bucket)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn delete_bucket_public_access_block_and_load_info_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
@@ -8579,6 +8664,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         config: BucketOwnershipControls,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_ownership_controls_and_load_info_raw(bucket, config)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_ownership_controls_and_load_info_raw(
+        &self,
+        bucket: &BucketName,
+        config: BucketOwnershipControls,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.put_bucket_property_command_and_load_info(
             bucket,
@@ -8588,6 +8683,15 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn delete_bucket_ownership_controls_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.delete_bucket_ownership_controls_and_load_info_raw(bucket)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn delete_bucket_ownership_controls_and_load_info_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
@@ -8602,6 +8706,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         enabled: bool,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_abac_enabled_and_load_info_raw(bucket, enabled)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_abac_enabled_and_load_info_raw(
+        &self,
+        bucket: &BucketName,
+        enabled: bool,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.put_bucket_property_command_and_load_info(
             bucket,
@@ -8611,6 +8725,17 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn put_bucket_acl_and_load_info(
+        &self,
+        bucket: &BucketName,
+        acl_grants: &AclGrants,
+        summary: BucketAclSummary,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_acl_and_load_info_raw(bucket, acl_grants, summary)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_acl_and_load_info_raw(
         &self,
         bucket: &BucketName,
         acl_grants: &AclGrants,
@@ -8898,6 +9023,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         req: PutBucketSubresource<'_>,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_subresource_and_load_info_raw(bucket, req)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn put_bucket_subresource_and_load_info_raw(
+        &self,
+        bucket: &BucketName,
+        req: PutBucketSubresource<'_>,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.put_bucket_subresource_and_load_info_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
@@ -8934,6 +9069,16 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         kind: OpaqueBucketSubresourceKind,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.delete_bucket_subresource_and_load_info_raw(bucket, kind)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn delete_bucket_subresource_and_load_info_raw(
+        &self,
+        bucket: &BucketName,
+        kind: OpaqueBucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
         self.delete_bucket_subresource_and_load_info_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
@@ -8948,6 +9093,15 @@ impl super::StorageCluster {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn delete_bucket_tags_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+        self.delete_bucket_tags_and_load_info_raw(bucket)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn delete_bucket_tags_and_load_info_raw(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
@@ -9207,7 +9361,7 @@ impl super::StorageCluster {
             );
         }
         for bucket in self.list_lifecycle_sweep_buckets()?.aborting_buckets {
-            match self.head_bucket_info(&bucket) {
+            match self.head_bucket_info_internal(&bucket) {
                 Ok(bucket_info) => roots.push(LifecycleSweepRoot {
                     bucket,
                     bucket_incarnation_generation: bucket_info.bucket_incarnation_generation,
@@ -13540,14 +13694,29 @@ impl super::StorageCluster {
             BucketSnapshot,
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
+    ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
+        self.create_put_object_stream_session_raw(bucket, key, request, action)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn create_put_object_stream_session_raw<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateStreamUploadReq), E>,
     ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
-        self.create_put_object_stream_session_with_cleanup_deadline(
+        self.create_put_object_stream_session_with_cleanup_deadline_raw(
             bucket, key, request, None, action,
         )
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_put_object_stream_session_with_cleanup_deadline<T, E>(
+    pub(crate) fn create_put_object_stream_session_with_cleanup_deadline_raw<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -13571,6 +13740,28 @@ impl super::StorageCluster {
             cleanup_after,
             action,
         )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn create_put_object_stream_session_with_cleanup_deadline<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        cleanup_after: Option<u64>,
+        action: impl FnMut(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateStreamUploadReq), E>,
+    ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
+        self.create_put_object_stream_session_with_cleanup_deadline_raw(
+            bucket,
+            key,
+            request,
+            cleanup_after,
+            action,
+        )
+        .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub(super) fn create_put_object_stream_session_with_route_validation<T, E>(
@@ -16978,7 +17169,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
     ) -> Result<(), BucketWriteDrainError> {
         let bucket_info = self
-            .head_bucket_info(bucket)
+            .head_bucket_info_internal(bucket)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         self.begin_bucket_delete_if_current(
             bucket,
@@ -16987,6 +17178,14 @@ impl super::StorageCluster {
     }
 
     pub fn bucket_delete_diagnostic(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketDeleteDiagnostic, crate::BucketSnapshotLoadFailure> {
+        self.bucket_delete_diagnostic_internal(bucket)
+            .map_err(crate::BucketSnapshotLoadFailure::from)
+    }
+
+    fn bucket_delete_diagnostic_internal(
         &self,
         bucket: &BucketName,
     ) -> Result<BucketDeleteDiagnostic, BucketSnapshotLoadError> {
@@ -18292,7 +18491,7 @@ impl super::StorageCluster {
             },
         };
         let _ = self
-            .create_bucket_with_config_and_load_info(&create)
+            .create_bucket_with_config_and_load_info_raw(&create)
             .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?;
         self.test_begin_bucket_delete_if_current(bucket)?;
         self.test_enqueue_current_bucket_delete_finalize(bucket)?;

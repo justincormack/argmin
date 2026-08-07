@@ -360,7 +360,7 @@ fn stream_put_create_partial_apply_retry_reuses_existing_session() {
     ));
 
     let err = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -403,7 +403,7 @@ fn stream_put_create_partial_apply_retry_reuses_existing_session() {
     }
 
     let retry_value = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -470,7 +470,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_created_at() {
     };
 
     cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -490,7 +490,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_created_at() {
     }
 
     let err = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -541,7 +541,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_allocator_floor(
     };
 
     cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -563,7 +563,7 @@ fn stream_put_create_retry_rejects_same_request_with_mismatched_allocator_floor(
     }
 
     let err = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -646,7 +646,7 @@ fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
     ));
 
     cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -664,7 +664,7 @@ fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
     );
 
     let value = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -768,7 +768,7 @@ fn stream_put_create_retries_after_pending_install_conflict() {
 
     let attempts_for_action = Arc::clone(&attempts);
     let value = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),

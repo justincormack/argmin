@@ -10,8 +10,8 @@ use crate::cluster::{
 };
 use crate::{
     BucketDeleteBeginRoot, BucketDeleteFinalizeOutcome, BucketDeleteFinalizeRoot, BucketName,
-    BucketSnapshotLoadError, BucketWriteDrainError, GenerationId, MetadataError, ObjectKey,
-    ObjectPgActionError, ReclaimWorkItem, StorageCluster, StoreError,
+    BucketWriteDrainError, GenerationId, MetadataError, ObjectKey, ObjectPgActionError,
+    ReclaimWorkItem, StorageCluster, StoreError,
 };
 
 use super::{StorageMaintenanceAdmission, StorageMaintenanceStartError, TRACE_TARGET};
@@ -340,7 +340,14 @@ fn bucket_delete_begin_root_is_stale(
             info.bucket_execution_generation != root.bucket_execution_generation()
                 || info.bucket_incarnation_generation != root.bucket_incarnation_generation()
         }
-        Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { .. })) => true,
+        Err(error)
+            if matches!(
+                error.kind(),
+                crate::BucketSnapshotLoadFailureKind::BucketNotFound { .. }
+            ) =>
+        {
+            true
+        }
         Err(_) => false,
     }
 }

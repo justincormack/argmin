@@ -208,21 +208,8 @@ impl ReadRuntime {
         }
     }
 
-    fn map_bucket_snapshot_error(error: storage::BucketSnapshotLoadError) -> ServerError {
-        match error {
-            storage::BucketSnapshotLoadError::Store(error) => super::map_store_error(error),
-            storage::BucketSnapshotLoadError::Metadata(ref error)
-                if super::metadata_error_is_command_contention(error) =>
-            {
-                ServerError::SlowDown
-            }
-            storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { name },
-            ) => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            storage::BucketSnapshotLoadError::Metadata(error) => ServerError::Metadata(error),
-        }
+    fn map_bucket_snapshot_error(error: storage::BucketSnapshotLoadFailure) -> ServerError {
+        Coordinator::map_bucket_snapshot_load_error(error)
     }
 
     pub(super) fn enqueue_object_payload_reclaim_for(
@@ -444,9 +431,14 @@ impl ReadRuntime {
         let bucket = &claim.bucket;
         let bucket_info = match self.storage_node().head_bucket_info(bucket) {
             Ok(bucket_info) => bucket_info,
-            Err(storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    storage::BucketSnapshotLoadFailureKind::BucketNotFound { .. }
+                ) =>
+            {
+                return Ok(())
+            }
             Err(error) => return Err(Self::map_bucket_snapshot_error(error)),
         };
         if bucket_info.bucket_incarnation_generation != claim.bucket_incarnation_generation {

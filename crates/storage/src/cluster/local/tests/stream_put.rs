@@ -455,7 +455,7 @@ fn stream_put_create_pending_install_race_reruns_authorization_action() {
         crate::SessionId::try_from("66666666666666666666666666666666".to_string()).unwrap();
     let calls_for_action = Arc::clone(&action_calls);
     let result = first_cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -617,7 +617,7 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
         crate::SessionId::try_from("57575757575757575757575757575757".to_string()).unwrap();
     let calls_for_action = Arc::clone(&action_calls);
     let result = first_cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),

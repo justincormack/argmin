@@ -2946,7 +2946,7 @@ fn frontend_unix_bucket_metadata_mode_creates_bucket_on_storage_node() {
     };
 
     let outcome = cluster
-        .create_bucket_with_config_and_load_info(&config)
+        .create_bucket_with_config_and_load_info_raw(&config)
         .unwrap();
     assert!(matches!(
         outcome,

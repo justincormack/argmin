@@ -182,6 +182,7 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::VersionNotFound { .. } => "The specified version does not exist.".to_string(),
         ServerError::Store(_)
         | ServerError::BucketWriteDrain(_)
+        | ServerError::BucketSnapshotLoad(_)
         | ServerError::Metadata(_)
         | ServerError::Ec(_)
         | ServerError::MetadataBlobError { .. }
@@ -4976,6 +4977,14 @@ mod tests {
                     ),
                 ),
                 vec!["bucket write drain failed"],
+            ),
+            (
+                ServerError::BucketSnapshotLoad(
+                    storage::test_support::bucket_snapshot_load_failure_for_kind(
+                        storage::BucketSnapshotLoadFailureKind::InternalError,
+                    ),
+                ),
+                vec!["bucket snapshot load failed"],
             ),
             (
                 ServerError::Store(

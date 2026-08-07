@@ -62,20 +62,7 @@ pub(super) fn load_bucket_tags_for_policy_action(
     let tags = coord
         .storage_node()
         .get_bucket_tags(&bucket.name)
-        .map_err(|error| match error {
-            storage::BucketSnapshotLoadError::Store(error) => super::super::map_store_error(error),
-            storage::BucketSnapshotLoadError::Metadata(ref error)
-                if super::super::metadata_error_is_command_contention(error) =>
-            {
-                ServerError::SlowDown
-            }
-            storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { name },
-            ) => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
-        })?;
+        .map_err(Coordinator::map_bucket_snapshot_load_error)?;
     match tags {
         Some(tags) => Ok(Some(tags.tag_set().clone().into_pairs())),
         None => Ok(Some(Vec::new())),

@@ -147,12 +147,15 @@ pub use control_plane_service_client::{
     ControlPlaneFrontendClient, ControlPlaneServiceClientBootstrapError,
     ControlPlaneStorageNodeClient,
 };
-pub use error::{
-    BucketSnapshotLoadError, BucketWriteDrainFailure, BucketWriteDrainFailureKind,
-    ClusterBuildError, MetadataError, ObjectPgActionError, ShardIoError, StoreError, StoreFailure,
-    StoreOperationFailureClass,
+pub(crate) use error::{
+    BucketSnapshotLoadError, BucketWriteDrainError, StorageNodeFailureClass,
+    StorageNodeFailureDetail,
 };
-pub(crate) use error::{BucketWriteDrainError, StorageNodeFailureClass, StorageNodeFailureDetail};
+pub use error::{
+    BucketSnapshotLoadFailure, BucketSnapshotLoadFailureKind, BucketWriteDrainFailure,
+    BucketWriteDrainFailureKind, ClusterBuildError, MetadataError, ObjectPgActionError,
+    ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
+};
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
     LivePgMetadataTransferError, LivePgMetadataTransferFailpoint, LivePgMetadataTransferSummary,
@@ -972,18 +975,18 @@ pub mod test_support {
         fn test_bucket_presence(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketPresence, BucketSnapshotLoadError>;
+        ) -> Result<TestBucketPresence, BucketSnapshotLoadFailure>;
 
         fn test_bucket_execution_generation_is_newer_than(
             &self,
             bucket: &BucketName,
             generation: u64,
-        ) -> Result<bool, BucketSnapshotLoadError>;
+        ) -> Result<bool, BucketSnapshotLoadFailure>;
 
         fn test_capture_bucket_delete_begin_subject(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketDeleteBeginSubject, BucketSnapshotLoadError>;
+        ) -> Result<TestBucketDeleteBeginSubject, BucketSnapshotLoadFailure>;
 
         fn test_begin_current_bucket_delete(
             &self,
@@ -995,12 +998,12 @@ pub mod test_support {
         fn test_current_bucket_delete_marked_once(
             &self,
             subject: &TestBucketDeleteBeginSubject,
-        ) -> Result<bool, BucketSnapshotLoadError>;
+        ) -> Result<bool, BucketSnapshotLoadFailure>;
 
         fn test_current_bucket_is_distinct_active_incarnation(
             &self,
             subject: &TestBucketDeleteBeginSubject,
-        ) -> Result<bool, BucketSnapshotLoadError>;
+        ) -> Result<bool, BucketSnapshotLoadFailure>;
 
         fn test_seed_bucket_delete_attempt(
             &self,
@@ -1013,7 +1016,7 @@ pub mod test_support {
         fn test_observe_bucket_delete_progress(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketDeleteProgress, BucketSnapshotLoadError>;
+        ) -> Result<TestBucketDeleteProgress, BucketSnapshotLoadFailure>;
 
         fn test_stream_upload_reservation_exists(
             &self,
@@ -1111,7 +1114,7 @@ pub mod test_support {
         fn test_bucket_presence(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketPresence, BucketSnapshotLoadError> {
+        ) -> Result<TestBucketPresence, BucketSnapshotLoadFailure> {
             match StorageCluster::test_head_bucket_raw(self, bucket) {
                 Ok(info) => Ok(match info.state {
                     BucketState::Active => TestBucketPresence::Active,
@@ -1120,7 +1123,7 @@ pub mod test_support {
                 Err(BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound {
                     ..
                 })) => Ok(TestBucketPresence::Missing),
-                Err(error) => Err(error),
+                Err(error) => Err(error.into()),
             }
         }
 
@@ -1128,7 +1131,7 @@ pub mod test_support {
             &self,
             bucket: &BucketName,
             generation: u64,
-        ) -> Result<bool, BucketSnapshotLoadError> {
+        ) -> Result<bool, BucketSnapshotLoadFailure> {
             Ok(
                 StorageCluster::test_head_bucket_raw(self, bucket)?.bucket_execution_generation
                     > generation,
@@ -1138,7 +1141,7 @@ pub mod test_support {
         fn test_capture_bucket_delete_begin_subject(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketDeleteBeginSubject, BucketSnapshotLoadError> {
+        ) -> Result<TestBucketDeleteBeginSubject, BucketSnapshotLoadFailure> {
             let info = StorageCluster::test_head_bucket_raw(self, bucket)?;
             Ok(TestBucketDeleteBeginSubject {
                 root: BucketDeleteBeginRoot {
@@ -1169,7 +1172,7 @@ pub mod test_support {
         fn test_current_bucket_delete_marked_once(
             &self,
             subject: &TestBucketDeleteBeginSubject,
-        ) -> Result<bool, BucketSnapshotLoadError> {
+        ) -> Result<bool, BucketSnapshotLoadFailure> {
             let info = StorageCluster::test_head_bucket_raw(self, &subject.root.bucket)?;
             let expected_execution_generation =
                 subject.root.bucket_execution_generation.checked_add(1);
@@ -1181,7 +1184,7 @@ pub mod test_support {
         fn test_current_bucket_is_distinct_active_incarnation(
             &self,
             subject: &TestBucketDeleteBeginSubject,
-        ) -> Result<bool, BucketSnapshotLoadError> {
+        ) -> Result<bool, BucketSnapshotLoadFailure> {
             let info = StorageCluster::test_head_bucket_raw(self, &subject.root.bucket)?;
             Ok(info.state == BucketState::Active
                 && info.bucket_incarnation_generation != subject.root.bucket_incarnation_generation)
@@ -1215,8 +1218,9 @@ pub mod test_support {
         fn test_observe_bucket_delete_progress(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketDeleteProgress, BucketSnapshotLoadError> {
+        ) -> Result<TestBucketDeleteProgress, BucketSnapshotLoadFailure> {
             StorageCluster::test_bucket_delete_progress(self, bucket)
+                .map_err(BucketSnapshotLoadFailure::from)
         }
 
         fn test_stream_upload_reservation_exists(
@@ -1538,6 +1542,17 @@ pub mod test_support {
         kind: BucketWriteDrainFailureKind,
     ) -> BucketWriteDrainFailure {
         BucketWriteDrainFailure::for_test(kind)
+    }
+
+    /// Construct an opaque bucket-snapshot failure from its logical outcome.
+    ///
+    /// This lets cross-crate response-mapping tests remain exhaustive without
+    /// constructing storage implementation errors.
+    #[must_use]
+    pub fn bucket_snapshot_load_failure_for_kind(
+        kind: BucketSnapshotLoadFailureKind,
+    ) -> BucketSnapshotLoadFailure {
+        BucketSnapshotLoadFailure::for_test(kind)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

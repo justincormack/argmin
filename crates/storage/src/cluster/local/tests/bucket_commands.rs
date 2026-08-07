@@ -545,7 +545,7 @@ fn create_bucket_command_applies_to_all_acting_pg_nodes() {
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let created = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -591,7 +591,7 @@ fn create_bucket_command_applies_to_all_acting_pg_nodes() {
     );
 
     let exists = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -669,7 +669,7 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
     };
 
     let err = cluster
-        .create_bucket_with_config_and_load_info(&create_config())
+        .create_bucket_with_config_and_load_info_raw(&create_config())
         .unwrap_err();
     assert!(
         matches!(
@@ -718,7 +718,7 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
     }
 
     let retried = cluster
-        .create_bucket_with_config_and_load_info(&create_config())
+        .create_bucket_with_config_and_load_info_raw(&create_config())
         .unwrap();
     assert!(matches!(
         retried,
@@ -809,7 +809,7 @@ fn create_bucket_retries_partial_exact_command_conflict() {
     ));
 
     let created = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -888,7 +888,7 @@ fn create_bucket_retries_partial_exact_command_conflict_on_first_replica() {
     ));
 
     let created = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -961,7 +961,7 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
     ));
 
     let err = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: first_bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -989,7 +989,7 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
     drop(hook_guard);
 
     let second = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: second_bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -1044,7 +1044,7 @@ fn put_bucket_versioning_command_applies_to_all_acting_pg_nodes() {
     };
 
     let updated = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     assert_eq!(updated.versioning, crate::BucketVersioningState::Enabled);
     assert!(updated.bucket_execution_generation > original.bucket_execution_generation);
@@ -1105,7 +1105,7 @@ fn put_bucket_versioning_command_retry_reuses_pending_partial_replica_command() 
     ));
 
     let err = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap_err();
     assert!(
         matches!(
@@ -1163,7 +1163,7 @@ fn put_bucket_versioning_command_retry_reuses_pending_partial_replica_command() 
     }
 
     let retried = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     assert_eq!(retried.versioning, crate::BucketVersioningState::Enabled);
     assert_eq!(
@@ -1235,7 +1235,7 @@ fn same_bucket_pending_metadata_command_drains_before_later_acl() {
     ));
 
     let err = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap_err();
     assert!(
         matches!(
@@ -1270,7 +1270,7 @@ fn same_bucket_pending_metadata_command_drains_before_later_acl() {
 
     let acl_grants = crate::AclGrants::default();
     let acl_updated = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -1332,7 +1332,7 @@ fn bucket_update_cleans_terminal_pending_slot_before_new_command() {
     );
 
     let updated = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
 
     assert_eq!(updated.versioning, crate::BucketVersioningState::Enabled);
@@ -1385,7 +1385,7 @@ fn put_bucket_acl_command_applies_to_all_acting_pg_nodes() {
     let acl_grants = crate::AclGrants::default();
 
     let updated = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -1458,7 +1458,7 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
     ));
 
     let err = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -1509,7 +1509,7 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
     }
 
     let retried = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -1617,7 +1617,7 @@ fn bucket_acl_drains_pending_multipart_completion_barrier_command() {
 
     let acl_grants = crate::AclGrants::default();
     let updated = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -1685,7 +1685,7 @@ fn existing_create_bucket_preserves_pending_acl_command_for_retry() {
     ));
 
     let err = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -1730,7 +1730,7 @@ fn existing_create_bucket_preserves_pending_acl_command_for_retry() {
 
     let attacker_owner = crate::CanonicalUserId::from_principal("attacker");
     let exists = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "attacker",
             owner_canonical_id: &attacker_owner,
@@ -1815,7 +1815,7 @@ fn bucket_acl_retry_rejects_same_acl_with_mismatched_post_image() {
     insert_pending_metadata_command_for_test(&map, PgId::new(1), &bucket, &command);
 
     let err = cluster
-        .put_bucket_acl_and_load_info(
+        .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
             BucketAclSummary {
@@ -1864,7 +1864,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
     }
     .bucket_execution_generation;
     let updated = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -1877,7 +1877,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
         }),
     };
     let updated = cluster
-        .put_bucket_object_lock_and_load_info(&bucket, object_lock)
+        .put_bucket_object_lock_and_load_info_raw(&bucket, object_lock)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -1894,7 +1894,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
         sse_c_blocked: false,
     };
     let updated = cluster
-        .put_bucket_encryption_and_load_info(&bucket, encryption)
+        .put_bucket_encryption_and_load_info_raw(&bucket, encryption)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -1917,7 +1917,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
         restrict_public_buckets: false,
     };
     let updated = cluster
-        .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+        .put_bucket_public_access_block_and_load_info_raw(&bucket, public_access_block)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -1930,7 +1930,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_public_access_block_and_load_info(&bucket)
+        .delete_bucket_public_access_block_and_load_info_raw(&bucket)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -1946,7 +1946,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
         object_ownership: crate::BucketObjectOwnership::BucketOwnerPreferred,
     };
     let updated = cluster
-        .put_bucket_ownership_controls_and_load_info(&bucket, ownership_controls)
+        .put_bucket_ownership_controls_and_load_info_raw(&bucket, ownership_controls)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -1959,7 +1959,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_ownership_controls_and_load_info(&bucket)
+        .delete_bucket_ownership_controls_and_load_info_raw(&bucket)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -1972,7 +1972,7 @@ fn bucket_property_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .put_bucket_abac_enabled_and_load_info(&bucket, true)
+        .put_bucket_abac_enabled_and_load_info_raw(&bucket, true)
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -2038,7 +2038,7 @@ fn bucket_property_command_retry_reuses_pending_partial_replica_command() {
     ));
 
     let err = cluster
-        .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+        .put_bucket_public_access_block_and_load_info_raw(&bucket, public_access_block)
         .unwrap_err();
     assert!(
         matches!(
@@ -2084,7 +2084,7 @@ fn bucket_property_command_retry_reuses_pending_partial_replica_command() {
     }
 
     let retried = cluster
-        .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+        .put_bucket_public_access_block_and_load_info_raw(&bucket, public_access_block)
         .unwrap();
     assert_eq!(retried.public_access_block, Some(public_access_block));
     assert_eq!(
@@ -2135,7 +2135,7 @@ fn invalid_bucket_property_command_does_not_poison_bucket_command_stream() {
         default_retention: None,
     };
     let err = cluster
-        .put_bucket_object_lock_and_load_info(&bucket, invalid_object_lock)
+        .put_bucket_object_lock_and_load_info_raw(&bucket, invalid_object_lock)
         .unwrap_err();
     match err {
         crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::InvariantViolation {
@@ -2163,7 +2163,7 @@ fn invalid_bucket_property_command_does_not_poison_bucket_command_stream() {
         restrict_public_buckets: false,
     };
     let updated = cluster
-        .put_bucket_public_access_block_and_load_info(&bucket, public_access_block)
+        .put_bucket_public_access_block_and_load_info_raw(&bucket, public_access_block)
         .unwrap();
     assert_eq!(updated.public_access_block, Some(public_access_block));
     assert!(updated.bucket_execution_generation > initial_generation);
@@ -2208,7 +2208,7 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
 
     let policy_body = r#"{"Statement":[]}"#;
     let updated = cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Policy,
@@ -2242,7 +2242,10 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     let tags_body = "<Tagging><TagSet/></Tagging>";
     let tags = crate::SerializedBucketTagSet::new(tags_body.to_string());
     let updated = cluster
-        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
+        .put_bucket_subresource_and_load_info_raw(
+            &bucket,
+            crate::PutBucketSubresource::tagging(&tags),
+        )
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -2263,7 +2266,9 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
         assert_eq!(info.bucket_execution_generation, previous_generation);
     }
 
-    let updated = cluster.delete_bucket_tags_and_load_info(&bucket).unwrap();
+    let updated = cluster
+        .delete_bucket_tags_and_load_info_raw(&bucket)
+        .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
     for node_id in node_ids {
@@ -2282,7 +2287,7 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
 
     let lifecycle_body = "<LifecycleConfiguration/>";
     let updated = cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Lifecycle,
@@ -2313,7 +2318,7 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
 
     let cors_body = "<CORSConfiguration/>";
     let updated = cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Cors,
@@ -2341,7 +2346,10 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_subresource_and_load_info(&bucket, crate::OpaqueBucketSubresourceKind::Cors)
+        .delete_bucket_subresource_and_load_info_raw(
+            &bucket,
+            crate::OpaqueBucketSubresourceKind::Cors,
+        )
         .unwrap();
     assert!(updated.bucket_execution_generation > previous_generation);
     previous_generation = updated.bucket_execution_generation;
@@ -2360,7 +2368,7 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_subresource_and_load_info(
+        .delete_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::OpaqueBucketSubresourceKind::Policy,
         )
@@ -2385,7 +2393,7 @@ fn bucket_subresource_commands_apply_to_all_acting_pg_nodes() {
     }
 
     let updated = cluster
-        .delete_bucket_subresource_and_load_info(
+        .delete_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::OpaqueBucketSubresourceKind::Lifecycle,
         )
@@ -2459,7 +2467,7 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
     ));
 
     let err = cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Policy,
@@ -2510,7 +2518,7 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
     }
 
     let retried = cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Policy,
@@ -2577,7 +2585,7 @@ fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
     .bucket_execution_generation;
 
     let err = cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Tagging,
@@ -2614,7 +2622,10 @@ fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
     let tags_body = "<Tagging><TagSet/></Tagging>";
     let tags = crate::SerializedBucketTagSet::new(tags_body.to_string());
     let updated = cluster
-        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
+        .put_bucket_subresource_and_load_info_raw(
+            &bucket,
+            crate::PutBucketSubresource::tagging(&tags),
+        )
         .unwrap();
     assert!(updated.bucket_execution_generation > initial_generation);
 

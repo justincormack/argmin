@@ -65,7 +65,7 @@ fn bucket_delete_subject_binds_incarnation_and_exactly_once_transition() {
         .test_bucket_execution_generation_is_newer_than(&target, initial_generation)
         .unwrap());
     cluster
-        .put_bucket_versioning_and_load_info(&target, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&target, crate::BucketVersioningState::Enabled)
         .unwrap();
     assert!(cluster
         .test_bucket_execution_generation_is_newer_than(&target, initial_generation)
@@ -126,7 +126,7 @@ fn seeded_bucket_delete_subject_uses_the_acquired_drain_generation() {
         before_begin_bucket_delete_drain: Some(Arc::new(move || {
             if !hook_ran_for_hook.swap(true, Ordering::SeqCst) {
                 cluster_for_hook
-                    .put_bucket_versioning_and_load_info(
+                    .put_bucket_versioning_and_load_info_raw(
                         &bucket_for_hook,
                         crate::BucketVersioningState::Enabled,
                     )
@@ -226,7 +226,7 @@ fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
     ));
 
     let err = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap_err();
     assert!(
         matches!(
@@ -266,7 +266,7 @@ fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let recreated = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -287,7 +287,7 @@ fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
     assert!(recreated_generation > old_partial_generation);
 
     let updated = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     assert_eq!(updated.versioning, crate::BucketVersioningState::Enabled);
     assert!(updated.bucket_execution_generation > recreated_generation);
@@ -332,7 +332,7 @@ fn finalized_bucket_delete_removes_replicated_create_rows() {
         .unwrap()
         .bucket_execution_generation;
     cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     let pre_delete_generation = map
         .node(NodeId::new(1))
@@ -377,7 +377,7 @@ fn finalized_bucket_delete_removes_replicated_create_rows() {
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let recreated = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -2251,7 +2251,7 @@ fn bucket_update_fails_closed_on_divergent_same_index_after_partial_apply() {
     ));
 
     let err = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap_err();
 
     assert!(
@@ -2378,7 +2378,7 @@ fn bucket_snapshot_fails_closed_while_bucket_pg_is_peering() {
     let cluster = crate::StorageCluster::from_static_local_map(map).unwrap();
 
     let err = cluster
-        .load_bucket_snapshot(&bucket, crate::BucketSnapshotRequest::default())
+        .load_bucket_snapshot_internal(&bucket, crate::BucketSnapshotRequest::default())
         .unwrap_err();
     assert!(matches!(
         err,
@@ -2416,7 +2416,7 @@ fn composite_multipart_and_lifecycle_scans_fan_out_to_routed_pg_primaries() {
     create_test_bucket(&cluster, &lifecycle_bucket);
     create_test_bucket(&cluster, &aborting_bucket);
     cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &lifecycle_bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Lifecycle,
@@ -2640,11 +2640,11 @@ fn bucket_control_plane_pending_install_waits_behind_durable_delete_drain() {
 
     cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
     let versioned = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     assert_eq!(versioned.versioning, crate::BucketVersioningState::Enabled);
     let lifecycle = cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Lifecycle,
@@ -2655,7 +2655,7 @@ fn bucket_control_plane_pending_install_waits_behind_durable_delete_drain() {
         .unwrap();
     assert!(lifecycle.bucket_lifecycle_present);
     cluster
-        .put_bucket_subresource_and_load_info(
+        .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
                 kind: crate::BucketSubresourceKind::Cors,
@@ -5840,7 +5840,7 @@ fn begin_bucket_delete_drains_pending_delete_marker_before_emptiness_decision() 
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
 
     let pg_id = PgId::new(2);
@@ -5946,7 +5946,7 @@ fn begin_bucket_delete_drains_pending_specific_version_delete_that_empties_bucke
     let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
     create_test_bucket(&cluster, &bucket);
     cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     let committed = write_committed_direct_segment_for_with_versioning(
         &cluster,

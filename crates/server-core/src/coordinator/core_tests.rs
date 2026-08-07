@@ -10105,24 +10105,16 @@ fn object_pg_command_contention_maps_to_slow_down() {
 
 #[test]
 fn stale_bucket_metadata_command_maps_to_slow_down() {
-    let bucket = trusted_bucket_name("stale-bucket-command");
-    let error = storage::BucketSnapshotLoadError::Metadata(
-        storage::MetadataError::StaleBucketMetadataCommand {
-            name: bucket,
-            bucket_execution_generation: 7,
-        },
+    let error = storage::test_support::bucket_snapshot_load_failure_for_kind(
+        storage::BucketSnapshotLoadFailureKind::MetadataCommandContention,
     );
     assert!(matches!(
         Coordinator::map_bucket_snapshot_load_error(error),
         ServerError::SlowDown
     ));
 
-    let bucket = trusted_bucket_name("stale-bucket-handle-command");
-    let error = storage::BucketSnapshotLoadError::Metadata(
-        storage::MetadataError::StaleBucketMetadataCommand {
-            name: bucket,
-            bucket_execution_generation: 8,
-        },
+    let error = storage::test_support::bucket_snapshot_load_failure_for_kind(
+        storage::BucketSnapshotLoadFailureKind::MetadataCommandContention,
     );
     assert!(matches!(
         BucketHandleLoader::map_bucket_snapshot_error(error),
@@ -10132,25 +10124,69 @@ fn stale_bucket_metadata_command_maps_to_slow_down() {
 
 #[test]
 fn bucket_snapshot_object_reservation_conflicts_map_to_slow_down() {
-    let version_conflict = storage::BucketSnapshotLoadError::Metadata(
-        storage::MetadataError::ObjectVersionReservationConflict {
-            version_id: storage::VersionId::from_u64(9),
-        },
+    let version_conflict = storage::test_support::bucket_snapshot_load_failure_for_kind(
+        storage::BucketSnapshotLoadFailureKind::MetadataCommandContention,
     );
     assert!(matches!(
         Coordinator::map_bucket_snapshot_load_error(version_conflict),
         ServerError::SlowDown
     ));
 
-    let generation_conflict = storage::BucketSnapshotLoadError::Metadata(
-        storage::MetadataError::ObjectGenerationReservationConflict {
-            reservation_id: "reservation".to_string(),
-            generation_id: 17,
-        },
+    let generation_conflict = storage::test_support::bucket_snapshot_load_failure_for_kind(
+        storage::BucketSnapshotLoadFailureKind::MetadataCommandContention,
     );
     assert!(matches!(
         BucketHandleLoader::map_bucket_snapshot_error(generation_conflict),
         ServerError::SlowDown
+    ));
+}
+
+#[test]
+fn bucket_snapshot_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let map = |kind| {
+        Coordinator::map_bucket_snapshot_load_error(
+            storage::test_support::bucket_snapshot_load_failure_for_kind(kind),
+        )
+    };
+
+    assert!(matches!(
+        map(storage::BucketSnapshotLoadFailureKind::SlowDown),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
+        map(storage::BucketSnapshotLoadFailureKind::MetadataCommandContention),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
+        map(storage::BucketSnapshotLoadFailureKind::BucketNotEmpty),
+        ServerError::BucketNotEmpty
+    ));
+    let bucket = trusted_bucket_name("missing-snapshot-bucket");
+    assert!(matches!(
+        map(storage::BucketSnapshotLoadFailureKind::BucketNotFound {
+            name: bucket.clone(),
+        }),
+        ServerError::BucketNotFound { name } if name == bucket.as_str()
+    ));
+    assert!(matches!(
+        map(storage::BucketSnapshotLoadFailureKind::NoSuchUpload {
+            upload_id: "missing-upload".to_string(),
+        }),
+        ServerError::NoSuchUpload { upload_id } if upload_id == "missing-upload"
+    ));
+    assert!(matches!(
+        map(
+            storage::BucketSnapshotLoadFailureKind::InvalidVersioningTransition {
+                from: storage::BucketVersioningState::Suspended,
+                to: storage::BucketVersioningState::Disabled,
+            },
+        ),
+        ServerError::InvalidRequest { reason }
+            if reason == "invalid versioning transition from Suspended to Disabled"
+    ));
+    assert!(matches!(
+        map(storage::BucketSnapshotLoadFailureKind::InternalError),
+        ServerError::BucketSnapshotLoad(_)
     ));
 }
 
@@ -10256,15 +10292,19 @@ fn semantic_storage_failure_classes_map_to_s3_outcomes() {
         ServerError::SlowDown
     ));
     assert!(matches!(
-        Coordinator::map_bucket_snapshot_load_error(storage::BucketSnapshotLoadError::Store(
-            resource_exhausted(),
-        )),
+        Coordinator::map_bucket_snapshot_load_error(
+            storage::test_support::bucket_snapshot_load_failure_for_kind(
+                storage::BucketSnapshotLoadFailureKind::SlowDown,
+            ),
+        ),
         ServerError::SlowDown
     ));
     assert!(matches!(
-        BucketHandleLoader::map_bucket_snapshot_error(storage::BucketSnapshotLoadError::Store(
-            resource_exhausted(),
-        )),
+        BucketHandleLoader::map_bucket_snapshot_error(
+            storage::test_support::bucket_snapshot_load_failure_for_kind(
+                storage::BucketSnapshotLoadFailureKind::SlowDown,
+            ),
+        ),
         ServerError::SlowDown
     ));
     assert!(matches!(

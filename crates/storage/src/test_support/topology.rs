@@ -988,11 +988,11 @@ mod tests {
             stale.test_route_authority_digest_matches_local_map(),
             "stale routes must be installed before the route-authority digest is minted"
         );
-        assert!(matches!(
-            stale.head_bucket_info(&bucket),
-            Err(crate::BucketSnapshotLoadError::Store(
-                crate::StoreError::StaleMetadataRoute { .. }
-            ))
-        ));
+        let error = stale.head_bucket_info(&bucket).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            &crate::BucketSnapshotLoadFailureKind::SlowDown
+        );
+        assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
     }
 }

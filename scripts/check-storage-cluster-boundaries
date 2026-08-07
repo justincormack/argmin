@@ -4329,6 +4329,22 @@ fail_with_matches \
     "BucketWriteDrainError is storage-private; callers must use BucketWriteDrainFailure and its exhaustive logical kind" \
     "$raw_bucket_write_drain_error_transit"
 
+raw_bucket_snapshot_load_error_transit=$(
+    {
+        rg -n --color=never '\bBucketSnapshotLoadError\b' \
+            crates/server-core crates/server-http crates/argmin-s3 \
+            || true
+        rg -n -U --color=never \
+            'pub enum BucketSnapshotLoadError|pub use error::(?s:[^;]*)\bBucketSnapshotLoadError\b|^[[:space:]]*pub[[:space:]]+(async[[:space:]]+)?fn[^{;]*\bBucketSnapshotLoadError\b' \
+            crates/storage/src/error.rs crates/storage/src/lib.rs \
+            crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "BucketSnapshotLoadError is storage-private; callers must use BucketSnapshotLoadFailure and its exhaustive logical kind" \
+    "$raw_bucket_snapshot_load_error_transit"
+
 raw_storage_wrapper_diagnostic_formatting=$(
     {
         rg -n -U --color=never \
@@ -4414,195 +4430,6 @@ fail_with_matches \
     "Production coordinator payload reads must map storage errors through map_store_error before using ?" \
     "$raw_coordinator_payload_read_store_mapping"
 
-raw_coordinator_bucket_snapshot_store_mappers=$(
-    awk '
-    FNR == 1 {
-        current_fn = ""
-        pending_test_cfg = 0
-        in_test_cfg = 0
-        in_bucket_snapshot_store_mapper = 0
-        mapper_depth = 0
-        brace_depth = 0
-        command_conflict_seen = 0
-        fallback_count = 0
-    }
-    function brace_delta(line,    opens, closes, tmp) {
-        tmp = line
-        opens = gsub(/\{/, "{", tmp)
-        tmp = line
-        closes = gsub(/\}/, "}", tmp)
-        return opens - closes
-    }
-    function flush_mapper(    i) {
-        if (in_bucket_snapshot_store_mapper && fallback_count > 0 && !command_conflict_seen) {
-            for (i = 1; i <= fallback_count; i++) {
-                print fallback_line[i]
-            }
-        }
-        in_bucket_snapshot_store_mapper = 0
-        mapper_depth = 0
-        command_conflict_seen = 0
-        fallback_count = 0
-        delete fallback_line
-    }
-    function flush_function() {
-        if (!in_test_cfg) {
-            flush_mapper()
-        }
-        in_bucket_snapshot_store_mapper = 0
-        mapper_depth = 0
-        command_conflict_seen = 0
-        fallback_count = 0
-        delete fallback_line
-    }
-    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
-        pending_test_cfg = 1
-        next
-    }
-    /^[[:space:]]*#\[/ {
-        next
-    }
-    function update_function_context() {
-        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
-            flush_function()
-            current_fn = $0
-            sub(/^.*fn /, "", current_fn)
-            sub(/\(.*/, "", current_fn)
-            in_test_cfg = pending_test_cfg
-            pending_test_cfg = 0
-        } else if (pending_test_cfg \
-            && $0 !~ /^[[:space:]]*$/ \
-            && $0 !~ /^[[:space:]]*#\[/) {
-            pending_test_cfg = 0
-        }
-    }
-    {
-        update_function_context()
-        if (in_test_cfg) {
-            brace_depth += brace_delta($0)
-            next
-        }
-        if (!in_bucket_snapshot_store_mapper && $0 ~ /BucketSnapshotLoadError::/) {
-            in_bucket_snapshot_store_mapper = 1
-            mapper_depth = brace_depth
-            if ($0 ~ /match[^{]*\{/) {
-                mapper_depth++
-            }
-        }
-        if (in_bucket_snapshot_store_mapper \
-            && $0 ~ /MetadataCommand(LogConflict|PendingConflict)/) {
-            command_conflict_seen = 1
-        }
-        if (in_bucket_snapshot_store_mapper && $0 ~ /ServerError::Store[[:space:]]*\(/) {
-            fallback_count++
-            fallback_line[fallback_count] = FILENAME ":" FNR ":" $0
-        }
-        brace_depth += brace_delta($0)
-        if (in_bucket_snapshot_store_mapper && brace_depth < mapper_depth) {
-            flush_mapper()
-        }
-    }
-    END {
-        flush_function()
-    }
-    ' $(find crates/server-core/src/coordinator -type f -name '*.rs' \
-        ! -name '*_tests.rs' \
-        ! -path '*/tests/*' \
-        | sort)
-)
-fail_with_matches \
-    "Production coordinator bucket snapshot store errors must use contention-aware bucket snapshot mappers instead of ad hoc Store mapping" \
-    "$raw_coordinator_bucket_snapshot_store_mappers"
-
-raw_coordinator_bucket_snapshot_metadata_mappers=$(
-    awk '
-    FNR == 1 {
-        current_fn = ""
-        pending_test_cfg = 0
-        in_test_cfg = 0
-        in_bucket_snapshot_mapper = 0
-        mapper_depth = 0
-        brace_depth = 0
-        command_contention_mapper_seen = 0
-    }
-    function brace_delta(line,    opens, closes, tmp) {
-        tmp = line
-        opens = gsub(/\{/, "{", tmp)
-        tmp = line
-        closes = gsub(/\}/, "}", tmp)
-        return opens - closes
-    }
-    function flush_mapper() {
-        in_bucket_snapshot_mapper = 0
-        mapper_depth = 0
-        command_contention_mapper_seen = 0
-    }
-    function flush_function() {
-        if (!in_test_cfg) {
-            flush_mapper()
-        }
-        in_bucket_snapshot_mapper = 0
-        mapper_depth = 0
-        command_contention_mapper_seen = 0
-    }
-    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
-        pending_test_cfg = 1
-        next
-    }
-    /^[[:space:]]*#\[/ {
-        next
-    }
-    function update_function_context() {
-        if ($0 ~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/) {
-            flush_function()
-            current_fn = $0
-            sub(/^.*fn /, "", current_fn)
-            sub(/\(.*/, "", current_fn)
-            in_test_cfg = pending_test_cfg
-            pending_test_cfg = 0
-        } else if (pending_test_cfg \
-            && $0 !~ /^[[:space:]]*$/ \
-            && $0 !~ /^[[:space:]]*#\[/) {
-            pending_test_cfg = 0
-        }
-    }
-    {
-        update_function_context()
-        if (in_test_cfg) {
-            brace_depth += brace_delta($0)
-            next
-        }
-        if (!in_bucket_snapshot_mapper && $0 ~ /BucketSnapshotLoadError::/) {
-            in_bucket_snapshot_mapper = 1
-            mapper_depth = brace_depth
-            if ($0 ~ /match[^{]*\{/) {
-                mapper_depth++
-            }
-        }
-        if (in_bucket_snapshot_mapper && $0 ~ /metadata_error_is_command_contention/) {
-            command_contention_mapper_seen = 1
-        }
-        if (in_bucket_snapshot_mapper && $0 ~ /ServerError::Metadata[[:space:]]*\(/) {
-            if (!command_contention_mapper_seen) {
-                print FILENAME ":" FNR ":" $0
-            }
-        }
-        brace_depth += brace_delta($0)
-        if (in_bucket_snapshot_mapper && brace_depth < mapper_depth) {
-            flush_mapper()
-        }
-    }
-    END {
-        flush_function()
-    }
-    ' $(find crates/server-core/src/coordinator -type f -name '*.rs' \
-        ! -name '*_tests.rs' \
-        ! -path '*/tests/*' \
-        | sort)
-)
-fail_with_matches \
-    "Production coordinator bucket snapshot mappers must handle metadata command contention before raw Metadata fallback" \
-    "$raw_coordinator_bucket_snapshot_metadata_mappers"
 
 unbudgeted_request_work_helpers=$(
     awk '

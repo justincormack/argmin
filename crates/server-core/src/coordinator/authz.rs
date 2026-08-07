@@ -1160,20 +1160,7 @@ impl Coordinator {
         let raw_policy = self
             .storage_node()
             .get_bucket_subresource(&bucket.name, storage::OpaqueBucketSubresourceKind::Policy)
-            .map_err(|error| match error {
-                storage::BucketSnapshotLoadError::Store(other) => super::map_store_error(other),
-                storage::BucketSnapshotLoadError::Metadata(ref error)
-                    if super::metadata_error_is_command_contention(error) =>
-                {
-                    ServerError::SlowDown
-                }
-                storage::BucketSnapshotLoadError::Metadata(
-                    storage::MetadataError::BucketNotFound { name },
-                ) => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         let parsed_policy = match raw_policy {
             Some(policy) => Arc::new(auth::parse_bucket_policy(&policy).map_err(|e| {
                 ServerError::InternalError {
@@ -1859,8 +1846,10 @@ impl Coordinator {
             expected_bucket_owner,
             |request| {
                 admission
-                    .active_bucket_route(bucket)?
+                    .active_bucket_route(bucket)
+                    .map_err(super::map_store_error)?
                     .load_bucket_snapshot(request)
+                    .map_err(BucketHandleLoader::map_bucket_snapshot_error)
             },
         )
     }
@@ -1871,8 +1860,7 @@ impl Coordinator {
         expected_bucket_owner: Option<&str>,
         load_snapshot: impl FnOnce(
             storage::BucketSnapshotRequest,
-        )
-            -> Result<storage::BucketSnapshot, storage::BucketSnapshotLoadError>,
+        ) -> Result<storage::BucketSnapshot, ServerError>,
     ) -> Result<LoadedBucketHandle, ServerError> {
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
@@ -1934,7 +1922,7 @@ impl Coordinator {
             Ok(snapshot) => snapshot,
             Err(err) => {
                 self.remove_bucket_fast_path(bucket);
-                return Err(BucketHandleLoader::map_bucket_snapshot_error(err));
+                return Err(err);
             }
         };
         let bucket_is_boe =

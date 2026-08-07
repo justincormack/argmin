@@ -3270,7 +3270,7 @@ impl ActivePutObjectRoute<'_> {
         &self,
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
-    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+    ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .with_bucket_write_snapshot_with_route_validation(
@@ -3283,6 +3283,7 @@ impl ActivePutObjectRoute<'_> {
                 request,
                 action,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn with_bucket_write_snapshot_for_command<T, E>(
@@ -3292,7 +3293,7 @@ impl ActivePutObjectRoute<'_> {
             BucketSnapshot,
             BucketWriteReservationProof,
         ) -> BucketWriteSnapshotAction<T, E>,
-    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+    ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .with_put_object_bucket_write_snapshot_for_command_with_route_validation(
@@ -3301,6 +3302,7 @@ impl ActivePutObjectRoute<'_> {
                 request,
                 action,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn reserve_generation(
@@ -3324,7 +3326,7 @@ impl ActivePutObjectRoute<'_> {
             BucketSnapshot,
             Option<StoredObject>,
         ) -> Result<(T, CreateStreamUploadReq), E>,
-    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+    ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .create_put_object_stream_session_with_route_validation(
@@ -3334,6 +3336,7 @@ impl ActivePutObjectRoute<'_> {
                 cleanup_after,
                 action,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn create_stream_session_record(
@@ -3643,7 +3646,8 @@ impl ActiveMultipartObjectRoute<'_> {
             BucketSnapshot,
             Option<StoredObject>,
         ) -> Result<(T, crate::CreateMultipartUploadInput), E>,
-    ) -> Result<Result<crate::CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+    ) -> Result<Result<crate::CreateMultipartUploadOutcome<T>, E>, crate::BucketSnapshotLoadFailure>
+    {
         self.admission
             .cluster
             .create_multipart_upload_with_ordered_id_with_route_validation(
@@ -3652,6 +3656,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 request,
                 action,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     /// Resolve one multipart upload for request authorization on this exact
@@ -4067,7 +4072,7 @@ impl ActiveBucketRoute<'_> {
     pub fn create_bucket_with_config_and_load_info(
         &self,
         config: &crate::CreateBucketConfig<'_>,
-    ) -> Result<crate::BucketCreateAttemptOutcome, BucketSnapshotLoadError> {
+    ) -> Result<crate::BucketCreateAttemptOutcome, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .create_bucket_with_config_and_load_info_with_route_validation(
@@ -4075,6 +4080,7 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 config,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn try_finalize_bucket_delete(
@@ -4112,34 +4118,38 @@ impl ActiveBucketRoute<'_> {
             });
     }
 
-    pub fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    pub fn head_bucket_info(&self) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.with_metadata_route(|route| route.head_bucket_info())
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn get_bucket_subresource(
         &self,
         kind: crate::OpaqueBucketSubresourceKind,
-    ) -> Result<Option<String>, BucketSnapshotLoadError> {
+    ) -> Result<Option<String>, crate::BucketSnapshotLoadFailure> {
         self.with_metadata_route(|route| route.get_bucket_subresource(kind.stored_kind()))
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn get_bucket_tags(
         &self,
-    ) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
+    ) -> Result<Option<SerializedBucketTagSet>, crate::BucketSnapshotLoadFailure> {
         self.with_metadata_route(|route| route.get_bucket_tags())
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn load_bucket_snapshot(
         &self,
         request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+    ) -> Result<BucketSnapshot, crate::BucketSnapshotLoadFailure> {
         self.with_metadata_route(|route| route.load_bucket_snapshot(request))
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn load_bucket_delete_authorization_snapshot(
         &self,
         request: BucketSnapshotRequest,
-    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+    ) -> Result<BucketSnapshot, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .load_bucket_delete_authorization_snapshot_with_route_validation(
@@ -4147,12 +4157,13 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 request,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn load_active_bucket_delete_attempt_authorization_snapshot(
         &self,
         request: BucketSnapshotRequest,
-    ) -> Result<Option<BucketSnapshot>, BucketSnapshotLoadError> {
+    ) -> Result<Option<BucketSnapshot>, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .load_active_bucket_delete_attempt_authorization_snapshot_with_route_validation(
@@ -4160,13 +4171,14 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 request,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn with_bucket_write_snapshot<T, E>(
         &self,
         request: BucketSnapshotRequest,
         action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
-    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+    ) -> Result<Result<T, E>, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .with_bucket_write_snapshot_with_route_validation(
@@ -4175,12 +4187,13 @@ impl ActiveBucketRoute<'_> {
                 request,
                 action,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn put_bucket_versioning_and_load_info(
         &self,
         state: BucketVersioningState,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .put_bucket_versioning_and_load_info_with_route_validation(
@@ -4188,6 +4201,7 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 state,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     fn put_bucket_property_and_load_info(
@@ -4206,59 +4220,66 @@ impl ActiveBucketRoute<'_> {
     pub fn put_bucket_object_lock_and_load_info(
         &self,
         config: BucketObjectLockConfig,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.put_bucket_property_and_load_info(BucketPropertyMutation::ObjectLock(config))
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn put_bucket_encryption_and_load_info(
         &self,
         config: BucketEncryptionConfig,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.put_bucket_property_and_load_info(BucketPropertyMutation::Encryption(config))
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn put_bucket_public_access_block_and_load_info(
         &self,
         config: PublicAccessBlockConfig,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.put_bucket_property_and_load_info(BucketPropertyMutation::PublicAccessBlock(Some(
             config,
         )))
+        .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn delete_bucket_public_access_block_and_load_info(
         &self,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.put_bucket_property_and_load_info(BucketPropertyMutation::PublicAccessBlock(None))
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn put_bucket_ownership_controls_and_load_info(
         &self,
         config: BucketOwnershipControls,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.put_bucket_property_and_load_info(BucketPropertyMutation::OwnershipControls(Some(
             config,
         )))
+        .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn delete_bucket_ownership_controls_and_load_info(
         &self,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.put_bucket_property_and_load_info(BucketPropertyMutation::OwnershipControls(None))
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn put_bucket_abac_enabled_and_load_info(
         &self,
         enabled: bool,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.put_bucket_property_and_load_info(BucketPropertyMutation::AbacEnabled(enabled))
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn put_bucket_acl_and_load_info(
         &self,
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .put_bucket_acl_and_load_info_with_route_validation(
@@ -4267,12 +4288,13 @@ impl ActiveBucketRoute<'_> {
                 acl_grants,
                 summary,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn put_bucket_subresource_and_load_info(
         &self,
         req: PutBucketSubresource<'_>,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .put_bucket_subresource_and_load_info_with_route_validation(
@@ -4280,12 +4302,13 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 req,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     pub fn delete_bucket_subresource_and_load_info(
         &self,
         kind: crate::OpaqueBucketSubresourceKind,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .delete_bucket_subresource_and_load_info_with_route_validation(
@@ -4293,9 +4316,12 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 kind.stored_kind(),
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn delete_bucket_tags_and_load_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    pub fn delete_bucket_tags_and_load_info(
+        &self,
+    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
             .delete_bucket_subresource_and_load_info_with_route_validation(
@@ -4303,14 +4329,18 @@ impl ActiveBucketRoute<'_> {
                 || self.admission.require_valid_now(),
                 BucketSubresourceKind::Tagging,
             )
+            .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_probe_bucket_pg_available(&self) -> Result<bool, BucketSnapshotLoadError> {
-        self.admission.require_valid_now()?;
-        self.admission
-            .cluster
-            .try_probe_bucket_pg_available(&self.bucket)
+    pub fn try_probe_bucket_pg_available(&self) -> Result<bool, crate::BucketSnapshotLoadFailure> {
+        let result = (|| {
+            self.admission.require_valid_now()?;
+            self.admission
+                .cluster
+                .try_probe_bucket_pg_available(&self.bucket)
+        })();
+        result.map_err(crate::BucketSnapshotLoadFailure::from)
     }
 }
 
@@ -6401,22 +6431,18 @@ mod runtime_map_refresh_invalidation_tests {
         });
         crate::clock::with_time_override(6_000, || {
             cluster.require_route_map_valid_now().unwrap();
-            assert!(matches!(
-                route.head_bucket_info(),
-                Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
-                    cluster_epoch,
-                    valid_until_ms: 5_000,
-                    now_ms: 6_000,
-                })) if cluster_epoch == ClusterEpoch::INITIAL
-            ));
-            assert!(matches!(
-                route.load_bucket_snapshot(BucketSnapshotRequest::default()),
-                Err(BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
-                    cluster_epoch,
-                    valid_until_ms: 5_000,
-                    now_ms: 6_000,
-                })) if cluster_epoch == ClusterEpoch::INITIAL
-            ));
+            for error in [
+                route.head_bucket_info().unwrap_err(),
+                route
+                    .load_bucket_snapshot(BucketSnapshotRequest::default())
+                    .unwrap_err(),
+            ] {
+                assert_eq!(
+                    error.kind(),
+                    &crate::BucketSnapshotLoadFailureKind::SlowDown
+                );
+                assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
+            }
         });
     }
 
@@ -6433,8 +6459,8 @@ mod runtime_map_refresh_invalidation_tests {
             let owner = CanonicalUserId::from_principal("owner");
             let acl_grants = AclGrants::default();
 
-            assert!(matches!(
-                route.create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+            let error = route
+                .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
                     name: other_bucket.as_str(),
                     owner_principal: "owner",
                     owner_canonical_id: &owner,
@@ -6446,13 +6472,13 @@ mod runtime_map_refresh_invalidation_tests {
                     ownership_controls: BucketOwnershipControls {
                         object_ownership: crate::BucketObjectOwnership::ObjectWriter,
                     },
-                }),
-                Err(BucketSnapshotLoadError::Store(
-                    StoreError::RouteCapabilitySubjectMismatch {
-                        operation: "create bucket",
-                    }
-                ))
-            ));
+                })
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                &crate::BucketSnapshotLoadFailureKind::InternalError
+            );
+            assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
         });
     }
 

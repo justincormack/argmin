@@ -60,7 +60,7 @@ pub(super) fn emit_bucket_delete_begin_failed(
 
 impl Coordinator {
     pub(super) fn map_bucket_snapshot_load_error(
-        err: storage::BucketSnapshotLoadError,
+        err: storage::BucketSnapshotLoadFailure,
     ) -> ServerError {
         Self::map_bucket_snapshot_load_error_with_metadata_contention(
             err,
@@ -69,36 +69,39 @@ impl Coordinator {
     }
 
     fn map_bucket_snapshot_load_error_with_metadata_contention(
-        err: storage::BucketSnapshotLoadError,
+        err: storage::BucketSnapshotLoadFailure,
         metadata_contention: super::MetadataContentionResponse,
     ) -> ServerError {
-        let diagnostic_label = match &err {
-            storage::BucketSnapshotLoadError::Store(error) => error.diagnostic_cause_label(),
-            storage::BucketSnapshotLoadError::Metadata(_) => "metadata_failure",
-        };
+        let diagnostic_label = err.diagnostic_cause_label();
         let _ = observability::event(
             TRACE_TARGET,
             "bucket_snapshot_load_error",
             Some(format_args!("cause_label={diagnostic_label}")),
         );
-        match err {
-            storage::BucketSnapshotLoadError::Store(other) => {
-                super::map_store_error_with_metadata_contention(other, metadata_contention)
-            }
-            storage::BucketSnapshotLoadError::Metadata(ref error)
-                if super::metadata_error_is_command_contention(error) =>
-            {
+        match err.kind() {
+            storage::BucketSnapshotLoadFailureKind::SlowDown => ServerError::SlowDown,
+            storage::BucketSnapshotLoadFailureKind::MetadataCommandContention => {
                 metadata_contention.into_server_error()
             }
-            storage::BucketSnapshotLoadError::Metadata(storage::MetadataError::BucketNotEmpty) => {
-                ServerError::BucketNotEmpty
+            storage::BucketSnapshotLoadFailureKind::BucketNotEmpty => ServerError::BucketNotEmpty,
+            storage::BucketSnapshotLoadFailureKind::BucketNotFound { name } => {
+                ServerError::BucketNotFound {
+                    name: name.to_string(),
+                }
             }
-            storage::BucketSnapshotLoadError::Metadata(
-                storage::MetadataError::BucketNotFound { name },
-            ) => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            storage::BucketSnapshotLoadError::Metadata(other) => ServerError::Metadata(other),
+            storage::BucketSnapshotLoadFailureKind::NoSuchUpload { upload_id } => {
+                ServerError::NoSuchUpload {
+                    upload_id: upload_id.clone(),
+                }
+            }
+            storage::BucketSnapshotLoadFailureKind::InvalidVersioningTransition { from, to } => {
+                ServerError::InvalidRequest {
+                    reason: format!("invalid versioning transition from {from:?} to {to:?}"),
+                }
+            }
+            storage::BucketSnapshotLoadFailureKind::InternalError => {
+                ServerError::BucketSnapshotLoad(err)
+            }
         }
     }
 
@@ -641,14 +644,7 @@ impl Coordinator {
             .active_bucket_route(&authorized.bucket)
             .map_err(super::map_store_error)?
             .put_bucket_versioning_and_load_info(authorized.state)
-            .map_err(|e| match e {
-                storage::BucketSnapshotLoadError::Metadata(
-                    storage::MetadataError::InvalidVersioningTransition { from, to },
-                ) => ServerError::InvalidRequest {
-                    reason: format!("invalid versioning transition from {from:?} to {to:?}"),
-                },
-                other => Self::map_bucket_snapshot_load_error(other),
-            })?;
+            .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
         Ok(())
     }

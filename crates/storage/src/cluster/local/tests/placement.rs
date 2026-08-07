@@ -752,7 +752,7 @@ fn stale_storage_cluster_handle_rejects_bucket_metadata_before_mutation() {
     };
 
     let err = stale_cluster
-        .create_bucket_with_config_and_load_info(&create)
+        .create_bucket_with_config_and_load_info_raw(&create)
         .unwrap_err();
 
     assert!(matches!(
@@ -764,7 +764,9 @@ fn stale_storage_cluster_handle_rejects_bucket_metadata_before_mutation() {
         }) if operation_epoch == ClusterEpoch::new(2).unwrap()
             && current_epoch == ClusterEpoch::INITIAL
     ));
-    let err = current_cluster.head_bucket_info(&bucket).unwrap_err();
+    let err = current_cluster
+        .head_bucket_info_internal(&bucket)
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::BucketNotFound { .. })

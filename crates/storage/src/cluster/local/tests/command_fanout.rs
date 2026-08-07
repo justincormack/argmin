@@ -704,7 +704,7 @@ fn stream_put_create_keeps_reservation_until_pending_converges() {
 
     let session_id = crate::SessionId::try_from("d0".repeat(16)).unwrap();
     let err = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -742,7 +742,7 @@ fn stream_put_create_keeps_reservation_until_pending_converges() {
 
     drop(hook_guard);
     cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -833,7 +833,7 @@ fn stream_put_create_preserves_reservation_when_pending_owner_check_fails() {
 
     let session_id = crate::SessionId::try_from("d1".repeat(16)).unwrap();
     let err = cluster
-        .create_put_object_stream_session(
+        .create_put_object_stream_session_raw(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
@@ -1360,7 +1360,7 @@ fn stream_create_command_allows_bucket_metadata_generation_change() {
         .unwrap();
     let proof = crate::metadata_command::BucketWriteReservationProof::from(&reservation.record);
     let updated = cluster
-        .put_bucket_versioning_and_load_info(&bucket, crate::BucketVersioningState::Enabled)
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
         .unwrap();
     assert!(
         updated.bucket_execution_generation > proof.bucket_execution_generation,

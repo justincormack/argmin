@@ -1,7 +1,8 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
 use storage::error::{
-    BucketWriteDrainFailure, MetadataError, StoreError, StoreFailure, StoreOperationFailureClass,
+    BucketSnapshotLoadFailure, BucketWriteDrainFailure, MetadataError, StoreError, StoreFailure,
+    StoreOperationFailureClass,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +53,9 @@ pub enum ServerError {
 
     #[error("bucket write drain error: {0}")]
     BucketWriteDrain(BucketWriteDrainFailure),
+
+    #[error("bucket snapshot load error: {0}")]
+    BucketSnapshotLoad(BucketSnapshotLoadFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -499,6 +503,7 @@ impl ServerError {
         match self {
             Self::Store(error) => error.diagnostic_cause_label(),
             Self::BucketWriteDrain(error) => error.diagnostic_cause_label(),
+            Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -531,6 +536,10 @@ impl ServerError {
             ),
             Self::BucketWriteDrain(error) => format!(
                 "server_error>bucket_write_drain>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::BucketSnapshotLoad(error) => format!(
+                "server_error>bucket_snapshot_load>{}",
                 error.diagnostic_cause_label()
             ),
             Self::Metadata(error) => format!(
@@ -705,6 +714,7 @@ impl ServerError {
             Self::IntegrityError { .. } => "InternalError",
             Self::Store(_) => "InternalError",
             Self::BucketWriteDrain(_) => "InternalError",
+            Self::BucketSnapshotLoad(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }
@@ -1076,6 +1086,17 @@ mod tests {
         assert_eq!(
             stale_object.diagnostic_cause_chain(),
             "server_error>metadata_error>stale_object_write_command"
+        );
+
+        let snapshot = ServerError::BucketSnapshotLoad(
+            storage::test_support::bucket_snapshot_load_failure_for_kind(
+                storage::BucketSnapshotLoadFailureKind::InternalError,
+            ),
+        );
+        assert_eq!(snapshot.diagnostic_cause_label(), "metadata_failure");
+        assert_eq!(
+            snapshot.diagnostic_cause_chain(),
+            "server_error>bucket_snapshot_load>metadata_failure"
         );
     }
 
@@ -1592,6 +1613,15 @@ mod tests {
     fn http_status_500_wildcard() {
         assert_eq!(
             ServerError::Store(StoreError::NotFound.into()).http_status(),
+            500
+        );
+        assert_eq!(
+            ServerError::BucketSnapshotLoad(
+                storage::test_support::bucket_snapshot_load_failure_for_kind(
+                    storage::BucketSnapshotLoadFailureKind::InternalError,
+                ),
+            )
+            .http_status(),
             500
         );
         assert_eq!(

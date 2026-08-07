@@ -147,10 +147,6 @@ impl<'a> AdmittedStreamSegmentAppend<'a> {
     }
 }
 
-pub(super) fn metadata_error_is_command_contention(error: &storage::MetadataError) -> bool {
-    error.is_command_contention()
-}
-
 pub(super) fn object_pg_action_error_is_metadata_command_contention(
     error: &storage::ObjectPgActionError,
 ) -> bool {

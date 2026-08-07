@@ -377,23 +377,9 @@ impl<'a> BucketHandleLoader<'a> {
     }
 
     pub(super) fn map_bucket_snapshot_error(
-        error: storage::BucketSnapshotLoadError,
+        error: storage::BucketSnapshotLoadFailure,
     ) -> ServerError {
-        match error {
-            storage::BucketSnapshotLoadError::Store(error) => super::map_store_error(error),
-            storage::BucketSnapshotLoadError::Metadata(error) => match error {
-                ref error if super::metadata_error_is_command_contention(error) => {
-                    ServerError::SlowDown
-                }
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                storage::MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            },
-        }
+        Coordinator::map_bucket_snapshot_load_error(error)
     }
 }
 

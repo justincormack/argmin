@@ -2034,11 +2034,13 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     failures.
     Public diagnostics contain that category but never PG, shard, route, command-log, node,
     operation, path, database, or RPC values; `Display` and `Error::source` remain opaque.
-    Exported `BucketWriteDrainError`, `BucketSnapshotLoadError`, and `ObjectPgActionError`
-    wrappers expose bounded labels and have redacted public formatting and error chains, so
-    current production diagnostics cannot observe their nested implementation errors before
-    protocol conversion. This slice therefore establishes policy and rendering containment, not
-    the stronger structural claim that concrete storage errors never cross a crate boundary.
+    At item 13 completion, the then-exported `BucketWriteDrainError`,
+    `BucketSnapshotLoadError`, and `ObjectPgActionError` wrappers exposed bounded labels and had
+    redacted public formatting and error chains, so production diagnostics could not observe
+    their nested implementation errors before protocol conversion. Item 14 has since made the
+    first two wrappers crate-private; `ObjectPgActionError` remains the outstanding structural
+    transit. Item 13 therefore established policy and rendering containment, not the stronger
+    structural claim that concrete storage errors never cross a crate boundary.
     Metadata contention interpretation is likewise owner-provided. The storage-node intermediate
     class is private, owner-local tests pin the classifications, bounded category coverage, and
     redaction, cross-crate classification tests use opaque semantic fixtures, and
@@ -2061,14 +2063,23 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        Cross-crate response tests use an owner-provided logical fixture, the stale-authorization
        regression drives the admitted production mutation from the authorization result, and the
        boundary check rejects raw drain-error transit or re-export.
-       `BucketSnapshotLoadError` and `ObjectPgActionError` still publicly carry implementation
-       errors, `server-core::ServerError` retains a concrete `MetadataError`, and coordinator
-       translation adapters still destructure those raw operation wrappers. Replace these
-       remaining surfaces one operation family at a time with exhaustive
+       The bucket-snapshot sub-slice completed on 2026-08-07. `BucketSnapshotLoadError` is now
+       crate-private; admitted bucket, direct logical read, lifecycle test-support, and bounded
+       test-hook entry points return opaque `BucketSnapshotLoadFailure` values. Its exhaustive
+       logical kind preserves throttling/convergence, operation-selected metadata contention,
+       bucket absence/not-empty, missing-upload, and invalid-versioning outcomes, while a shared
+       private diagnostic category retains only bounded store or metadata failure domains. Raw
+       impossible-state tests use crate-private owner helpers, cross-crate translation tests use
+       owner-provided logical fixtures, and the boundary check rejects raw snapshot-error transit
+       or re-export.
+       `ObjectPgActionError` still publicly carries implementation errors,
+       `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
+       adapters still destructure that raw operation wrapper. Replace these remaining surfaces
+       one operation family at a time with exhaustive
        storage-owned semantic errors. Preserve only logical values required for S3 translation,
        such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
        other implementation detail behind the existing bounded opaque diagnostic. Continue with
-       bucket-snapshot loading, then object-PG operations and streaming. Remove
+       object-PG operations and streaming. Remove
        `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
        public raw error exports once no public storage signature requires them. Tests that
        currently construct raw storage errors must use owner-provided semantic fixtures or move

@@ -1801,7 +1801,7 @@ fn stale_duplicate_metadata_command_index_on_non_primary_fails_closed_without_dr
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let err = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: second_bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -2499,7 +2499,7 @@ fn zero_apply_command_failure_records_tombstone_for_later_hash_chain_convergence
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let err = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: first_bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
@@ -6720,7 +6720,7 @@ fn partial_abandoned_create_bucket_retry_rebuilds_command_before_reporting_creat
     let owner = crate::CanonicalUserId::from_principal("owner");
     let acl_grants = crate::AclGrants::default();
     let outcome = cluster
-        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: bucket.as_str(),
             owner_principal: "owner",
             owner_canonical_id: &owner,
