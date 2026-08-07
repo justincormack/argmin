@@ -432,18 +432,18 @@ Initial ownership assessment:
 | --- | --- | --- |
 | PG schema and physical PG/shard layout | `storage` | Complete: SQL, driver, SQLite identity, filenames, directory layout, synchronization, and impossible-state tests are storage-owned. |
 | Metadata command log, checkpoints, and canonical metadata digests | `storage` | Complete: codecs and recovery/corruption fixtures are private; every embedded nested format is inventoried below. |
-| Storage-node RPC | `storage` | Framing, wire errors, transports, and malformed-wire tests are storage-owned. Residual: `argmin-s3` still imports `STORAGE_RPC_TLS_ALPN` and constructs raw Rustls client/server profiles before passing them into storage endpoints/listeners. |
+| Storage-node RPC | `storage` | Complete containment: framing, wire errors, Unix/TLS transports, TLS 1.3 and private ALPN profile construction, authentication, dispatch, and malformed-wire/profile tests are storage-owned. The process supplies only deployment endpoint, trust-root, certificate-identity, listener, and lifecycle inputs. |
 | Control-plane durable state, RPC, and auth envelope | `storage` | Complete: client and server transport are contained behind typed Unix/TLS endpoints and opaque storage-owned facades. |
 | Raft peer protocol, restart artifact, and WAL | `storage` | Peer wire and durable representations are contained: raw frames, restart artifacts, WAL records/files, and layout helpers are private; process tests use logical clients and opaque semantic recovery inspection. |
-| PG topology, route state, and physical payload placement | `storage` | Incomplete: `server-core` and `argmin-s3` still construct and interpret PG identifiers, route snapshots, acting sets, placement epochs, EC shard requests, and physical shard locations. |
+| PG topology, route state, and physical payload placement | `storage` | Production request, administration, placement, and maintenance paths are contained behind opaque storage-owned capabilities. Item 14 retains only the local debug endpoint's direct `PgId`/snapshot access and its final enforcement gate. |
 | Physical storage maintenance workflows | `storage` | Complete: shard scavenging, repair, backfill, payload reclaim, accepted bucket-delete continuation/finalization, and abandoned stream-session cleanup run behind opaque storage-owned workers; their durable cursors, claims, work records, cleanup roots, and debug snapshots are private. |
-| Control-plane topology and metadata-transfer workflows | `storage` | Incomplete: `argmin-s3` constructs control-plane commands and implements PG fencing, route inspection, metadata transfer, and topology convergence. |
-| Storage implementation-error taxonomy | `storage` | Complete: storage exhaustively classifies operation failures, retains implementation errors behind a redacted opaque diagnostic, and boundary-checks production callers against variant or storage-node sub-classification. |
+| Control-plane topology and metadata-transfer workflows | `storage` | Complete containment: topology commands, PG fencing, route/proof interpretation, metadata transfer, convergence, certification, durability publication, and retry classification are storage-owned. The process supplies logical operator or deployment inputs through opaque administration and host capabilities. |
+| Storage implementation-error taxonomy | `storage` | Policy and rendering containment are complete: storage exhaustively classifies operation failures, and `StoreFailure` retains only a semantic request class plus a bounded operator category rather than the implementation error. Structural transit of public `StoreError`, `MetadataError`, and raw operation wrappers remains item 14 work. |
 | Object user/system metadata blobs | `server-core` | Complete: serialization is crate-private and storage carries only opaque validated blobs. |
 | Tag and ACL canonical value formats | `s3-types` | Complete: validation and canonical codecs are centralized; storage owns and validates their containing row, command, checkpoint, digest, and RPC formats. |
 | Object encryption state | `storage` | Complete: the durable codec is private and callers receive only typed encryption state. |
 | Session-token envelope | `auth` | Exact-current version selection and representation constants are private to `auth`; callers use semantic credential issuance and authentication APIs, enforced by the boundary check. |
-| Static manifest and process identity files | `argmin-s3` | File codecs and process identities are contained, but the manifest's storage-topology section still becomes `Vec<(PgId, Vec<NodeId>)>` in `argmin-s3`; storage must own validation and interpretation of that subdocument. |
+| Static manifest and process identity files | `argmin-s3` | The outer manifest and process-identity codecs remain process-owned. Storage validates and interprets the manifest's storage-topology subdocument through its own builder and returns opaque certified topology/bootstrap capabilities; raw PG topology no longer crosses back into the process workflow. |
 | Shared operator metric schema | `observability` | Excluded from this storage-upgrade boundary: current metrics are neither persisted state nor an internal wire format, and no stable external metric-schema contract exists pre-release. If one is declared later, `observability` owns a separate compatibility plan. |
 
 These are the current owners, not placeholders shared between crates. A later extraction into
@@ -630,9 +630,9 @@ endianness, and length encoding for all three encryption variants.
 
 This inventory covers the storage-node, control-plane, and Raft peer RPC surfaces. All three
 protocols are owned by `storage`. `argmin-s3` owns process configuration and lifecycle, but it
-must eventually pass typed endpoint/listener and credential configuration to storage-owned
-clients and servers rather than implementing any wire exchange itself. No separate protocol
-crate is justified by the current dependency graph.
+now passes typed endpoint/listener and credential configuration to storage-owned clients and
+servers and does not implement their wire exchanges. No separate protocol crate is justified by
+the current dependency graph.
 
 The protocols currently assume identical binaries. They have exact current-version rejection,
 but no version negotiation or supported compatibility window:
@@ -663,30 +663,30 @@ The public boundary and containment status for each surface are as follows.
   `serve_forever()`; it does not handle storage-node frames.
 - The wire-error containment slice is complete. `StorageRpcErrorCode` is now a crate-private
   alias for the opaque `StorageNodeFailure`; only storage can construct or match its protocol
-  values. `StoreError::storage_node_failure_class()` maps transient cases to the public semantic
-  `StorageNodeFailureClass`, leaving `server-core` and `argmin-s3` to select their own retry
-  policies without knowing wire codes. Remote diagnostic text is retained only in the opaque
-  `StorageNodeFailureDetail`; its public `Debug` and `Display` are redacted, and generic storage
-  failures expose one bounded diagnostic kind rather than their wire-specific identity.
-  Raw-code mapping and redaction tests are storage-owned, caller policies use exhaustive matches
-  over the semantic enum, and the repository boundary check prevents wire types, opaque
-  diagnostic values, or their fields from being used outside storage.
-- `storage_rpc_transport` still publicly exposes the protocol ALPN. `argmin-s3` uses it while
-  constructing raw Rustls client and server configurations with `argmin-storage-rpc/1`, then
-  passes those configurations into storage endpoints and listeners. Endpoint addresses, trust
-  roots, certificate identities, and listener bindings are valid public inputs; TLS version,
-  ALPN selection, and protocol-profile validation are storage RPC representation and must move
-  behind storage-owned TLS endpoint/listener constructors. The ALPN constant must then become
-  owner-private and the repository boundary check must reject both the constant and storage-RPC
-  Rustls profile construction outside `storage`.
+  values. Storage privately maps wire-specific failures into the exhaustive public
+  `StoreOperationFailureClass`; `StorageNodeFailureClass` and
+  `StoreError::storage_node_failure_class()` are crate-private. `server-core` selects S3 request
+  policy from `StoreOperationFailureClass` without knowing wire codes, while `argmin-s3` receives
+  only its operation-specific opaque failures. Remote diagnostic text remains inside the private
+  `StorageNodeFailureDetail` while a raw storage error is owner-local; conversion to
+  `StoreFailure` retains only the semantic request class and one bounded operator category.
+  Raw-code mapping, classification, and redaction tests are storage-owned, and the repository
+  boundary check prevents wire types, private storage-node classification, opaque diagnostic
+  values, or their fields from being used outside storage.
+- Storage-node TLS profile containment is complete. `storage` constructs and validates the fixed
+  TLS 1.3 client/server profiles and private `argmin-storage-rpc/1` ALPN inside typed endpoint and
+  listener constructors. `argmin-s3` supplies only addresses, server names, trust roots,
+  certificate identities, listener bindings, and lifecycle configuration. The ALPN constant and
+  raw Rustls profiles are private, and the repository boundary check rejects profile construction
+  or protocol-identifier use outside storage.
 - Retry policy remains intentionally caller-owned while representation translation is
-  storage-owned. `server-core` and `argmin-s3` make exhaustive decisions over
-  `StorageNodeFailureClass`; storage-internal protocol handling alone may inspect wire codes or
-  retained remote diagnostic text.
+  storage-owned. `server-core` makes exhaustive S3-policy decisions over
+  `StoreOperationFailureClass`; storage-internal protocol handling alone may inspect wire codes,
+  `StorageNodeFailureClass`, or retained remote diagnostic text. Process operations receive their
+  own storage-owned semantic failure surfaces rather than the storage-node class.
 - Raw codec, malformed-frame, authentication, client, and server tests are already in `storage`.
-  Cross-crate S3/process tests mostly use logical storage operations. The remaining
-  `argmin-s3` ALPN/endpoint-shape tests should use typed configuration and leave protocol-profile
-  assertions in `storage`.
+  Cross-crate S3/process tests use logical storage operations or typed endpoint/listener
+  configuration; exact TLS/ALPN profile assertions are owner-local.
 
 #### Control-plane RPC
 
@@ -1771,10 +1771,10 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Boundary family | Owner | Current candidate baseline | Gate status |
 | --- | --- | --- | --- |
 | PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 1`; version zero is valid only with no user schema objects | Recorded |
-| Metadata commands and abandoned-command records | `storage` | command encoding 5; abandoned-command encoding 1 | Evidence required |
+| Metadata commands and abandoned-command records | `storage` | command encoding 6; abandoned-command encoding 1 | Evidence required |
 | Metadata checkpoints and canonical state | `storage` | checkpoint encoding 1; canonical-state encoding 4 | Evidence required |
-| Storage-node RPC and authentication | `storage` | frame encoding 11; auth binding 2; auth transport envelope 1 | Blocked on Phase 1 TLS, topology, payload, maintenance, and error containment; then evidence required |
-| Control-plane logical state, commands, and snapshots | `storage` | state 26; command 14; snapshot 1 | Blocked on Phase 1 topology/admin-workflow containment; then evidence required |
+| Storage-node RPC and authentication | `storage` | frame encoding 15; auth binding 2; auth transport envelope 1 | Evidence required; transport/profile and wire-error containment are complete, while item 14's public operation-error cleanup does not change this private wire baseline |
+| Control-plane logical state, commands, and snapshots | `storage` | state 27; command 14; snapshot 1 | Evidence required; topology and administration workflow containment are complete |
 | Control-plane RPC and authentication | `storage` | RPC 13; shared authentication envelope 1 | Evidence required |
 | Single-authority control-plane durable artifacts | `storage` | clock checkpoint 2; state identity 1; initialized marker 1; journal file 2; journal record 2 | Evidence required |
 | Raft peer RPC and authentication | `storage` | peer RPC 2; shared authentication envelope 1 | Evidence required |
@@ -1785,9 +1785,9 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Object encryption state | `storage` | SSE-C 3; SSE-S3 1, selected by a typed outer discriminator | Recorded |
 | Object-tag and bucket-tag canonical XML | `s3-types` | no independent marker; exact canonical XML is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
 | ACL canonical string | `s3-types` | no independent marker; exact canonical string is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
-| Static cluster manifest and static identities | `argmin-s3` | manifest schema 1; storage identity 1; control-plane identity 2 | Storage-topology subdocument is blocked on Phase 1 ownership containment; remaining evidence required |
+| Static cluster manifest and static identities | `argmin-s3` | manifest schema 1; storage identity 1; control-plane identity 2 | Evidence required; the storage-topology subdocument is interpreted through the contained storage-owned builder |
 | Temporary-credential session token | `auth` | `ARGST1` envelope / version 1 | Recorded |
-| Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Storage RPC is blocked on Phase 1 containment; the other two require evidence consolidation |
+| Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Evidence required; all three identifiers and protocol-profile constructors are owner-private and boundary-checked |
 
 The evidence audit proceeds in this bounded order after Phase 1 containment is complete:
 
@@ -2044,20 +2044,57 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     redaction, cross-crate classification tests use opaque semantic fixtures, and
     `check-storage-cluster-boundaries` rejects production variant matching or reconstruction of
     the removed storage-node policy.
-14. **Pending:** eliminate the remaining concrete `StoreError` and raw operation-wrapper transit
-    from public storage operation signatures by converting to owner-defined semantic errors before
-    the crate boundary; contain local debug PG operations behind owner-provided opaque diagnostics;
-    move impossible topology/route/claim fixtures into storage; and enforce the final structural
-    boundary through crate visibility plus `check-storage-cluster-boundaries` coverage. The
-    Phase 5 test-support slice in
-    `storage-boundary-compiler-enforcement-plan.md` completed on 2026-08-07:
-    raw stream/direct-PUT cleanup assertions, UploadPartCopy shard-loss
-    injection, backfill and retained-placement fixtures, lifecycle/reclaim
-    generation observations, and broad multipart state-model records are now
-    storage-owner tests or opaque/logical owner-defined scenarios. This item
-    remains pending for the production concrete-error/operation-wrapper
-    transit and debug-PG containment described above; it no longer owns any
-    residual cross-crate test-fixture migration.
+14. **Pending — production error, debug, and dependency containment.** The Phase 5 test-support
+    work in `storage-boundary-compiler-enforcement-plan.md` completed on 2026-08-07. Raw
+    stream/direct-PUT cleanup assertions, UploadPartCopy shard-loss injection, backfill and
+    retained-placement fixtures, lifecycle/reclaim generation observations, and broad multipart
+    state-model records are now storage-owner tests or opaque/logical owner-defined scenarios.
+    Item 14 no longer owns any impossible-state or cross-crate test-fixture migration. Its
+    remaining work is the following bounded production and dependency cleanup:
+
+    1. **Structural error containment.** `StoreError` and `MetadataError` remain public storage
+       exports. `BucketWriteDrainError`, `BucketSnapshotLoadError`, and `ObjectPgActionError`
+       publicly carry those implementation errors, `server-core::ServerError` retains a concrete
+       `MetadataError`, and coordinator translation adapters still destructure the raw operation
+       wrappers. Replace these surfaces one operation family at a time with exhaustive
+       storage-owned semantic errors. Preserve only logical values required for S3 translation,
+       such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
+       other implementation detail behind the existing bounded opaque diagnostic. Start with the
+       smaller bucket-write-drain family, then bucket-snapshot loading, then object-PG operations
+       and streaming. Remove `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters,
+       and the public raw error exports once no public storage signature requires them. Tests that
+       currently construct raw storage errors must use owner-provided semantic fixtures or move to
+       storage; Phase 5 completion must not be used to keep the production representations public.
+
+    2. **Debug-PG containment.** The bucket-delete debug endpoint already follows the required
+       model: storage owns the diagnostic and returns owner-rendered opaque text. The metadata
+       checkpoint endpoint still parses and constructs `PgId` in `server-http`, obtains a raw
+       `StorageCluster`, invokes `record_current_metadata_command_checkpoint_for_pg`, interprets
+       `MetadataCommandCheckpointRecordSummary`, formats its fields, and receives `StoreError`.
+       Replace that path with a storage/coordinator diagnostic operation which accepts only the
+       logical operator input, constructs and interprets the PG operation inside storage, and
+       returns owner-rendered output plus a bounded semantic outcome. The object-payload-placement
+       endpoint must likewise request one owner-provided diagnostic instead of loading an object
+       snapshot directly in HTTP. Debug/test-only compilation does not waive this ownership rule.
+
+    3. **Remove HTTP's direct EC test dependency.** `server-http` no longer needs EC in production,
+       but its dev-dependency remains because three duplicated HTTP test-cluster constructors use
+       `ec::EcConfig` to select an EC shape and derive storage node count, while a response
+       redaction test constructs `ec::EcError` directly. Provide one storage-owned default test
+       cluster facility whose public signature exposes no PG, node, shard, or EC representation,
+       and a server-core-owned semantic error fixture for the HTTP redaction case. Remove the
+       direct `server-http` dev-dependency on `ec`; HTTP tests must not choose storage topology or
+       construct EC implementation errors.
+
+    4. **Final enforcement.** Extend `check-storage-cluster-boundaries` to reject concrete
+       `StoreError`/`MetadataError` and raw operation-wrapper use outside storage, their public
+       export from storage after migration, direct `PgId` construction and raw storage diagnostic
+       calls in `server-http` (including `local-debug-endpoints` feature code), and a direct `ec`
+       dependency or `ec::` source use in `server-http`. Do not use an indiscriminate repository-wide
+       `PgId` text ban: enforce the actual non-owner production and feature-gated seams while
+       retaining owner-local storage tests. Item 14 completes only when crate visibility is the
+       primary representation boundary and the repository check prevents each removed escape hatch
+       from being reintroduced.
 
 After items 9 through 14 are complete, work proceeds through the Phase 2 evidence gate rather than
 reopening containment opportunistically.
