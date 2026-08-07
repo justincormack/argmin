@@ -131,11 +131,8 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
     let error = crossed_key_route
         .commit_direct_object(commit_payload, &prepared, |_| Ok::<(), ()>(()))
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::InvalidRequest { ref reason }
-            if reason == "direct PUT payload does not match admitted object route"
-    ));
+    assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "invalid_request");
     assert_direct_payload_staging_cleaned(
         &map,
         &cluster,
@@ -163,11 +160,8 @@ fn opaque_direct_put_payload_rejects_crossed_object_routes() {
     let error = crossed_bucket_route
         .discard_direct_object_payload(discard_payload)
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::InvalidRequest { ref reason }
-            if reason == "direct PUT payload does not match admitted object route"
-    ));
+    assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "invalid_request");
     assert_direct_payload_staging_cleaned(
         &map,
         &cluster,
@@ -254,11 +248,8 @@ fn opaque_direct_put_payload_rejects_same_epoch_cross_cluster_commit_and_cleans_
     let error = receiver_route
         .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::InvalidRequest { ref reason }
-            if reason == "direct PUT payload does not match admitted object route"
-    ));
+    assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "invalid_request");
     assert_direct_payload_staging_cleaned(
         &issuer_map,
         &issuer,
@@ -417,12 +408,14 @@ fn matching_pending_direct_put_preserves_payload_when_abandoned_log_inspection_f
     let error = route
         .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-            context: "injected abandoned-log inspection failure"
-        })
-    ));
+    assert_eq!(
+        error.kind(),
+        crate::DirectPutFailureKind::MetadataCommandContention
+    );
+    assert_eq!(
+        error.diagnostic_cause_label(),
+        "store_metadata_command_contention"
+    );
 
     let retained = pending_metadata_command_for_test(&map, pg_id, &bucket)
         .expect("matching durable command must remain pending");
@@ -553,12 +546,14 @@ fn physically_mismatched_pending_direct_put_partitions_mixed_overlap_cleanup() {
             panic!("a physically mismatched pending command must not enter recovery")
         })
         .unwrap_err();
-    assert!(matches!(
-        error,
-        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
-            context: "pending direct PUT command payload differs from request"
-        })
-    ));
+    assert_eq!(
+        error.kind(),
+        crate::DirectPutFailureKind::MetadataCommandContention
+    );
+    assert_eq!(
+        error.diagnostic_cause_label(),
+        "store_metadata_command_contention"
+    );
 
     let retained = pending_metadata_command_for_test(&map, pg_id, &bucket)
         .expect("physically mismatched command must remain pending");

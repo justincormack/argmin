@@ -61,15 +61,14 @@ fn embedded_peering_metadata_read_rechecks_certified_proof_under_pg_lock() {
         )
         .unwrap();
     }
-    assert!(matches!(
-        cluster
-            .load_existing_live_object(&bucket, &key)
-            .unwrap_err(),
-        ObjectPgActionError::Store(StoreError::StaleMetadataReadProof {
-            node_id: 0,
-            pg_id: 0,
-        })
-    ));
+    let error = cluster
+        .load_existing_live_object(&bucket, &key)
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::ObjectReadFailureKind::RetryableConvergence
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
     map.node(certified_node)
         .unwrap()
         .test_node()
@@ -98,15 +97,14 @@ fn embedded_peering_metadata_read_rechecks_certified_proof_under_pg_lock() {
         pg.refresh_metadata_command_state_digest().unwrap();
     }
 
-    assert!(matches!(
-        cluster
-            .load_existing_live_object(&bucket, &key)
-            .unwrap_err(),
-        ObjectPgActionError::Store(StoreError::StaleMetadataReadProof {
-            node_id: 0,
-            pg_id: 0,
-        })
-    ));
+    let error = cluster
+        .load_existing_live_object(&bucket, &key)
+        .unwrap_err();
+    assert_eq!(
+        error.kind(),
+        crate::ObjectReadFailureKind::RetryableConvergence
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
 }
 
 #[test]

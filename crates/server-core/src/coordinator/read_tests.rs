@@ -798,10 +798,11 @@ fn buffered_put_post_publish_error_keeps_committed_shards() {
     assert!(
         matches!(
             err,
-            ServerError::InvalidRequest { ref reason }
-                if reason == "post-publish direct put test failure"
+            ServerError::DirectPut(ref failure)
+                if failure.kind() == storage::DirectPutFailureKind::InternalError
+                    && failure.diagnostic_cause_label() == "invalid_request"
         ),
-        "expected injected post-publish failure, got {err:?}"
+        "expected opaque injected post-publish failure, got {err:?}"
     );
 
     let bucket = trusted_bucket_name("bucket");

@@ -186,6 +186,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::ObjectRead(_)
         | ServerError::ObjectMetadataMutation(_)
         | ServerError::StreamUpload(_)
+        | ServerError::DirectPut(_)
         | ServerError::Metadata(_)
         | ServerError::Ec(_)
         | ServerError::MetadataBlobError { .. }
@@ -4978,6 +4979,7 @@ mod tests {
         let object_mutation_error =
             storage::test_support::object_metadata_mutation_failure_diagnostic_fixture();
         let stream_upload_error = storage::test_support::stream_upload_failure_diagnostic_fixture();
+        let direct_put_error = storage::test_support::direct_put_failure_diagnostic_fixture();
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
             (
                 ServerError::BucketWriteDrain(
@@ -5006,6 +5008,10 @@ mod tests {
             (
                 ServerError::StreamUpload(stream_upload_error.0),
                 stream_upload_error.1.to_vec(),
+            ),
+            (
+                ServerError::DirectPut(direct_put_error.0),
+                direct_put_error.1.to_vec(),
             ),
             (
                 ServerError::Store(

@@ -34,7 +34,7 @@ trait StreamPutFinalizationRoute {
     fn enqueue_object_payload_reclaim(&self, generation_id: storage::GenerationId);
 
     #[cfg(test)]
-    fn try_probe_object_pg_available(&self) -> Result<bool, storage::ObjectPgActionError>;
+    fn try_probe_object_pg_available(&self) -> Result<bool, storage::DirectPutFailure>;
 }
 
 impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
@@ -60,12 +60,21 @@ impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
     }
 
     #[cfg(test)]
-    fn try_probe_object_pg_available(&self) -> Result<bool, storage::ObjectPgActionError> {
+    fn try_probe_object_pg_available(&self) -> Result<bool, storage::DirectPutFailure> {
         storage::ActivePutObjectRoute::try_probe_object_pg_available(self)
     }
 }
 
 impl Coordinator {
+    pub(super) fn map_direct_put_failure(error: storage::DirectPutFailure) -> ServerError {
+        match error.kind() {
+            storage::DirectPutFailureKind::ResourceExhausted
+            | storage::DirectPutFailureKind::MetadataCommandContention
+            | storage::DirectPutFailureKind::RetryableConvergence => ServerError::SlowDown,
+            storage::DirectPutFailureKind::InternalError => ServerError::DirectPut(error),
+        }
+    }
+
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
         let admission = self.admit_storage_route_for_request()?;
@@ -278,7 +287,7 @@ impl Coordinator {
                             write_encryption.encrypt_segment(0, req.data)?;
                         let generation_id = put_route
                             .reserve_generation(&transient_segment_id)
-                            .map_err(Coordinator::map_object_pg_action_error)?;
+                            .map_err(Coordinator::map_direct_put_failure)?;
 
                         let written_payload = match put_route.write_direct_object_payload(
                             &transient_segment_id,
@@ -289,7 +298,7 @@ impl Coordinator {
                             Ok(written_segment) => written_segment,
                             Err(error) => {
                                 put_route.release_generation_reservation(&transient_segment_id);
-                                return Err(super::map_store_error(error));
+                                return Err(Coordinator::map_direct_put_failure(error));
                             }
                         };
                         let prepared_commit = PreparedDirectPutObjectCommit {
@@ -309,20 +318,20 @@ impl Coordinator {
                         if self.should_probe_direct_put_commit(authorized.bucket()) {
                             let object_pg_ready = match put_route
                                 .try_probe_object_pg_available()
-                                .map_err(Coordinator::map_object_pg_action_error)
+                                .map_err(Coordinator::map_direct_put_failure)
                             {
                                 Ok(object_pg_ready) => object_pg_ready,
                                 Err(error) => {
                                     put_route
                                         .discard_direct_object_payload(written_payload)
-                                        .map_err(Coordinator::map_object_pg_action_error)?;
+                                        .map_err(Coordinator::map_direct_put_failure)?;
                                     return Err(error);
                                 }
                             };
                             if !object_pg_ready {
                                 put_route
                                     .discard_direct_object_payload(written_payload)
-                                    .map_err(Coordinator::map_object_pg_action_error)?;
+                                    .map_err(Coordinator::map_direct_put_failure)?;
                                 return Err(ServerError::InternalError {
                                     reason: "test probe: object pg still locked before direct put commit"
                                         .to_string(),
@@ -352,7 +361,7 @@ impl Coordinator {
                                     Ok(())
                                 },
                             )
-                            .map_err(Coordinator::map_object_pg_action_error)??;
+                            .map_err(Coordinator::map_direct_put_failure)??;
                         let lifecycle_expiration = self
                             .current_object_write_lifecycle_expiration_for_loaded_bucket(
                                 &bucket_handle,
@@ -757,7 +766,7 @@ impl Coordinator {
             if self.should_probe_finalize_stream_put_commit(req.object.bucket_name()) {
                 let object_pg_ready = route
                     .try_probe_object_pg_available()
-                    .map_err(Coordinator::map_object_pg_action_error)?;
+                    .map_err(Coordinator::map_direct_put_failure)?;
                 if !object_pg_ready {
                     return Err(ServerError::InternalError {
                         reason:

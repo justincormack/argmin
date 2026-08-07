@@ -2124,6 +2124,20 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        classification/redaction tests, exhaustive cross-crate mapping tests,
        HTTP sanitization coverage, and the boundary checker reject raw error transit through this
        streaming seam.
+       The direct/buffered PutObject sub-slice completed on 2026-08-07. Admitted existing-object
+       authorization reads, generation reservation, payload staging, commit, explicit discard,
+       and the test-only route probe now return opaque `DirectPutFailure` values. Its exhaustive
+       logical kind is limited to resource exhaustion, metadata-command contention, retryable
+       convergence, and internal failure; conditional-request and object-existence decisions
+       remain on the typed commit callback. Crossed payload capabilities, stale snapshots, and
+       other impossible route states therefore fail internally instead of exposing storage
+       invariant text as client-visible `InvalidRequest`. Storage retains only a bounded private
+       diagnostic category, while `ServerError::DirectPut` preserves that category through request
+       telemetry and redacts it from HTTP responses. The unadmitted raw reservation helper is now
+       owner-test-only, the release helper is crate-private, and the shared logical existing-live-
+       object loader reuses `ObjectReadFailure`. Owner-local direct-PUT state-machine tests,
+       exhaustive classification and response-mapping tests, HTTP redaction coverage, and the
+       boundary checker reject raw error transit or renewed public low-level mutation entry points.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces
@@ -2131,7 +2145,7 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        storage-owned semantic errors. Preserve only logical values required for S3 translation,
        such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
        other implementation detail behind the existing bounded opaque diagnostic. Continue with
-       direct PutObject and multipart-management/completion object-PG operations. Remove
+       multipart-management/completion object-PG operations next. Remove
        `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
        public raw error exports once no public storage signature requires them. Tests that
        currently construct raw storage errors must use owner-provided semantic fixtures or move

@@ -10194,27 +10194,30 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<Option<StoredObject>, ObjectPgActionError> {
+    ) -> Result<Option<StoredObject>, crate::ObjectReadFailure> {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
         let read_node = self
             .local_map
-            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
+            .metadata_pg_read_node(self.operation_epoch(), pg_id)
+            .map_err(crate::ObjectReadFailure::from_store)?;
         let object_read_client = read_node.object_read_metadata_client();
-        let object_read_route = object_read_client.open_object_read_metadata_route(
-            self.operation_epoch(),
-            object_pg_id,
-            bucket,
-            key,
-            read_node.authorization(),
-        )?;
+        let object_read_route = object_read_client
+            .open_object_read_metadata_route(
+                self.operation_epoch(),
+                object_pg_id,
+                bucket,
+                key,
+                read_node.authorization(),
+            )
+            .map_err(crate::ObjectReadFailure::from_object_pg_action)?;
         match object_read_route.load_object_read_auth_subject(None) {
             Ok(subject) => match subject.stored {
                 StoredObject::Live(_) => Ok(Some(subject.stored)),
                 StoredObject::DeleteMarker(_) => Ok(None),
             },
             Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)) => Ok(None),
-            Err(error) => Err(error),
+            Err(error) => Err(crate::ObjectReadFailure::from_object_pg_action(error)),
         }
     }
 

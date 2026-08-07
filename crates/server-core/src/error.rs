@@ -1,7 +1,7 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
 use storage::error::{
-    BucketSnapshotLoadFailure, BucketWriteDrainFailure, MetadataError,
+    BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure, MetadataError,
     ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
     StoreOperationFailureClass, StreamUploadFailure,
 };
@@ -66,6 +66,9 @@ pub enum ServerError {
 
     #[error("stream upload error: {0}")]
     StreamUpload(StreamUploadFailure),
+
+    #[error("direct PutObject error: {0}")]
+    DirectPut(DirectPutFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -517,6 +520,7 @@ impl ServerError {
             Self::ObjectRead(error) => error.diagnostic_cause_label(),
             Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
             Self::StreamUpload(error) => error.diagnostic_cause_label(),
+            Self::DirectPut(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -567,6 +571,9 @@ impl ServerError {
                 "server_error>stream_upload>{}",
                 error.diagnostic_cause_label()
             ),
+            Self::DirectPut(error) => {
+                format!("server_error>direct_put>{}", error.diagnostic_cause_label())
+            }
             Self::Metadata(error) => format!(
                 "server_error>metadata_error>{}",
                 metadata_error_diagnostic_cause_chain(error)
@@ -743,6 +750,7 @@ impl ServerError {
             Self::ObjectRead(_) => "InternalError",
             Self::ObjectMetadataMutation(_) => "InternalError",
             Self::StreamUpload(_) => "InternalError",
+            Self::DirectPut(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }
@@ -1180,6 +1188,19 @@ mod tests {
         for secret in secret_fragments {
             assert!(!rendered.contains(secret));
         }
+
+        let (direct_put_failure, secret_fragments) =
+            storage::test_support::direct_put_failure_diagnostic_fixture();
+        let direct_put = ServerError::DirectPut(direct_put_failure);
+        assert_eq!(direct_put.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            direct_put.diagnostic_cause_chain(),
+            "server_error>direct_put>store_io_failure"
+        );
+        let rendered = format!("{direct_put:?} {direct_put}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
     }
 
     #[test]
@@ -1601,6 +1622,15 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_direct_put() {
+        let err = ServerError::DirectPut(storage::test_support::direct_put_failure_for_kind(
+            storage::DirectPutFailureKind::InternalError,
+        ));
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
     fn s3_error_code_metadata() {
         let err = ServerError::Metadata(MetadataError::ObjectNotFound);
         assert_eq!(err.s3_error_code(), "InternalError");
@@ -1748,6 +1778,13 @@ mod tests {
                     storage::ObjectMetadataMutationFailureKind::InternalError,
                 ),
             )
+            .http_status(),
+            500
+        );
+        assert_eq!(
+            ServerError::DirectPut(storage::test_support::direct_put_failure_for_kind(
+                storage::DirectPutFailureKind::InternalError,
+            ))
             .http_status(),
             500
         );

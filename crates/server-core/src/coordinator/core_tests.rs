@@ -10167,6 +10167,28 @@ fn object_metadata_mutation_failure_kinds_map_exhaustively_to_s3_outcomes() {
 }
 
 #[test]
+fn direct_put_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let map = |kind| {
+        Coordinator::map_direct_put_failure(storage::test_support::direct_put_failure_for_kind(
+            kind,
+        ))
+    };
+
+    for kind in [
+        storage::DirectPutFailureKind::ResourceExhausted,
+        storage::DirectPutFailureKind::MetadataCommandContention,
+        storage::DirectPutFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind), ServerError::SlowDown));
+    }
+    assert!(matches!(
+        map(storage::DirectPutFailureKind::InternalError),
+        ServerError::DirectPut(error)
+            if error.diagnostic_cause_label() == "store_internal_failure"
+    ));
+}
+
+#[test]
 fn stream_upload_failure_kinds_map_exhaustively_to_s3_outcomes() {
     let map = |kind| {
         Coordinator::map_stream_upload_failure(
@@ -13354,8 +13376,9 @@ fn direct_put_retry_converges_pending_partial_metadata_command() {
     assert!(
         matches!(
             first_err,
-            ServerError::Store(ref failure)
-                if failure.class() == storage::StoreOperationFailureClass::Other
+            ServerError::DirectPut(ref failure)
+                if failure.kind() == storage::DirectPutFailureKind::InternalError
+                    && failure.diagnostic_cause_label() == "store_io_failure"
         ),
         "expected injected direct PUT command failure, got {first_err:?}"
     );

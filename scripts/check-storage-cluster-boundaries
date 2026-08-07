@@ -4539,6 +4539,73 @@ fail_with_matches \
     "Admitted stream uploads must cross storage through StreamUploadFailure rather than raw storage implementation errors" \
     "$raw_stream_upload_error_transit"
 
+raw_direct_put_error_transit=$(
+    {
+        rg -n --color=never '\bObjectPgActionError\b|\bMetadataError\b|\bStoreError\b' \
+            crates/server-core/src/coordinator/put.rs \
+            || true
+        awk '
+        /^impl ActivePutObjectRoute/ {
+            in_direct_put_impl = 1
+            next
+        }
+        /^impl / {
+            in_direct_put_impl = 0
+            collecting_signature = 0
+        }
+        in_direct_put_impl && /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        in_direct_put_impl && collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/cluster.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub fn (reserve_put_object_generation|release_object_generation_reservation|write_direct_put_segment_payload_shards|commit_direct_put_object_from_payload_shards)' \
+            crates/storage/src/cluster.rs \
+            || true
+        if ! rg -q -U \
+            'pub fn load_existing_live_object(?s:.{0,300})ObjectReadFailure' \
+            crates/storage/src/cluster/request_ops.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/request_ops.rs: direct logical existing-object load must return ObjectReadFailure'
+        fi
+        if ! rg -q -U \
+            'fn map_direct_put_failure(?s:.{0,300})error: storage::DirectPutFailure' \
+            crates/server-core/src/coordinator/put.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/put.rs: direct PutObject response mapping must accept DirectPutFailure'
+        fi
+        if ! rg -q \
+            'DirectPut\(DirectPutFailure\)' \
+            crates/server-core/src/error.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/error.rs: internal direct PutObject failures must remain typed through ServerError'
+        fi
+    }
+)
+fail_with_matches \
+    "Direct PutObject must cross storage through DirectPutFailure rather than raw storage implementation errors" \
+    "$raw_direct_put_error_transit"
+
 http_storage_debug_representation_leaks=$(
     {
         rg -n --color=never \

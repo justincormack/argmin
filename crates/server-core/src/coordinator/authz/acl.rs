@@ -101,7 +101,7 @@ impl Coordinator {
                         req.object.bucket.name_typed(),
                         req.object.key_typed(),
                     )
-                    .map_err(Self::map_object_pg_action_error)?;
+                    .map_err(super::super::map_object_read_failure)?;
                 self.authorize_put_object_write_with_existing_object(
                     req,
                     &bucket,
@@ -126,7 +126,7 @@ impl Coordinator {
         self.with_bucket_write_handle_on_admitted_route(admission, &req.object, request, |bucket| {
             let existing_object = put_route
                 .load_existing_live_object()
-                .map_err(Coordinator::map_object_pg_action_error)?;
+                .map_err(Coordinator::map_direct_put_failure)?;
             self.authorize_put_object_write_with_existing_object(
                 req,
                 &bucket,
@@ -573,7 +573,7 @@ impl Coordinator {
             let existing_object = self
                 .storage_node()
                 .load_existing_live_object(req.object.bucket.name_typed(), req.object.key_typed())
-                .map_err(Self::map_object_pg_action_error)?;
+                .map_err(super::super::map_object_read_failure)?;
             self.authorize_create_multipart_upload_with_existing_object(
                 req,
                 &bucket,

@@ -3287,7 +3287,9 @@ impl ActivePutObjectRoute<'_> {
         }
     }
 
-    pub fn load_existing_live_object(&self) -> Result<Option<StoredObject>, ObjectPgActionError> {
+    pub fn load_existing_live_object(
+        &self,
+    ) -> Result<Option<StoredObject>, crate::DirectPutFailure> {
         let route = ObjectReadMetadataRoute {
             bucket: &self.bucket,
             key: &self.key,
@@ -3304,7 +3306,7 @@ impl ActivePutObjectRoute<'_> {
             Ok(Ok(StoredObject::DeleteMarker(_)))
             | Err(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)) => Ok(None),
             Ok(Err(never)) => match never {},
-            Err(error) => Err(error),
+            Err(error) => Err(crate::DirectPutFailure::from_object_pg_action(error)),
         }
     }
 
@@ -3350,7 +3352,7 @@ impl ActivePutObjectRoute<'_> {
     pub fn reserve_generation(
         &self,
         reservation_id: &SessionId,
-    ) -> Result<GenerationId, ObjectPgActionError> {
+    ) -> Result<GenerationId, crate::DirectPutFailure> {
         self.admission
             .cluster
             .reserve_put_object_generation_with_route_validation(
@@ -3358,6 +3360,7 @@ impl ActivePutObjectRoute<'_> {
                 reservation_id,
                 || self.admission.require_valid_now(),
             )
+            .map_err(crate::DirectPutFailure::from_object_pg_action)
     }
 
     pub fn create_stream_session<T, E>(
@@ -3553,7 +3556,7 @@ impl ActivePutObjectRoute<'_> {
         generation_id: GenerationId,
         logical_size: u64,
         data: &[u8],
-    ) -> Result<DirectPutPayloadWrite<'_>, StoreError> {
+    ) -> Result<DirectPutPayloadWrite<'_>, crate::DirectPutFailure> {
         let segment_index = 0;
         let segment_okh =
             crate::direct_put_segment_key_hash(generation_reservation_id, segment_index);
@@ -3567,7 +3570,8 @@ impl ActivePutObjectRoute<'_> {
                 &segment_okh,
                 data,
                 || self.admission.require_valid_now(),
-            )?;
+            )
+            .map_err(crate::DirectPutFailure::from_store)?;
         Ok(DirectPutPayloadWrite {
             owner: self.admission,
             armed: std::cell::Cell::new(true),
@@ -3590,7 +3594,7 @@ impl ActivePutObjectRoute<'_> {
         payload: DirectPutPayloadWrite<'_>,
         prepared: &PreparedDirectPutObjectCommit,
         action: impl FnMut(DirectPutCommitSnapshot) -> Result<(), E>,
-    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, ObjectPgActionError> {
+    ) -> Result<Result<FinalizeDirectPutObjectOutcome, E>, crate::DirectPutFailure> {
         if !payload.issued_by(self.admission)
             || payload.bucket != self.bucket
             || payload.key != self.key
@@ -3599,20 +3603,26 @@ impl ActivePutObjectRoute<'_> {
             self.admission
                 .cluster
                 .release_bucket_write_reservation_proof(&prepared.bucket_write_reservation)
-                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "direct PUT payload does not match admitted object route".to_string(),
-            });
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)
+                .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT payload does not match admitted object route".to_string(),
+                },
+            ));
         }
         if payload.placement_cluster_epoch != prepared.bucket_write_reservation.cluster_epoch {
             self.admission
                 .cluster
                 .release_bucket_write_reservation_proof(&prepared.bucket_write_reservation)
-                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "direct PUT payload does not match bucket write reservation epoch"
-                    .to_string(),
-            });
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)
+                .map_err(crate::DirectPutFailure::from_object_pg_action)?;
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT payload does not match bucket write reservation epoch"
+                        .to_string(),
+                },
+            ));
         }
         let request = CommitDirectPutObjectReq {
             bucket: payload.bucket.clone(),
@@ -3648,6 +3658,7 @@ impl ActivePutObjectRoute<'_> {
                 || self.admission.require_valid_now(),
                 action,
             )
+            .map_err(crate::DirectPutFailure::from_object_pg_action)
     }
 
     pub fn release_generation_reservation(&self, reservation_id: &SessionId) {
@@ -3660,15 +3671,17 @@ impl ActivePutObjectRoute<'_> {
     pub fn discard_direct_object_payload(
         &self,
         payload: DirectPutPayloadWrite<'_>,
-    ) -> Result<(), ObjectPgActionError> {
+    ) -> Result<(), crate::DirectPutFailure> {
         let subject_matches = payload.issued_by(self.admission)
             && payload.bucket == self.bucket
             && payload.key == self.key;
         payload.cleanup_on_owner();
         if !subject_matches {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "direct PUT payload does not match admitted object route".to_string(),
-            });
+            return Err(crate::DirectPutFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "direct PUT payload does not match admitted object route".to_string(),
+                },
+            ));
         }
         Ok(())
     }
@@ -3682,11 +3695,14 @@ impl ActivePutObjectRoute<'_> {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
-        self.admission.require_valid_now()?;
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, crate::DirectPutFailure> {
+        self.admission
+            .require_valid_now()
+            .map_err(crate::DirectPutFailure::from_store)?;
         self.admission
             .cluster
             .try_probe_object_pg_available(&self.bucket, &self.key)
+            .map_err(crate::DirectPutFailure::from_object_pg_action)
     }
 }
 
@@ -12666,7 +12682,8 @@ impl StorageCluster {
         )
     }
 
-    pub fn reserve_put_object_generation(
+    #[cfg(test)]
+    pub(crate) fn reserve_put_object_generation(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -14562,7 +14579,7 @@ impl StorageCluster {
         let _ = self.release_object_generation_reservation(bucket, key, reservation_id);
     }
 
-    pub fn release_object_generation_reservation(
+    pub(crate) fn release_object_generation_reservation(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

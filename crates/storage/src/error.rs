@@ -2560,6 +2560,102 @@ impl std::fmt::Display for ObjectMetadataMutationFailure {
 
 impl std::error::Error for ObjectMetadataMutationFailure {}
 
+/// Exhaustive logical outcome of an admitted direct PutObject operation.
+///
+/// Conditional-request and object-existence decisions are returned through
+/// the commit callback, not through this storage failure. Physical placement,
+/// reservation, command-log, route, database, and RPC details remain owned by
+/// storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectPutFailureKind {
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+/// Opaque failure returned by admitted direct PutObject capabilities.
+pub struct DirectPutFailure {
+    kind: DirectPutFailureKind,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl DirectPutFailure {
+    #[must_use]
+    pub const fn kind(&self) -> DirectPutFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let (operation_kind, diagnostic_category) = classify_object_pg_action(error);
+        let kind = match operation_kind {
+            ObjectOperationFailureKind::ResourceExhausted => {
+                DirectPutFailureKind::ResourceExhausted
+            }
+            ObjectOperationFailureKind::MetadataCommandContention => {
+                DirectPutFailureKind::MetadataCommandContention
+            }
+            ObjectOperationFailureKind::RetryableConvergence => {
+                DirectPutFailureKind::RetryableConvergence
+            }
+            ObjectOperationFailureKind::ObjectNotFound
+            | ObjectOperationFailureKind::InternalError => DirectPutFailureKind::InternalError,
+        };
+        Self {
+            kind,
+            diagnostic_category,
+        }
+    }
+
+    pub(crate) fn from_store(error: StoreError) -> Self {
+        Self::from_object_pg_action(ObjectPgActionError::Store(error))
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) const fn for_test(kind: DirectPutFailureKind) -> Self {
+        let operation_kind = match kind {
+            DirectPutFailureKind::ResourceExhausted => {
+                ObjectMetadataMutationFailureKind::ResourceExhausted
+            }
+            DirectPutFailureKind::MetadataCommandContention => {
+                ObjectMetadataMutationFailureKind::MetadataCommandContention
+            }
+            DirectPutFailureKind::RetryableConvergence => {
+                ObjectMetadataMutationFailureKind::RetryableConvergence
+            }
+            DirectPutFailureKind::InternalError => ObjectMetadataMutationFailureKind::InternalError,
+        };
+        let failure = ObjectMetadataMutationFailure::for_test(operation_kind);
+        Self {
+            kind,
+            diagnostic_category: failure.diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for DirectPutFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DirectPutFailure")
+            .field("kind", &self.kind)
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for DirectPutFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("direct PutObject failed")
+    }
+}
+
+impl std::error::Error for DirectPutFailure {}
+
 /// Exhaustive logical outcome of an admitted stream-upload operation.
 ///
 /// Session state and the client-visible invalid-request reason are logical
@@ -3456,6 +3552,88 @@ mod tests {
                 source: DatabaseError::new(SECRET_SOURCE),
             }),
         );
+        assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
+        let rendered = format!("{metadata:?} {metadata}");
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&metadata).is_none());
+    }
+
+    #[test]
+    fn direct_put_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| DirectPutFailure::from_object_pg_action(error).kind();
+
+        for (class, expected) in [
+            (
+                StoreOperationFailureClass::ResourceExhausted,
+                DirectPutFailureKind::ResourceExhausted,
+            ),
+            (
+                StoreOperationFailureClass::MetadataCommandContention,
+                DirectPutFailureKind::MetadataCommandContention,
+            ),
+            (
+                StoreOperationFailureClass::RetryableConvergence,
+                DirectPutFailureKind::RetryableConvergence,
+            ),
+            (
+                StoreOperationFailureClass::Other,
+                DirectPutFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(
+                convert(ObjectPgActionError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                )),
+                expected
+            );
+            assert_eq!(DirectPutFailure::for_test(expected).kind(), expected);
+        }
+
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(
+                MetadataError::ObjectGenerationReservationConflict {
+                    reservation_id: "opaque-reservation".to_string(),
+                    generation_id: 7,
+                },
+            )),
+            DirectPutFailureKind::MetadataCommandContention
+        );
+        for error in [
+            ObjectPgActionError::Metadata(MetadataError::ObjectNotFound),
+            ObjectPgActionError::InvalidRequest {
+                reason: "crossed direct PutObject authority".to_string(),
+            },
+            ObjectPgActionError::StaleDirectPutCommitSnapshot,
+        ] {
+            assert_eq!(convert(error), DirectPutFailureKind::InternalError);
+        }
+    }
+
+    #[test]
+    fn direct_put_failure_discards_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret direct PutObject operation";
+        const SECRET_SOURCE: &str = "secret direct PutObject source";
+        let failure = DirectPutFailure::from_store(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+
+        assert_eq!(failure.kind(), DirectPutFailureKind::InternalError);
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "direct PutObject failed");
+        let rendered = format!("{failure:?} {failure}");
+        assert!(rendered.contains("store_io_failure"));
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&failure).is_none());
+
+        let metadata = DirectPutFailure::from_object_pg_action(ObjectPgActionError::Metadata(
+            MetadataError::Db {
+                context: SECRET_CONTEXT,
+                source: DatabaseError::new(SECRET_SOURCE),
+            },
+        ));
         assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
         let rendered = format!("{metadata:?} {metadata}");
         assert!(!rendered.contains(SECRET_CONTEXT));

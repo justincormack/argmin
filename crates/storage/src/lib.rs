@@ -153,10 +153,10 @@ pub(crate) use error::{
 };
 pub use error::{
     BucketSnapshotLoadFailure, BucketSnapshotLoadFailureKind, BucketWriteDrainFailure,
-    BucketWriteDrainFailureKind, ClusterBuildError, MetadataError, ObjectMetadataMutationFailure,
-    ObjectMetadataMutationFailureKind, ObjectPgActionError, ObjectReadFailure,
-    ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
-    StreamUploadFailure, StreamUploadFailureKind,
+    BucketWriteDrainFailureKind, ClusterBuildError, DirectPutFailure, DirectPutFailureKind,
+    MetadataError, ObjectMetadataMutationFailure, ObjectMetadataMutationFailureKind,
+    ObjectPgActionError, ObjectReadFailure, ObjectReadFailureKind, ShardIoError, StoreError,
+    StoreFailure, StoreOperationFailureClass, StreamUploadFailure, StreamUploadFailureKind,
 };
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
@@ -1599,6 +1599,27 @@ pub mod test_support {
     #[must_use]
     pub fn stream_upload_failure_for_kind(kind: StreamUploadFailureKind) -> StreamUploadFailure {
         StreamUploadFailure::for_test(kind)
+    }
+
+    /// Construct an opaque direct-PutObject failure from its logical outcome.
+    #[must_use]
+    pub fn direct_put_failure_for_kind(kind: DirectPutFailureKind) -> DirectPutFailure {
+        DirectPutFailure::for_test(kind)
+    }
+
+    /// Construct an opaque direct-PutObject failure containing a bounded I/O
+    /// diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn direct_put_failure_diagnostic_fixture() -> (DirectPutFailure, &'static [&'static str]) {
+        const SECRET_CONTEXT: &str = "secret direct PutObject fixture operation";
+        const SECRET_SOURCE: &str = "secret direct PutObject fixture source";
+        (
+            DirectPutFailure::from_store(StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            }),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
     }
 
     /// Construct an opaque stream-upload failure containing a bounded I/O
