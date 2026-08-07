@@ -4554,27 +4554,6 @@ impl ObjectReadMetadataRoute for LocalObjectReadMetadataRoute {
             snapshot_mode,
         )
     }
-
-    fn get_object_tags_for_subject(
-        &self,
-        version_id: Option<VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        authorized_version_id: VersionId,
-    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
-        let pg = self.storage_node.get_pg_for_metadata_read(
-            self.node_id,
-            self.pg_id.pg_id(),
-            self.authorization,
-        )?;
-        SharedStorageNode::get_object_tags_for_subject_from_object_pg(
-            &pg,
-            &self.bucket,
-            &self.key,
-            version_id,
-            expected_identity,
-            authorized_version_id,
-        )
-    }
 }
 
 impl ObjectListingMetadataNodeClient for LocalStorageNodeClient {

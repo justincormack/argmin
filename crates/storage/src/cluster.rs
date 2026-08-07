@@ -30,7 +30,8 @@ use crate::control_plane::{
 };
 use crate::control_plane_lease::BoundRouteMapLease;
 use crate::error::{
-    ClusterBuildError, ObjectReadFailure, PgMetadataTransferError, ShardIoError, StoreError,
+    ClusterBuildError, ObjectMetadataMutationFailure, ObjectReadFailure, PgMetadataTransferError,
+    ShardIoError, StoreError,
 };
 use crate::metadata_command::{
     metadata_command_log_hash, AbortStreamUploadCommand, AppendStreamSegmentCommand,
@@ -3048,7 +3049,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
         &self,
         tags: &SerializedTagSet,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectMetadataMutationFailure> {
         self.admission
             .cluster
             .put_object_metadata_if_with_route_validation(
@@ -3063,12 +3064,13 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                     ))
                 },
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     pub fn delete_tags_if<E>(
         &self,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<(), E>, ObjectPgActionError> {
+    ) -> Result<Result<(), E>, ObjectMetadataMutationFailure> {
         self.admission
             .cluster
             .put_object_metadata_if_with_route_validation(
@@ -3079,6 +3081,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                     Ok(((), version_id, PutObjectMetadataMutation::DeleteTags))
                 },
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     /// Returns the version id the retention was applied to.
@@ -3086,7 +3089,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
         &self,
         retention: ObjectRetention,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectMetadataMutationFailure> {
         self.admission
             .cluster
             .put_object_metadata_if_with_route_validation(
@@ -3101,6 +3104,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                     ))
                 },
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     /// Returns the version id the legal hold was applied to.
@@ -3108,7 +3112,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
         &self,
         legal_hold: StoredLegalHoldStatus,
         mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectMetadataMutationFailure> {
         self.admission
             .cluster
             .put_object_metadata_if_with_route_validation(
@@ -3123,12 +3127,13 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                     ))
                 },
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     pub fn put_acl_if<E>(
         &self,
         mut action: impl FnMut(&StoredObject) -> Result<(VersionId, AclGrants, bool), E>,
-    ) -> Result<Result<VersionId, E>, ObjectPgActionError> {
+    ) -> Result<Result<VersionId, E>, ObjectMetadataMutationFailure> {
         self.admission
             .cluster
             .put_object_metadata_if_with_route_validation(
@@ -3146,12 +3151,13 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                     ))
                 },
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     pub fn delete_current_object_if<T, E>(
         &self,
         action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
-    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<Result<DeleteCurrentObjectOutcome<T>, E>, ObjectMetadataMutationFailure> {
         self.admission
             .cluster
             .delete_current_object_if_with_route_validation(
@@ -3159,12 +3165,14 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                 || self.admission.require_valid_now(),
                 action,
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     pub fn delete_specific_object_version_if<T, E>(
         &self,
         action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
-    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectMetadataMutationFailure>
+    {
         self.admission
             .cluster
             .delete_specific_object_version_if_with_route_validation(
@@ -3172,6 +3180,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                 || self.admission.require_valid_now(),
                 action,
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     pub fn insert_current_delete_marker_if<T, E>(
@@ -3179,7 +3188,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
         versioning: BucketVersioningState,
         owner: OwnerIdentity,
         action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
-    ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectPgActionError> {
+    ) -> Result<Result<InsertCurrentDeleteMarkerOutcome<T>, E>, ObjectMetadataMutationFailure> {
         self.admission
             .cluster
             .insert_current_delete_marker_if_with_route_validation(
@@ -3189,6 +3198,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
                 owner,
                 action,
             )
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 
     pub fn enqueue_object_payload_reclaim(&self, generation_id: GenerationId) {
@@ -3200,11 +3210,14 @@ impl ActiveObjectMetadataMutationRoute<'_> {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectPgActionError> {
-        self.admission.require_valid_now()?;
+    pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectMetadataMutationFailure> {
+        self.admission.require_valid_now().map_err(|error| {
+            ObjectMetadataMutationFailure::from_object_pg_action(ObjectPgActionError::Store(error))
+        })?;
         self.admission
             .cluster
             .try_probe_object_pg_available(&self.bucket, &self.key)
+            .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
     }
 }
 

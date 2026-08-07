@@ -1,5 +1,4 @@
 use super::*;
-use s3_types::VersionId;
 #[cfg(test)]
 use s3_types::{AclGrants, LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus};
 
@@ -18,57 +17,6 @@ impl SharedStorageNode {
             None => PgMetadataStore::get_object_meta(&*pg, bucket, key)?,
         };
         action(&pg, &stored)
-    }
-
-    #[cfg(test)]
-    pub fn get_object_tags_if<E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        action: impl FnOnce(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<Option<crate::SerializedTagSet>, E>, ObjectPgActionError> {
-        self.with_object_metadata_if(bucket, key, version_id, |pg, stored| match action(stored) {
-            Ok(version_id) => Ok(Ok(PgMetadataStore::get_object_tags(
-                pg, bucket, key, version_id,
-            )?)),
-            Err(error) => Ok(Err(error)),
-        })
-    }
-
-    pub(crate) fn get_object_tags_for_subject_from_object_pg(
-        pg: &PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        authorized_version_id: VersionId,
-    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
-        let stored = match Self::load_stored_object_from_object_pg(pg, bucket, key, version_id) {
-            Ok(stored) => stored,
-            Err(ObjectPgActionError::Metadata(crate::error::MetadataError::ObjectNotFound)) => {
-                return Err(ObjectPgActionError::StaleObjectReadSubject);
-            }
-            Err(error) => return Err(error),
-        };
-        if !expected_identity.matches_stored(&stored) {
-            return Err(ObjectPgActionError::StaleObjectReadSubject);
-        }
-        if stored.version_id() != authorized_version_id {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: format!(
-                    "object tag action returned version {:?} for stored version {:?}",
-                    authorized_version_id,
-                    stored.version_id()
-                ),
-            });
-        }
-        Ok(PgMetadataStore::get_object_tags(
-            pg,
-            bucket,
-            key,
-            authorized_version_id,
-        )?)
     }
 
     #[cfg(test)]

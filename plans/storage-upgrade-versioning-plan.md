@@ -639,7 +639,7 @@ but no version negotiation or supported compatibility window:
 
 | Surface | Current wire baseline | Authentication baseline | Negotiation and current disposition |
 | --- | --- | --- | --- |
-| Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 15` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
+| Storage-node RPC | `STORAGE_RPC_FRAME_ENCODING_VERSION = 16` in `storage_rpc.rs`; frame magic, message-kind tags, checksums, and payload codecs are crate-private. | Binding version 2 and transport-envelope version 1 in `storage_rpc_auth.rs`. | Exact versions are required before dispatch. There is no negotiation. Treat any other version as incompatible until mixed-version operation is designed. |
 | Control-plane RPC | `CONTROL_PLANE_RPC_VERSION = 13` in `control_plane.rs`; the frame contains magic, version, request kind, length, checksum, and payload. | Shared control-plane authentication-envelope version 1 in `control_plane_auth.rs`. | The frame and auth decoders reject non-current versions before logical dispatch. There is no negotiation. Treat any other version as incompatible. |
 | Raft peer RPC | `CONTROL_PLANE_RAFT_PEER_RPC_VERSION = 2` in `control_plane_raft.rs`; request, response, snapshot, peer-identity, checksum, and numeric OpenRaft tags share this baseline. | Shared control-plane authentication-envelope version 1, with the authenticated operation and peer identity bound to the inner frame. | The decoder rejects non-current versions before OpenRaft dispatch. There is no negotiation, and OpenRaft peers currently require the same binary. Treat any other version as incompatible. |
 
@@ -1773,7 +1773,7 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 1`; version zero is valid only with no user schema objects | Recorded |
 | Metadata commands and abandoned-command records | `storage` | command encoding 6; abandoned-command encoding 1 | Evidence required |
 | Metadata checkpoints and canonical state | `storage` | checkpoint encoding 1; canonical-state encoding 4 | Evidence required |
-| Storage-node RPC and authentication | `storage` | frame encoding 15; auth binding 2; auth transport envelope 1 | Evidence required; transport/profile and wire-error containment are complete, while item 14's public operation-error cleanup does not change this private wire baseline |
+| Storage-node RPC and authentication | `storage` | frame encoding 16; auth binding 2; auth transport envelope 1 | Evidence required; transport/profile and wire-error containment are complete. Item 14 removed the superseded per-subject tag-read message kind and advanced the private frame baseline from 15 to 16; exact v16 bytes and resealed v15/v17 rejection fixtures pin the new boundary. |
 | Control-plane logical state, commands, and snapshots | `storage` | state 27; command 14; snapshot 1 | Evidence required; topology and administration workflow containment are complete |
 | Control-plane RPC and authentication | `storage` | RPC 13; shared authentication envelope 1 | Evidence required |
 | Single-authority control-plane durable artifacts | `storage` | clock checkpoint 2; state identity 1; initialized marker 1; journal file 2; journal record 2 | Evidence required |
@@ -2086,6 +2086,25 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        fixtures, and the boundary check rejects raw error return types from every synchronous,
        leased, and payload-retention read entry point or their reintroduction into the
        authorization seam.
+       The object-metadata mutation sub-slice completed on 2026-08-07. Public admitted tag,
+       retention, legal-hold, ACL, and delete capabilities now return opaque
+       `ObjectMetadataMutationFailure` values with an exhaustive logical kind for object absence,
+       resource exhaustion, metadata-command contention, retryable convergence, and internal
+       failure. Storage owns the common object-operation classification and retains only a bounded
+       diagnostic category. `server-core` continues to select operation-specific policy:
+       PutObjectTagging maps contention to `OperationAborted`, conditional delete maps it to
+       `ConditionalRequestConflict`, other mutations throttle it, and missing-object disclosure
+       remains authorization- and version-aware. Internal failures remain typed through
+       `ServerError::ObjectMetadataMutation`, preserving bounded request diagnostics without raw
+       storage errors. Unused direct legal-hold and retention readers were removed; remaining
+       owner-test mutation/read helpers are crate-private and test-only. Owner-local exhaustive
+       classification and redaction tests, cross-crate logical mapping tests, and the boundary
+       checker prevent raw error transit through this operation family. The superseded
+       per-subject object-tag read RPC, its wire codec and admission branch, and its old
+       split-read retry test were removed; current object-read snapshots already bind tags to the
+       authorized stored-object identity atomically. Because that removal changed the accepted
+       message-kind grammar, storage RPC frame encoding advanced from 15 to 16 rather than leaving
+       an incompatible grammar under the old marker.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces

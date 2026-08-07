@@ -10424,57 +10424,6 @@ impl super::StorageCluster {
             .exists()
     }
 
-    pub fn get_object_tags_if<E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        mut action: impl FnMut(&StoredObject) -> Result<VersionId, E>,
-    ) -> Result<Result<Option<SerializedTagSet>, E>, ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
-        let pg_id = object_pg_id.pg_id();
-        let read_node = self
-            .local_map
-            .metadata_pg_read_node(self.operation_epoch(), pg_id)?;
-        let object_read_client = read_node.object_read_metadata_client();
-        let object_read_route = object_read_client.open_object_read_metadata_route(
-            self.operation_epoch(),
-            object_pg_id,
-            bucket,
-            key,
-            read_node.authorization(),
-        )?;
-
-        let mut work_budget =
-            super::RequestWorkBudget::new(OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET, None)
-                .for_operation("get_object_tags")
-                .for_pg(pg_id);
-        loop {
-            work_budget
-                .check("get object tags stale retry budget exhausted")
-                .map_err(ObjectPgActionError::Store)?;
-            let subject = object_read_route.load_object_read_auth_subject(version_id)?;
-            let authorized_version_id = match action(&subject.stored) {
-                Ok(authorized_version_id) => authorized_version_id,
-                Err(error) => return Ok(Err(error)),
-            };
-            match object_read_route.get_object_tags_for_subject(
-                version_id,
-                &subject.identity,
-                authorized_version_id,
-            ) {
-                Ok(tags) => return Ok(Ok(tags)),
-                Err(ObjectPgActionError::StaleObjectReadSubject) => {
-                    work_budget
-                        .sleep_after_contention("get object tags stale retry budget exhausted")
-                        .map_err(ObjectPgActionError::Store)?;
-                    continue;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-
     fn put_object_metadata_command_from_stored(
         stored: &StoredObject,
         version_id: VersionId,
@@ -10713,7 +10662,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn put_object_tags_if<E>(
+    pub(crate) fn put_object_tags_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -10732,7 +10681,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn delete_object_tags_if<E>(
+    pub(crate) fn delete_object_tags_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -10747,7 +10696,7 @@ impl super::StorageCluster {
 
     /// Returns the version id the retention was applied to.
     #[cfg(test)]
-    pub fn put_object_retention_if<E>(
+    pub(crate) fn put_object_retention_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -10767,7 +10716,7 @@ impl super::StorageCluster {
 
     /// Returns the version id the legal hold was applied to.
     #[cfg(test)]
-    pub fn put_object_legal_hold_if<E>(
+    pub(crate) fn put_object_legal_hold_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -10786,7 +10735,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn put_object_acl_if<E>(
+    pub(crate) fn put_object_acl_if<E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -10804,54 +10753,6 @@ impl super::StorageCluster {
                 },
             ))
         })
-    }
-
-    pub fn get_object_legal_hold_if<E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        action: impl FnOnce(&StoredObject) -> Result<Option<LegalHoldStatus>, E>,
-    ) -> Result<Result<Option<LegalHoldStatus>, E>, ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
-        let pg_id = object_pg_id.pg_id();
-        let object_read_client = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client();
-        let object_read_route = object_read_client.open_object_read_metadata_route(
-            self.operation_epoch(),
-            object_pg_id,
-            bucket,
-            key,
-            MetadataReadAuthorization::active(pg_id),
-        )?;
-        let subject = object_read_route.load_object_read_auth_subject(version_id)?;
-        Ok(action(&subject.stored))
-    }
-
-    pub fn get_object_retention_if<E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        action: impl FnOnce(&StoredObject) -> Result<Option<ObjectRetention>, E>,
-    ) -> Result<Result<Option<ObjectRetention>, E>, ObjectPgActionError> {
-        let object_pg_id = self.object_metadata_pg(bucket, key);
-        let pg_id = object_pg_id.pg_id();
-        let object_read_client = self
-            .local_map
-            .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
-            .object_read_metadata_client();
-        let object_read_route = object_read_client.open_object_read_metadata_route(
-            self.operation_epoch(),
-            object_pg_id,
-            bucket,
-            key,
-            MetadataReadAuthorization::active(pg_id),
-        )?;
-        let subject = object_read_route.load_object_read_auth_subject(version_id)?;
-        Ok(action(&subject.stored))
     }
 
     fn load_bucket_lifecycle_context(
@@ -11767,28 +11668,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn delete_specific_object_version_if<T, E>(
-        &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: VersionId,
-        action: impl FnMut(Option<&StoredObject>) -> Result<T, E>,
-    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
-        self.delete_specific_object_version_if_with_route_validation(
-            super::ObjectMetadataMutationEffectRoute {
-                pg_id: self.object_metadata_pg(bucket, key),
-                bucket,
-                key,
-                requested_version_id: Some(version_id),
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            || Ok(()),
-            action,
-        )
-    }
-
-    #[cfg(test)]
-    pub fn delete_current_object_if<T, E>(
+    pub(crate) fn delete_current_object_if<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -11808,7 +11688,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
-    pub fn insert_current_delete_marker_if<T, E>(
+    pub(crate) fn insert_current_delete_marker_if<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

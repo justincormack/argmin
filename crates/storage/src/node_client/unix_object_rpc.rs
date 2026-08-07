@@ -5604,46 +5604,6 @@ impl UnixStorageNodeClient {
             }
         }
     }
-
-    fn get_object_tags_for_subject(
-        &self,
-        pg_id: ObjectMetadataPgId,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        authorized_version_id: VersionId,
-    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
-        let request = StorageRpcObjectTagsForSubjectRequest {
-            object: StorageRpcObjectRequest {
-                node_id: self.node_id,
-                cluster_epoch: self.cluster_epoch,
-                pg_id: pg_id.pg_id(),
-                bucket: bucket.clone(),
-                key: key.clone(),
-            },
-            version_id,
-            expected_identity: expected_identity.clone(),
-            authorized_version_id,
-        };
-        let payload = encode_object_tags_for_subject_request(&request);
-        let response = self
-            .rpc_request(StorageRpcMessageKind::ObjectTagsForSubjectLoad, payload)
-            .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_tags_for_subject_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode object tags for subject response",
-                    error.to_string(),
-                ))
-            })?;
-        match response.outcome {
-            StorageRpcObjectTagsForSubjectOutcome::Loaded(tags) => Ok(tags),
-            StorageRpcObjectTagsForSubjectOutcome::StaleSubject => {
-                Err(ObjectPgActionError::StaleObjectReadSubject)
-            }
-        }
-    }
 }
 
 impl ObjectReadMetadataNodeClient for UnixStorageNodeClient {
@@ -5742,22 +5702,6 @@ impl ObjectReadMetadataRoute for UnixObjectReadMetadataRoute<'_> {
             version_id,
             expected_identity,
             snapshot_mode,
-        )
-    }
-
-    fn get_object_tags_for_subject(
-        &self,
-        version_id: Option<VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        authorized_version_id: VersionId,
-    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError> {
-        self.client.get_object_tags_for_subject(
-            self.pg_id,
-            &self.bucket,
-            &self.key,
-            version_id,
-            expected_identity,
-            authorized_version_id,
         )
     }
 }

@@ -60,15 +60,15 @@ impl Coordinator {
         Self::map_object_read_snapshot_error(bucket, key, version_id, can_discover_missing, error)
     }
 
-    fn map_object_metadata_mutation_access_error(
+    pub(super) fn map_object_metadata_mutation_access_error(
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
         can_discover_missing: bool,
-        error: storage::ObjectPgActionError,
+        error: storage::ObjectMetadataMutationFailure,
     ) -> ServerError {
-        match error {
-            storage::ObjectPgActionError::Metadata(storage::MetadataError::ObjectNotFound) => {
+        match error.kind() {
+            storage::ObjectMetadataMutationFailureKind::ObjectNotFound => {
                 if !can_discover_missing {
                     ServerError::AccessDenied
                 } else if let Some(version_id) = version_id {
@@ -84,7 +84,14 @@ impl Coordinator {
                     }
                 }
             }
-            other => Self::map_object_pg_action_error(other),
+            storage::ObjectMetadataMutationFailureKind::ResourceExhausted
+            | storage::ObjectMetadataMutationFailureKind::MetadataCommandContention
+            | storage::ObjectMetadataMutationFailureKind::RetryableConvergence => {
+                ServerError::SlowDown
+            }
+            storage::ObjectMetadataMutationFailureKind::InternalError => {
+                ServerError::ObjectMetadataMutation(error)
+            }
         }
     }
 
@@ -440,7 +447,9 @@ impl Coordinator {
                 Ok(stored.version_id())
             })
             .map_err(|error| {
-                if super::object_pg_action_error_is_metadata_command_contention(&error) {
+                if error.kind()
+                    == storage::ObjectMetadataMutationFailureKind::MetadataCommandContention
+                {
                     ServerError::OperationAborted
                 } else {
                     Self::map_object_metadata_mutation_access_error(

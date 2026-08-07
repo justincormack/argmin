@@ -153,9 +153,9 @@ pub(crate) use error::{
 };
 pub use error::{
     BucketSnapshotLoadFailure, BucketSnapshotLoadFailureKind, BucketWriteDrainFailure,
-    BucketWriteDrainFailureKind, ClusterBuildError, MetadataError, ObjectPgActionError,
-    ObjectReadFailure, ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure,
-    StoreOperationFailureClass,
+    BucketWriteDrainFailureKind, ClusterBuildError, MetadataError, ObjectMetadataMutationFailure,
+    ObjectMetadataMutationFailureKind, ObjectPgActionError, ObjectReadFailure,
+    ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
 };
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
@@ -1581,6 +1581,32 @@ pub mod test_support {
     #[must_use]
     pub fn object_read_failure_for_kind(kind: ObjectReadFailureKind) -> ObjectReadFailure {
         ObjectReadFailure::for_test(kind)
+    }
+
+    /// Construct an opaque object-metadata mutation failure from its logical outcome.
+    #[must_use]
+    pub fn object_metadata_mutation_failure_for_kind(
+        kind: ObjectMetadataMutationFailureKind,
+    ) -> ObjectMetadataMutationFailure {
+        ObjectMetadataMutationFailure::for_test(kind)
+    }
+
+    /// Construct an opaque object-metadata mutation failure containing a
+    /// bounded I/O diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn object_metadata_mutation_failure_diagnostic_fixture(
+    ) -> (ObjectMetadataMutationFailure, &'static [&'static str]) {
+        const SECRET_CONTEXT: &str = "secret object mutation fixture operation";
+        const SECRET_SOURCE: &str = "secret object mutation fixture source";
+        (
+            ObjectMetadataMutationFailure::from_object_pg_action(ObjectPgActionError::Store(
+                StoreError::Io {
+                    context: SECRET_CONTEXT,
+                    source: std::io::Error::other(SECRET_SOURCE),
+                },
+            )),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
     }
 
     /// Construct an opaque object-read failure containing a bounded I/O

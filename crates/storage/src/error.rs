@@ -2256,14 +2256,14 @@ pub enum ObjectReadFailureKind {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ObjectReadFailureDiagnosticCategory {
+enum ObjectOperationFailureDiagnosticCategory {
     Operation(OperationFailureDiagnosticCategory),
     InvalidRequest,
     StaleObjectReadSubject,
     UnexpectedObjectOperationOutcome,
 }
 
-impl ObjectReadFailureDiagnosticCategory {
+impl ObjectOperationFailureDiagnosticCategory {
     const fn cause_label(self) -> &'static str {
         match self {
             Self::Operation(category) => category.cause_label(),
@@ -2274,6 +2274,75 @@ impl ObjectReadFailureDiagnosticCategory {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ObjectOperationFailureKind {
+    ObjectNotFound,
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+fn classify_object_pg_action(
+    error: ObjectPgActionError,
+) -> (
+    ObjectOperationFailureKind,
+    ObjectOperationFailureDiagnosticCategory,
+) {
+    let diagnostic_category = match &error {
+        ObjectPgActionError::Store(error) => ObjectOperationFailureDiagnosticCategory::Operation(
+            OperationFailureDiagnosticCategory::from_store(error),
+        ),
+        ObjectPgActionError::Metadata(error) => {
+            ObjectOperationFailureDiagnosticCategory::Operation(
+                OperationFailureDiagnosticCategory::from_metadata(error),
+            )
+        }
+        ObjectPgActionError::InvalidRequest { .. } => {
+            ObjectOperationFailureDiagnosticCategory::InvalidRequest
+        }
+        ObjectPgActionError::StaleObjectReadSubject => {
+            ObjectOperationFailureDiagnosticCategory::StaleObjectReadSubject
+        }
+        ObjectPgActionError::StaleDirectPutCommitSnapshot
+        | ObjectPgActionError::StaleStreamFinalizeSnapshot
+        | ObjectPgActionError::StaleMultipartCompletionSnapshot
+        | ObjectPgActionError::MultipartConditionalRequestConflict => {
+            ObjectOperationFailureDiagnosticCategory::UnexpectedObjectOperationOutcome
+        }
+    };
+    let kind = match &error {
+        ObjectPgActionError::Store(error) => match error.operation_failure_class() {
+            StoreOperationFailureClass::ResourceExhausted => {
+                ObjectOperationFailureKind::ResourceExhausted
+            }
+            StoreOperationFailureClass::MetadataCommandContention => {
+                ObjectOperationFailureKind::MetadataCommandContention
+            }
+            StoreOperationFailureClass::RetryableConvergence => {
+                ObjectOperationFailureKind::RetryableConvergence
+            }
+            StoreOperationFailureClass::Other => ObjectOperationFailureKind::InternalError,
+        },
+        ObjectPgActionError::Metadata(MetadataError::ObjectNotFound) => {
+            ObjectOperationFailureKind::ObjectNotFound
+        }
+        ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
+            ObjectOperationFailureKind::MetadataCommandContention
+        }
+        ObjectPgActionError::Metadata(_)
+        | ObjectPgActionError::InvalidRequest { .. }
+        | ObjectPgActionError::StaleObjectReadSubject
+        | ObjectPgActionError::StaleDirectPutCommitSnapshot
+        | ObjectPgActionError::StaleStreamFinalizeSnapshot
+        | ObjectPgActionError::StaleMultipartCompletionSnapshot
+        | ObjectPgActionError::MultipartConditionalRequestConflict => {
+            ObjectOperationFailureKind::InternalError
+        }
+    };
+    (kind, diagnostic_category)
+}
+
 /// Opaque failure returned by public object-read capabilities.
 ///
 /// The semantic kind is sufficient for request translation. The diagnostic
@@ -2282,7 +2351,7 @@ impl ObjectReadFailureDiagnosticCategory {
 /// implementation error.
 pub struct ObjectReadFailure {
     kind: ObjectReadFailureKind,
-    diagnostic_category: ObjectReadFailureDiagnosticCategory,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
 }
 
 impl ObjectReadFailure {
@@ -2297,54 +2366,19 @@ impl ObjectReadFailure {
     }
 
     pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
-        let diagnostic_category = match &error {
-            ObjectPgActionError::Store(error) => ObjectReadFailureDiagnosticCategory::Operation(
-                OperationFailureDiagnosticCategory::from_store(error),
-            ),
-            ObjectPgActionError::Metadata(error) => ObjectReadFailureDiagnosticCategory::Operation(
-                OperationFailureDiagnosticCategory::from_metadata(error),
-            ),
-            ObjectPgActionError::InvalidRequest { .. } => {
-                ObjectReadFailureDiagnosticCategory::InvalidRequest
+        let (operation_kind, diagnostic_category) = classify_object_pg_action(error);
+        let kind = match operation_kind {
+            ObjectOperationFailureKind::ObjectNotFound => ObjectReadFailureKind::ObjectNotFound,
+            ObjectOperationFailureKind::ResourceExhausted => {
+                ObjectReadFailureKind::ResourceExhausted
             }
-            ObjectPgActionError::StaleObjectReadSubject => {
-                ObjectReadFailureDiagnosticCategory::StaleObjectReadSubject
-            }
-            ObjectPgActionError::StaleDirectPutCommitSnapshot
-            | ObjectPgActionError::StaleStreamFinalizeSnapshot
-            | ObjectPgActionError::StaleMultipartCompletionSnapshot
-            | ObjectPgActionError::MultipartConditionalRequestConflict => {
-                ObjectReadFailureDiagnosticCategory::UnexpectedObjectOperationOutcome
-            }
-        };
-        let kind = match &error {
-            ObjectPgActionError::Store(error) => match error.operation_failure_class() {
-                StoreOperationFailureClass::ResourceExhausted => {
-                    ObjectReadFailureKind::ResourceExhausted
-                }
-                StoreOperationFailureClass::MetadataCommandContention => {
-                    ObjectReadFailureKind::MetadataCommandContention
-                }
-                StoreOperationFailureClass::RetryableConvergence => {
-                    ObjectReadFailureKind::RetryableConvergence
-                }
-                StoreOperationFailureClass::Other => ObjectReadFailureKind::InternalError,
-            },
-            ObjectPgActionError::Metadata(MetadataError::ObjectNotFound) => {
-                ObjectReadFailureKind::ObjectNotFound
-            }
-            ObjectPgActionError::Metadata(error) if error.is_command_contention() => {
+            ObjectOperationFailureKind::MetadataCommandContention => {
                 ObjectReadFailureKind::MetadataCommandContention
             }
-            ObjectPgActionError::Metadata(_)
-            | ObjectPgActionError::InvalidRequest { .. }
-            | ObjectPgActionError::StaleObjectReadSubject
-            | ObjectPgActionError::StaleDirectPutCommitSnapshot
-            | ObjectPgActionError::StaleStreamFinalizeSnapshot
-            | ObjectPgActionError::StaleMultipartCompletionSnapshot
-            | ObjectPgActionError::MultipartConditionalRequestConflict => {
-                ObjectReadFailureKind::InternalError
+            ObjectOperationFailureKind::RetryableConvergence => {
+                ObjectReadFailureKind::RetryableConvergence
             }
+            ObjectOperationFailureKind::InternalError => ObjectReadFailureKind::InternalError,
         };
         Self {
             kind,
@@ -2360,38 +2394,40 @@ impl ObjectReadFailure {
     pub(crate) const fn for_test(kind: ObjectReadFailureKind) -> Self {
         let diagnostic_category = match kind {
             ObjectReadFailureKind::ObjectNotFound => {
-                ObjectReadFailureDiagnosticCategory::Operation(
+                ObjectOperationFailureDiagnosticCategory::Operation(
                     OperationFailureDiagnosticCategory::Metadata(
                         MetadataFailureDiagnosticCategory::Other,
                     ),
                 )
             }
             ObjectReadFailureKind::ResourceExhausted => {
-                ObjectReadFailureDiagnosticCategory::Operation(
+                ObjectOperationFailureDiagnosticCategory::Operation(
                     OperationFailureDiagnosticCategory::Store(
                         StoreFailureDiagnosticCategory::ResourceExhausted,
                     ),
                 )
             }
             ObjectReadFailureKind::MetadataCommandContention => {
-                ObjectReadFailureDiagnosticCategory::Operation(
+                ObjectOperationFailureDiagnosticCategory::Operation(
                     OperationFailureDiagnosticCategory::Metadata(
                         MetadataFailureDiagnosticCategory::ObjectGenerationReservationConflict,
                     ),
                 )
             }
             ObjectReadFailureKind::RetryableConvergence => {
-                ObjectReadFailureDiagnosticCategory::Operation(
+                ObjectOperationFailureDiagnosticCategory::Operation(
                     OperationFailureDiagnosticCategory::Store(
                         StoreFailureDiagnosticCategory::Topology,
                     ),
                 )
             }
-            ObjectReadFailureKind::InternalError => ObjectReadFailureDiagnosticCategory::Operation(
-                OperationFailureDiagnosticCategory::Store(
-                    StoreFailureDiagnosticCategory::InternalInvariant,
-                ),
-            ),
+            ObjectReadFailureKind::InternalError => {
+                ObjectOperationFailureDiagnosticCategory::Operation(
+                    OperationFailureDiagnosticCategory::Store(
+                        StoreFailureDiagnosticCategory::InternalInvariant,
+                    ),
+                )
+            }
         };
         Self {
             kind,
@@ -2417,6 +2453,112 @@ impl std::fmt::Display for ObjectReadFailure {
 }
 
 impl std::error::Error for ObjectReadFailure {}
+
+/// Exhaustive logical outcome of an object-metadata mutation.
+///
+/// This deliberately omits PG, node, route, database, command-log, and RPC
+/// representations. Callers may select operation-specific S3 responses for
+/// absence and contention, but cannot inspect the storage implementation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObjectMetadataMutationFailureKind {
+    ObjectNotFound,
+    ResourceExhausted,
+    MetadataCommandContention,
+    RetryableConvergence,
+    InternalError,
+}
+
+/// Opaque failure returned by public object-metadata mutation capabilities.
+///
+/// The semantic kind is sufficient for request translation. The diagnostic
+/// category is retained and rendered only as a bounded storage-owned label;
+/// public formatting and the error chain never expose the underlying storage
+/// implementation error.
+pub struct ObjectMetadataMutationFailure {
+    kind: ObjectMetadataMutationFailureKind,
+    diagnostic_category: ObjectOperationFailureDiagnosticCategory,
+}
+
+impl ObjectMetadataMutationFailure {
+    #[must_use]
+    pub const fn kind(&self) -> ObjectMetadataMutationFailureKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn diagnostic_cause_label(&self) -> &'static str {
+        self.diagnostic_category.cause_label()
+    }
+
+    pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        let (operation_kind, diagnostic_category) = classify_object_pg_action(error);
+        let kind = match operation_kind {
+            ObjectOperationFailureKind::ObjectNotFound => {
+                ObjectMetadataMutationFailureKind::ObjectNotFound
+            }
+            ObjectOperationFailureKind::ResourceExhausted => {
+                ObjectMetadataMutationFailureKind::ResourceExhausted
+            }
+            ObjectOperationFailureKind::MetadataCommandContention => {
+                ObjectMetadataMutationFailureKind::MetadataCommandContention
+            }
+            ObjectOperationFailureKind::RetryableConvergence => {
+                ObjectMetadataMutationFailureKind::RetryableConvergence
+            }
+            ObjectOperationFailureKind::InternalError => {
+                ObjectMetadataMutationFailureKind::InternalError
+            }
+        };
+        Self {
+            kind,
+            diagnostic_category,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) const fn for_test(kind: ObjectMetadataMutationFailureKind) -> Self {
+        let read_kind = match kind {
+            ObjectMetadataMutationFailureKind::ObjectNotFound => {
+                ObjectReadFailureKind::ObjectNotFound
+            }
+            ObjectMetadataMutationFailureKind::ResourceExhausted => {
+                ObjectReadFailureKind::ResourceExhausted
+            }
+            ObjectMetadataMutationFailureKind::MetadataCommandContention => {
+                ObjectReadFailureKind::MetadataCommandContention
+            }
+            ObjectMetadataMutationFailureKind::RetryableConvergence => {
+                ObjectReadFailureKind::RetryableConvergence
+            }
+            ObjectMetadataMutationFailureKind::InternalError => {
+                ObjectReadFailureKind::InternalError
+            }
+        };
+        let read_failure = ObjectReadFailure::for_test(read_kind);
+        Self {
+            kind,
+            diagnostic_category: read_failure.diagnostic_category,
+        }
+    }
+}
+
+impl std::fmt::Debug for ObjectMetadataMutationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ObjectMetadataMutationFailure")
+            .field("kind", &self.kind)
+            .field("cause_label", &self.diagnostic_cause_label())
+            .finish()
+    }
+}
+
+impl std::fmt::Display for ObjectMetadataMutationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("object metadata mutation failed")
+    }
+}
+
+impl std::error::Error for ObjectMetadataMutationFailure {}
 
 #[cfg(test)]
 mod tests {
@@ -2995,6 +3137,101 @@ mod tests {
             },
         ));
         assert_eq!(metadata.kind(), ObjectReadFailureKind::InternalError);
+        assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
+        let rendered = format!("{metadata:?} {metadata}");
+        assert!(!rendered.contains(SECRET_CONTEXT));
+        assert!(!rendered.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&metadata).is_none());
+    }
+
+    #[test]
+    fn object_metadata_mutation_errors_convert_to_exhaustive_logical_failures() {
+        let convert = |error| ObjectMetadataMutationFailure::from_object_pg_action(error).kind();
+
+        for (class, expected) in [
+            (
+                StoreOperationFailureClass::ResourceExhausted,
+                ObjectMetadataMutationFailureKind::ResourceExhausted,
+            ),
+            (
+                StoreOperationFailureClass::MetadataCommandContention,
+                ObjectMetadataMutationFailureKind::MetadataCommandContention,
+            ),
+            (
+                StoreOperationFailureClass::RetryableConvergence,
+                ObjectMetadataMutationFailureKind::RetryableConvergence,
+            ),
+            (
+                StoreOperationFailureClass::Other,
+                ObjectMetadataMutationFailureKind::InternalError,
+            ),
+        ] {
+            assert_eq!(
+                convert(ObjectPgActionError::Store(
+                    crate::test_support::store_error_for_operation_failure_class(class),
+                )),
+                expected
+            );
+        }
+
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)),
+            ObjectMetadataMutationFailureKind::ObjectNotFound
+        );
+        assert_eq!(
+            convert(ObjectPgActionError::Metadata(
+                MetadataError::ObjectVersionReservationConflict {
+                    version_id: crate::VersionId::from_u64(7),
+                },
+            )),
+            ObjectMetadataMutationFailureKind::MetadataCommandContention
+        );
+        for error in [
+            ObjectPgActionError::InvalidRequest {
+                reason: "not valid for an admitted metadata mutation".to_string(),
+            },
+            ObjectPgActionError::StaleObjectReadSubject,
+            ObjectPgActionError::StaleDirectPutCommitSnapshot,
+            ObjectPgActionError::StaleStreamFinalizeSnapshot,
+            ObjectPgActionError::StaleMultipartCompletionSnapshot,
+            ObjectPgActionError::MultipartConditionalRequestConflict,
+        ] {
+            assert_eq!(
+                convert(error),
+                ObjectMetadataMutationFailureKind::InternalError
+            );
+        }
+    }
+
+    #[test]
+    fn object_metadata_mutation_failure_discards_raw_diagnostic_detail() {
+        const SECRET_CONTEXT: &str = "secret object mutation operation";
+        const SECRET_SOURCE: &str = "secret object mutation source";
+        let failure = ObjectMetadataMutationFailure::from_object_pg_action(
+            ObjectPgActionError::Store(StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            }),
+        );
+
+        assert_eq!(
+            failure.kind(),
+            ObjectMetadataMutationFailureKind::InternalError
+        );
+        assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(failure.to_string(), "object metadata mutation failed");
+        let debug = format!("{failure:?}");
+        assert!(debug.contains("store_io_failure"));
+        assert!(!debug.contains(SECRET_CONTEXT));
+        assert!(!debug.contains(SECRET_SOURCE));
+        assert!(std::error::Error::source(&failure).is_none());
+
+        let metadata = ObjectMetadataMutationFailure::from_object_pg_action(
+            ObjectPgActionError::Metadata(MetadataError::Db {
+                context: SECRET_CONTEXT,
+                source: DatabaseError::new(SECRET_SOURCE),
+            }),
+        );
         assert_eq!(metadata.diagnostic_cause_label(), "metadata_db_error");
         let rendered = format!("{metadata:?} {metadata}");
         assert!(!rendered.contains(SECRET_CONTEXT));

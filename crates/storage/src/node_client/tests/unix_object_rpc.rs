@@ -1449,7 +1449,7 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
 
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..35)
+    let server_threads: Vec<_> = (0..34)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -1606,17 +1606,6 @@ fn unix_object_metadata_clients_reject_wrong_object_pg_before_node_access() {
         .unwrap_err();
     assert!(matches!(
         read_snapshot_error,
-        ObjectPgActionError::Store(StoreError::StorageRpc {
-            failure: StorageRpcErrorCode::PayloadDecode,
-            ..
-        })
-    ));
-
-    let read_tags_error = wrong_read_route
-        .get_object_tags_for_subject(None, &read_subject.identity, VersionId::Null)
-        .unwrap_err();
-    assert!(matches!(
-        read_tags_error,
         ObjectPgActionError::Store(StoreError::StorageRpc {
             failure: StorageRpcErrorCode::PayloadDecode,
             ..
@@ -3504,7 +3493,7 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
     }
     private_socket_dir(config.socket_path.parent().unwrap());
     let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
-    let server_threads: Vec<_> = (0..3)
+    let server_threads: Vec<_> = (0..2)
         .map(|_| {
             let server = Arc::clone(&server);
             thread::spawn(move || server.accept_one().unwrap())
@@ -3541,17 +3530,6 @@ fn unix_object_read_metadata_client_loads_subject_and_snapshot() {
     assert_eq!(snapshot.object_segments[0].object_record(), Some(&segment));
     assert!(snapshot.multipart_parts.is_empty());
     assert!(snapshot.multipart_part_segments.is_empty());
-
-    let tags = read_route
-        .get_object_tags_for_subject(None, &subject.identity, VersionId::Null)
-        .unwrap();
-    let expected_tags = crate::tests::object_tags(
-        "<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>",
-    );
-    assert_eq!(
-        tags.as_ref().map(crate::SerializedTagSet::tag_set),
-        Some(expected_tags.tag_set())
-    );
 
     for thread in server_threads {
         thread.join().unwrap();

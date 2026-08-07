@@ -10100,6 +10100,73 @@ fn object_read_failure_kinds_map_exhaustively_to_s3_outcomes() {
 }
 
 #[test]
+fn object_metadata_mutation_failure_kinds_map_exhaustively_to_s3_outcomes() {
+    let bucket = trusted_bucket_name("mutation-failure-bucket");
+    let key = trusted_object_key("mutation-failure-key");
+    let map = |kind, version_id, can_discover_missing| {
+        Coordinator::map_object_metadata_mutation_access_error(
+            &bucket,
+            &key,
+            version_id,
+            can_discover_missing,
+            storage::test_support::object_metadata_mutation_failure_for_kind(kind),
+        )
+    };
+
+    for kind in [
+        storage::ObjectMetadataMutationFailureKind::ResourceExhausted,
+        storage::ObjectMetadataMutationFailureKind::MetadataCommandContention,
+        storage::ObjectMetadataMutationFailureKind::RetryableConvergence,
+    ] {
+        assert!(matches!(map(kind, None, true), ServerError::SlowDown));
+    }
+
+    assert!(matches!(
+        map(
+            storage::ObjectMetadataMutationFailureKind::ObjectNotFound,
+            None,
+            false,
+        ),
+        ServerError::AccessDenied
+    ));
+    assert!(matches!(
+        map(
+            storage::ObjectMetadataMutationFailureKind::ObjectNotFound,
+            None,
+            true,
+        ),
+        ServerError::ObjectNotFound {
+            bucket: missing_bucket,
+            key: missing_key,
+        } if missing_bucket == bucket.as_str() && missing_key == key.as_str()
+    ));
+    let version_id = storage::VersionId::from_u64(7);
+    assert!(matches!(
+        map(
+            storage::ObjectMetadataMutationFailureKind::ObjectNotFound,
+            Some(version_id),
+            true,
+        ),
+        ServerError::VersionNotFound {
+            bucket: missing_bucket,
+            key: missing_key,
+            version_id: missing_version,
+        } if missing_bucket == bucket.as_str()
+            && missing_key == key.as_str()
+            && missing_version == version_id.to_string()
+    ));
+    assert!(matches!(
+        map(
+            storage::ObjectMetadataMutationFailureKind::InternalError,
+            None,
+            true,
+        ),
+        ServerError::ObjectMetadataMutation(error)
+            if error.diagnostic_cause_label() == "store_internal_failure"
+    ));
+}
+
+#[test]
 fn stale_bucket_metadata_command_maps_to_slow_down() {
     let error = storage::test_support::bucket_snapshot_load_failure_for_kind(
         storage::BucketSnapshotLoadFailureKind::MetadataCommandContention,
@@ -12376,9 +12443,9 @@ fn delete_object_marker_version_reservation_maps_command_log_conflict_to_slow_do
 fn conditional_delete_maps_metadata_command_budget_exhaustion_to_request_conflict() {
     let cond = DeleteCondition::IfMatch("\"etag\"".into());
     let error = Coordinator::map_delete_object_pg_action_error(
-        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandContention {
-            context: "object version reservation retry budget exhausted",
-        }),
+        storage::test_support::object_metadata_mutation_failure_for_kind(
+            storage::ObjectMetadataMutationFailureKind::MetadataCommandContention,
+        ),
         &cond,
         "key",
     );
@@ -12389,20 +12456,18 @@ fn conditional_delete_maps_metadata_command_budget_exhaustion_to_request_conflic
     ));
 
     let error = Coordinator::map_delete_object_pg_action_error(
-        storage::ObjectPgActionError::Store(storage::StoreError::MetadataCommandContention {
-            context: "object version reservation retry budget exhausted",
-        }),
+        storage::test_support::object_metadata_mutation_failure_for_kind(
+            storage::ObjectMetadataMutationFailureKind::MetadataCommandContention,
+        ),
         &DeleteCondition::None,
         "key",
     );
     assert!(matches!(error, ServerError::SlowDown));
 
     let error = Coordinator::map_delete_object_pg_action_error(
-        storage::ObjectPgActionError::Store(storage::StoreError::RouteMapExpired {
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            valid_until_ms: 1,
-            now_ms: 2,
-        }),
+        storage::test_support::object_metadata_mutation_failure_for_kind(
+            storage::ObjectMetadataMutationFailureKind::RetryableConvergence,
+        ),
         &cond,
         "key",
     );

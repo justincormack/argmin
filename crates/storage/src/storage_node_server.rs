@@ -121,7 +121,7 @@ use crate::storage_rpc::{
     decode_object_payload_reclaim_command_build_request,
     decode_object_payload_reclaim_exists_request, decode_object_read_auth_subject_request,
     decode_object_read_snapshot_request, decode_object_request,
-    decode_object_tags_for_subject_request, decode_placed_segment_backfill_reference_page_request,
+    decode_placed_segment_backfill_reference_page_request,
     decode_placed_segment_shard_backfill_claim_acquire_request,
     decode_placed_segment_shard_backfill_claim_error_request,
     decode_placed_segment_shard_backfill_claim_record_request,
@@ -184,9 +184,8 @@ use crate::storage_rpc::{
     encode_object_payload_lease_control_response,
     encode_object_payload_reclaim_claim_optional_record_response,
     encode_object_payload_reclaim_response, encode_object_read_auth_subject_response,
-    encode_object_read_snapshot_response, encode_object_tags_for_subject_response,
-    encode_object_version_response, encode_payload_reclaim_root_response,
-    encode_placed_segment_backfill_reference_page_response,
+    encode_object_read_snapshot_response, encode_object_version_response,
+    encode_payload_reclaim_root_response, encode_placed_segment_backfill_reference_page_response,
     encode_placed_segment_shard_backfill_claim_optional_record_response,
     encode_placed_segment_shard_backfill_count_response,
     encode_placed_segment_shard_backfills_response,
@@ -297,9 +296,7 @@ use crate::storage_rpc::{
     StorageRpcObjectPayloadReclaimResponse, StorageRpcObjectReadAuthSubjectOutcome,
     StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadAuthSubjectResponse,
     StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
-    StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest,
-    StorageRpcObjectTagsForSubjectOutcome, StorageRpcObjectTagsForSubjectRequest,
-    StorageRpcObjectTagsForSubjectResponse, StorageRpcObjectVersionResponse,
+    StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest, StorageRpcObjectVersionResponse,
     StorageRpcPayloadReclaimRootResponse, StorageRpcPlacedSegmentBackfillReferencePageRequest,
     StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
     StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
@@ -4984,24 +4981,6 @@ impl StorageNodeMetadataReadObjectRoute<'_> {
         })
     }
 
-    fn get_object_tags_for_subject(
-        &self,
-        version_id: Option<s3_types::VersionId>,
-        expected_identity: &crate::ObjectReadAuthSubjectIdentity,
-        authorized_version_id: s3_types::VersionId,
-    ) -> Result<Option<crate::SerializedTagSet>, StorageNodeObjectRouteError> {
-        self.with_local_route(|pg| {
-            SharedStorageNode::get_object_tags_for_subject_from_object_pg(
-                pg,
-                self.bucket,
-                self.key,
-                version_id,
-                expected_identity,
-                authorized_version_id,
-            )
-        })
-    }
-
     fn load_bound_multipart_upload(
         pg: &PgStore,
         bucket: &BucketName,
@@ -8571,15 +8550,6 @@ impl StorageNodeConnectionHandler {
             StorageRpcMessageKind::ObjectReadSnapshotLoad => {
                 match decode_object_read_snapshot_request(&frame.payload) {
                     Ok(request) => self.object_read_snapshot_response(route_permit, request),
-                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::PayloadDecode,
-                        message: error.to_string(),
-                    }),
-                }
-            }
-            StorageRpcMessageKind::ObjectTagsForSubjectLoad => {
-                match decode_object_tags_for_subject_request(&frame.payload) {
-                    Ok(request) => self.object_tags_for_subject_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
                         message: error.to_string(),
@@ -12836,51 +12806,6 @@ impl StorageNodeConnectionHandler {
                     encode_object_read_snapshot_response(&StorageRpcObjectReadSnapshotResponse {
                         outcome: StorageRpcObjectReadSnapshotOutcome::StaleSubject,
                     });
-                Ok(encode_storage_rpc_success_response(&payload))
-            }
-            Err(StorageNodeObjectRouteError::Route(error)) => {
-                encode_storage_rpc_error_response(&error)
-            }
-            Err(StorageNodeObjectRouteError::Object(error)) => {
-                encode_storage_rpc_error_response(&object_pg_error_response(error))
-            }
-        }
-    }
-
-    fn object_tags_for_subject_response(
-        &self,
-        route_permit: &StorageNodeRouteAdmissionPermit,
-        request: StorageRpcObjectTagsForSubjectRequest,
-    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        let route = match self.metadata_read_object_route(
-            route_permit,
-            &request.object,
-            "object tags for subject load",
-        ) {
-            Ok(route) => route,
-            Err(error) => return encode_storage_rpc_error_response(&error),
-        };
-        match route.get_object_tags_for_subject(
-            request.version_id,
-            &request.expected_identity,
-            request.authorized_version_id,
-        ) {
-            Ok(tags) => {
-                let payload = encode_object_tags_for_subject_response(
-                    &StorageRpcObjectTagsForSubjectResponse {
-                        outcome: StorageRpcObjectTagsForSubjectOutcome::Loaded(tags),
-                    },
-                );
-                Ok(encode_storage_rpc_success_response(&payload))
-            }
-            Err(StorageNodeObjectRouteError::Object(
-                ObjectPgActionError::StaleObjectReadSubject,
-            )) => {
-                let payload = encode_object_tags_for_subject_response(
-                    &StorageRpcObjectTagsForSubjectResponse {
-                        outcome: StorageRpcObjectTagsForSubjectOutcome::StaleSubject,
-                    },
-                );
                 Ok(encode_storage_rpc_success_response(&payload))
             }
             Err(StorageNodeObjectRouteError::Route(error)) => {
@@ -27013,7 +26938,6 @@ mod tests {
 
         let read_subject = crate::clock::with_time_override(1_000, || {
             let subject = read_route.load_object_read_auth_subject(None).unwrap();
-            let expected_tags = crate::tests::object_tags(serialized_tags);
             let snapshot = read_route
                 .load_object_read_snapshot_for_subject(
                     None,
@@ -27023,14 +26947,6 @@ mod tests {
                 .unwrap();
             assert_eq!(snapshot.stored, subject.stored);
             assert!(snapshot.object_segments.is_empty());
-            assert_eq!(
-                read_route
-                    .get_object_tags_for_subject(None, &subject.identity, VersionId::Null,)
-                    .unwrap()
-                    .as_ref()
-                    .map(crate::SerializedTagSet::tag_set),
-                Some(expected_tags.tag_set())
-            );
             subject
         });
 
@@ -28421,12 +28337,6 @@ mod tests {
                             &read_subject.identity,
                             crate::ObjectReadSnapshotMode::StandardSegments,
                         )
-                        .map(|_| ()),
-                ),
-                (
-                    "object tags load",
-                    read_route
-                        .get_object_tags_for_subject(None, &read_subject.identity, VersionId::Null)
                         .map(|_| ()),
                 ),
                 (

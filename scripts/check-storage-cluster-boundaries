@@ -4379,13 +4379,18 @@ raw_object_read_error_transit=$(
         }
         ' crates/storage/src/cluster.rs
         rg -n -U --color=never \
-            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_object_if|load_object_read_snapshot_if|load_leased_object_read_snapshot_if|retain_object_payload_read)(?s:.{0,500})Result<[^;{]*(ObjectPgActionError|StoreError)' \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_object_if|load_object_read_snapshot_if|load_leased_object_read_snapshot_if|retain_object_payload_read|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if)(?s:.{0,500})Result<[^;{]*(ObjectPgActionError|StoreError)' \
             crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
             || true
         rg -n --color=never '\bObjectPgActionError\b|\bMetadataError\b|\bStoreError\b' \
             crates/server-core/src/coordinator/authz.rs \
             crates/server-core/src/coordinator/authz/acl.rs \
             crates/server-core/src/coordinator/authz/modern.rs \
+            || true
+        rg -n --color=never \
+            '\b(ObjectTagsForSubject|get_object_tags_for_subject|object_tags_for_subject)' \
+            crates/storage/src \
+            -g '*.rs' \
             || true
         if ! rg -q -U \
             'fn map_object_read_snapshot_error(?s:.{0,300})error: storage::ObjectReadFailure' \
@@ -4399,6 +4404,63 @@ raw_object_read_error_transit=$(
 fail_with_matches \
     "Object-read authorization must cross storage through ObjectReadFailure rather than raw storage implementation errors" \
     "$raw_object_read_error_transit"
+
+raw_object_metadata_mutation_error_transit=$(
+    {
+        awk '
+        /^impl ActiveObjectMetadataMutationRoute/ {
+            in_mutation_impl = 1
+            next
+        }
+        /^impl / {
+            in_mutation_impl = 0
+            collecting_signature = 0
+        }
+        in_mutation_impl && /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        in_mutation_impl && collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/cluster.rs
+        rg -n --color=never '\bObjectPgActionError\b|\bMetadataError\b|\bStoreError\b' \
+            crates/server-core/src/coordinator/object_metadata.rs \
+            crates/server-core/src/coordinator/delete.rs \
+            || true
+        if ! rg -q -U \
+            'fn map_object_metadata_mutation_access_error(?s:.{0,300})error: storage::ObjectMetadataMutationFailure' \
+            crates/server-core/src/coordinator/object_metadata.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/object_metadata.rs: object-metadata mutation response mapping must accept ObjectMetadataMutationFailure'
+        fi
+        if ! rg -q -U \
+            'fn map_delete_object_pg_action_error(?s:.{0,300})error: storage::ObjectMetadataMutationFailure' \
+            crates/server-core/src/coordinator/delete.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator/delete.rs: object-delete response mapping must accept ObjectMetadataMutationFailure'
+        fi
+    }
+)
+fail_with_matches \
+    "Object-metadata mutations must cross storage through ObjectMetadataMutationFailure rather than raw storage implementation errors" \
+    "$raw_object_metadata_mutation_error_transit"
 
 http_storage_debug_representation_leaks=$(
     {

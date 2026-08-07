@@ -1,8 +1,9 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
 use storage::error::{
-    BucketSnapshotLoadFailure, BucketWriteDrainFailure, MetadataError, ObjectReadFailure,
-    StoreError, StoreFailure, StoreOperationFailureClass,
+    BucketSnapshotLoadFailure, BucketWriteDrainFailure, MetadataError,
+    ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
+    StoreOperationFailureClass,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,6 +60,9 @@ pub enum ServerError {
 
     #[error("object read error: {0}")]
     ObjectRead(ObjectReadFailure),
+
+    #[error("object metadata mutation error: {0}")]
+    ObjectMetadataMutation(ObjectMetadataMutationFailure),
 
     #[error("metadata error: {0}")]
     Metadata(MetadataError),
@@ -508,6 +512,7 @@ impl ServerError {
             Self::BucketWriteDrain(error) => error.diagnostic_cause_label(),
             Self::BucketSnapshotLoad(error) => error.diagnostic_cause_label(),
             Self::ObjectRead(error) => error.diagnostic_cause_label(),
+            Self::ObjectMetadataMutation(error) => error.diagnostic_cause_label(),
             Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
@@ -548,6 +553,10 @@ impl ServerError {
             ),
             Self::ObjectRead(error) => format!(
                 "server_error>object_read>{}",
+                error.diagnostic_cause_label()
+            ),
+            Self::ObjectMetadataMutation(error) => format!(
+                "server_error>object_metadata_mutation>{}",
                 error.diagnostic_cause_label()
             ),
             Self::Metadata(error) => format!(
@@ -724,6 +733,7 @@ impl ServerError {
             Self::BucketWriteDrain(_) => "InternalError",
             Self::BucketSnapshotLoad(_) => "InternalError",
             Self::ObjectRead(_) => "InternalError",
+            Self::ObjectMetadataMutation(_) => "InternalError",
             Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }
@@ -1135,6 +1145,19 @@ mod tests {
             object_read.diagnostic_cause_chain(),
             "server_error>object_read>store_io_failure"
         );
+
+        let (object_mutation_failure, secret_fragments) =
+            storage::test_support::object_metadata_mutation_failure_diagnostic_fixture();
+        let object_mutation = ServerError::ObjectMetadataMutation(object_mutation_failure);
+        assert_eq!(object_mutation.diagnostic_cause_label(), "store_io_failure");
+        assert_eq!(
+            object_mutation.diagnostic_cause_chain(),
+            "server_error>object_metadata_mutation>store_io_failure"
+        );
+        let rendered = format!("{object_mutation:?} {object_mutation}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
     }
 
     #[test]
@@ -1536,6 +1559,17 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_object_metadata_mutation() {
+        let err = ServerError::ObjectMetadataMutation(
+            storage::test_support::object_metadata_mutation_failure_for_kind(
+                storage::ObjectMetadataMutationFailureKind::InternalError,
+            ),
+        );
+        assert_eq!(err.s3_error_code(), "InternalError");
+        assert_eq!(err.http_status(), 500);
+    }
+
+    #[test]
     fn s3_error_code_metadata() {
         let err = ServerError::Metadata(MetadataError::ObjectNotFound);
         assert_eq!(err.s3_error_code(), "InternalError");
@@ -1674,6 +1708,15 @@ mod tests {
             ServerError::ObjectRead(storage::test_support::object_read_failure_for_kind(
                 storage::ObjectReadFailureKind::InternalError,
             ))
+            .http_status(),
+            500
+        );
+        assert_eq!(
+            ServerError::ObjectMetadataMutation(
+                storage::test_support::object_metadata_mutation_failure_for_kind(
+                    storage::ObjectMetadataMutationFailureKind::InternalError,
+                ),
+            )
             .http_status(),
             500
         );

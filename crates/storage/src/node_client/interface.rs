@@ -863,13 +863,6 @@ pub(crate) trait ObjectReadMetadataRoute: Send {
         expected_identity: &ObjectReadAuthSubjectIdentity,
         snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError>;
-
-    fn get_object_tags_for_subject(
-        &self,
-        version_id: Option<VersionId>,
-        expected_identity: &ObjectReadAuthSubjectIdentity,
-        authorized_version_id: VersionId,
-    ) -> Result<Option<crate::SerializedTagSet>, ObjectPgActionError>;
 }
 
 pub(crate) struct BuildStreamPutCommitCommandReq<'a> {

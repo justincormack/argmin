@@ -78,7 +78,7 @@ use std::io::{Read, Write};
 use std::num::{NonZeroU16, NonZeroU32};
 
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
-pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 15;
+pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 16;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;
 pub(crate) const STORAGE_RPC_MAX_FRAME_LEN: usize =
     4 + STORAGE_RPC_FRAME_MAGIC.len() + 2 + 8 + 2 + 4 + 8 + STORAGE_RPC_MAX_PAYLOAD_LEN;
@@ -425,8 +425,6 @@ const STORAGE_RPC_MAX_DIRECT_PUT_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 
 const STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_GENERATION_REQUEST_PAYLOAD_LEN + 1 + 8;
 const STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
-const STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN: usize =
-    STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN + 8;
 const STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN: usize =
     STORAGE_RPC_MAX_OBJECT_READ_REQUEST_PAYLOAD_LEN;
 const STORAGE_RPC_MAX_OBJECT_METADATA_COMMAND_BUILD_REQUEST_PAYLOAD_LEN: usize = 2 * 1024 * 1024;
@@ -724,7 +722,6 @@ pub(crate) enum StorageRpcMessageKind {
     MultipartCompletionBarrierCommandBuild = 45,
     ObjectReadAuthSubjectLoad = 46,
     ObjectReadSnapshotLoad = 47,
-    ObjectTagsForSubjectLoad = 48,
     ObjectMetadataPutSnapshotLoad = 49,
     ObjectMetadataPutCommandBuild = 50,
     ObjectDeleteCurrentSnapshotLoad = 51,
@@ -1073,7 +1070,6 @@ impl StorageRpcMessageKind {
             }
             Self::ObjectReadAuthSubjectLoad => "object read auth subject load",
             Self::ObjectReadSnapshotLoad => "object read snapshot load",
-            Self::ObjectTagsForSubjectLoad => "object tags for subject load",
             Self::ObjectMetadataPutSnapshotLoad => "object metadata PUT snapshot load",
             Self::ObjectMetadataPutCommandBuild => "object metadata PUT command build",
             Self::ObjectDeleteCurrentSnapshotLoad => "object delete current snapshot load",
@@ -1263,7 +1259,6 @@ impl StorageRpcMessageKind {
             45 => Ok(Self::MultipartCompletionBarrierCommandBuild),
             46 => Ok(Self::ObjectReadAuthSubjectLoad),
             47 => Ok(Self::ObjectReadSnapshotLoad),
-            48 => Ok(Self::ObjectTagsForSubjectLoad),
             49 => Ok(Self::ObjectMetadataPutSnapshotLoad),
             50 => Ok(Self::ObjectMetadataPutCommandBuild),
             51 => Ok(Self::ObjectDeleteCurrentSnapshotLoad),
@@ -1840,25 +1835,6 @@ pub(crate) enum StorageRpcObjectReadSnapshotOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcObjectReadSnapshotResponse {
     pub(crate) outcome: StorageRpcObjectReadSnapshotOutcome,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcObjectTagsForSubjectRequest {
-    pub(crate) object: StorageRpcObjectRequest,
-    pub(crate) version_id: Option<VersionId>,
-    pub(crate) expected_identity: ObjectReadAuthSubjectIdentity,
-    pub(crate) authorized_version_id: VersionId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StorageRpcObjectTagsForSubjectOutcome {
-    Loaded(Option<SerializedTagSet>),
-    StaleSubject,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StorageRpcObjectTagsForSubjectResponse {
-    pub(crate) outcome: StorageRpcObjectTagsForSubjectOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3913,9 +3889,6 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ObjectReadSnapshotLoad => {
             STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN
         }
-        StorageRpcMessageKind::ObjectTagsForSubjectLoad => {
-            STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN
-        }
         StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad
         | StorageRpcMessageKind::ObjectDeleteCurrentSnapshotLoad
         | StorageRpcMessageKind::ObjectDeleteSpecificSnapshotLoad
@@ -5501,33 +5474,6 @@ pub(crate) fn decode_object_read_snapshot_request(
     })
 }
 
-pub(crate) fn encode_object_tags_for_subject_request(
-    request: &StorageRpcObjectTagsForSubjectRequest,
-) -> Vec<u8> {
-    let mut out = encode_object_request(&request.object);
-    put_optional_version_id(&mut out, request.version_id);
-    put_stored_object(&mut out, request.expected_identity.stored());
-    put_u64(&mut out, request.authorized_version_id.to_u64());
-    out
-}
-
-pub(crate) fn decode_object_tags_for_subject_request(
-    bytes: &[u8],
-) -> Result<StorageRpcObjectTagsForSubjectRequest, StorageRpcPayloadError> {
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let object = decoder.read_rpc_object_request()?;
-    let version_id = decoder.read_optional_version_id()?;
-    let expected_stored = decoder.read_stored_object()?;
-    let authorized_version_id = VersionId::from_u64(decoder.read_u64()?);
-    decoder.finish()?;
-    Ok(StorageRpcObjectTagsForSubjectRequest {
-        object,
-        version_id,
-        expected_identity: ObjectReadAuthSubjectIdentity::for_stored(&expected_stored),
-        authorized_version_id,
-    })
-}
-
 pub(crate) fn encode_put_object_metadata_snapshot_request(
     request: &StorageRpcPutObjectMetadataSnapshotRequest,
 ) -> Vec<u8> {
@@ -6967,39 +6913,6 @@ pub(crate) fn decode_object_read_snapshot_response(
     };
     decoder.finish()?;
     Ok(StorageRpcObjectReadSnapshotResponse { outcome })
-}
-
-pub(crate) fn encode_object_tags_for_subject_response(
-    response: &StorageRpcObjectTagsForSubjectResponse,
-) -> Vec<u8> {
-    let mut out = Vec::new();
-    match &response.outcome {
-        StorageRpcObjectTagsForSubjectOutcome::Loaded(tags) => {
-            put_u8(&mut out, 0);
-            put_optional_string(&mut out, tags.as_ref().map(SerializedTagSet::as_str));
-        }
-        StorageRpcObjectTagsForSubjectOutcome::StaleSubject => put_u8(&mut out, 1),
-    }
-    out
-}
-
-pub(crate) fn decode_object_tags_for_subject_response(
-    bytes: &[u8],
-) -> Result<StorageRpcObjectTagsForSubjectResponse, StorageRpcPayloadError> {
-    let mut decoder = StorageRpcDecoder::new(bytes);
-    let outcome = match decoder.read_u8()? {
-        0 => StorageRpcObjectTagsForSubjectOutcome::Loaded(
-            decoder.read_optional_serialized_tag_set()?,
-        ),
-        1 => StorageRpcObjectTagsForSubjectOutcome::StaleSubject,
-        _ => {
-            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
-                "invalid object tags for subject outcome tag",
-            ))
-        }
-    };
-    decoder.finish()?;
-    Ok(StorageRpcObjectTagsForSubjectResponse { outcome })
 }
 
 pub(crate) fn encode_put_object_metadata_snapshot_response(
@@ -18276,7 +18189,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&15u16.to_le_bytes());
+        expected.extend_from_slice(&16u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -18287,15 +18200,14 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_rejects_version_fourteen_fixture() {
-        let mut bytes =
-            encode_storage_rpc_frame(7, StorageRpcMessageKind::Health, b"old version").unwrap();
-        let version_offset = 4 + STORAGE_RPC_FRAME_MAGIC.len();
-        bytes[version_offset..version_offset + 2].copy_from_slice(&14_u16.to_le_bytes());
-
+    fn storage_rpc_frame_rejects_resealed_old_and_new_version_fixtures() {
         assert_eq!(
-            decode_storage_rpc_frame(&bytes),
-            Err(StorageRpcFrameError::UnsupportedVersion(14))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(15)),
+            Err(StorageRpcFrameError::UnsupportedVersion(15))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(17)),
+            Err(StorageRpcFrameError::UnsupportedVersion(17))
         );
     }
 
@@ -18444,6 +18356,23 @@ mod tests {
                 payload.len() as u32,
                 payload,
             ),
+        );
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    fn raw_storage_rpc_frame_with_version(version: u16) -> Vec<u8> {
+        let payload = b"old or future version";
+        let kind = StorageRpcMessageKind::Health as u16;
+        let mut bytes = Vec::new();
+        put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
+        put_u16(&mut bytes, version);
+        put_u64(&mut bytes, 1);
+        put_u16(&mut bytes, kind);
+        put_u32(&mut bytes, payload.len() as u32);
+        put_u64(
+            &mut bytes,
+            storage_rpc_frame_checksum(version, 1, kind, payload.len() as u32, payload),
         );
         bytes.extend_from_slice(payload);
         bytes
@@ -21140,11 +21069,6 @@ mod tests {
                 STORAGE_RPC_MAX_OBJECT_READ_SNAPSHOT_REQUEST_PAYLOAD_LEN,
             ),
             (
-                StorageRpcMessageKind::ObjectTagsForSubjectLoad,
-                STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN + 1,
-                STORAGE_RPC_MAX_OBJECT_TAGS_FOR_SUBJECT_REQUEST_PAYLOAD_LEN,
-            ),
-            (
                 StorageRpcMessageKind::ObjectMetadataPutSnapshotLoad,
                 STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_OBJECT_METADATA_SNAPSHOT_REQUEST_PAYLOAD_LEN,
@@ -22875,32 +22799,6 @@ mod tests {
         };
         let bytes = encode_object_read_snapshot_response(&response);
         let decoded = decode_object_read_snapshot_response(&bytes).unwrap();
-        assert_eq!(decoded, response);
-
-        let tags_request = StorageRpcObjectTagsForSubjectRequest {
-            object: snapshot_request.object,
-            version_id: snapshot_request.version_id,
-            expected_identity: snapshot_request.expected_identity,
-            authorized_version_id: VersionId::from_u64(7),
-        };
-        let bytes = encode_object_tags_for_subject_request(&tags_request);
-        let decoded = decode_object_tags_for_subject_request(&bytes).unwrap();
-        assert_eq!(decoded, tags_request);
-
-        let response = StorageRpcObjectTagsForSubjectResponse {
-            outcome: StorageRpcObjectTagsForSubjectOutcome::Loaded(Some(
-                SerializedTagSet::default(),
-            )),
-        };
-        let bytes = encode_object_tags_for_subject_response(&response);
-        let decoded = decode_object_tags_for_subject_response(&bytes).unwrap();
-        assert_eq!(decoded, response);
-
-        let response = StorageRpcObjectTagsForSubjectResponse {
-            outcome: StorageRpcObjectTagsForSubjectOutcome::StaleSubject,
-        };
-        let bytes = encode_object_tags_for_subject_response(&response);
-        let decoded = decode_object_tags_for_subject_response(&bytes).unwrap();
         assert_eq!(decoded, response);
     }
 

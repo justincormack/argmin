@@ -493,8 +493,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::BucketFastPathIdentities
         | StorageRpcMessageKind::BucketSubresourceGet
         | StorageRpcMessageKind::ObjectReadAuthSubjectLoad
-        | StorageRpcMessageKind::ObjectReadSnapshotLoad
-        | StorageRpcMessageKind::ObjectTagsForSubjectLoad => UnixStorageNodeRpcAdmissionClass::Read,
+        | StorageRpcMessageKind::ObjectReadSnapshotLoad => UnixStorageNodeRpcAdmissionClass::Read,
 
         StorageRpcMessageKind::ShardScavengerListFiles
         | StorageRpcMessageKind::BucketWriteReservationsList
@@ -1265,10 +1264,6 @@ mod tests {
         );
         assert_eq!(
             storage_rpc_admission_class(StorageRpcMessageKind::ObjectReadSnapshotLoad),
-            UnixStorageNodeRpcAdmissionClass::Read
-        );
-        assert_eq!(
-            storage_rpc_admission_class(StorageRpcMessageKind::ObjectTagsForSubjectLoad),
             UnixStorageNodeRpcAdmissionClass::Read
         );
     }

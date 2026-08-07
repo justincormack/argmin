@@ -184,6 +184,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::BucketWriteDrain(_)
         | ServerError::BucketSnapshotLoad(_)
         | ServerError::ObjectRead(_)
+        | ServerError::ObjectMetadataMutation(_)
         | ServerError::Metadata(_)
         | ServerError::Ec(_)
         | ServerError::MetadataBlobError { .. }
@@ -4973,6 +4974,8 @@ mod tests {
         let internal_implementation_error =
             server_core::error::test_support::internal_implementation_error_redaction_fixture();
         let object_read_error = storage::test_support::object_read_failure_diagnostic_fixture();
+        let object_mutation_error =
+            storage::test_support::object_metadata_mutation_failure_diagnostic_fixture();
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
             (
                 ServerError::BucketWriteDrain(
@@ -4993,6 +4996,10 @@ mod tests {
             (
                 ServerError::ObjectRead(object_read_error.0),
                 object_read_error.1.to_vec(),
+            ),
+            (
+                ServerError::ObjectMetadataMutation(object_mutation_error.0),
+                object_mutation_error.1.to_vec(),
             ),
             (
                 ServerError::Store(
