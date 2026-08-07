@@ -4,8 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+default = ["ring"]
+ring = ["rustls/ring"]
 openssl = ["dep:rustls-openssl"]
 
 [dependencies]
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-openssl = { version = "0.3.1", default-features = false, features = ["tls12"], optional = true }

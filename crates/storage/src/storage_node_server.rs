@@ -20732,7 +20732,7 @@ mod tests {
             rustls::sign::CertifiedKey::from_der(
                 certificates,
                 private_key,
-                &rustls::crypto::ring::default_provider(),
+                &tls_provider::build_provider(),
             )
             .unwrap(),
         )

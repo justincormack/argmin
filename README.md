@@ -25,9 +25,19 @@ This builds the production server binary without pulling in the full workspace
 test harness dependency set. The binary is at `target/release/argmin-s3`.
 
 Do not use `--all-features` for production artifacts. The normal production
-release build uses the default feature set. There is a single production feature
-`--features openssl-tls` to dynamically link against OpenSSL as a TLS library, rather
-than the default `ring`.
+release build uses the default feature set. There is a single alternative
+production feature, `openssl`, which dynamically links every cryptographic
+primitive and TLS connection against the system OpenSSL library rather than
+the default ring-based implementation:
+
+```bash
+cargo build -p argmin-s3 --release --no-default-features --features openssl
+```
+
+The `--no-default-features` flag prevents the default ring implementation from
+also being linked into the OpenSSL binary. OpenSSL is the recommended provider
+on RISC-V because ring does not currently provide comparable acceleration
+there.
 
 ## Run
 

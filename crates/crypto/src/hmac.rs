@@ -1,48 +1,115 @@
 //! HMAC primitives.
 
 /// A reusable HMAC-SHA256 key.
+#[cfg(feature = "openssl")]
+pub struct Sha256Key(openssl::pkey::PKey<openssl::pkey::Private>);
+
+/// A reusable HMAC-SHA256 key.
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 pub struct Sha256Key(ring::hmac::Key);
 
 impl Sha256Key {
     #[must_use]
     pub fn new(key: &[u8]) -> Self {
-        Self(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key))
+        #[cfg(feature = "openssl")]
+        {
+            // EVP_PKEY rejects a zero-length HMAC key. HMAC pads every key
+            // shorter than the SHA-256 block size with zeroes, so a single
+            // zero byte is exactly equivalent to the empty key.
+            let openssl_key = if key.is_empty() { &[0][..] } else { key };
+            Self(openssl::pkey::PKey::hmac(openssl_key).expect("OpenSSL HMAC key creation failed"))
+        }
+        #[cfg(all(feature = "ring", not(feature = "openssl")))]
+        {
+            Self(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key))
+        }
     }
 
     #[must_use]
     pub fn sign(&self, data: &[u8]) -> [u8; 32] {
-        ring::hmac::sign(&self.0, data)
-            .as_ref()
-            .try_into()
-            .expect("HMAC-SHA256 produces a 32-byte tag")
+        #[cfg(feature = "openssl")]
+        {
+            let mut context = self.context();
+            context.update(data);
+            context.finalize()
+        }
+        #[cfg(all(feature = "ring", not(feature = "openssl")))]
+        {
+            ring::hmac::sign(&self.0, data)
+                .as_ref()
+                .try_into()
+                .expect("HMAC-SHA256 produces a 32-byte tag")
+        }
     }
 
     #[must_use]
     pub fn verify(&self, data: &[u8], tag: &[u8]) -> bool {
-        ring::hmac::verify(&self.0, data, tag).is_ok()
+        #[cfg(feature = "openssl")]
+        {
+            tag.len() == 32 && openssl::memcmp::eq(&self.sign(data), tag)
+        }
+        #[cfg(all(feature = "ring", not(feature = "openssl")))]
+        {
+            ring::hmac::verify(&self.0, data, tag).is_ok()
+        }
     }
 
     #[must_use]
     pub fn context(&self) -> Sha256Context {
-        Sha256Context(ring::hmac::Context::with_key(&self.0))
+        #[cfg(feature = "openssl")]
+        {
+            let mut context =
+                openssl::md_ctx::MdCtx::new().expect("OpenSSL HMAC-SHA256 context creation failed");
+            context
+                .digest_sign_init(Some(openssl::md::Md::sha256()), &self.0)
+                .expect("OpenSSL HMAC-SHA256 initialization failed");
+            Sha256Context(context)
+        }
+        #[cfg(all(feature = "ring", not(feature = "openssl")))]
+        {
+            Sha256Context(ring::hmac::Context::with_key(&self.0))
+        }
     }
 }
 
 /// Incremental HMAC-SHA256 computation.
+#[cfg(feature = "openssl")]
+pub struct Sha256Context(openssl::md_ctx::MdCtx);
+
+/// Incremental HMAC-SHA256 computation.
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 pub struct Sha256Context(ring::hmac::Context);
 
 impl Sha256Context {
     pub fn update(&mut self, data: &[u8]) {
+        #[cfg(feature = "openssl")]
+        self.0
+            .digest_sign_update(data)
+            .expect("OpenSSL HMAC-SHA256 update failed");
+        #[cfg(all(feature = "ring", not(feature = "openssl")))]
         self.0.update(data);
     }
 
     #[must_use]
     pub fn finalize(self) -> [u8; 32] {
-        self.0
-            .sign()
-            .as_ref()
-            .try_into()
-            .expect("HMAC-SHA256 produces a 32-byte tag")
+        #[cfg(feature = "openssl")]
+        {
+            let mut context = self.0;
+            let mut output = [0; 32];
+            let written = context
+                .digest_sign_final(Some(&mut output))
+                .expect("OpenSSL HMAC-SHA256 finalization failed");
+            assert_eq!(written, output.len(), "OpenSSL returned a truncated HMAC");
+            output
+        }
+        #[cfg(all(feature = "ring", not(feature = "openssl")))]
+        {
+            self.0
+                .sign()
+                .as_ref()
+                .try_into()
+                .expect("HMAC-SHA256 produces a 32-byte tag")
+        }
     }
 }
 

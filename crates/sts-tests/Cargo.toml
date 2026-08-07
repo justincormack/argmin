@@ -4,9 +4,14 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+default = ["ring"]
+ring = ["auth/ring", "s3-tests/ring"]
+openssl = ["auth/openssl", "s3-tests/openssl"]
+
 [dependencies]
-s3-tests = { path = "../s3-tests" }
-auth = { path = "../auth" }
+s3-tests = { path = "../s3-tests", default-features = false }
+auth = { path = "../auth", default-features = false }
 aws-smithy-types = "1"
 ring = "0.17"
 serde_json = "1"

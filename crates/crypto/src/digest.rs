@@ -1,8 +1,93 @@
-//! Cryptographic message digests other than the target-optimized SHA-256 path.
+//! Incremental message digests.
+
+#[cfg(feature = "openssl")]
+fn openssl_hasher(digest: openssl::hash::MessageDigest) -> openssl::hash::Hasher {
+    openssl::hash::Hasher::new(digest).expect("OpenSSL digest context creation failed")
+}
+
+#[cfg(feature = "openssl")]
+macro_rules! openssl_digest {
+    ($name:ident, $algorithm:ident, $length:literal, $description:literal) => {
+        #[doc = $description]
+        pub struct $name(openssl::hash::Hasher);
+
+        impl $name {
+            #[must_use]
+            pub fn new() -> Self {
+                Self(openssl_hasher(openssl::hash::MessageDigest::$algorithm()))
+            }
+
+            pub fn update(&mut self, data: &[u8]) {
+                self.0.update(data).expect("OpenSSL digest update failed");
+            }
+
+            #[must_use]
+            pub fn finalize(mut self) -> [u8; $length] {
+                self.0
+                    .finish()
+                    .expect("OpenSSL digest finalization failed")
+                    .as_ref()
+                    .try_into()
+                    .expect("digest output length matches its algorithm")
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+    };
+}
+
+#[cfg(feature = "openssl")]
+openssl_digest!(Md5, md5, 16, "Incremental MD5 hasher for S3 compatibility.");
+#[cfg(feature = "openssl")]
+openssl_digest!(
+    Sha1,
+    sha1,
+    20,
+    "Incremental SHA-1 hasher for legacy S3 checksum compatibility."
+);
+#[cfg(feature = "openssl")]
+openssl_digest!(Sha512, sha512, 64, "Incremental SHA-512 hasher.");
+
+/// Incremental MD5 hasher for S3 compatibility.
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
+pub struct Md5(md5_legacy::Md5);
+
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
+impl Md5 {
+    #[must_use]
+    pub fn new() -> Self {
+        use md5_legacy::Digest as _;
+        Self(md5_legacy::Md5::new())
+    }
+
+    pub fn update(&mut self, data: &[u8]) {
+        use md5_legacy::Digest as _;
+        self.0.update(data);
+    }
+
+    #[must_use]
+    pub fn finalize(self) -> [u8; 16] {
+        use md5_legacy::Digest as _;
+        self.0.finalize().into()
+    }
+}
+
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
+impl Default for Md5 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Incremental SHA-1 hasher for legacy S3 checksum compatibility.
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 pub struct Sha1(ring::digest::Context);
 
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 impl Sha1 {
     #[must_use]
     pub fn new() -> Self {
@@ -25,6 +110,7 @@ impl Sha1 {
     }
 }
 
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 impl Default for Sha1 {
     fn default() -> Self {
         Self::new()
@@ -32,8 +118,10 @@ impl Default for Sha1 {
 }
 
 /// Incremental SHA-512 hasher.
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 pub struct Sha512(ring::digest::Context);
 
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 impl Sha512 {
     #[must_use]
     pub fn new() -> Self {
@@ -54,10 +142,18 @@ impl Sha512 {
     }
 }
 
+#[cfg(all(feature = "ring", not(feature = "openssl")))]
 impl Default for Sha512 {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[must_use]
+pub fn md5(data: &[u8]) -> [u8; 16] {
+    let mut hasher = Md5::new();
+    hasher.update(data);
+    hasher.finalize()
 }
 
 #[cfg(test)]
@@ -66,6 +162,13 @@ mod tests {
 
     #[test]
     fn standard_vectors() {
+        assert_eq!(
+            Md5::new().finalize(),
+            [
+                0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8,
+                0x42, 0x7e,
+            ]
+        );
         assert_eq!(
             Sha1::new().finalize(),
             [

@@ -8,20 +8,32 @@ name = "crypto_bench"
 required-features = ["crypto-bench"]
 
 [features]
+default = ["ring"]
+ring = [
+    "argmin-crypto/ring",
+    "checksum/ring",
+    "s3-types/ring",
+    "tls-provider?/ring",
+]
+openssl = [
+    "argmin-crypto/openssl",
+    "checksum/openssl",
+    "s3-types/openssl",
+    "tls-provider?/openssl",
+]
 crypto-bench = ["checksum/bench-select", "dep:tls-provider"]
 deep-tracing = ["observability/deep-tracing"]
-openssl-tls = ["crypto-bench", "tls-provider/openssl"]
 
 [dependencies]
-argmin-crypto = { path = "../crypto" }
+argmin-crypto = { path = "../crypto", default-features = false }
 base64 = "0.22"
 checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
 serde_json = "1"
-s3-types = { path = "../s3-types" }
+s3-types = { path = "../s3-types", default-features = false }
 subtle = "2"
 thiserror = "2"
-tls-provider = { path = "../tls-provider", optional = true }
+tls-provider = { path = "../tls-provider", default-features = false, optional = true }
 
 [dev-dependencies]
 aws-credential-types = "1"

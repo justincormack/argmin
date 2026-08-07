@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+production_tree="$(
+  cargo tree \
+    -p argmin-s3 \
+    --no-default-features \
+    --features openssl \
+    --edges normal,build \
+    --prefix none
+)"
+
+if printf '%s\n' "$production_tree" | grep -Eq '^(md-5|ring) v'; then
+  echo "OpenSSL production dependency graph unexpectedly contains ring or md-5:" >&2
+  printf '%s\n' "$production_tree" | grep -E '^(md-5|ring) v' >&2
+  exit 1
+fi
+
+cargo nextest run \
+  --workspace \
+  --no-default-features \
+  --features \
+    argmin-s3/openssl,s3-tests/openssl,s3-http-tests/openssl,s3-local-tests/openssl,sts-tests/openssl \
+  "$@"

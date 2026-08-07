@@ -15,7 +15,6 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::{TokioIo, TokioTimer};
-use md5_legacy::Digest;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::time::Instant as TokioInstant;
@@ -3210,7 +3209,10 @@ async fn handle_streaming_put(
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| checksum::sha256::Sha256::new());
-    let mut content_md5_hasher = ctx.checksum.content_md5.map(|_| md5_legacy::Md5::new());
+    let mut content_md5_hasher = ctx
+        .checksum
+        .content_md5
+        .map(|_| argmin_crypto::digest::Md5::new());
 
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
@@ -3593,7 +3595,7 @@ async fn abort_streaming(
 struct StreamingPutIngestState<'a> {
     hasher: &'a mut checksum::crc64::Hasher,
     payload_sha256_hasher: &'a mut Option<checksum::sha256::Sha256>,
-    content_md5_hasher: &'a mut Option<md5_legacy::Md5>,
+    content_md5_hasher: &'a mut Option<argmin_crypto::digest::Md5>,
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,
@@ -4133,7 +4135,10 @@ async fn handle_streaming_part(
     let mut payload_sha256_hasher = claimed_payload_sha256
         .as_ref()
         .map(|_| checksum::sha256::Sha256::new());
-    let mut content_md5_hasher = ctx.checksum.content_md5.map(|_| md5_legacy::Md5::new());
+    let mut content_md5_hasher = ctx
+        .checksum
+        .content_md5
+        .map(|_| argmin_crypto::digest::Md5::new());
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let mut hasher = checksum::crc64::Hasher::new();
     let mut segment_index: u32 = 0;
@@ -4620,7 +4625,7 @@ async fn abort_streaming_part_ctx(
 struct StreamingPartIngestState<'a> {
     hasher: &'a mut checksum::crc64::Hasher,
     payload_sha256_hasher: &'a mut Option<checksum::sha256::Sha256>,
-    content_md5_hasher: &'a mut Option<md5_legacy::Md5>,
+    content_md5_hasher: &'a mut Option<argmin_crypto::digest::Md5>,
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,

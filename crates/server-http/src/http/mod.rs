@@ -43,7 +43,6 @@ use conditional::{
     copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
     write_condition_from_headers,
 };
-use md5_legacy::Digest;
 use request::{S3Request, TransportSecurity};
 use response::{ErrorDiagnostic, S3Response, WireResponseIds};
 use router::{
@@ -5588,7 +5587,7 @@ fn parse_sse_customer_request_with_names(
         .try_into()
         .map_err(|_| ServerError::InvalidDigest)?;
 
-    let actual_md5 = md5_legacy::Md5::digest(customer_key_bytes);
+    let actual_md5 = argmin_crypto::digest::md5(&customer_key_bytes);
     let mut actual_md5_bytes = [0u8; 16];
     actual_md5_bytes.copy_from_slice(actual_md5.as_ref());
     if claimed_md5 != actual_md5_bytes {
@@ -5697,7 +5696,7 @@ fn parse_sse_customer_form_fields(
         .try_into()
         .map_err(|_| ServerError::InvalidDigest)?;
 
-    let actual_md5 = md5_legacy::Md5::digest(customer_key_bytes);
+    let actual_md5 = argmin_crypto::digest::md5(&customer_key_bytes);
     let mut actual_md5_bytes = [0u8; 16];
     actual_md5_bytes.copy_from_slice(actual_md5.as_ref());
     if claimed_md5 != actual_md5_bytes {
@@ -5914,7 +5913,7 @@ fn validate_content_md5(req: &S3Request) -> Result<(), ServerError> {
     let Some(claim) = ContentMd5Claim::from_request(req)? else {
         return Ok(());
     };
-    let actual = md5_legacy::Md5::digest(&req.body);
+    let actual = argmin_crypto::digest::md5(&req.body);
     let mut actual_bytes = [0u8; 16];
     actual_bytes.copy_from_slice(actual.as_ref());
     claim.verify(&actual_bytes)
@@ -9941,7 +9940,7 @@ mod tests {
     fn content_md5_value(body: &[u8]) -> String {
         use base64::Engine;
 
-        let digest = md5_legacy::Md5::digest(body);
+        let digest = argmin_crypto::digest::md5(body);
         base64::engine::general_purpose::STANDARD.encode(&digest[..])
     }
 

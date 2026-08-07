@@ -5,6 +5,23 @@ edition = "2021"
 publish = false
 
 [features]
+default = ["ring"]
+ring = [
+    "auth/ring",
+    "checksum/ring",
+    "s3-types/ring",
+    "server-core/ring",
+    "server_http/ring",
+    "storage/ring",
+]
+openssl = [
+    "auth/openssl",
+    "checksum/openssl",
+    "s3-types/openssl",
+    "server-core/openssl",
+    "server_http/openssl",
+    "storage/openssl",
+]
 deep-tracing = [
     "auth/deep-tracing",
     "ec/deep-tracing",
@@ -18,12 +35,12 @@ deep-tracing = [
 # Server (for local TestServer)
 server_http = { package = "server-http", path = "../server-http", default-features = false }
 server-core = { path = "../server-core", default-features = false }
-auth = { path = "../auth" }
+auth = { path = "../auth", default-features = false }
 ec = { path = "../ec", default-features = false }
 storage = { path = "../storage", default-features = false }
 checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
-s3-types = { path = "../s3-types" }
+s3-types = { path = "../s3-types", default-features = false }
 
 # AWS SDK (independent S3 client for validation)
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "http-1x", "sigv4a"] }

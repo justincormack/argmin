@@ -1,7 +1,5 @@
 use std::hash::Hasher as _;
 
-use md5_legacy::Digest as _;
-
 use crate::{ChecksumAlgorithm, RawChecksum};
 
 /// Incremental checksum hasher for S3 object checksum algorithms.
@@ -9,7 +7,7 @@ pub enum ChecksumHasher {
     Crc32(crate::crc32::Hasher),
     Crc32c(crate::crc32c::Hasher),
     Crc64(crate::crc64::Hasher),
-    Md5(md5_legacy::Md5),
+    Md5(argmin_crypto::digest::Md5),
     Sha1(argmin_crypto::digest::Sha1),
     Sha256(crate::sha256::Sha256),
     Sha512(argmin_crypto::digest::Sha512),
@@ -25,7 +23,7 @@ impl ChecksumHasher {
             ChecksumAlgorithm::Crc32 => Self::Crc32(crate::crc32::Hasher::new()),
             ChecksumAlgorithm::Crc32c => Self::Crc32c(crate::crc32c::Hasher::new()),
             ChecksumAlgorithm::Crc64nvme => Self::Crc64(crate::crc64::Hasher::new()),
-            ChecksumAlgorithm::Md5 => Self::Md5(md5_legacy::Md5::new()),
+            ChecksumAlgorithm::Md5 => Self::Md5(argmin_crypto::digest::Md5::new()),
             ChecksumAlgorithm::Sha1 => Self::Sha1(argmin_crypto::digest::Sha1::new()),
             ChecksumAlgorithm::Sha256 => Self::Sha256(crate::sha256::Sha256::new()),
             ChecksumAlgorithm::Sha512 => Self::Sha512(argmin_crypto::digest::Sha512::new()),

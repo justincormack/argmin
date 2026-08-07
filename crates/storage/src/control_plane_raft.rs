@@ -14555,7 +14555,7 @@ mod tests {
             "../../s3-tests/testdata/localhost-key.pem"
         ))
         .unwrap();
-        let signing_key = rustls::crypto::ring::default_provider()
+        let signing_key = tls_provider::build_provider()
             .key_provider
             .load_private_key(private_key)
             .unwrap();
@@ -14575,14 +14575,13 @@ mod tests {
             "../../s3-tests/testdata/localhost-key.pem"
         ))
         .unwrap();
-        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(certificates, private_key)
-        .unwrap();
+        let mut server_config =
+            rustls::ServerConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(certificates, private_key)
+                .unwrap();
         if with_alpn {
             server_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
         }
@@ -17780,13 +17779,12 @@ mod tests {
                 .unwrap();
         });
 
-        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(raft_peer_test_tls_roots())
-        .with_no_client_auth();
+        let mut client_config =
+            rustls::ClientConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(raft_peer_test_tls_roots())
+                .with_no_client_auth();
         client_config.alpn_protocols = vec![CONTROL_PLANE_RAFT_TLS_ALPN.to_vec()];
         let connection = rustls::ClientConnection::new(
             Arc::new(client_config.clone()),

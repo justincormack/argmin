@@ -8,6 +8,23 @@ name = "server_http"
 path = "src/lib.rs"
 
 [features]
+default = ["ring"]
+ring = [
+    "argmin-crypto/ring",
+    "auth/ring",
+    "checksum/ring",
+    "server-core/ring",
+    "s3-types/ring",
+    "storage/ring",
+]
+openssl = [
+    "argmin-crypto/openssl",
+    "auth/openssl",
+    "checksum/openssl",
+    "server-core/openssl",
+    "s3-types/openssl",
+    "storage/openssl",
+]
 local-debug-endpoints = []
 deep-tracing = [
     "auth/deep-tracing",
@@ -17,12 +34,12 @@ deep-tracing = [
 ]
 
 [dependencies]
-argmin-crypto = { path = "../crypto" }
-auth = { path = "../auth" }
+argmin-crypto = { path = "../crypto", default-features = false }
+auth = { path = "../auth", default-features = false }
 checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
 server-core = { path = "../server-core", default-features = false }
-s3-types = { path = "../s3-types" }
+s3-types = { path = "../s3-types", default-features = false }
 storage = { path = "../storage", default-features = false }
 base64 = "0.22"
 hyper = { version = "1", features = ["http1", "server"] }
@@ -32,7 +49,6 @@ http = "1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util"] }
 quick-xml = "0.41"
-md5_legacy = { package = "md-5", version = "0.10" }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "tls12"] }
 
 [dev-dependencies]

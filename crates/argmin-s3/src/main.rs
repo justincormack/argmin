@@ -5537,7 +5537,7 @@ mod tests {
             "../../s3-tests/testdata/localhost-key.pem"
         ))
         .unwrap();
-        let signing_key = rustls::crypto::ring::default_provider()
+        let signing_key = tls_provider::build_provider()
             .key_provider
             .load_private_key(private_key)
             .unwrap();

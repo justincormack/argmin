@@ -4,17 +4,32 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-argmin-crypto = { path = "../crypto" }
-auth = { path = "../auth" }
+argmin-crypto = { path = "../crypto", default-features = false }
+auth = { path = "../auth", default-features = false }
 checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
 observability = { path = "../observability" }
 storage = { path = "../storage", default-features = false }
-s3-types = { path = "../s3-types" }
+s3-types = { path = "../s3-types", default-features = false }
 base64 = "0.22"
 thiserror = "2"
 
 [features]
+default = ["ring"]
+ring = [
+    "argmin-crypto/ring",
+    "auth/ring",
+    "checksum/ring",
+    "s3-types/ring",
+    "storage/ring",
+]
+openssl = [
+    "argmin-crypto/openssl",
+    "auth/openssl",
+    "checksum/openssl",
+    "s3-types/openssl",
+    "storage/openssl",
+]
 test-utils = []
 deep-tracing = [
     "auth/deep-tracing",

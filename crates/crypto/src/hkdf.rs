@@ -2,13 +2,7 @@
 
 use crate::CryptoError;
 
-struct OutputLength<const N: usize>;
-
-impl<const N: usize> ring::hkdf::KeyType for OutputLength<N> {
-    fn len(&self) -> usize {
-        N
-    }
-}
+const SHA256_LEN: usize = 32;
 
 /// Derive `N` bytes using HKDF-SHA256 and one info value.
 pub fn sha256<const N: usize>(
@@ -16,14 +10,55 @@ pub fn sha256<const N: usize>(
     input_key_material: &[u8],
     info: &[u8],
 ) -> Result<[u8; N], CryptoError> {
-    let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt);
-    let pseudorandom_key = salt.extract(input_key_material);
-    let info = [info];
-    let output = pseudorandom_key
-        .expand(&info, OutputLength::<N>)
-        .map_err(|_| CryptoError)?;
+    if N > 255 * SHA256_LEN {
+        return Err(CryptoError);
+    }
+
     let mut result = [0; N];
-    output.fill(&mut result).map_err(|_| CryptoError)?;
+    if N == 0 {
+        return Ok(result);
+    }
+
+    #[cfg(feature = "openssl")]
+    {
+        use openssl::pkey::Id;
+        use openssl::pkey_ctx::PkeyCtx;
+
+        let mut context = PkeyCtx::new_id(Id::HKDF).map_err(|_| CryptoError)?;
+        context.derive_init().map_err(|_| CryptoError)?;
+        context
+            .set_hkdf_md(openssl::md::Md::sha256())
+            .map_err(|_| CryptoError)?;
+        context
+            .set_hkdf_key(input_key_material)
+            .map_err(|_| CryptoError)?;
+        context.set_hkdf_salt(salt).map_err(|_| CryptoError)?;
+        context.add_hkdf_info(info).map_err(|_| CryptoError)?;
+        let written = context.derive(Some(&mut result)).map_err(|_| CryptoError)?;
+        if written != N {
+            return Err(CryptoError);
+        }
+    }
+
+    #[cfg(all(feature = "ring", not(feature = "openssl")))]
+    {
+        struct OutputLength(usize);
+
+        impl ring::hkdf::KeyType for OutputLength {
+            fn len(&self) -> usize {
+                self.0
+            }
+        }
+
+        let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, salt);
+        let pseudorandom_key = salt.extract(input_key_material);
+        let info = [info];
+        pseudorandom_key
+            .expand(&info, OutputLength(N))
+            .map_err(|_| CryptoError)?
+            .fill(&mut result)
+            .map_err(|_| CryptoError)?;
+    }
     Ok(result)
 }
 

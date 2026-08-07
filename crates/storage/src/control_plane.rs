@@ -24088,20 +24088,19 @@ mod tests {
             "../../s3-tests/testdata/localhost-key.pem"
         ))
         .unwrap();
-        let provider = rustls::crypto::ring::default_provider();
+        let provider = tls_provider::build_provider();
         Arc::new(CertifiedKey::from_der(certificates, private_key, &provider).unwrap())
     }
 
     fn control_plane_test_tls_server_config() -> Arc<rustls::ServerConfig> {
         let certified_key = control_plane_test_tls_certified_key();
         let resolver = ControlPlaneRpcTlsCertificateResolver { certified_key };
-        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_cert_resolver(Arc::new(resolver));
+        let mut server_config =
+            rustls::ServerConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_cert_resolver(Arc::new(resolver));
         server_config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
         Arc::new(server_config)
     }
@@ -24109,13 +24108,12 @@ mod tests {
     fn control_plane_test_tls_client_config(
         negotiate_control_plane_alpn: bool,
     ) -> Arc<rustls::ClientConfig> {
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(control_plane_test_tls_roots())
-        .with_no_client_auth();
+        let mut config =
+            rustls::ClientConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(control_plane_test_tls_roots())
+                .with_no_client_auth();
         if negotiate_control_plane_alpn {
             config.alpn_protocols = vec![CONTROL_PLANE_RPC_TLS_ALPN.to_vec()];
         }

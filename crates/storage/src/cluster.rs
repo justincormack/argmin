@@ -5967,13 +5967,12 @@ mod runtime_map_refresh_invalidation_tests {
             )
             .unwrap();
         let initial_runtime_map = authority.snapshot().runtime_map(1_000).unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
+        let mut tls =
+            rustls::ClientConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
         tls.alpn_protocols = vec![crate::storage_rpc_transport::STORAGE_RPC_TLS_ALPN.to_vec()];
         let endpoint = crate::storage_rpc_transport::StorageRpcClientEndpoint::tcp_with_config(
             "tcp://localhost:7701",
@@ -6041,13 +6040,12 @@ mod runtime_map_refresh_invalidation_tests {
         let historical_runtime_map = current_runtime_map
             .runtime_map_at_epoch(initial_runtime_map.cluster_epoch())
             .unwrap();
-        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
+        let mut tls =
+            rustls::ClientConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
         tls.alpn_protocols = vec![crate::storage_rpc_transport::STORAGE_RPC_TLS_ALPN.to_vec()];
         let tls = Arc::new(tls);
         let endpoints = [(1_u32, 7701_u16), (2, 7702)].map(|(node_id, port)| {

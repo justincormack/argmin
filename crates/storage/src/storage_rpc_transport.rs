@@ -706,7 +706,7 @@ mod tests {
     }
 
     fn test_certified_key() -> Arc<CertifiedKey> {
-        test_certified_key_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        test_certified_key_with_provider(tls_provider::configured_provider())
     }
 
     fn test_certified_key_with_provider(
@@ -733,13 +733,12 @@ mod tests {
     }
 
     fn client_config(alpn: Vec<Vec<u8>>) -> Arc<rustls::ClientConfig> {
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth();
+        let mut config =
+            rustls::ClientConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
         config.alpn_protocols = alpn;
         Arc::new(config)
     }
@@ -780,14 +779,13 @@ mod tests {
 
     #[test]
     fn storage_owned_client_profile_rejects_tls_1_2_only_server() {
-        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS12])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(test_certificates(), test_private_key())
-        .unwrap();
+        let mut server_config =
+            rustls::ServerConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(test_certificates(), test_private_key())
+                .unwrap();
         server_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
         let server_config = Arc::new(server_config);
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -835,13 +833,12 @@ mod tests {
             .err()
             .expect("TLS 1.3 storage server must not negotiate with a TLS 1.2-only client")
         });
-        let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS12])
-        .unwrap()
-        .with_root_certificates((*test_trust_roots()).clone())
-        .with_no_client_auth();
+        let mut client_config =
+            rustls::ClientConfig::builder_with_provider(tls_provider::configured_provider())
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .unwrap()
+                .with_root_certificates((*test_trust_roots()).clone())
+                .with_no_client_auth();
         client_config.alpn_protocols = vec![STORAGE_RPC_TLS_ALPN.to_vec()];
         let endpoint = StorageRpcClientEndpoint::tcp_with_config(
             format!("tcp://localhost:{}", address.port()),
@@ -861,7 +858,7 @@ mod tests {
         assert_ne!(server_error.kind(), io::ErrorKind::TimedOut);
     }
 
-    #[cfg(feature = "openssl-tls")]
+    #[cfg(feature = "openssl")]
     fn assert_tls_provider_interoperability(
         client_provider: Arc<rustls::crypto::CryptoProvider>,
         server_provider: Arc<rustls::crypto::CryptoProvider>,
@@ -908,7 +905,7 @@ mod tests {
         server.join().unwrap();
     }
 
-    #[cfg(feature = "openssl-tls")]
+    #[cfg(feature = "openssl")]
     #[test]
     fn openssl_and_ring_tls_providers_interoperate_in_both_directions() {
         assert_tls_provider_interoperability(

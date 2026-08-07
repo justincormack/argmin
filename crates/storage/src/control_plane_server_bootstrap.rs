@@ -727,7 +727,7 @@ mod tests {
                 "../../s3-tests/testdata/localhost-key.pem"
             ))
             .unwrap();
-            let provider = rustls::crypto::ring::default_provider();
+            let provider = tls_provider::build_provider();
             ControlPlaneRpcServerListenerInput::TlsTcp {
                 listener,
                 certified_key: Arc::new(

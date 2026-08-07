@@ -4,12 +4,24 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
+default = ["ring"]
+ring = [
+    "argmin-crypto/ring",
+    "checksum/ring",
+    "s3-types/ring",
+    "tls-provider/ring",
+]
+openssl = [
+    "argmin-crypto/openssl",
+    "checksum/openssl",
+    "s3-types/openssl",
+    "tls-provider/openssl",
+]
 deep-tracing = ["observability/deep-tracing"]
-openssl-tls = ["tls-provider/openssl"]
 test-hooks = []
 
 [dependencies]
-argmin-crypto = { path = "../crypto" }
+argmin-crypto = { path = "../crypto", default-features = false }
 checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
 futures-util = "0.3"
@@ -17,14 +29,15 @@ libc = "0.2"
 observability = { path = "../observability" }
 openraft = { version = "=0.10.0-alpha.30", default-features = false, features = ["tokio-rt"] }
 placement = { path = "../placement" }
-s3-types = { path = "../s3-types" }
+s3-types = { path = "../s3-types", default-features = false }
 rapidhash = "4.4"
-rustls = { version = "0.23", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 rusqlite = { version = "0.33", features = ["bundled", "functions", "trace"] }
 thiserror = "2"
-tls-provider = { path = "../tls-provider" }
+tls-provider = { path = "../tls-provider", default-features = false }
 tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
 proptest = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

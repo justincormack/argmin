@@ -3,6 +3,11 @@ name = "s3-types"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["ring"]
+ring = ["checksum/ring"]
+openssl = ["checksum/openssl"]
+
 [dependencies]
 checksum = { path = "../checksum", default-features = false }
 quick-xml = "0.41"

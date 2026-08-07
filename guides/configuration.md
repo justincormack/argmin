@@ -46,20 +46,24 @@ not required by storage-only or control-plane-only processes.
 both be unset. They configure the public S3 listener only. Internal TCP TLS is
 configured through the cluster manifest.
 
-### TLS cryptography provider
+### Cryptography provider
 
-Ring is the default cryptography provider for every rustls connection,
-including the public listener and internal TLS/TCP connections. A build can
-also use the system OpenSSL library:
+Ring is the default provider for cryptographic primitives and every rustls
+connection, including the public listener and internal TLS/TCP connections. A
+build can also use the system OpenSSL library:
 
 ```bash
-cargo build --release -p argmin-s3 --features openssl-tls
+cargo build --release -p argmin-s3 --no-default-features --features openssl
 ./target/release/argmin-s3
 ```
 
-The `openssl-tls` feature selects OpenSSL for the whole build. Builds without
-it select ring. There is no runtime provider setting. This choice does not
-change the SigV4 cryptography implementation.
+The `openssl` feature selects the dynamically linked system OpenSSL library
+for TLS, SigV4, authenticated encryption, message digests, HMAC, HKDF, and
+secure randomness. Builds using the default feature set select ring, with a
+Rust implementation of MD5 for S3 compatibility. There is no runtime provider
+setting. Use `--no-default-features` for OpenSSL production builds so ring is
+not linked as well. OpenSSL is the recommended provider on RISC-V because the
+default ring build lacks comparable cryptographic acceleration there.
 
 Generate a wrapping or validator key with:
 

@@ -1781,12 +1781,8 @@ mod tests {
         ))
         .unwrap();
         let certified_key = Arc::new(
-            CertifiedKey::from_der(
-                certificates,
-                private_key,
-                &rustls::crypto::ring::default_provider(),
-            )
-            .unwrap(),
+            CertifiedKey::from_der(certificates, private_key, &tls_provider::build_provider())
+                .unwrap(),
         );
         let first = TcpListener::bind("127.0.0.1:0").unwrap();
         let second = first.try_clone().unwrap();

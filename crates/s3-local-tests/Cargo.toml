@@ -5,7 +5,10 @@ edition = "2021"
 publish = false
 
 [features]
+default = ["ring"]
+ring = ["s3-tests/ring"]
+openssl = ["s3-tests/openssl"]
 deep-tracing = ["s3-tests/deep-tracing"]
 
 [dependencies]
-s3-tests = { path = "../s3-tests" }
+s3-tests = { path = "../s3-tests", default-features = false }

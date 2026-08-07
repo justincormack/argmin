@@ -48,6 +48,8 @@ dependencies = [
 name = "argmin-crypto"
 version = "0.1.0"
 dependencies = [
+ "md-5 0.10.6",
+ "openssl",
  "proptest",
  "ring",
 ]
@@ -547,7 +549,6 @@ name = "checksum"
 version = "0.1.0"
 dependencies = [
  "argmin-crypto",
- "md-5 0.10.6",
  "proptest",
  "twox-hash",
 ]
@@ -2333,7 +2334,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "md-5 0.10.6",
  "observability",
  "quick-xml",
  "ring",

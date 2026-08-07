@@ -5,6 +5,9 @@ use std::sync::Arc;
 
 use rustls::crypto::CryptoProvider;
 
+#[cfg(not(any(feature = "ring", feature = "openssl")))]
+compile_error!("tls-provider requires either the `ring` or `openssl` feature");
+
 /// Construct the cryptography provider selected for this build.
 #[must_use]
 pub fn build_provider() -> CryptoProvider {
@@ -12,7 +15,7 @@ pub fn build_provider() -> CryptoProvider {
     {
         rustls_openssl::default_provider()
     }
-    #[cfg(not(feature = "openssl"))]
+    #[cfg(all(feature = "ring", not(feature = "openssl")))]
     {
         rustls::crypto::ring::default_provider()
     }
@@ -39,7 +42,7 @@ pub const fn provider_name() -> &'static str {
     {
         "openssl"
     }
-    #[cfg(not(feature = "openssl"))]
+    #[cfg(all(feature = "ring", not(feature = "openssl")))]
     {
         "ring"
     }
@@ -66,7 +69,7 @@ mod tests {
         assert!(!build_provider().cipher_suites.is_empty());
     }
 
-    #[cfg(not(feature = "openssl"))]
+    #[cfg(all(feature = "ring", not(feature = "openssl")))]
     #[test]
     fn default_build_selects_ring() {
         assert_eq!(provider_name(), "ring");

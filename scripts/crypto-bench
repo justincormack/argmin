@@ -14,11 +14,12 @@ SAMPLES="${SAMPLES:-5}"
 echo "cpu=$(uname -m)"
 echo "size_mib=$SIZE_MIB warmup_iters=$WARMUP_ITERS sample_iters=$SAMPLE_ITERS samples=$SAMPLES"
 echo "sigv4_warmup_iters=$SIGV4_WARMUP_ITERS sigv4_sample_iters=$SIGV4_SAMPLE_ITERS"
-echo "sha256_backend_override=${ARGMIN_SHA256_BENCH_BACKEND:-auto}"
 
 FEATURES="crypto-bench"
+DEFAULT_FEATURE_ARGS=()
 if [[ "${1:-}" == "--openssl" ]]; then
-  FEATURES="crypto-bench,openssl-tls"
+  FEATURES="crypto-bench,openssl"
+  DEFAULT_FEATURE_ARGS=(--no-default-features)
   shift
 fi
 if [[ "$#" -ne 0 ]]; then
@@ -26,7 +27,7 @@ if [[ "$#" -ne 0 ]]; then
   exit 2
 fi
 
-cargo run --offline -p auth --example crypto_bench --release --features "$FEATURES" -- \
+cargo run --offline -p auth --example crypto_bench --release "${DEFAULT_FEATURE_ARGS[@]}" --features "$FEATURES" -- \
   --size-mib "$SIZE_MIB" \
   --warmup-iters "$WARMUP_ITERS" \
   --sample-iters "$SAMPLE_ITERS" \

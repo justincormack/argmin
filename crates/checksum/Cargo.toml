@@ -8,11 +8,13 @@ missing_safety_doc = "deny"
 undocumented_unsafe_blocks = "deny"
 
 [features]
-bench-select = ["argmin-crypto/bench-select"]
+default = ["ring"]
+ring = ["argmin-crypto/ring"]
+openssl = ["argmin-crypto/openssl"]
+bench-select = []
 
 [dependencies]
-argmin-crypto = { path = "../crypto" }
-md5_legacy = { package = "md-5", version = "0.10" }
+argmin-crypto = { path = "../crypto", default-features = false }
 twox-hash = { version = "2.1.2", default-features = false, features = [
     "std",
     "xxhash64",
