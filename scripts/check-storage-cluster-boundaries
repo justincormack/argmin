@@ -6092,10 +6092,12 @@ fail_with_matches \
     "Cross-crate multipart and stream-session test support must consume raw storage errors inside storage and return only opaque failures" \
     "$multipart_test_support_error_leaks"
 
-scan_object_test_support_error_leaks() {
+scan_test_storage_failure_method_leaks() {
     local source=$1
+    local trait_name=${2:-StorageClusterObjectTestSupport}
+    local method_pattern=${3:-.*}
 
-    awk '
+    awk -v trait_name="$trait_name" -v method_pattern="$method_pattern" '
     function trim(value) {
         sub(/^[[:space:]]+/, "", value)
         sub(/[[:space:]]+$/, "", value)
@@ -6154,11 +6156,17 @@ scan_object_test_support_error_leaks() {
         signature = ""
         signature_start = ""
     }
-    /^[[:space:]]*pub trait StorageClusterObjectTestSupport[[:space:]]*\{/ {
-        in_object_support = 1
+    $0 ~ "^[[:space:]]*pub trait " trait_name "[[:space:]]*\\{" {
+        in_test_support = 1
         next
     }
-    in_object_support && /^[[:space:]]*fn[[:space:]]+/ {
+    in_test_support && /^[[:space:]]*((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+        method_name = $0
+        sub(/^[[:space:]]*((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/, "", method_name)
+        sub(/\(.*/, "", method_name)
+        if (method_name !~ method_pattern) {
+            next
+        }
         collecting_signature = 1
         signature = $0
         signature_start = FILENAME ":" FNR ":" $0
@@ -6167,22 +6175,22 @@ scan_object_test_support_error_leaks() {
         }
         next
     }
-    in_object_support && collecting_signature {
+    in_test_support && collecting_signature {
         signature = signature " " $0
         if ($0 ~ /;/) {
             inspect_signature()
         }
         next
     }
-    in_object_support && /^[[:space:]]*\}/ {
-        in_object_support = 0
+    in_test_support && /^[[:space:]]*\}/ {
+        in_test_support = 0
     }
     ' "$source"
 }
 
 object_test_support_error_leaks=$(
     {
-        scan_object_test_support_error_leaks crates/storage/src/lib.rs
+        scan_test_storage_failure_method_leaks crates/storage/src/lib.rs
         if ! rg -q \
             '^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+delete_marker_version_has_owner_raw_for_owner_test' \
             crates/storage/src/lib.rs
@@ -6197,7 +6205,7 @@ fail_with_matches \
     "$object_test_support_error_leaks"
 
 object_test_support_error_fixture=$(
-    scan_object_test_support_error_leaks \
+    scan_test_storage_failure_method_leaks \
         scripts/fixtures/storage-boundary-object-test-support-errors.rs
 )
 expected_object_test_support_error_fixture='scripts/fixtures/storage-boundary-object-test-support-errors.rs:3:    fn raw_shard_error(&self) -> ShardIoError;
@@ -6212,6 +6220,68 @@ fi
 fail_with_matches \
     "Object test-support fallible-signature scan must reject raw and otherwise non-opaque errors" \
     "$object_test_support_error_fixture_failure"
+
+topology_and_stream_test_support_error_leaks=$(
+    {
+        awk '
+        /^[[:space:]]*pub trait StorageClusterTopologyTestSupport[[:space:]]*\{/ {
+            in_topology_support = 1
+        }
+        /^[[:space:]]*pub trait StorageClusterRuntimeMapTopologyTestSupport[[:space:]]*\{/ {
+            in_topology_support = 0
+        }
+        in_topology_support && /(ObjectPgActionError|MetadataError|StoreError|ShardIoError)/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        ' crates/storage/src/test_support/topology.rs
+        awk '
+        /^[[:space:]]*pub trait StorageClusterStreamSessionTestSupport[[:space:]]*\{/ {
+            in_stream_support = 1
+        }
+        /^[[:space:]]*impl StorageClusterStreamSessionTestSupport/ {
+            in_stream_support = 0
+        }
+        in_stream_support && /(ObjectPgActionError|MetadataError|StoreError|ShardIoError)/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        ' crates/storage/src/test_support/stream_route.rs
+        scan_test_storage_failure_method_leaks \
+            crates/storage/src/test_support/topology.rs \
+            StorageClusterTopologyTestSupport \
+            '^(test_current_object_has_metadata_pg_after_data_pg|test_stream_put_session_crosses_metadata_and_data_pgs)$'
+        scan_test_storage_failure_method_leaks \
+            crates/storage/src/test_support/stream_route.rs \
+            StorageClusterStreamSessionTestSupport \
+            '^test_create_put_object_stream_session_with_cleanup_deadline$'
+        for method in \
+            current_object_has_metadata_pg_after_data_pg_raw \
+            stream_put_session_crosses_metadata_and_data_pgs_raw
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}" \
+                crates/storage/src/test_support/topology.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/test_support/topology.rs: raw topology helper ${method} must remain crate-private"
+            fi
+        done
+        for method in \
+            create_put_object_stream_session_record \
+            create_put_object_stream_session_record_with_cleanup_deadline
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}" \
+                crates/storage/src/cluster/payload_operations.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/payload_operations.rs: raw stream-session setup ${method} must remain crate-private"
+            fi
+        done
+    }
+)
+fail_with_matches \
+    "Cross-crate topology observations and stream-session setup must consume raw storage errors inside storage" \
+    "$topology_and_stream_test_support_error_leaks"
 
 metadata_command_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for)|struct[[:space:]]+MetadataCommandApplyTestContext|type[[:space:]]+MetadataCommandApplyContextTestHook)\b'
 

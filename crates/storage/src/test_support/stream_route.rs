@@ -1,6 +1,8 @@
+use super::TestStorageFailure;
 use crate::{
-    ActiveMultipartObjectRoute, ActivePutObjectRoute, BucketName, ObjectKey, SessionId,
-    StorageCluster, StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadFailure,
+    ActiveMultipartObjectRoute, ActivePutObjectRoute, BucketName, ObjectEncryption, ObjectKey,
+    SessionId, StorageCluster, StreamSegmentAppendInput, StreamSegmentAppendOutcome,
+    StreamUploadFailure,
 };
 
 /// Logical stream-session mutation support for cross-crate tests.
@@ -10,6 +12,15 @@ use crate::{
 /// race tests can end a known session and observe the same opaque failure
 /// boundary used by production admitted routes.
 pub trait StorageClusterStreamSessionTestSupport {
+    fn test_create_put_object_stream_session_with_cleanup_deadline(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        encryption: ObjectEncryption,
+        cleanup_after: Option<u64>,
+    ) -> Result<(), TestStorageFailure>;
+
     fn test_abort_stream_upload_session(
         &self,
         bucket: &BucketName,
@@ -19,6 +30,25 @@ pub trait StorageClusterStreamSessionTestSupport {
 }
 
 impl StorageClusterStreamSessionTestSupport for StorageCluster {
+    fn test_create_put_object_stream_session_with_cleanup_deadline(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        encryption: ObjectEncryption,
+        cleanup_after: Option<u64>,
+    ) -> Result<(), TestStorageFailure> {
+        StorageCluster::create_put_object_stream_session_record_with_cleanup_deadline(
+            self,
+            bucket,
+            key,
+            session_id,
+            encryption,
+            cleanup_after,
+        )
+        .map_err(TestStorageFailure::from_object_pg_action)
+    }
+
     fn test_abort_stream_upload_session(
         &self,
         bucket: &BucketName,

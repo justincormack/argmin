@@ -1,6 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use super::TestStorageFailure;
 use crate::control_plane;
 use crate::{
     BucketName, ClusterEpoch, GenerationId, ObjectKey, ObjectPgActionError, PgId, PgState,
@@ -86,14 +87,14 @@ pub trait StorageClusterTopologyTestSupport {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<bool, ObjectPgActionError>;
+    ) -> Result<bool, TestStorageFailure>;
 
     fn test_stream_put_session_crosses_metadata_and_data_pgs(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<bool, ObjectPgActionError>;
+    ) -> Result<bool, TestStorageFailure>;
 
     fn test_clone_with_stale_current_pg_routes(
         &self,
@@ -129,6 +130,48 @@ pub trait StorageClusterRuntimeMapTopologyTestSupport {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<ClusterEpoch, TestStorageTopologyScenarioError>;
+}
+
+pub(crate) fn current_object_has_metadata_pg_after_data_pg_raw(
+    cluster: &StorageCluster,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> Result<bool, ObjectPgActionError> {
+    let generation_id = match cluster.test_get_object_meta(bucket, key)? {
+        StoredObject::Live(record) => record.generation_id,
+        StoredObject::DeleteMarker(_) => {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "topology observation requires a current live object".to_string(),
+            });
+        }
+    };
+    Ok(cluster.test_object_pg_id_for(bucket, key)
+        > cluster.test_data_pg_id_for(bucket, key, generation_id))
+}
+
+pub(crate) fn stream_put_session_crosses_metadata_and_data_pgs_raw(
+    cluster: &StorageCluster,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    session_id: &SessionId,
+) -> Result<bool, ObjectPgActionError> {
+    let is_exact_put_session = cluster
+        .test_list_all_stream_uploads()?
+        .into_iter()
+        .any(|session| {
+            session.bucket == *bucket
+                && session.key == *key
+                && session.session_id == *session_id
+                && session.target == StreamUploadTarget::PutObject
+        });
+    if !is_exact_put_session {
+        return Err(ObjectPgActionError::InvalidRequest {
+            reason: "topology observation requires the exact PutObject stream session".to_string(),
+        });
+    }
+    let generation_id = cluster.test_object_generation_reservation_for(bucket, key, session_id)?;
+    Ok(cluster.test_object_pg_id_for(bucket, key)
+        != cluster.test_data_pg_id_for(bucket, key, generation_id))
 }
 
 impl StorageClusterTopologyTestSupport for StorageCluster {
@@ -234,17 +277,9 @@ impl StorageClusterTopologyTestSupport for StorageCluster {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<bool, ObjectPgActionError> {
-        let generation_id = match self.test_get_object_meta(bucket, key)? {
-            StoredObject::Live(record) => record.generation_id,
-            StoredObject::DeleteMarker(_) => {
-                return Err(ObjectPgActionError::InvalidRequest {
-                    reason: "topology observation requires a current live object".to_string(),
-                });
-            }
-        };
-        Ok(self.test_object_pg_id_for(bucket, key)
-            > self.test_data_pg_id_for(bucket, key, generation_id))
+    ) -> Result<bool, TestStorageFailure> {
+        current_object_has_metadata_pg_after_data_pg_raw(self, bucket, key)
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     fn test_stream_put_session_crosses_metadata_and_data_pgs(
@@ -252,25 +287,9 @@ impl StorageClusterTopologyTestSupport for StorageCluster {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<bool, ObjectPgActionError> {
-        let is_exact_put_session =
-            self.test_list_all_stream_uploads()?
-                .into_iter()
-                .any(|session| {
-                    session.bucket == *bucket
-                        && session.key == *key
-                        && session.session_id == *session_id
-                        && session.target == StreamUploadTarget::PutObject
-                });
-        if !is_exact_put_session {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "topology observation requires the exact PutObject stream session"
-                    .to_string(),
-            });
-        }
-        let generation_id = self.test_object_generation_reservation_for(bucket, key, session_id)?;
-        Ok(self.test_object_pg_id_for(bucket, key)
-            != self.test_data_pg_id_for(bucket, key, generation_id))
+    ) -> Result<bool, TestStorageFailure> {
+        stream_put_session_crosses_metadata_and_data_pgs_raw(self, bucket, key, session_id)
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     fn test_clone_with_stale_current_pg_routes(

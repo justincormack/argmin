@@ -1712,6 +1712,8 @@ pub mod test_support {
     };
 
     mod topology;
+    #[cfg(test)]
+    pub(crate) use topology::stream_put_session_crosses_metadata_and_data_pgs_raw;
     pub use topology::{
         StorageClusterRuntimeMapTopologyTestSupport, StorageClusterTopologyTestSupport,
         TestStorageTopologyScenarioError,

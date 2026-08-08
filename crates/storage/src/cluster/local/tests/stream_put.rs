@@ -97,25 +97,25 @@ fn topology_test_support_binds_stream_placement_to_exact_put_session() {
             },
         ) {
             let (other_key, other_session_id, _) = selected.unwrap();
-            let error = cluster
-                .test_stream_put_session_crosses_metadata_and_data_pgs(
-                    &bucket,
-                    &other_key,
-                    &session_id,
-                )
-                .unwrap_err();
+            let error = crate::test_support::stream_put_session_crosses_metadata_and_data_pgs_raw(
+                &cluster,
+                &bucket,
+                &other_key,
+                &session_id,
+            )
+            .unwrap_err();
             assert!(matches!(
                 error,
                 crate::ObjectPgActionError::InvalidRequest { ref reason }
                     if reason == "topology observation requires the exact PutObject stream session"
             ));
-            let error = cluster
-                .test_stream_put_session_crosses_metadata_and_data_pgs(
-                    &bucket,
-                    &key,
-                    &other_session_id,
-                )
-                .unwrap_err();
+            let error = crate::test_support::stream_put_session_crosses_metadata_and_data_pgs_raw(
+                &cluster,
+                &bucket,
+                &key,
+                &other_session_id,
+            )
+            .unwrap_err();
             assert!(matches!(
                 error,
                 crate::ObjectPgActionError::InvalidRequest { ref reason }

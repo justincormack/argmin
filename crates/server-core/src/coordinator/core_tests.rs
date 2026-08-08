@@ -20,9 +20,9 @@ use storage::test_support::{
     StorageClusterMetadataCommandTestSupport as _, StorageClusterObjectTestSupport as _,
     StorageClusterPayloadTestSupport as _, StorageClusterRouteHandleTestSupport as _,
     StorageClusterRouteMapTestSupport as _, StorageClusterRuntimeMapTopologyTestSupport as _,
-    StorageClusterSchedulingTestSupport as _, StorageClusterTopologyTestSupport as _,
-    StorageMaintenanceSweeperTestSupport as _, StorageShardRepairSweeperTestSupport as _,
-    StorageStreamSessionSweeperTestSupport as _,
+    StorageClusterSchedulingTestSupport as _, StorageClusterStreamSessionTestSupport as _,
+    StorageClusterTopologyTestSupport as _, StorageMaintenanceSweeperTestSupport as _,
+    StorageShardRepairSweeperTestSupport as _, StorageStreamSessionSweeperTestSupport as _,
 };
 use storage::{
     RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
@@ -6125,7 +6125,7 @@ fn stream_session_sweeper_follows_runtime_map_refresh_for_durable_cleanup() {
     let session_id = storage::SessionId::try_from("81818181818181818181818181818181").unwrap();
     let cleanup_after = 1_100;
     initial
-        .create_put_object_stream_session_record_with_cleanup_deadline(
+        .test_create_put_object_stream_session_with_cleanup_deadline(
             &bucket,
             &key,
             &session_id,

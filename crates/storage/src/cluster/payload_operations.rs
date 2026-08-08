@@ -3505,8 +3505,8 @@ impl StorageCluster {
         );
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_put_object_stream_session_record(
+    #[cfg(test)]
+    pub(crate) fn create_put_object_stream_session_record(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -3519,7 +3519,7 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_put_object_stream_session_record_with_cleanup_deadline(
+    pub(crate) fn create_put_object_stream_session_record_with_cleanup_deadline(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

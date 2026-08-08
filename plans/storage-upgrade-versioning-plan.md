@@ -2288,13 +2288,20 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        exact non-delete-marker validation regression remains owner-local through a crate-private
        raw observer. The boundary checker scans the complete object-support trait and requires the
        owner raw observer to remain crate-private.
+       The topology and stream-session setup error sub-slice completed on 2026-08-08. The logical
+       current-object placement and exact PutObject-session placement observations now return
+       `TestStorageFailure`; storage consumes object lookup, session inventory, reservation, and
+       subject-validation failures. Exact crossed-session validation remains owner-local through a
+       crate-private raw observer. The one higher-layer cleanup-deadline fixture now creates its
+       session through `StorageClusterStreamSessionTestSupport`, and both raw stream-session
+       creation methods are crate-private. The boundary checker rejects raw errors throughout the
+       public topology and stream-session traits, pins these three opaque return types, and requires
+       their raw owner helpers to remain crate-private.
        A compiler visibility audit performed after that conversion proved the earlier final-export
-       inventory incomplete. Making the raw enums crate-private currently identifies two remaining
-       topology test-support methods and one direct stream-session test setup that still cross the
-       crate boundary with `ObjectPgActionError`. It also identifies owner-only public methods for
-       raw shard I/O, route-history reconstruction, stream and multipart primitives, payload leases,
-       and physical placement; these have no external production callers and must be narrowed to
-       crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
+       inventory incomplete. Making the raw enums crate-private still identifies owner-only public
+       methods for raw shard I/O, route-history reconstruction, stream and multipart primitives,
+       payload leases, and physical placement; these have no external production callers and must
+       be narrowed to crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
        `StorageNodeServerError::Store` publicly embed `StoreError` and need storage-owned opaque
        diagnostics while preserving owner-local exact-error coverage. Complete those three bounded
        groups, rerun the compiler visibility audit with warnings denied, then make `StoreError`,
