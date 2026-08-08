@@ -1,0 +1,6261 @@
+    use super::*;
+    use crate::control_plane_auth::{
+        ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+        ControlPlaneScopedCredentialStore,
+    };
+    use crate::node_client::{
+        LocalUnixStorageNodeClientAdmissionSettings, PlacedShardNodeClient, UnixStorageNodeClient,
+    };
+    use crate::storage_rpc_transport::StorageRpcClientEndpoint;
+    use crate::{BucketAclSummary, StorageRpcClientAuthConfig};
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::Write;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    use s3_types::{AclGrants, BucketObjectLockConfig, BucketVersioningState};
+
+    use crate::control_plane::{
+        FileControlPlaneStore, NodeHeartbeat, NodeMembershipState, SingleAuthorityControlPlane,
+    };
+    use crate::metadata_command::{
+        BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateBucketCommand,
+        CreateStreamUploadCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
+        InsertDeleteMarkerCommand, MetadataCommandEnvelope, MetadataCommandId,
+        MetadataCommandLogIndex, MetadataCommandPayload, MetadataTransferCommand,
+        PutBucketAclCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
+    };
+    use crate::node_runtime::traits::{PgMetadataStore, ShardStore};
+    use crate::storage_rpc::{
+        decode_bucket_mark_deleting_command_build_response, decode_health_response,
+        decode_metadata_command_acceptance_response,
+        decode_metadata_command_applied_hashes_response,
+        decode_metadata_command_bool_outcome_response,
+        decode_metadata_command_log_hash_range_response,
+        decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
+        decode_metadata_command_pending_envelope_response,
+        decode_metadata_command_pending_slot_insert_response,
+        decode_metadata_command_pending_slot_remove_response,
+        decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
+        decode_read_handle_acquire_response, decode_read_handle_release_response,
+        decode_scavenger_list_files_response, decode_shard_ack_item_response,
+        decode_shard_read_range_response, decode_shard_read_response, decode_shard_write_ack,
+        decode_storage_rpc_response_payload, encode_bucket_mark_deleting_command_build_request,
+        encode_bucket_pg_request, encode_metadata_command_log_hash_range_request,
+        encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+        encode_metadata_command_pending_slot_request, encode_metadata_command_request,
+        encode_metadata_command_state_request, encode_metadata_command_transfer_adopt_request,
+        encode_metadata_command_transfer_checkpoint_base_request,
+        encode_metadata_command_transfer_empty_state_request,
+        encode_metadata_command_transfer_matching_state_request,
+        encode_placed_segment_shard_backfill_claim_acquire_request,
+        encode_placed_segment_shard_backfill_claim_error_request,
+        encode_placed_segment_shard_backfill_claim_record_request,
+        encode_placed_segment_shard_backfill_item_request,
+        encode_placed_segment_shard_backfill_record_request,
+        encode_placed_segment_shard_repair_claim_acquire_request,
+        encode_placed_segment_shard_repair_claim_error_request,
+        encode_placed_segment_shard_repair_claim_record_request,
+        encode_placed_segment_shard_repair_item_request,
+        encode_placed_segment_shard_repair_record_request, encode_read_handle_acquire_request,
+        encode_read_handle_release_request, encode_scavenger_list_files_request,
+        encode_scavenger_observation_key_request, encode_scavenger_observation_record_request,
+        encode_shard_ack_batch_request, encode_shard_ack_item_request, encode_shard_delete_request,
+        encode_shard_read_range_request, encode_shard_read_request, encode_shard_write_request,
+        encode_storage_rpc_frame, read_storage_rpc_frame_from, write_storage_rpc_frame_to,
+        StorageRpcBucketMarkDeletingCommandBuildOutcome,
+        StorageRpcBucketMarkDeletingCommandBuildRequest, StorageRpcBucketPgRequest,
+        StorageRpcBucketRequest, StorageRpcMetadataCommandAcceptanceOutcome,
+        StorageRpcMetadataCommandLogHashRangeRequest,
+        StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcMetadataCommandNextIdRequest,
+        StorageRpcMetadataCommandPendingSlotInsertOutcome,
+        StorageRpcMetadataCommandPendingSlotRequest, StorageRpcMetadataCommandRequest,
+        StorageRpcMetadataCommandStateOutcome, StorageRpcMetadataCommandStateRequest,
+        StorageRpcMetadataCommandTransferAdoptRequest,
+        StorageRpcMetadataCommandTransferCheckpointBaseRequest,
+        StorageRpcMetadataCommandTransferEmptyStateRequest,
+        StorageRpcMetadataCommandTransferMatchingStateRequest,
+        StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
+        StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
+        StorageRpcPlacedSegmentShardBackfillClaimRecordRequest,
+        StorageRpcPlacedSegmentShardBackfillItemRequest,
+        StorageRpcPlacedSegmentShardBackfillRecordRequest,
+        StorageRpcPlacedSegmentShardRepairClaimAcquireRequest,
+        StorageRpcPlacedSegmentShardRepairClaimErrorRequest,
+        StorageRpcPlacedSegmentShardRepairClaimRecordRequest,
+        StorageRpcPlacedSegmentShardRepairItemRequest,
+        StorageRpcPlacedSegmentShardRepairRecordRequest, StorageRpcReadHandleAcquireRequest,
+        StorageRpcReadHandleReleaseRequest, StorageRpcScavengerListFilesRequest,
+        StorageRpcScavengerObservationKeyRequest, StorageRpcScavengerObservationRecordRequest,
+        StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
+        StorageRpcShardDeleteRequest, StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest,
+        StorageRpcShardWriteRequest,
+    };
+    use crate::types::{
+        BucketName, BucketSubresourceAux, BucketSubresourceKind, CreateBucketConfig, GenerationId,
+        PgId, PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimRecord,
+        PlacedSegmentShardBackfillWorkItem, PlacedSegmentShardRepairClaimAcquire,
+        PlacedSegmentShardRepairClaimRecord, PlacedSegmentShardRepairWorkItem,
+        PutBucketSubresource, SegmentStoredBytesRequest, ShardIndex, ShardKey,
+        ShardScavengerObservationKey, ShardScavengerObservationReason,
+        ShardScavengerObservationRecord, VersionId,
+    };
+
+    #[test]
+    fn placed_segment_shard_repair_claim_route_epoch_must_match_claim_epoch() {
+        let route_epoch = ClusterEpoch::new(2).unwrap();
+        let claim_epoch = ClusterEpoch::new(1).unwrap();
+        let claim = PlacedSegmentShardRepairClaimRecord {
+            work_item: PlacedSegmentShardRepairWorkItem {
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: 7,
+                    segment_okh: [0xAC; 16],
+                    segment_vid: GenerationId::new(42).unwrap(),
+                    stored_size: 1024,
+                    segment_crc64: 0x1234,
+                    ec: EcShape { k: 4, m: 2 },
+                },
+                shard_index: ShardIndex::new(5),
+            },
+            claim_id: "claim-1".to_string(),
+            owner_token: "worker-1".to_string(),
+            cluster_epoch: claim_epoch,
+            claimed_at: 10,
+            lease_deadline: Some(20),
+            attempt_count: 1,
+            last_error: None,
+        };
+
+        assert!(matches!(
+            validate_placed_segment_shard_repair_claim_route_epoch(
+                PgId::new(7),
+                route_epoch,
+                &claim
+            ),
+            Err(StoreError::StalePayloadOperation {
+                operation_epoch,
+                current_epoch,
+                ..
+            }) if operation_epoch == claim_epoch && current_epoch == route_epoch
+        ));
+    }
+
+    #[test]
+    fn placed_segment_shard_backfill_claim_route_epoch_must_match_claim_epoch() {
+        let route_epoch = ClusterEpoch::new(2).unwrap();
+        let claim_epoch = ClusterEpoch::new(1).unwrap();
+        let claim = PlacedSegmentShardBackfillClaimRecord {
+            work_item: PlacedSegmentShardBackfillWorkItem {
+                request: SegmentStoredBytesRequest {
+                    data_pg_id: 7,
+                    segment_okh: [0xAC; 16],
+                    segment_vid: GenerationId::new(42).unwrap(),
+                    stored_size: 1024,
+                    segment_crc64: 0x1234,
+                    ec: EcShape { k: 4, m: 2 },
+                },
+                source_cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                desired_cluster_epoch: ClusterEpoch::new(2).unwrap(),
+            },
+            remaining_tolerance: 2,
+            claim_id: "claim-1".to_string(),
+            owner_token: "worker-1".to_string(),
+            cluster_epoch: claim_epoch,
+            claimed_at: 10,
+            lease_deadline: Some(20),
+            attempt_count: 1,
+            last_error: None,
+        };
+
+        assert!(matches!(
+            validate_placed_segment_shard_backfill_claim_route_epoch(
+                PgId::new(7),
+                route_epoch,
+                &claim
+            ),
+            Err(StoreError::StalePayloadOperation {
+                operation_epoch,
+                current_epoch,
+                ..
+            }) if operation_epoch == claim_epoch && current_epoch == route_epoch
+        ));
+    }
+
+    fn test_config(tmp: &test_util::TempDir) -> StorageNodeProcessConfig {
+        StorageNodeProcessConfig {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("node"),
+            default_ec_shape: EcShape { k: 4, m: 2 },
+            pg_ids: vec![0],
+            socket_path: tmp.path().join("sock").join("storage.sock"),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(7)],
+            }],
+            historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn standalone_storage_node_route_identity_has_exact_baseline_and_binds_inputs() {
+        let baseline = StorageNodeProcessConfig {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: PathBuf::from("/data/node"),
+            default_ec_shape: EcShape { k: 4, m: 2 },
+            pg_ids: vec![0],
+            socket_path: PathBuf::from("/run/node.sock"),
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(7)],
+            }],
+            historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
+        };
+        let identity = baseline.standalone_route_identity().unwrap();
+        assert_eq!(
+            identity.0,
+            [
+                54, 173, 168, 164, 79, 238, 241, 136, 186, 45, 203, 51, 18, 114, 94, 181, 178, 238,
+                22, 143, 165, 48, 13, 231, 250, 91, 2, 14, 82, 194, 201, 57,
+            ]
+        );
+
+        let mut changed = Vec::new();
+        let mut config = baseline.clone();
+        config.data_dir = PathBuf::from("/data/other");
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.socket_path = PathBuf::from("/run/other.sock");
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.default_ec_shape = EcShape { k: 3, m: 2 };
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.pg_routes[0].state = PgState::Degraded;
+        changed.push(config);
+        let mut config = baseline.clone();
+        config.pg_routes[0].acting_set.push(NodeId::new(8));
+        changed.push(config);
+        for config in changed {
+            assert_ne!(config.standalone_route_identity().unwrap(), identity);
+        }
+
+        let mut dynamic = baseline;
+        dynamic.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        assert!(matches!(
+            dynamic.standalone_route_identity(),
+            Err(crate::StandaloneRouteIdentityError::DynamicAuthority)
+        ));
+    }
+
+    const STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn storage_rpc_auth_test_credential(
+        principal: ControlPlaneAuthPrincipal,
+    ) -> ControlPlaneScopedCredential {
+        ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: "storage-node-server-auth-test".to_owned(),
+            credential_id: "storage-node-server-caller".to_owned(),
+            credential_version: 1,
+            principal,
+            secret: b"storage-node-server-auth-secret".to_vec(),
+        })
+        .unwrap()
+    }
+
+    fn storage_rpc_server_auth(
+        credential: &ControlPlaneScopedCredential,
+    ) -> StorageRpcServerAuthConfig {
+        storage_rpc_server_auth_with_max_connections(
+            credential,
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+        )
+    }
+
+    fn storage_rpc_test_transport_limits(
+        max_connections: usize,
+    ) -> crate::StorageRpcTransportLimits {
+        let defaults = crate::StorageRpcTransportLimits::DEFAULT;
+        crate::StorageRpcTransportLimits::new(
+            defaults.max_frame_bytes(),
+            max_connections,
+            defaults.io_timeout(),
+        )
+        .unwrap()
+    }
+
+    fn storage_rpc_server_auth_with_max_connections(
+        credential: &ControlPlaneScopedCredential,
+        max_connections: usize,
+    ) -> StorageRpcServerAuthConfig {
+        StorageRpcServerAuthConfig::new(
+            credential.cluster_id(),
+            ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap(),
+            9,
+            STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+        )
+        .unwrap()
+        .with_transport_limits(storage_rpc_test_transport_limits(max_connections))
+    }
+
+    fn storage_rpc_client_auth(
+        credential: ControlPlaneScopedCredential,
+        topology_generation: u64,
+    ) -> Arc<StorageRpcClientAuthConfig> {
+        storage_rpc_client_auth_with_max_connections(
+            credential,
+            topology_generation,
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+        )
+    }
+
+    fn storage_rpc_client_auth_with_max_connections(
+        credential: ControlPlaneScopedCredential,
+        topology_generation: u64,
+        max_connections: usize,
+    ) -> Arc<StorageRpcClientAuthConfig> {
+        Arc::new(
+            crate::FrontendStorageRpcClientCapability::new_with_transport_limits(
+                credential,
+                topology_generation,
+                STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                storage_rpc_test_transport_limits(max_connections),
+            )
+            .unwrap()
+            .into(),
+        )
+    }
+
+    fn storage_rpc_tls_certified_key() -> Arc<rustls::sign::CertifiedKey> {
+        let certificates = CertificateDer::pem_slice_iter(include_bytes!(
+            "../../../s3-tests/testdata/localhost-cert.pem"
+        ))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+        let private_key = PrivateKeyDer::from_pem_slice(include_bytes!(
+            "../../../s3-tests/testdata/localhost-key.pem"
+        ))
+        .unwrap();
+        Arc::new(
+            rustls::sign::CertifiedKey::from_der(
+                certificates,
+                private_key,
+                &tls_provider::build_provider(),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn storage_rpc_tls_trust_roots() -> Arc<rustls::RootCertStore> {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(
+                CertificateDer::pem_slice_iter(include_bytes!(
+                    "../../../s3-tests/testdata/ca-cert.pem"
+                ))
+                .next()
+                .unwrap()
+                .unwrap(),
+            )
+            .unwrap();
+        Arc::new(roots)
+    }
+
+    fn storage_rpc_tls_server_config() -> Arc<rustls::ServerConfig> {
+        crate::storage_rpc_transport::storage_rpc_tls_server_config(storage_rpc_tls_certified_key())
+            .unwrap()
+    }
+
+    fn storage_rpc_tls_client_config() -> Arc<rustls::ClientConfig> {
+        crate::storage_rpc_transport::storage_rpc_tls_client_config(storage_rpc_tls_trust_roots())
+            .unwrap()
+    }
+
+    #[test]
+    fn tls_tcp_listener_constructs_the_storage_owned_profile() {
+        let listener = StorageNodeRpcListenerConfig::tls_tcp(
+            "127.0.0.1:7701".parse().unwrap(),
+            storage_rpc_tls_certified_key(),
+        )
+        .unwrap();
+
+        let StorageNodeRpcListenerConfigInner::Tcp {
+            tls_server_config, ..
+        } = &listener.inner
+        else {
+            panic!("TLS constructor returned a Unix listener");
+        };
+        assert_eq!(
+            tls_server_config.alpn_protocols,
+            [crate::storage_rpc_transport::STORAGE_RPC_TLS_ALPN]
+        );
+        assert!(listener.is_tls_tcp());
+    }
+
+    fn bounded_runtime_refresh_config(
+        mut config: StorageNodeProcessConfig,
+    ) -> StorageNodeProcessConfig {
+        config.route_map_validity =
+            RouteMapValidity::until_ms(crate::clock::current_time_millis().saturating_add(60_000))
+                .expect("test validity deadline must be representable");
+        config
+    }
+
+    fn test_route(pg_id: u32) -> StorageNodePgRoute {
+        StorageNodePgRoute {
+            pg_id,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: PgState::Active,
+            primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
+            acting_set: vec![NodeId::new(7)],
+        }
+    }
+
+    fn assert_storage_node_process_config_eq(
+        actual: &StorageNodeProcessConfig,
+        expected: &StorageNodeProcessConfig,
+    ) {
+        assert_eq!(actual.node_id, expected.node_id);
+        assert_eq!(actual.cluster_epoch, expected.cluster_epoch);
+        assert_eq!(actual.route_map_validity, expected.route_map_validity);
+        assert_eq!(actual.data_dir, expected.data_dir);
+        assert_eq!(actual.default_ec_shape, expected.default_ec_shape);
+        assert_eq!(actual.pg_ids, expected.pg_ids);
+        assert_eq!(actual.socket_path, expected.socket_path);
+        assert_eq!(actual.pg_routes, expected.pg_routes);
+        assert_eq!(actual.historical_pg_routes, expected.historical_pg_routes);
+    }
+
+    fn replace_runtime_config_count(raw: &str, label: &str, count: usize) -> String {
+        let prefix = format!("{label} ");
+        let mut replaced = false;
+        let mut lines: Vec<_> = raw
+            .lines()
+            .map(|line| {
+                if line.starts_with(&prefix) {
+                    assert!(!replaced, "runtime config label must be unique");
+                    replaced = true;
+                    format!("{label} {count}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        assert!(replaced, "runtime config label must exist");
+        lines.push(String::new());
+        lines.join("\n")
+    }
+
+    #[test]
+    fn storage_node_process_config_new_rejects_invalid_route_table() {
+        let tmp = test_util::tempdir();
+        let err = StorageNodeProcessConfig::new(StorageNodeProcessConfigParts {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("node"),
+            default_ec_shape: EcShape { k: 4, m: 2 },
+            pg_ids: vec![0],
+            socket_path: tmp.path().join("sock").join("storage.sock"),
+            pg_routes: Vec::new(),
+            historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            StorageNodeServerError::MissingPgRoute { pg_id: 0 }
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_round_trips() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(9).unwrap();
+        config.route_map_validity = RouteMapValidity::until_ms(12_345).unwrap();
+        config.pg_ids = vec![0, 2];
+        config.pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(7), NodeId::new(8)],
+            },
+            StorageNodePgRoute {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::new(9).unwrap(),
+                state: PgState::Peering,
+                primary_node_id: NodeId::new(8),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(8), NodeId::new(7)],
+            },
+        ];
+        config.historical_pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(7), NodeId::new(8)],
+            },
+            StorageNodePgRoute {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::new(6).unwrap(),
+                state: PgState::Peering,
+                primary_node_id: NodeId::new(8),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(8), NodeId::new(7)],
+            },
+        ];
+
+        config.persist_control_plane_runtime_config().unwrap();
+        let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &config.data_dir,
+            config.node_id,
+            config.default_ec_shape,
+            &config.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_storage_node_process_config_eq(&loaded, &config);
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_rejects_reserved_validity_deadline() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let raw = encode_control_plane_runtime_config(&config).replace(
+            "route_map_validity forever\n",
+            &format!("route_map_validity until {}\n", u64::MAX),
+        );
+
+        assert!(matches!(
+            decode_control_plane_runtime_config(
+                &tmp.path().join("runtime-config"),
+                tmp.path().join("node"),
+                config.default_ec_shape,
+                &raw,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("reserved unbounded sentinel")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_rejects_counts_beyond_remaining_records() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let raw = encode_control_plane_runtime_config(&config);
+        let path = tmp.path().join("runtime-config");
+
+        for label in [
+            "pg_ids",
+            "pg_routes",
+            "historical_pg_routes",
+            "pending_metadata_command_recoveries",
+        ] {
+            let malformed = replace_runtime_config_count(&raw, label, usize::MAX);
+            assert!(matches!(
+                decode_control_plane_runtime_config(
+                    &path,
+                    tmp.path().join("node"),
+                    config.default_ec_shape,
+                    &malformed,
+                ),
+                Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                    if message.contains("count exceeds remaining runtime config records")
+            ));
+        }
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_rejects_overflowing_acting_set_count() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let raw = encode_control_plane_runtime_config(&config);
+        let mut lines: Vec<_> = raw.lines().map(str::to_owned).collect();
+        let route_header = lines.iter().position(|line| line == "pg_routes 1").unwrap();
+        lines[route_header + 1] = format!("0 1 1 7 - - - - - {} 7", usize::MAX);
+        lines.push(String::new());
+        let malformed = lines.join("\n");
+
+        assert!(matches!(
+            decode_control_plane_runtime_config(
+                &tmp.path().join("runtime-config"),
+                tmp.path().join("node"),
+                config.default_ec_shape,
+                &malformed,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("acting set length mismatch")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_oversized_file() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        let file = File::create(&path).unwrap();
+        file.set_len(CONTROL_PLANE_RUNTIME_CONFIG_MAX_BYTES as u64 + 1)
+            .unwrap();
+
+        assert!(matches!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("runtime config exceeds")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_symlink() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let target = tmp.path().join("runtime-config-target");
+        fs::write(&target, encode_control_plane_runtime_config(&config)).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        assert!(matches!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigRead { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_non_regular_file() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        fs::create_dir(&path).unwrap();
+
+        assert!(matches!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            ),
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("not a regular file")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_load_rejects_fifo_without_blocking() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `path_bytes` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
+        let data_dir = config.data_dir.clone();
+        let socket_path = config.socket_path.clone();
+        let node_id = config.node_id;
+        let default_ec_shape = config.default_ec_shape;
+        let (result_tx, result_rx) = mpsc::channel();
+        let loader = thread::spawn(move || {
+            result_tx
+                .send(StorageNodeProcessConfig::load_control_plane_runtime_config(
+                    data_dir,
+                    node_id,
+                    default_ec_shape,
+                    socket_path,
+                ))
+                .unwrap();
+        });
+
+        let (blocked, result) = match result_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(result) => (false, result),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Unblock a regressed blocking read so the test process can join cleanly.
+                drop(OpenOptions::new().write(true).open(&path).unwrap());
+                (
+                    true,
+                    result_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                )
+            }
+            Err(error) => panic!("runtime config loader disconnected: {error}"),
+        };
+        loader.join().unwrap();
+
+        assert!(
+            !blocked,
+            "runtime config FIFO open blocked before validation"
+        );
+        assert!(matches!(
+            result,
+            Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                if message.contains("not a regular file")
+        ));
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_persistence_rejects_staging_symlink() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let target = tmp.path().join("staging-symlink-target");
+        fs::write(&target, b"preserve this target").unwrap();
+        let staging_path =
+            control_plane_runtime_config_path(&config.data_dir).with_extension("tmp");
+        std::os::unix::fs::symlink(&target, &staging_path).unwrap();
+
+        let error = config.persist_control_plane_runtime_config().unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageNodeServerError::RuntimeConfigWrite { source, .. }
+                if source.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert_eq!(fs::read(&target).unwrap(), b"preserve this target");
+        assert!(fs::symlink_metadata(staging_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn storage_node_control_plane_runtime_config_persistence_replaces_stale_regular_staging_file() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        prepare_private_data_dir(&config.data_dir).unwrap();
+        let path = control_plane_runtime_config_path(&config.data_dir);
+        let staging_path = path.with_extension("tmp");
+        fs::write(&staging_path, b"stale crash residue").unwrap();
+
+        config.persist_control_plane_runtime_config().unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            encode_control_plane_runtime_config(&config)
+        );
+        assert!(!staging_path.exists());
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_refresh_persists_control_plane_runtime_config() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        config.historical_pg_routes.push(StorageNodePgRoute {
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            state: PgState::Active,
+            primary_node_id: NodeId::new(7),
+            metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
+            acting_set: vec![NodeId::new(7)],
+        });
+
+        server
+            .install_control_plane_runtime_config(config.clone())
+            .unwrap();
+        let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &config.data_dir,
+            config.node_id,
+            config.default_ec_shape,
+            &config.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_storage_node_process_config_eq(&loaded, &config);
+    }
+
+    #[test]
+    fn storage_node_incarnation_advances_and_persists() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+
+        assert_eq!(advance_storage_node_incarnation(&data_dir).unwrap(), 1);
+        assert_eq!(advance_storage_node_incarnation(&data_dir).unwrap(), 2);
+        assert_eq!(
+            std::fs::read_to_string(data_dir.join(STORAGE_NODE_INCARNATION_FILE)).unwrap(),
+            "2\n"
+        );
+        assert!(!data_dir.join(STORAGE_NODE_INCARNATION_TMP_FILE).exists());
+    }
+
+    #[test]
+    fn storage_node_state_initialization_uses_configured_epoch_and_ec_shape() {
+        const TEST_IDENTITY: &[u8] = b"storage-node-test-identity";
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        let initial_epoch = ClusterEpoch::new(7).unwrap();
+        let ec_shape = EcShape { k: 4, m: 2 };
+
+        let initialization_guard = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap();
+        initialize_storage_node_state(
+            &initialization_guard,
+            NodeId::new(11),
+            &[0, 3],
+            ec_shape,
+            initial_epoch,
+            TEST_IDENTITY,
+        )
+        .unwrap();
+        drop(initialization_guard);
+        let initialization_guard = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap();
+        initialize_storage_node_state(
+            &initialization_guard,
+            NodeId::new(11),
+            &[0, 3],
+            ec_shape,
+            initial_epoch,
+            TEST_IDENTITY,
+        )
+        .unwrap();
+
+        assert_eq!(
+            inspect_initialized_storage_node_state(&data_dir, &[0, 3], TEST_IDENTITY).unwrap(),
+            StorageNodeStateInspection::default()
+        );
+
+        for pg_id in [0, 3] {
+            let store = PgStore::open(&data_dir.join(format!("pg-{pg_id:04}")), pg_id).unwrap();
+            assert_eq!(
+                store
+                    .metadata_command_replica_state()
+                    .unwrap()
+                    .cluster_epoch,
+                initial_epoch
+            );
+        }
+        let reopened =
+            SharedStorageNode::open_with_default_ec_shape(&data_dir, &[0, 3], ec_shape).unwrap();
+        assert_eq!(reopened.default_ec_shape(), ec_shape);
+    }
+
+    #[test]
+    fn storage_node_state_initialization_guard_rejects_symlinked_native_lock() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        let external = tmp.path().join("external-lock-target");
+        prepare_private_data_dir(&data_dir).unwrap();
+        fs::write(&external, b"external").unwrap();
+        std::os::unix::fs::symlink(
+            &external,
+            data_dir.join(STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME),
+        )
+        .unwrap();
+
+        let error = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap_err();
+
+        assert!(matches!(
+            error,
+            StorageNodeServerError::Io {
+                context: "open storage-node data-dir lock",
+                ..
+            }
+        ));
+        assert_eq!(fs::read(&external).unwrap(), b"external");
+    }
+
+    #[test]
+    fn storage_node_initialization_entries_hide_and_validate_native_lock() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        let guard = StorageNodeStateInitializationGuard::acquire(&data_dir).unwrap();
+        assert!(guard
+            .data_dir_entry_names_excluding_held_lock()
+            .unwrap()
+            .is_empty());
+        fs::write(data_dir.join("outer-b"), b"b").unwrap();
+        fs::write(data_dir.join("outer-a"), b"a").unwrap();
+
+        assert_eq!(
+            guard.data_dir_entry_names_excluding_held_lock().unwrap(),
+            ["outer-a", "outer-b"]
+        );
+
+        fs::remove_file(data_dir.join(STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME)).unwrap();
+        fs::write(
+            data_dir.join(STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME),
+            b"replacement",
+        )
+        .unwrap();
+        assert!(matches!(
+            guard.data_dir_entry_names_excluding_held_lock(),
+            Err(StorageNodeServerError::DataDirLockIdentityChanged { path })
+                if path == data_dir
+        ));
+    }
+
+    #[test]
+    fn initialized_pg_state_error_keeps_implementation_diagnostic_opaque() {
+        let tmp = test_util::tempdir();
+
+        let error = inspect_initialized_storage_node_state(
+            &tmp.path().join("missing-node"),
+            &[3],
+            b"storage-node-test-identity",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            StorageNodeServerError::InitializedPgStateInvalid { pg_id: 3, .. }
+        ));
+        assert!(std::error::Error::source(&error).is_none());
+        assert_eq!(
+            error.to_string(),
+            "storage-node PG 3 initialized durable state is invalid"
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("StoreError"));
+        assert!(!debug.contains("PgDurableIdentityInvalid"));
+        assert!(!debug.contains("PG directory is unavailable"));
+    }
+
+    #[test]
+    fn storage_node_bootstrap_owns_raw_startup_and_persists_runtime_config() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let data_dir = tmp.path().join("node");
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let default_ec_shape = EcShape { k: 1, m: 0 };
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let now_ms = crate::clock::current_time_millis();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 1,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                now_ms,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 1,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 10_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                now_ms.saturating_add(1),
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        let runtime_map = authority
+            .snapshot()
+            .runtime_map(now_ms.saturating_add(2))
+            .unwrap();
+
+        let bootstrap = StorageNodeBootstrap::open_control_plane_managed(
+            node_id,
+            &data_dir,
+            &[pg_id.get()],
+            default_ec_shape,
+            &socket_path,
+        )
+        .unwrap();
+        assert_eq!(bootstrap.node_incarnation(), 1);
+        let initial_heartbeat = bootstrap.control_plane_heartbeat(10_000).unwrap();
+        assert_eq!(initial_heartbeat.node_id, node_id);
+        assert_eq!(initial_heartbeat.node_incarnation, 1);
+        assert_eq!(initial_heartbeat.observed_epoch, ClusterEpoch::INITIAL);
+        assert_eq!(initial_heartbeat.endpoint, socket_path.to_str().unwrap());
+        assert!(initial_heartbeat.pg_observations.is_empty());
+
+        let prepared = bootstrap.prepare(&runtime_map).unwrap();
+        let config = prepared.config();
+        assert_eq!(config.node_id(), node_id);
+        assert_eq!(config.cluster_epoch(), runtime_map.cluster_epoch());
+        assert_eq!(config.socket_path(), socket_path);
+        let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &data_dir,
+            node_id,
+            default_ec_shape,
+            &socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert_storage_node_process_config_eq(&loaded, config);
+        let server = prepared.bind().unwrap();
+        let served_heartbeat = server.control_plane_heartbeat(1, 10_000).unwrap();
+        assert_eq!(served_heartbeat.observed_epoch, runtime_map.cluster_epoch());
+        assert_eq!(served_heartbeat.pg_observations.len(), 1);
+        drop(server);
+
+        let restarted = StorageNodeBootstrap::open_control_plane_managed(
+            node_id,
+            &data_dir,
+            &[pg_id.get()],
+            default_ec_shape,
+            &socket_path,
+        )
+        .unwrap();
+        assert_eq!(restarted.node_incarnation(), 2);
+        let restart_heartbeat = restarted.control_plane_heartbeat(10_000).unwrap();
+        assert_eq!(
+            restart_heartbeat.observed_epoch,
+            runtime_map.cluster_epoch()
+        );
+        assert_eq!(restart_heartbeat.endpoint, socket_path.to_str().unwrap());
+        assert_eq!(restart_heartbeat.pg_observations.len(), 1);
+        assert_eq!(restart_heartbeat.pg_observations[0].pg_id, pg_id);
+        let restarted_server = restarted.prepare(&runtime_map).unwrap().bind().unwrap();
+        let served_restart_heartbeat = restarted_server.control_plane_heartbeat(2, 10_000).unwrap();
+        assert_eq!(
+            served_restart_heartbeat.observed_epoch,
+            runtime_map.cluster_epoch()
+        );
+        drop(restarted_server);
+    }
+
+    #[test]
+    fn storage_node_bind_rejects_config_older_than_persisted_runtime_config() {
+        let tmp = test_util::tempdir();
+        let mut persisted = test_config(&tmp);
+        private_socket_dir(persisted.socket_path.parent().unwrap());
+        let stale = persisted.clone();
+        persisted.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        persisted.pg_routes[0].cluster_epoch = persisted.cluster_epoch;
+        persisted.persist_control_plane_runtime_config().unwrap();
+
+        assert!(matches!(
+            StorageNodeServer::bind(stale),
+            Err(StorageNodeServerError::PersistedRuntimeConfigMismatch { path })
+                if path == control_plane_runtime_config_path(&persisted.data_dir)
+        ));
+    }
+
+    #[test]
+    fn storage_node_server_advances_incarnation_while_bound() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        assert_eq!(server.advance_control_plane_node_incarnation().unwrap(), 1);
+        assert_eq!(
+            std::fs::read_to_string(config.data_dir.join(STORAGE_NODE_INCARNATION_FILE)).unwrap(),
+            "1\n"
+        );
+    }
+
+    #[test]
+    fn storage_node_server_serializes_concurrent_incarnation_advances() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let caller_count = 8;
+        let barrier = Arc::new(Barrier::new(caller_count));
+        let mut joins = Vec::new();
+
+        for _ in 0..caller_count {
+            let server = Arc::clone(&server);
+            let barrier = Arc::clone(&barrier);
+            joins.push(thread::spawn(move || {
+                barrier.wait();
+                server.advance_control_plane_node_incarnation().unwrap()
+            }));
+        }
+
+        let mut incarnations = joins
+            .into_iter()
+            .map(|join| join.join().unwrap())
+            .collect::<Vec<_>>();
+        incarnations.sort_unstable();
+
+        assert_eq!(incarnations, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            std::fs::read_to_string(config.data_dir.join(STORAGE_NODE_INCARNATION_FILE)).unwrap(),
+            "8\n"
+        );
+        assert!(!config
+            .data_dir
+            .join(STORAGE_NODE_INCARNATION_TMP_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn storage_node_incarnation_rejects_invalid_persisted_value() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join(STORAGE_NODE_INCARNATION_FILE);
+        std::fs::write(&path, "0\n").unwrap();
+
+        assert!(matches!(
+            advance_storage_node_incarnation(&data_dir),
+            Err(StorageNodeServerError::InvalidNodeIncarnation {
+                path: error_path,
+                value,
+            }) if error_path == path && value == "0\n"
+        ));
+    }
+
+    #[test]
+    fn storage_node_incarnation_rejects_overflow() {
+        let tmp = test_util::tempdir();
+        let data_dir = tmp.path().join("node");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let path = data_dir.join(STORAGE_NODE_INCARNATION_FILE);
+        std::fs::write(&path, format!("{}\n", u64::MAX)).unwrap();
+
+        assert!(matches!(
+            advance_storage_node_incarnation(&data_dir),
+            Err(StorageNodeServerError::NodeIncarnationOverflow { path: error_path })
+                if error_path == path
+        ));
+    }
+
+    #[test]
+    fn storage_node_process_config_preserves_route_map_validity() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(1_500).unwrap();
+
+        assert_eq!(config.route_map_valid_until_ms(), Some(1_500));
+        assert!(config.is_route_map_valid_at(1_499));
+        assert!(matches!(
+            config.require_route_map_valid_at(1_500),
+            Err(StorageNodeServerError::RouteMapExpired {
+                cluster_epoch,
+                valid_until_ms: 1_500,
+                now_ms: 1_500,
+            }) if cluster_epoch == config.cluster_epoch
+        ));
+    }
+
+    #[test]
+    fn storage_node_server_rejects_expired_route_map_for_serving_rpc() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let error = server
+            .connection_handler()
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(error.message.contains("route map"));
+        assert!(error.message.contains("expired"));
+    }
+
+    #[test]
+    fn metadata_command_pg_lock_release_allows_expired_route_map_cleanup() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let mut session =
+            StorageNodeSession::new(Arc::clone(&server.read_handles), Arc::clone(&server._node));
+        session
+            .acquire_metadata_command_pg_lock(
+                &server.metadata_command_locks,
+                config.node_id,
+                StorageNodeMetadataCommandLockBinding {
+                    pg_id: PgId::new(0),
+                    cluster_epoch: config.cluster_epoch,
+                    authority: StorageNodeMetadataCommandLockAuthority::CurrentPrimary,
+                },
+                None,
+            )
+            .unwrap();
+        assert!(session.holds_metadata_command_pg_lock(PgId::new(0)));
+
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+        };
+        let response = handler
+            .metadata_command_pg_lock_release_response(&mut session, request)
+            .unwrap();
+        decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap();
+
+        assert!(!session.holds_metadata_command_pg_lock(PgId::new(0)));
+    }
+
+    #[test]
+    fn bucket_write_reservation_release_allows_expired_route_map_cleanup() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("expired-route-reservation-cleanup");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let record = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "reservation-expired-route-cleanup",
+                    owner_token: "owner-token-expired-route-cleanup",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: "put-object",
+                    created_at: 10,
+                    lease_deadline: 20,
+                    target_context: Some("key=a"),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            record
+        };
+
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let route_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let serving_error = handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(serving_error.code, StorageRpcErrorCode::StaleShardLocation);
+
+        let request = StorageRpcBucketWriteReservationRecordRequest {
+            node_id: config.node_id,
+            route_cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            record: record.clone(),
+        };
+        let response = handler
+            .bucket_write_reservation_release_response(&route_permit, request)
+            .unwrap();
+        decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap();
+
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &bucket,
+            &record.reservation_id,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn bucket_write_drain_capabilities_separate_active_and_retained_authority() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("bucket-write-drain-capability");
+        crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+        });
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+        };
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_route(&active_permit, &request, "test bucket write drain")
+                .unwrap()
+        });
+        let drain = crate::clock::with_time_override(1_000, || {
+            let drain = route
+                .begin_write_drain(
+                    "captured-route-drain",
+                    "captured-route-drain-owner",
+                    config.cluster_epoch,
+                    1_000,
+                    4_000,
+                    AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                )
+                .unwrap();
+            let drain = route.heartbeat_write_drain(&drain, 4_500).unwrap();
+            assert!(route.write_drain_exists().unwrap());
+            assert_eq!(route.write_drain().unwrap(), Some(drain.clone()));
+            assert_eq!(route.clear_expired_write_drain(4_000).unwrap(), None);
+            drain
+        });
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(10_000)
+        );
+
+        crate::clock::with_time_override(6_000, || {
+            let expired_operations = [
+                (
+                    "begin",
+                    route
+                        .begin_write_drain(
+                            "expired-route-drain",
+                            "expired-route-drain-owner",
+                            config.cluster_epoch,
+                            6_000,
+                            9_000,
+                            AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "heartbeat",
+                    route.heartbeat_write_drain(&drain, 9_000).map(|_| ()),
+                ),
+                (
+                    "clear expired",
+                    route.clear_expired_write_drain(6_000).map(|_| ()),
+                ),
+                ("exists", route.write_drain_exists().map(|_| ())),
+                ("get", route.write_drain().map(|_| ())),
+            ];
+            for (operation, result) in expired_operations {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                        assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("captured route should expire before drain {operation}: {error}")
+                    }
+                    Ok(()) => panic!("expired captured route performed drain {operation}"),
+                }
+            }
+        });
+        let assert_drain_unchanged = || {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket).unwrap(),
+                Some(drain.clone())
+            );
+        };
+        assert_drain_unchanged();
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_write_drain_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &drain,
+            "test bucket write drain clear",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active permit constructed retained drain authority"),
+        }
+        assert_drain_unchanged();
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_write_drain_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &drain,
+            "test bucket write drain clear",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign permit constructed retained drain authority"),
+        }
+        assert_drain_unchanged();
+
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_bucket_write_drain_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &drain,
+                    "test bucket write drain clear",
+                )
+                .unwrap()
+                .clear()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+                .unwrap()
+                .is_none(),
+            "retained capability must clear the exact drain after active route expiry"
+        );
+    }
+
+    #[test]
+    fn bucket_delete_finalize_claim_capabilities_separate_active_and_retained_authority() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("bucket-delete-finalize-claim-capability");
+        let bucket_incarnation_generation = crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            PgMetadataStore::mark_bucket_deleting(&*pg, &bucket).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .bucket_incarnation_generation
+        });
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+        };
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_route(
+                    &active_permit,
+                    &request,
+                    "test bucket delete finalize claim",
+                )
+                .unwrap()
+        });
+        let claim = crate::clock::with_time_override(1_000, || {
+            let claim = route
+                .acquire_bucket_delete_finalize_claim(
+                    bucket_incarnation_generation,
+                    "captured-route-finalize-claim",
+                    "captured-route-finalize-owner",
+                    config.cluster_epoch,
+                    1_000,
+                    None,
+                    1_000,
+                )
+                .unwrap()
+                .expect("active route should acquire a finalizer claim");
+            assert_eq!(
+                route.bucket_delete_finalize_claim().unwrap(),
+                Some(claim.clone())
+            );
+            claim
+        });
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            let expired_operations = [
+                (
+                    "acquire",
+                    route
+                        .acquire_bucket_delete_finalize_claim(
+                            bucket_incarnation_generation,
+                            "expired-route-finalize-claim",
+                            "expired-route-finalize-owner",
+                            config.cluster_epoch,
+                            6_000,
+                            Some(9_000),
+                            6_000,
+                        )
+                        .map(|_| ()),
+                ),
+                ("get", route.bucket_delete_finalize_claim().map(|_| ())),
+            ];
+            for (operation, result) in expired_operations {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                        assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("captured route should expire before claim {operation}: {error}")
+                    }
+                    Ok(()) => panic!("expired captured route performed claim {operation}"),
+                }
+            }
+        });
+        let assert_claim_unchanged = || {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::bucket_delete_finalize_claim(&*pg).unwrap(),
+                Some(claim.clone())
+            );
+        };
+        assert_claim_unchanged();
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_delete_finalize_claim_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &claim,
+            "test bucket delete finalize claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active permit constructed retained finalizer-claim authority"),
+        }
+        assert_claim_unchanged();
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_bucket_delete_finalize_claim_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &claim,
+            "test bucket delete finalize claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign permit constructed retained finalizer-claim authority"),
+        }
+        assert_claim_unchanged();
+
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_bucket_delete_finalize_claim_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &claim,
+                    "test bucket delete finalize claim release",
+                )
+                .unwrap()
+                .release()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::bucket_delete_finalize_claim(&*pg)
+                .unwrap()
+                .is_none(),
+            "retained capability must release the exact claim after active route expiry"
+        );
+    }
+
+    #[test]
+    fn lifecycle_sweep_claim_capabilities_separate_active_and_retained_authority() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("lifecycle-sweep-claim-capability");
+        let bucket_incarnation_generation = crate::clock::with_time_override(1_000, || {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            PgMetadataStore::put_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .bucket_incarnation_generation
+        });
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcBucketRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+        };
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_route(&active_permit, &request, "test lifecycle sweep claim")
+                .unwrap()
+        });
+        let claim = crate::clock::with_time_override(1_000, || {
+            route
+                .acquire_lifecycle_sweep_claim(
+                    bucket_incarnation_generation,
+                    "captured-route-lifecycle-claim",
+                    "captured-route-lifecycle-owner",
+                    config.cluster_epoch,
+                    1_000,
+                    Some(4_500),
+                    1_000,
+                )
+                .unwrap()
+                .expect("active route should acquire a lifecycle claim")
+        });
+        let heartbeat = crate::clock::with_time_override(1_500, || {
+            route
+                .heartbeat_lifecycle_sweep_claim(&claim, 1_500, None)
+                .unwrap()
+        });
+        let error_record = crate::clock::with_time_override(1_500, || {
+            route
+                .record_lifecycle_sweep_claim_error(&heartbeat, "transient lifecycle failure")
+                .unwrap()
+        });
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_500, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            let expired_operations = [
+                (
+                    "acquire",
+                    route
+                        .acquire_lifecycle_sweep_claim(
+                            bucket_incarnation_generation,
+                            "expired-route-lifecycle-claim",
+                            "expired-route-lifecycle-owner",
+                            config.cluster_epoch,
+                            6_000,
+                            Some(9_000),
+                            6_000,
+                        )
+                        .map(|_| ()),
+                ),
+                (
+                    "heartbeat",
+                    route
+                        .heartbeat_lifecycle_sweep_claim(&error_record, 6_000, Some(9_000))
+                        .map(|_| ()),
+                ),
+                (
+                    "record error",
+                    route
+                        .record_lifecycle_sweep_claim_error(&error_record, "must not be recorded")
+                        .map(|_| ()),
+                ),
+            ];
+            for (operation, result) in expired_operations {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                        assert!(error.message.contains("expired at 5000ms, now 6000ms"));
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("captured route should expire before claim {operation}: {error}")
+                    }
+                    Ok(()) => panic!("expired captured route performed claim {operation}"),
+                }
+            }
+        });
+        let assert_claim_unchanged = || {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::acquire_lifecycle_sweep_claim(
+                    &*pg,
+                    &bucket,
+                    bucket_incarnation_generation,
+                    &error_record.claim_id,
+                    &error_record.owner_token,
+                    error_record.cluster_epoch,
+                    error_record.claimed_at,
+                    error_record.lease_deadline,
+                    6_000,
+                )
+                .unwrap(),
+                Some(error_record.clone())
+            );
+        };
+        assert_claim_unchanged();
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_lifecycle_sweep_claim_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &error_record,
+            "test lifecycle sweep claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active permit constructed retained lifecycle-claim authority"),
+        }
+        assert_claim_unchanged();
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.retained_lifecycle_sweep_claim_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &error_record,
+            "test lifecycle sweep claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign permit constructed retained lifecycle-claim authority"),
+        }
+        assert_claim_unchanged();
+
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_lifecycle_sweep_claim_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &error_record,
+                    "test lifecycle sweep claim release",
+                )
+                .unwrap()
+                .release()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        let replacement = PgMetadataStore::acquire_lifecycle_sweep_claim(
+            &*pg,
+            &bucket,
+            bucket_incarnation_generation,
+            "post-release-lifecycle-claim",
+            "post-release-lifecycle-owner",
+            config.cluster_epoch,
+            6_000,
+            None,
+            6_000,
+        )
+        .unwrap()
+        .expect("retained capability must release the exact non-expiring claim");
+        PgMetadataStore::release_lifecycle_sweep_claim(
+            &*pg,
+            &replacement.bucket,
+            replacement.bucket_incarnation_generation,
+            &replacement.claim_id,
+            &replacement.owner_token,
+            replacement.cluster_epoch,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn metadata_command_proof_release_requires_exact_retained_capability() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let bucket = crate::tests::bucket_name("retained-metadata-command-proof-cleanup");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let record = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "retained-metadata-command-proof",
+                    owner_token: "retained-metadata-command-proof-owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: "put-object",
+                    created_at: 10,
+                    lease_deadline: 20,
+                    target_context: Some("key=a"),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            record
+        };
+        let proof = BucketWriteReservationProof::from(&record);
+
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let retained_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let active_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+
+        let assert_record_unchanged = || {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::durable_bucket_write_reservation(
+                    &*pg,
+                    &bucket,
+                    &record.reservation_id,
+                )
+                .unwrap(),
+                Some(record.clone())
+            );
+        };
+
+        match handler.retained_metadata_command_proof_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &proof,
+            "test metadata command proof release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign permit constructed retained proof authority"),
+        }
+        assert_record_unchanged();
+
+        match handler.retained_metadata_command_proof_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &proof,
+            "test metadata command proof release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active permit constructed retained proof authority"),
+        }
+        assert_record_unchanged();
+
+        let mismatched_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+        match handler.retained_metadata_command_proof_route(
+            &retained_permit,
+            config.node_id,
+            mismatched_epoch,
+            PgId::new(0),
+            &proof,
+            "test metadata command proof release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+                assert!(error.message.contains("does not match proof epoch"));
+            }
+            Ok(_) => panic!("mismatched route epoch constructed retained proof authority"),
+        }
+        assert_record_unchanged();
+
+        let route = handler
+            .retained_metadata_command_proof_route(
+                &retained_permit,
+                config.node_id,
+                config.cluster_epoch,
+                PgId::new(0),
+                &proof,
+                "test metadata command proof release",
+            )
+            .unwrap();
+        route.release().unwrap();
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &bucket,
+            &record.reservation_id,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn bucket_write_reservation_release_uses_retained_historical_primary_route() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let historical_epoch = config.cluster_epoch;
+        let bucket = crate::tests::bucket_name("historical-route-reservation-cleanup");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let record = {
+            let node = SharedStorageNode::open_with_default_ec_shape(
+                &config.data_dir,
+                &config.pg_ids,
+                config.default_ec_shape,
+            )
+            .unwrap();
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let record = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "reservation-historical-route-cleanup",
+                    owner_token: "owner-token-historical-route-cleanup",
+                    cluster_epoch: historical_epoch,
+                    operation_kind: "put-object",
+                    created_at: 10,
+                    lease_deadline: 20,
+                    target_context: Some("key=a"),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            record
+        };
+
+        let historical_route = config.pg_routes[0].clone();
+        config.cluster_epoch = ClusterEpoch::new(historical_epoch.get() + 1).unwrap();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        config.pg_routes[0].primary_node_id = NodeId::new(8);
+        config.pg_routes[0].acting_set = vec![config.node_id, NodeId::new(8)];
+        config.historical_pg_routes.push(historical_route);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+        let route_permit = handler
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let request = StorageRpcBucketWriteReservationRecordRequest {
+            node_id: config.node_id,
+            route_cluster_epoch: historical_epoch,
+            pg_id: PgId::new(0),
+            record: record.clone(),
+        };
+        let response = handler
+            .bucket_write_reservation_release_response(&route_permit, request)
+            .unwrap();
+        decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap();
+
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                &record.reservation_id,
+            )
+            .unwrap()
+            .is_none(),
+            "retained cleanup must use the historical route primary rather than the successor"
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_refresh_allows_route_table_changes() {
+        let tmp = test_util::tempdir();
+        let current = test_config(&tmp);
+        let mut candidate = current.clone();
+        candidate.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        candidate.route_map_validity = RouteMapValidity::until_ms(3_000).unwrap();
+        candidate.pg_ids = vec![0, 1];
+        candidate.pg_routes.push(StorageNodePgRoute {
+            pg_id: 1,
+            cluster_epoch: candidate.cluster_epoch,
+            state: PgState::Peering,
+            primary_node_id: candidate.node_id,
+            metadata_transfer_destination_epoch: None,
+            metadata_read_route: None,
+            acting_set: vec![candidate.node_id],
+        });
+        candidate.pg_routes[0].cluster_epoch = candidate.cluster_epoch;
+
+        candidate.validate_runtime_refresh_from(&current).unwrap();
+    }
+
+    #[test]
+    fn storage_node_runtime_refresh_rejects_process_identity_changes() {
+        let tmp = test_util::tempdir();
+        let current = test_config(&tmp);
+
+        let mut changed_node = current.clone();
+        changed_node.node_id = NodeId::new(8);
+        assert!(matches!(
+            changed_node.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshNodeChanged {
+                current: 7,
+                candidate: 8,
+            })
+        ));
+
+        let mut changed_data = current.clone();
+        changed_data.data_dir = tmp.path().join("other-node");
+        assert!(matches!(
+            changed_data.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshDataDirChanged { .. })
+        ));
+
+        let mut changed_ec = current.clone();
+        changed_ec.default_ec_shape = EcShape { k: 2, m: 1 };
+        assert!(matches!(
+            changed_ec.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshEcShapeChanged { .. })
+        ));
+
+        let mut changed_socket = current.clone();
+        changed_socket.socket_path = tmp.path().join("sock").join("other.sock");
+        assert!(matches!(
+            changed_socket.validate_runtime_refresh_from(&current),
+            Err(StorageNodeServerError::RuntimeRefreshSocketPathChanged { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_rejects_pg_set_changes() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut candidate = config.clone();
+        candidate.pg_ids = vec![0, 1];
+        candidate.pg_routes.push(test_route(1));
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(candidate),
+            Err(StorageNodeServerError::RuntimeRefreshPgSetChanged {
+                current,
+                candidate,
+            }) if current == vec![0] && candidate == vec![0, 1]
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_validates_route_table() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut candidate = config.clone();
+        candidate.cluster_epoch = ClusterEpoch::new(2).unwrap();
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(candidate),
+            Err(StorageNodeServerError::RouteEpochMismatch {
+                pg_id: 0,
+                route_epoch,
+                config_epoch,
+            }) if route_epoch == ClusterEpoch::new(1).unwrap()
+                && config_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_rejects_epoch_downgrade() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.pg_routes[0].cluster_epoch = config.cluster_epoch;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut stale = config.clone();
+        stale.cluster_epoch = ClusterEpoch::new(1).unwrap();
+        stale.pg_routes[0].cluster_epoch = stale.cluster_epoch;
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(stale),
+            Err(StorageNodeServerError::RuntimeRefreshEpochDowngrade {
+                current,
+                candidate,
+            }) if current == ClusterEpoch::new(2).unwrap()
+                && candidate == ClusterEpoch::new(1).unwrap()
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_rejects_same_epoch_unbounded_validity() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let mut unbounded = config.clone();
+        unbounded.route_map_validity = RouteMapValidity::Forever;
+        assert!(matches!(
+            server.install_control_plane_runtime_config(unbounded),
+            Err(
+                StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity {
+                    candidate
+                }
+            ) if candidate == config.cluster_epoch
+        ));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_rejects_later_epoch_unbounded_validity() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let mut unbounded = config.clone();
+        unbounded.cluster_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1)
+            .expect("test epoch should not overflow");
+        unbounded.route_map_validity = RouteMapValidity::Forever;
+        for route in &mut unbounded.pg_routes {
+            route.cluster_epoch = unbounded.cluster_epoch;
+        }
+
+        assert!(matches!(
+            server.install_control_plane_runtime_config(unbounded),
+            Err(
+                StorageNodeServerError::RuntimeRefreshUnboundedRouteMapValidity {
+                    candidate
+                }
+            ) if candidate == ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap()
+        ));
+        assert_eq!(server.config_snapshot().cluster_epoch, config.cluster_epoch);
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(5_000)
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_accepts_same_epoch_shorter_bounded_validity() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut shorter = config;
+        shorter.route_map_validity = RouteMapValidity::until_ms(4_000).unwrap();
+
+        server
+            .install_control_plane_runtime_config(shorter)
+            .unwrap();
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(4_000)
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_accepts_bounded_authoritative_refresh() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::Forever;
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut authoritative = config.clone();
+        authoritative.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+
+        server
+            .install_control_plane_runtime_config(authoritative)
+            .unwrap();
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(5_000)
+        );
+    }
+
+    #[test]
+    fn expired_route_map_rejects_new_work_but_allows_cleanup_route_validation() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let handler = server.connection_handler();
+
+        let new_work_error = handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(new_work_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(new_work_error
+            .message
+            .contains("storage-node route map for cluster epoch"));
+
+        handler
+            .validate_pg_route_for_cleanup(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap();
+
+        let stale_epoch = ClusterEpoch::new(config.cluster_epoch.get() + 1).unwrap();
+        let stale_epoch_error = handler
+            .validate_pg_route_for_cleanup(config.node_id, stale_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(
+            stale_epoch_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+    }
+
+    #[test]
+    fn storage_node_process_config_builds_control_plane_heartbeat() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_ids = vec![0, 1];
+        config.pg_routes = vec![
+            StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: config.cluster_epoch,
+                state: PgState::Peering,
+                primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(7)],
+            },
+            StorageNodePgRoute {
+                pg_id: 1,
+                cluster_epoch: config.cluster_epoch,
+                state: PgState::Active,
+                primary_node_id: NodeId::new(7),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![NodeId::new(7)],
+            },
+        ];
+        let node = SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+
+        let heartbeat = config.control_plane_heartbeat(&node, 12, 2_000).unwrap();
+
+        assert_eq!(heartbeat.node_id, config.node_id);
+        assert_eq!(heartbeat.node_incarnation, 12);
+        assert_eq!(heartbeat.endpoint, config.socket_path.to_str().unwrap());
+        assert_eq!(heartbeat.observed_epoch, config.cluster_epoch);
+        assert_eq!(heartbeat.requested_lease_duration_ms, 2_000);
+        assert_eq!(
+            heartbeat.cluster_map_history_route_references,
+            node.cluster_map_history_route_references().unwrap()
+        );
+        assert_eq!(heartbeat.pg_observations.len(), 2);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
+        assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
+        assert_eq!(heartbeat.pg_observations[1].pg_id, PgId::new(1));
+        assert_eq!(heartbeat.pg_observations[1].state, PgState::Active);
+        for observation in &heartbeat.pg_observations {
+            let metadata_state = {
+                let pg = node.get_pg(observation.pg_id.get()).unwrap();
+                pg.metadata_command_replica_state().unwrap()
+            };
+            assert_eq!(
+                observation.metadata_proof.applied_log_index,
+                metadata_state.applied_log_index
+            );
+            assert_eq!(
+                observation.metadata_proof.applied_log_hash,
+                metadata_state.applied_log_hash
+            );
+            assert_eq!(
+                observation.metadata_proof.state_digest,
+                metadata_state.state_digest
+            );
+        }
+    }
+
+    #[test]
+    fn storage_node_process_config_rejects_route_epoch_mismatch_for_heartbeat() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        config.pg_routes[0].cluster_epoch = ClusterEpoch::new(1).unwrap();
+        let node = SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+
+        assert!(matches!(
+            config.control_plane_heartbeat(&node, 12, 2_000),
+            Err(StorageNodeServerError::RouteEpochMismatch {
+                pg_id: 0,
+                route_epoch,
+                config_epoch,
+            }) if route_epoch == ClusterEpoch::new(1).unwrap()
+                && config_epoch == ClusterEpoch::new(2).unwrap()
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn storage_node_process_config_rejects_non_utf8_heartbeat_endpoint() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.socket_path = PathBuf::from(OsString::from_vec(vec![0xff]));
+        let node = SharedStorageNode::open(&config.data_dir, &config.pg_ids).unwrap();
+
+        assert!(matches!(
+            config.control_plane_heartbeat(&node, 12, 2_000),
+            Err(StorageNodeServerError::SocketPathNotUtf8 { path }) if path == config.socket_path
+        ));
+    }
+
+    #[test]
+    fn storage_node_server_builds_control_plane_heartbeat() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+
+        let heartbeat = server.control_plane_heartbeat(12, 2_000).unwrap();
+
+        assert_eq!(heartbeat.node_id, config.node_id);
+        assert_eq!(heartbeat.node_incarnation, 12);
+        assert_eq!(heartbeat.endpoint, config.socket_path.to_str().unwrap());
+        assert_eq!(heartbeat.observed_epoch, config.cluster_epoch);
+        assert_eq!(heartbeat.requested_lease_duration_ms, 2_000);
+        assert_eq!(
+            heartbeat.cluster_map_history_route_references.summary(),
+            server
+                ._node
+                .cluster_map_history_reference_summary()
+                .unwrap()
+        );
+        assert_eq!(heartbeat.pg_observations.len(), 1);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, PgId::new(0));
+        assert_eq!(heartbeat.pg_observations[0].state, PgState::Active);
+        let metadata_state = {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.metadata_command_replica_state().unwrap()
+        };
+        assert_eq!(
+            heartbeat.pg_observations[0]
+                .metadata_proof
+                .applied_log_index,
+            metadata_state.applied_log_index
+        );
+        assert_eq!(
+            heartbeat.pg_observations[0].metadata_proof.applied_log_hash,
+            metadata_state.applied_log_hash
+        );
+        assert_eq!(
+            heartbeat.pg_observations[0].metadata_proof.state_digest,
+            metadata_state.state_digest
+        );
+    }
+
+    #[test]
+    fn runtime_map_config_opens_non_acting_pgs_without_heartbeat_observation() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let acting_node_id = NodeId::new(8);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage-7.sock");
+        let acting_socket_path = tmp.path().join("sock").join("storage-8.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let base_time_ms = crate::clock::current_time_millis();
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        for (idx, (heartbeat_node_id, heartbeat_socket_path)) in [
+            (node_id, socket_path.clone()),
+            (acting_node_id, acting_socket_path),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let heartbeat_at_ms = base_time_ms + (idx as u64 * 2);
+            authority
+                .set_node_membership(heartbeat_node_id, NodeMembershipState::Active)
+                .unwrap();
+            let first = authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms,
+                )
+                .unwrap();
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: first.cluster_epoch(),
+                        requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms + 1,
+                )
+                .unwrap();
+        }
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        authority
+            .set_pg_acting_set(pg_id, vec![acting_node_id])
+            .unwrap();
+        let observed_epoch = authority.snapshot().cluster_epoch();
+        for (idx, (heartbeat_node_id, heartbeat_socket_path)) in [
+            (node_id, socket_path.clone()),
+            (
+                acting_node_id,
+                tmp.path().join("sock").join("storage-8.sock"),
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let heartbeat_at_ms = base_time_ms + 4 + idx as u64;
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch,
+                        requested_lease_duration_ms: crate::control_plane::MAX_HEARTBEAT_LEASE_MS,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms,
+                )
+                .unwrap();
+        }
+
+        let runtime_map = authority.snapshot().runtime_map(base_time_ms + 6).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+
+        assert_eq!(config.pg_ids, vec![pg_id.get()]);
+        assert_eq!(config.pg_routes.len(), 1);
+        assert_eq!(config.pg_routes[0].acting_set, vec![acting_node_id]);
+
+        let server = StorageNodeServer::bind(config).unwrap();
+        let heartbeat = server.control_plane_heartbeat(12, 1_000).unwrap();
+        assert!(heartbeat.pg_observations.is_empty());
+
+        let live_error = server
+            .connection_handler()
+            .validate_pg_route(node_id, runtime_map.cluster_epoch(), pg_id)
+            .unwrap_err();
+        assert!(matches!(
+            live_error.code,
+            StorageRpcErrorCode::InactivePgRoute | StorageRpcErrorCode::NonActingSetAccess
+        ));
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let request = StorageRpcHistoricalShardReadRequest {
+            location: ShardLocation::new(
+                runtime_map.cluster_epoch(),
+                DataPgId::new_for_test(pg_id),
+                ShardIndex::new(0),
+                node_id,
+            )
+            .into(),
+            shard_key: test_shard_key(0),
+        };
+        let error = match server.connection_handler().retained_shard_inspection_route(
+            &retained_permit,
+            &request,
+            "test historical shard inspection",
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("non-acting current route created historical inspection authority"),
+        };
+        assert_eq!(error.code, StorageRpcErrorCode::NonActingSetAccess);
+    }
+
+    #[test]
+    fn runtime_map_storage_node_server_heartbeat_updates_authority_pg_observation() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let second = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        assert!(second.serving());
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let server = StorageNodeServer::bind(config).unwrap();
+        let heartbeat = server.control_plane_heartbeat(12, 1_000).unwrap();
+        assert_eq!(heartbeat.observed_epoch, runtime_map.cluster_epoch());
+        assert_eq!(heartbeat.pg_observations.len(), 1);
+        assert_eq!(heartbeat.pg_observations[0].pg_id, pg_id);
+        assert_eq!(heartbeat.pg_observations[0].state, PgState::Peering);
+        let proof = heartbeat.pg_observations[0].metadata_proof;
+
+        let lease = server
+            .heartbeat_control_plane(&mut authority, 12, 1_000, 1_003)
+            .unwrap();
+        assert_eq!(lease.node_id(), node_id);
+        assert_eq!(lease.cluster_epoch(), runtime_map.cluster_epoch());
+
+        let observation = authority
+            .snapshot()
+            .node(node_id)
+            .unwrap()
+            .pg_observation(pg_id)
+            .unwrap();
+        assert_eq!(observation.state(), PgState::Peering);
+        assert_eq!(observation.observed_epoch(), runtime_map.cluster_epoch());
+        assert_eq!(observation.observed_at_ms(), 1_003);
+        assert_eq!(observation.metadata_proof(), proof);
+    }
+
+    #[test]
+    fn storage_node_refreshes_control_plane_runtime_map_candidate() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let second = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        assert!(second.serving());
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let mut config = config;
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let stale_error = server
+            .connection_handler()
+            .validate_pg_route(node_id, runtime_map.cluster_epoch(), pg_id)
+            .unwrap_err();
+        assert_eq!(stale_error.code, StorageRpcErrorCode::StaleShardLocation);
+
+        let refresh = server
+            .refresh_control_plane_runtime_map(&mut authority, 12, 1_000, 1_003)
+            .unwrap();
+        assert_eq!(refresh.lease().node_id(), node_id);
+        assert_eq!(
+            refresh.lease().cluster_epoch(),
+            refresh.runtime_map().cluster_epoch()
+        );
+        assert_eq!(refresh.next_config().node_id, node_id);
+        assert_eq!(
+            refresh.next_config().cluster_epoch,
+            refresh.runtime_map().cluster_epoch()
+        );
+        assert_eq!(refresh.next_config().data_dir, config.data_dir);
+        assert_eq!(refresh.next_config().pg_ids, vec![pg_id.get()]);
+        assert_eq!(refresh.next_config().pg_routes.len(), 1);
+        assert_eq!(refresh.next_config().pg_routes[0].state, PgState::Active);
+
+        let installed_epoch = refresh.next_config().cluster_epoch;
+        let lease = server.install_control_plane_refresh(refresh).unwrap();
+        assert_eq!(lease.node_id(), node_id);
+        assert!(
+            !lease.serving(),
+            "peering completion bumps the epoch before the node observes it"
+        );
+        let installed_config = server.config_snapshot();
+        assert_eq!(installed_config.cluster_epoch, installed_epoch);
+        assert_eq!(installed_config.pg_routes[0].state, PgState::Active);
+        assert!(installed_config.route_map_valid_until_ms().is_some());
+        let installed_heartbeat = server.control_plane_heartbeat(12, 1_000).unwrap();
+        assert_eq!(installed_heartbeat.observed_epoch, installed_epoch);
+        assert_eq!(
+            installed_heartbeat.pg_observations[0].state,
+            PgState::Active
+        );
+        assert!(
+            authority
+                .snapshot()
+                .node(node_id)
+                .unwrap()
+                .pg_observation(pg_id)
+                .is_none(),
+            "peering completion clears observations until the node heartbeats the new epoch"
+        );
+        let active_lease = server
+            .heartbeat_control_plane(&mut authority, 12, 1_000, 1_004)
+            .unwrap();
+        assert!(active_lease.serving());
+
+        let observation = authority
+            .snapshot()
+            .node(node_id)
+            .unwrap()
+            .pg_observation(pg_id)
+            .unwrap();
+        assert_eq!(observation.state(), PgState::Active);
+        assert_eq!(observation.observed_epoch(), installed_epoch);
+    }
+
+    #[test]
+    fn storage_node_refresh_config_merges_retained_history_delta() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let current_runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &current_runtime_map,
+        )
+        .unwrap();
+        let retained_epoch = ClusterEpoch::new(1).unwrap();
+        current.historical_pg_routes.push(StorageNodePgRoute::from(
+            &PgRouteSnapshot::reconstructed(
+                retained_epoch,
+                pg_id,
+                node_id,
+                vec![node_id],
+                PgState::Active,
+            ),
+        ));
+
+        authority
+            .set_node_membership(NodeId::new(8), NodeMembershipState::Active)
+            .unwrap();
+        let delta_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(
+                1_003,
+                node_id,
+                current_runtime_map.cluster_epoch(),
+            )
+            .unwrap();
+        assert!(!delta_runtime_map
+            .historical_pg_routes()
+            .iter()
+            .any(|route| route.cluster_epoch() == retained_epoch));
+
+        let next = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &delta_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(retained_epoch),
+                oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
+                oldest_object_payload_reclaim_claim_epoch: None,
+            },
+        )
+        .unwrap();
+        assert!(next
+            .historical_pg_routes
+            .iter()
+            .any(|route| route.cluster_epoch == retained_epoch && route.pg_id == pg_id.get()));
+        assert!(next.historical_pg_routes.iter().any(|route| {
+            route.cluster_epoch == current_runtime_map.cluster_epoch() && route.pg_id == pg_id.get()
+        }));
+    }
+
+    #[test]
+    fn storage_node_refresh_installs_remote_backfill_source_route() {
+        let tmp = test_util::tempdir();
+        let source_node_id = NodeId::new(1);
+        let metadata_node_id = NodeId::new(2);
+        let unrelated_node_id = NodeId::new(3);
+        let pg_id = PgId::new(0);
+        let source_socket_path = tmp.path().join("sock").join("source.sock");
+        private_socket_dir(source_socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        for (index, node_id) in [source_node_id, metadata_node_id, unrelated_node_id]
+            .into_iter()
+            .enumerate()
+        {
+            authority
+                .set_node_membership(node_id, NodeMembershipState::Active)
+                .unwrap();
+            let endpoint = if node_id == source_node_id {
+                source_socket_path.clone()
+            } else {
+                tmp.path().join("sock").join(format!("node-{index}.sock"))
+            };
+            let first = authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id,
+                        node_incarnation: 12,
+                        endpoint: endpoint.to_str().unwrap().to_owned(),
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    1_000 + index as u64 * 2,
+                )
+                .unwrap();
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id,
+                        node_incarnation: 12,
+                        endpoint: endpoint.to_str().unwrap().to_owned(),
+                        observed_epoch: first.cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    1_001 + index as u64 * 2,
+                )
+                .unwrap();
+        }
+
+        authority
+            .set_pg_acting_set(pg_id, vec![source_node_id])
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .set_pg_acting_set(pg_id, vec![metadata_node_id])
+            .unwrap();
+        let current_epoch = authority.snapshot().cluster_epoch();
+        let history_references = crate::PgClusterMapHistoryRouteReferences::try_from_iter([
+            crate::PgClusterMapHistoryRouteReference::new(
+                crate::PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+                source_epoch,
+                pg_id,
+            ),
+        ])
+        .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id: metadata_node_id,
+                    node_incarnation: 12,
+                    endpoint: tmp
+                        .path()
+                        .join("sock")
+                        .join("node-1.sock")
+                        .to_str()
+                        .unwrap()
+                        .to_owned(),
+                    observed_epoch: current_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: history_references,
+                    pg_observations: Vec::new(),
+                },
+                2_000,
+            )
+            .unwrap();
+
+        let refresh_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(2_001, source_node_id, current_epoch)
+            .unwrap();
+        assert!(refresh_map
+            .historical_pg_routes()
+            .iter()
+            .any(|route| { route.cluster_epoch() == source_epoch && route.pg_id() == pg_id }));
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            source_node_id,
+            tmp.path().join("source-node"),
+            EcShape { k: 1, m: 0 },
+            &refresh_map,
+        )
+        .unwrap();
+        current.historical_pg_routes.clear();
+        let next = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &refresh_map,
+            crate::PgClusterMapHistoryReferenceSummary::default(),
+        )
+        .unwrap();
+        assert!(next
+            .historical_pg_routes
+            .iter()
+            .any(|route| { route.cluster_epoch == source_epoch && route.pg_id == pg_id.get() }));
+
+        let server = crate::clock::with_time_override(2_001, || {
+            StorageNodeServer::bind(next.clone()).unwrap()
+        });
+        let shard_key = test_shard_key(0);
+        let payload = b"globally protected backfill source";
+        let ack = server
+            ._node
+            .write_shard_file_if_absent(pg_id.get(), &shard_key, payload)
+            .unwrap();
+        server
+            ._node
+            .get_pg(pg_id.get())
+            .unwrap()
+            .register_written_shards_batch_exact(&[(&shard_key, ack)])
+            .unwrap();
+        let permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        let loaded = server
+            .connection_handler()
+            .retained_shard_ack_inspection_route(
+                &permit,
+                &StorageRpcShardAckItemRequest {
+                    node_id: source_node_id,
+                    cluster_epoch: source_epoch,
+                    pg_id,
+                    shard_key,
+                },
+                "test globally protected historical shard ack inspection",
+            )
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(loaded, ack);
+    }
+
+    #[test]
+    fn storage_node_refresh_config_prunes_unreferenced_history_growth() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        for step in 0_u32..8 {
+            authority
+                .set_node_membership(NodeId::new(100 + step), NodeMembershipState::Active)
+                .unwrap();
+            let delta_runtime_map = authority
+                .snapshot()
+                .runtime_map_for_storage_node_refresh(
+                    2_000 + u64::from(step),
+                    node_id,
+                    current.cluster_epoch,
+                )
+                .unwrap();
+            current = StorageNodeProcessConfig::from_runtime_map_refresh(
+                &current,
+                &delta_runtime_map,
+                crate::PgClusterMapHistoryReferenceSummary::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                current.historical_pg_routes.len(),
+                current.pg_routes.len(),
+                "unreferenced local history should retain only the previous current route set"
+            );
+        }
+    }
+
+    #[test]
+    fn storage_node_refresh_config_keeps_predecessor_for_retained_floor() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        for step in 0_u32..10 {
+            authority
+                .set_node_membership(NodeId::new(200 + step), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        let runtime_map = authority.snapshot().runtime_map(1_100).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        for raw_epoch in [2, 4, 6, 8] {
+            let cluster_epoch = ClusterEpoch::new(raw_epoch).unwrap();
+            current.historical_pg_routes.push(StorageNodePgRoute {
+                pg_id: pg_id.get(),
+                cluster_epoch,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![node_id],
+            });
+        }
+
+        authority
+            .set_node_membership(NodeId::new(250), NodeMembershipState::Active)
+            .unwrap();
+        let delta_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(1_200, node_id, current.cluster_epoch)
+            .unwrap();
+        let next = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &delta_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary {
+                oldest_live_placement_epoch: Some(ClusterEpoch::new(5).unwrap()),
+                oldest_durable_backfill_epoch: None,
+                oldest_pending_metadata_command_epoch: None,
+                oldest_object_payload_reclaim_claim_epoch: None,
+            },
+        )
+        .unwrap();
+        let retained_epochs: Vec<u64> = next
+            .historical_pg_routes
+            .iter()
+            .filter(|route| route.pg_id == pg_id.get())
+            .map(|route| route.cluster_epoch.get())
+            .collect();
+
+        assert!(!retained_epochs.contains(&2));
+        assert!(retained_epochs.contains(&4));
+        assert!(retained_epochs.contains(&6));
+        assert!(retained_epochs.contains(&8));
+        assert!(retained_epochs.contains(&current.cluster_epoch.get()));
+    }
+
+    #[test]
+    fn storage_node_refresh_config_keeps_metadata_transfer_route_epochs_across_restart() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let destination_node_id = NodeId::new(8);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        let destination_socket_path = tmp.path().join("sock").join("storage-8.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        for (idx, (heartbeat_node_id, heartbeat_socket_path)) in [
+            (node_id, socket_path.clone()),
+            (destination_node_id, destination_socket_path.clone()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let heartbeat_at_ms = 1_000 + idx as u64 * 2;
+            authority
+                .set_node_membership(heartbeat_node_id, NodeMembershipState::Active)
+                .unwrap();
+            let first = authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: authority.snapshot().cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms,
+                )
+                .unwrap();
+            authority
+                .heartbeat(
+                    NodeHeartbeat {
+                        node_id: heartbeat_node_id,
+                        node_incarnation: 12,
+                        endpoint: heartbeat_socket_path.to_str().unwrap().to_owned(),
+                        observed_epoch: first.cluster_epoch(),
+                        requested_lease_duration_ms: 1_000,
+                        cluster_map_history_route_references: Default::default(),
+                        pg_observations: Vec::new(),
+                    },
+                    heartbeat_at_ms + 1,
+                )
+                .unwrap();
+        }
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+        let active_proof = crate::control_plane::PgMetadataProof {
+            applied_log_index: 9,
+            applied_log_hash: 10,
+            state_digest: 11,
+        };
+        let peering_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: peering_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Peering,
+                        metadata_proof: active_proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                2_000,
+            )
+            .unwrap();
+        authority
+            .complete_pg_peering(pg_id, node_id, 12, 2_001)
+            .unwrap();
+        let source_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: source_epoch,
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Active,
+                        metadata_proof: active_proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                2_002,
+            )
+            .unwrap();
+        let source_runtime_map = authority.snapshot().runtime_map(2_003).unwrap();
+        let mut current = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &source_runtime_map,
+        )
+        .unwrap();
+        assert_eq!(current.cluster_epoch, source_epoch);
+        assert!(current
+            .historical_pg_routes
+            .iter()
+            .all(|route| { route.pg_id != pg_id.get() || route.cluster_epoch < source_epoch }));
+
+        authority
+            .set_pg_acting_set_with_metadata_transfer(
+                pg_id,
+                vec![destination_node_id],
+                crate::control_plane::PgMetadataTransferProof::new(source_epoch, active_proof),
+            )
+            .unwrap();
+        let destination_epoch = authority.snapshot().cluster_epoch();
+        for step in 0_u32..8 {
+            authority
+                .set_node_membership(NodeId::new(300 + step), NodeMembershipState::Active)
+                .unwrap();
+        }
+
+        let delta_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(3_000, node_id, current.cluster_epoch)
+            .unwrap();
+        assert!(delta_runtime_map
+            .pg_routes()
+            .iter()
+            .any(|route| route.pg_id() == pg_id
+                && route.peering_metadata_transfer_source_route_epoch() == Some(source_epoch)));
+        assert!(delta_runtime_map
+            .historical_pg_routes()
+            .iter()
+            .any(|route| {
+                route.pg_id() == pg_id
+                    && route.cluster_epoch() == destination_epoch
+                    && route.peering_metadata_transfer_destination_epoch()
+                        == Some(destination_epoch)
+            }));
+        current = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &delta_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary::default(),
+        )
+        .unwrap();
+
+        assert!(current
+            .historical_pg_routes
+            .iter()
+            .any(|route| route.pg_id == pg_id.get() && route.cluster_epoch == source_epoch));
+        assert!(current.historical_pg_routes.iter().any(|route| {
+            route.pg_id == pg_id.get()
+                && route.cluster_epoch == destination_epoch
+                && route.metadata_transfer_destination_epoch == Some(destination_epoch)
+        }));
+
+        current.persist_control_plane_runtime_config().unwrap();
+        let restarted = StorageNodeProcessConfig::load_control_plane_runtime_config(
+            &current.data_dir,
+            current.node_id,
+            current.default_ec_shape,
+            &current.socket_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(restarted.historical_pg_routes.iter().any(|route| {
+            route.pg_id == pg_id.get()
+                && route.cluster_epoch == destination_epoch
+                && route.metadata_transfer_destination_epoch == Some(destination_epoch)
+        }));
+
+        let completion_epoch = authority.snapshot().cluster_epoch();
+        authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id: destination_node_id,
+                    node_incarnation: 12,
+                    endpoint: destination_socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: completion_epoch,
+                    requested_lease_duration_ms: 5_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
+                        pg_id,
+                        state: PgState::Peering,
+                        metadata_proof: active_proof,
+                        pending_metadata_command: None,
+                    }],
+                },
+                3_001,
+            )
+            .unwrap();
+        authority
+            .complete_pg_peering(pg_id, destination_node_id, 12, 4_003)
+            .unwrap();
+        let completed_runtime_map = authority
+            .snapshot()
+            .runtime_map_for_storage_node_refresh(4_004, node_id, current.cluster_epoch)
+            .unwrap();
+        let completed = StorageNodeProcessConfig::from_runtime_map_refresh(
+            &current,
+            &completed_runtime_map,
+            crate::PgClusterMapHistoryReferenceSummary::default(),
+        )
+        .unwrap();
+        assert!(!completed.historical_pg_routes.iter().any(|route| {
+            route.pg_id == pg_id.get() && route.cluster_epoch == destination_epoch
+        }));
+    }
+
+    #[test]
+    fn storage_node_control_plane_refresh_loop_installs_runtime_maps() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let pg_id = PgId::new(0);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let mut authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+        authority
+            .set_node_membership(node_id, NodeMembershipState::Active)
+            .unwrap();
+
+        let first = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: authority.snapshot().cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_000,
+            )
+            .unwrap();
+        let second = authority
+            .heartbeat(
+                NodeHeartbeat {
+                    node_id,
+                    node_incarnation: 12,
+                    endpoint: socket_path.to_str().unwrap().to_owned(),
+                    observed_epoch: first.cluster_epoch(),
+                    requested_lease_duration_ms: 1_000,
+                    cluster_map_history_route_references: Default::default(),
+                    pg_observations: Vec::new(),
+                },
+                1_001,
+            )
+            .unwrap();
+        assert!(second.serving());
+        authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
+
+        let runtime_map = authority.snapshot().runtime_map(1_002).unwrap();
+        let config = StorageNodeProcessConfig::from_runtime_map(
+            node_id,
+            tmp.path().join("node"),
+            EcShape { k: 1, m: 0 },
+            &runtime_map,
+        )
+        .unwrap();
+        let mut config = config;
+        config.route_map_validity = RouteMapValidity::until_ms(1).unwrap();
+        let server = Arc::new(StorageNodeServer::bind(config).unwrap());
+        let now = Arc::new(AtomicU64::new(1_003));
+        let loop_now = Arc::clone(&now);
+        let mut refresh_loop = Arc::clone(&server)
+            .spawn_control_plane_refresh_loop(
+                authority,
+                12,
+                STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+                move || loop_now.fetch_add(1, Ordering::SeqCst),
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if refresh_loop.status().successes > 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "control-plane refresh loop did not install a runtime map: {:?}",
+                refresh_loop.status()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let installed_config = server.config_snapshot();
+        assert!(installed_config.cluster_epoch > runtime_map.cluster_epoch());
+        assert!(installed_config.route_map_valid_until_ms().is_some());
+        assert_eq!(installed_config.pg_routes.len(), 1);
+        assert_eq!(installed_config.pg_routes[0].state, PgState::Active);
+        assert_eq!(refresh_loop.status().failures, 0);
+
+        refresh_loop.stop();
+        let attempts_after_stop = refresh_loop.status().attempts;
+        thread::sleep(Duration::from_millis(15));
+        assert_eq!(refresh_loop.status().attempts, attempts_after_stop);
+    }
+
+    #[test]
+    fn storage_node_control_plane_heartbeat_schedule_is_lease_derived_and_jittered() {
+        let node_7_first =
+            storage_node_control_plane_heartbeat_interval(NodeId::new(7), 10_000, 1).unwrap();
+        let node_7_second =
+            storage_node_control_plane_heartbeat_interval(NodeId::new(7), 10_000, 2).unwrap();
+        let node_8_first =
+            storage_node_control_plane_heartbeat_interval(NodeId::new(8), 10_000, 1).unwrap();
+        assert!((Duration::from_millis(750)..=Duration::from_secs(1)).contains(&node_7_first));
+        assert!((Duration::from_millis(750)..=Duration::from_secs(1)).contains(&node_7_second));
+        assert!((Duration::from_millis(750)..=Duration::from_secs(1)).contains(&node_8_first));
+        assert_ne!(node_7_first, node_7_second);
+        assert_ne!(node_7_first, node_8_first);
+
+        let default_lease = storage_node_control_plane_heartbeat_interval(
+            NodeId::new(7),
+            STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+            1,
+        )
+        .unwrap();
+        assert!((Duration::from_millis(249)..=Duration::from_millis(333)).contains(&default_lease));
+    }
+
+    #[test]
+    fn storage_node_minimum_heartbeat_lease_remains_valid_through_first_renewal() {
+        let local_wall_ms = 20_000;
+        let local_monotonic_ms = 30_000;
+        let validity = RouteMapValidity::until_ms(
+            local_wall_ms + STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+        )
+        .unwrap();
+        let bound = bind_storage_node_route_map_lease_at(
+            validity,
+            local_wall_ms,
+            local_monotonic_ms,
+            Some(local_wall_ms),
+        )
+        .unwrap()
+        .unwrap();
+        let first_renewal = storage_node_control_plane_heartbeat_interval(
+            NodeId::new(7),
+            STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS,
+            1,
+        )
+        .unwrap();
+        let first_renewal_ms = u64::try_from(first_renewal.as_millis()).unwrap();
+
+        assert!(bound.is_valid_at_monotonic(local_monotonic_ms));
+        assert!(bound.is_valid_at_monotonic(local_monotonic_ms + first_renewal_ms));
+        assert_eq!(
+            bound.local_valid_until_monotonic_ms(),
+            local_monotonic_ms + STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_USABLE_LEASE_MS
+        );
+    }
+
+    #[test]
+    fn storage_node_control_plane_refresh_loop_rejects_too_short_lease() {
+        let tmp = test_util::tempdir();
+        let node_id = NodeId::new(7);
+        let socket_path = tmp.path().join("sock").join("storage.sock");
+        private_socket_dir(socket_path.parent().unwrap());
+        let config = StorageNodeProcessConfig {
+            node_id,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            route_map_validity: RouteMapValidity::Forever,
+            data_dir: tmp.path().join("node"),
+            default_ec_shape: EcShape { k: 1, m: 0 },
+            pg_ids: vec![0],
+            socket_path,
+            pg_routes: vec![StorageNodePgRoute {
+                pg_id: 0,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: node_id,
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: vec![node_id],
+            }],
+
+            historical_pg_routes: Vec::new(),
+            pending_metadata_command_recoveries: Vec::new(),
+        };
+        let server = Arc::new(StorageNodeServer::bind(config).unwrap());
+        let authority = SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            tmp.path().join("control-plane.state"),
+        ))
+        .unwrap();
+
+        assert!(matches!(
+            Arc::clone(&server).spawn_control_plane_refresh_loop(
+                authority,
+                12,
+                STORAGE_NODE_CONTROL_PLANE_HEARTBEAT_MIN_LEASE_MS - 1,
+                || 1_000,
+            ),
+            Err(StorageNodeServerError::ControlPlaneRefreshLoopLeaseTooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn metadata_command_lock_wait_emits_diagnostic() {
+        let locks = StorageNodeMetadataCommandLocks::default();
+        let pg_id = PgId::new(0);
+        let first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
+        let before = observability::metrics_snapshot();
+        let (wait_tx, wait_rx) = mpsc::channel();
+        locks.set_before_wait_hook(Arc::new(move |actual_pg_id| {
+            assert_eq!(actual_pg_id, pg_id);
+            let _ = wait_tx.send(());
+        }));
+        let waiting_locks = locks.clone();
+
+        let waiter = thread::spawn(move || {
+            let _attached = observability::AttachedTrace::new(
+                observability::TraceContext::from_ids(observability::TraceContextIds {
+                    trace_id: "trace-metadata-command-lock-wait".to_string(),
+                    request_id: "request-metadata-command-lock-wait".to_string(),
+                }),
+            );
+            let _guard = waiting_locks.acquire(NodeId::new(7), pg_id, None).unwrap();
+        });
+
+        wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter should enter metadata-command lock wait");
+        drop(first);
+        waiter
+            .join()
+            .expect("waiter should acquire and release lock");
+
+        let after = observability::metrics_snapshot();
+        assert!(
+            after.metadata_command_session_wait_total > before.metadata_command_session_wait_total
+        );
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| record.request_id == "request-metadata-command-lock-wait")
+            .expect("lock wait should be recorded in flight recorder");
+        assert_eq!(record.event, "metadata_command_session_wait");
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("pg_id=0"));
+        assert!(record.detail.contains("wait_us="));
+    }
+
+    #[test]
+    fn metadata_command_lock_wait_times_out_with_contention_error() {
+        let locks = StorageNodeMetadataCommandLocks::default();
+        let pg_id = PgId::new(0);
+        let _first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
+        let _stderr_guard = locks.suppress_lock_wait_stderr();
+        let started = Instant::now();
+        let err = match locks.acquire_with_timeout(
+            NodeId::new(7),
+            pg_id,
+            None,
+            Duration::from_millis(25),
+        ) {
+            Ok(_) => panic!("metadata-command lock acquisition should time out"),
+            Err(error) => error,
+        };
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "metadata-command lock wait should return a bounded contention error"
+        );
+        assert_eq!(err.code, StorageRpcErrorCode::MetadataCommandContention);
+        assert!(err.message.contains("metadata command lock wait"));
+    }
+
+    #[test]
+    fn metadata_command_lock_wait_emits_blocked_holder_diagnostic() {
+        let locks = StorageNodeMetadataCommandLocks::default();
+        let pg_id = PgId::new(0);
+        let first = locks
+            .acquire(
+                NodeId::new(7),
+                pg_id,
+                Some(StorageNodeMetadataCommandLockContext {
+                    request_id: 41,
+                    kind: StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+                }),
+            )
+            .unwrap();
+        locks.update_context(
+            pg_id,
+            Some(StorageNodeMetadataCommandLockContext {
+                request_id: 43,
+                kind: StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            }),
+        );
+        let _stderr_guard = locks.suppress_lock_wait_stderr();
+        let (wait_tx, wait_rx) = mpsc::channel();
+        locks.set_before_wait_hook(Arc::new(move |actual_pg_id| {
+            assert_eq!(actual_pg_id, pg_id);
+            let _ = wait_tx.send(());
+        }));
+        let waiting_locks = locks.clone();
+
+        let waiter = thread::spawn(move || {
+            let _attached = observability::AttachedTrace::new(
+                observability::TraceContext::from_ids(observability::TraceContextIds {
+                    trace_id: "trace-metadata-command-lock-blocked".to_string(),
+                    request_id: "request-metadata-command-lock-blocked".to_string(),
+                }),
+            );
+            let _guard = waiting_locks
+                .acquire_with_timeout(
+                    NodeId::new(7),
+                    pg_id,
+                    Some(StorageNodeMetadataCommandLockContext {
+                        request_id: 42,
+                        kind: StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+                    }),
+                    Duration::from_secs(2),
+                )
+                .unwrap();
+        });
+
+        wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("waiter should enter metadata-command lock wait");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let record = loop {
+            if let Some(record) = observability::flight_recorder_snapshot()
+                .into_iter()
+                .rev()
+                .find(|record| {
+                    record.request_id == "request-metadata-command-lock-blocked"
+                        && record.event == "metadata_command_lock_wait_blocked"
+                })
+            {
+                break record;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "blocked lock diagnostic should be emitted before waiter acquires"
+            );
+            thread::sleep(Duration::from_millis(25));
+        };
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("pg_id=0"));
+        assert!(record.detail.contains("waiter_request_id=42"));
+        assert!(record
+            .detail
+            .contains("waiter_kind=\"metadata command pending envelope\""));
+        assert!(record.detail.contains("holder_request_id=41"));
+        assert!(record
+            .detail
+            .contains("holder_kind=\"metadata command PG lock acquire\""));
+        assert!(record.detail.contains("holder_held_us="));
+        assert!(record.detail.contains("holder_current_request_id=43"));
+        assert!(record
+            .detail
+            .contains("holder_current_kind=\"metadata command apply and record\""));
+        assert!(record.detail.contains("holder_current_elapsed_us="));
+        locks.update_context(pg_id, None);
+        {
+            let held = locks.state.held.lock().unwrap_or_else(|e| e.into_inner());
+            let holder = held
+                .get(&pg_id)
+                .expect("holder should still be present before release");
+            assert!(holder.current_context.is_none());
+            assert!(holder.current_started_at.is_none());
+        }
+
+        drop(first);
+        waiter
+            .join()
+            .expect("waiter should acquire and release lock");
+    }
+
+    #[test]
+    fn storage_node_rpc_metadata_command_wait_records_frame_trace() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            pg_id: PgId::new(0),
+            command: command.clone(),
+            scope_bucket: Some(command.bucket_name().clone()),
+            effect_deadline: None,
+        };
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();
+        let pg_guard = server
+            .metadata_command_locks
+            .acquire(NodeId::new(7), PgId::new(0), None);
+        let (wait_tx, wait_rx) = mpsc::channel();
+        server
+            .metadata_command_locks
+            .set_before_wait_hook(Arc::new(move |actual_pg_id| {
+                assert_eq!(actual_pg_id, PgId::new(0));
+                let _ = wait_tx.send(());
+            }));
+        let socket_path = config.socket_path.clone();
+        let accept = thread::spawn(move || server.accept_one().unwrap());
+        let before = observability::metrics_snapshot();
+
+        let client = thread::spawn(move || {
+            let mut client = UnixStream::connect(socket_path).unwrap();
+            send_frame(
+                &mut client,
+                11,
+                StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
+                encode_metadata_command_pending_slot_request(&request).unwrap(),
+            )
+        });
+
+        wait_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("RPC handler should enter metadata-command lock wait");
+        drop(pg_guard);
+        let response = client.join().expect("client should receive response");
+        accept.join().unwrap();
+        decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+
+        let after = observability::metrics_snapshot();
+        assert!(
+            after.metadata_command_session_wait_total > before.metadata_command_session_wait_total
+        );
+        let records = observability::flight_recorder_snapshot();
+        let record = records
+            .iter()
+            .rev()
+            .find(|record| {
+                record.request_id == "storage-node-7-rpc-11"
+                    && record.event == "metadata_command_session_wait"
+            })
+            .expect("storage-node RPC wait should be recorded without caller-attached trace");
+        assert!(record.detail.contains("node_id=7"));
+        assert!(record.detail.contains("pg_id=0"));
+        assert!(record.detail.contains("wait_us="));
+    }
+
+    fn private_socket_dir(path: &Path) {
+        fs::create_dir_all(path).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn bind_error(config: StorageNodeProcessConfig) -> StorageNodeServerError {
+        match StorageNodeServer::bind(config) {
+            Ok(_) => panic!("expected storage-node bind to fail"),
+            Err(error) => error,
+        }
+    }
+
+    fn read_handle_acquire_payload(read_operation_id: &str, location: ShardLocation) -> Vec<u8> {
+        encode_read_handle_acquire_request(&StorageRpcReadHandleAcquireRequest {
+            read_operation_id: read_operation_id.to_string(),
+            locations: vec![location.into()],
+            shard_keys: vec![test_shard_key(location.shard_index().get())],
+        })
+        .unwrap()
+    }
+
+    fn test_location(epoch: u64, pg_id: u32, node_id: u32) -> ShardLocation {
+        test_location_with_shard(epoch, pg_id, node_id, 0)
+    }
+
+    fn test_location_with_shard(
+        epoch: u64,
+        pg_id: u32,
+        node_id: u32,
+        shard_index: u8,
+    ) -> ShardLocation {
+        ShardLocation::new(
+            ClusterEpoch::new(epoch).unwrap(),
+            DataPgId::new_for_test(PgId::new(pg_id)),
+            ShardIndex::new(shard_index),
+            NodeId::new(node_id),
+        )
+    }
+
+    fn test_shard_key(shard_index: u8) -> ShardKey {
+        ShardKey::new(&[0x42; 16], 99, shard_index)
+    }
+
+    fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(pg_id),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+                crate::tests::bucket_name("metadata-rpc-bucket"),
+                crate::tests::object_key("object"),
+                crate::tests::stream_session_id("metadata-rpc"),
+                GenerationId::new(1).unwrap(),
+                123,
+            )),
+        )
+    }
+
+    fn create_probe_bucket_direct(store: &PgStore, bucket: &BucketName) {
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        store
+            .create_bucket_with_config(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &AclGrants::default(),
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
+            })
+            .unwrap();
+    }
+
+    fn put_probe_lifecycle_direct(store: &PgStore, bucket: &BucketName) {
+        store
+            .put_bucket_subresource(
+                bucket,
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration/>",
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+    }
+
+    fn test_metadata_checkpoint_with_bucket(
+        bucket_name: &str,
+    ) -> (
+        BucketName,
+        crate::node_runtime::pg_store::MetadataCommandCheckpoint,
+    ) {
+        let source_tmp = test_util::tempdir();
+        let source_node = crate::node::SharedStorageNode::open(source_tmp.path(), &[0]).unwrap();
+        let bucket = crate::tests::bucket_name(bucket_name);
+        let checkpoint = {
+            let source_pg = source_node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&source_pg, &bucket);
+            put_probe_lifecycle_direct(&source_pg, &bucket);
+            source_pg.refresh_metadata_command_state_digest().unwrap();
+            source_pg
+                .metadata_command_checkpoint(11, ClusterEpoch::INITIAL)
+                .unwrap()
+        };
+        (bucket, checkpoint)
+    }
+
+    fn test_bucket_write_reservation_proof(
+        bucket: crate::BucketName,
+        key: &crate::ObjectKey,
+    ) -> BucketWriteReservationProof {
+        BucketWriteReservationProof {
+            bucket,
+            reservation_id: "reservation-id".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: "storage-node-rpc-test".to_string(),
+            created_at: 1,
+            lease_deadline: 20,
+            target_context: Some(key.as_str().to_string()),
+        }
+    }
+
+    fn read_handle_release_payload(read_operation_id: &str) -> Vec<u8> {
+        encode_read_handle_release_request(&StorageRpcReadHandleReleaseRequest {
+            read_operation_id: read_operation_id.to_string(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn metadata_checkpoint_success_response_returns_structured_error_when_frame_too_large() {
+        let success = encode_metadata_command_checkpoint_success_response(
+            "metadata command checkpoint export",
+            b"ok",
+            256,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_storage_rpc_response_payload(&success).unwrap(),
+            Ok(b"ok".to_vec())
+        );
+
+        let oversized_payload = vec![42; 300];
+        let response = encode_metadata_command_checkpoint_success_response(
+            "metadata command checkpoint export",
+            &oversized_payload,
+            256,
+        )
+        .unwrap();
+        let error = decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+        assert!(error
+            .message
+            .contains("metadata command checkpoint export response is too large"));
+        assert!(error
+            .message
+            .contains("exceeds storage RPC payload limit 256 bytes"));
+
+        let response = encode_metadata_command_checkpoint_success_response(
+            "metadata command checkpoint candidates",
+            &oversized_payload,
+            256,
+        )
+        .unwrap();
+        let error = decode_storage_rpc_response_payload(&response)
+            .unwrap()
+            .unwrap_err();
+
+        assert_eq!(error.code, StorageRpcErrorCode::ResourceExhausted);
+        assert!(error
+            .message
+            .contains("metadata command checkpoint candidates response is too large"));
+    }
+
+    #[test]
+    fn metadata_checkpoint_candidates_for_frame_skips_oversized_newest_candidate() {
+        let tmp = test_util::tempdir();
+        let node = crate::node::SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let pg = node.get_pg(0).unwrap();
+        let bucket = crate::tests::bucket_name("metadata-checkpoint-frame-candidate");
+        create_probe_bucket_direct(&pg, &bucket);
+        pg.refresh_metadata_command_state_digest().unwrap();
+        let small = pg
+            .record_current_metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
+            .unwrap();
+
+        let large_body = format!(
+            "<LifecycleConfiguration>{}</LifecycleConfiguration>",
+            "x".repeat(4096)
+        );
+        pg.put_bucket_subresource(
+            &bucket,
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: &large_body,
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        let large = pg
+            .record_current_metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
+            .unwrap();
+
+        let small_payload = encode_metadata_command_checkpoint_candidates_response(
+            &StorageRpcMetadataCommandCheckpointCandidatesResponse {
+                checkpoints: vec![small.clone()],
+            },
+        )
+        .unwrap();
+        let large_payload = encode_metadata_command_checkpoint_candidates_response(
+            &StorageRpcMetadataCommandCheckpointCandidatesResponse {
+                checkpoints: vec![large],
+            },
+        )
+        .unwrap();
+        let small_response_len = encode_storage_rpc_success_response(&small_payload).len();
+        let large_response_len = encode_storage_rpc_success_response(&large_payload).len();
+        assert!(large_response_len > small_response_len);
+
+        let candidates = metadata_command_checkpoint_candidates_for_frame(
+            &pg,
+            ClusterEpoch::INITIAL,
+            u64::MAX,
+            1,
+            small_response_len,
+        )
+        .unwrap();
+
+        assert_eq!(candidates, vec![small]);
+    }
+
+    fn send_frame(
+        client: &mut UnixStream,
+        request_id: u64,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+    ) -> StorageRpcFrame {
+        let request = StorageRpcFrame {
+            request_id,
+            kind,
+            payload,
+        };
+        write_storage_rpc_frame_to(client, &request).unwrap();
+        read_storage_rpc_frame_from(client).unwrap()
+    }
+
+    fn send_read_handle_acquire(
+        config: StorageNodeProcessConfig,
+        location: ShardLocation,
+    ) -> StorageRpcErrorResponse {
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let request = StorageRpcFrame {
+            request_id: 7,
+            kind: StorageRpcMessageKind::ReadHandlesAcquire,
+            payload: read_handle_acquire_payload("read-op", location),
+        };
+        write_storage_rpc_frame_to(&mut client, &request).unwrap();
+        let response = read_storage_rpc_frame_from(&mut client).unwrap();
+        drop(client);
+        join.join().unwrap();
+
+        decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap_err()
+    }
+
+    fn wait_for_read_handle_count(
+        server: &StorageNodeServer,
+        location: ShardLocation,
+        expected: usize,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let actual = server.read_handle_count(location);
+            if actual == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "read handle count for {location:?} stayed at {actual}, expected {expected}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn storage_node_server_answers_health_request() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let request = StorageRpcFrame {
+            request_id: 42,
+            kind: StorageRpcMessageKind::Health,
+            payload: Vec::new(),
+        };
+        write_storage_rpc_frame_to(&mut client, &request).unwrap();
+        let response = read_storage_rpc_frame_from(&mut client).unwrap();
+        drop(client);
+        join.join().unwrap();
+
+        assert_eq!(response.request_id, 42);
+        assert_eq!(response.kind, StorageRpcMessageKind::Health);
+        let health_payload = decode_storage_rpc_response_payload(&response.payload)
+            .unwrap()
+            .unwrap();
+        let health = decode_health_response(&health_payload).unwrap();
+        assert_eq!(health.node_id, NodeId::new(7));
+        assert_eq!(health.cluster_epoch, ClusterEpoch::new(1).unwrap());
+    }
+
+    #[test]
+    fn authenticated_unix_storage_rpc_reuses_connection_across_real_server_boundary() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .bind()
+            .unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            StorageRpcClientEndpoint::unix(socket_path),
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        for _ in 0..2 {
+            let payload = client
+                .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+                .unwrap();
+            let health = decode_health_response(&payload).unwrap();
+
+            assert_eq!(health.node_id, config.node_id);
+            assert_eq!(health.cluster_epoch, config.cluster_epoch);
+        }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_storage_rpc_crosses_real_server_boundary() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+            .bind()
+            .unwrap();
+        let address = server.tcp_listener_addr_for_test();
+        let join = thread::spawn(move || server.accept_one());
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        for _ in 0..2 {
+            let payload = client
+                .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+                .unwrap();
+            let health = decode_health_response(&payload).unwrap();
+
+            assert_eq!(health.node_id, config.node_id);
+            assert_eq!(health.cluster_epoch, config.cluster_epoch);
+        }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn tls_tcp_ordinary_pool_reserves_single_connection_limit_for_stateful_session() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth_with_max_connections(&credential, 1))
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+            .bind()
+            .unwrap();
+        let address = server.tcp_listener_addr_for_test();
+        let join = thread::spawn(move || {
+            server.accept_one().unwrap();
+            server.accept_one().unwrap();
+        });
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth_with_max_connections(
+                credential, 9, 1,
+            )),
+        );
+
+        let payload = client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        assert_eq!(
+            decode_health_response(&payload).unwrap().node_id,
+            config.node_id
+        );
+
+        let critical_section = MetadataCommandNodeClient::open_metadata_command_critical_section(
+            &client,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+        drop(critical_section);
+        drop(client);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn tls_tcp_distinct_ordinary_pools_leave_reserved_stateful_capacity() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth_with_max_connections(&credential, 2))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let new_client = || {
+            let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap();
+            UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                config.node_id,
+                config.cluster_epoch,
+                endpoint,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(storage_rpc_client_auth_with_max_connections(
+                    credential.clone(),
+                    9,
+                    2,
+                )),
+            )
+        };
+        let first = new_client();
+        let second = new_client();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let payload = first
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        assert_eq!(
+            decode_health_response(&payload).unwrap().node_id,
+            config.node_id
+        );
+        accept.join().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let payload = second
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        assert_eq!(
+            decode_health_response(&payload).unwrap().node_id,
+            config.node_id
+        );
+        accept.join().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let critical_section = MetadataCommandNodeClient::open_metadata_command_critical_section(
+            &second,
+            PgId::new(0),
+            config.cluster_epoch,
+        )
+        .unwrap();
+        accept.join().unwrap();
+        drop(critical_section);
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    fn tls_tcp_durable_effect_deadline_rebinds_to_storage_host_monotonic_clock() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
+                .bind()
+                .unwrap()
+        });
+        let command = test_metadata_command(0, 1);
+        let bucket = command.bucket_name().clone();
+        let drain_bucket = BucketName::try_from("tcp-portable-drain-bucket").unwrap();
+        let expired_drain_bucket = BucketName::try_from("tcp-expired-drain-bucket").unwrap();
+        let shard_key = test_shard_key(0);
+        let expired_shard_key = test_shard_key(1);
+        let pg = server._node.get_pg(0).unwrap();
+        create_probe_bucket_direct(&pg, &bucket);
+        create_probe_bucket_direct(&pg, &drain_bucket);
+        create_probe_bucket_direct(&pg, &expired_drain_bucket);
+        drop(pg);
+        let node = Arc::clone(&server._node);
+        let address = server.tcp_listener_addr_for_test();
+        let join = thread::spawn(move || {
+            crate::clock::with_time_and_monotonic_override(2_500, 901_500, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(2_800, 901_800, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(2_800, 901_800, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap()
+            });
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap()
+            });
+        });
+        let new_client = || {
+            let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap();
+            UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                config.node_id,
+                config.cluster_epoch,
+                endpoint,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(storage_rpc_client_auth(credential.clone(), 9)),
+            )
+            .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()))
+        };
+        // The frontend's captured deadline is 1,500 ms away on its local
+        // monotonic clock. The production client must project that to the
+        // portable wall deadline (4,000 ms); no monotonic timestamp may cross
+        // the TLS/TCP boundary.
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let client = new_client();
+        let reservation_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &bucket,
+            )
+            .unwrap();
+        let reservation = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            reservation_route
+                .acquire_durable_bucket_write_reservation_with_effect_fence(
+                    DurableBucketWriteReservationAcquire {
+                        name: &bucket,
+                        reservation_id: "tcp-portable-reservation",
+                        owner_token: "tcp-portable-owner",
+                        cluster_epoch: config.cluster_epoch,
+                        operation_kind: "put-object-metadata",
+                        created_at: 1_000,
+                        lease_deadline: 9_000,
+                        target_context: Some("object"),
+                    },
+                    effect_fence,
+                )
+                .unwrap()
+        });
+        assert_eq!(reservation.bucket, bucket);
+        drop(reservation_route);
+        drop(client);
+
+        let client = new_client();
+        let drain_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &drain_bucket,
+            )
+            .unwrap();
+        let drain = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
+            drain_route
+                .begin_durable_bucket_write_drain_with_effect_fence(
+                    "tcp-portable-drain",
+                    "tcp-portable-drain-owner",
+                    1_000,
+                    9_000,
+                    effect_fence,
+                )
+                .unwrap()
+        });
+        assert_eq!(drain.bucket, drain_bucket);
+        drop(drain_route);
+        drop(client);
+
+        let shard_payload = b"portable fenced shard";
+        let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+        let client = new_client();
+        let shard_route = client
+            .open_placed_shard_route(
+                crate::cluster::ShardLocation::new(
+                    config.cluster_epoch,
+                    data_pg_id,
+                    shard_key.shard_index(),
+                    config.node_id,
+                ),
+                &shard_key,
+            )
+            .unwrap();
+        let shard_ack = crate::clock::with_time_and_monotonic_override(2_600, 10_100, || {
+            shard_route
+                .write_placed_shard_with_effect_fence(shard_payload, effect_fence)
+                .unwrap()
+        });
+        assert_eq!(shard_ack.stored_size, shard_payload.len() as u64);
+        assert_eq!(node.read_shard_file(0, &shard_key).unwrap(), shard_payload);
+        drop(shard_route);
+        drop(client);
+
+        let client = new_client();
+        let expired_drain_route = client
+            .open_bucket_write_reservation_route(
+                config.cluster_epoch,
+                BucketPgId::new_for_test(PgId::new(0)),
+                &expired_drain_bucket,
+            )
+            .unwrap();
+        let drain_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
+            expired_drain_route
+                .begin_durable_bucket_write_drain_with_effect_fence(
+                    "tcp-expired-drain",
+                    "tcp-expired-drain-owner",
+                    1_000,
+                    9_000,
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &drain_error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{drain_error:?}"
+        );
+        drop(expired_drain_route);
+        drop(client);
+
+        let client = new_client();
+        let pending_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
+            MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence(
+                &client,
+                PgId::new(0),
+                &command,
+                Some(command.bucket_name()),
+                effect_fence,
+            )
+            .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &pending_error,
+                StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                }
+            ),
+            "{pending_error:?}"
+        );
+        drop(client);
+
+        let client = new_client();
+        let expired_shard_route = client
+            .open_placed_shard_route(
+                crate::cluster::ShardLocation::new(
+                    config.cluster_epoch,
+                    data_pg_id,
+                    expired_shard_key.shard_index(),
+                    config.node_id,
+                ),
+                &expired_shard_key,
+            )
+            .unwrap();
+        let shard_error = crate::clock::with_time_and_monotonic_override(3_500, 11_000, || {
+            expired_shard_route
+                .write_placed_shard_with_effect_fence(b"must not be written", effect_fence)
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &shard_error,
+                StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                }
+            ),
+            "{shard_error:?}"
+        );
+        drop(expired_shard_route);
+        drop(client);
+        join.join().unwrap();
+
+        assert_eq!(node.read_shard_file(0, &shard_key).unwrap(), shard_payload);
+        assert!(matches!(
+            node.read_shard_file(0, &expired_shard_key),
+            Err(StoreError::NotFound)
+        ));
+        let pg = node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::durable_bucket_write_drain(&*pg, &expired_drain_bucket)
+                .unwrap()
+                .is_none()
+        );
+        assert!(pg
+            .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn unix_multipart_abort_build_rebinds_and_rejects_expired_effect_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-expired-abort-bucket");
+        let key = crate::tests::object_key("unix-expired-abort-key");
+        let upload_id = crate::tests::multipart_upload_id("unix-expired-abort-upload");
+        let create = CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: crate::OwnerIdentity::from_principal("unix-expired-abort-owner"),
+            owner: crate::OwnerIdentity::from_principal("unix-expired-abort-owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let node = Arc::clone(&server._node);
+        let (upload, cleanup, command_log_index_before) =
+            crate::clock::with_time_override(1_000, || {
+                let pg = node.get_pg(0).unwrap();
+                PgMetadataStore::create_multipart_upload(&*pg, &create).unwrap();
+                let upload = PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+                let cleanup = pg
+                    .prepare_abort_multipart_upload_cleanup(&bucket, &key, &upload_id)
+                    .unwrap()
+                    .expect("in-progress upload must have abort cleanup");
+                let command_log_index = pg
+                    .max_metadata_command_log_index(config.cluster_epoch)
+                    .unwrap();
+                (upload, cleanup, command_log_index)
+            });
+        let authorized_upload =
+            crate::types::AuthorizedMultipartUploadAbort::assume_authorized(upload);
+        let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
+        proof.operation_kind = ABORT_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
+
+        let serving = thread::spawn(move || {
+            for _ in 0..2 {
+                crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                    server.accept_one().unwrap();
+                });
+            }
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route = ObjectMutationMetadataNodeClient::open_multipart_abort_mutation_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            &upload_id,
+        )
+        .unwrap();
+        // The frontend still has 1,500 ms on its local monotonic clock and
+        // projects a portable wall deadline of 4,000 ms. The storage host
+        // receives the request at 4,500 ms and must reject it after rebinding
+        // that portable deadline to its unrelated monotonic clock.
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let ordinary_error = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            route
+                .build_abort_multipart_upload_command(
+                    BuildAbortMultipartUploadCommandReq {
+                        expected_cleanup: Some(&cleanup),
+                        bucket_write_reservation: &proof,
+                    },
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &ordinary_error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{ordinary_error:?}"
+        );
+        let authorized_error =
+            crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+                route
+                    .build_authorized_abort_multipart_upload_command(
+                        BuildAuthorizedAbortMultipartUploadCommandReq {
+                            authorized_upload: &authorized_upload,
+                            expected_cleanup: Some(&cleanup),
+                            bucket_write_reservation: &proof,
+                        },
+                        effect_fence,
+                    )
+                    .unwrap_err()
+            });
+        assert!(
+            matches!(
+                &authorized_error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{authorized_error:?}"
+        );
+        serving.join().unwrap();
+
+        let pg = node.get_pg(0).unwrap();
+        assert_eq!(
+            pg.max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            command_log_index_before,
+            "expired Unix abort builds must not advance the PG command log"
+        );
+    }
+
+    #[test]
+    fn unix_payload_reclaim_claim_acquire_rebinds_and_rejects_expired_effect_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-expired-reclaim-claim-bucket");
+        let key = crate::tests::object_key("unix-expired-reclaim-claim-key");
+        let generation_id = GenerationId::new(91).unwrap();
+        let node = Arc::clone(&server._node);
+        {
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::put_object_segments_reclaim(
+                &*pg,
+                &crate::ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id,
+                    created_at: 1_000,
+                    segments: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let serving = thread::spawn(move || {
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap();
+            });
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let error = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            route
+                .acquire_claim(
+                    AcquireObjectPayloadReclaimClaimReq {
+                        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                        bucket_incarnation_generation: 1,
+                        claim_id: "unix-expired-reclaim-claim",
+                        owner_token: "unix-expired-reclaim-owner",
+                        claimed_at: 2_500,
+                        lease_deadline: Some(9_000),
+                        now: 2_500,
+                    },
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        serving.join().unwrap();
+
+        assert!(
+            PgMetadataStore::object_payload_reclaim_claim(&*node.get_pg(0).unwrap())
+                .unwrap()
+                .is_none(),
+            "expired portable effect authority must not insert a reclaim claim"
+        );
+    }
+
+    #[test]
+    fn unix_payload_reclaim_claim_acquire_is_bounded_by_server_route_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-server-expired-reclaim-claim-bucket");
+        let key = crate::tests::object_key("unix-server-expired-reclaim-claim-key");
+        let generation_id = GenerationId::new(92).unwrap();
+        let node = Arc::clone(&server._node);
+        {
+            let pg = node.get_pg(0).unwrap();
+            PgMetadataStore::put_object_segments_reclaim(
+                &*pg,
+                &crate::ObjectSegmentsReclaimRecord {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    generation_id,
+                    created_at: 1_000,
+                    segments: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+
+        let server_node = Arc::clone(&node);
+        let serving = thread::spawn(move || {
+            let clock = crate::clock::test_time_override_guard(1_000);
+            let hook_clock = clock.control();
+            server_node
+                .get_pg(0)
+                .unwrap()
+                .test_install_before_object_payload_reclaim_claim_effect_check_hook(move || {
+                    hook_clock.set(4_500);
+                });
+            server.accept_one().unwrap();
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+        let client_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 10_000, 10_000);
+        let error = crate::clock::with_time_and_monotonic_override(1_000, 1_000, || {
+            route
+                .acquire_claim(
+                    AcquireObjectPayloadReclaimClaimReq {
+                        reclaim_kind: ObjectPayloadReclaimKind::ObjectSegments,
+                        bucket_incarnation_generation: 1,
+                        claim_id: "unix-server-expired-reclaim-claim",
+                        owner_token: "unix-server-expired-reclaim-owner",
+                        claimed_at: 1_000,
+                        lease_deadline: Some(9_000),
+                        now: 1_000,
+                    },
+                    client_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &error,
+                BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        serving.join().unwrap();
+
+        assert!(
+            PgMetadataStore::object_payload_reclaim_claim(&*node.get_pg(0).unwrap())
+                .unwrap()
+                .is_none(),
+            "the shorter server route fence must prevent durable claim insertion"
+        );
+    }
+
+    #[test]
+    fn unix_payload_reclaim_build_rebinds_and_rejects_expired_effect_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_and_monotonic_override(1_000, 900_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("unix-expired-reclaim-build-bucket");
+        let key = crate::tests::object_key("unix-expired-reclaim-build-key");
+        let generation_id = GenerationId::new(91).unwrap();
+        let reclaim = ObjectPayloadReclaimCommand::Segments(crate::ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: 1_000,
+            segments: Vec::new(),
+        });
+        let node = Arc::clone(&server._node);
+        let (claim, command_log_index_before) = {
+            let pg = node.get_pg(0).unwrap();
+            let ObjectPayloadReclaimCommand::Segments(record) = &reclaim else {
+                unreachable!("test reclaim uses the object-segments layout")
+            };
+            PgMetadataStore::put_object_segments_reclaim(&*pg, record).unwrap();
+            let claim = PgMetadataStore::acquire_object_payload_reclaim_claim(
+                &*pg,
+                &bucket,
+                1,
+                &key,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "unix-expired-reclaim-build-claim",
+                "unix-expired-reclaim-build-owner",
+                config.cluster_epoch,
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+                1_000,
+                Some(9_000),
+                1_000,
+            )
+            .unwrap()
+            .expect("seeded reclaim must be claimable");
+            let command_log_index = pg
+                .max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap();
+            (claim, command_log_index)
+        };
+
+        let serving = thread::spawn(move || {
+            crate::clock::with_time_and_monotonic_override(4_500, 903_500, || {
+                server.accept_one().unwrap();
+            });
+        });
+        let client = UnixStorageNodeClient::new(
+            config.node_id,
+            config.cluster_epoch,
+            config.socket_path.clone(),
+        );
+        let route = ObjectMutationMetadataNodeClient::open_object_payload_reclaim_metadata_route(
+            &client,
+            config.cluster_epoch,
+            ObjectMetadataPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            &key,
+            generation_id,
+        )
+        .unwrap();
+        let effect_fence = AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 11_500);
+        let error = crate::clock::with_time_and_monotonic_override(2_500, 10_000, || {
+            route
+                .build_delete_object_payload_reclaim_command(
+                    BuildDeleteObjectPayloadReclaimCommandReq {
+                        payload: &reclaim,
+                        claim: &claim,
+                    },
+                    effect_fence,
+                )
+                .unwrap_err()
+        });
+        assert!(
+            matches!(
+                &error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::StaleShardLocation,
+                    ..
+                })
+            ),
+            "{error:?}"
+        );
+        serving.join().unwrap();
+
+        let pg = node.get_pg(0).unwrap();
+        assert_eq!(
+            pg.max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            command_log_index_before,
+            "expired Unix reclaim build must not advance the PG command log"
+        );
+    }
+
+    #[test]
+    fn stalled_tls_handshake_does_not_block_the_next_storage_rpc_connection() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let stalled = TcpStream::connect(address).unwrap();
+
+        server.accept_and_spawn().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let payload = client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        let health = decode_health_response(&payload).unwrap();
+
+        assert_eq!(health.node_id, config.node_id);
+        accept.join().unwrap();
+        drop(stalled);
+    }
+
+    #[test]
+    fn malformed_tls_handshake_is_contained_to_its_storage_rpc_connection() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                )])
+                .bind()
+                .unwrap(),
+        );
+        let address = server.tcp_listener_addr_for_test();
+        let mut malformed = TcpStream::connect(address).unwrap();
+        malformed.write_all(b"not a TLS handshake").unwrap();
+        malformed.shutdown(std::net::Shutdown::Write).unwrap();
+
+        server.accept_and_spawn().unwrap();
+
+        let serving = Arc::clone(&server);
+        let accept = thread::spawn(move || serving.accept_and_spawn().unwrap());
+        let endpoint = StorageRpcClientEndpoint::tcp_with_config(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            storage_rpc_tls_client_config(),
+        )
+        .unwrap();
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let payload = client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .unwrap();
+        let health = decode_health_response(&payload).unwrap();
+
+        assert_eq!(health.node_id, config.node_id);
+        accept.join().unwrap();
+    }
+
+    #[test]
+    fn tls_tcp_storage_rpc_listener_requires_rpc_authentication() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let result = PreparedStorageNodeServer::new(config)
+            .with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+            .bind();
+
+        assert!(matches!(
+            result,
+            Err(StorageNodeServerError::TcpRpcListenerRequiresAuthentication { .. })
+        ));
+    }
+
+    #[test]
+    fn storage_rpc_listener_bind_failure_removes_previously_bound_unix_socket() {
+        let tmp = test_util::tempdir();
+        private_socket_dir(tmp.path());
+        let socket_path = tmp.path().join("partial-bind.sock");
+        let result = bind_storage_node_rpc_listeners(
+            vec![
+                StorageNodeRpcListenerConfig::unix(&socket_path),
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StorageNodeServerError::TcpRpcListenerRequiresAuthentication { .. })
+        ));
+        assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn authenticated_unix_storage_rpc_rejects_legacy_frame_before_dispatch() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .bind()
+            .unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::new(config.node_id, config.cluster_epoch, socket_path);
+
+        assert!(client
+            .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+            .is_err());
+        let server_error = join.join().unwrap().unwrap_err();
+        assert!(server_error.to_string().contains("transport magic"));
+    }
+
+    #[test]
+    fn authenticated_unix_storage_rpc_rejects_wrong_target_and_topology() {
+        for (client_node_id, topology_generation, expected_error) in [
+            (NodeId::new(8), 9, "WrongTarget"),
+            (NodeId::new(7), 10, "WrongTopology"),
+        ] {
+            let tmp = test_util::tempdir();
+            let config = test_config(&tmp);
+            private_socket_dir(config.socket_path.parent().unwrap());
+            let credential =
+                storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+                    instance_id: "frontend-1".to_owned(),
+                });
+            let server = PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(storage_rpc_server_auth(&credential))
+                .bind()
+                .unwrap();
+            let socket_path = config.socket_path.clone();
+            let join = thread::spawn(move || server.accept_one());
+            let client = UnixStorageNodeClient::with_rpc_admission_settings_and_auth(
+                client_node_id,
+                config.cluster_epoch,
+                socket_path,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(storage_rpc_client_auth(credential, topology_generation)),
+            );
+
+            assert!(client
+                .rpc_request(StorageRpcMessageKind::Health, Vec::new())
+                .is_err());
+            let server_error = join.join().unwrap().unwrap_err();
+            assert!(server_error.to_string().contains(expected_error));
+        }
+    }
+
+    #[test]
+    fn storage_node_server_drops_idle_rpc_session_after_timeout() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let socket_path = config.socket_path.clone();
+        let started = Instant::now();
+        let join = thread::spawn(move || server.accept_one().unwrap());
+
+        let _client = UnixStream::connect(socket_path).unwrap();
+        join.join().unwrap();
+        assert!(
+            started.elapsed() < STORAGE_RPC_SERVER_IDLE_TIMEOUT + Duration::from_secs(2),
+            "idle storage RPC session should be closed by server timeout"
+        );
+    }
+
+    #[test]
+    fn storage_node_connection_refreshes_config_for_each_frame() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let server_for_thread = Arc::clone(&server);
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server_for_thread.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let first = send_frame(&mut client, 1, StorageRpcMessageKind::Health, Vec::new());
+        let first_payload = decode_storage_rpc_response_payload(&first.payload)
+            .unwrap()
+            .unwrap();
+        let first_health = decode_health_response(&first_payload).unwrap();
+        assert_eq!(first_health.cluster_epoch, ClusterEpoch::new(1).unwrap());
+
+        let mut next_config = bounded_runtime_refresh_config(config.clone());
+        next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+
+        let second = send_frame(&mut client, 2, StorageRpcMessageKind::Health, Vec::new());
+        let second_payload = decode_storage_rpc_response_payload(&second.payload)
+            .unwrap()
+            .unwrap();
+        let second_health = decode_health_response(&second_payload).unwrap();
+        assert_eq!(second_health.cluster_epoch, ClusterEpoch::new(2).unwrap());
+
+        let stale_read_acquire = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::ReadHandlesAcquire,
+            read_handle_acquire_payload("stale-read", test_location(1, 0, 7)),
+        );
+        let stale_error = decode_storage_rpc_response_payload(&stale_read_acquire.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(stale_error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(stale_error
+            .message
+            .contains("does not match storage-node epoch 2"));
+        assert_eq!(server.read_handle_count(test_location(1, 0, 7)), 0);
+
+        drop(client);
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn storage_node_session_rejects_current_primary_lock_for_historical_abandonment() {
+        let tmp = test_util::tempdir();
+        let source_epoch = ClusterEpoch::INITIAL;
+        let current_epoch = ClusterEpoch::new(2).unwrap();
+        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let command = test_metadata_command(0, 1);
+        let source_route = config.pg_routes[0].clone();
+        let local_node_id = config.node_id;
+        let socket_path = config.socket_path.clone();
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let serving = Arc::clone(&server);
+        let join = thread::spawn(move || serving.accept_one().unwrap());
+
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        let current_lock_response = send_frame(
+            &mut client,
+            1,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        decode_storage_rpc_response_payload(&current_lock_response.payload)
+            .unwrap()
+            .unwrap();
+
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = current_epoch;
+        next_config.pg_routes[0].cluster_epoch = current_epoch;
+        next_config.pg_routes[0].state = PgState::Peering;
+        next_config.historical_pg_routes.push(source_route);
+        next_config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                local_node_id,
+                PendingMetadataCommandObservation::new(
+                    source_epoch,
+                    std::num::NonZeroU64::MIN,
+                    command.checksum_crc64(),
+                ),
+            ),
+        ));
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+
+        let historical_lock_response = send_frame(
+            &mut client,
+            2,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        let historical_lock_error =
+            decode_storage_rpc_response_payload(&historical_lock_response.payload)
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(
+            historical_lock_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+        assert!(historical_lock_error.message.contains("CurrentPrimary"));
+        assert!(historical_lock_error
+            .message
+            .contains("HistoricalRecoveryPrimary"));
+
+        let abandonment_response = send_frame(
+            &mut client,
+            3,
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+                command: command.clone(),
+            })
+            .unwrap(),
+        );
+        let abandonment_error = decode_storage_rpc_response_payload(&abandonment_response.payload)
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(
+            abandonment_error.code,
+            StorageRpcErrorCode::StaleShardLocation
+        );
+        assert!(abandonment_error
+            .message
+            .contains("exact held recovery-primary lock binding"));
+
+        let release_response = send_frame(
+            &mut client,
+            4,
+            StorageRpcMessageKind::MetadataCommandPgLockRelease,
+            encode_metadata_command_state_request(&StorageRpcMetadataCommandStateRequest {
+                node_id: local_node_id,
+                cluster_epoch: source_epoch,
+                pg_id: PgId::new(0),
+            }),
+        );
+        decode_storage_rpc_response_payload(&release_response.payload)
+            .unwrap()
+            .unwrap();
+        drop(client);
+        join.join().unwrap();
+
+        assert!(!server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_abandoned(local_node_id.as_u32(), &command)
+            .unwrap());
+    }
+
+    #[test]
+    fn storage_node_connection_route_validation_uses_refreshed_config() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let mut handler = server.connection_handler();
+
+        handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap();
+
+        let mut next_config = bounded_runtime_refresh_config(config.clone());
+        next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+        handler.refresh_config_snapshot();
+
+        let error = handler
+            .validate_pg_route(config.node_id, config.cluster_epoch, PgId::new(0))
+            .unwrap_err();
+        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+        assert!(error
+            .message
+            .contains("does not match storage-node epoch 2"));
+    }
+
+    #[test]
+    fn storage_node_runtime_config_install_drains_admitted_route_permit() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
+
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(next_config)
+                .unwrap();
+            installed_tx.send(()).unwrap();
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let state = server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.transition == StorageNodeRouteTransitionState::Draining {
+                break;
+            }
+            drop(state);
+            assert!(
+                Instant::now() < deadline,
+                "route install did not begin draining"
+            );
+            thread::yield_now();
+        }
+        assert!(matches!(
+            installed_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            server.config_snapshot().cluster_epoch,
+            ClusterEpoch::new(1).unwrap()
+        );
+        drop(admitted);
+        installed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        installer.join().unwrap();
+        assert_eq!(
+            server.config_snapshot().cluster_epoch,
+            ClusterEpoch::new(2).unwrap()
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_config_staging_keeps_route_admission_open() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        let stage_barrier = Arc::new(std::sync::Barrier::new(2));
+        let hook_barrier = Arc::clone(&stage_barrier);
+        *server
+            .runtime_config_stage_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            hook_barrier.wait();
+            hook_barrier.wait();
+        }));
+
+        let mut next_config = bounded_runtime_refresh_config(config);
+        next_config.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        next_config.pg_routes[0].cluster_epoch = next_config.cluster_epoch;
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(next_config)
+                .unwrap();
+        });
+
+        stage_barrier.wait();
+        assert_eq!(
+            server
+                .route_admission
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .transition,
+            StorageNodeRouteTransitionState::Open,
+            "runtime-config staging must not close route admission"
+        );
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        drop(admitted);
+        stage_barrier.wait();
+        installer.join().unwrap();
+        assert_eq!(
+            server.config_snapshot().cluster_epoch,
+            ClusterEpoch::new(2).unwrap()
+        );
+    }
+
+    #[test]
+    fn storage_node_runtime_config_validity_extension_is_memory_only_and_does_not_drain_frames() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+        config.persist_control_plane_runtime_config().unwrap();
+        let persisted_path = control_plane_runtime_config_path(&config.data_dir);
+        let persisted_before = fs::read(&persisted_path).unwrap();
+        let staged = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let staged_from_hook = Arc::clone(&staged);
+        *server
+            .runtime_config_stage_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(move || {
+            staged_from_hook.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }));
+        let admitted = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(6_000).unwrap();
+
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let installing_server = Arc::clone(&server);
+        let installer = thread::spawn(move || {
+            installing_server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+            installed_tx.send(()).unwrap();
+        });
+
+        installed_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("validity-only extension must not wait for admitted frames");
+        assert_eq!(
+            server.config_snapshot().route_map_valid_until_ms(),
+            Some(6_000)
+        );
+        assert_eq!(
+            staged.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "validity-only extension must not stage the unchanged route map"
+        );
+        assert_eq!(fs::read(&persisted_path).unwrap(), persisted_before);
+        assert_eq!(
+            StorageNodeProcessConfig::load_control_plane_runtime_config(
+                &config.data_dir,
+                config.node_id,
+                config.default_ec_shape,
+                &config.socket_path,
+            )
+            .unwrap()
+            .unwrap()
+            .route_map_valid_until_ms(),
+            Some(5_000),
+            "the durable route map remains a fail-closed restart checkpoint"
+        );
+        drop(admitted);
+        installer.join().unwrap();
+    }
+
+    #[test]
+    fn bucket_metadata_scan_capability_binds_admission_domain_and_deadline() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("bucket-metadata-scan-capability");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &owner,
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_bucket_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test bucket metadata scan",
+                )
+                .unwrap()
+        });
+        let read_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .metadata_read_bucket_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test bucket metadata read scan",
+                )
+                .unwrap()
+        });
+        crate::clock::with_time_override(1_000, || {
+            assert_eq!(read_route.list_buckets(owner.as_str()).unwrap().len(), 1);
+            assert!(route
+                .load_bucket_execution_generations(std::slice::from_ref(&bucket))
+                .unwrap()
+                .contains_key(&bucket));
+            assert!(route
+                .load_bucket_fast_path_identities(std::slice::from_ref(&bucket))
+                .unwrap()
+                .contains_key(&bucket));
+        });
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        match handler.active_bucket_scan_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            "test bucket metadata scan",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign admission created a bucket metadata scan route"),
+        }
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.active_bucket_scan_route(
+            &retained_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            "test bucket metadata scan",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires active route admission"));
+            }
+            Ok(_) => panic!("retained admission created a bucket metadata scan route"),
+        }
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            fn assert_expired<T>(result: Result<T, StorageNodeBucketRouteError>) {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("expired scan reached bucket storage: {error}")
+                    }
+                    Ok(_) => panic!("expired bucket metadata scan route remained usable"),
+                }
+            }
+
+            assert_expired(read_route.list_buckets(owner.as_str()));
+            assert_expired(route.load_bucket_execution_generations(std::slice::from_ref(&bucket)));
+            assert_expired(route.load_bucket_fast_path_identities(std::slice::from_ref(&bucket)));
+        });
+    }
+
+    #[test]
+    fn object_payload_reclaim_capabilities_capture_deadline_and_retain_exact_claim_cleanup() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.route_map_validity = RouteMapValidity::until_ms(5_000).unwrap();
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = crate::clock::with_time_override(1_000, || {
+            StorageNodeServer::bind(config.clone()).unwrap()
+        });
+        let bucket = crate::tests::bucket_name("reclaim-capability-bucket");
+        let key = crate::tests::object_key("reclaim-capability-key");
+        let generation_id = GenerationId::new(91).unwrap();
+        let reclaim = ObjectPayloadReclaimCommand::Segments(crate::ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: 1_000,
+            segments: Vec::new(),
+        });
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            let ObjectPayloadReclaimCommand::Segments(reclaim) = &reclaim else {
+                unreachable!("test reclaim is an object-segments record")
+            };
+            PgMetadataStore::put_object_segments_reclaim(&*pg, reclaim).unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+        }
+
+        let handler = server.connection_handler();
+        let active_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        let request = StorageRpcObjectRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            bucket: bucket.clone(),
+            key: key.clone(),
+        };
+        let route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_primary_object_route(
+                    &active_permit,
+                    &request,
+                    "test object payload reclaim",
+                )
+                .unwrap()
+        });
+        let claim = crate::clock::with_time_override(1_000, || {
+            assert!(route.payload_reclaim_exists(generation_id).unwrap());
+            assert_eq!(
+                route.load_object_payload_reclaim(generation_id).unwrap(),
+                Some(reclaim.clone())
+            );
+            route
+                .acquire_object_payload_reclaim_claim(
+                    1,
+                    generation_id,
+                    ObjectPayloadReclaimKind::ObjectSegments,
+                    "reclaim-capability-claim",
+                    "reclaim-capability-owner",
+                    1_000,
+                    Some(4_000),
+                    1_000,
+                    AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 4_000),
+                )
+                .unwrap()
+                .expect("active reclaim route must acquire the exact claim")
+        });
+        let scan_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .active_primary_object_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test object payload reclaim scan",
+                )
+                .unwrap()
+        });
+        let read_scan_route = crate::clock::with_time_override(1_000, || {
+            handler
+                .metadata_read_object_scan_route(
+                    &active_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    "test object metadata read scan",
+                )
+                .unwrap()
+        });
+        crate::clock::with_time_override(1_000, || {
+            let expected_root = PayloadReclaimRoot {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                generation_id,
+            };
+            assert_eq!(
+                scan_route.bucket_payload_reclaim_root(&bucket).unwrap(),
+                Some(expected_root.clone())
+            );
+            assert_eq!(
+                scan_route.payload_reclaim_root().unwrap(),
+                Some(expected_root)
+            );
+            assert_eq!(
+                scan_route.object_payload_reclaim_claim().unwrap(),
+                Some(claim.clone())
+            );
+            assert!(read_scan_route
+                .list_objects_page(&crate::ListObjectsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    start_after: None,
+                    start_at: None,
+                    max_keys: 1,
+                })
+                .unwrap()
+                .objects
+                .is_empty());
+            assert!(read_scan_route
+                .list_object_versions_page(&crate::ListObjectVersionsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    start_at: None,
+                    max_keys: 1,
+                })
+                .unwrap()
+                .versions
+                .is_empty());
+            assert!(read_scan_route
+                .list_multipart_uploads_page(&crate::ListMultipartUploadsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    page_start: None,
+                    max_uploads: 1,
+                })
+                .unwrap()
+                .uploads
+                .is_empty());
+            assert!(scan_route
+                .list_stream_uploads_for_bucket_page(&bucket, None, 1)
+                .unwrap()
+                .uploads
+                .is_empty());
+            assert!(scan_route
+                .list_all_stream_uploads_page(None, 1)
+                .unwrap()
+                .uploads
+                .is_empty());
+            assert!(scan_route
+                .list_shard_scavenger_payload_references()
+                .unwrap()
+                .is_empty());
+        });
+
+        let foreign_permit = StorageNodeRouteAdmissionGate::default()
+            .acquire(StorageNodeRouteAdmissionClass::Active);
+        match handler.active_primary_object_scan_route(
+            &foreign_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            "test object payload reclaim scan",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("different admission domain"));
+            }
+            Ok(_) => panic!("foreign admission created an active object scan route"),
+        }
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        match handler.active_primary_object_scan_route(
+            &retained_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            "test object payload reclaim scan",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires active route admission"));
+            }
+            Ok(_) => panic!("retained admission created an active object scan route"),
+        }
+        match handler.retained_object_payload_reclaim_claim_route(
+            &active_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &claim,
+            "test object payload reclaim claim release",
+        ) {
+            Err(error) => {
+                assert_eq!(error.code, StorageRpcErrorCode::Internal);
+                assert!(error.message.contains("requires retained-cleanup"));
+            }
+            Ok(_) => panic!("active admission created retained reclaim cleanup authority"),
+        }
+        let mut wrong_pg_claim = claim.clone();
+        wrong_pg_claim.pg_id = 1;
+        match handler.retained_object_payload_reclaim_claim_route(
+            &retained_permit,
+            config.node_id,
+            config.cluster_epoch,
+            PgId::new(0),
+            &wrong_pg_claim,
+            "test object payload reclaim claim release",
+        ) {
+            Err(error) => assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode),
+            Ok(_) => panic!("mismatched claim PG created retained reclaim cleanup authority"),
+        }
+
+        let mut extended = config.clone();
+        extended.route_map_validity = RouteMapValidity::until_ms(10_000).unwrap();
+        crate::clock::with_time_override(1_000, || {
+            server
+                .install_control_plane_runtime_config(extended)
+                .unwrap();
+        });
+        crate::clock::with_time_override(6_000, || {
+            fn assert_scan_route_expired<T>(
+                result: Result<T, StorageNodeObjectPayloadReclaimRouteError>,
+            ) {
+                match result {
+                    Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    }
+                    Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
+                        panic!("captured scan route should expire before node access: {error}")
+                    }
+                    Ok(_) => panic!("expired captured scan route reached node access"),
+                }
+            }
+
+            fn assert_bucket_scan_route_expired<T>(result: Result<T, StorageNodeBucketRouteError>) {
+                match result {
+                    Err(StorageNodeBucketRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    }
+                    Err(StorageNodeBucketRouteError::Bucket(error)) => {
+                        panic!("captured scan route should expire before node access: {error}")
+                    }
+                    Ok(_) => panic!("expired captured scan route reached node access"),
+                }
+            }
+
+            fn assert_object_scan_route_expired<T>(result: Result<T, StorageNodeObjectRouteError>) {
+                match result {
+                    Err(StorageNodeObjectRouteError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    }
+                    Err(StorageNodeObjectRouteError::Object(error)) => {
+                        panic!("captured scan route should expire before node access: {error}")
+                    }
+                    Ok(_) => panic!("expired captured scan route reached node access"),
+                }
+            }
+
+            fn assert_store_scan_route_expired<T>(
+                result: Result<T, StorageNodeObjectScanStoreError>,
+            ) {
+                match result {
+                    Err(StorageNodeObjectScanStoreError::Route(error)) => {
+                        assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                    }
+                    Err(StorageNodeObjectScanStoreError::Store(error)) => {
+                        panic!("captured scan route should expire before node access: {error}")
+                    }
+                    Ok(_) => panic!("expired captured scan route reached node access"),
+                }
+            }
+
+            assert_scan_route_expired(scan_route.bucket_payload_reclaim_root(&bucket));
+            assert_scan_route_expired(scan_route.payload_reclaim_root());
+            assert_scan_route_expired(scan_route.object_payload_reclaim_claim());
+            assert_bucket_scan_route_expired(read_scan_route.list_objects_page(
+                &crate::ListObjectsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    start_after: None,
+                    start_at: None,
+                    max_keys: 1,
+                },
+            ));
+            assert_bucket_scan_route_expired(read_scan_route.list_object_versions_page(
+                &crate::ListObjectVersionsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    start_at: None,
+                    max_keys: 1,
+                },
+            ));
+            assert_bucket_scan_route_expired(read_scan_route.list_multipart_uploads_page(
+                &crate::ListMultipartUploadsReq {
+                    bucket: bucket.clone(),
+                    prefix: None,
+                    page_start: None,
+                    max_uploads: 1,
+                },
+            ));
+            assert_object_scan_route_expired(
+                scan_route.list_stream_uploads_for_bucket_page(&bucket, None, 1),
+            );
+            assert_object_scan_route_expired(scan_route.list_all_stream_uploads_page(None, 1));
+            assert_store_scan_route_expired(scan_route.list_shard_scavenger_payload_references());
+            match route.payload_reclaim_exists(generation_id) {
+                Err(StorageNodeObjectRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                }
+                Err(StorageNodeObjectRouteError::Object(error)) => {
+                    panic!("captured route should expire before reclaim existence read: {error}")
+                }
+                Ok(exists) => panic!("expired captured route returned reclaim existence {exists}"),
+            }
+            match route.load_object_payload_reclaim(generation_id) {
+                Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                }
+                Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
+                    panic!("captured route should expire before reclaim load: {error}")
+                }
+                Ok(loaded) => panic!("expired captured route loaded reclaim {loaded:?}"),
+            }
+            match route.acquire_object_payload_reclaim_claim(
+                1,
+                generation_id,
+                ObjectPayloadReclaimKind::ObjectSegments,
+                "expired-reclaim-capability-claim",
+                "reclaim-capability-owner",
+                6_000,
+                Some(9_000),
+                6_000,
+                AdmittedRouteEffectFence::bounded(config.cluster_epoch, 5_000, 4_000),
+            ) {
+                Err(StorageNodeObjectPayloadReclaimRouteError::Route(error)) => {
+                    assert_eq!(error.code, StorageRpcErrorCode::StaleShardLocation);
+                }
+                Err(StorageNodeObjectPayloadReclaimRouteError::Reclaim(error)) => {
+                    panic!("captured route should expire before reclaim claim mutation: {error}")
+                }
+                Ok(record) => panic!("expired captured route returned reclaim claim {record:?}"),
+            }
+        });
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            assert_eq!(
+                PgMetadataStore::object_payload_reclaim_claim(&*pg).unwrap(),
+                Some(claim.clone()),
+                "expired active route must leave the durable reclaim claim exact"
+            );
+        }
+        drop(active_permit);
+        drop(retained_permit);
+
+        let history_summary = server
+            ._node
+            .cluster_map_history_reference_summary()
+            .unwrap();
+        assert_eq!(
+            history_summary.oldest_object_payload_reclaim_claim_epoch,
+            Some(config.cluster_epoch),
+            "the durable claim must retain its acquisition route epoch"
+        );
+        let epoch_one_route = server.config_snapshot().pg_routes[0].clone();
+        let mut epoch_two = server.config_snapshot();
+        epoch_two.cluster_epoch = ClusterEpoch::new(2).unwrap();
+        epoch_two.route_map_validity = RouteMapValidity::until_ms(20_000).unwrap();
+        epoch_two.pg_routes[0].cluster_epoch = epoch_two.cluster_epoch;
+        epoch_two.historical_pg_routes = prune_refresh_historical_pg_routes(
+            BTreeMap::from([(
+                (epoch_one_route.cluster_epoch, epoch_one_route.pg_id),
+                epoch_one_route.clone(),
+            )]),
+            config.cluster_epoch,
+            history_summary,
+            &BTreeSet::new(),
+        );
+        crate::clock::with_time_override(6_000, || {
+            server
+                .install_control_plane_runtime_config(epoch_two.clone())
+                .unwrap();
+        });
+
+        let epoch_two_route = epoch_two.pg_routes[0].clone();
+        let mut epoch_three = epoch_two.clone();
+        epoch_three.cluster_epoch = ClusterEpoch::new(3).unwrap();
+        epoch_three.pg_routes[0].cluster_epoch = epoch_three.cluster_epoch;
+        let historical_candidates = epoch_two
+            .historical_pg_routes
+            .iter()
+            .cloned()
+            .chain(std::iter::once(epoch_two_route))
+            .map(|route| ((route.cluster_epoch, route.pg_id), route))
+            .collect();
+        epoch_three.historical_pg_routes = prune_refresh_historical_pg_routes(
+            historical_candidates,
+            epoch_two.cluster_epoch,
+            history_summary,
+            &BTreeSet::new(),
+        );
+        assert!(epoch_three.historical_pg_routes.iter().any(|route| {
+            route.cluster_epoch == config.cluster_epoch && route.pg_id == PgId::new(0).get()
+        }));
+        crate::clock::with_time_override(6_000, || {
+            server
+                .install_control_plane_runtime_config(epoch_three)
+                .unwrap();
+        });
+
+        let retained_permit = server
+            .route_admission
+            .acquire(StorageNodeRouteAdmissionClass::RetainedCleanup);
+        crate::clock::with_time_override(6_000, || {
+            handler
+                .retained_object_payload_reclaim_claim_route(
+                    &retained_permit,
+                    config.node_id,
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    &claim,
+                    "test object payload reclaim claim release",
+                )
+                .unwrap()
+                .release()
+                .unwrap();
+        });
+        let pg = server._node.get_pg(0).unwrap();
+        assert!(
+            PgMetadataStore::object_payload_reclaim_claim(&*pg)
+                .unwrap()
+                .is_none(),
+            "retained cleanup must release the exact expired-route reclaim claim"
+        );
+        drop(pg);
+        assert_eq!(
+            server
+                ._node
+                .cluster_map_history_reference_summary()
+                .unwrap()
+                .oldest_object_payload_reclaim_claim_epoch,
+            None,
+            "exact claim release must also release its historical-route reference"
+        );
+    }
