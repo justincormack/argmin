@@ -8,7 +8,8 @@ use crate::sse::ManagedWrappingKeyConfig;
 use crate::system_metadata::SystemMetadata;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier, MutexGuard};
+use std::sync::{Arc, Barrier, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 use storage::test_support::{
     StorageClusterLifecycleTestSupport as _, StorageClusterPayloadTestSupport as _,
 };
@@ -386,8 +387,40 @@ fn install_stream_append_race_hooks(
 struct MultipartCompletePreCommitRaceSync {
     reached: Arc<Barrier>,
     resume: Arc<Barrier>,
+    retry_clock: Option<MultipartCompleteRetryClock>,
     _serial_guard: MutexGuard<'static, ()>,
     _guard: ReclamationTestHookGuard,
+}
+
+#[derive(Clone)]
+struct MultipartCompleteRetryClock {
+    now: Arc<Mutex<Instant>>,
+}
+
+impl MultipartCompleteRetryClock {
+    fn frozen() -> Self {
+        Self {
+            now: Arc::new(Mutex::new(Instant::now())),
+        }
+    }
+
+    fn now(&self) -> Instant {
+        *self.now.lock().unwrap()
+    }
+
+    fn advance(&self, elapsed: Duration) {
+        let mut now = self.now.lock().unwrap();
+        *now += elapsed;
+    }
+}
+
+impl MultipartCompletePreCommitRaceSync {
+    fn advance_retry_clock(&self, elapsed: Duration) {
+        self.retry_clock
+            .as_ref()
+            .expect("multipart completion race hook must install a retry clock")
+            .advance(elapsed);
+    }
 }
 
 fn install_multipart_complete_pre_commit_race_hooks(
@@ -402,17 +435,21 @@ fn install_multipart_complete_pre_commit_race_hooks(
     let resume = Arc::new(Barrier::new(2));
     let reached_hook = Arc::clone(&reached);
     let resume_hook = Arc::clone(&resume);
+    let retry_clock = MultipartCompleteRetryClock::frozen();
+    let retry_clock_hook = retry_clock.clone();
     let guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), key.to_string())),
         after_multipart_complete_pre_commit: Some(Arc::new(move || {
             reached_hook.wait();
             resume_hook.wait();
         })),
+        multipart_complete_stale_snapshot_retry_now: Some(Arc::new(move || retry_clock_hook.now())),
         ..ReclamationTestHooks::default()
     });
     MultipartCompletePreCommitRaceSync {
         reached,
         resume,
+        retry_clock: Some(retry_clock),
         _serial_guard: serial,
         _guard: guard,
     }
@@ -433,6 +470,8 @@ fn install_counted_multipart_complete_pre_commit_race_hooks(
     let resume_hook = Arc::clone(&resume);
     let remaining = Arc::new(AtomicUsize::new(pauses));
     let remaining_hook = Arc::clone(&remaining);
+    let retry_clock = MultipartCompleteRetryClock::frozen();
+    let retry_clock_hook = retry_clock.clone();
     let guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), key.to_string())),
         after_multipart_complete_pre_commit: Some(Arc::new(move || {
@@ -446,11 +485,13 @@ fn install_counted_multipart_complete_pre_commit_race_hooks(
                 resume_hook.wait();
             }
         })),
+        multipart_complete_stale_snapshot_retry_now: Some(Arc::new(move || retry_clock_hook.now())),
         ..ReclamationTestHooks::default()
     });
     MultipartCompletePreCommitRaceSync {
         reached,
         resume,
+        retry_clock: Some(retry_clock),
         _serial_guard: serial,
         _guard: guard,
     }
@@ -483,6 +524,7 @@ fn install_one_shot_multipart_complete_pre_commit_race_hooks(
     MultipartCompletePreCommitRaceSync {
         reached,
         resume,
+        retry_clock: None,
         _serial_guard: serial,
         _guard: guard,
     }
@@ -511,6 +553,7 @@ fn install_multipart_complete_snapshot_race_hooks(
     MultipartCompletePreCommitRaceSync {
         reached,
         resume,
+        retry_clock: None,
         _serial_guard: serial,
         _guard: guard,
     }
@@ -543,6 +586,7 @@ fn install_one_shot_multipart_complete_snapshot_race_hooks(
     MultipartCompletePreCommitRaceSync {
         reached,
         resume,
+        retry_clock: None,
         _serial_guard: serial,
         _guard: guard,
     }
@@ -1515,10 +1559,7 @@ fn stale_snapshot_time_budget_exhaustion_returns_operation_aborted_without_publi
         replacement.etag, parts[0].etag,
         "{invariant}: second replacement must preserve the requested ETag"
     );
-    std::thread::sleep(
-        multipart::COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET
-            + std::time::Duration::from_millis(25),
-    );
+    sync.advance_retry_clock(multipart::COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET);
     sync.resume.wait();
 
     let err = t_complete.join().unwrap().unwrap_err();

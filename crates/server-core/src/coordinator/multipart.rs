@@ -1,5 +1,7 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(test))]
+use std::time::Instant;
 #[cfg(test)]
 use storage::{BucketName, ObjectKey, SessionId};
 use storage::{
@@ -56,7 +58,7 @@ use super::{
 #[cfg(test)]
 use super::{
     maybe_run_multipart_complete_commit_hook, maybe_run_multipart_complete_pre_commit_hook,
-    maybe_run_multipart_complete_snapshot_hook,
+    maybe_run_multipart_complete_snapshot_hook, multipart_complete_stale_snapshot_retry_now,
 };
 use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
@@ -66,6 +68,11 @@ use crate::system_metadata::SystemMetadata;
 
 const COMPLETE_MULTIPART_TERMINAL_RACE_RETRIES: usize = 1;
 pub(super) const COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET: Duration = Duration::from_secs(2);
+
+#[cfg(not(test))]
+fn multipart_complete_stale_snapshot_retry_now(_bucket: &str, _key: &str) -> Instant {
+    Instant::now()
+}
 
 fn complete_multipart_part_checksum(
     part: &MultipartCompletionPart,
@@ -955,9 +962,12 @@ impl Coordinator {
                     if error.kind() == storage::MultipartCompletionFailureKind::StaleSnapshot =>
                 {
                     let deadline = stale_snapshot_retry_deadline.get_or_insert_with(|| {
-                        Instant::now() + COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET
+                        multipart_complete_stale_snapshot_retry_now(bucket.as_str(), key.as_str())
+                            + COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET
                     });
-                    if Instant::now() < *deadline {
+                    if multipart_complete_stale_snapshot_retry_now(bucket.as_str(), key.as_str())
+                        < *deadline
+                    {
                         continue 'retry_stale_commit_snapshot;
                     }
                     return Err(ServerError::OperationAborted);
