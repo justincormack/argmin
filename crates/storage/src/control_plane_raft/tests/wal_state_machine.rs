@@ -2876,7 +2876,10 @@ fn control_plane_raft_state_machine_applies_openraft_bootstrap_membership() {
     let mut empty_state_machine = ControlPlaneRaftStateMachine::empty();
     let empty_snapshot = empty_state_machine.build_snapshot().unwrap();
     assert_eq!(empty_snapshot.meta.last_log_id, None);
-    assert_eq!(empty_snapshot.meta.snapshot_id, "control-plane-empty");
+    assert_eq!(
+        control_plane_raft_snapshot_id(empty_snapshot.meta.last_log_id),
+        "control-plane-empty"
+    );
 
     let mut state_machine = ControlPlaneRaftStateMachine::empty();
 
@@ -2895,8 +2898,14 @@ fn control_plane_raft_state_machine_applies_openraft_bootstrap_membership() {
 
     let snapshot = state_machine.build_snapshot().unwrap();
     assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(0, 7, 0)));
-    assert_eq!(snapshot.meta.snapshot_id, "control-plane-T0-N7-I0");
-    assert_ne!(snapshot.meta.snapshot_id, empty_snapshot.meta.snapshot_id);
+    assert_eq!(
+        control_plane_raft_snapshot_id(snapshot.meta.last_log_id),
+        "control-plane-T0-N7-I0"
+    );
+    assert_ne!(
+        control_plane_raft_snapshot_id(snapshot.meta.last_log_id),
+        control_plane_raft_snapshot_id(empty_snapshot.meta.last_log_id)
+    );
     assert_eq!(
         snapshot.meta.last_membership.log_id(),
         &Some(raft_log_id(0, 7, 0))
@@ -2983,26 +2992,6 @@ fn control_plane_raft_state_machine_new_rejects_inconsistent_restart_state() {
     .unwrap_err();
     assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
 
-    let mut state_machine = ControlPlaneRaftStateMachine::new(
-        replicated_state_machine_with_noops(3, 1),
-        Some(raft_log_id(3, 7, 1)),
-        StoredMembership::default(),
-    )
-    .unwrap();
-    state_machine.build_snapshot().unwrap();
-    let mut artifact = state_machine.export_restart_artifact();
-    artifact
-        .current_snapshot
-        .as_mut()
-        .expect("tip snapshot should be exported")
-        .meta
-        .snapshot_id = "control-plane-wrong".to_string();
-    let err = ControlPlaneRaftStateMachine::from_restart_artifact(artifact).unwrap_err();
-    assert!(matches!(
-        err,
-        ControlPlaneError::CommandDecode { message }
-            if message.contains("cached OpenRaft snapshot id")
-    ));
 }
 
 #[test]
@@ -3276,7 +3265,10 @@ fn control_plane_raft_state_machine_builds_and_installs_snapshot() {
     let snapshot = source.build_snapshot().unwrap();
 
     assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(2, 7, 1)));
-    assert_eq!(snapshot.meta.snapshot_id, "control-plane-T2-N7-I1");
+    assert_eq!(
+        control_plane_raft_snapshot_id(snapshot.meta.last_log_id),
+        "control-plane-T2-N7-I1"
+    );
 
     let mut target = ControlPlaneRaftStateMachine::empty();
     target
@@ -3304,7 +3296,10 @@ fn control_plane_raft_snapshot_builder_returns_stable_snapshot_view() {
     let snapshot = ControlPlaneRaftTypeConfig::run(builder.build_snapshot()).unwrap();
 
     assert_eq!(snapshot.meta.last_log_id, Some(raft_log_id(2, 7, 1)));
-    assert_eq!(snapshot.meta.snapshot_id, "control-plane-T2-N7-I1");
+    assert_eq!(
+        control_plane_raft_snapshot_id(snapshot.meta.last_log_id),
+        "control-plane-T2-N7-I1"
+    );
     assert_eq!(state_machine.last_applied(), Some(raft_log_id(2, 7, 2)));
     assert_eq!(
         state_machine
@@ -3338,21 +3333,24 @@ fn control_plane_raft_snapshot_install_rejects_same_position_different_leader() 
 }
 
 #[test]
-fn control_plane_raft_snapshot_install_rejects_mismatched_snapshot_id() {
+fn control_plane_raft_snapshot_meta_decode_rejects_mismatched_legacy_snapshot_id() {
     let mut source = ControlPlaneRaftStateMachine::empty();
     source.apply_entry(blank_entry(2, 7, 1)).unwrap();
     let snapshot = source.build_snapshot().unwrap();
-    let mut bad_meta = snapshot.meta.clone();
-    bad_meta.snapshot_id = "control-plane-1".to_string();
+    let mut encoded = Vec::new();
+    write_raft_option_log_id(&mut encoded, snapshot.meta.last_log_id);
+    write_raft_stored_membership(&mut encoded, &snapshot.meta.last_membership).unwrap();
+    write_raft_string(&mut encoded, "control-plane-1").unwrap();
 
-    let mut target = ControlPlaneRaftStateMachine::empty();
-    let err = target
-        .install_snapshot(&bad_meta, snapshot.snapshot)
+    let err = RaftArtifactReader::new(&encoded)
+        .read_snapshot_meta()
         .unwrap_err();
 
-    assert!(matches!(err, ControlPlaneError::SnapshotDecode { .. }));
-    assert_eq!(target.last_applied(), None);
-    assert!(target.current_snapshot().is_none());
+    assert!(matches!(
+        err,
+        ControlPlaneError::CommandDecode { message }
+            if message.contains("snapshot id control-plane-1 does not match expected control-plane-T2-N7-I1")
+    ));
 }
 
 #[test]

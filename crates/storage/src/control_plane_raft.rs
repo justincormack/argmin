@@ -25,10 +25,11 @@ use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::BasicNode;
 use openraft::impls::Entry;
 use openraft::impls::Vote;
+use openraft::metrics::WaitError;
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
 use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, SnapshotResponse, TransferLeaderError,
-    TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
+    AppendEntriesRequest, AppendEntriesResponse, ClientWriteResponse, SnapshotResponse,
+    TransferLeaderError, TransferLeaderRequest, TransferLeaderResponse, VoteRequest, VoteResponse,
 };
 use openraft::storage::Snapshot;
 use openraft::storage::SnapshotMeta;
@@ -38,6 +39,7 @@ use openraft::type_config::alias::{
 };
 use openraft::type_config::TypeConfigExt;
 use openraft::EntryPayload;
+use openraft::Instant as _;
 use openraft::LogId;
 use openraft::Membership;
 use openraft::OptionalSend;
@@ -431,6 +433,18 @@ pub struct ControlPlaneRaftAuthority {
     durable_artifact_path: Option<Arc<PathBuf>>,
     checkpoint_metrics: Arc<ControlPlaneRaftCheckpointMetrics>,
     command_metrics: Arc<ControlPlaneRaftCommandMetrics>,
+    #[cfg(test)]
+    proposal_pause_after_confirmation: Mutex<Option<Duration>>,
+    #[cfg(test)]
+    proposal_lease_retry_count: AtomicUsize,
+    #[cfg(test)]
+    proposal_changed_tip_rejection_count: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+struct ControlPlaneRaftProposalAttempt {
+    leader_id: ControlPlaneRaftLeaderId,
+    last_log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2770,6 +2784,12 @@ impl ControlPlaneRaftAuthority {
             durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
+            #[cfg(test)]
+            proposal_pause_after_confirmation: Mutex::new(None),
+            #[cfg(test)]
+            proposal_lease_retry_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            proposal_changed_tip_rejection_count: AtomicUsize::new(0),
         }
     }
 
@@ -2801,6 +2821,12 @@ impl ControlPlaneRaftAuthority {
             durable_artifact_path: None,
             checkpoint_metrics: Arc::new(ControlPlaneRaftCheckpointMetrics::default()),
             command_metrics: Arc::new(ControlPlaneRaftCommandMetrics::default()),
+            #[cfg(test)]
+            proposal_pause_after_confirmation: Mutex::new(None),
+            #[cfg(test)]
+            proposal_lease_retry_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            proposal_changed_tip_rejection_count: AtomicUsize::new(0),
         }
     }
 
@@ -3074,11 +3100,30 @@ impl ControlPlaneRaftAuthority {
         self.reject_static_peer_reconfiguration("change-membership")?;
         let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
         let overlay_rebase = self.current_volatile_heartbeat_overlay().await?;
-        let response = self
-            .raft
-            .change_membership(voters, retain_removed_voters_as_learners)
-            .await
-            .map_err(|error| openraft_remote_error("change-membership", error))?;
+        let retry_deadline = self.writable_proposal_retry_deadline();
+        let response = loop {
+            let attempt = self.prepare_writable_proposal(retry_deadline).await?;
+            self.ensure_writable_proposal_time_remaining(
+                retry_deadline,
+                "change-membership dispatch",
+            )?;
+            match self
+                .raft
+                .change_membership(voters.clone(), retain_removed_voters_as_learners)
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) => {
+                    if self
+                        .writable_proposal_may_retry(&attempt, &error, retry_deadline)
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(openraft_client_write_error("change-membership", error));
+                }
+            }
+        };
         if let Some((authority_term, snapshot)) = overlay_rebase {
             self.publish_rebased_volatile_heartbeat_overlay(
                 authority_term,
@@ -3099,11 +3144,27 @@ impl ControlPlaneRaftAuthority {
         self.reject_static_peer_reconfiguration("add-learner")?;
         let _update_guard = self.volatile_heartbeat_update_gate.lock().await;
         let overlay_rebase = self.current_volatile_heartbeat_overlay().await?;
-        let response = self
-            .raft
-            .add_learner(node_id, node, wait_for_catch_up)
-            .await
-            .map_err(|error| openraft_remote_error("add-learner", error))?;
+        let retry_deadline = self.writable_proposal_retry_deadline();
+        let response = loop {
+            let attempt = self.prepare_writable_proposal(retry_deadline).await?;
+            self.ensure_writable_proposal_time_remaining(retry_deadline, "add-learner dispatch")?;
+            match self
+                .raft
+                .add_learner(node_id, node.clone(), wait_for_catch_up)
+                .await
+            {
+                Ok(response) => break response,
+                Err(error) => {
+                    if self
+                        .writable_proposal_may_retry(&attempt, &error, retry_deadline)
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(openraft_client_write_error("add-learner", error));
+                }
+            }
+        };
         if let Some((authority_term, snapshot)) = overlay_rebase {
             self.publish_rebased_volatile_heartbeat_overlay(
                 authority_term,
@@ -3753,6 +3814,276 @@ impl ControlPlaneRaftAuthority {
         Ok(status)
     }
 
+    /// Confirm alpha.33's proposal lease before handing a mutation to Raft.
+    ///
+    /// ReadIndex proves linearizable read authority but does not refresh the
+    /// quorum acknowledgement used by OpenRaft to admit writes. Avoid an extra
+    /// heartbeat while the lease has enough margin for dispatch; otherwise
+    /// force a heartbeat and wait for an acknowledgement sent after this
+    /// admission attempt began.
+    async fn confirm_writable_proposal_lease(
+        &self,
+        effective_voters: &BTreeSet<ControlPlaneRaftNodeId>,
+        retry_deadline: Instant,
+    ) -> Result<(), ControlPlaneError> {
+        if effective_voters.len() == 1 && effective_voters.contains(&self.node_id) {
+            return Ok(());
+        }
+
+        let leader =
+            self.raft
+                .as_leader()
+                .map_err(|error| ControlPlaneError::OpenRaftOperation {
+                    kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                    message: format!(
+                        "OpenRaft proposal-lease confirmation requires the local leader: {error}"
+                    ),
+                })?;
+        let election_timeout_max = self.raft.config().election_timeout_max;
+        let heartbeat_interval = self.raft.config().heartbeat_interval;
+        let leader_lease = Duration::from_millis(election_timeout_max);
+        let dispatch_margin = Duration::from_millis(heartbeat_interval.saturating_mul(2));
+        let maximum_accepted_age = leader_lease.saturating_sub(dispatch_margin);
+        if leader
+            .last_quorum_acked()
+            .is_some_and(|acked| acked.elapsed() <= maximum_accepted_age)
+        {
+            return Ok(());
+        }
+
+        let confirmation_started = ControlPlaneRaftTypeConfig::now();
+        let heartbeat_enqueue_timeout = self
+            .writable_proposal_time_remaining(retry_deadline, "proposal-lease heartbeat enqueue")?;
+        ControlPlaneRaftTypeConfig::timeout(
+            heartbeat_enqueue_timeout,
+            self.raft.trigger().heartbeat(),
+        )
+        .await
+        .map_err(|_| ControlPlaneError::OpenRaftOperation {
+            kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+            message: format!(
+                "OpenRaft proposal-lease heartbeat enqueue timed out after {heartbeat_enqueue_timeout:?}"
+            ),
+        })?
+        .map_err(|error| ControlPlaneError::OpenRaftOperation {
+            kind: ControlPlaneRaftOperationErrorKind::Fatal,
+            message: format!("OpenRaft proposal-lease heartbeat trigger failed: {error}"),
+        })?;
+        let remaining = self.writable_proposal_time_remaining(
+            retry_deadline,
+            "proposal-lease quorum acknowledgement",
+        )?;
+        let confirmation_timeout = Duration::from_millis(election_timeout_max).min(remaining);
+        self.raft
+            .wait(Some(confirmation_timeout))
+            .leader_with_quorum_acked(
+                Some(confirmation_started),
+                "control-plane proposal lease confirmation",
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                let kind = match error {
+                    WaitError::Timeout(_, _) => {
+                        ControlPlaneRaftOperationErrorKind::QuorumNotEnough
+                    }
+                    WaitError::ShuttingDown => ControlPlaneRaftOperationErrorKind::Fatal,
+                };
+                ControlPlaneError::OpenRaftOperation {
+                    kind,
+                    message: format!(
+                        "OpenRaft proposal lease was not confirmed before {confirmation_timeout:?}: {error}"
+                    ),
+                }
+            })
+    }
+
+    fn writable_proposal_retry_deadline(&self) -> Instant {
+        let election_timeout = Duration::from_millis(self.raft.config().election_timeout_max);
+        Instant::now() + Duration::from_secs(1).max(election_timeout.saturating_mul(2))
+    }
+
+    fn writable_proposal_time_remaining(
+        &self,
+        retry_deadline: Instant,
+        operation: &'static str,
+    ) -> Result<Duration, ControlPlaneError> {
+        let remaining = retry_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(ControlPlaneError::OpenRaftOperation {
+                kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                message: format!("OpenRaft {operation} deadline expired"),
+            });
+        }
+        Ok(remaining)
+    }
+
+    fn ensure_writable_proposal_time_remaining(
+        &self,
+        retry_deadline: Instant,
+        operation: &'static str,
+    ) -> Result<(), ControlPlaneError> {
+        self.writable_proposal_time_remaining(retry_deadline, operation)
+            .map(|_| ())
+    }
+
+    async fn writable_proposal_raft_state(
+        &self,
+        retry_deadline: Instant,
+    ) -> Result<
+        (
+            BTreeSet<ControlPlaneRaftNodeId>,
+            Option<LogIdOf<ControlPlaneRaftTypeConfig>>,
+        ),
+        ControlPlaneError,
+    > {
+        let timeout =
+            self.writable_proposal_time_remaining(retry_deadline, "proposal-state read")?;
+        ControlPlaneRaftTypeConfig::timeout(
+            timeout,
+            self.raft.with_raft_state(|state| {
+                let effective_voters = state
+                    .membership_state
+                    .effective()
+                    .membership()
+                    .voter_ids()
+                    .collect();
+                (effective_voters, state.log_ids.last().copied())
+            }),
+        )
+        .await
+        .map_err(|_| ControlPlaneError::OpenRaftOperation {
+            kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+            message: format!("OpenRaft proposal-state read timed out after {timeout:?}"),
+        })?
+        .map_err(|error| openraft_remote_error("proposal-state read", error))
+    }
+
+    async fn prepare_writable_proposal(
+        &self,
+        retry_deadline: Instant,
+    ) -> Result<ControlPlaneRaftProposalAttempt, ControlPlaneError> {
+        let (effective_voters, _) = self.writable_proposal_raft_state(retry_deadline).await?;
+        self.confirm_writable_proposal_lease(&effective_voters, retry_deadline)
+            .await?;
+        let leader_id = *self
+            .raft
+            .as_leader()
+            .map_err(|error| ControlPlaneError::OpenRaftOperation {
+                kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                message: format!(
+                    "OpenRaft proposal preparation requires the local leader: {error}"
+                ),
+            })?
+            .leader_id();
+        let (_, last_log_id) = self.writable_proposal_raft_state(retry_deadline).await?;
+
+        #[cfg(test)]
+        {
+            let delay = self
+                .proposal_pause_after_confirmation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            if let Some(delay) = delay {
+                ControlPlaneRaftTypeConfig::sleep(delay).await;
+            }
+        }
+
+        Ok(ControlPlaneRaftProposalAttempt {
+            leader_id,
+            last_log_id,
+        })
+    }
+
+    async fn writable_proposal_may_retry(
+        &self,
+        attempt: &ControlPlaneRaftProposalAttempt,
+        error: &RaftError<ControlPlaneRaftTypeConfig, ClientWriteError<ControlPlaneRaftTypeConfig>>,
+        retry_deadline: Instant,
+    ) -> Result<bool, ControlPlaneError> {
+        let lease_rejection = matches!(
+            error,
+            RaftError::APIError(ClientWriteError::ForwardToLeader(forward))
+                if forward.leader_id.is_none()
+        );
+        if !lease_rejection || Instant::now() >= retry_deadline {
+            return Ok(false);
+        }
+
+        // An empty ForwardToLeader is also used when OpenRaft rejects an
+        // expired proposal lease before append. It is not sufficient by
+        // itself: leadership loss after append can produce the same error.
+        // Retry only while the exact leader generation and local log tip from
+        // immediately before dispatch are unchanged. Any append, including a
+        // partial membership transition, makes the result ambiguous and is
+        // returned to the caller without automatic resubmission.
+        let Ok(leader) = self.raft.as_leader() else {
+            return Ok(false);
+        };
+        if leader.leader_id() != &attempt.leader_id {
+            return Ok(false);
+        }
+        let (_, last_log_id) = self.writable_proposal_raft_state(retry_deadline).await?;
+        if last_log_id != attempt.last_log_id {
+            #[cfg(test)]
+            self.proposal_changed_tip_rejection_count
+                .fetch_add(1, Ordering::Relaxed);
+            return Ok(false);
+        }
+
+        #[cfg(test)]
+        self.proposal_lease_retry_count
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    async fn submit_control_plane_command_with_proposal_retry(
+        &self,
+        command: ControlPlaneCommand,
+    ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
+        validate_control_plane_command_replication_size_detailed(&command)?;
+        let retry_deadline = self.writable_proposal_retry_deadline();
+        loop {
+            let attempt = self.prepare_writable_proposal(retry_deadline).await?;
+            self.ensure_writable_proposal_time_remaining(retry_deadline, "client-write dispatch")?;
+            match self.raft.client_write(command.clone()).await {
+                Ok(response) => return submitted_control_plane_command(response),
+                Err(error) => {
+                    if self
+                        .writable_proposal_may_retry(&attempt, &error, retry_deadline)
+                        .await?
+                    {
+                        continue;
+                    }
+                    return Err(openraft_client_write_error("client-write", error));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_next_proposal_after_lease_confirmation_for_test(&self, delay: Duration) {
+        *self
+            .proposal_pause_after_confirmation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(delay);
+        self.proposal_lease_retry_count.store(0, Ordering::Relaxed);
+        self.proposal_changed_tip_rejection_count
+            .store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn proposal_lease_retry_count_for_test(&self) -> usize {
+        self.proposal_lease_retry_count.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn proposal_changed_tip_rejection_count_for_test(&self) -> usize {
+        self.proposal_changed_tip_rejection_count
+            .load(Ordering::Relaxed)
+    }
+
     async fn submit_control_plane_command_locked(
         &self,
         mut command: ControlPlaneCommand,
@@ -3779,8 +4110,9 @@ impl ControlPlaneRaftAuthority {
                 let promoted_live = live_snapshot
                     .apply_control_plane_command(promotion.clone())?
                     .into_snapshot();
-                let submitted_promotion =
-                    submit_control_plane_command_via_openraft(&self.raft, promotion).await?;
+                let submitted_promotion = self
+                    .submit_control_plane_command_with_proposal_retry(promotion)
+                    .await?;
                 match submitted_promotion.into_outcome() {
                     ControlPlaneRaftCommandOutcome::Applied(
                         ControlPlaneCommandResponse::PromoteNodeHeartbeatLeases,
@@ -3821,7 +4153,9 @@ impl ControlPlaneRaftAuthority {
             })
             .transpose()?;
 
-        let submitted = submit_control_plane_command_via_openraft(&self.raft, command).await?;
+        let submitted = self
+            .submit_control_plane_command_with_proposal_retry(command)
+            .await?;
         if let Some((authority_term, previous_snapshot, applied_snapshot)) = overlay_rebase {
             let snapshot = match submitted.outcome() {
                 ControlPlaneRaftCommandOutcome::Applied(_) => applied_snapshot.ok_or_else(|| {
@@ -4966,15 +5300,9 @@ pub fn assert_openraft_type_config() {
     assert_config::<ControlPlaneRaftTypeConfig>();
 }
 
-pub async fn submit_control_plane_command_via_openraft(
-    raft: &Raft<ControlPlaneRaftTypeConfig, ControlPlaneRaftStateMachine>,
-    command: ControlPlaneCommand,
+fn submitted_control_plane_command(
+    response: ClientWriteResponse<ControlPlaneRaftTypeConfig>,
 ) -> Result<SubmittedControlPlaneRaftCommand, ControlPlaneError> {
-    validate_control_plane_command_replication_size_detailed(&command)?;
-    let response = raft
-        .client_write(command)
-        .await
-        .map_err(|error| openraft_client_write_error("client-write", error))?;
     let outcome = match response.data {
         ControlPlaneRaftApplyResponse::Applied(response) => {
             ControlPlaneRaftCommandOutcome::Applied(response)
@@ -5072,11 +5400,10 @@ async fn control_plane_runtime_map_status_via_openraft_read_index(
     let read_log_id = raft
         .ensure_linearizable(ReadPolicy::ReadIndex)
         .await
-        .map_err(|error| openraft_linearizable_read_error("runtime-map status read-index", error))?
-        .ok_or_else(|| ControlPlaneError::CommandDecode {
-            message: "OpenRaft runtime-map status read-index returned no applied log id"
-                .to_string(),
+        .map_err(|error| {
+            openraft_linearizable_read_error("runtime-map status read-index", error)
         })?;
+    let read_log_id = *read_log_id.log_id();
     let read_index = control_plane_log_id_from_raft(read_log_id).ok_or_else(|| {
         ControlPlaneError::CommandDecode {
             message: format!(
@@ -5093,7 +5420,7 @@ async fn control_plane_runtime_map_status_via_openraft_read_index(
                     last_applied: state_machine.inner().last_applied(),
                 });
             };
-            if last_applied.index() < read_log_id.index() {
+            if last_applied < read_log_id {
                 return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
                     read_index,
                     last_applied: state_machine.inner().last_applied(),
@@ -5148,10 +5475,8 @@ async fn control_plane_snapshot_via_openraft_read_index(
     let read_log_id = raft
         .ensure_linearizable(ReadPolicy::ReadIndex)
         .await
-        .map_err(|error| openraft_linearizable_read_error("read-index", error))?
-        .ok_or_else(|| ControlPlaneError::CommandDecode {
-            message: "OpenRaft read-index returned no applied log id".to_string(),
-        })?;
+        .map_err(|error| openraft_linearizable_read_error("read-index", error))?;
+    let read_log_id = *read_log_id.log_id();
     let read_index = control_plane_log_id_from_raft(read_log_id).ok_or_else(|| {
         ControlPlaneError::CommandDecode {
             message: format!("invalid OpenRaft read-index log id for runtime map: {read_log_id}"),
@@ -5166,7 +5491,7 @@ async fn control_plane_snapshot_via_openraft_read_index(
                     last_applied: state_machine.inner().last_applied(),
                 });
             };
-            if last_applied.index() < read_log_id.index() {
+            if last_applied < read_log_id {
                 return Err(ControlPlaneError::ControlPlaneReadIndexNotApplied {
                     read_index,
                     last_applied: state_machine.inner().last_applied(),
@@ -8262,8 +8587,23 @@ fn write_raft_snapshot_meta(
 ) -> Result<(), ControlPlaneError> {
     write_raft_option_log_id(out, meta.last_log_id);
     write_raft_stored_membership(out, &meta.last_membership)?;
-    write_raft_string(out, &meta.snapshot_id)?;
+    // Keep the removed OpenRaft snapshot-id field in Argmin's durable and peer
+    // formats so alpha.30 artifacts and mixed-version peers remain compatible.
+    // The value has always been derived from the covered log position.
+    write_raft_string(out, &control_plane_raft_snapshot_id(meta.last_log_id))?;
     Ok(())
+}
+
+fn control_plane_raft_snapshot_id(log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>) -> String {
+    match log_id {
+        Some(log_id) => format!(
+            "control-plane-T{}-N{}-I{}",
+            log_id.committed_leader_id().term,
+            log_id.committed_leader_id().node_id,
+            log_id.index()
+        ),
+        None => "control-plane-empty".to_string(),
+    }
 }
 
 fn write_raft_append_entries_request(
@@ -8843,10 +9183,15 @@ impl<'a> RaftArtifactReader<'a> {
         let last_log_id = self.read_option_log_id()?;
         let last_membership = self.read_stored_membership()?;
         let snapshot_id = self.read_string()?;
+        let expected_snapshot_id = control_plane_raft_snapshot_id(last_log_id);
+        if snapshot_id != expected_snapshot_id {
+            return Err(raft_artifact_protocol_error(format!(
+                "control-plane OpenRaft snapshot id {snapshot_id} does not match expected {expected_snapshot_id} for last_log_id {last_log_id:?}"
+            )));
+        }
         Ok(SnapshotMeta {
             last_log_id,
             last_membership,
-            snapshot_id,
         })
     }
 

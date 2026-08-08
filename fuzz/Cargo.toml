@@ -13,7 +13,7 @@ base64 = "0.22"
 libfuzzer-sys = "0.4"
 s3-types = { path = "../crates/s3-types" }
 serde_json = "1"
-server-http = { path = "../crates/server-http", default-features = false }
+server-http = { path = "../crates/server-http", default-features = false, features = ["ring"] }
 
 [[bin]]
 name = "auth_dates"

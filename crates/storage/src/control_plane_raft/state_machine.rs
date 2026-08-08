@@ -451,15 +451,6 @@ impl ControlPlaneRaftStateMachine {
             snapshot.meta.last_log_id,
             &snapshot.meta.last_membership,
         )?;
-        let expected_snapshot_id = Self::snapshot_id_for_log_id(snapshot.meta.last_log_id);
-        if snapshot.meta.snapshot_id != expected_snapshot_id {
-            return Err(ControlPlaneError::CommandDecode {
-                message: format!(
-                    "cached OpenRaft snapshot id {} does not match expected {} for last_log_id {:?}",
-                    snapshot.meta.snapshot_id, expected_snapshot_id, snapshot.meta.last_log_id
-                ),
-            });
-        }
         if !Self::snapshot_at_or_before(snapshot.meta.last_log_id, self.last_applied) {
             return Err(ControlPlaneError::CommandDecode {
                 message: format!(
@@ -786,20 +777,7 @@ impl ControlPlaneRaftStateMachine {
         Ok(SnapshotMeta {
             last_log_id,
             last_membership: last_membership.clone(),
-            snapshot_id: Self::snapshot_id_for_log_id(last_log_id),
         })
-    }
-
-    fn snapshot_id_for_log_id(log_id: Option<LogIdOf<ControlPlaneRaftTypeConfig>>) -> String {
-        match log_id {
-            Some(log_id) => format!(
-                "control-plane-T{}-N{}-I{}",
-                log_id.committed_leader_id().term,
-                log_id.committed_leader_id().node_id,
-                log_id.index()
-            ),
-            None => "control-plane-empty".to_string(),
-        }
     }
 
     fn validate_snapshot_meta(
@@ -813,15 +791,6 @@ impl ControlPlaneRaftStateMachine {
         };
         self.validate_snapshot_install_position(meta.last_log_id)?;
         Self::validate_snapshot_membership_position(meta.last_log_id, &meta.last_membership)?;
-        let expected_snapshot_id = Self::snapshot_id_for_log_id(meta.last_log_id);
-        if meta.snapshot_id != expected_snapshot_id {
-            return Err(ControlPlaneError::SnapshotDecode {
-                message: format!(
-                    "OpenRaft snapshot id {} does not match expected {} for last_log_id {:?}",
-                    meta.snapshot_id, expected_snapshot_id, meta.last_log_id
-                ),
-            });
-        }
         Ok(snapshot_log_id)
     }
 
@@ -1047,12 +1016,6 @@ impl RaftStateMachine<ControlPlaneRaftTypeConfig> for ControlPlaneRaftStateMachi
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.capture_snapshot_builder()
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<ControlPlaneRaftSnapshotData, io::Error> {
-        Ok(ControlPlaneRaftSnapshotData::new(Vec::new()))
     }
 
     async fn install_snapshot(

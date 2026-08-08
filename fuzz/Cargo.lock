@@ -36,6 +36,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "argmin-crypto"
+version = "0.1.0"
+dependencies = [
+ "md-5",
+ "ring",
+]
+
+[[package]]
 name = "argmin-fuzz"
 version = "0.0.0"
 dependencies = [
@@ -57,13 +65,15 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "auth"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "base64",
+ "checksum",
  "observability",
- "ring",
  "s3-types",
  "serde_json",
  "subtle",
  "thiserror",
+ "tls-provider",
 ]
 
 [[package]]
@@ -71,29 +81,6 @@ name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
-
-[[package]]
-name = "aws-lc-rs"
-version = "1.17.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "00bdb5da18dac48ca2cc7cd4a98e533e8635a58e2361d13a1a4ee3888e0d72f1"
-dependencies = [
- "aws-lc-sys",
- "zeroize",
-]
-
-[[package]]
-name = "aws-lc-sys"
-version = "0.43.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43103168cc76fe62678a375e722fc9cb3a0146159ac5828bc4f0dfd755c2224c"
-dependencies = [
- "cc",
- "cmake",
- "dunce",
- "fs_extra",
- "pkg-config",
-]
 
 [[package]]
 name = "backoff-series"
@@ -173,8 +160,7 @@ dependencies = [
 name = "checksum"
 version = "0.1.0"
 dependencies = [
- "md-5",
- "ring",
+ "argmin-crypto",
  "twox-hash",
 ]
 
@@ -213,15 +199,6 @@ dependencies = [
  "parse-zoneinfo",
  "phf",
  "phf_codegen",
-]
-
-[[package]]
-name = "cmake"
-version = "0.1.58"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
-dependencies = [
- "cc",
 ]
 
 [[package]]
@@ -302,12 +279,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dunce"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
-
-[[package]]
 name = "ec"
 version = "0.1.0"
 dependencies = [
@@ -344,12 +315,6 @@ name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
-
-[[package]]
-name = "fs_extra"
-version = "1.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "42703706b716c37f96a77aea830392ad231f44c9e9a67872fa5548707e11b11c"
 
 [[package]]
 name = "futures-channel"
@@ -673,9 +638,9 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7ee2febc2358d7d98a2ef862334faced350898361fb1c29cae4aef49f4935ab"
+checksum = "ba6e911fb3c97faeecb8324b803a37d77a7387d02ee7019fc2a9777569e7f7b8"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -699,22 +664,22 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09fb59121d90b48db847cc5c4df2ed0b1ef36d7693a63702ee721637f27c2875"
+checksum = "2a2293c918ef188cdbc39529a863612d39337b373f401089d01379e03fe23582"
 dependencies = [
  "chrono",
  "proc-macro2",
  "quote",
  "semver",
- "syn 2.0.119",
+ "syn 3.0.3",
 ]
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f547a950b78c2e0935857ea5d63e155c66998334442616c099b88fdde823b39a"
+checksum = "b12e93f23354250c4be864d8cdff42e6d0c5193d4a4e5987159550b624db8592"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -725,9 +690,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.30"
+version = "0.10.0-alpha.33"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7960a1ee0630bde5f0fdbfe883b0bd34fdab9d523eff99bfaa4d0da75ad430ab"
+checksum = "f331a3217fb29dfdfa5ffe01889565df225ff3747f9f1b8e42b4b3ba7b74c1f3"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -955,7 +920,6 @@ version = "0.23.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3c54fcab019b409d04215d3a17cb438fd7fbf192ee61461f20f4fe18704bc138"
 dependencies = [
- "aws-lc-rs",
  "log",
  "once_cell",
  "ring",
@@ -980,7 +944,6 @@ version = "0.103.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "61c429a8649f110dddef65e2a5ad240f747e85f7758a6bccc7e5777bd33f756e"
 dependencies = [
- "aws-lc-rs",
  "ring",
  "rustls-pki-types",
  "untrusted",
@@ -996,8 +959,8 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 name = "s3-types"
 version = "0.1.0"
 dependencies = [
+ "checksum",
  "quick-xml",
- "ring",
  "thiserror",
  "unicode-general-category",
 ]
@@ -1055,16 +1018,14 @@ dependencies = [
 name = "server-core"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "auth",
  "base64",
  "checksum",
  "ec",
  "observability",
- "rapidhash",
- "ring",
  "s3-types",
  "storage",
- "subtle",
  "thiserror",
 ]
 
@@ -1072,19 +1033,17 @@ dependencies = [
 name = "server-http"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "auth",
  "base64",
  "bytes",
  "checksum",
- "ec",
  "http",
  "http-body-util",
  "hyper",
  "hyper-util",
- "md-5",
  "observability",
  "quick-xml",
- "ring",
  "s3-types",
  "server-core",
  "storage",
@@ -1130,6 +1089,7 @@ dependencies = [
 name = "storage"
 version = "0.1.0"
 dependencies = [
+ "argmin-crypto",
  "checksum",
  "ec",
  "futures-util",
@@ -1138,11 +1098,11 @@ dependencies = [
  "openraft",
  "placement",
  "rapidhash",
- "ring",
  "rusqlite",
  "rustls",
  "s3-types",
  "thiserror",
+ "tls-provider",
  "tokio",
 ]
 
@@ -1192,6 +1152,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "tls-provider"
+version = "0.1.0"
+dependencies = [
+ "rustls",
 ]
 
 [[package]]

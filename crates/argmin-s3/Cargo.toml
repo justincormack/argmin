@@ -51,6 +51,6 @@ toml = "1.1"
 x509-cert = { version = "0.3", default-features = false }
 
 [dev-dependencies]
-openraft = { version = "=0.10.0-alpha.30", default-features = false }
+openraft = { version = "=0.10.0-alpha.33", default-features = false }
 storage = { path = "../storage", default-features = false, features = ["test-hooks"] }
 test-util = { path = "../test-util" }

@@ -616,6 +616,102 @@ fn control_plane_openraft_explicit_handles_manage_membership_and_leadership() {
             "explicit handles wait for transferred leader",
         )
         .await;
+        wait_for_authority_status_matching(
+            &authority2,
+            Duration::from_secs(1),
+            "explicit handles transferred leader serving before proposal lease expiry",
+            ControlPlaneRaftAuthorityStatus::linearized_authority_serving,
+        )
+        .await;
+        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(350)).await;
+        assert!(
+            authority2
+                .status()
+                .await
+                .unwrap()
+                .linearized_authority_serving(),
+            "serving status remains true after alpha.33's proposal lease expires"
+        );
+        authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
+            350,
+        ));
+        let post_expiry_write = expect_bounded_control_plane_raft(
+            authority2.submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(402),
+                availability: NodeAvailabilityState::Unavailable,
+            }),
+            operation_timeout,
+            "explicit handles write after proposal lease expiry",
+        )
+        .await;
+        assert!(matches!(
+            post_expiry_write.outcome(),
+            ControlPlaneRaftCommandOutcome::Applied(
+                ControlPlaneCommandResponse::MarkNodeAvailability
+            )
+        ));
+        assert_eq!(
+            authority2.proposal_lease_retry_count_for_test(),
+            1,
+            "ordinary proposal should safely retry after its confirmed lease expires before dispatch"
+        );
+
+        let before_expired_dispatch = authority2.status().await.unwrap().last_log_id();
+        authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
+            1_100,
+        ));
+        let expired_dispatch_error = expect_bounded_control_plane_raft_error(
+            authority2.submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {
+                node_id: NodeId::new(401),
+                availability: NodeAvailabilityState::Unavailable,
+            }),
+            operation_timeout,
+            "explicit handles reject proposal after overall reconfirmation deadline",
+        )
+        .await;
+        assert!(matches!(
+            expired_dispatch_error,
+            ControlPlaneError::OpenRaftOperation {
+                kind: ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+                ..
+            }
+        ));
+        assert_eq!(
+            authority2.status().await.unwrap().last_log_id(),
+            before_expired_dispatch,
+            "an expired pre-dispatch budget must not append the command"
+        );
+
+        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(350)).await;
+        authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
+            350,
+        ));
+        let learner_log_id = expect_bounded_control_plane_raft(
+            admin2.add_learner(403, BasicNode::new("node-403"), false),
+            operation_timeout,
+            "explicit handles add learner",
+        )
+        .await;
+        assert_eq!(
+            authority2.proposal_lease_retry_count_for_test(),
+            1,
+            "learner proposal should safely retry after its confirmed lease expires before dispatch"
+        );
+        expect_bounded_control_plane_raft(
+            lifecycle2.wait_for_applied_log_id(
+                learner_log_id,
+                Duration::from_secs(1),
+                "explicit handles applied learner addition",
+            ),
+            operation_timeout,
+            "explicit handles wait for learner addition",
+        )
+        .await;
+
+        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(350)).await;
+        authority2.pause_next_proposal_after_lease_confirmation_for_test(Duration::from_millis(
+            350,
+        ));
 
         let membership_log_id = expect_bounded_control_plane_raft(
             admin2.replace_voters(BTreeSet::from([402]), false),
@@ -623,6 +719,11 @@ fn control_plane_openraft_explicit_handles_manage_membership_and_leadership() {
             "explicit handles replace voters",
         )
         .await;
+        assert_eq!(
+            authority2.proposal_lease_retry_count_for_test(),
+            1,
+            "membership proposal should safely retry after its confirmed lease expires before dispatch"
+        );
         expect_bounded_control_plane_raft(
             lifecycle2.wait_for_applied_log_id(
                 membership_log_id,
@@ -658,6 +759,95 @@ fn control_plane_openraft_explicit_handles_manage_membership_and_leadership() {
             "explicit handles shutdown surviving voter",
         )
         .await;
+    });
+}
+
+#[test]
+fn control_plane_openraft_partial_membership_transition_is_not_retried() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let operation_timeout = Duration::from_secs(2);
+        let (authority1, authority2) = initialized_two_node_authorities(
+            "control-plane-raft-partial-membership-no-retry-test",
+            451,
+            452,
+        )
+        .await;
+        let before_log_id = authority1
+            .status()
+            .await
+            .unwrap()
+            .last_log_id()
+            .expect("initialized authority should have a log tip");
+
+        let apply_gate = Arc::new(ControlPlaneRaftStateMachineBlockingHook::default());
+        let apply_gate_for_state_machine = Arc::clone(&apply_gate);
+        authority1
+            .raft()
+            .with_state_machine(move |state_machine| {
+                state_machine.set_test_hooks(ControlPlaneRaftStateMachineTestHooks {
+                    apply: Some(apply_gate_for_state_machine),
+                    ..ControlPlaneRaftStateMachineTestHooks::default()
+                });
+                Box::pin(async {})
+            })
+            .await
+            .unwrap();
+
+        let apply_gate_watchdog = Arc::clone(&apply_gate);
+        let release_worker = thread::spawn(move || {
+            apply_gate_watchdog.wait_until_entered(Duration::from_secs(1));
+            thread::sleep(Duration::from_millis(350));
+            apply_gate_watchdog.release();
+        });
+        let error = expect_bounded_control_plane_raft_error(
+            authority1.replace_voters(BTreeSet::from([451]), false),
+            operation_timeout,
+            "partial membership transition rejects final entry after lease expiry",
+        )
+        .await;
+        release_worker.join().unwrap();
+        assert!(matches!(
+            error,
+            ControlPlaneError::OpenRaftOperation {
+                kind: ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+                ..
+            }
+        ));
+        assert_eq!(authority1.proposal_lease_retry_count_for_test(), 0);
+        assert_eq!(
+            authority1.proposal_changed_tip_rejection_count_for_test(),
+            1,
+            "the final-entry lease rejection should fail closed because the joint entry advanced the log"
+        );
+
+        let (last_log_id, effective_membership_log_id, joint_config) = authority1
+            .raft()
+            .with_raft_state(|state| {
+                let effective = state.membership_state.effective();
+                (
+                    state.log_ids.last().copied(),
+                    *effective.log_id(),
+                    effective.membership().get_joint_config().to_vec(),
+                )
+            })
+            .await
+            .unwrap();
+        let last_log_id = last_log_id.expect("joint membership entry should remain in the log");
+        assert_eq!(last_log_id.index(), before_log_id.index() + 1);
+        assert_eq!(effective_membership_log_id, Some(last_log_id));
+        assert_eq!(joint_config.len(), 2);
+        assert!(joint_config.contains(&BTreeSet::from([451, 452])));
+        assert!(joint_config.contains(&BTreeSet::from([451])));
+
+        ControlPlaneRaftTypeConfig::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            authority1.status().await.unwrap().last_log_id(),
+            Some(last_log_id),
+            "the wrapper must not submit a final or repeated membership entry after returning the ambiguous result"
+        );
+
+        authority1.shutdown().await.unwrap();
+        authority2.shutdown().await.unwrap();
     });
 }
 
@@ -1882,20 +2072,12 @@ fn control_plane_openraft_leader_transfer_fences_old_leader() {
             .replace_voters(BTreeSet::from([701]), false)
             .await
             .unwrap_err();
-        assert!(matches!(
-            old_leader_replace_voters_err,
-            ControlPlaneError::RpcRemote { diagnostic: message }
-                if message.contains("OpenRaft change-membership failed")
-        ));
+        assert!(old_leader_replace_voters_err.is_control_plane_leader_routing_rejection());
         let old_leader_add_learner_err = authority1
             .add_learner(703, BasicNode::new("node-703"), false)
             .await
             .unwrap_err();
-        assert!(matches!(
-            old_leader_add_learner_err,
-            ControlPlaneError::RpcRemote { diagnostic: message }
-                if message.contains("OpenRaft add-learner failed")
-        ));
+        assert!(old_leader_add_learner_err.is_control_plane_leader_routing_rejection());
 
         let follow_up = authority2
             .submit_control_plane_command(ControlPlaneCommand::MarkNodeAvailability {

@@ -1225,7 +1225,10 @@ fn control_plane_openraft_durable_single_node_restores_current_snapshot_cache() 
             restored_snapshot.meta.last_log_id,
             Some(raft_log_id(3, 1, 1))
         );
-        assert_eq!(restored_snapshot.meta.snapshot_id, "control-plane-T3-N1-I1");
+        assert_eq!(
+            control_plane_raft_snapshot_id(restored_snapshot.meta.last_log_id),
+            "control-plane-T3-N1-I1"
+        );
 
         authority.shutdown().await.unwrap();
     });
