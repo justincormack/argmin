@@ -435,8 +435,8 @@ pub(super) mod pg_store_facade {
         MetadataCommandCheckpointValidationError, MetadataCommandLogCompactionStatus,
         MetadataCommandLogStats, PgClusterMapHistoryReferenceSummary,
         PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
-        PgClusterMapHistoryRouteReferences, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
-        MAX_PG_DURABLE_IDENTITY_BYTES,
+        PgClusterMapHistoryRouteReferenceLimitError, PgClusterMapHistoryRouteReferences,
+        MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_PG_DURABLE_IDENTITY_BYTES,
     };
     pub(crate) use super::pg_store::{
         ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,

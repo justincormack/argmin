@@ -1799,7 +1799,7 @@ impl StorageCluster {
                                 .map_err(shard_io_error_to_store)?;
                             written.push((shard_key.clone(), ack));
                         }
-                        Ok(written)
+                        Ok::<_, StoreError>(written)
                     },
                 )?;
             backfilled.extend(reconstructed);
@@ -2097,7 +2097,7 @@ impl StorageCluster {
                         .map_err(shard_io_error_to_store)?;
                     repaired.push((shard_key.clone(), ack));
                 }
-                Ok(repaired)
+                Ok::<_, StoreError>(repaired)
             },
         )?;
         let repaired_acks: Vec<_> = repaired

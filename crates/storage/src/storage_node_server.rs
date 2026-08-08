@@ -26,7 +26,7 @@ use crate::control_plane_lease::{
     validate_process_lease_clock, BoundRouteMapLease, CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
 };
 use crate::data_dir::prepare_private_data_dir;
-use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError};
+use crate::error::{BucketSnapshotLoadError, MetadataError, StoreError, StoreFailure};
 use crate::metadata_command::{
     is_stream_create_bucket_write_operation_kind, validate_metadata_command_recovery_certificate,
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,

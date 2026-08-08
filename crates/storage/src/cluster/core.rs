@@ -1750,7 +1750,7 @@ impl ReleasedObjectPayloadLease {
         self.remaining
     }
 
-    pub fn payload_reclaim_exists(&self) -> Result<bool, ObjectPgActionError> {
+    pub(crate) fn payload_reclaim_exists(&self) -> Result<bool, ObjectPgActionError> {
         let Some(cluster) = self.cluster.upgrade() else {
             // The already-acquired lease has been released; if its original
             // cluster handle is gone, conservatively let the caller enqueue a

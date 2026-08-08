@@ -44,7 +44,7 @@ mod control_plane_service_client;
 pub(crate) mod data_dir;
 pub mod deadline_io;
 pub(crate) mod durable_journal;
-pub mod error;
+mod error;
 mod live_pg_transfer;
 mod maintenance;
 pub(crate) mod metadata_command;
@@ -151,16 +151,15 @@ pub use error::{
     BucketSnapshotLoadFailureKind, BucketWriteDrainFailure, BucketWriteDrainFailureKind,
     ClusterBuildError, DirectPutFailure, DirectPutFailureKind, LifecycleMaintenanceFailure,
     LifecycleMaintenanceFailureKind, LifecycleMutationFailure, LifecycleMutationFailureKind,
-    MetadataError, MultipartCompletionFailure, MultipartCompletionFailureKind,
-    MultipartManagementFailure, MultipartManagementFailureKind, ObjectMetadataListingFailure,
-    ObjectMetadataListingFailureKind, ObjectMetadataMutationFailure,
-    ObjectMetadataMutationFailureKind, ObjectPgActionError, ObjectReadFailure,
-    ObjectReadFailureKind, ShardIoError, StoreError, StoreFailure, StoreOperationFailureClass,
-    StreamUploadFailure, StreamUploadFailureKind,
+    MultipartCompletionFailure, MultipartCompletionFailureKind, MultipartManagementFailure,
+    MultipartManagementFailureKind, ObjectMetadataListingFailure, ObjectMetadataListingFailureKind,
+    ObjectMetadataMutationFailure, ObjectMetadataMutationFailureKind, ObjectReadFailure,
+    ObjectReadFailureKind, StoreFailure, StoreOperationFailureClass, StreamUploadFailure,
+    StreamUploadFailureKind,
 };
 pub(crate) use error::{
-    BucketSnapshotLoadError, BucketWriteDrainError, StorageNodeFailureClass,
-    StorageNodeFailureDetail,
+    BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError,
+    StorageNodeFailureClass, StorageNodeFailureDetail, StoreError,
 };
 pub use live_pg_transfer::{
     LivePgMetadataTransferAdmin, LivePgMetadataTransferControlPlaneClient,
@@ -3523,8 +3522,9 @@ pub use pg_store::{
     MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandCheckpointValidationError,
     MetadataCommandLogCompactionStatus, MetadataCommandLogStats,
     PgClusterMapHistoryReferenceSummary, PgClusterMapHistoryRouteReference,
-    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferences,
-    MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_PG_DURABLE_IDENTITY_BYTES,
+    PgClusterMapHistoryRouteReferenceKind, PgClusterMapHistoryRouteReferenceLimitError,
+    PgClusterMapHistoryRouteReferences, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
+    MAX_PG_DURABLE_IDENTITY_BYTES,
 };
 pub use pg_topology::PgTopology;
 pub use placement::NodeId;

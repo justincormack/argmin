@@ -245,7 +245,7 @@ impl StorageCluster {
             },
             Some(effect_fence),
             &mut require_valid_route,
-            &mut || Ok(()),
+            &mut || Ok::<(), StoreError>(()),
         )?;
 
         Ok(DirectPutWrittenSegment {

@@ -338,7 +338,7 @@ impl super::StorageCluster {
     }
 
     #[cfg(feature = "test-hooks")]
-    pub fn try_probe_object_pg_available(
+    pub(crate) fn try_probe_object_pg_available(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

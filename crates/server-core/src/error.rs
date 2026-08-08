@@ -1,6 +1,6 @@
 /// Unified error type for the server crate.
 use s3_types::VersionId;
-use storage::error::{
+use storage::{
     BucketListingFailure, BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure,
     LifecycleMaintenanceFailure, LifecycleMutationFailure, MultipartCompletionFailure,
     MultipartManagementFailure, ObjectMetadataListingFailure, ObjectMetadataMutationFailure,

@@ -4582,7 +4582,7 @@ fn cluster_map_history_route_references_fail_closed_at_collection_bound() {
     .unwrap_err();
     assert!(matches!(
         error,
-        StoreError::ClusterMapHistoryReferenceLimitExceeded {
+        PgClusterMapHistoryRouteReferenceLimitError {
             count,
             max: MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
         } if count == MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES + 1

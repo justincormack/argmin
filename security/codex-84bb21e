@@ -16,11 +16,8 @@ Fixed as of 2026-08-04 by the item 13 storage-boundary containment change.
 
 The earlier acceptance has been superseded. Raw storage RPC messages no longer
 enter HTTP 500 diagnostics, the flight recorder, panic-on-500, or abort-on-500
-output. Existing storage operation signatures still pass concrete `StoreError`
-values to designated `server-core` translation adapters; this resolution does
-not claim that representation transit has been eliminated. Those adapters do
-not match or render the concrete error. Storage classifies every local, nested
-shard, and RPC failure exhaustively through two independent bounded values:
+output. Storage classifies every local, nested shard, and RPC failure
+exhaustively through two independent bounded values:
 
 - `StoreOperationFailureClass` carries only the semantic information required
   for request outcome and retry policy.
@@ -31,16 +28,18 @@ shard, and RPC failure exhaustively through two independent bounded values:
 The operator label contains no bucket or object name, node/PG/epoch identity,
 path, database text, RPC operation, remote message, or nested cause. Public
 `StoreFailure` formatting is bounded, its `Display` is generic, and
-`Error::source()` is deliberately empty. Exported `BucketWriteDrainError`,
-`BucketSnapshotLoadError`, and `ObjectPgActionError` values can be observed
-before conversion to `StoreFailure`; all three now expose only bounded
-storage-owned labels through public formatting and expose no nested error
-source. The bucket-drain failure flight record emits that label rather than
-formatting its wrapper. Owner-local and cross-crate flight-recorder regressions
-verify that the categories remain useful while sensitive implementation text
-is absent; the cross-crate boundary checker rejects renewed production policy
-matching or raw diagnostic formatting. Full removal of concrete errors from
-public operation signatures remains separate structural-containment work.
+`Error::source()` is deliberately empty. The bucket-drain failure flight record
+emits the bounded label rather than formatting its owner-local wrapper.
+Owner-local and cross-crate flight-recorder regressions verify that the
+categories remain useful while sensitive implementation text is absent.
+
+The subsequent item 14 structural-containment work completed on 2026-08-08.
+`StoreError`, `MetadataError`, `ObjectPgActionError`, `ShardIoError`, and the
+module defining them are now crate-private. Public startup wrappers consume
+concrete causes into `StoreFailure`, and all other public operations return
+logical or bounded opaque failures. The boundary checker pins those private
+declarations and removed exports and rejects renewed concrete-error use outside
+storage.
 
 # Summary
 Introduced: the commit propagates raw storage RPC diagnostic messages into HTTP 500 diagnostics and emits them to server-side observability sinks without redacting or hashing sensitive request-derived fields.

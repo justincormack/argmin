@@ -1,5 +1,5 @@
 impl super::StorageCluster {
-    pub fn payload_reclaim_exists(
+    pub(crate) fn payload_reclaim_exists(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

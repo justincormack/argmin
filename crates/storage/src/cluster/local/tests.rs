@@ -133,15 +133,9 @@ fn local_cluster_rejects_existing_writable_node_data_dir() {
         .expect_err("world-writable node dir must fail");
 
     assert!(matches!(
-        err,
-        ClusterBuildError::OpenLocalNode {
-            source:
-                StoreError::Io {
-                    source,
-                    ..
-                },
-            ..
-        } if source.kind() == std::io::ErrorKind::PermissionDenied
+        err.open_local_node_store_error(),
+        Some((_, StoreError::Io { source, .. }))
+            if source.kind() == std::io::ErrorKind::PermissionDenied
     ));
     let _ = std::fs::set_permissions(&node_dir, std::fs::Permissions::from_mode(0o700));
 }

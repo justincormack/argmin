@@ -1924,7 +1924,7 @@ impl ShardKey {
     }
 
     /// Parse a shard key from a byte slice.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, StoreError> {
         if bytes.len() != SHARD_KEY_LEN {
             return Err(StoreError::InvalidKeyLength {
                 len: bytes.len(),
@@ -1973,7 +1973,7 @@ impl ShardKey {
     }
 
     /// Parse a shard key from its fixed-width lowercase or uppercase hex form.
-    pub fn from_hex(hex: &str) -> Result<Self, StoreError> {
+    pub(crate) fn from_hex(hex: &str) -> Result<Self, StoreError> {
         if hex.len() != SHARD_KEY_HEX_LEN {
             return Err(StoreError::InvalidShardKeyHex);
         }

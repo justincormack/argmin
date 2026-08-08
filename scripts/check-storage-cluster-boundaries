@@ -4502,6 +4502,68 @@ fail_with_matches \
     "Concrete storage implementation errors must not cross into another crate, including through test hooks or generic ServerError adapters" \
     "$cross_crate_raw_storage_error_transit"
 
+scan_raw_storage_error_public_surface() {
+    local source_root=$1
+
+    rg -n -U --color=never --pcre2 \
+        -e '^[\t ]*pub[\t ]+mod[\t ]+error[\t ]*;' \
+        -e '^[\t ]*pub[\t ]+(?:enum|struct|type)[\t ]+(?:StoreError|MetadataError|ObjectPgActionError|ShardIoError)\b' \
+        -e '^[\t ]*pub[\t ]+use[\t ]+error::\{(?s:[^}]{0,2400})\b(?:StoreError|MetadataError|ObjectPgActionError|ShardIoError)\b' \
+        -e '^[\t ]*pub[\t ]+use[^;]{0,600}\b(?:StoreError|MetadataError|ObjectPgActionError|ShardIoError)\b' \
+        -e 'OpenLocalNode[\t ]*\{(?s:[^}]{0,500})\bStoreError\b' \
+        -e 'StorageNodeServerError(?s:.{0,2400})\bStore[\t ]*\([^)]*\bStoreError\b' \
+        "$source_root" \
+        -g '*.rs' \
+        || true
+}
+
+raw_storage_error_public_surface=$(
+    {
+        scan_raw_storage_error_public_surface crates/storage/src
+        if ! rg -q '^[[:space:]]*mod[[:space:]]+error;' crates/storage/src/lib.rs; then
+            printf '%s\n' 'crates/storage/src/lib.rs: storage error module must remain private'
+        fi
+        for error_type in StoreError MetadataError ObjectPgActionError ShardIoError; do
+            if ! rg -q \
+                "^[[:space:]]*pub\\(crate\\)[[:space:]]+enum[[:space:]]+${error_type}\\b" \
+                crates/storage/src/error.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/error.rs: ${error_type} must remain crate-private"
+            fi
+        done
+        if ! rg -q -U \
+            'OpenLocalNode[[:space:]]*\{(?s:[^}]{0,300})failure:[[:space:]]*StoreFailure' \
+            crates/storage/src/error.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/error.rs: ClusterBuildError::OpenLocalNode must contain only StoreFailure'
+        fi
+        if ! rg -q -U \
+            'failed to open storage node(?s:.{0,200})Store\(StoreFailure\)' \
+            crates/storage/src/storage_node_server/config.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/storage_node_server/config.rs: StorageNodeServerError::Store must contain only StoreFailure'
+        fi
+    }
+)
+fail_with_matches \
+    "Storage implementation errors and their module must remain crate-private; public startup wrappers may retain only bounded StoreFailure values" \
+    "$raw_storage_error_public_surface"
+
+raw_storage_error_public_surface_fixture=$(
+    scan_raw_storage_error_public_surface \
+        scripts/fixtures/storage-boundary-private-errors
+)
+raw_storage_error_public_surface_fixture_failure=""
+if [[ -z "$raw_storage_error_public_surface_fixture" ]]; then
+    raw_storage_error_public_surface_fixture_failure="fixture scan returned no matches"
+fi
+fail_with_matches \
+    "Raw storage-error public-surface scan must reject the negative fixture" \
+    "$raw_storage_error_public_surface_fixture_failure"
+
 raw_payload_shard_write_public_surface=$(
     {
         rg -n --color=never \

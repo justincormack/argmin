@@ -230,10 +230,26 @@ pub struct PgClusterMapHistoryRouteReferences {
     references: BTreeSet<PgClusterMapHistoryRouteReference>,
 }
 
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+#[error("cluster-map history route reference count {count} exceeds maximum {max}")]
+pub struct PgClusterMapHistoryRouteReferenceLimitError {
+    pub(crate) count: usize,
+    pub(crate) max: usize,
+}
+
+impl From<PgClusterMapHistoryRouteReferenceLimitError> for StoreError {
+    fn from(error: PgClusterMapHistoryRouteReferenceLimitError) -> Self {
+        Self::ClusterMapHistoryReferenceLimitExceeded {
+            count: error.count,
+            max: error.max,
+        }
+    }
+}
+
 impl PgClusterMapHistoryRouteReferences {
     pub fn try_from_iter(
         references: impl IntoIterator<Item = PgClusterMapHistoryRouteReference>,
-    ) -> Result<Self, StoreError> {
+    ) -> Result<Self, PgClusterMapHistoryRouteReferenceLimitError> {
         let mut result = Self::default();
         result.extend(references)?;
         Ok(result)
@@ -242,13 +258,13 @@ impl PgClusterMapHistoryRouteReferences {
     pub fn insert(
         &mut self,
         reference: PgClusterMapHistoryRouteReference,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), PgClusterMapHistoryRouteReferenceLimitError> {
         if self.references.contains(&reference) {
             return Ok(());
         }
         let count = self.references.len() + 1;
         if count > MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES {
-            return Err(StoreError::ClusterMapHistoryReferenceLimitExceeded {
+            return Err(PgClusterMapHistoryRouteReferenceLimitError {
                 count,
                 max: MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
             });
@@ -260,14 +276,17 @@ impl PgClusterMapHistoryRouteReferences {
     pub fn extend(
         &mut self,
         references: impl IntoIterator<Item = PgClusterMapHistoryRouteReference>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), PgClusterMapHistoryRouteReferenceLimitError> {
         for reference in references {
             self.insert(reference)?;
         }
         Ok(())
     }
 
-    pub fn merge(&mut self, other: Self) -> Result<(), StoreError> {
+    pub fn merge(
+        &mut self,
+        other: Self,
+    ) -> Result<(), PgClusterMapHistoryRouteReferenceLimitError> {
         self.extend(other.references)
     }
 

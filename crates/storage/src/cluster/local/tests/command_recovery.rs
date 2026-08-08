@@ -8730,7 +8730,17 @@ fn local_cluster_reopen_rejects_future_epoch_pending_slot() {
 
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
-        format!("{err:?}").contains("MetadataCommandLogConflict"),
+        matches!(
+            err.open_local_node_store_error(),
+            Some((
+                node_id,
+                StoreError::MetadataCommandLogConflict {
+                    pg_id: 1,
+                    cluster_epoch,
+                    ..
+                }
+            )) if node_id == primary_node_id.as_u32() && *cluster_epoch == future_epoch
+        ),
         "future-epoch pending slot should fail closed, got {err:?}"
     );
 }

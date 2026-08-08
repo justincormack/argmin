@@ -3635,8 +3635,8 @@
         let error = bind_error(config);
         assert!(
             matches!(
-                error,
-                StorageNodeServerError::Store(StoreError::MetadataStateDigestMismatch {
+                error.retained_store_error(),
+                Some(StoreError::MetadataStateDigestMismatch {
                     node_id: 7,
                     pg_id: 0,
                     ..
@@ -3644,6 +3644,31 @@
             ),
             "bind should fail closed on corrupted metadata state digest: {error:?}"
         );
+    }
+
+    #[test]
+    fn storage_node_server_store_error_reduces_diagnostics() {
+        const SECRET_CONTEXT: &str = "secret storage-node open operation";
+        const SECRET_SOURCE: &str = "secret storage-node open source";
+        let error = StorageNodeServerError::from(StoreError::Io {
+            context: SECRET_CONTEXT,
+            source: std::io::Error::other(SECRET_SOURCE),
+        });
+
+        assert_eq!(
+            error.to_string(),
+            "failed to open storage node: storage operation failed"
+        );
+        let debug = format!("{error:?}");
+        for secret in [SECRET_CONTEXT, SECRET_SOURCE] {
+            assert!(!debug.contains(secret), "debug leaked {secret}: {debug}");
+        }
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(matches!(
+            error.retained_store_error(),
+            Some(StoreError::Io { context: SECRET_CONTEXT, source })
+                if source.to_string() == SECRET_SOURCE
+        ));
     }
 
     #[test]

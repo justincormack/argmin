@@ -1702,7 +1702,7 @@ pub enum StorageNodeServerError {
     #[error("storage-node incarnation counter overflowed in {path:?}")]
     NodeIncarnationOverflow { path: PathBuf },
     #[error("failed to open storage node: {0}")]
-    Store(#[from] StoreError),
+    Store(StoreFailure),
     #[error("storage RPC stream error: {message}")]
     RpcStream { message: String },
     #[error("storage RPC response payload error: {message}")]
@@ -1711,6 +1711,22 @@ pub enum StorageNodeServerError {
     TooManyActiveSessions { limit: usize },
     #[error("control-plane heartbeat failed: {0}")]
     ControlPlane(#[from] ControlPlaneError),
+}
+
+impl From<StoreError> for StorageNodeServerError {
+    fn from(error: StoreError) -> Self {
+        Self::Store(error.into())
+    }
+}
+
+#[cfg(test)]
+impl StorageNodeServerError {
+    fn retained_store_error(&self) -> Option<&StoreError> {
+        match self {
+            Self::Store(failure) => failure.retained_store_error(),
+            _ => None,
+        }
+    }
 }
 
 pub fn validate_storage_node_process_configs(

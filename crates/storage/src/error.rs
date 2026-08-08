@@ -123,6 +123,8 @@ impl StoreFailureDiagnosticCategory {
 pub struct StoreFailure {
     class: StoreOperationFailureClass,
     diagnostic_category: StoreFailureDiagnosticCategory,
+    #[cfg(test)]
+    retained_error: Option<Box<StoreError>>,
 }
 
 impl StoreFailure {
@@ -136,6 +138,24 @@ impl StoreFailure {
         self.diagnostic_category.cause_label()
     }
 
+    #[cfg(test)]
+    pub(crate) fn retained_store_error(&self) -> Option<&StoreError> {
+        self.retained_error.as_deref()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    const fn from_categories(
+        class: StoreOperationFailureClass,
+        diagnostic_category: StoreFailureDiagnosticCategory,
+    ) -> Self {
+        Self {
+            class,
+            diagnostic_category,
+            #[cfg(test)]
+            retained_error: None,
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn from_metadata(error: MetadataError) -> Self {
         match error {
@@ -144,18 +164,17 @@ impl StoreFailure {
             | MetadataError::ObjectGenerationReservationConflict { .. }
             | MetadataError::ObjectVersionReservationConflict { .. }
             | MetadataError::StaleBucketMetadataCommand { .. }
-            | MetadataError::StaleObjectWriteCommand { .. } => Self {
-                class: StoreOperationFailureClass::MetadataCommandContention,
-                diagnostic_category: StoreFailureDiagnosticCategory::MetadataContention,
-            },
+            | MetadataError::StaleObjectWriteCommand { .. } => Self::from_categories(
+                StoreOperationFailureClass::MetadataCommandContention,
+                StoreFailureDiagnosticCategory::MetadataContention,
+            ),
             MetadataError::RouteEffectRejected { source } => source.into(),
-            MetadataError::Db { .. } => Self {
-                class: StoreOperationFailureClass::Other,
-                diagnostic_category: StoreFailureDiagnosticCategory::Database,
-            },
+            MetadataError::Db { .. } => Self::from_categories(
+                StoreOperationFailureClass::Other,
+                StoreFailureDiagnosticCategory::Database,
+            ),
             MetadataError::BucketNotFound { .. }
             | MetadataError::InvalidBucketName { .. }
-            | MetadataError::InvalidObjectKey { .. }
             | MetadataError::BucketAlreadyExists
             | MetadataError::BucketNotEmpty
             | MetadataError::BucketNotFinalizedForDelete { .. }
@@ -174,20 +193,23 @@ impl StoreFailure {
             | MetadataError::StreamSessionNotInProgress { .. }
             | MetadataError::StreamSegmentConflict { .. }
             | MetadataError::ObjectGenerationReservationNotFound { .. }
-            | MetadataError::NotImplemented { .. }
-            | MetadataError::InvariantViolation { .. } => Self {
-                class: StoreOperationFailureClass::Other,
-                diagnostic_category: StoreFailureDiagnosticCategory::InternalInvariant,
-            },
+            | MetadataError::InvariantViolation { .. } => Self::from_categories(
+                StoreOperationFailureClass::Other,
+                StoreFailureDiagnosticCategory::InternalInvariant,
+            ),
         }
     }
 }
 
 impl From<StoreError> for StoreFailure {
     fn from(error: StoreError) -> Self {
+        let class = error.operation_failure_class();
+        let diagnostic_category = error.failure_diagnostic_category();
         Self {
-            class: error.operation_failure_class(),
-            diagnostic_category: error.failure_diagnostic_category(),
+            class,
+            diagnostic_category,
+            #[cfg(test)]
+            retained_error: Some(Box::new(error)),
         }
     }
 }
@@ -247,7 +269,7 @@ impl std::fmt::Display for StorageNodeFailureDetail {
 
 /// Shard-level storage errors.
 #[derive(Debug, thiserror::Error)]
-pub enum StoreError {
+pub(crate) enum StoreError {
     #[error("shard not found")]
     NotFound,
 
@@ -369,6 +391,10 @@ pub enum StoreError {
 
     #[error(
         "metadata-primary bridge for local node {metadata_node_id} has operation epoch {operation_epoch}, current cluster epoch is {current_epoch}"
+    )]
+    #[cfg_attr(
+        not(any(test, feature = "test-hooks")),
+        expect(dead_code, reason = "the metadata-primary bridge is test support")
     )]
     StaleMetadataPrimaryBridge {
         metadata_node_id: u32,
@@ -932,22 +958,12 @@ impl StoreError {
     /// Construct the semantic resource-exhaustion state without exposing a
     /// remote storage-node diagnostic.
     #[must_use]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn storage_node_resource_exhausted(node_id: u32, operation: &'static str) -> Self {
         Self::StorageRpcResourceExhausted {
             node_id,
             operation,
             detail: StorageNodeFailureDetail::new("semantic resource exhaustion"),
-        }
-    }
-
-    /// Construct the semantic shard-deletion state without exposing a remote
-    /// storage-node diagnostic.
-    #[must_use]
-    pub fn storage_node_shard_delete_in_progress(node_id: u32, operation: &'static str) -> Self {
-        Self::StorageRpcShardDeleteInProgress {
-            node_id,
-            operation,
-            detail: StorageNodeFailureDetail::new("semantic shard deletion in progress"),
         }
     }
 
@@ -1116,7 +1132,7 @@ impl StoreError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ShardIoError {
+pub(crate) enum ShardIoError {
     #[error(
         "shard operation for local node {node_id} PG {pg_id} has epoch {operation_epoch}, current cluster epoch is {current_epoch}"
     )]
@@ -1518,25 +1534,37 @@ pub enum ClusterBuildError {
         data_dir: PathBuf,
     },
 
-    #[error("failed to open local node {node_id}: {source}")]
-    OpenLocalNode {
-        node_id: u32,
-        #[source]
-        source: StoreError,
-    },
+    #[error("failed to open local node {node_id}: {failure}")]
+    OpenLocalNode { node_id: u32, failure: StoreFailure },
+}
+
+impl ClusterBuildError {
+    pub(crate) fn open_local_node(node_id: u32, error: StoreError) -> Self {
+        Self::OpenLocalNode {
+            node_id,
+            failure: error.into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_local_node_store_error(&self) -> Option<(u32, &StoreError)> {
+        match self {
+            Self::OpenLocalNode { node_id, failure } => failure
+                .retained_store_error()
+                .map(|error| (*node_id, error)),
+            _ => None,
+        }
+    }
 }
 
 /// Metadata-level errors (object records, bucket operations).
 #[derive(Debug, thiserror::Error)]
-pub enum MetadataError {
+pub(crate) enum MetadataError {
     #[error("bucket not found: {name}")]
     BucketNotFound { name: crate::types::BucketName },
 
     #[error("invalid bucket name: {reason}")]
     InvalidBucketName { reason: String },
-
-    #[error("invalid object key: {reason}")]
-    InvalidObjectKey { reason: String },
 
     #[error("bucket already exists")]
     BucketAlreadyExists,
@@ -1590,6 +1618,10 @@ pub enum MetadataError {
     NoSuchUpload { upload_id: String },
 
     #[error("upload not in InProgress state (current: {state})")]
+    #[cfg_attr(
+        not(any(test, feature = "test-hooks")),
+        expect(dead_code, reason = "direct upload-state mutation is test support")
+    )]
     UploadNotInProgress { state: u8 },
 
     #[error("multipart part not found: upload={upload_id} part={part_number}")]
@@ -1636,9 +1668,6 @@ pub enum MetadataError {
         generation_id: Option<u64>,
     },
 
-    #[error("not implemented: {context}")]
-    NotImplemented { context: &'static str },
-
     #[error("metadata invariant violation during {context}: {reason}")]
     InvariantViolation {
         context: &'static str,
@@ -1669,7 +1698,6 @@ impl MetadataError {
             | Self::StaleObjectWriteCommand { .. } => true,
             Self::BucketNotFound { .. }
             | Self::InvalidBucketName { .. }
-            | Self::InvalidObjectKey { .. }
             | Self::BucketAlreadyExists
             | Self::BucketNotEmpty
             | Self::BucketNotFinalizedForDelete { .. }
@@ -1689,7 +1717,6 @@ impl MetadataError {
             | Self::StreamSessionNotInProgress { .. }
             | Self::StreamSegmentConflict { .. }
             | Self::ObjectGenerationReservationNotFound { .. }
-            | Self::NotImplemented { .. }
             | Self::InvariantViolation { .. }
             | Self::Db { .. } => false,
         }
@@ -1868,7 +1895,6 @@ impl MetadataFailureDiagnosticCategory {
             MetadataError::Db { .. } => Self::Database,
             MetadataError::BucketNotFound { .. }
             | MetadataError::InvalidBucketName { .. }
-            | MetadataError::InvalidObjectKey { .. }
             | MetadataError::BucketAlreadyExists
             | MetadataError::BucketNotEmpty
             | MetadataError::BucketNotFinalizedForDelete { .. }
@@ -1886,7 +1912,6 @@ impl MetadataFailureDiagnosticCategory {
             | MetadataError::StreamSessionNotInProgress { .. }
             | MetadataError::StreamSegmentConflict { .. }
             | MetadataError::ObjectGenerationReservationNotFound { .. }
-            | MetadataError::NotImplemented { .. }
             | MetadataError::InvariantViolation { .. } => Self::Other,
         }
     }
@@ -2211,7 +2236,7 @@ impl std::fmt::Display for BucketWriteDrainFailure {
 
 impl std::error::Error for BucketWriteDrainFailure {}
 
-pub enum ObjectPgActionError {
+pub(crate) enum ObjectPgActionError {
     Store(StoreError),
     Metadata(MetadataError),
     InvalidRequest { reason: String },
@@ -2241,7 +2266,8 @@ impl ObjectPgActionError {
     /// Report whether the underlying object-PG operation encountered metadata
     /// command contention without exposing its storage representation.
     #[must_use]
-    pub fn is_metadata_command_contention(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_metadata_command_contention(&self) -> bool {
         match self {
             Self::Store(error) => {
                 error.operation_failure_class()
@@ -3752,6 +3778,34 @@ mod tests {
             "storage-node repair read payload shard on node 0 exhausted resources: \
              storage-node diagnostic redacted"
         );
+    }
+
+    #[test]
+    fn cluster_build_open_local_node_error_reduces_store_diagnostics() {
+        const SECRET_CONTEXT: &str = "secret local-node open operation";
+        const SECRET_SOURCE: &str = "secret local-node open source";
+        let error = ClusterBuildError::open_local_node(
+            7,
+            StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            },
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "failed to open local node 7: storage operation failed"
+        );
+        let debug = format!("{error:?}");
+        for secret in [SECRET_CONTEXT, SECRET_SOURCE] {
+            assert!(!debug.contains(secret), "debug leaked {secret}: {debug}");
+        }
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(matches!(
+            error.open_local_node_store_error(),
+            Some((7, StoreError::Io { context: SECRET_CONTEXT, source }))
+                if source.to_string() == SECRET_SOURCE
+        ));
     }
 
     #[test]

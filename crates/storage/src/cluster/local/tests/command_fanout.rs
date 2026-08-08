@@ -1636,11 +1636,8 @@ fn local_cluster_reopen_rejects_large_command_stream_materialized_tamper() {
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
         matches!(
-            err,
-            ClusterBuildError::OpenLocalNode {
-                node_id: 0,
-                source: StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
-            }
+            err.open_local_node_store_error(),
+            Some((0, StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }))
         ),
         "unexpected reopen error: {err:?}"
     );

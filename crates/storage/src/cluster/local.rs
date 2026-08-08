@@ -1953,10 +1953,7 @@ impl LocalClusterMap {
         for node_id in ordered_node_ids {
             let node_store =
                 LocalNodeStore::topology_only(node_id, &storage_pg_ids, default_ec_shape).map_err(
-                    |source| ClusterBuildError::OpenLocalNode {
-                        node_id: node_id.as_u32(),
-                        source,
-                    },
+                    |source| ClusterBuildError::open_local_node(node_id.as_u32(), source),
                 )?;
             nodes.insert(node_id, node_store);
         }
@@ -2044,10 +2041,7 @@ impl LocalClusterMap {
         for node_id in ordered_node_ids {
             let node_store =
                 LocalNodeStore::topology_only(node_id, &storage_pg_ids, default_ec_shape).map_err(
-                    |source| ClusterBuildError::OpenLocalNode {
-                        node_id: node_id.as_u32(),
-                        source,
-                    },
+                    |source| ClusterBuildError::open_local_node(node_id.as_u32(), source),
                 )?;
             nodes.insert(node_id, node_store);
         }
@@ -2278,10 +2272,7 @@ impl LocalClusterMap {
                 default_ec_shape,
                 cluster_epoch,
             )
-            .map_err(|source| ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            })?;
+            .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
             nodes.insert(
                 node_id,
                 LocalNodeStore::new(node_id, canonical_data_dir, runtime),
@@ -2299,9 +2290,8 @@ impl LocalClusterMap {
                 store
                     .runtime()
                     .prepare_metadata_command_recovery(*node_id)
-                    .map_err(|source| ClusterBuildError::OpenLocalNode {
-                        node_id: node_id.as_u32(),
-                        source,
+                    .map_err(|source| {
+                        ClusterBuildError::open_local_node(node_id.as_u32(), source)
                     })?;
             }
         }
@@ -2318,9 +2308,8 @@ impl LocalClusterMap {
                 store
                     .runtime()
                     .recover_metadata_command_state(*node_id)
-                    .map_err(|source| ClusterBuildError::OpenLocalNode {
-                        node_id: node_id.as_u32(),
-                        source,
+                    .map_err(|source| {
+                        ClusterBuildError::open_local_node(node_id.as_u32(), source)
                     })?;
             }
         }
@@ -2631,7 +2620,8 @@ impl LocalClusterMap {
         self.route_map_validity().is_valid_at(now_ms)
     }
 
-    pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
+    #[cfg(test)]
+    pub(crate) fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
         match self.route_map_valid_until_ms() {
             Some(valid_until_ms) if valid_until_ms <= now_ms => Err(StoreError::RouteMapExpired {
                 cluster_epoch: self.epoch,
@@ -5253,36 +5243,27 @@ fn validate_metadata_command_replay_state(
             let peering_route = node
                 .metadata_command_peering_client()
                 .open_metadata_command_peering_route(pg_id, cluster_epoch)
-                .map_err(|source| ClusterBuildError::OpenLocalNode {
-                    node_id: node_id.as_u32(),
-                    source,
-                })?;
+                .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
             let state = if node_id == primary_node_id {
                 peering_route.validate_metadata_command_replay_state_preserving_pending_slot()
             } else {
                 peering_route.validate_metadata_command_replay_state()
             }
-            .map_err(|source| ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            })?;
+            .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
             let pending_command = node
                 .metadata_command_inspection_client()
                 .pending_metadata_command_envelope(pg_id, cluster_epoch)
-                .map_err(|source| ClusterBuildError::OpenLocalNode {
-                    node_id: node_id.as_u32(),
-                    source,
-                })?;
+                .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
             if pending_command.is_some() && node_id != primary_node_id {
-                return Err(ClusterBuildError::OpenLocalNode {
-                    node_id: node_id.as_u32(),
-                    source: StoreError::MetadataCommandPendingOnNonPrimary {
+                return Err(ClusterBuildError::open_local_node(
+                    node_id.as_u32(),
+                    StoreError::MetadataCommandPendingOnNonPrimary {
                         node_id: node_id.as_u32(),
                         primary_node_id: primary_node_id.as_u32(),
                         pg_id: pg_id.get(),
                         cluster_epoch,
                     },
-                });
+                ));
             }
             if pending_command.is_some() && node_id == primary_node_id {
                 primary_pending_command = pending_command;
@@ -5341,10 +5322,7 @@ fn clean_converged_primary_terminal_pending_slot(
     primary
         .metadata_command_client()
         .remove_pending_metadata_command_slot(pg_id, command)
-        .map_err(|source| ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source,
-        })?;
+        .map_err(|source| ClusterBuildError::open_local_node(primary_node_id.as_u32(), source))?;
     Ok(())
 }
 
@@ -5381,12 +5359,15 @@ fn release_open_metadata_command_bucket_write_reservation(
     node.retained_bucket_write_reservation_client()
         .open_retained_bucket_write_reservation_route(bucket_pg, &proof.bucket)
         .and_then(|route| route.release_metadata_command_bucket_write_reservation(proof))
-        .map_err(|source| ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source: StoreError::Io {
-                context: "release metadata command bucket write reservation on local cluster open",
-                source: std::io::Error::other(source),
-            },
+        .map_err(|source| {
+            ClusterBuildError::open_local_node(
+                primary_node_id.as_u32(),
+                StoreError::Io {
+                    context:
+                        "release metadata command bucket write reservation on local cluster open",
+                    source: std::io::Error::other(source),
+                },
+            )
         })?;
     Ok(())
 }
@@ -5405,9 +5386,11 @@ fn converge_in_flight_metadata_command_on_open(
         validate_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
         node.metadata_command_client()
             .apply_metadata_command_and_record(pg_id, command)
-            .map_err(|source| ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source: bucket_snapshot_error_to_store_error(source),
+            .map_err(|source| {
+                ClusterBuildError::open_local_node(
+                    node_id.as_u32(),
+                    bucket_snapshot_error_to_store_error(source),
+                )
             })?;
     }
 
@@ -5419,16 +5402,10 @@ fn converge_in_flight_metadata_command_on_open(
         let peering_route = node
             .metadata_command_peering_client()
             .open_metadata_command_peering_route(pg_id, cluster_epoch)
-            .map_err(|source| ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            })?;
+            .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
         let state = peering_route
             .validate_metadata_command_replay_state()
-            .map_err(|source| ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            })?;
+            .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
         converged_states.push((node_id, state));
     }
     validate_metadata_command_replica_agreement_or_in_flight_recovery(
@@ -5451,15 +5428,15 @@ fn validate_open_metadata_command_bucket_write_reservation(
         return Ok(());
     };
     if proof.cluster_epoch != command.id().cluster_epoch() {
-        return Err(ClusterBuildError::OpenLocalNode {
-            node_id: 0,
-            source: StoreError::Io {
+        return Err(ClusterBuildError::open_local_node(
+            0,
+            StoreError::Io {
                 context: "validate metadata command bucket write reservation on local cluster open",
                 source: std::io::Error::other(MetadataError::BucketWriteReservationConflict {
                     reservation_id: proof.reservation_id.clone(),
                 }),
             },
-        });
+        ));
     }
     let topology = nodes
         .values()
@@ -5479,12 +5456,15 @@ fn validate_open_metadata_command_bucket_write_reservation(
     node.bucket_write_reservation_client()
         .open_bucket_write_reservation_route(proof.cluster_epoch, bucket_pg, &proof.bucket)
         .and_then(|route| route.validate_bucket_write_reservation_proof(proof))
-        .map_err(|source| ClusterBuildError::OpenLocalNode {
-            node_id: primary_node_id.as_u32(),
-            source: StoreError::Io {
-                context: "validate metadata command bucket write reservation on local cluster open",
-                source: std::io::Error::other(source),
-            },
+        .map_err(|source| {
+            ClusterBuildError::open_local_node(
+                primary_node_id.as_u32(),
+                StoreError::Io {
+                    context:
+                        "validate metadata command bucket write reservation on local cluster open",
+                    source: std::io::Error::other(source),
+                },
+            )
         })
 }
 
@@ -5660,10 +5640,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
                     command,
                     unadvanced_state.applied_log_hash,
                 )
-                .map_err(|source| ClusterBuildError::OpenLocalNode {
-                    node_id: node_id.as_u32(),
-                    source,
-                })?;
+                .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
             if !matches_pending {
                 return Err(metadata_command_replica_state_diverged_error(
                     pg_id,
@@ -5724,10 +5701,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
                 command,
                 primary_state.applied_log_hash,
             )
-            .map_err(|source| ClusterBuildError::OpenLocalNode {
-                node_id: node_id.as_u32(),
-                source,
-            })?;
+            .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
         if !matches_pending {
             return Err(metadata_command_replica_state_diverged_error(
                 pg_id,
@@ -5776,9 +5750,9 @@ fn metadata_command_replica_state_diverged_error(
     state: &MetadataCommandReplicaState,
     reference_state: &MetadataCommandReplicaState,
 ) -> ClusterBuildError {
-    ClusterBuildError::OpenLocalNode {
-        node_id: node_id.as_u32(),
-        source: StoreError::MetadataCommandReplicaStateDiverged {
+    ClusterBuildError::open_local_node(
+        node_id.as_u32(),
+        StoreError::MetadataCommandReplicaStateDiverged {
             node_id: node_id.as_u32(),
             reference_node_id: reference_node_id.as_u32(),
             pg_id: pg_id.get(),
@@ -5791,7 +5765,7 @@ fn metadata_command_replica_state_diverged_error(
             state_digest: state.state_digest,
             reference_state_digest: reference_state.state_digest,
         },
-    }
+    )
 }
 
 fn validate_local_pg_ids(pg_ids: &[u32]) -> Result<Vec<PgId>, ClusterBuildError> {
@@ -5949,22 +5923,24 @@ fn prepare_local_node_data_dir(
     node_id: NodeId,
     data_dir: &Path,
 ) -> Result<PathBuf, ClusterBuildError> {
-    prepare_private_data_dir(data_dir).map_err(|source| ClusterBuildError::OpenLocalNode {
-        node_id: node_id.as_u32(),
-        source: StoreError::Io {
-            context: "prepare private local node data dir",
-            source,
-        },
+    prepare_private_data_dir(data_dir).map_err(|source| {
+        ClusterBuildError::open_local_node(
+            node_id.as_u32(),
+            StoreError::Io {
+                context: "prepare private local node data dir",
+                source,
+            },
+        )
     })?;
-    data_dir
-        .canonicalize()
-        .map_err(|source| ClusterBuildError::OpenLocalNode {
-            node_id: node_id.as_u32(),
-            source: StoreError::Io {
+    data_dir.canonicalize().map_err(|source| {
+        ClusterBuildError::open_local_node(
+            node_id.as_u32(),
+            StoreError::Io {
                 context: "canonicalize local node data dir",
                 source,
             },
-        })
+        )
+    })
 }
 
 #[cfg(test)]

@@ -1365,15 +1365,15 @@ fn local_cluster_reopen_rejects_missing_applied_command_log_entry() {
 
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(matches!(
-        err,
-        ClusterBuildError::OpenLocalNode {
-            node_id: 0,
-            source: StoreError::MetadataCommandLogConflict {
+        err.open_local_node_store_error(),
+        Some((
+            0,
+            StoreError::MetadataCommandLogConflict {
                 pg_id: 1,
                 log_index: 1,
                 ..
             }
-        }
+        ))
     ));
 }
 
@@ -1404,16 +1404,16 @@ fn local_cluster_reopen_rejects_pending_slot_on_non_primary_replica() {
 
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(matches!(
-        err,
-        ClusterBuildError::OpenLocalNode {
-            node_id: 1,
-            source: StoreError::MetadataCommandPendingOnNonPrimary {
+        err.open_local_node_store_error(),
+        Some((
+            1,
+            StoreError::MetadataCommandPendingOnNonPrimary {
                 node_id: 1,
                 primary_node_id: 0,
                 pg_id: 1,
                 ..
             }
-        }
+        ))
     ));
 }
 
@@ -1500,17 +1500,17 @@ fn local_cluster_reopen_rejects_nonprimary_applied_mismatched_primary_pending_sl
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
         matches!(
-            err,
-            ClusterBuildError::OpenLocalNode {
-                node_id: 1,
-                source: StoreError::MetadataCommandReplicaStateDiverged {
+            err.open_local_node_store_error(),
+            Some((
+                1,
+                StoreError::MetadataCommandReplicaStateDiverged {
                     pg_id: 1,
                     reference_node_id: 0,
                     applied_log_index: 1,
                     reference_applied_log_index: 0,
                     ..
                 }
-            }
+            ))
         ),
         "unexpected reopen error: {err:?}"
     );
@@ -1775,17 +1775,17 @@ fn local_cluster_reopen_rejects_inflight_matching_log_with_divergent_advanced_di
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
         matches!(
-            err,
-            ClusterBuildError::OpenLocalNode {
-                node_id: 2,
-                source: StoreError::MetadataCommandReplicaStateDiverged {
+            err.open_local_node_store_error(),
+            Some((
+                2,
+                StoreError::MetadataCommandReplicaStateDiverged {
                     pg_id: 1,
                     reference_node_id: 1,
                     applied_log_index: 1,
                     reference_applied_log_index: 1,
                     ..
                 }
-            }
+            ))
         ),
         "unexpected reopen error: {err:?}"
     );
@@ -1881,15 +1881,15 @@ fn local_cluster_reopen_rejects_reordered_applied_command_log_entry() {
 
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(matches!(
-        err,
-        ClusterBuildError::OpenLocalNode {
-            node_id: 0,
-            source: StoreError::MetadataCommandLogConflict {
+        err.open_local_node_store_error(),
+        Some((
+            0,
+            StoreError::MetadataCommandLogConflict {
                 pg_id: 1,
                 log_index: 1,
                 ..
             }
-        }
+        ))
     ));
 }
 
@@ -1926,15 +1926,15 @@ fn local_cluster_reopen_rejects_corrupt_applied_command_log_hash() {
 
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(matches!(
-        err,
-        ClusterBuildError::OpenLocalNode {
-            node_id: 0,
-            source: StoreError::MetadataCommandLogHashMismatch {
+        err.open_local_node_store_error(),
+        Some((
+            0,
+            StoreError::MetadataCommandLogHashMismatch {
                 pg_id: 1,
                 log_index: 1,
                 ..
             }
-        }
+        ))
     ));
 }
 
@@ -1971,11 +1971,8 @@ fn local_cluster_reopen_rejects_materialized_state_digest_mismatch() {
 
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(matches!(
-        err,
-        ClusterBuildError::OpenLocalNode {
-            node_id: 0,
-            source: StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
-        }
+        err.open_local_node_store_error(),
+        Some((0, StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }))
     ));
 }
 
@@ -2013,11 +2010,8 @@ fn local_cluster_reopen_rejects_replica_materialized_state_digest_mismatch() {
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
         matches!(
-            err,
-            ClusterBuildError::OpenLocalNode {
-                node_id: 1,
-                source: StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }
-            }
+            err.open_local_node_store_error(),
+            Some((1, StoreError::MetadataStateDigestMismatch { pg_id: 1, .. }))
         ),
         "unexpected reopen error: {err:?}"
     );
@@ -2056,11 +2050,11 @@ fn local_cluster_reopen_rejects_missing_replica_state_for_nonempty_pg() {
 
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(matches!(
-        err,
-        ClusterBuildError::OpenLocalNode {
-            node_id: 0,
-            source: StoreError::MetadataCommandReplicaStateMissing { pg_id: 1 }
-        }
+        err.open_local_node_store_error(),
+        Some((
+            0,
+            StoreError::MetadataCommandReplicaStateMissing { pg_id: 1 }
+        ))
     ));
 }
 
@@ -2122,17 +2116,17 @@ fn local_cluster_reopen_rejects_replica_state_disagreement() {
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
         matches!(
-            err,
-            ClusterBuildError::OpenLocalNode {
-                node_id: 1,
-                source: StoreError::MetadataCommandReplicaStateDiverged {
+            err.open_local_node_store_error(),
+            Some((
+                1,
+                StoreError::MetadataCommandReplicaStateDiverged {
                     pg_id: 1,
                     reference_node_id: 0,
                     applied_log_index: 2,
                     reference_applied_log_index: 1,
                     ..
                 }
-            }
+            ))
         ),
         "unexpected reopen error: {err:?}"
     );
@@ -2190,17 +2184,17 @@ fn local_cluster_reopen_rejects_same_state_with_different_history() {
     let err = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap_err();
     assert!(
         matches!(
-            err,
-            ClusterBuildError::OpenLocalNode {
-                node_id: 1,
-                source: StoreError::MetadataCommandReplicaStateDiverged {
+            err.open_local_node_store_error(),
+            Some((
+                1,
+                StoreError::MetadataCommandReplicaStateDiverged {
                     pg_id: 1,
                     reference_node_id: 0,
                     applied_log_index: 1,
                     reference_applied_log_index: 1,
                     ..
                 }
-            }
+            ))
         ),
         "unexpected reopen error: {err:?}"
     );
