@@ -6092,6 +6092,127 @@ fail_with_matches \
     "Cross-crate multipart and stream-session test support must consume raw storage errors inside storage and return only opaque failures" \
     "$multipart_test_support_error_leaks"
 
+scan_object_test_support_error_leaks() {
+    local source=$1
+
+    awk '
+    function trim(value) {
+        sub(/^[[:space:]]+/, "", value)
+        sub(/[[:space:]]+$/, "", value)
+        return value
+    }
+    function result_error_is_test_storage_failure(value, open_index, angle_depth, paren_depth, bracket_depth, brace_depth, error_start, i, character, previous, error_type) {
+        if (!match(value, /->[[:space:]]*([[:alnum:]_]+::)*Result[[:space:]]*</)) {
+            return 0
+        }
+        open_index = RSTART + RLENGTH - 1
+        angle_depth = 1
+        for (i = open_index + 1; i <= length(value); i++) {
+            character = substr(value, i, 1)
+            previous = substr(value, i - 1, 1)
+            if (character == "<") {
+                angle_depth++
+            } else if (character == ">" && previous != "-") {
+                angle_depth--
+                if (angle_depth == 0) {
+                    if (error_start == 0) {
+                        return 0
+                    }
+                    error_type = trim(substr(value, error_start, i - error_start))
+                    return error_type ~ /^([[:alnum:]_]+::)*TestStorageFailure$/
+                }
+            } else if (character == "(") {
+                paren_depth++
+            } else if (character == ")") {
+                paren_depth--
+            } else if (character == "[") {
+                bracket_depth++
+            } else if (character == "]") {
+                bracket_depth--
+            } else if (character == "{") {
+                brace_depth++
+            } else if (character == "}") {
+                brace_depth--
+            } else if (character == "," && angle_depth == 1 && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0) {
+                if (error_start != 0) {
+                    return 0
+                }
+                error_start = i + 1
+            }
+        }
+        return 0
+    }
+    function inspect_signature() {
+        raw_error = signature ~ /(ObjectPgActionError|MetadataError|StoreError|ShardIoError)/
+        fallible_result = signature ~ /->[[:space:]]*([[:alnum:]_]+::)*Result[[:space:]]*</
+        opaque_result = result_error_is_test_storage_failure(signature)
+        nonopaque_result = fallible_result && !opaque_result
+        if (raw_error || nonopaque_result) {
+            print signature_start
+        }
+        collecting_signature = 0
+        signature = ""
+        signature_start = ""
+    }
+    /^[[:space:]]*pub trait StorageClusterObjectTestSupport[[:space:]]*\{/ {
+        in_object_support = 1
+        next
+    }
+    in_object_support && /^[[:space:]]*fn[[:space:]]+/ {
+        collecting_signature = 1
+        signature = $0
+        signature_start = FILENAME ":" FNR ":" $0
+        if ($0 ~ /;/) {
+            inspect_signature()
+        }
+        next
+    }
+    in_object_support && collecting_signature {
+        signature = signature " " $0
+        if ($0 ~ /;/) {
+            inspect_signature()
+        }
+        next
+    }
+    in_object_support && /^[[:space:]]*\}/ {
+        in_object_support = 0
+    }
+    ' "$source"
+}
+
+object_test_support_error_leaks=$(
+    {
+        scan_object_test_support_error_leaks crates/storage/src/lib.rs
+        if ! rg -q \
+            '^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+delete_marker_version_has_owner_raw_for_owner_test' \
+            crates/storage/src/lib.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/lib.rs: raw delete-marker owner observation must remain crate-private for owner tests'
+        fi
+    }
+)
+fail_with_matches \
+    "Cross-crate object and checksum test support must consume raw storage errors inside storage and return only opaque failures" \
+    "$object_test_support_error_leaks"
+
+object_test_support_error_fixture=$(
+    scan_object_test_support_error_leaks \
+        scripts/fixtures/storage-boundary-object-test-support-errors.rs
+)
+expected_object_test_support_error_fixture='scripts/fixtures/storage-boundary-object-test-support-errors.rs:3:    fn raw_shard_error(&self) -> ShardIoError;
+scripts/fixtures/storage-boundary-object-test-support-errors.rs:4:    fn other_fallible_error('
+object_test_support_error_fixture_failure=""
+if [[ "$object_test_support_error_fixture" != "$expected_object_test_support_error_fixture" ]]; then
+    object_test_support_error_fixture_failure=$object_test_support_error_fixture
+    if [[ -z "$object_test_support_error_fixture_failure" ]]; then
+        object_test_support_error_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Object test-support fallible-signature scan must reject raw and otherwise non-opaque errors" \
+    "$object_test_support_error_fixture_failure"
+
 metadata_command_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for)|struct[[:space:]]+MetadataCommandApplyTestContext|type[[:space:]]+MetadataCommandApplyContextTestHook)\b'
 
 scan_public_metadata_command_test_surface() {

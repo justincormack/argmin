@@ -2199,8 +2199,14 @@ fn logical_delete_marker_owner_observation_rejects_live_and_binds_owner_fields()
         .unwrap()
         .unwrap();
 
-    let matching_live_owner_err = cluster
-        .test_delete_marker_version_has_owner(&bucket, &key, live.version_id, &live_owner)
+    let matching_live_owner_err =
+        crate::test_support::delete_marker_version_has_owner_raw_for_owner_test(
+            &cluster,
+            &bucket,
+            &key,
+            live.version_id,
+            &live_owner,
+        )
         .expect_err("a live version must not pass through the delete-marker observation");
     assert!(matches!(
         matching_live_owner_err,
@@ -2210,8 +2216,14 @@ fn logical_delete_marker_owner_observation_rejects_live_and_binds_owner_fields()
     assert!(cluster
         .test_delete_marker_version_has_owner(&bucket, &key, marker.version_id, &marker_owner)
         .unwrap());
-    let crossed_live_version_err = cluster
-        .test_delete_marker_version_has_owner(&bucket, &key, live.version_id, &marker_owner)
+    let crossed_live_version_err =
+        crate::test_support::delete_marker_version_has_owner_raw_for_owner_test(
+            &cluster,
+            &bucket,
+            &key,
+            live.version_id,
+            &marker_owner,
+        )
         .expect_err("a crossed live version must not be treated as a delete marker");
     assert!(matches!(
         crossed_live_version_err,

@@ -2282,8 +2282,26 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        observer is opaque. The boundary checker scans the complete multipart trait, pins every
        public stream-session and multipart helper to the opaque failure, and requires the raw
        observer to remain crate-private.
-       The object/checksum test-support family still requires the same conversion before the raw
-       error exports can be removed.
+       The object/checksum test-support error sub-slice completed on 2026-08-08. Stored SSE-C
+       checksum observations and delete-marker owner checks now return `TestStorageFailure`, with
+       storage consuming object lookup, checksum decoding, and logical validation failures. The
+       exact non-delete-marker validation regression remains owner-local through a crate-private
+       raw observer. The boundary checker scans the complete object-support trait and requires the
+       owner raw observer to remain crate-private.
+       A compiler visibility audit performed after that conversion proved the earlier final-export
+       inventory incomplete. Making the raw enums crate-private currently identifies two remaining
+       topology test-support methods and one direct stream-session test setup that still cross the
+       crate boundary with `ObjectPgActionError`. It also identifies owner-only public methods for
+       raw shard I/O, route-history reconstruction, stream and multipart primitives, payload leases,
+       and physical placement; these have no external production callers and must be narrowed to
+       crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
+       `StorageNodeServerError::Store` publicly embed `StoreError` and need storage-owned opaque
+       diagnostics while preserving owner-local exact-error coverage. Complete those three bounded
+       groups, rerun the compiler visibility audit with warnings denied, then make `StoreError`,
+       `MetadataError`, `ObjectPgActionError`, and `ShardIoError` plus the `error` module
+       crate-private and remove their root exports. The boundary checker must pin the final private
+       declarations and reject renewed raw public signatures rather than relying only on the
+       current cross-crate source-use ban.
        The three concrete error types remain public storage exports only because storage still has
        public low-level or test-support signatures which name them. Continue by converting or
        restricting those owner APIs one bounded family at a time, then remove the root exports and
