@@ -4608,6 +4608,49 @@ fail_with_matches \
     "Route-history reconstruction and reference collection on cluster handles must remain storage-owned crate-private operations" \
     "$raw_route_history_query_public_surface"
 
+raw_stream_multipart_primitive_public_surface=$(
+    {
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+[^({]+(?s:[^;{]{0,1200})(ObjectPgActionError|MetadataError|StoreError|ShardIoError)' \
+            crates/storage/src/cluster/request_ops/bucket_delete.rs \
+            crates/storage/src/cluster/request_ops/multipart_operations.rs \
+            || true
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+heartbeat_put_object_stream_session\b' \
+            crates/storage/src/cluster/request_ops/bucket_delete.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/request_ops/bucket_delete.rs: direct PutObject stream heartbeat must remain owner-test-only'
+        fi
+        for method in \
+            finalize_put_object_stream \
+            finalize_upload_part_stream \
+            abort_multipart_upload \
+            create_upload_part_stream_session \
+            create_upload_part_stream_session_with_cleanup_deadline
+        do
+            if ! rg -q -U \
+                "#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/request_ops/multipart_operations.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/request_ops/multipart_operations.rs: direct stream/multipart primitive ${method} must remain owner-test-only"
+            fi
+        done
+        rg -n --color=never \
+            'create_upload_part_stream_session_for_authorized_part_with_cleanup_deadline' \
+            crates/storage/src \
+            || true
+        rg -n --color=never \
+            '^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+list_multipart_parts_for_authorized_upload\b' \
+            crates/storage/src/cluster/request_ops/multipart_operations.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "Direct stream and multipart primitives must remain storage-owner-only and dormant raw-error test hooks must stay removed" \
+    "$raw_stream_multipart_primitive_public_surface"
+
 raw_payload_test_support_error_transit=$(
     {
         awk '

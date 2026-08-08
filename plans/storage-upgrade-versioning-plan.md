@@ -2313,11 +2313,19 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        only for owner tests because the visibility change proved that they had no production
        caller; the storage-node RPC operation remains part of the current wire grammar. The
        boundary checker pins all five owner methods to crate visibility.
+       The direct stream/multipart primitive visibility sub-slice completed on 2026-08-08.
+       Direct PutObject-session heartbeat and finalization, UploadPart finalization, and raw
+       multipart abort wrappers now compile only for owner tests; production already reaches those
+       state machines through admitted operation-route capabilities. The lower UploadPart-session
+       constructors used by owner tests are test-only. A raw authorized list-parts wrapper and an
+       exported test-hook UploadPart-session constructor had no workspace callers and were removed
+       rather than retained as dormant raw-error APIs; production list-parts uses the admitted
+       route-validation state machine directly. The boundary checker pins all six owner-test
+       wrappers and removal of both unused constructors.
        A compiler visibility audit performed after that conversion proved the earlier final-export
        inventory incomplete. Making the raw enums crate-private still identifies owner-only public
-       methods for stream and multipart primitives, payload leases, and physical placement; these
-       have no external production callers and must be narrowed to crate visibility. Finally,
-       `ClusterBuildError::OpenLocalNode` and
+       methods for payload leases and physical placement; these have no external production callers
+       and must be narrowed to crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
        `StorageNodeServerError::Store` publicly embed `StoreError` and need storage-owned opaque
        diagnostics while preserving owner-local exact-error coverage. Complete those three bounded
        groups, rerun the compiler visibility audit with warnings denied, then make `StoreError`,

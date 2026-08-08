@@ -352,8 +352,8 @@ impl super::StorageCluster {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn finalize_put_object_stream<T, E>(
+    #[cfg(test)]
+    pub(crate) fn finalize_put_object_stream<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -1127,7 +1127,7 @@ impl super::StorageCluster {
         )
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(crate) fn create_upload_part_stream_session_with_cleanup_deadline(
         &self,
         authorized_upload: &AuthorizedMultipartUploadRecord,
@@ -1149,24 +1149,6 @@ impl super::StorageCluster {
             session_id,
             cleanup_after,
             || Ok(()),
-        )
-    }
-
-    /// Test/composition entry point matching the production UploadPart capability boundary.
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn create_upload_part_stream_session_for_authorized_part_with_cleanup_deadline(
-        &self,
-        authorized_upload: crate::AuthorizedMultipartUploadPart,
-        session_id: &SessionId,
-        cleanup_after: Option<u64>,
-    ) -> Result<SessionId, ObjectPgActionError> {
-        let internal_authorized_upload =
-            AuthorizedMultipartUploadRecord::assume_authorized(authorized_upload.record().clone());
-        self.create_upload_part_stream_session_with_cleanup_deadline(
-            &internal_authorized_upload,
-            authorized_upload.part_number(),
-            session_id,
-            cleanup_after,
         )
     }
 
@@ -2090,8 +2072,8 @@ impl super::StorageCluster {
         pending == &adjusted
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn finalize_upload_part_stream<T, E>(
+    #[cfg(test)]
+    pub(crate) fn finalize_upload_part_stream<T, E>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -2767,29 +2749,6 @@ impl super::StorageCluster {
         )
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn list_multipart_parts_for_authorized_upload(
-        &self,
-        authorized_upload: &crate::AuthorizedMultipartUploadListParts,
-        part_number_marker: Option<u32>,
-        max_parts: u32,
-    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
-        let bucket = &authorized_upload.record().bucket;
-        let key = &authorized_upload.record().key;
-        self.list_multipart_parts_for_authorized_upload_with_route_validation(
-            super::MultipartObjectMutationEffectRoute {
-                pg_id: self.object_metadata_pg(bucket, key),
-                bucket,
-                key,
-                effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
-            },
-            authorized_upload,
-            part_number_marker,
-            max_parts,
-            || Ok(()),
-        )
-    }
-
     pub(super) fn list_multipart_parts_for_authorized_upload_with_route_validation(
         &self,
         route: super::MultipartObjectMutationEffectRoute<'_>,
@@ -2894,7 +2853,8 @@ impl super::StorageCluster {
             .lookup_multipart_upload_management(upload_id)
     }
 
-    pub fn abort_multipart_upload(
+    #[cfg(test)]
+    pub(crate) fn abort_multipart_upload(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

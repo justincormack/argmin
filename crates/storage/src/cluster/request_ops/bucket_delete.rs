@@ -915,8 +915,8 @@ impl super::StorageCluster {
         crate::clock::current_time_millis().saturating_add(BUCKET_WRITE_RESERVATION_LEASE_MILLIS)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn heartbeat_put_object_stream_session(
+    #[cfg(test)]
+    pub(crate) fn heartbeat_put_object_stream_session(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
