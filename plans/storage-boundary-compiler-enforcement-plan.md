@@ -1,6 +1,6 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–5 complete; Phase 6 pending
+Status: active — Phases 0–5 complete; Phase 6 inventory in progress
 
 Related plans:
 
@@ -6391,6 +6391,84 @@ Completion:
   feature graphs, or typed test-support APIs enforce the same invariant
 
 ### Phase 6 — shrink and redefine the boundary check
+
+Phase 6 inventory baseline (2026-08-08):
+
+- this inventory was taken after the storage-upgrade/versioning containment
+  work completed. In particular, `StoreError`, `MetadataError`,
+  `ObjectPgActionError`, `ShardIoError`, physical placement records, retained
+  route-history helpers, direct stream/multipart primitives, and payload-lease
+  construction are now storage-private. The inventory therefore treats a
+  source scan which merely restates that visibility as redundant rather than
+  as continuing enforcement;
+- `scripts/check-storage-cluster-boundaries` is 7,181 lines and has 216
+  `fail_with_matches` sections, three exact production shard-caller
+  inventories, one discovered-file inventory, two publisher/recovery
+  inventories, one publisher registry comparison, and eight exact fixture
+  output inventories. This is the transitional baseline, not the intended
+  retained shape; and
+- no rule is removed during the inventory slice. Removal happens by cohort so
+  that each deleted check has an identified compiler, module, Cargo, or test
+  replacement.
+
+The initial visibility audit confirms the main versioning precondition:
+`StoreError`, `MetadataError`, `ObjectPgActionError`, `ShardIoError`,
+`PgMetadataStore`, `ShardLocation`, and the raw payload hook types are
+`pub(crate)`; `PgStore` is declared inside the private `pg_store` module and is
+reexported only as `pub(crate)`; and none of these types has a public crate-root
+reexport. Cross-crate source scans for those names therefore duplicate a
+compiler boundary rather than close an export gap.
+
+| Cohort | Transitional contents | Present enforcement | Preliminary Phase 6 disposition |
+| --- | --- | --- | --- |
+| Workspace feature graph | One exhaustive normal/build dependency-feature check, including a miniature Cargo fixture | Cargo does not reject a production package enabling another package's test feature, and Rust visibility does not see the resolved feature graph | **Retain.** This is a stable semantic configuration check. Keep the exhaustive workspace classification and empty reviewed allowlist. |
+| Node-client and route adoption | Thirty historical source scans covering `SharedStorageNode`, `single_node`, bridge helpers, raw PG-store calls, and operation-specific node-client/route methods | Role-specific node-client traits, private stores/nodes, scoped route capabilities, and private constructors now provide the production boundary | **Remove after a visibility audit.** Delete method-name and call-shape scans once the audit confirms no public or cross-module raw route/store authority remains. Do not preserve the historical operation list. |
+| Physical payload and opaque operation APIs | Eighty-five checks covering placed shard reads/writes, multipart records, upload capabilities, topology/control-plane/Raft assembly, opaque fields, `Debug`/equality derivations, and removed legacy paths | Storage-private physical types and methods, opaque one-use capabilities, redacted owner-defined formatting, and owner-local tests now enforce almost all of this cohort | **Mostly remove.** Compiler visibility and focused type/unit tests replace name and field inventories. The three explicitly temporary shard read/delete caller inventories remain open until their comments' capability migrations complete; the discovered `server-core` payload-read file inventory is deleted because file membership is not an invariant. |
+| Metadata-command publisher and recovery classification | Seven source checks plus the publisher scanner fixture, exact recovery-drain authority inventory, and registry/live-publisher comparison | Sealed class-specific tokens and typed installer outcomes enforce publisher class and behavior, but each token's `__from_registry_marker` mint is still `pub(crate)` and can be called or captured by any storage module; one registry also supplies the human classification | **Split.** Retain the direct-constructor/reference guard until token minting is structurally unforgeable. Independently retain the registry/documentation consistency check until the guide is generated from the authoritative registry. Remove function-count, wrapper, and exact recovery-call inventories where private authority types already reject misuse. |
+| Error and production-facade ownership | Fifty-six checks covering raw storage errors, coordinator mapping adapters, diagnostics, placement/lease primitives, control-plane/Raft administration, metadata transfer, codecs, and worker internals | The completed versioning item 14 makes concrete errors and raw operation wrappers crate-private and exposes bounded opaque failures/facades | **Remove by owner boundary.** First confirm public exports and dependency edges with the compiler; then delete concrete-type, method-name, error-mapping, field, and formatting scans. Retain behavior/redaction tests, not a parallel list of private symbols. |
+| Cross-crate test support | Thirty-seven checks plus eight exact fixture-output comparisons covering public inherent test methods, curated support signatures, raw hooks, scheduling, physical shards, clocks, and maintenance workers | The normal/build feature graph is fail closed; inherent adapters and raw hooks are crate-private; `storage::test_support` exposes logical observations, opaque scenarios, and scoped controls | **Collapse.** Remove historical method-name/source-root inventories. Keep at most one semantic public-API check for forbidden physical types that are intentionally public production types and therefore cannot be hidden from test support by visibility alone. Replace exact fixture text with outcome-based adversarial fixtures. |
+| Session-token representation | One source scan forbidding callers from selecting auth token formats or constants | The representation module and constants are private and issuance/authentication APIs are semantic | **Remove.** Module visibility plus auth format/round-trip tests are the invariant. This check is unrelated to the storage cluster boundary once privacy is confirmed. |
+
+The exact-inventory audit has these initial outcomes:
+
+- keep, temporarily, the exact low-level payload shard delete, shard read, and
+  segment payload-read caller inventories because their adjacent comments
+  identify incomplete capability migrations. Convert or delete them with those
+  migrations, not through an allowlist refresh;
+- delete the `server-core` payload-read discovered-file inventory. Moving a
+  production caller between files must not change boundary validity;
+- replace the publisher scanner's exact fixture text with semantic pass/fail
+  fixtures if that scanner survives the registry split;
+- retain the direct `__from_registry_marker` call/function-item guard. Sealing
+  prevents a token from selecting another publisher class, but the current
+  `pub(crate)` mint does not prove that every token originated at its canonical
+  `metadata_command_publisher!` marker. This guard may be removed only after a
+  minting redesign makes unmarked construction in another storage module
+  unexpressible;
+- remove the exact recovery-drain authority use inventory once the authority
+  constructors and mutation entry points are inaccessible outside the recovery
+  module; and
+- remove exact expected output for public-test-surface fixtures. Any retained
+  public-API scanner must assert that valid fixtures pass and adversarial
+  fixtures fail, independent of line number, indentation, or the total number
+  of diagnostics.
+
+Implementation order from this inventory:
+
+1. audit the public exports, module visibility, and resolved Cargo feature
+   graph which replace the proposed deletions;
+2. remove the compiler-redundant error/physical-type and historical-symbol
+   cohorts first, running the checker after each coherent deletion;
+3. isolate the three temporary shard caller inventories so they are visibly
+   migration work rather than permanent architecture;
+4. reduce publisher checking to the direct token-mint guard plus
+   registry/documentation consistency, and remove only the exact call-site
+   inventories already enforced by sealed typed authority;
+5. collapse test-support checking to the feature graph and, only if still
+   necessary, one declaration-semantic public-API rule with adversarial
+   fixtures; and
+6. update `guides/storage-cluster-invariants.md` with the resulting structural
+   boundary and a short table of the final semantic checks.
 
 For each remaining section, record:
 
