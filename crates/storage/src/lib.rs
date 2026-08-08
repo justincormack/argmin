@@ -91,11 +91,10 @@ pub use cluster::{
     LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
     LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
-    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PlacedSegmentShardHealth,
-    PlacedSegmentShardSetHealth, PlacedSegmentShardSetRisk, PlacedSegmentShardValidation,
-    PreparedStandaloneEmbeddedTopology, ProcessLocalRegistryKey, ReleasedObjectPayloadLease,
-    RetainedObjectPayloadRead, RetainedStreamUploadCleanup, ShardLocation, StorageCluster,
-    StorageClusterRouteAdmission, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
+    LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PreparedStandaloneEmbeddedTopology,
+    ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,
+    RetainedStreamUploadCleanup, StorageCluster, StorageClusterRouteAdmission,
+    StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
     StorageClusterRuntimeMapRefreshError, StorageClusterRuntimeMapRefreshLoop,
     StorageClusterRuntimeMapRefreshLoopFailure, StorageClusterRuntimeMapRefreshLoopStatus,
     StorageClusterRuntimeMapRefreshLoopStatusHandle, StorageClusterRuntimeMapRefreshLoopSuccess,
@@ -1684,6 +1683,9 @@ pub mod test_support {
         payload_shard_write_retryable_convergence_failure, TestPayloadShardWriteAttemptGuard,
         TestPayloadShardWriteAttemptHook, TestPayloadShardWriteAttempts,
     };
+
+    mod pg_topology;
+    pub use pg_topology::{PgTopologyPlacementTestSupport, TestObjectDataPgSelection};
 
     mod failure_scheduling;
     pub use failure_scheduling::{StorageClusterFailureTestSupport, TestStorageFailureGuard};

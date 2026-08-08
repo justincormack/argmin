@@ -1,5 +1,9 @@
 use std::{collections::BTreeSet, io::Write, path::Path, time::Duration};
 
+use s3_tests::uat_pg_backfill_support::{
+    committed_data_pg_satisfies_request, distinct_data_pg_bucket_search_limit,
+    parse_committed_object_placement, CommittedObjectPlacement,
+};
 use s3_tests::{
     aws_sdk_s3::{
         error::{ProvideErrorMetadata, SdkError},
@@ -11,7 +15,8 @@ use s3_tests::{
     put_object_retrying_operation_aborted, retrying_operation_aborted_result, unique_bucket, Agent,
     SendRetryingOperationAborted, RT,
 };
-use storage::{BucketName, GenerationId, ObjectKey, PgTopology};
+use storage::test_support::PgTopologyPlacementTestSupport;
+use storage::{BucketName, PgTopology};
 
 fn usage() -> ! {
     eprintln!(
@@ -68,12 +73,6 @@ fn client_from_env() -> s3_tests::aws_sdk_s3::Client {
     )
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CommittedObjectPlacement {
-    generation_id: u64,
-    data_pg_id: u32,
-}
-
 struct ObjectPlacementInspector {
     endpoint: String,
     agent: Agent,
@@ -119,40 +118,6 @@ impl ObjectPlacementInspector {
     }
 }
 
-fn parse_committed_object_placement(body: &str) -> Result<CommittedObjectPlacement, String> {
-    let generation_id = body
-        .lines()
-        .find_map(|line| line.strip_prefix("generation_id="))
-        .ok_or_else(|| "missing generation_id".to_string())?
-        .parse::<u64>()
-        .map_err(|error| format!("invalid generation_id: {error}"))?;
-    let segment_count = body
-        .lines()
-        .find_map(|line| line.strip_prefix("segment_count="))
-        .ok_or_else(|| "missing segment_count".to_string())?
-        .parse::<usize>()
-        .map_err(|error| format!("invalid segment_count: {error}"))?;
-    if segment_count != 1 {
-        return Err(format!(
-            "UAT placement requires one standard segment, got {segment_count}"
-        ));
-    }
-    let segment = body
-        .lines()
-        .find(|line| line.starts_with("segment_index=0 "))
-        .ok_or_else(|| "missing segment_index=0".to_string())?;
-    let data_pg_id = segment
-        .split_ascii_whitespace()
-        .find_map(|field| field.strip_prefix("data_pg_id="))
-        .ok_or_else(|| "missing segment-0 data_pg_id".to_string())?
-        .parse::<u32>()
-        .map_err(|error| format!("invalid data_pg_id: {error}"))?;
-    Ok(CommittedObjectPlacement {
-        generation_id,
-        data_pg_id,
-    })
-}
-
 async fn create_bucket(client: &s3_tests::aws_sdk_s3::Client, bucket: &str) {
     retrying_operation_aborted_result(|| {
         let request = client.create_bucket().bucket(bucket);
@@ -178,22 +143,6 @@ async fn enable_bucket_versioning(client: &s3_tests::aws_sdk_s3::Client, bucket:
 
 async fn put_object(client: &s3_tests::aws_sdk_s3::Client, bucket: &str, key: &str, body: Vec<u8>) {
     put_object_retrying_operation_aborted(client, bucket, key, body).await;
-}
-
-fn committed_data_pg_satisfies_request(
-    topology: &PgTopology,
-    bucket: &str,
-    key: &str,
-    data_pg_id: u32,
-    target_data_pg: Option<u32>,
-) -> bool {
-    if target_data_pg.is_some_and(|target| target != data_pg_id) {
-        return false;
-    }
-    let bucket = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
-    let key = ObjectKey::try_from(key.to_string()).expect("UAT key must be valid");
-    data_pg_id != topology.bucket_pg_for(&bucket)
-        && data_pg_id != topology.object_pg_for(&bucket, &key)
 }
 
 async fn put_object_with_committed_data_pg(
@@ -407,78 +356,17 @@ fn find_key_with_distinct_data_pg_in_topology(
     excluded_metadata_pgs: &BTreeSet<u32>,
 ) -> Option<(String, u32)> {
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
-    let bucket_pg = topology.bucket_pg_for(&bucket_name);
-    if excluded_metadata_pgs.contains(&bucket_pg) {
-        return None;
-    }
-    let pg_count = topology.pg_count();
-    if target_data_pg.is_some_and(|target| target >= pg_count) {
-        return None;
-    }
-    let eligible_metadata_pg_count = pg_count.saturating_sub(
-        excluded_metadata_pgs
-            .iter()
-            .filter(|pg_id| **pg_id < pg_count)
-            .count() as u32,
-    );
-    if eligible_metadata_pg_count == 0 {
-        return None;
-    }
-    let generation_id = GenerationId::new(1).expect("first object generation id is valid");
-    let search_limit = distinct_data_pg_key_search_limit(
-        pg_count,
-        eligible_metadata_pg_count,
-        target_data_pg.is_some(),
-    );
-
-    for suffix in 0..search_limit {
-        let key = format!("{key_prefix}-{suffix:04}");
-        let object_key = ObjectKey::try_from(key.clone()).expect("UAT key must be valid");
-        let object_pg = topology.object_pg_for(&bucket_name, &object_key);
-        let data_pg = topology
-            .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
-            .get();
-        if data_pg != bucket_pg
-            && data_pg != object_pg
-            && !excluded_metadata_pgs.contains(&object_pg)
-            && target_data_pg.is_none_or(|target| data_pg == target)
-        {
-            return Some((key, data_pg));
-        }
-    }
-    None
-}
-
-fn distinct_data_pg_key_search_limit(
-    pg_count: u32,
-    eligible_metadata_pg_count: u32,
-    targets_exact_data_pg: bool,
-) -> u32 {
-    const MIN_SEARCH_LIMIT: u64 = 10_000;
-    const EXPECTED_MATCH_SAFETY_FACTOR: u64 = 128;
-
-    if !targets_exact_data_pg {
-        return MIN_SEARCH_LIMIT as u32;
-    }
-    let estimated_attempts_per_match = u64::from(pg_count)
-        .saturating_mul(u64::from(pg_count))
-        .div_ceil(u64::from(eligible_metadata_pg_count));
-    MIN_SEARCH_LIMIT
-        .max(estimated_attempts_per_match.saturating_mul(EXPECTED_MATCH_SAFETY_FACTOR))
-        .min(u64::from(u32::MAX)) as u32
-}
-
-fn distinct_data_pg_bucket_search_limit(pg_count: u32, eligible_metadata_pg_count: u32) -> u32 {
-    const MIN_SEARCH_LIMIT: u64 = 100;
-    const EXPECTED_ELIGIBLE_BUCKET_SAFETY_FACTOR: u64 = 128;
-
-    MIN_SEARCH_LIMIT
-        .max(
-            u64::from(pg_count)
-                .div_ceil(u64::from(eligible_metadata_pg_count))
-                .saturating_mul(EXPECTED_ELIGIBLE_BUCKET_SAFETY_FACTOR),
+    topology
+        .test_find_object_key_with_distinct_metadata_and_data_pgs(
+            &bucket_name,
+            key_prefix,
+            target_data_pg,
+            excluded_metadata_pgs,
         )
-        .min(u64::from(u32::MAX)) as u32
+        .map(|selection| {
+            let (key, data_pg) = selection.into_key_and_data_pg();
+            (key.as_str().to_string(), data_pg)
+        })
 }
 
 fn choose_key_with_distinct_data_pg(
@@ -502,19 +390,16 @@ fn key_with_metadata_pg_and_distinct_data_pg(
     target_metadata_pg: u32,
 ) -> Option<(String, u32)> {
     let bucket_name = BucketName::try_from(bucket.to_string()).expect("UAT bucket must be valid");
-    let generation_id = GenerationId::new(1).expect("first object generation id is valid");
-    for suffix in 0..10_000u32 {
-        let key = format!("{key_prefix}-{suffix:04}");
-        let object_key = ObjectKey::try_from(key.clone()).expect("UAT key must be valid");
-        let object_pg = topology.object_pg_for(&bucket_name, &object_key);
-        let data_pg = topology
-            .object_generation_segment_data_pg(&bucket_name, &object_key, generation_id, 0)
-            .get();
-        if object_pg == target_metadata_pg && data_pg != target_metadata_pg {
-            return Some((key, data_pg));
-        }
-    }
-    None
+    topology
+        .test_find_object_key_on_metadata_pg_with_distinct_data_pg(
+            &bucket_name,
+            key_prefix,
+            target_metadata_pg,
+        )
+        .map(|selection| {
+            let (key, data_pg) = selection.into_key_and_data_pg();
+            (key.as_str().to_string(), data_pg)
+        })
 }
 
 fn choose_bucket_key_with_metadata_pg_and_distinct_data_pg(
@@ -1187,109 +1072,5 @@ fn main() {
             });
         }
         _ => usage(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn committed_placement_parser_requires_one_standard_segment() {
-        let parsed = parse_committed_object_placement(
-            "generation_id=2\nsegment_count=1\nsegment_index=0 data_pg_id=12 placement_cluster_epoch=7\n",
-        )
-        .unwrap();
-        assert_eq!(
-            parsed,
-            CommittedObjectPlacement {
-                generation_id: 2,
-                data_pg_id: 12,
-            }
-        );
-        assert!(parse_committed_object_placement(
-            "generation_id=2\nsegment_count=2\nsegment_index=0 data_pg_id=12 placement_cluster_epoch=7\n"
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn committed_placement_rejects_generation_prediction_drift() {
-        let topology = PgTopology::new(&(0..32).collect::<Vec<_>>()).unwrap();
-        let (bucket, key, generation_one_pg, generation_two_pg) = (0..100u32)
-            .find_map(|bucket_suffix| {
-                let bucket = format!("uat-placement-{bucket_suffix}");
-                let bucket_name = BucketName::try_from(bucket.clone()).unwrap();
-                (0..1_000u32).find_map(|key_suffix| {
-                    let key = format!("object-{key_suffix}");
-                    let object_key = ObjectKey::try_from(key.clone()).unwrap();
-                    let object_pg = topology.object_pg_for(&bucket_name, &object_key);
-                    let bucket_pg = topology.bucket_pg_for(&bucket_name);
-                    let generation_one_pg = topology
-                        .object_generation_segment_data_pg(
-                            &bucket_name,
-                            &object_key,
-                            GenerationId::new(1).unwrap(),
-                            0,
-                        )
-                        .get();
-                    let generation_two_pg = topology
-                        .object_generation_segment_data_pg(
-                            &bucket_name,
-                            &object_key,
-                            GenerationId::new(2).unwrap(),
-                            0,
-                        )
-                        .get();
-                    (generation_one_pg != generation_two_pg
-                        && generation_one_pg != bucket_pg
-                        && generation_one_pg != object_pg)
-                        .then_some((bucket.clone(), key, generation_one_pg, generation_two_pg))
-                })
-            })
-            .expect("test topology should contain generation-dependent placement");
-
-        assert!(committed_data_pg_satisfies_request(
-            &topology,
-            &bucket,
-            &key,
-            generation_one_pg,
-            Some(generation_one_pg),
-        ));
-        assert!(!committed_data_pg_satisfies_request(
-            &topology,
-            &bucket,
-            &key,
-            generation_two_pg,
-            Some(generation_one_pg),
-        ));
-    }
-
-    #[test]
-    fn distinct_data_pg_search_scales_for_large_excluded_metadata_set() {
-        let topology = PgTopology::new(&(0..216).collect::<Vec<_>>()).unwrap();
-        let excluded_metadata_pgs = (0..200).collect::<BTreeSet<_>>();
-        let result = find_key_with_distinct_data_pg_in_topology(
-            &topology,
-            "argmin-s3-976110-18cf77b41c5bca93-14",
-            "uat-route-change-new-object-61",
-            Some(60),
-            &excluded_metadata_pgs,
-        )
-        .expect("scaled search should find the retained soak target");
-
-        assert_eq!(result.1, 60);
-        assert!(result.0.starts_with("uat-route-change-new-object-61-"));
-        let suffix = result
-            .0
-            .rsplit_once('-')
-            .and_then(|(_, suffix)| suffix.parse::<u32>().ok())
-            .expect("generated key should end in a numeric suffix");
-        assert!(
-            suffix >= 10_000,
-            "regression must exceed the old fixed bound"
-        );
-        assert!(distinct_data_pg_key_search_limit(216, 16, true) > 10_000);
-        assert_eq!(distinct_data_pg_bucket_search_limit(216, 16), 1_792);
     }
 }

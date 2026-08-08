@@ -2828,7 +2828,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn segment_payload_shard_locations(
+    pub(crate) fn segment_payload_shard_locations(
         &self,
         data_pg_id: u32,
         ec: EcShape,

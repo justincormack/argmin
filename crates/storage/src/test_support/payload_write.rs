@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
-use crate::cluster::PayloadShardWriteTestHookGuard;
-use crate::{ShardKey, ShardLocation, StorageCluster, StoreError, StoreFailure};
+use crate::cluster::{PayloadShardWriteTestHookGuard, ShardLocation};
+use crate::{ShardKey, StorageCluster, StoreError, StoreFailure};
 
 /// Opaque storage-owned failure injected at the physical shard-write boundary.
 pub struct TestPayloadShardWriteFailure {

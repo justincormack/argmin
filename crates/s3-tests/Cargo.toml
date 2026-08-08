@@ -30,6 +30,12 @@ deep-tracing = [
     "server_http/deep-tracing",
     "storage/deep-tracing",
 ]
+uat-pg-topology = ["storage/test-hooks"]
+
+[[bin]]
+name = "uat_pg_backfill_smoke"
+path = "src/bin/uat_pg_backfill_smoke.rs"
+required-features = ["uat-pg-topology"]
 
 [dependencies]
 # Server (for local TestServer)

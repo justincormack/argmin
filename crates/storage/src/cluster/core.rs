@@ -1310,7 +1310,7 @@ impl Drop for PayloadCleanupTestHookGuard {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ShardLocation {
+pub(crate) struct ShardLocation {
     cluster_epoch: ClusterEpoch,
     data_pg_id: DataPgId,
     shard_index: ShardIndex,
@@ -1332,25 +1332,25 @@ impl ShardLocation {
         }
     }
 
-    pub fn cluster_epoch(&self) -> ClusterEpoch {
+    pub(crate) fn cluster_epoch(&self) -> ClusterEpoch {
         self.cluster_epoch
     }
 
-    pub fn data_pg_id(&self) -> DataPgId {
+    pub(crate) fn data_pg_id(&self) -> DataPgId {
         self.data_pg_id
     }
 
-    pub fn shard_index(&self) -> ShardIndex {
+    pub(crate) fn shard_index(&self) -> ShardIndex {
         self.shard_index
     }
 
-    pub fn node_id(&self) -> NodeId {
+    pub(crate) fn node_id(&self) -> NodeId {
         self.node_id
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlacedSegmentShardValidation {
+pub(crate) enum PlacedSegmentShardValidation {
     Valid,
     MissingAck,
     WrongSize { expected: u64, actual: u64 },
@@ -1359,38 +1359,38 @@ pub enum PlacedSegmentShardValidation {
 
 impl PlacedSegmentShardValidation {
     #[must_use]
-    pub fn is_valid(&self) -> bool {
+    pub(crate) fn is_valid(&self) -> bool {
         matches!(self, Self::Valid)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardHealth {
-    pub shard_index: ShardIndex,
-    pub shard_key: ShardKey,
-    pub location: ShardLocation,
-    pub validation: PlacedSegmentShardValidation,
+pub(crate) struct PlacedSegmentShardHealth {
+    pub(crate) shard_index: ShardIndex,
+    pub(crate) shard_key: ShardKey,
+    pub(crate) location: ShardLocation,
+    pub(crate) validation: PlacedSegmentShardValidation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlacedSegmentShardSetRisk {
+pub(crate) enum PlacedSegmentShardSetRisk {
     Healthy,
     Degraded { tolerance_remaining: usize },
     Unrecoverable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlacedSegmentShardSetHealth {
-    pub total_shards: usize,
-    pub required_shards: usize,
-    pub valid_shards: usize,
-    pub risk: PlacedSegmentShardSetRisk,
-    pub shards: Vec<PlacedSegmentShardHealth>,
+pub(crate) struct PlacedSegmentShardSetHealth {
+    pub(crate) total_shards: usize,
+    pub(crate) required_shards: usize,
+    pub(crate) valid_shards: usize,
+    pub(crate) risk: PlacedSegmentShardSetRisk,
+    pub(crate) shards: Vec<PlacedSegmentShardHealth>,
 }
 
 impl PlacedSegmentShardSetHealth {
     #[must_use]
-    pub fn repair_targets(&self) -> Vec<ShardIndex> {
+    pub(crate) fn repair_targets(&self) -> Vec<ShardIndex> {
         self.shards
             .iter()
             .filter(|shard| !shard.validation.is_valid())

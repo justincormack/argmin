@@ -4,6 +4,8 @@ mod post_form;
 mod raw_http_client;
 pub mod server;
 pub mod shape;
+#[doc(hidden)]
+pub mod uat_pg_backfill_support;
 
 pub use aws_sdk_s3;
 pub use helpers::{

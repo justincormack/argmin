@@ -4713,6 +4713,175 @@ fail_with_matches \
     "Raw payload lease construction and physical lease observations must remain storage-owner-only" \
     "$raw_payload_lease_primitive_public_surface"
 
+physical_payload_placement_public_surface=$(
+    {
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(place_payload_shards|place_payload_shards_for_pg_route|place_payload_shards_for_pg_route_snapshot|payload_shard_node|object_data_pg_set_width|object_generation_data_pg_set|object_generation_data_pg_set_with_width|object_generation_segment_data_pg|object_generation_segment_data_pg_with_width|object_generation_multipart_part_data_pg|object_generation_multipart_part_segment_data_pg|segment_payload_shard_locations)\b' \
+            crates/storage/src/cluster/payload_operations.rs \
+            crates/storage/src/cluster/local.rs \
+            crates/storage/src/cluster/shard_maintenance.rs \
+            crates/storage/src/pg_topology.rs \
+            || true
+        rg -n --color=never \
+            '\.(object_data_pg_set_width|object_generation_data_pg_set|object_generation_data_pg_set_with_width|object_generation_segment_data_pg|object_generation_segment_data_pg_with_width|object_generation_multipart_part_data_pg|object_generation_multipart_part_segment_data_pg)\b' \
+            crates \
+            --glob '*.rs' \
+            --glob '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\b(ShardLocation|PlacedSegmentShardHealth|PlacedSegmentShardSetHealth|PlacedSegmentShardSetRisk|PlacedSegmentShardValidation)\b' \
+            crates/storage/src/lib.rs \
+            || true
+        for type_name in \
+            ShardLocation \
+            PlacedSegmentShardHealth \
+            PlacedSegmentShardSetHealth \
+            PlacedSegmentShardSetRisk \
+            PlacedSegmentShardValidation
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+(struct|enum)[[:space:]]+${type_name}\\b" \
+                crates/storage/src/cluster/core.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/core.rs: physical placement type ${type_name} must remain crate-private"
+            fi
+        done
+        for method in \
+            place_payload_shards \
+            place_payload_shards_for_pg_route \
+            place_payload_shards_for_pg_route_snapshot
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/payload_operations.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/payload_operations.rs: physical placement method ${method} must remain crate-private"
+            fi
+        done
+        for method in \
+            object_generation_data_pg_set \
+            object_generation_segment_data_pg \
+            object_generation_multipart_part_data_pg \
+            object_generation_multipart_part_segment_data_pg
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/pg_topology.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/pg_topology.rs: physical topology selector ${method} must remain crate-private"
+            fi
+        done
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+object_data_pg_set_width\b' \
+            crates/storage/src/pg_topology.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/pg_topology.rs: data-PG set-width observation must remain owner-test-only'
+        fi
+        for method in \
+            object_generation_data_pg_set_with_width \
+            object_generation_segment_data_pg_with_width
+        do
+            if ! rg -q \
+                "^[[:space:]]*fn[[:space:]]+${method}\\b" \
+                crates/storage/src/pg_topology.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/pg_topology.rs: width-parameterized physical topology selector ${method} must remain implementation-private"
+            fi
+        done
+        for method in \
+            object_generation_segment_data_pg \
+            place_payload_shards \
+            place_payload_shards_for_pg_route
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/local.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/local.rs: physical placement method ${method} must remain crate-private"
+            fi
+        done
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+object_generation_multipart_part_data_pg\b' \
+            crates/storage/src/cluster/local.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/local.rs: multipart-part data-PG prediction must remain crate-private owner-test support'
+        fi
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+payload_shard_node\b' \
+            crates/storage/src/cluster/local.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/local.rs: LocalClusterMap shard-node convenience lookup must remain owner-test-only'
+        fi
+        if ! rg -q \
+            '^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+segment_payload_shard_locations\b' \
+            crates/storage/src/cluster/shard_maintenance.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/shard_maintenance.rs: segment physical-location expansion must remain crate-private'
+        fi
+        if ! rg -q \
+            '^uat-pg-topology = \["storage/test-hooks"\]$' \
+            crates/s3-tests/Cargo.toml
+        then
+            printf '%s\n' \
+                'crates/s3-tests/Cargo.toml: PG topology UAT support must remain explicitly feature-gated'
+        fi
+        if ! rg -q \
+            '^required-features = \["uat-pg-topology"\]$' \
+            crates/s3-tests/Cargo.toml
+        then
+            printf '%s\n' \
+                'crates/s3-tests/Cargo.toml: PG topology UAT binary must require its storage test-support feature'
+        fi
+        if ! rg -q \
+            '^pub trait PgTopologyPlacementTestSupport' \
+            crates/storage/src/test_support/pg_topology.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/test_support/pg_topology.rs: storage must own the feature-gated UAT placement selector'
+        fi
+        if ! rg -q \
+            '^pub mod uat_pg_backfill_support;$' \
+            crates/s3-tests/src/lib.rs
+        then
+            printf '%s\n' \
+                'crates/s3-tests/src/lib.rs: PG topology UAT unit logic must remain in the default-built library target'
+        fi
+        rg -n -U --color=never \
+            '#\[cfg[^\n]*\][[:space:]]*(#\[doc\(hidden\)\][[:space:]]*)?pub mod uat_pg_backfill_support;' \
+            crates/s3-tests/src/lib.rs \
+            || true
+        rg -n --color=never \
+            '#\[(cfg\(test\)|test)\]' \
+            crates/s3-tests/src/bin/uat_pg_backfill_smoke.rs \
+            || true
+        for test_name in \
+            committed_placement_parser_requires_one_standard_segment \
+            committed_placement_rejects_a_target_mismatch \
+            distinct_data_pg_bucket_search_scales_for_large_excluded_metadata_set
+        do
+            if ! rg -q \
+                "^[[:space:]]*fn[[:space:]]+${test_name}\\b" \
+                crates/s3-tests/src/uat_pg_backfill_support.rs
+            then
+                printf '%s\n' \
+                    "crates/s3-tests/src/uat_pg_backfill_support.rs: default-built UAT regression ${test_name} is missing"
+            fi
+        done
+    }
+)
+fail_with_matches \
+    "Physical payload placement types and methods must remain private to storage" \
+    "$physical_payload_placement_public_surface"
+
 raw_payload_test_support_error_transit=$(
     {
         awk '

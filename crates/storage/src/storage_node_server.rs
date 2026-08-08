@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 use super::clients::LocalStorageNodeClient;
 use super::engine::SharedStorageNode;
 use super::PreparedRetainedStreamUploadAbort;
+use crate::cluster::ShardLocation;
 use crate::control_plane::{
     ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneHeartbeatRuntimeMapSource,
     ControlPlaneHeartbeatSink, HeartbeatLease, NodeHeartbeat, PendingMetadataCommandObservation,
@@ -356,8 +357,8 @@ use crate::{
     CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, LifecycleSweepClaimRecord,
     LifecycleSweepRoot, MultipartUploadRecord, NodeId, ObjectKey, ObjectPayloadReclaimClaimRecord,
     ObjectPayloadReclaimKind, ObjectPgActionError, PayloadReclaimRoot,
-    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardKey, ShardLocation,
-    StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
+    PrepareStreamUploadSegmentAppendReq, RouteMapValidity, ShardKey, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadTarget, UploadId,
 };
 use crate::{BucketFastPathIdentity, BucketPgId, ObjectMetadataPgId, ObjectMetadataScanPgId};
 use checksum::{ChecksumAlgorithm, ChecksumHasher};

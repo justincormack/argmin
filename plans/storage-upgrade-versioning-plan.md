@@ -2331,18 +2331,36 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        aggregation they use are owner-test-only. The boundary checker rejects renewed public raw
        lease constructors and pins the count helpers at every cluster/node layer to their test-only
        visibility.
+       The physical-placement representation sub-slice completed on 2026-08-08. `ShardLocation`
+       and the placed-shard health, validation, and risk records are now crate-private and are no
+       longer root exports. Placement expansion, historical segment-location reconstruction,
+       payload data-PG selection, and shard-node selection on public cluster/map handles are
+       crate-private; the multipart-part data-PG predictor and local-map shard-node convenience
+       wrapper compile only for owner tests. Storage RPC validation and encoding continue to
+       translate through the private representation inside the owner. The boundary checker pins
+       the private types, removed exports, method visibility, and test-support-only wrappers.
+       Review then found that `PgTopology` still publicly exposed the lower payload data-PG set,
+       segment, and multipart selectors, and the backfill UAT predicted those physical values
+       directly. Those selectors are now crate-private or implementation-private. The UAT asks a
+       feature-gated storage test facility for one of its two required logical key-placement
+       relations and receives only the candidate key and data-PG identifier needed to drive the
+       external topology transition. Ordinary AWS-facing `s3-tests` builds do not enable storage
+       test hooks; both UAT launchers explicitly request the required feature. The boundary checker
+       covers the lower topology API, external raw-selector calls, the test facility, and its Cargo
+       feature gate. Because Cargo omits a binary whose required feature is disabled, the UAT's
+       parser, committed-result predicate, search bound, and their unit tests live in the
+       default-built `s3-tests` library target. Ordinary workspace `nextest` therefore continues to
+       discover every regression without a second feature-specific test invocation.
        A compiler visibility audit performed after that conversion proved the earlier final-export
-       inventory incomplete. Making the raw enums crate-private still identifies owner-only public
-       methods for physical placement; these have no external production callers and must be
-       narrowed to crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
-       `StorageNodeServerError::Store` publicly embed `StoreError` and need storage-owned opaque
-       diagnostics while preserving owner-local exact-error coverage. Complete those three bounded
-       groups, rerun the compiler visibility audit with warnings denied, then make `StoreError`,
-       `MetadataError`, `ObjectPgActionError`, and `ShardIoError` plus the `error` module
-       crate-private and remove their root exports. The boundary checker must pin the final private
-       declarations and reject renewed raw public signatures rather than relying only on the
-       current cross-crate source-use ban.
-       The three concrete error types remain public storage exports only because storage still has
+       inventory incomplete. The remaining public wrappers
+       `ClusterBuildError::OpenLocalNode` and `StorageNodeServerError::Store` embed `StoreError` and
+       need storage-owned opaque diagnostics while preserving owner-local exact-error coverage.
+       Complete that bounded group, rerun the compiler visibility audit with warnings denied, then
+       make `StoreError`, `MetadataError`, `ObjectPgActionError`, and `ShardIoError` plus the
+       `error` module crate-private and remove their root exports. The boundary checker must pin the
+       final private declarations and reject renewed raw public signatures rather than relying only
+       on the current cross-crate source-use ban.
+       The four concrete error types remain public storage exports only because storage still has
        public low-level or test-support signatures which name them. Continue by converting or
        restricting those owner APIs one bounded family at a time, then remove the root exports and
        enforce their crate-private visibility. Preserve only logical values required for S3

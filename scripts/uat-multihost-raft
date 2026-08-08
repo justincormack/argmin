@@ -296,9 +296,9 @@ fi
 [[ -x "$binary" ]] || die "argmin-s3 binary is not executable: $binary"
 
 if [[ -z "$client_binary" ]]; then
-    client_build=(cargo build -p s3-tests --bin uat_pg_backfill_smoke)
+    client_build=(cargo build -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
     if ((release)); then
-        client_build=(cargo build --release -p s3-tests --bin uat_pg_backfill_smoke)
+        client_build=(cargo build --release -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
     fi
     print_command "${client_build[@]}"
     "${client_build[@]}"

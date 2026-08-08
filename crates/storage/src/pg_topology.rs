@@ -100,11 +100,12 @@ impl PgTopology {
         self.bucket_pg(bucket.as_str())
     }
 
-    pub fn object_data_pg_set_width(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn object_data_pg_set_width(&self) -> usize {
         DEFAULT_OBJECT_DATA_PG_SET_WIDTH.min(self.pg_ids.len())
     }
 
-    pub fn object_generation_data_pg_set(
+    pub(crate) fn object_generation_data_pg_set(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -119,7 +120,7 @@ impl PgTopology {
         )
     }
 
-    pub fn object_generation_data_pg_set_with_width(
+    fn object_generation_data_pg_set_with_width(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -149,7 +150,7 @@ impl PgTopology {
             .collect()
     }
 
-    pub fn object_generation_segment_data_pg(
+    pub(crate) fn object_generation_segment_data_pg(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -166,7 +167,7 @@ impl PgTopology {
         )
     }
 
-    pub fn object_generation_segment_data_pg_with_width(
+    fn object_generation_segment_data_pg_with_width(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -179,7 +180,7 @@ impl PgTopology {
         set[band_index as usize % set.len()]
     }
 
-    pub fn object_generation_multipart_part_data_pg(
+    pub(crate) fn object_generation_multipart_part_data_pg(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -190,7 +191,7 @@ impl PgTopology {
         self.object_generation_band_data_pg(bucket, key, generation_id, part_band_index)
     }
 
-    pub fn object_generation_multipart_part_segment_data_pg(
+    pub(crate) fn object_generation_multipart_part_segment_data_pg(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,

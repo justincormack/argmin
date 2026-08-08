@@ -3663,7 +3663,7 @@ impl LocalClusterMap {
         self.pg_topology.object_pg_for(bucket, key)
     }
 
-    pub fn object_generation_segment_data_pg(
+    pub(crate) fn object_generation_segment_data_pg(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -3679,7 +3679,8 @@ impl LocalClusterMap {
         .expect("installed payload placement must select a configured data PG")
     }
 
-    pub fn object_generation_multipart_part_data_pg(
+    #[cfg(test)]
+    pub(crate) fn object_generation_multipart_part_data_pg(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -4647,7 +4648,7 @@ impl LocalClusterMap {
             .metadata_command_abandon_acceptance(target_pg_id, command)
     }
 
-    pub fn place_payload_shards(
+    pub(crate) fn place_payload_shards(
         &self,
         operation_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
@@ -4665,7 +4666,7 @@ impl LocalClusterMap {
         )
     }
 
-    pub fn place_payload_shards_for_pg_route(
+    pub(crate) fn place_payload_shards_for_pg_route(
         cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
         ec_shape: EcShape,
@@ -4696,7 +4697,8 @@ impl LocalClusterMap {
             .collect())
     }
 
-    pub fn payload_shard_node(
+    #[cfg(test)]
+    pub(crate) fn payload_shard_node(
         &self,
         operation_epoch: ClusterEpoch,
         data_pg_id: DataPgId,

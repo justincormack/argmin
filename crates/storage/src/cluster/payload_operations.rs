@@ -1,5 +1,5 @@
 impl StorageCluster {
-    pub fn place_payload_shards(
+    pub(crate) fn place_payload_shards(
         &self,
         data_pg_id: DataPgId,
         ec_shape: EcShape,
@@ -13,7 +13,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn place_payload_shards_for_pg_route(
+    pub(crate) fn place_payload_shards_for_pg_route(
         &self,
         cluster_epoch: ClusterEpoch,
         data_pg_id: DataPgId,
@@ -30,7 +30,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn place_payload_shards_for_pg_route_snapshot(
+    pub(crate) fn place_payload_shards_for_pg_route_snapshot(
         &self,
         route: &PgRouteSnapshot,
         data_pg_id: DataPgId,
@@ -52,22 +52,6 @@ impl StorageCluster {
             ec_shape,
             stable_placement_key,
             route.acting_set(),
-        )
-    }
-
-    pub fn payload_shard_node(
-        &self,
-        data_pg_id: DataPgId,
-        shard_index: ShardIndex,
-        ec_shape: EcShape,
-        stable_placement_key: &[u8],
-    ) -> Result<NodeId, ClusterBuildError> {
-        self.local_map.payload_shard_node(
-            self.operation_epoch(),
-            data_pg_id,
-            shard_index,
-            ec_shape,
-            stable_placement_key,
         )
     }
 

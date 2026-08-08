@@ -15,7 +15,7 @@ use super::{
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{
     MetadataCommandApplyContextTestHook, MetadataCommandApplyContextTestHookGuard,
-    MetadataCommandApplyTestContext, MetadataCommandApplyTestKind,
+    MetadataCommandApplyTestContext, MetadataCommandApplyTestKind, ShardLocation,
 };
 #[cfg(test)]
 use super::{
