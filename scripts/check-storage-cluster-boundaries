@@ -4345,6 +4345,34 @@ fail_with_matches \
     "BucketSnapshotLoadError is storage-private; callers must use BucketSnapshotLoadFailure and its exhaustive logical kind" \
     "$raw_bucket_snapshot_load_error_transit"
 
+raw_route_admission_error_transit=$(
+    {
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(admit_current_route|require_admission_valid_now|require_valid_now|require_valid_now_for|remaining_validity|active_bucket_route|active_bucket_metadata_scan|active_object_metadata_scan|active_object_read_route|active_object_metadata_mutation_route|active_put_object_route|active_multipart_object_route|retained_stream_upload_cleanup)(?s:[^;{]{0,700})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/cluster.rs \
+            || true
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(is_route_map_valid_at|require_route_map_valid_at)\b' \
+            crates/storage/src/cluster.rs \
+            || true
+        rg -n -U --color=never \
+            '(admit_current_route|require_admission_valid_now|active_bucket_route|active_bucket_metadata_scan|active_object_metadata_scan|active_object_read_route|active_object_metadata_mutation_route|active_put_object_route|active_multipart_object_route|retained_stream_upload_cleanup)\([^;]{0,700}map_err\([^)]*map_store_error\)' \
+            crates/server-core/src/coordinator \
+            -g '*.rs' \
+            || true
+        if ! rg -q -U \
+            'fn map_store_failure(?s:.{0,400})error: storage::StoreFailure(?s:.{0,500})StoreOperationFailureClass::Other[[:space:]]*=>[[:space:]]*ServerError::Store' \
+            crates/server-core/src/coordinator.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator.rs: route admission must map the opaque StoreFailure exhaustively'
+        fi
+    }
+)
+fail_with_matches \
+    "Route admission, raw route-map validation, active-route derivation, and retained cleanup must remain storage-owned or cross through StoreFailure" \
+    "$raw_route_admission_error_transit"
+
 raw_object_read_error_transit=$(
     {
         awk '

@@ -117,7 +117,7 @@ impl Coordinator {
                     prepared.authorized_write.bucket_typed(),
                     prepared.authorized_write.key_typed(),
                 )
-                .map_err(super::map_store_error)?;
+                .map_err(super::map_store_failure)?;
             let result = self
                 .put_large_object_from_authorized_write_with_session_on_admitted_route(
                     &route,
@@ -190,7 +190,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let put_route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let object_crc64 = checksum::crc64::checksum(req.data);
         observability::trace_scope!(
             TRACE_TARGET,
@@ -452,7 +452,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(req.object.bucket_name_typed(), req.object.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let session_id = Self::random_session_id("failed to generate session ID")?;
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
@@ -519,7 +519,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let session_id = Self::random_session_id("failed to generate stream session ID")?;
         route
             .create_stream_session_record(
@@ -548,7 +548,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(req.bucket, req.key)
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let session = route
             .load_stream_session(req.session_id)
             .map_err(Self::map_stream_upload_failure)?;
@@ -616,7 +616,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let session = route
             .load_stream_session(req.session_id)
             .map_err(Self::map_stream_upload_failure)?;
@@ -652,7 +652,7 @@ impl Coordinator {
         let admission = self.admit_storage_route_for_request()?;
         let route = admission
             .active_put_object_route(authorized.bucket_typed(), authorized.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         self.finalize_stream_put_with_authorized_write_tags_on_admitted_route(
             &route, req, authorized, tags,
         )
@@ -724,7 +724,7 @@ impl Coordinator {
         let admission = self.admit_storage_route_for_request()?;
         let route = admission
             .active_put_object_route(req.object.bucket_name_typed(), req.object.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let request = BucketHandleRequest::new().requiring_lifecycle_view();
         route
             .with_bucket_write_snapshot(request.resolve_to_storage_request(), |snapshot| {
@@ -864,7 +864,7 @@ impl Coordinator {
         self.require_storage_route_admission(&admission)?;
         admission
             .active_put_object_route(bucket, key)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .abort_stream_session(session_id)
             .map_err(Self::map_stream_upload_failure)
     }
@@ -892,7 +892,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         admission
             .active_put_object_route(bucket, key)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .heartbeat_stream_session(session_id)
             .map_err(Self::map_stream_upload_failure)
     }

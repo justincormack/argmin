@@ -95,6 +95,15 @@ pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
     map_store_error_with_metadata_contention(error, MetadataContentionResponse::SlowDown)
 }
 
+pub(super) fn map_store_failure(error: storage::StoreFailure) -> ServerError {
+    match error.class() {
+        storage::StoreOperationFailureClass::ResourceExhausted
+        | storage::StoreOperationFailureClass::MetadataCommandContention
+        | storage::StoreOperationFailureClass::RetryableConvergence => ServerError::SlowDown,
+        storage::StoreOperationFailureClass::Other => ServerError::Store(error),
+    }
+}
+
 /// Map storage failures without treating retryability as an S3 conflict.
 ///
 /// `OperationAborted` describes an operation-specific resource conflict. It is

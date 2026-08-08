@@ -62,7 +62,7 @@ impl Coordinator {
             } => {
                 let route = admission
                     .active_object_metadata_mutation_route(&bucket, &key, None)
-                    .map_err(super::map_store_error)?;
+                    .map_err(super::map_store_failure)?;
                 let deleted = route
                     .delete_current_object_if(|stored| -> Result<(), ServerError> {
                         if !self.requester_can_delete_object_with_bucket_policy(
@@ -149,7 +149,7 @@ impl Coordinator {
 
                 let route = admission
                     .active_object_metadata_mutation_route(&bucket, &key, Some(version_id))
-                    .map_err(super::map_store_error)?;
+                    .map_err(super::map_store_failure)?;
                 let deleted = route
                     .delete_specific_object_version_if(|stored| -> Result<(), ServerError> {
                             if !self.requester_can_delete_object_version_with_bucket_policy(
@@ -257,7 +257,7 @@ impl Coordinator {
             } => {
                 let route = admission
                     .active_object_metadata_mutation_route(&bucket, &key, None)
-                    .map_err(super::map_store_error)?;
+                    .map_err(super::map_store_failure)?;
                 let marker = route
                     .insert_current_delete_marker_if(
                         bucket_info.versioning,

@@ -1561,6 +1561,18 @@ pub mod test_support {
         }
     }
 
+    /// Construct an opaque operation-level storage failure.
+    ///
+    /// This is the representation accepted by public route-admission APIs;
+    /// cross-crate tests can verify response policy without reconstructing a
+    /// route, PG, command-log, or RPC error.
+    #[must_use]
+    pub fn store_failure_for_operation_failure_class(
+        class: StoreOperationFailureClass,
+    ) -> StoreFailure {
+        store_error_for_operation_failure_class(class).into()
+    }
+
     /// Construct an opaque bucket-write drain failure from its logical outcome.
     ///
     /// This lets cross-crate response-mapping tests remain exhaustive without

@@ -378,17 +378,17 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     ExpireCurrentObjectIfDue => (
-        "expire_current_object_if_due",
+        "expire_current_object_if_due_raw",
         "DeleteObjectVersion/InsertDeleteMarker",
         SnapshotSensitive
     ),
     DeleteNoncurrentLiveVersionsIfDue => (
-        "delete_noncurrent_live_versions_if_due",
+        "delete_noncurrent_live_versions_if_due_raw",
         "DeleteObjectVersion",
         SnapshotSensitive
     ),
     DeleteExpiredDeleteMarkerIfDue => (
-        "delete_expired_delete_marker_if_due",
+        "delete_expired_delete_marker_if_due_raw",
         "DeleteObjectVersion",
         SnapshotSensitive
     ),

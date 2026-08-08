@@ -684,7 +684,7 @@ impl Coordinator {
                 lookup_version_id,
                 ObjectReadSnapshotMode::MetadataOnly,
             )
-            .map_err(crate::coordinator::map_store_error)?;
+            .map_err(crate::coordinator::map_store_failure)?;
         #[cfg(test)]
         if self.should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = route

@@ -351,7 +351,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let multipart_route = admission
             .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let dst_bucket_handle = self.load_bucket_handle_for_object_policy_read_on_admitted_route(
             admission,
             req.upload.bucket_name_typed(),
@@ -411,7 +411,7 @@ impl Coordinator {
             .requiring_lifecycle_view();
         let multipart_route = admission
             .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         self.with_bucket_write_handle_on_admitted_route(
             admission,
             &req.upload,
@@ -455,7 +455,7 @@ impl Coordinator {
         let route = ObjectReadSnapshotRoute {
             route: admission
                 .active_object_read_route(req.bucket, req.key, req.version_id, req.snapshot_mode)
-                .map_err(super::map_store_error)?,
+                .map_err(super::map_store_failure)?,
             retain_payload: req.snapshot_mode == ObjectReadSnapshotMode::FullPayloadLayout,
         };
         match ObjectAuthLoadedBucketHandle::classify(&bucket) {
@@ -487,7 +487,7 @@ impl Coordinator {
                     req.version_id,
                     ObjectReadSnapshotMode::FullPayloadLayout,
                 )
-                .map_err(super::map_store_error)?,
+                .map_err(super::map_store_failure)?,
             retain_payload: true,
         };
         match ObjectAuthLoadedBucketHandle::classify(&bucket) {
@@ -1847,7 +1847,7 @@ impl Coordinator {
             |request| {
                 admission
                     .active_bucket_route(bucket)
-                    .map_err(super::map_store_error)?
+                    .map_err(super::map_store_failure)?
                     .load_bucket_snapshot(request)
                     .map_err(BucketHandleLoader::map_bucket_snapshot_error)
             },
@@ -1996,7 +1996,7 @@ impl Coordinator {
         let expected_bucket_owner = req.expected_bucket_owner();
         admission
             .active_bucket_route(req.bucket_name_typed())
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .with_bucket_write_snapshot(request.resolve_to_storage_request(), |snapshot| {
                 let bucket = self
                     .bucket_handle_loader()

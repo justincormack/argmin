@@ -36,7 +36,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let raw_config = admission
             .active_bucket_route(&bucket.name)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .get_bucket_subresource(storage::OpaqueBucketSubresourceKind::Lifecycle)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         match raw_config {

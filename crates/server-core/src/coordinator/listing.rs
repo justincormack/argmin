@@ -66,7 +66,7 @@ impl Coordinator {
 
         let listed = admission
             .active_object_metadata_scan(bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .list_objects(
                 list_prefix.as_ref(),
                 delimiter,
@@ -161,7 +161,7 @@ impl Coordinator {
         let list_key_marker = optional_list_object_key(key_marker)?;
         let listed = admission
             .active_object_metadata_scan(bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .list_object_versions(
                 list_prefix.as_ref(),
                 delimiter,

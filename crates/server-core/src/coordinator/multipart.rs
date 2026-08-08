@@ -340,7 +340,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_multipart_object_route(&req.bucket, &req.key)
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let write_encryption = self.load_stream_part_write_encryption_on_admitted_multipart_route(
             &route,
             req.upload_id,
@@ -394,7 +394,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
@@ -465,7 +465,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let multipart_route = admission
             .active_multipart_object_route(req.object.bucket.name_typed(), req.object.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let metadata_blob = req.metadata.serialize()?;
         let system_metadata_blob = req.system_metadata.serialize()?;
         let request = BucketHandleRequest::new()
@@ -649,7 +649,7 @@ impl Coordinator {
             maybe_run_multipart_complete_snapshot_hook(bucket.as_str(), key.as_str());
             let multipart_route = admission
                 .active_multipart_object_route(&bucket, &key)
-                .map_err(super::map_store_error)?;
+                .map_err(super::map_store_failure)?;
             let completion_snapshot = match multipart_route
                 .load_multipart_completion_snapshot(*upload, &requested_part_numbers)
             {
@@ -1052,7 +1052,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let multipart_route = admission
             .active_multipart_object_route(upload.bucket_name_typed(), upload.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         match multipart_route.require_in_progress_multipart_upload(upload.upload_id()) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == storage::MultipartManagementFailureKind::NoSuchUpload => {
@@ -1101,7 +1101,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         admission
             .active_multipart_object_route(upload.bucket_name_typed(), upload.key_typed())
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .require_in_progress_multipart_upload(upload.upload_id())
             .map_err(|error| Self::map_multipart_management_failure(upload.upload_id(), error))
     }
@@ -1135,7 +1135,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let multipart_route = admission
             .active_multipart_object_route(req.bucket_name_typed(), req.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         match self.authorize_abort_multipart_upload_on_admitted_route(admission, req)? {
             AuthorizedAbortMultipartUpload::Terminal => Ok(()),
             AuthorizedAbortMultipartUpload::InProgress { upload } => {
@@ -1179,7 +1179,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let multipart_route = admission
             .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let AuthorizedListParts {
             bucket_info,
             upload: authorized_upload,
@@ -1282,7 +1282,7 @@ impl Coordinator {
 
         let listed = admission
             .active_object_metadata_scan(&bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .list_multipart_uploads(
                 optional_list_object_key(prefix)?.as_ref(),
                 delimiter,
@@ -1526,7 +1526,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let route = admission
             .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         self.finalize_stream_part_on_route(&route, req)
     }
 
@@ -1541,7 +1541,7 @@ impl Coordinator {
         self.require_storage_route_admission(&admission)?;
         admission
             .active_multipart_object_route(bucket, key)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .abort_stream_session(session_id)
             .map_err(Self::map_stream_upload_failure)
     }

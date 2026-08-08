@@ -49,7 +49,7 @@ impl Coordinator {
                 object.version_id,
                 storage::ObjectReadSnapshotMode::FullPayloadLayout,
             )
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let retained = route
             .retain_object_payload_read(payload_handoff)
             .map_err(super::map_object_read_failure)?

@@ -140,7 +140,7 @@ impl Coordinator {
         let authorized = self.authorize_create_bucket(req)?;
         let route = admission
             .active_bucket_route(&authorized.name)
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let create_outcome = self.create_bucket_with_acl_grants_on_admitted_route(
             &route,
             &authorized.owner,
@@ -280,7 +280,7 @@ impl Coordinator {
         let admission = self.admit_storage_route_for_request()?;
         let route = admission
             .active_bucket_route(&trusted_bucket_name(name))
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         self.create_bucket_with_acl_grants_on_admitted_route(
             &route,
             owner,
@@ -490,7 +490,7 @@ impl Coordinator {
         );
         let route = admission
             .active_bucket_route(&name)
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let begin_started = std::time::Instant::now();
         let _ = observability::emit_flight_event(
             TRACE_TARGET,
@@ -620,7 +620,7 @@ impl Coordinator {
         let AuthorizedListBuckets { owner_canonical_id } = self.authorize_list_buckets(req)?;
         let buckets = admission
             .active_bucket_metadata_scan(&owner_canonical_id)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .list_buckets_for_owner()
             .map_err(Self::map_bucket_listing_failure)?;
         Ok(buckets.into_iter().map(Self::bucket_summary).collect())
@@ -651,7 +651,7 @@ impl Coordinator {
         let authorized = self.authorize_put_bucket_versioning_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_versioning_and_load_info(authorized.state)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -730,7 +730,7 @@ impl Coordinator {
             self.authorize_put_bucket_object_lock_configuration_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_object_lock_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -787,7 +787,7 @@ impl Coordinator {
         let authorized = self.authorize_put_bucket_encryption_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_encryption_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -843,7 +843,7 @@ impl Coordinator {
             self.authorize_delete_bucket_encryption_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_encryption_and_load_info(BucketEncryptionConfig::default())
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -921,7 +921,7 @@ impl Coordinator {
         let authorized = self.authorize_load_bucket_cors_config_for(name);
         admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .get_bucket_subresource(storage::OpaqueBucketSubresourceKind::Cors)
             .map_err(Self::map_bucket_snapshot_load_error)
     }
@@ -941,7 +941,7 @@ impl Coordinator {
         let authorized = self.authorize_delete_bucket_cors_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_bucket_subresource_and_load_info(storage::OpaqueBucketSubresourceKind::Cors)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1029,7 +1029,7 @@ impl Coordinator {
         let authorized = self.authorize_delete_bucket_tagging_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_bucket_tags_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1064,7 +1064,7 @@ impl Coordinator {
         )?;
         admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .get_bucket_tags()
             .map(|tags| tags.map(|tags| tags.tag_set().clone()))
             .map_err(Self::map_bucket_snapshot_load_error)
@@ -1179,7 +1179,7 @@ impl Coordinator {
             self.authorize_untag_bucket_tag_control_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_bucket_tags_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1211,7 +1211,7 @@ impl Coordinator {
         let authorized = self.authorize_put_bucket_abac_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_abac_enabled_and_load_info(authorized.enabled)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1335,7 +1335,7 @@ impl Coordinator {
         let authorized = self.authorize_delete_bucket_policy_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_bucket_subresource_and_load_info(storage::OpaqueBucketSubresourceKind::Policy)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1368,7 +1368,7 @@ impl Coordinator {
         if self.should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
             let bucket_pg_ready = admission
                 .active_bucket_route(&authorized.bucket)
-                .map_err(super::map_store_error)?
+                .map_err(super::map_store_failure)?
                 .try_probe_bucket_pg_available()
                 .map_err(Self::map_bucket_snapshot_load_error)?;
             if !bucket_pg_ready {
@@ -1436,7 +1436,7 @@ impl Coordinator {
             self.authorize_delete_bucket_lifecycle_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_bucket_subresource_and_load_info(
                 storage::OpaqueBucketSubresourceKind::Lifecycle,
             )
@@ -1468,7 +1468,7 @@ impl Coordinator {
             self.authorize_put_bucket_public_access_block_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_public_access_block_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1525,7 +1525,7 @@ impl Coordinator {
             self.authorize_delete_bucket_public_access_block_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_bucket_public_access_block_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1558,7 +1558,7 @@ impl Coordinator {
             self.authorize_put_bucket_ownership_controls_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_ownership_controls_and_load_info(authorized.config)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1615,7 +1615,7 @@ impl Coordinator {
             self.authorize_delete_bucket_ownership_controls_on_admitted_route(admission, req)?;
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_bucket_ownership_controls_and_load_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1709,7 +1709,7 @@ impl Coordinator {
         if self.should_probe_bucket_mutation_write(authorized.bucket.as_str()) {
             let bucket_pg_ready = admission
                 .active_bucket_route(&authorized.bucket)
-                .map_err(super::map_store_error)?
+                .map_err(super::map_store_failure)?
                 .try_probe_bucket_pg_available()
                 .map_err(Self::map_bucket_snapshot_load_error)?;
             if !bucket_pg_ready {
@@ -1721,7 +1721,7 @@ impl Coordinator {
         }
         let info = admission
             .active_bucket_route(&authorized.bucket)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_acl_and_load_info(&authorized.acl_grants, authorized.summary)
             .map_err(Self::map_bucket_snapshot_load_error)?;
         self.clear_bucket_fast_path(&info);
@@ -1764,7 +1764,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         admission
             .active_bucket_route(name)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_bucket_subresource_and_load_info(req)
             .map_err(|error| {
                 Self::map_bucket_snapshot_load_error_with_metadata_contention(

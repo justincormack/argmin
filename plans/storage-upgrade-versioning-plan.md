@@ -2205,6 +2205,19 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        partial-publication recovery, and redaction tests; exhaustive runtime mapping; the existing
        lifecycle sweep and contention regressions; HTTP sanitization; and the boundary checker
        reject raw errors through the complete lifecycle mutation seam.
+       The request route-admission sub-slice completed on 2026-08-07. Acquiring an admission,
+       revalidating it against its issuing publication domain, inspecting its remaining absolute
+       validity, deriving every active bucket/object/PutObject/multipart scan or mutation route,
+       and retaining stream-upload cleanup authority now return the existing opaque
+       `StoreFailure`. Storage keeps the exact route-map expiry and publication-domain mismatch
+       errors behind crate-private validation methods used by admitted operation retry closures.
+       `server-core` exhaustively maps the three retryable semantic classes to `SlowDown` and
+       retains only the bounded diagnostic category for an unclassified failure; route
+       construction no longer enters the raw `StoreError` adapter. `server-http` can bound body
+       reads and distinguish an expired admission without observing the underlying route error.
+       Owner-local expiry, crossed-domain, remaining-validity, classification, and redaction
+       regressions plus the repository boundary check prevent raw errors from returning through
+       this common runtime authority seam or being routed back through `map_store_error`.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces

@@ -320,7 +320,7 @@ impl<'a> BucketHandleLoader<'a> {
             .require_storage_route_admission(admission)?;
         let snapshot = admission
             .active_bucket_route(name)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .load_bucket_snapshot(request.resolve_to_storage_request())
             .map_err(Self::map_bucket_snapshot_error)?;
         self.load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)

@@ -2442,7 +2442,11 @@ pub struct StorageClusterRouteAdmission {
 }
 
 impl StorageClusterRouteAdmission {
-    pub fn require_valid_now(&self) -> Result<(), StoreError> {
+    pub fn require_valid_now(&self) -> Result<(), crate::StoreFailure> {
+        self.require_valid_now_raw().map_err(Into::into)
+    }
+
+    fn require_valid_now_raw(&self) -> Result<(), StoreError> {
         self.cluster.require_route_map_valid_now()?;
         let local_monotonic_ms = crate::clock::monotonic_time_millis();
         if self
@@ -2468,6 +2472,14 @@ impl StorageClusterRouteAdmission {
     pub fn require_valid_now_for(
         &self,
         storage_cluster: &Arc<StorageCluster>,
+    ) -> Result<(), crate::StoreFailure> {
+        self.require_valid_now_for_raw(storage_cluster)
+            .map_err(Into::into)
+    }
+
+    fn require_valid_now_for_raw(
+        &self,
+        storage_cluster: &Arc<StorageCluster>,
     ) -> Result<(), StoreError> {
         if !Arc::ptr_eq(&self.cluster, storage_cluster) {
             return Err(StoreError::RouteAdmissionClusterMismatch {
@@ -2475,7 +2487,7 @@ impl StorageClusterRouteAdmission {
                 operation_epoch: storage_cluster.cluster_epoch(),
             });
         }
-        self.require_valid_now()
+        self.require_valid_now_raw()
     }
 
     /// Return the remaining lifetime of this admission's captured route
@@ -2483,8 +2495,12 @@ impl StorageClusterRouteAdmission {
     /// renewal; callers may use this to bound waits which otherwise perform no
     /// storage effect and therefore have no natural capability revalidation
     /// point.
-    pub fn remaining_validity(&self) -> Result<Option<Duration>, StoreError> {
-        self.require_valid_now()?;
+    pub fn remaining_validity(&self) -> Result<Option<Duration>, crate::StoreFailure> {
+        self.remaining_validity_raw().map_err(Into::into)
+    }
+
+    fn remaining_validity_raw(&self) -> Result<Option<Duration>, StoreError> {
+        self.require_valid_now_raw()?;
         let Some(valid_until_monotonic_ms) = self.admitted_lease.local_valid_until_monotonic_ms
         else {
             return Ok(None);
@@ -2541,8 +2557,9 @@ impl StorageClusterRouteAdmission {
     pub fn active_bucket_route<'admission>(
         &'admission self,
         bucket: &BucketName,
-    ) -> Result<ActiveBucketRoute<'admission>, StoreError> {
-        self.require_valid_now()?;
+    ) -> Result<ActiveBucketRoute<'admission>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         Ok(ActiveBucketRoute {
             admission: self,
             bucket: bucket.clone(),
@@ -2555,8 +2572,9 @@ impl StorageClusterRouteAdmission {
     pub fn active_bucket_metadata_scan(
         &self,
         owner_canonical_id: &CanonicalUserId,
-    ) -> Result<ActiveBucketMetadataScan<'_>, StoreError> {
-        self.require_valid_now()?;
+    ) -> Result<ActiveBucketMetadataScan<'_>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         Ok(ActiveBucketMetadataScan {
             admission: self,
             owner_canonical_id: owner_canonical_id.clone(),
@@ -2568,8 +2586,9 @@ impl StorageClusterRouteAdmission {
     pub fn active_object_metadata_scan(
         &self,
         bucket: &BucketName,
-    ) -> Result<ActiveObjectMetadataScan<'_>, StoreError> {
-        self.require_valid_now()?;
+    ) -> Result<ActiveObjectMetadataScan<'_>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         Ok(ActiveObjectMetadataScan {
             admission: self,
             bucket: bucket.clone(),
@@ -2584,8 +2603,9 @@ impl StorageClusterRouteAdmission {
         key: &ObjectKey,
         version_id: Option<VersionId>,
         snapshot_mode: ObjectReadSnapshotMode,
-    ) -> Result<ActiveObjectReadRoute<'admission>, StoreError> {
-        self.require_valid_now()?;
+    ) -> Result<ActiveObjectReadRoute<'admission>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         Ok(ActiveObjectReadRoute {
             admission: self,
             bucket: bucket.clone(),
@@ -2603,8 +2623,9 @@ impl StorageClusterRouteAdmission {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
-    ) -> Result<ActiveObjectMetadataMutationRoute<'admission>, StoreError> {
-        self.require_valid_now()?;
+    ) -> Result<ActiveObjectMetadataMutationRoute<'admission>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         Ok(ActiveObjectMetadataMutationRoute {
             admission: self,
             bucket: bucket.clone(),
@@ -2620,8 +2641,9 @@ impl StorageClusterRouteAdmission {
         &'admission self,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<ActivePutObjectRoute<'admission>, StoreError> {
-        self.require_valid_now()?;
+    ) -> Result<ActivePutObjectRoute<'admission>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         Ok(ActivePutObjectRoute {
             admission: self,
             bucket: bucket.clone(),
@@ -2637,8 +2659,9 @@ impl StorageClusterRouteAdmission {
         &'admission self,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<ActiveMultipartObjectRoute<'admission>, StoreError> {
-        self.require_valid_now()?;
+    ) -> Result<ActiveMultipartObjectRoute<'admission>, crate::StoreFailure> {
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         Ok(ActiveMultipartObjectRoute {
             admission: self,
             bucket: bucket.clone(),
@@ -2655,11 +2678,12 @@ impl StorageClusterRouteAdmission {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<RetainedStreamUploadCleanup, StoreError> {
+    ) -> Result<RetainedStreamUploadCleanup, crate::StoreFailure> {
         #[cfg(any(test, feature = "test-hooks"))]
         self.cluster
             .maybe_run_before_retained_stream_cleanup_capability_hook();
-        self.require_valid_now()?;
+        self.require_valid_now_raw()
+            .map_err(crate::StoreFailure::from)?;
         let cleanup = RetainedStreamUploadCleanup {
             cluster: Arc::clone(&self.cluster),
             cluster_epoch: self.cluster.cluster_epoch(),
@@ -2766,7 +2790,7 @@ impl ActiveBucketMetadataScan<'_> {
         self.admission
             .cluster
             .list_buckets_for_owner_with_route_validation(self.owner_canonical_id.as_str(), || {
-                self.admission.require_valid_now()
+                self.admission.require_valid_now_raw()
             })
             .map_err(crate::BucketListingFailure::from_object_pg_action)
     }
@@ -2941,7 +2965,7 @@ impl ActiveObjectReadRoute<'_> {
         };
         self.admission
             .cluster
-            .load_object_if_on_route(&route, action, || self.admission.require_valid_now())
+            .load_object_if_on_route(&route, action, || self.admission.require_valid_now_raw())
             .map_err(ObjectReadFailure::from_object_pg_action)
     }
 
@@ -2959,7 +2983,7 @@ impl ActiveObjectReadRoute<'_> {
         self.admission
             .cluster
             .load_object_read_snapshot_if_on_route(&route, action, || {
-                self.admission.require_valid_now()
+                self.admission.require_valid_now_raw()
             })
             .map_err(ObjectReadFailure::from_object_pg_action)
     }
@@ -2979,7 +3003,7 @@ impl ActiveObjectReadRoute<'_> {
             .admission
             .cluster
             .load_leased_object_read_snapshot_if_on_route(&route, action, || {
-                self.admission.require_valid_now()
+                self.admission.require_valid_now_raw()
             })
             .map_err(ObjectReadFailure::from_object_pg_action)?;
         Ok(outcome.map(|mut outcome| {
@@ -3019,7 +3043,7 @@ impl ActiveObjectReadRoute<'_> {
         self.admission
             .cluster
             .retain_object_payload_read_from_leased_snapshot(leased_snapshot, || {
-                self.admission.require_valid_now()
+                self.admission.require_valid_now_raw()
             })
             .map_err(ObjectReadFailure::from_store)
     }
@@ -3027,7 +3051,7 @@ impl ActiveObjectReadRoute<'_> {
     #[cfg(feature = "test-hooks")]
     pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectReadFailure> {
         self.admission
-            .require_valid_now()
+            .require_valid_now_raw()
             .map_err(ObjectReadFailure::from_store)?;
         self.admission
             .cluster
@@ -3056,7 +3080,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .put_object_metadata_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 |stored| {
                     let version_id = action(stored)?;
                     Ok((
@@ -3077,7 +3101,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .put_object_metadata_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 |stored| {
                     let version_id = action(stored)?;
                     Ok(((), version_id, PutObjectMetadataMutation::DeleteTags))
@@ -3096,7 +3120,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .put_object_metadata_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 |stored| {
                     let version_id = action(stored)?;
                     Ok((
@@ -3119,7 +3143,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .put_object_metadata_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 |stored| {
                     let version_id = action(stored)?;
                     Ok((
@@ -3140,7 +3164,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .put_object_metadata_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 |stored| {
                     let (version_id, acl_grants, public_read) = action(stored)?;
                     Ok((
@@ -3164,7 +3188,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .delete_current_object_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 action,
             )
             .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
@@ -3179,7 +3203,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .delete_specific_object_version_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 action,
             )
             .map_err(ObjectMetadataMutationFailure::from_object_pg_action)
@@ -3195,7 +3219,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
             .cluster
             .insert_current_delete_marker_if_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 versioning,
                 owner,
                 action,
@@ -3213,7 +3237,7 @@ impl ActiveObjectMetadataMutationRoute<'_> {
 
     #[cfg(feature = "test-hooks")]
     pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectMetadataMutationFailure> {
-        self.admission.require_valid_now().map_err(|error| {
+        self.admission.require_valid_now_raw().map_err(|error| {
             ObjectMetadataMutationFailure::from_object_pg_action(ObjectPgActionError::Store(error))
         })?;
         self.admission
@@ -3301,7 +3325,7 @@ impl ActivePutObjectRoute<'_> {
         match self.admission.cluster.load_object_if_on_route(
             &route,
             |stored| Ok::<_, std::convert::Infallible>(stored.clone()),
-            || self.admission.require_valid_now(),
+            || self.admission.require_valid_now_raw(),
         ) {
             Ok(Ok(stored @ StoredObject::Live(_))) => Ok(Some(stored)),
             Ok(Ok(StoredObject::DeleteMarker(_)))
@@ -3324,7 +3348,7 @@ impl ActivePutObjectRoute<'_> {
                     bucket: &self.bucket,
                     effect_fence: self.admission.effect_fence(),
                 },
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 request,
                 action,
             )
@@ -3343,7 +3367,7 @@ impl ActivePutObjectRoute<'_> {
             .cluster
             .with_put_object_bucket_write_snapshot_for_command_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 request,
                 action,
             )
@@ -3359,7 +3383,7 @@ impl ActivePutObjectRoute<'_> {
             .reserve_put_object_generation_with_route_validation(
                 self.effect_route(),
                 reservation_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::DirectPutFailure::from_object_pg_action)
     }
@@ -3377,7 +3401,7 @@ impl ActivePutObjectRoute<'_> {
             .cluster
             .create_put_object_stream_session_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 request,
                 cleanup_after,
                 action,
@@ -3398,7 +3422,7 @@ impl ActivePutObjectRoute<'_> {
                 session_id,
                 encryption,
                 cleanup_after,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
@@ -3408,7 +3432,7 @@ impl ActivePutObjectRoute<'_> {
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, crate::StreamUploadFailure> {
         self.admission
-            .require_valid_now()
+            .require_valid_now_raw()
             .map_err(ObjectPgActionError::from)
             .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
         self.admission
@@ -3426,7 +3450,7 @@ impl ActivePutObjectRoute<'_> {
             .abort_stream_upload_session_with_route_validation(
                 self.effect_route(),
                 session_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
@@ -3440,7 +3464,7 @@ impl ActivePutObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 || {},
                 || Ok(()),
             )
@@ -3460,7 +3484,7 @@ impl ActivePutObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 || {},
                 || maintain_lease().map_err(AdmittedStreamAppendError::Maintenance),
             );
@@ -3485,7 +3509,7 @@ impl ActivePutObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 after_prepare,
                 || Ok(()),
             )
@@ -3506,7 +3530,7 @@ impl ActivePutObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 after_prepare,
                 || maintain_lease().map_err(AdmittedStreamAppendError::Maintenance),
             );
@@ -3528,7 +3552,7 @@ impl ActivePutObjectRoute<'_> {
             .heartbeat_put_object_stream_session_with_route_validation(
                 self.effect_route(),
                 session_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
@@ -3545,7 +3569,7 @@ impl ActivePutObjectRoute<'_> {
                 self.effect_route(),
                 session_id,
                 total_size,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 action,
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
@@ -3570,7 +3594,7 @@ impl ActivePutObjectRoute<'_> {
                 segment_index,
                 &segment_okh,
                 data,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::DirectPutFailure::from_store)?;
         Ok(DirectPutPayloadWrite {
@@ -3656,7 +3680,7 @@ impl ActivePutObjectRoute<'_> {
                 &request,
                 &payload.written.written_shards,
                 || payload.disarm(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 action,
             )
             .map_err(crate::DirectPutFailure::from_object_pg_action)
@@ -3698,7 +3722,7 @@ impl ActivePutObjectRoute<'_> {
     #[cfg(feature = "test-hooks")]
     pub fn try_probe_object_pg_available(&self) -> Result<bool, crate::DirectPutFailure> {
         self.admission
-            .require_valid_now()
+            .require_valid_now_raw()
             .map_err(crate::DirectPutFailure::from_store)?;
         self.admission
             .cluster
@@ -3740,7 +3764,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .cluster
             .create_multipart_upload_with_ordered_id_with_route_validation(
                 self.effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 request,
                 action,
             )
@@ -3758,7 +3782,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .lookup_multipart_upload_management_with_route_validation(
                 self.effect_route(),
                 upload_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map(crate::MultipartUploadAbortLookup::from_management_lookup)
             .map_err(crate::MultipartManagementFailure::from_object_pg_action)
@@ -3774,7 +3798,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .lookup_multipart_upload_management_with_route_validation(
                 self.effect_route(),
                 upload_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map(crate::MultipartUploadListPartsLookup::from_management_lookup)
             .map_err(crate::MultipartManagementFailure::from_object_pg_action)
@@ -3790,7 +3814,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .lookup_multipart_upload_management_with_route_validation(
                 self.effect_route(),
                 upload_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map(crate::MultipartUploadCompletionLookup::from_management_lookup)
             .map_err(crate::MultipartManagementFailure::from_object_pg_action)
@@ -3806,7 +3830,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .load_in_progress_multipart_upload_with_route_validation(
                 self.effect_route(),
                 upload_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map(crate::MultipartUploadPartCandidate::from_record)
             .map_err(crate::MultipartManagementFailure::from_object_pg_action)
@@ -3823,7 +3847,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .load_in_progress_multipart_upload_with_route_validation(
                 self.effect_route(),
                 upload_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map(drop)
             .map_err(crate::MultipartManagementFailure::from_object_pg_action)
@@ -3840,7 +3864,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .load_in_progress_multipart_upload_with_route_validation(
                 self.effect_route(),
                 upload_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
     }
 
@@ -3861,7 +3885,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 authorized_upload.part_number(),
                 session_id,
                 self.admission.authority_valid_until_ms(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
@@ -3871,7 +3895,7 @@ impl ActiveMultipartObjectRoute<'_> {
         session_id: &SessionId,
     ) -> Result<StreamUploadRecord, crate::StreamUploadFailure> {
         self.admission
-            .require_valid_now()
+            .require_valid_now_raw()
             .map_err(ObjectPgActionError::from)
             .map_err(crate::StreamUploadFailure::from_object_pg_action)?;
         self.admission
@@ -3889,7 +3913,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .abort_stream_upload_session_with_route_validation(
                 self.stream_effect_route(),
                 session_id,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
     }
@@ -3903,7 +3927,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.stream_effect_route(),
                 input,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 || {},
                 || Ok(()),
             )
@@ -3922,7 +3946,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .append_stream_segment_with_route_validation(
                 self.stream_effect_route(),
                 input,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 after_prepare,
                 || Ok(()),
             )
@@ -3939,7 +3963,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .finalize_upload_part_stream_with_route_validation(
                 self.effect_route(),
                 input,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 action,
             )
             .map_err(crate::StreamUploadFailure::from_object_pg_action)
@@ -3948,7 +3972,7 @@ impl ActiveMultipartObjectRoute<'_> {
     #[cfg(feature = "test-hooks")]
     pub fn try_probe_object_pg_available(&self) -> Result<bool, crate::MultipartManagementFailure> {
         self.admission
-            .require_valid_now()
+            .require_valid_now_raw()
             .map_err(crate::MultipartManagementFailure::from_store)?;
         self.admission
             .cluster
@@ -3962,7 +3986,7 @@ impl ActiveMultipartObjectRoute<'_> {
         upload_id: &UploadId,
     ) -> Result<Option<MultipartUploadRecord>, crate::MultipartManagementFailure> {
         self.admission
-            .require_valid_now()
+            .require_valid_now_raw()
             .map_err(crate::MultipartManagementFailure::from_store)?;
         self.admission
             .cluster
@@ -3995,7 +4019,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 authorized_upload,
                 part_number_marker,
                 max_parts,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
@@ -4018,7 +4042,7 @@ impl ActiveMultipartObjectRoute<'_> {
                 self.effect_route(),
                 &internal_authorized_upload,
                 requested_part_numbers,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::MultipartCompletionFailure::from_object_pg_action)?;
         Ok(crate::AuthorizedMultipartCompletionSnapshot::new(
@@ -4036,7 +4060,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .complete_multipart_upload_commit_serialized_with_route_validation(
                 self.effect_route(),
                 request,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::MultipartCompletionFailure::from_object_pg_action)
     }
@@ -4061,7 +4085,7 @@ impl ActiveMultipartObjectRoute<'_> {
             .abort_authorized_multipart_upload_locked(
                 self.effect_route(),
                 authorized_upload,
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
             )
             .map_err(crate::MultipartManagementFailure::from_object_pg_action)
     }
@@ -4086,7 +4110,7 @@ impl ActiveObjectMetadataScan<'_> {
         continuation_token: Option<&ObjectKey>,
         max_keys: u32,
     ) -> Result<ListedBucketObjects, crate::ObjectMetadataListingFailure> {
-        let require_valid_route = || self.admission.require_valid_now();
+        let require_valid_route = || self.admission.require_valid_now_raw();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
             require_valid_route: &require_valid_route,
@@ -4111,7 +4135,7 @@ impl ActiveObjectMetadataScan<'_> {
         version_id_marker: Option<VersionId>,
         max_keys: u32,
     ) -> Result<ListedBucketObjectVersions, crate::ObjectMetadataListingFailure> {
-        let require_valid_route = || self.admission.require_valid_now();
+        let require_valid_route = || self.admission.require_valid_now_raw();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
             require_valid_route: &require_valid_route,
@@ -4137,7 +4161,7 @@ impl ActiveObjectMetadataScan<'_> {
         upload_id_marker: Option<&crate::UploadId>,
         max_uploads: u32,
     ) -> Result<ListedBucketMultipartUploads, crate::ObjectMetadataListingFailure> {
-        let require_valid_route = || self.admission.require_valid_now();
+        let require_valid_route = || self.admission.require_valid_now_raw();
         let scan = ObjectMetadataScanRoute {
             bucket: &self.bucket,
             require_valid_route: &require_valid_route,
@@ -4173,7 +4197,7 @@ impl ActiveBucketRoute<'_> {
         &self,
         action: impl FnOnce(&dyn BucketMetadataRoute) -> Result<T, BucketSnapshotLoadError>,
     ) -> Result<T, BucketSnapshotLoadError> {
-        self.admission.require_valid_now()?;
+        self.admission.require_valid_now_raw()?;
         let cluster = &self.admission.cluster;
         let node = cluster
             .local_map
@@ -4197,7 +4221,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .create_bucket_with_config_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 config,
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
@@ -4207,7 +4231,7 @@ impl ActiveBucketRoute<'_> {
         &self,
     ) -> Result<crate::BucketDeleteFinalizeOutcome, crate::BucketWriteDrainFailure> {
         self.admission
-            .require_valid_now()
+            .require_valid_now_raw()
             .map_err(crate::BucketWriteDrainError::from)
             .map_err(crate::BucketWriteDrainFailure::from)?;
         self.admission
@@ -4223,7 +4247,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .begin_bucket_delete_if_current_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 bucket_identity,
             )
             .map_err(crate::BucketWriteDrainFailure::from)
@@ -4274,7 +4298,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .load_bucket_delete_authorization_snapshot_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 request,
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
@@ -4288,7 +4312,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .load_active_bucket_delete_attempt_authorization_snapshot_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 request,
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
@@ -4303,7 +4327,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .with_bucket_write_snapshot_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 request,
                 action,
             )
@@ -4318,7 +4342,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .put_bucket_versioning_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 state,
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
@@ -4332,7 +4356,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .put_bucket_property_command_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 mutation,
             )
     }
@@ -4404,7 +4428,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .put_bucket_acl_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 acl_grants,
                 summary,
             )
@@ -4419,7 +4443,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .put_bucket_subresource_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 req,
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
@@ -4433,7 +4457,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .delete_bucket_subresource_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 kind.stored_kind(),
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
@@ -4446,7 +4470,7 @@ impl ActiveBucketRoute<'_> {
             .cluster
             .delete_bucket_subresource_and_load_info_with_route_validation(
                 self.mutation_effect_route(),
-                || self.admission.require_valid_now(),
+                || self.admission.require_valid_now_raw(),
                 BucketSubresourceKind::Tagging,
             )
             .map_err(crate::BucketSnapshotLoadFailure::from)
@@ -4455,7 +4479,7 @@ impl ActiveBucketRoute<'_> {
     #[cfg(feature = "test-hooks")]
     pub fn try_probe_bucket_pg_available(&self) -> Result<bool, crate::BucketSnapshotLoadFailure> {
         let result = (|| {
-            self.admission.require_valid_now()?;
+            self.admission.require_valid_now_raw()?;
             self.admission
                 .cluster
                 .try_probe_bucket_pg_available(&self.bucket)
@@ -4569,6 +4593,14 @@ impl StorageClusterRouteHandle {
     pub fn require_admission_valid_now(
         &self,
         admission: &StorageClusterRouteAdmission,
+    ) -> Result<(), crate::StoreFailure> {
+        self.require_admission_valid_now_raw(admission)
+            .map_err(Into::into)
+    }
+
+    fn require_admission_valid_now_raw(
+        &self,
+        admission: &StorageClusterRouteAdmission,
     ) -> Result<(), StoreError> {
         let cluster = self.current();
         if !Arc::ptr_eq(&self.route_admission.inner, &admission._permit.gate.inner) {
@@ -4577,7 +4609,7 @@ impl StorageClusterRouteHandle {
                 operation_epoch: cluster.cluster_epoch(),
             });
         }
-        admission.require_valid_now_for(&cluster)
+        admission.require_valid_now_for_raw(&cluster)
     }
 
     /// Return whether both handles participate in the same frontend
@@ -4605,7 +4637,11 @@ impl StorageClusterRouteHandle {
         self.route_admission.wait_until_publication_is_pending();
     }
 
-    pub fn admit_current_route(&self) -> Result<StorageClusterRouteAdmission, StoreError> {
+    pub fn admit_current_route(&self) -> Result<StorageClusterRouteAdmission, crate::StoreFailure> {
+        self.admit_current_route_raw().map_err(Into::into)
+    }
+
+    fn admit_current_route_raw(&self) -> Result<StorageClusterRouteAdmission, StoreError> {
         let permit = self.route_admission.acquire();
         let cluster = self.current();
         let admitted_lease = cluster.local_map.route_map_lease_snapshot();
@@ -4614,7 +4650,7 @@ impl StorageClusterRouteHandle {
             cluster,
             _permit: permit,
         };
-        admission.require_valid_now()?;
+        admission.require_valid_now_raw()?;
         Ok(admission)
     }
 
@@ -4636,7 +4672,7 @@ impl StorageClusterRouteHandle {
             cluster,
             _permit: permit,
         };
-        admission.require_valid_now()?;
+        admission.require_valid_now_raw()?;
         Ok(admission)
     }
 
@@ -6439,7 +6475,7 @@ mod runtime_map_refresh_invalidation_tests {
         crate::clock::with_time_override(6_000, || {
             cluster.require_route_map_valid_now().unwrap();
             assert!(matches!(
-                admission.require_valid_now(),
+                admission.require_valid_now_raw(),
                 Err(StoreError::RouteMapExpired {
                     cluster_epoch,
                     valid_until_ms: 5_000,
@@ -6462,9 +6498,11 @@ mod runtime_map_refresh_invalidation_tests {
                 StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&admitted_cluster));
             let admission = handle.admit_current_route().unwrap();
 
-            admission.require_valid_now_for(&admitted_cluster).unwrap();
+            admission
+                .require_valid_now_for_raw(&admitted_cluster)
+                .unwrap();
             assert!(matches!(
-                admission.require_valid_now_for(&unrelated_cluster),
+                admission.require_valid_now_for_raw(&unrelated_cluster),
                 Err(StoreError::RouteAdmissionClusterMismatch {
                     admitted_epoch,
                     operation_epoch,
@@ -6488,14 +6526,20 @@ mod runtime_map_refresh_invalidation_tests {
             admitted_handle
                 .require_admission_valid_now(&admission)
                 .unwrap();
-            assert!(matches!(
-                unrelated_handle.require_admission_valid_now(&admission),
-                Err(StoreError::RouteAdmissionClusterMismatch {
-                    admitted_epoch,
-                    operation_epoch,
-                }) if admitted_epoch == ClusterEpoch::INITIAL
-                    && operation_epoch == ClusterEpoch::INITIAL
-            ));
+            let error = unrelated_handle
+                .require_admission_valid_now(&admission)
+                .unwrap_err();
+            assert_eq!(
+                error.class(),
+                crate::StoreOperationFailureClass::RetryableConvergence
+            );
+            assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
+            assert_eq!(error.to_string(), "storage operation failed");
+            assert!(std::error::Error::source(&error).is_none());
+            let debug = format!("{error:?}");
+            assert!(!debug.contains("RouteAdmissionClusterMismatch"));
+            assert!(!debug.contains("admitted_epoch"));
+            assert!(!debug.contains("operation_epoch"));
         });
     }
 
@@ -6519,14 +6563,12 @@ mod runtime_map_refresh_invalidation_tests {
             );
         });
         crate::clock::with_time_override(5_000, || {
-            assert!(matches!(
-                admission.remaining_validity(),
-                Err(StoreError::RouteMapExpired {
-                    valid_until_ms: 5_000,
-                    now_ms: 5_000,
-                    ..
-                })
-            ));
+            let error = admission.remaining_validity().unwrap_err();
+            assert_eq!(
+                error.class(),
+                crate::StoreOperationFailureClass::RetryableConvergence
+            );
+            assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
         });
     }
 
@@ -6649,7 +6691,7 @@ mod runtime_map_refresh_invalidation_tests {
         crate::clock::with_time_override(6_000, || {
             cluster.require_route_map_valid_now().unwrap();
             assert!(matches!(
-                admission.require_valid_now(),
+                admission.require_valid_now_raw(),
                 Err(StoreError::RouteMapExpired {
                     valid_until_ms: 5_000,
                     now_ms: 6_000,
@@ -6681,14 +6723,15 @@ mod runtime_map_refresh_invalidation_tests {
         crate::clock::with_time_override(5_000, || {
             let cluster = active_test_cluster(RouteMapValidity::until_ms(5_000).unwrap());
             let handle = StorageClusterRouteHandle::from_authorized_cluster(cluster);
-            assert!(matches!(
-                handle.admit_current_route(),
-                Err(StoreError::RouteMapExpired {
-                    cluster_epoch,
-                    valid_until_ms: 5_000,
-                    now_ms: 5_000,
-                }) if cluster_epoch == ClusterEpoch::INITIAL
-            ));
+            let error = handle
+                .admit_current_route()
+                .err()
+                .expect("expired route must not be admitted");
+            assert_eq!(
+                error.class(),
+                crate::StoreOperationFailureClass::RetryableConvergence
+            );
+            assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
         });
     }
 
@@ -10449,11 +10492,8 @@ impl StorageCluster {
             .replace_route_map_lease(validity, bound_lease);
     }
 
-    pub fn is_route_map_valid_at(&self, now_ms: u64) -> bool {
-        self.local_map.is_route_map_valid_at(now_ms)
-    }
-
-    pub fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
+    #[cfg(test)]
+    pub(crate) fn require_route_map_valid_at(&self, now_ms: u64) -> Result<(), StoreError> {
         self.local_map.require_route_map_valid_at(now_ms)
     }
 

@@ -122,7 +122,7 @@ impl Coordinator {
             .requiring_bucket_tags_if_abac_enabled();
         let put_route = admission
             .active_put_object_route(req.object.bucket.name_typed(), req.object.key_typed())
-            .map_err(super::super::map_store_error)?;
+            .map_err(super::super::map_store_failure)?;
         self.with_bucket_write_handle_on_admitted_route(admission, &req.object, request, |bucket| {
             let existing_object = put_route
                 .load_existing_live_object()
@@ -187,7 +187,7 @@ impl Coordinator {
                 lookup_version_id,
                 ObjectReadSnapshotMode::MetadataOnly,
             )
-            .map_err(crate::coordinator::map_store_error)?;
+            .map_err(crate::coordinator::map_store_failure)?;
         #[cfg(test)]
         if self.should_probe_delete_object_lookup(bucket.as_str()) {
             let object_pg_ready = route
@@ -712,7 +712,7 @@ impl Coordinator {
         let admission = self.admit_storage_route_for_request()?;
         let route = admission
             .active_multipart_object_route(bucket, key)
-            .map_err(super::super::map_store_error)?;
+            .map_err(super::super::map_store_failure)?;
         self.with_bucket_write_handle_on_admitted_route(
             &admission,
             &req.upload,
@@ -883,7 +883,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let multipart_route = admission
             .active_multipart_object_route(bucket, key)
-            .map_err(super::super::map_store_error)?;
+            .map_err(super::super::map_store_failure)?;
         let bucket_info = self.checked_active_bucket_summary_for_admitted_route(
             admission,
             bucket,
@@ -975,7 +975,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         let multipart_route = admission
             .active_multipart_object_route(bucket, key)
-            .map_err(super::super::map_store_error)?;
+            .map_err(super::super::map_store_failure)?;
         let bucket_info = self.checked_active_bucket_summary_for_admitted_route(
             admission,
             bucket,

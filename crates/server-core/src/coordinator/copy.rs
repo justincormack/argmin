@@ -309,7 +309,7 @@ impl Coordinator {
                     src_version_id,
                     storage::ObjectReadSnapshotMode::FullPayloadLayout,
                 )
-                .map_err(super::map_store_error)?;
+                .map_err(super::map_store_failure)?;
             let retained = source_route
                 .retain_object_payload_read(source_payload_handoff)
                 .map_err(super::map_object_read_failure)?
@@ -388,7 +388,7 @@ impl Coordinator {
                 req.destination.bucket.name_typed(),
                 req.destination.key_typed(),
             )
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let stream_cleanup = self.retained_stream_upload_cleanup(
             admission,
             req.destination.bucket.name_typed(),
@@ -626,7 +626,7 @@ impl Coordinator {
                     src_version_id,
                     storage::ObjectReadSnapshotMode::FullPayloadLayout,
                 )
-                .map_err(super::map_store_error)?;
+                .map_err(super::map_store_failure)?;
             let retained = source_route
                 .retain_object_payload_read(source_payload_handoff)
                 .map_err(super::map_object_read_failure)?
@@ -667,7 +667,7 @@ impl Coordinator {
         } = destination;
         let multipart_route = admission
             .active_multipart_object_route(req.upload.bucket_name_typed(), req.upload.key_typed())
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         let stream_cleanup = self.retained_stream_upload_cleanup(
             admission,
             req.upload.bucket_name_typed(),

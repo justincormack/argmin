@@ -163,7 +163,7 @@ impl Coordinator {
             .requiring_bucket_tags_if_abac_enabled();
         let snapshot = match admission
             .active_bucket_route(req.name_typed())
-            .map_err(crate::coordinator::map_store_error)?
+            .map_err(crate::coordinator::map_store_failure)?
             .load_bucket_delete_authorization_snapshot(request.resolve_to_storage_request())
         {
             Ok(snapshot) => snapshot,
@@ -197,7 +197,7 @@ impl Coordinator {
             .requiring_bucket_tags_if_abac_enabled();
         let Some(snapshot) = admission
             .active_bucket_route(req.name_typed())
-            .map_err(crate::coordinator::map_store_error)?
+            .map_err(crate::coordinator::map_store_failure)?
             .load_active_bucket_delete_attempt_authorization_snapshot(
                 request.resolve_to_storage_request(),
             )

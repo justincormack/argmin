@@ -18,7 +18,7 @@ use super::runtime::{
 #[cfg(test)]
 use super::trusted_bucket_name;
 use super::{
-    map_store_error, shared_caches_for_storage_cluster, Coordinator, CoordinatorSharedCaches,
+    map_store_failure, shared_caches_for_storage_cluster, Coordinator, CoordinatorSharedCaches,
 };
 use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
@@ -266,7 +266,7 @@ impl Coordinator {
     ) -> Result<BucketSummary, ServerError> {
         let info = admission
             .active_bucket_route(name)
-            .map_err(map_store_error)?
+            .map_err(map_store_failure)?
             .head_bucket_info()
             .map_err(Self::map_bucket_snapshot_load_error)?;
         if info.state != BucketState::Active {
@@ -727,7 +727,7 @@ impl Coordinator {
     ) -> Result<StorageClusterRouteAdmission, ServerError> {
         self.storage_node
             .admit_current_route()
-            .map_err(map_store_error)
+            .map_err(map_store_failure)
     }
 
     pub(super) fn require_storage_route_admission(
@@ -736,7 +736,7 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         self.storage_node
             .require_admission_valid_now(admission)
-            .map_err(map_store_error)
+            .map_err(map_store_failure)
     }
 
     pub fn shares_storage_route_admission_with(&self, other: &Self) -> bool {

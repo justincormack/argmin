@@ -416,7 +416,7 @@ impl Coordinator {
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         let route = admission
             .active_object_metadata_mutation_route(bucket, key, req.object.version_id)
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         #[cfg(test)]
         self.probe_object_metadata_mutation_on_admitted_route(
             &route,
@@ -505,7 +505,7 @@ impl Coordinator {
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         admission
             .active_object_metadata_mutation_route(bucket, key, req.object.version_id)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_retention_if(req.retention, |stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
                     req.object.requester(),
@@ -588,7 +588,7 @@ impl Coordinator {
                 req.version_id,
                 ObjectReadSnapshotMode::MetadataOnly,
             )
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         #[cfg(test)]
         self.probe_object_metadata_access_on_admitted_route(
             &route,
@@ -665,7 +665,7 @@ impl Coordinator {
         let legal_hold = StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold));
         admission
             .active_object_metadata_mutation_route(bucket, key, req.object.version_id)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_legal_hold_if(legal_hold, |stored| {
                 if !self.requester_can_manage_object_lock_with_bucket_policy(
                     req.object.requester(),
@@ -734,7 +734,7 @@ impl Coordinator {
                 req.version_id,
                 ObjectReadSnapshotMode::MetadataOnly,
             )
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         #[cfg(test)]
         self.probe_object_metadata_access_on_admitted_route(
             &route,
@@ -811,7 +811,7 @@ impl Coordinator {
                 req.version_id,
                 ObjectReadSnapshotMode::MetadataOnly,
             )
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         #[cfg(test)]
         self.probe_object_metadata_access_on_admitted_route(
             &route,
@@ -885,7 +885,7 @@ impl Coordinator {
             Self::requester_can_bucket_owner_account_admin(req.object.requester(), &bucket_info);
         admission
             .active_object_metadata_mutation_route(bucket, key, req.version_id)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .delete_tags_if(|stored| {
                 if !self.requester_can_manage_object_tags_with_bucket_policy(
                     BucketPolicyAccess {
@@ -959,7 +959,7 @@ impl Coordinator {
                 req.version_id,
                 ObjectReadSnapshotMode::MetadataOnly,
             )
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         #[cfg(test)]
         self.probe_object_metadata_access_on_admitted_route(
             &route,
@@ -1061,7 +1061,7 @@ impl Coordinator {
         let policy_context = req.authorization_policy_context()?;
         admission
             .active_object_metadata_mutation_route(bucket, key, req.object.version_id)
-            .map_err(super::map_store_error)?
+            .map_err(super::map_store_failure)?
             .put_acl_if(|stored| {
                 if !self.requester_can_write_object_acl_with_bucket_policy(
                     BucketPolicyAccess {

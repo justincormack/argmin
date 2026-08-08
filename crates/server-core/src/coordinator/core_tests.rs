@@ -10564,6 +10564,12 @@ fn semantic_storage_failure_classes_map_to_s3_outcomes() {
             super::map_store_error(failure(class)),
             ServerError::SlowDown
         ));
+        assert!(matches!(
+            super::map_store_failure(
+                storage::test_support::store_failure_for_operation_failure_class(class),
+            ),
+            ServerError::SlowDown
+        ));
     }
     assert!(matches!(
         super::map_store_error_with_metadata_contention(
@@ -10574,6 +10580,15 @@ fn semantic_storage_failure_classes_map_to_s3_outcomes() {
     ));
     assert!(matches!(
         super::map_store_error(failure(storage::StoreOperationFailureClass::Other)),
+        ServerError::Store(ref failure)
+            if failure.class() == storage::StoreOperationFailureClass::Other
+    ));
+    assert!(matches!(
+        super::map_store_failure(
+            storage::test_support::store_failure_for_operation_failure_class(
+                storage::StoreOperationFailureClass::Other,
+            ),
+        ),
         ServerError::Store(ref failure)
             if failure.class() == storage::StoreOperationFailureClass::Other
     ));

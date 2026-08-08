@@ -87,7 +87,7 @@ impl Coordinator {
         self.require_storage_route_admission(admission)?;
         admission
             .retained_stream_upload_cleanup(bucket, key)
-            .map_err(super::map_store_error)
+            .map_err(super::map_store_failure)
     }
 
     pub fn abort_stream_upload_with_retained_cleanup(
@@ -608,7 +608,7 @@ impl Coordinator {
         let admission = self.admit_storage_route_for_request()?;
         let route = admission
             .active_put_object_route(bucket, key)
-            .map_err(super::map_store_error)?;
+            .map_err(super::map_store_failure)?;
         self.append_stream_segment_on_route(&route, bucket, key, session_id, segment_index, payload)
             .map_err(Self::map_stream_upload_failure)
     }
