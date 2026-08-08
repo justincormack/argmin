@@ -1386,6 +1386,7 @@ pub(crate) trait RetainedShardAckRoute: Send {
 }
 
 pub(crate) trait ShardScavengerNodeClient: Send + Sync {
+    #[cfg(test)]
     fn cluster_map_history_route_references(
         &self,
     ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError>;

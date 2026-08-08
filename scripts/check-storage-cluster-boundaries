@@ -4532,6 +4532,82 @@ fail_with_matches \
     "Physical payload shard writes and repairs must remain storage-private and expose no ShardIoError boundary" \
     "$raw_payload_shard_write_public_surface"
 
+raw_route_history_query_public_surface=$(
+    {
+        for method in \
+            cluster_map_history_reference_summary \
+            cluster_map_history_route_references \
+            reconstructed_pg_route_at_epoch
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/local.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/local.rs: owner-only route-history method ${method} must remain crate-private"
+            fi
+        done
+        for method in \
+            cluster_map_history_reference_summary \
+            reconstructed_pg_route_at_epoch
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/metadata_operations.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/metadata_operations.rs: owner-only route-history method ${method} must remain crate-private"
+            fi
+        done
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+cluster_map_history_reference_summary\b' \
+            crates/storage/src/cluster/metadata_operations.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/metadata_operations.rs: unused StorageCluster history-reference aggregation must remain owner-test-only'
+        fi
+        for method in \
+            cluster_map_history_reference_summary \
+            cluster_map_history_route_references
+        do
+            if ! rg -q -U \
+                "#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/local.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/local.rs: unused history-reference aggregation ${method} must remain owner-test-only"
+            fi
+        done
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*fn[[:space:]]+cluster_map_history_route_references\b' \
+            crates/storage/src/node_client/interface.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/node_client/interface.rs: unused history-reference node-client dispatch must remain owner-test-only'
+        fi
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*fn[[:space:]]+cluster_map_history_route_references\b' \
+            crates/storage/src/node_client/local.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/node_client/local.rs: unused local history-reference node-client dispatch must remain owner-test-only'
+        fi
+        unix_history_test_only_count=$(
+            rg -U -c \
+                '#\[cfg\(test\)\][[:space:]]*(pub\(crate\)[[:space:]]+)?fn[[:space:]]+cluster_map_history_route_references\b' \
+                crates/storage/src/node_client/unix_rpc.rs \
+                || true
+        )
+        if [ "$unix_history_test_only_count" != 2 ]; then
+            printf '%s\n' \
+                'crates/storage/src/node_client/unix_rpc.rs: both unused Unix history-reference dispatch layers must remain owner-test-only'
+        fi
+    }
+)
+fail_with_matches \
+    "Route-history reconstruction and reference collection on cluster handles must remain storage-owned crate-private operations" \
+    "$raw_route_history_query_public_surface"
+
 raw_payload_test_support_error_transit=$(
     {
         awk '

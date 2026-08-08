@@ -966,6 +966,7 @@ impl RetainedShardAckRoute for LocalRetainedShardAckRoute {
 }
 
 impl ShardScavengerNodeClient for LocalStorageNodeClient {
+    #[cfg(test)]
     fn cluster_map_history_route_references(
         &self,
     ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError> {

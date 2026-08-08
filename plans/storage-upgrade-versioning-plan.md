@@ -2303,11 +2303,21 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        owner-local tests. The boundary checker pins those three methods to crate visibility and the
        repository-wide concrete-error scan now rejects `ShardIoError` outside storage alongside the
        other raw implementation errors.
+       The route-history query visibility sub-slice completed on 2026-08-08. Route-history
+       reference collection and historical-route reconstruction on `StorageCluster` and
+       `LocalClusterMap` are now crate-private; all callers were already storage-owned routing,
+       recovery, maintenance, control-plane, or owner-local test code. The heartbeat and
+       control-plane history values remain storage-owned protocol representations, while the
+       cluster implementation methods which can return `StoreError` no longer form a public API.
+       The three reference-aggregation methods and their node-client dispatch branch are compiled
+       only for owner tests because the visibility change proved that they had no production
+       caller; the storage-node RPC operation remains part of the current wire grammar. The
+       boundary checker pins all five owner methods to crate visibility.
        A compiler visibility audit performed after that conversion proved the earlier final-export
        inventory incomplete. Making the raw enums crate-private still identifies owner-only public
-       methods for route-history reconstruction, stream and multipart primitives, payload leases,
-       and physical placement; these have no external production callers and must be narrowed to
-       crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
+       methods for stream and multipart primitives, payload leases, and physical placement; these
+       have no external production callers and must be narrowed to crate visibility. Finally,
+       `ClusterBuildError::OpenLocalNode` and
        `StorageNodeServerError::Store` publicly embed `StoreError` and need storage-owned opaque
        diagnostics while preserving owner-local exact-error coverage. Complete those three bounded
        groups, rerun the compiler visibility audit with warnings denied, then make `StoreError`,

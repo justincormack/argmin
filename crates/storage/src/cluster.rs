@@ -68,10 +68,9 @@ use crate::peering::{
     PgPeeringReconstructionDecision, PgPeeringReconstructionError, PgPeeringReconstructionFailure,
     PgPeeringReplicaReconstructionInput,
 };
-use crate::pg_store::{
-    MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,
-    PgClusterMapHistoryReferenceSummary,
-};
+#[cfg(test)]
+use crate::pg_store::PgClusterMapHistoryReferenceSummary;
+use crate::pg_store::{MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus};
 use crate::storage_rpc::{
     StorageRpcErrorCode, STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
     STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES, STORAGE_RPC_MAX_PAYLOAD_LEN,

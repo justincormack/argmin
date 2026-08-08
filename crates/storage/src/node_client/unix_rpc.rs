@@ -498,6 +498,7 @@ impl UnixStorageNodeClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cluster_map_history_route_references(
         &self,
     ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError> {
@@ -1533,6 +1534,7 @@ impl RetainedShardAckRoute for UnixRetainedShardAckRoute<'_> {
 }
 
 impl ShardScavengerNodeClient for UnixStorageNodeClient {
+    #[cfg(test)]
     fn cluster_map_history_route_references(
         &self,
     ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError> {

@@ -3814,7 +3814,8 @@ impl StorageCluster {
         self.local_map.node_ids()
     }
 
-    pub fn cluster_map_history_reference_summary(
+    #[cfg(test)]
+    pub(crate) fn cluster_map_history_reference_summary(
         &self,
     ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
         self.local_map.cluster_map_history_reference_summary()
@@ -3904,7 +3905,7 @@ impl StorageCluster {
         Ok(cluster)
     }
 
-    pub fn reconstructed_pg_route_at_epoch(
+    pub(crate) fn reconstructed_pg_route_at_epoch(
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,

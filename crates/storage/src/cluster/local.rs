@@ -47,6 +47,7 @@ use crate::node_client::{
     UNIX_STORAGE_NODE_DEFAULT_RPC_ADMISSION_WAIT_TIMEOUT,
     UNIX_STORAGE_NODE_MIN_RPC_ADMISSION_LIMIT,
 };
+#[cfg(test)]
 use crate::pg_store::PgClusterMapHistoryReferenceSummary;
 use crate::pg_topology::PgTopology;
 use crate::storage_rpc_transport::{StorageRpcClientEndpoint, StorageRpcEndpointAuthorityIdentity};
@@ -2774,13 +2775,15 @@ impl LocalClusterMap {
         self.nodes.get(&node_id)
     }
 
-    pub fn cluster_map_history_reference_summary(
+    #[cfg(test)]
+    pub(crate) fn cluster_map_history_reference_summary(
         &self,
     ) -> Result<PgClusterMapHistoryReferenceSummary, StoreError> {
         Ok(self.cluster_map_history_route_references()?.summary())
     }
 
-    pub fn cluster_map_history_route_references(
+    #[cfg(test)]
+    pub(crate) fn cluster_map_history_route_references(
         &self,
     ) -> Result<crate::PgClusterMapHistoryRouteReferences, StoreError> {
         let mut references = crate::PgClusterMapHistoryRouteReferences::default();
@@ -3555,7 +3558,7 @@ impl LocalClusterMap {
         self.historical_pg_routes.values()
     }
 
-    pub fn reconstructed_pg_route_at_epoch(
+    pub(crate) fn reconstructed_pg_route_at_epoch(
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
