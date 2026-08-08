@@ -3744,6 +3744,17 @@ mod tests {
     }
 
     #[test]
+    fn resource_exhaustion_rendering_is_pinned_inside_storage() {
+        let failure = StoreError::storage_node_resource_exhausted(0, "repair read payload shard");
+
+        assert_eq!(
+            failure.to_string(),
+            "storage-node repair read payload shard on node 0 exhausted resources: \
+             storage-node diagnostic redacted"
+        );
+    }
+
+    #[test]
     fn operation_failure_classification_is_storage_owned() {
         let epoch_two = ClusterEpoch::new(2).unwrap();
 

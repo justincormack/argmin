@@ -192,6 +192,78 @@ pub mod test_support {
 
     use super::*;
 
+    /// Opaque failure from a storage-owned test operation.
+    ///
+    /// Cross-crate tests receive only a bounded diagnostic category. The
+    /// underlying PG, shard, route, database, and RPC error representation is
+    /// consumed inside storage.
+    pub struct TestStorageFailure {
+        diagnostic_cause_label: &'static str,
+    }
+
+    impl TestStorageFailure {
+        #[must_use]
+        pub const fn diagnostic_cause_label(&self) -> &'static str {
+            self.diagnostic_cause_label
+        }
+
+        fn from_store(error: StoreError) -> Self {
+            Self {
+                diagnostic_cause_label: error.diagnostic_cause_label(),
+            }
+        }
+
+        fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+            Self {
+                diagnostic_cause_label: error.diagnostic_cause_label(),
+            }
+        }
+    }
+
+    impl fmt::Debug for TestStorageFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("TestStorageFailure")
+                .field("cause_label", &self.diagnostic_cause_label)
+                .finish()
+        }
+    }
+
+    impl fmt::Display for TestStorageFailure {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "storage test operation failed ({})",
+                self.diagnostic_cause_label
+            )
+        }
+    }
+
+    impl std::error::Error for TestStorageFailure {}
+
+    #[cfg(test)]
+    mod test_storage_failure_tests {
+        use super::*;
+
+        #[test]
+        fn formatting_retains_only_the_bounded_storage_category() {
+            const SECRET_CONTEXT: &str = "secret test-support storage operation";
+            const SECRET_SOURCE: &str = "secret test-support storage source";
+            let failure = TestStorageFailure::from_store(StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            });
+
+            assert_eq!(failure.diagnostic_cause_label(), "store_io_failure");
+            for rendered in [format!("{failure}"), format!("{failure:?}")] {
+                assert!(rendered.contains("store_io_failure"));
+                assert!(!rendered.contains(SECRET_CONTEXT));
+                assert!(!rendered.contains(SECRET_SOURCE));
+            }
+            assert!(std::error::Error::source(&failure).is_none());
+        }
+    }
+
     /// Opaque failure selected by a higher-layer deterministic test hook.
     pub struct TestInjectedStorageFailure {
         error: StoreError,
@@ -293,49 +365,49 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
-        ) -> Result<TestObjectPayloadSnapshot, ObjectPgActionError>;
+        ) -> Result<TestObjectPayloadSnapshot, TestStorageFailure>;
 
         fn test_object_payload_snapshot_is_fully_present(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_object_payload_snapshot_is_fully_absent(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_object_payload_snapshot_uses_generation_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_object_payload_snapshot_uses_transient_direct_put_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_inject_object_payload_first_segment_unknown_data_pg(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
 
         fn test_inject_object_payload_first_segment_checksum_mismatch(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
 
         fn test_capture_multipart_upload_payload(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError>;
+        ) -> Result<TestMultipartPartPayloadSnapshot, TestStorageFailure>;
 
         fn test_capture_multipart_part_payload(
             &self,
@@ -343,34 +415,34 @@ pub mod test_support {
             key: &ObjectKey,
             upload_id: &UploadId,
             part_number: u32,
-        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError>;
+        ) -> Result<TestMultipartPartPayloadSnapshot, TestStorageFailure>;
 
         fn test_multipart_part_payload_snapshot_is_fully_present(
             &self,
             snapshot: &TestMultipartPartPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_multipart_part_payload_snapshot_is_fully_absent(
             &self,
             snapshot: &TestMultipartPartPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_capture_stream_upload_payload(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             session_id: &SessionId,
-        ) -> Result<TestStreamUploadPayloadSnapshot, ObjectPgActionError>;
+        ) -> Result<TestStreamUploadPayloadSnapshot, TestStorageFailure>;
 
         fn test_stream_upload_payload_snapshot_is_fully_present(
             &self,
             snapshot: &TestStreamUploadPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_stream_upload_payload_snapshot_is_fully_absent(
             &self,
             snapshot: &TestStreamUploadPayloadSnapshot,
-        ) -> Result<bool, StoreError>;
+        ) -> Result<bool, TestStorageFailure>;
     }
 
     impl StorageClusterPayloadTestSupport for StorageCluster {
@@ -421,63 +493,71 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
-        ) -> Result<TestObjectPayloadSnapshot, ObjectPgActionError> {
+        ) -> Result<TestObjectPayloadSnapshot, TestStorageFailure> {
             StorageCluster::test_capture_object_payload(self, bucket, key, version_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_object_payload_snapshot_is_fully_present(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_object_payload_snapshot_is_fully_present(self, snapshot)
+                .map_err(TestStorageFailure::from_store)
         }
 
         fn test_object_payload_snapshot_is_fully_absent(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_object_payload_snapshot_is_fully_absent(self, snapshot)
+                .map_err(TestStorageFailure::from_store)
         }
 
         fn test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_object_payload_snapshot_places_each_shard_on_a_distinct_node(
                 self, snapshot,
             )
+            .map_err(TestStorageFailure::from_store)
         }
 
         fn test_object_payload_snapshot_uses_generation_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_object_payload_snapshot_uses_generation_layout(self, snapshot)
+                .map_err(TestStorageFailure::from_store)
         }
 
         fn test_object_payload_snapshot_uses_transient_direct_put_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_object_payload_snapshot_uses_transient_direct_put_layout(
                 self, snapshot,
             )
+            .map_err(TestStorageFailure::from_store)
         }
 
         fn test_inject_object_payload_first_segment_unknown_data_pg(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_inject_object_payload_first_segment_unknown_data_pg(self, snapshot)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_inject_object_payload_first_segment_checksum_mismatch(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_inject_object_payload_first_segment_checksum_mismatch(
                 self, snapshot,
             )
+            .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_capture_multipart_upload_payload(
@@ -485,8 +565,9 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError> {
+        ) -> Result<TestMultipartPartPayloadSnapshot, TestStorageFailure> {
             StorageCluster::test_capture_multipart_upload_payload(self, bucket, key, upload_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_capture_multipart_part_payload(
@@ -495,7 +576,7 @@ pub mod test_support {
             key: &ObjectKey,
             upload_id: &UploadId,
             part_number: u32,
-        ) -> Result<TestMultipartPartPayloadSnapshot, ObjectPgActionError> {
+        ) -> Result<TestMultipartPartPayloadSnapshot, TestStorageFailure> {
             StorageCluster::test_capture_multipart_part_payload(
                 self,
                 bucket,
@@ -503,20 +584,23 @@ pub mod test_support {
                 upload_id,
                 part_number,
             )
+            .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_multipart_part_payload_snapshot_is_fully_present(
             &self,
             snapshot: &TestMultipartPartPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_multipart_part_payload_snapshot_is_fully_present(self, snapshot)
+                .map_err(TestStorageFailure::from_store)
         }
 
         fn test_multipart_part_payload_snapshot_is_fully_absent(
             &self,
             snapshot: &TestMultipartPartPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_multipart_part_payload_snapshot_is_fully_absent(self, snapshot)
+                .map_err(TestStorageFailure::from_store)
         }
 
         fn test_capture_stream_upload_payload(
@@ -524,22 +608,25 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             session_id: &SessionId,
-        ) -> Result<TestStreamUploadPayloadSnapshot, ObjectPgActionError> {
+        ) -> Result<TestStreamUploadPayloadSnapshot, TestStorageFailure> {
             StorageCluster::test_capture_stream_upload_payload(self, bucket, key, session_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_stream_upload_payload_snapshot_is_fully_present(
             &self,
             snapshot: &TestStreamUploadPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_stream_upload_payload_snapshot_is_fully_present(self, snapshot)
+                .map_err(TestStorageFailure::from_store)
         }
 
         fn test_stream_upload_payload_snapshot_is_fully_absent(
             &self,
             snapshot: &TestStreamUploadPayloadSnapshot,
-        ) -> Result<bool, StoreError> {
+        ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_stream_upload_payload_snapshot_is_fully_absent(self, snapshot)
+                .map_err(TestStorageFailure::from_store)
         }
     }
 
@@ -1921,7 +2008,7 @@ pub mod test_support {
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
         segment_index: u32,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), TestStorageFailure> {
         let segment = snapshot
             .segments()
             .iter()
@@ -1931,9 +2018,12 @@ pub mod test_support {
                 source: std::io::Error::other(format!(
                     "captured payload has no segment {segment_index}"
                 )),
-            })?;
+            })
+            .map_err(TestStorageFailure::from_store)?;
         for shard_index in 0..segment.ec_k + segment.ec_m {
-            cluster.test_inject_object_payload_shard_loss(snapshot, segment_index, shard_index)?;
+            cluster
+                .test_inject_object_payload_shard_loss(snapshot, segment_index, shard_index)
+                .map_err(TestStorageFailure::from_store)?;
         }
         Ok(())
     }
@@ -1943,8 +2033,10 @@ pub mod test_support {
     pub fn object_payload_snapshot_has_exact_shard_owner_leases(
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
-    ) -> Result<bool, StoreError> {
-        cluster.test_object_payload_snapshot_has_exact_shard_owner_leases(snapshot)
+    ) -> Result<bool, TestStorageFailure> {
+        cluster
+            .test_object_payload_snapshot_has_exact_shard_owner_leases(snapshot)
+            .map_err(TestStorageFailure::from_store)
     }
 
     /// Reports whether an opaque payload snapshot has no deletion-exclusion
@@ -1952,8 +2044,10 @@ pub mod test_support {
     pub fn object_payload_snapshot_has_no_leases(
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
-    ) -> Result<bool, StoreError> {
-        cluster.test_object_payload_snapshot_has_no_leases(snapshot)
+    ) -> Result<bool, TestStorageFailure> {
+        cluster
+            .test_object_payload_snapshot_has_no_leases(snapshot)
+            .map_err(TestStorageFailure::from_store)
     }
 
     /// Opaque evidence for one storage-selected committed-payload shard fault.
@@ -2064,12 +2158,13 @@ pub mod test_support {
     pub fn inject_object_payload_first_data_shard_loss(
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
-    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+    ) -> Result<TestObjectPayloadShardFault, TestStorageFailure> {
         inject_object_payload_shard_loss_by_role(
             cluster,
             snapshot,
             TestObjectPayloadShardRole::FirstData,
         )
+        .map_err(TestStorageFailure::from_store)
     }
 
     /// Removes the requested number of data shards from storage's first
@@ -2078,35 +2173,44 @@ pub mod test_support {
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
         count: usize,
-    ) -> Result<TestObjectPayloadShardFaultSet, StoreError> {
-        let segment = snapshot.segments().first().ok_or_else(|| StoreError::Io {
-            context: "select object payload data-shard losses",
-            source: std::io::Error::other("captured object payload has no segments"),
-        })?;
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        let segment = snapshot
+            .segments()
+            .first()
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload data-shard losses",
+                source: std::io::Error::other("captured object payload has no segments"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
         if count > usize::from(segment.ec_k) {
-            return Err(StoreError::Io {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
                 context: "select object payload data-shard losses",
                 source: std::io::Error::other(format!(
                     "requested {count} data-shard losses from an EC layout with {} data shards",
                     segment.ec_k
                 )),
-            });
+            }));
         }
         let mut faults = Vec::with_capacity(count);
-        for shard_index in 0..u8::try_from(count).map_err(|_| StoreError::Io {
-            context: "select object payload data-shard losses",
-            source: std::io::Error::other("requested data-shard loss count does not fit u8"),
-        })? {
+        for shard_index in 0..u8::try_from(count)
+            .map_err(|_| StoreError::Io {
+                context: "select object payload data-shard losses",
+                source: std::io::Error::other("requested data-shard loss count does not fit u8"),
+            })
+            .map_err(TestStorageFailure::from_store)?
+        {
             let fault = TestObjectPayloadShardFault {
                 snapshot: snapshot.clone(),
                 segment_index: segment.segment_index,
                 shard_index,
             };
-            cluster.test_inject_object_payload_shard_loss(
-                &fault.snapshot,
-                fault.segment_index,
-                fault.shard_index,
-            )?;
+            cluster
+                .test_inject_object_payload_shard_loss(
+                    &fault.snapshot,
+                    fault.segment_index,
+                    fault.shard_index,
+                )
+                .map_err(TestStorageFailure::from_store)?;
             faults.push(fault);
         }
         Ok(TestObjectPayloadShardFaultSet { faults })
@@ -2118,35 +2222,44 @@ pub mod test_support {
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
         count: usize,
-    ) -> Result<TestObjectPayloadShardFaultSet, StoreError> {
-        let segment = snapshot.segments().first().ok_or_else(|| StoreError::Io {
-            context: "select object payload data-shard repair wakes",
-            source: std::io::Error::other("captured object payload has no segments"),
-        })?;
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
+        let segment = snapshot
+            .segments()
+            .first()
+            .ok_or_else(|| StoreError::Io {
+                context: "select object payload data-shard repair wakes",
+                source: std::io::Error::other("captured object payload has no segments"),
+            })
+            .map_err(TestStorageFailure::from_store)?;
         if count > usize::from(segment.ec_k) {
-            return Err(StoreError::Io {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
                 context: "select object payload data-shard repair wakes",
                 source: std::io::Error::other(format!(
                     "requested {count} data-shard repair wakes from an EC layout with {} data shards",
                     segment.ec_k
                 )),
-            });
+            }));
         }
         let mut faults = Vec::with_capacity(count);
-        for shard_index in 0..u8::try_from(count).map_err(|_| StoreError::Io {
-            context: "select object payload data-shard repair wakes",
-            source: std::io::Error::other("requested data-shard repair count does not fit u8"),
-        })? {
+        for shard_index in 0..u8::try_from(count)
+            .map_err(|_| StoreError::Io {
+                context: "select object payload data-shard repair wakes",
+                source: std::io::Error::other("requested data-shard repair count does not fit u8"),
+            })
+            .map_err(TestStorageFailure::from_store)?
+        {
             let fault = TestObjectPayloadShardFault {
                 snapshot: snapshot.clone(),
                 segment_index: segment.segment_index,
                 shard_index,
             };
-            cluster.test_schedule_object_payload_repair_wake(
-                &fault.snapshot,
-                fault.segment_index,
-                fault.shard_index,
-            )?;
+            cluster
+                .test_schedule_object_payload_repair_wake(
+                    &fault.snapshot,
+                    fault.segment_index,
+                    fault.shard_index,
+                )
+                .map_err(TestStorageFailure::from_store)?;
             faults.push(fault);
         }
         Ok(TestObjectPayloadShardFaultSet { faults })
@@ -2157,7 +2270,7 @@ pub mod test_support {
     pub fn inject_object_payload_additional_data_losses_beyond_parity(
         cluster: &StorageCluster,
         fault: &TestObjectPayloadShardFault,
-    ) -> Result<TestObjectPayloadShardFaultSet, StoreError> {
+    ) -> Result<TestObjectPayloadShardFaultSet, TestStorageFailure> {
         let segment = fault
             .snapshot
             .segments()
@@ -2166,14 +2279,15 @@ pub mod test_support {
             .ok_or_else(|| StoreError::Io {
                 context: "select additional object payload data-shard losses",
                 source: std::io::Error::other("fault segment is absent from its payload snapshot"),
-            })?;
+            })
+            .map_err(TestStorageFailure::from_store)?;
         if fault.shard_index != 0 || segment.ec_m >= segment.ec_k {
-            return Err(StoreError::Io {
+            return Err(TestStorageFailure::from_store(StoreError::Io {
                 context: "select additional object payload data-shard losses",
                 source: std::io::Error::other(
                     "first-data fault and at least one surviving data shard are required",
                 ),
-            });
+            }));
         }
         let mut faults = Vec::with_capacity(usize::from(segment.ec_m));
         for shard_index in 1..=segment.ec_m {
@@ -2182,11 +2296,13 @@ pub mod test_support {
                 segment_index: fault.segment_index,
                 shard_index,
             };
-            cluster.test_inject_object_payload_shard_loss(
-                &additional.snapshot,
-                additional.segment_index,
-                additional.shard_index,
-            )?;
+            cluster
+                .test_inject_object_payload_shard_loss(
+                    &additional.snapshot,
+                    additional.segment_index,
+                    additional.shard_index,
+                )
+                .map_err(TestStorageFailure::from_store)?;
             faults.push(additional);
         }
         Ok(TestObjectPayloadShardFaultSet { faults })
@@ -2195,45 +2311,49 @@ pub mod test_support {
     pub fn inject_object_payload_first_data_shard_corruption(
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
-    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+    ) -> Result<TestObjectPayloadShardFault, TestStorageFailure> {
         inject_object_payload_shard_corruption_by_role(
             cluster,
             snapshot,
             TestObjectPayloadShardRole::FirstData,
         )
+        .map_err(TestStorageFailure::from_store)
     }
 
     pub fn inject_object_payload_first_parity_shard_loss(
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
-    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+    ) -> Result<TestObjectPayloadShardFault, TestStorageFailure> {
         inject_object_payload_shard_loss_by_role(
             cluster,
             snapshot,
             TestObjectPayloadShardRole::FirstParity,
         )
+        .map_err(TestStorageFailure::from_store)
     }
 
     pub fn inject_object_payload_first_parity_shard_corruption(
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
-    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+    ) -> Result<TestObjectPayloadShardFault, TestStorageFailure> {
         inject_object_payload_shard_corruption_by_role(
             cluster,
             snapshot,
             TestObjectPayloadShardRole::FirstParity,
         )
+        .map_err(TestStorageFailure::from_store)
     }
 
     pub fn inject_object_payload_last_parity_shard_corruption(
         cluster: &StorageCluster,
         snapshot: &TestObjectPayloadSnapshot,
-    ) -> Result<TestObjectPayloadShardFault, StoreError> {
+    ) -> Result<TestObjectPayloadShardFault, TestStorageFailure> {
         inject_object_payload_shard_corruption_by_role(
             cluster,
             snapshot,
             TestObjectPayloadShardRole::LastParity,
         )
+        .map_err(TestStorageFailure::from_store)
     }
 
     /// Reports whether the selected shard still differs from its durable
@@ -2241,7 +2361,7 @@ pub mod test_support {
     pub fn object_payload_shard_fault_remains(
         cluster: &StorageCluster,
         fault: &TestObjectPayloadShardFault,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, TestStorageFailure> {
         cluster
             .test_object_payload_shard_file_matches_ack(
                 &fault.snapshot,
@@ -2249,12 +2369,13 @@ pub mod test_support {
                 fault.shard_index,
             )
             .map(|matches| !matches)
+            .map_err(TestStorageFailure::from_store)
     }
 
     pub fn object_payload_shard_faults_remain(
         cluster: &StorageCluster,
         faults: &TestObjectPayloadShardFaultSet,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, TestStorageFailure> {
         for fault in &faults.faults {
             if !object_payload_shard_fault_remains(cluster, fault)? {
                 return Ok(false);
@@ -2268,39 +2389,40 @@ pub mod test_support {
     pub fn object_payload_shard_fault_has_pending_repair(
         cluster: &StorageCluster,
         fault: &TestObjectPayloadShardFault,
-    ) -> Result<bool, StoreError> {
-        let repairs = cluster.test_object_payload_repair_observations(&fault.snapshot)?;
+    ) -> Result<bool, TestStorageFailure> {
+        let repairs = cluster
+            .test_object_payload_repair_observations(&fault.snapshot)
+            .map_err(TestStorageFailure::from_store)?;
         Ok(matches!(repairs.as_slice(), [repair]
             if repair.segment_index == fault.segment_index
                 && repair.shard_index == fault.shard_index
                 && repair.last_error.is_none()))
     }
 
-    /// Returns the worker error for the selected fault, if that exact fault is
-    /// the sole queued repair.
-    pub fn object_payload_shard_fault_repair_error(
+    /// Reports whether exactly the selected fault is the sole queued repair
+    /// and has a recorded worker error. The durable diagnostic text remains
+    /// storage-private.
+    pub fn object_payload_shard_fault_has_recorded_repair_error(
         cluster: &StorageCluster,
         fault: &TestObjectPayloadShardFault,
-    ) -> Result<Option<String>, StoreError> {
-        let repairs = cluster.test_object_payload_repair_observations(&fault.snapshot)?;
-        Ok(match repairs.as_slice() {
-            [repair]
-                if repair.segment_index == fault.segment_index
-                    && repair.shard_index == fault.shard_index =>
-            {
-                repair.last_error.clone()
-            }
-            _ => None,
-        })
+    ) -> Result<bool, TestStorageFailure> {
+        let repairs = cluster
+            .test_object_payload_repair_observations(&fault.snapshot)
+            .map_err(TestStorageFailure::from_store)?;
+        Ok(matches!(repairs.as_slice(), [repair]
+            if repair.segment_index == fault.segment_index
+                && repair.shard_index == fault.shard_index
+                && repair.last_error.is_some()))
     }
 
     pub fn object_payload_shard_fault_has_no_pending_repair(
         cluster: &StorageCluster,
         fault: &TestObjectPayloadShardFault,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, TestStorageFailure> {
         cluster
             .test_object_payload_repair_observations(&fault.snapshot)
             .map(|repairs| repairs.is_empty())
+            .map_err(TestStorageFailure::from_store)
     }
 
     /// Takes the repair wake for the fault's payload and reports whether it
@@ -2308,12 +2430,14 @@ pub mod test_support {
     pub fn take_object_payload_shard_fault_repair_wake(
         cluster: &StorageCluster,
         fault: &TestObjectPayloadShardFault,
-    ) -> Result<bool, StoreError> {
-        cluster.test_take_object_payload_repair_wake(
-            &fault.snapshot,
-            fault.segment_index,
-            fault.shard_index,
-        )
+    ) -> Result<bool, TestStorageFailure> {
+        cluster
+            .test_take_object_payload_repair_wake(
+                &fault.snapshot,
+                fault.segment_index,
+                fault.shard_index,
+            )
+            .map_err(TestStorageFailure::from_store)
     }
 
     /// Takes every selected repair wake in reverse selection order. This pins
@@ -2322,7 +2446,7 @@ pub mod test_support {
     pub fn take_object_payload_shard_fault_wakes_in_reverse(
         cluster: &StorageCluster,
         faults: &TestObjectPayloadShardFaultSet,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, TestStorageFailure> {
         for fault in faults.faults.iter().rev() {
             if !take_object_payload_shard_fault_repair_wake(cluster, fault)? {
                 return Ok(false);

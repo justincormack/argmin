@@ -4502,6 +4502,82 @@ fail_with_matches \
     "Concrete storage implementation errors must not cross into another crate, including through test hooks or generic ServerError adapters" \
     "$cross_crate_raw_storage_error_transit"
 
+raw_payload_test_support_error_transit=$(
+    {
+        awk '
+        /^    pub trait StorageClusterPayloadTestSupport/ {
+            in_payload_support = 1
+        }
+        /^    impl StorageClusterPayloadTestSupport/ {
+            in_payload_support = 0
+        }
+        in_payload_support && /(ObjectPgActionError|MetadataError|StoreError)/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        ' crates/storage/src/lib.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+(inject_object_payload_|object_payload_(snapshot|shard)_|schedule_object_payload_|take_object_payload_)(?s:[^;{]{0,500})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/lib.rs \
+            || true
+        awk '
+        /^    impl([<[:space:]])/ {
+            collecting_impl_header = 1
+            impl_header = $0
+            if ($0 ~ /[{]/) {
+                in_test_storage_failure = impl_header ~ /(^|[^A-Za-z0-9_])TestStorageFailure([^A-Za-z0-9_]|$)/
+                collecting_impl_header = 0
+            }
+            next
+        }
+        collecting_impl_header {
+            impl_header = impl_header " " $0
+            if ($0 ~ /[{]/) {
+                in_test_storage_failure = impl_header ~ /(^|[^A-Za-z0-9_])TestStorageFailure([^A-Za-z0-9_]|$)/
+                collecting_impl_header = 0
+            }
+            next
+        }
+        in_test_storage_failure && /^    }$/ {
+            in_test_storage_failure = 0
+            collecting_signature = 0
+            next
+        }
+        in_test_storage_failure && /^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+/ {
+            collecting_signature = 1
+            signature = $0
+            signature_start = FILENAME ":" FNR ":" $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+            next
+        }
+        in_test_storage_failure && collecting_signature {
+            signature = signature " " $0
+            if ($0 ~ /[{]/) {
+                if (signature ~ /(ObjectPgActionError|MetadataError|StoreError)/) {
+                    print signature_start
+                }
+                collecting_signature = 0
+            }
+        }
+        ' crates/storage/src/lib.rs
+        rg -n -U --pcre2 --color=never \
+            '^[ \t]*impl(?:(?s:[^{;]{0,1200})\bTestStorageFailure\b(?s:[^{;]{0,1200})\b(?:ObjectPgActionError|MetadataError|StoreError)\b|(?s:[^{;]{0,1200})\b(?:ObjectPgActionError|MetadataError|StoreError)\b(?s:[^{;]{0,1200})\bTestStorageFailure\b)(?s:[^{;]{0,1200})\{' \
+            crates/storage/src/lib.rs \
+            || true
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+object_payload_shard_fault_repair_error|^[[:space:]]*pub[[:space:]]+fn[[:space:]]+object_payload_shard_[A-Za-z0-9_]+(?s:[^;{]{0,500})Result<Option<String>' \
+            crates/storage/src/lib.rs \
+            || true
+    }
+)
+fail_with_matches \
+    "Cross-crate payload test support must return privately constructed TestStorageFailure values and logical observations rather than raw errors or rendered storage diagnostics" \
+    "$raw_payload_test_support_error_transit"
+
 raw_object_metadata_mutation_error_transit=$(
     {
         awk '

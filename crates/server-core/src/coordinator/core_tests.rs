@@ -18701,16 +18701,13 @@ fn shard_repair_worker_retries_after_transient_shard_read_error() {
         Arc::clone(&storage_cluster),
     ));
     assert!(repair.test_repair_one_pending());
-    let repair_error = storage::test_support::object_payload_shard_fault_repair_error(
-        &coord.storage_node(),
-        &corrupt_fault,
-    )
-    .unwrap()
-    .expect("selected corrupt shard should retain the transient repair failure");
-    assert!(repair_error.contains(
-        "storage-node repair read payload shard on node 0 exhausted resources: \
-         storage-node diagnostic redacted",
-    ));
+    assert!(
+        storage::test_support::object_payload_shard_fault_has_recorded_repair_error(
+            &coord.storage_node(),
+            &corrupt_fault,
+        )
+        .unwrap()
+    );
     assert!(read_failure.invocation_count() > 0);
 
     time.set(2_001);
@@ -18815,12 +18812,11 @@ fn shard_repair_worker_records_unrecoverable_repair_without_partial_write() {
     ));
     assert!(repair.test_repair_one_pending());
     assert!(
-        storage::test_support::object_payload_shard_fault_repair_error(
+        storage::test_support::object_payload_shard_fault_has_recorded_repair_error(
             &coord.storage_node(),
             &corrupt_fault,
         )
         .unwrap()
-        .is_some()
     );
     assert!(storage::test_support::object_payload_shard_fault_remains(
         &coord.storage_node(),

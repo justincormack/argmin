@@ -2241,6 +2241,20 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        implementation errors. The boundary checker now rejects every `StoreError`,
        `MetadataError`, or `ObjectPgActionError` reference outside storage, including test and
        feature-gated code, and separately inventories the payload-read lease method.
+       The payload test-support error sub-slice completed on 2026-08-08. The feature-gated
+       `StorageClusterPayloadTestSupport` trait and its cross-crate payload-loss, corruption,
+       repair, lease, and snapshot helpers now return the opaque `TestStorageFailure`. Storage
+       consumes the underlying store or object-PG error at the owner boundary and retains only a
+       bounded diagnostic cause label through private conversion methods; public `Debug`,
+       `Display`, and `Error::source` cannot reveal PG, shard, placement, route, database, or RPC
+       details. Durable repair-error text is asserted owner-locally, while higher-layer tests
+       observe only whether the selected repair has a recorded error. Existing higher-layer tests
+       otherwise continue to consume only logical snapshots, predicates, and fault capabilities.
+       Owner-local redaction/rendering coverage and the boundary checker reject raw implementation
+       errors, public raw-error conversion implementations, or rendered repair diagnostics from
+       this payload-support family. The metadata-command, lifecycle, multipart, and object/checksum
+       test-support families still require the same conversion before the raw error exports can be
+       removed.
        The three concrete error types remain public storage exports only because storage still has
        public low-level or test-support signatures which name them. Continue by converting or
        restricting those owner APIs one bounded family at a time, then remove the root exports and
