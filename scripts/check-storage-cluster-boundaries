@@ -5969,6 +5969,32 @@ fail_with_matches \
     "Cross-crate metadata-command tests must use opaque command-state evidence and subject-scoped storage::test_support hooks, not raw PG IDs, replica proofs, nodes, or apply contexts" \
     "$metadata_command_raw_test_symbol_leaks"
 
+metadata_command_test_support_error_leaks=$(
+    {
+        awk '
+        /^    pub trait StorageClusterMetadataCommandTestSupport/ {
+            in_metadata_command_support = 1
+        }
+        /^    impl StorageClusterMetadataCommandTestSupport/ {
+            in_metadata_command_support = 0
+        }
+        in_metadata_command_support && /(ObjectPgActionError|MetadataError|StoreError)/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        ' crates/storage/src/lib.rs
+        if ! rg -q -U \
+            'fn[[:space:]]+test_capture_object_metadata_command_state(?s:[^;{]{0,500})Result<TestObjectMetadataCommandState,[[:space:]]*TestStorageFailure>' \
+            crates/storage/src/lib.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/lib.rs: metadata-command state capture must return TestStorageFailure'
+        fi
+    }
+)
+fail_with_matches \
+    "Cross-crate metadata-command test support must consume raw storage errors inside storage and return only TestStorageFailure" \
+    "$metadata_command_test_support_error_leaks"
+
 metadata_command_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for)|struct[[:space:]]+MetadataCommandApplyTestContext|type[[:space:]]+MetadataCommandApplyContextTestHook)\b'
 
 scan_public_metadata_command_test_surface() {

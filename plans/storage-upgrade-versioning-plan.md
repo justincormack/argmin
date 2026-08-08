@@ -2252,9 +2252,17 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        otherwise continue to consume only logical snapshots, predicates, and fault capabilities.
        Owner-local redaction/rendering coverage and the boundary checker reject raw implementation
        errors, public raw-error conversion implementations, or rendered repair diagnostics from
-       this payload-support family. The metadata-command, lifecycle, multipart, and object/checksum
-       test-support families still require the same conversion before the raw error exports can be
-       removed.
+       this payload-support family.
+       The metadata-command test-support error sub-slice completed on 2026-08-08. Capturing opaque
+       object command-state evidence now returns `TestStorageFailure`; storage consumes failures
+       from subject routing, primary selection, and proof capture before the owner boundary. The
+       public apply hook already accepted only the opaque `TestInjectedStorageFailure`, whose raw
+       representation can be constructed and recovered only inside storage. Cross-crate tests
+       continue to select only logical bucket/object subjects and command kinds. The boundary
+       checker rejects raw implementation-error types anywhere in the public metadata-command
+       support trait and pins the state-capture method to the opaque failure.
+       The lifecycle, multipart, and object/checksum test-support families still require the same
+       conversion before the raw error exports can be removed.
        The three concrete error types remain public storage exports only because storage still has
        public low-level or test-support signatures which name them. Continue by converting or
        restricting those owner APIs one bounded family at a time, then remove the root exports and

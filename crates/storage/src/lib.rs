@@ -767,7 +767,7 @@ pub mod test_support {
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
-        ) -> Result<TestObjectMetadataCommandState, StoreError>;
+        ) -> Result<TestObjectMetadataCommandState, TestStorageFailure>;
 
         fn test_install_before_bucket_metadata_command_primary_apply_hook(
             &self,
@@ -815,12 +815,14 @@ pub mod test_support {
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
-        ) -> Result<TestObjectMetadataCommandState, StoreError> {
+        ) -> Result<TestObjectMetadataCommandState, TestStorageFailure> {
             Ok(TestObjectMetadataCommandState {
                 storage_domain: self.process_local_registry_key(),
                 bucket: bucket.clone(),
                 key: key.clone(),
-                proof: self.test_object_pg_metadata_proof(bucket, key)?,
+                proof: self
+                    .test_object_pg_metadata_proof(bucket, key)
+                    .map_err(TestStorageFailure::from_store)?,
             })
         }
 
