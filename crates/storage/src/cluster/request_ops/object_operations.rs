@@ -2028,7 +2028,8 @@ impl super::StorageCluster {
         }
     }
 
-    pub fn acquire_object_payload_lease(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn acquire_object_payload_lease(
         self: &std::sync::Arc<Self>,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -2078,7 +2079,7 @@ impl super::StorageCluster {
         ))
     }
 
-    pub fn acquire_object_payload_lease_for_shard_locations(
+    pub(crate) fn acquire_object_payload_lease_for_shard_locations(
         self: &std::sync::Arc<Self>,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -2216,8 +2217,8 @@ impl super::StorageCluster {
         Ok(runtime_state)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn object_payload_lease_count(
+    #[cfg(test)]
+    pub(crate) fn object_payload_lease_count(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -2245,8 +2246,8 @@ impl super::StorageCluster {
             .object_payload_lease_holder_node_count(bucket, key, generation_id)
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
+    #[cfg(test)]
+    pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         if self.operation_epoch() != self.cluster_epoch() {
             return 0;
         }

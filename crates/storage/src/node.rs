@@ -1922,7 +1922,7 @@ impl SharedStorageNode {
     }
 
     /// Return the number of active object-payload leases for a bucket.
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         let state = self
             .object_payload_leases

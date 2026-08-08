@@ -4651,6 +4651,68 @@ fail_with_matches \
     "Direct stream and multipart primitives must remain storage-owner-only and dormant raw-error test hooks must stay removed" \
     "$raw_stream_multipart_primitive_public_surface"
 
+raw_payload_lease_primitive_public_surface=$(
+    {
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+[[:alnum:]_]*payload[[:alnum:]_]*lease\b' \
+            crates/storage/src/cluster/request_ops/object_operations.rs \
+            | rg -v 'acquire_object_payload_read_lease\b' \
+            || true
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(acquire_object_payload_lease|acquire_object_payload_lease_for_shard_locations)(?s:[^;{]{0,900})(ObjectPgActionError|MetadataError|StoreError|ShardIoError)' \
+            crates/storage/src/cluster/request_ops/object_operations.rs \
+            || true
+        if ! rg -q -U \
+            '#\[cfg\(any\(test, feature = "test-hooks"\)\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+acquire_object_payload_lease\b' \
+            crates/storage/src/cluster/request_ops/object_operations.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/request_ops/object_operations.rs: direct generation-wide payload lease acquisition must remain crate-private test support'
+        fi
+        if ! rg -q \
+            '^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+acquire_object_payload_lease_for_shard_locations\b' \
+            crates/storage/src/cluster/request_ops/object_operations.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/request_ops/object_operations.rs: location-expanded payload lease acquisition must remain crate-private'
+        fi
+        if ! rg -q -U \
+            '#\[cfg\(any\(test, feature = "test-hooks"\)\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+try_acquire_object_payload_lease\b' \
+            crates/storage/src/cluster/local.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/local.rs: broad cluster-map payload lease acquisition must remain crate-private test support'
+        fi
+        for method in \
+            object_payload_lease_count \
+            bucket_object_payload_lease_count
+        do
+            if ! rg -q -U \
+                "#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/request_ops/object_operations.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/request_ops/object_operations.rs: payload lease observation ${method} must remain owner-test-only"
+            fi
+        done
+        for source in \
+            crates/storage/src/cluster/local.rs \
+            crates/storage/src/node.rs
+        do
+            if ! rg -q -U \
+                '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+bucket_object_payload_lease_count\b' \
+                "$source"
+            then
+                printf '%s\n' \
+                    "${source}: lower bucket-wide payload lease observation must remain owner-test-only"
+            fi
+        done
+    }
+)
+fail_with_matches \
+    "Raw payload lease construction and physical lease observations must remain storage-owner-only" \
+    "$raw_payload_lease_primitive_public_surface"
+
 raw_payload_test_support_error_transit=$(
     {
         awk '

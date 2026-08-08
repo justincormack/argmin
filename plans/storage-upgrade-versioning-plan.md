@@ -2322,10 +2322,19 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        rather than retained as dormant raw-error APIs; production list-parts uses the admitted
        route-validation state machine directly. The boundary checker pins all six owner-test
        wrappers and removal of both unused constructors.
+       The payload-lease primitive visibility sub-slice completed on 2026-08-08. The opaque,
+       subject-bound `ObjectPayloadLease` and `RetainedObjectPayloadRead` capabilities remain the
+       cross-crate read boundary. Direct generation-wide lease acquisition is now crate-private and
+       compiled only for storage test support and owner tests, including its lower cluster-map
+       constructor; location-expanded acquisition is crate-private for storage's read composition
+       and owner tests. The two direct lease-count observations and the lower bucket-wide node
+       aggregation they use are owner-test-only. The boundary checker rejects renewed public raw
+       lease constructors and pins the count helpers at every cluster/node layer to their test-only
+       visibility.
        A compiler visibility audit performed after that conversion proved the earlier final-export
        inventory incomplete. Making the raw enums crate-private still identifies owner-only public
-       methods for payload leases and physical placement; these have no external production callers
-       and must be narrowed to crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
+       methods for physical placement; these have no external production callers and must be
+       narrowed to crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
        `StorageNodeServerError::Store` publicly embed `StoreError` and need storage-owned opaque
        diagnostics while preserving owner-local exact-error coverage. Complete those three bounded
        groups, rerun the compiler visibility audit with warnings denied, then make `StoreError`,

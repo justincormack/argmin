@@ -3722,6 +3722,7 @@ impl LocalClusterMap {
         Arc::clone(&self.runtime_state)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn try_acquire_object_payload_lease(
         &self,
         bucket: &BucketName,
@@ -4070,7 +4071,7 @@ impl LocalClusterMap {
             .len()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(test)]
     pub(crate) fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         self.nodes
             .values()
