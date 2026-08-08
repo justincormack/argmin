@@ -1,7 +1,6 @@
 # Internal Format Ownership, Upgrade And Versioning Plan
 
-Status: Phase 0 complete; Phase 1 reopened for storage topology and maintenance containment;
-Phase 2 evidence audit planned
+Status: Phase 0 complete; Phase 1 containment complete; Phase 2 evidence audit in progress
 
 ## Context
 
@@ -352,13 +351,12 @@ field shapes without establishing the authority semantics the fields represent.
 Document every durable or cross-process format that needs an explicit baseline version, assign
 its owner, and close the representation leaks before adding further version machinery.
 
-**Status: reopened 2026-07-30.** The representation-containment work completed so far remains
-valid, but the durable-backfill convergence fix exposed a broader class of semantic storage leaks
-that the original audit did not cover. PG identities, route state, physical payload placement,
-maintenance claim protocols, control-plane topology workflows, and implementation error variants
-still cross into `server-core`, `server-http`, or `argmin-s3`. Storage-node TLS profile construction
-also remains outside `storage`. Phase 1 is complete only after both the representation and semantic
-topology/maintenance boundaries below are closed and regression-checked.
+**Status: complete 2026-08-08.** Phase 1 was reopened on 2026-07-30 after the durable-backfill
+convergence fix exposed semantic storage leaks that the original representation audit did not
+cover. The subsequent containment slices moved PG identity, route state, physical payload
+placement, maintenance claim protocols, control-plane topology workflows, implementation errors,
+and storage-node TLS profile construction behind storage-owned boundaries. The matrix and immediate
+steps below retain the detailed evidence for that completed work.
 
 Initial inventory:
 
@@ -1723,9 +1721,8 @@ Phase 1 exit criteria:
 - Boundary checks cover known high-risk leaks, while compiler visibility remains the primary
   enforcement mechanism.
 
-The storage-node TLS-profile item and every topology/maintenance item in the audit above remain
-unsatisfied Phase 1 exit criteria. Phase 2 may be inventoried in parallel, but implementation of
-new version boundaries does not begin until all of this containment work is complete.
+All Phase 1 exit criteria above are now satisfied and boundary-checked. Phase 2 therefore begins
+with the evidence audit below; it does not reopen containment or introduce compatibility readers.
 
 ## Phase 2: Baseline Version Markers
 
@@ -1771,7 +1768,9 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Boundary family | Owner | Current candidate baseline | Gate status |
 | --- | --- | --- | --- |
 | PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 1`; version zero is valid only with no user schema objects | Recorded |
-| Metadata commands and abandoned-command records | `storage` | command encoding 6; abandoned-command encoding 1 | Evidence required |
+| Applied metadata-command envelope | `storage` | magic `argmin-metadata-command`; command encoding 6 | Evidence required; first owner audit recorded below |
+| Abandoned metadata-command record | `storage` | magic `argmin-metadata-command-abandoned`; abandoned-command encoding 1 | Evidence required; first owner audit recorded below |
+| Metadata-command log hash chain | `storage` | private `ARGMIN-METADATA-COMMAND-LOG-V1` hash domain; persisted hashes carry no marker | Design required: bind changes to every containing format or add an explicit private version |
 | Metadata checkpoints and canonical state | `storage` | checkpoint encoding 1; canonical-state encoding 4 | Evidence required |
 | Storage-node RPC and authentication | `storage` | frame encoding 16; auth binding 2; auth transport envelope 1 | Evidence required; transport/profile and wire-error containment are complete. Item 14 removed the superseded per-subject tag-read message kind and advanced the private frame baseline from 15 to 16; exact v16 bytes and resealed v15/v17 rejection fixtures pin the new boundary. |
 | Control-plane logical state, commands, and snapshots | `storage` | state 27; command 14; snapshot 1 | Evidence required; topology and administration workflow containment are complete |
@@ -1789,13 +1788,34 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Temporary-credential session token | `auth` | `ARGST1` envelope / version 1 | Recorded |
 | Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Evidence required; all three identifiers and protocol-profile constructors are owner-private and boundary-checked |
 
+#### Metadata-command family evidence inventory (2026-08-08)
+
+The former combined metadata-command row contains two independently versioned, self-describing
+records plus one untagged durable hash-chain representation. All are private to `storage`; neither
+self-describing record has an older-version reader or a default-version fallback.
+
+| Format | Defining marker | Current writer | First rejecting reader | Existing permanent evidence | Evidence still required |
+| --- | --- | --- | --- | --- | --- |
+| Applied metadata-command envelope | Private `METADATA_COMMAND_MAGIC` followed by little-endian `METADATA_COMMAND_ENCODING_VERSION = 6` in `metadata_command.rs` | `canonical_command_bytes()`, reached through `MetadataCommandEnvelope::command_bytes()` before pending-slot, applied-log, transfer, or storage-RPC publication | `decode_metadata_command_log_entry_header()` for retained/applied log inspection and `decode_metadata_command_envelope()` for pending-slot, scavenger, transfer, and storage-RPC use; persistence paths verify the separately stored CRC64 before either decoder | Stable CRC64 fixtures cover every current payload kind and representative nested branches, providing sealed current-byte evidence; every fixture round-trips the header and full-envelope decoders. The header test rejects the prior version 5, trailing bytes, and an unknown payload kind. Owner-local persistence tests prove resealed malformed payloads fail closed without applying metadata. | Replace free-form decoder `String` failures with a private typed format error. Add missing/truncated marker and version, malformed magic, and too-new version 7 cases. Add checksummed persistence and framed-RPC fixtures with old and new unsupported versions resealed, proving version rejection occurs before dispatch or mutation rather than being masked by checksum failure. |
+| Abandoned metadata-command record | Private `ABANDONED_METADATA_COMMAND_MAGIC` followed by little-endian `ABANDONED_METADATA_COMMAND_ENCODING_VERSION = 1` in `metadata_command.rs` | `abandoned_command_log_bytes()`, reached through `MetadataCommandEnvelope::abandoned_log_bytes()` before terminal-log persistence | `decode_metadata_command_log_entry_header()` after the separately stored CRC64 is verified by `PgStore::verify_metadata_command_log_entry()` | The current writer/reader round-trip is covered, and direct decoder fixtures reject versions 0 and 2. Retained-log and recovery tests cover logical abandoned records and fail-closed malformed-row behavior. | Use the same private typed format error as applied envelopes. Add a fixed current-byte fixture pinning the complete record, including the original-command checksum. Add missing/truncated marker and version plus malformed-magic cases. Add resealed persisted versions 0 and 2 and prove rejection occurs before recovery, state mutation, or publication. |
+| Metadata-command log hash chain | Private `ARGMIN-METADATA-COMMAND-LOG-V1` domain inside `metadata_command_log_hash()`; the output is an untagged CRC64 | Applied publication and contiguous-tail advancement compute the hash before publishing it in the log row and replica state; abandoned rows may first be recorded with null chain fields and are hashed when the contiguous tail advances | Log-suffix validation and abandoned-tail recovery recompute the chain before advancing durable replica state; transfer reconstruction also requires matching retained hashes | Corrupt durable hash and unproven-prefix tests establish fail-closed recovery and transfer behavior. | Add an exact current hash golden covering the domain, field order, and little-endian encoding. Decide whether to give the hash an explicit private versioned carrier or bind it to every containing format. The latter set includes at least the PG SQLite schema, metadata checkpoint, storage-RPC frame, and the control-plane state, command, snapshot, and RPC formats that serialize `PgMetadataProof`. Record and enforce every dependency selected by that decision. |
+
+The applied envelope is persisted in pending-slot and metadata-command-log rows and is nested inside
+storage-RPC and peering-transfer payloads, but it carries its own marker and version. Its version is
+therefore authoritative for its bytes; an incompatible command-envelope change does not silently
+rely on the SQLite schema or outer RPC-frame version. The abandoned record likewise remains
+self-describing inside the metadata-command log. Materialized metadata checkpoints do not contain
+either command-log representation. The later storage-RPC audit must still verify that its containers
+do not bypass the inner applied-envelope decoder before dispatching the contained command.
+
 The evidence audit proceeds in this bounded order after Phase 1 containment is complete:
 
-1. Confirm storage-node TLS, topology, physical payload, maintenance workflow, control-plane admin,
-   and implementation-error containment are complete and boundary-checked.
-2. Expand each `storage` family above to one line per independently changeable format, recording
-   its defining constant, writer, first rejecting reader, exact-current fixture, and unsupported
-   version fixtures.
+1. **Complete:** storage-node TLS, topology, physical payload, maintenance workflow, control-plane
+   admin, and implementation-error containment are complete and boundary-checked.
+2. **In progress:** expand each `storage` family above to one line per independently changeable
+   format, recording its defining constant, writer, first rejecting reader, exact-current fixture,
+   and unsupported-version fixtures. The metadata-command family is the first recorded owner
+   inventory.
 3. Do the same for the `server-core`, `argmin-s3`, and `auth` rows, without exposing private
    constants or codecs to cross-crate tests.
 4. Decide the tag-XML and ACL-string strategy. If their containing formats are the version
@@ -1923,9 +1943,8 @@ The storage-owned PG layout slice is complete:
 
 The higher-layer control-plane error cleanup, control-plane and Raft transport containment, raw
 diagnostic and Raft representation containment, durable Raft restart/WAL containment, nested
-durable codecs, static route authority, and session-token ownership work are complete and
-boundary-checked. The completed work does not imply semantic topology containment: storage-node
-TLS-profile construction and the topology/maintenance audit above remain Phase 1 work.
+durable codecs, static route authority, session-token ownership, storage-node TLS profiles, and
+semantic topology and maintenance work are complete and boundary-checked.
 
 ## Immediate Next Steps
 
