@@ -687,6 +687,96 @@ fn object_delete_metadata_command_retry_reuses_pending_partial_replica_command()
 }
 
 #[test]
+fn object_delete_retries_replica_transport_failure_after_primary_apply() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let committed =
+        write_committed_direct_segment_for(&cluster, &bucket, &key, b"transport retry delete");
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let fail_replica_once = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let fail_replica_once_hook = Arc::clone(&fail_replica_once);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::DeleteObjectVersion(delete)
+                    if delete.bucket == hook_bucket
+                        && delete.key == hook_key
+                        && node_id == NodeId::new(0)
+                        && fail_replica_once_hook.swap(false, Ordering::SeqCst)
+            ) {
+                return Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "apply metadata command",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                    detail: crate::error::StorageNodeFailureDetail::new(
+                        "injected delete replica connection interruption after primary apply",
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let outcome = cluster
+        .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+    drop(hook_guard);
+    assert!(
+        !fail_replica_once.load(Ordering::SeqCst),
+        "object delete must exercise the post-primary transport retry"
+    );
+    assert!(matches!(
+        outcome.deleted,
+        crate::DeletedCurrentObject::Live {
+            generation_id,
+            ..
+        } if generation_id == committed.generation_id
+    ));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+        assert!(crate::PgMetadataStore::payload_reclaim_exists(
+            &*pg,
+            &bucket,
+            &key,
+            committed.generation_id
+        )
+        .unwrap());
+    }
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn object_delete_exact_pending_retry_converges_partial_exact_conflict() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
