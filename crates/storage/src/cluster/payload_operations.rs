@@ -1375,29 +1375,45 @@ impl StorageCluster {
             };
             match apply_result {
                 Ok(()) => {
-                    reservation_authority
-                        .release_applied_metadata_command_bucket_write_reservations(&command)
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                    match route_mode {
-                        MetadataCommandRouteMode::Normal => self
-                            .remove_pending_metadata_command_for_bucket_with_work_budget(
-                                pg_id,
-                                command_bucket,
-                                &command,
-                                work_budget,
-                            ),
-                        MetadataCommandRouteMode::Recovery => self
-                            .remove_pending_metadata_command_for_bucket_recovery(
-                                execution_route,
-                                pg_id,
-                                command_bucket,
-                                &command,
-                                work_budget,
-                            ),
+                    if reservation_authority
+                        .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                            pg_id, &command,
+                        )
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                    {
+                        match route_mode {
+                            MetadataCommandRouteMode::Normal => self
+                                .remove_pending_metadata_command_for_bucket_with_work_budget(
+                                    pg_id,
+                                    command_bucket,
+                                    &command,
+                                    work_budget,
+                                ),
+                            MetadataCommandRouteMode::Recovery => self
+                                .remove_pending_metadata_command_for_bucket_recovery(
+                                    execution_route,
+                                    pg_id,
+                                    command_bucket,
+                                    &command,
+                                    work_budget,
+                                ),
+                        }
+                        .map_err(ObjectPgActionError::from)?;
                     }
-                    .map_err(ObjectPgActionError::from)?;
                     self.after_object_metadata_command_applied(&command);
                     return Ok(PendingMetadataCommandOutcome::Applied);
+                }
+                Err(error)
+                    if request_ops::metadata_command_apply_transport_error_is_retryable(
+                        &error.source,
+                    ) =>
+                {
+                    work_budget
+                        .sleep_after_contention(
+                            "pending metadata command transport retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
                 }
                 Err(error)
                     if Self::metadata_command_log_conflict_matches(&command, &error.source)
@@ -1424,27 +1440,31 @@ impl StorageCluster {
                         )
                         .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                     {
-                        reservation_authority
-                            .release_applied_metadata_command_bucket_write_reservations(&command)
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                        match route_mode {
-                            MetadataCommandRouteMode::Normal => self
-                                .remove_pending_metadata_command_for_bucket_with_work_budget(
-                                    pg_id,
-                                    command_bucket,
-                                    &command,
-                                    work_budget,
-                                ),
-                            MetadataCommandRouteMode::Recovery => self
-                                .remove_pending_metadata_command_for_bucket_recovery(
-                                    execution_route,
-                                    pg_id,
-                                    command_bucket,
-                                    &command,
-                                    work_budget,
-                                ),
+                        if reservation_authority
+                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                                pg_id, &command,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                        {
+                            match route_mode {
+                                MetadataCommandRouteMode::Normal => self
+                                    .remove_pending_metadata_command_for_bucket_with_work_budget(
+                                        pg_id,
+                                        command_bucket,
+                                        &command,
+                                        work_budget,
+                                    ),
+                                MetadataCommandRouteMode::Recovery => self
+                                    .remove_pending_metadata_command_for_bucket_recovery(
+                                        execution_route,
+                                        pg_id,
+                                        command_bucket,
+                                        &command,
+                                        work_budget,
+                                    ),
+                            }
+                            .map_err(ObjectPgActionError::from)?;
                         }
-                        .map_err(ObjectPgActionError::from)?;
                         self.after_object_metadata_command_applied(&command);
                         return Ok(PendingMetadataCommandOutcome::Applied);
                     }
@@ -3022,6 +3042,18 @@ impl StorageCluster {
                 match self.apply_metadata_command_to_acting_set(&command) {
                     Ok(()) => break,
                     Err(error)
+                        if request_ops::metadata_command_apply_transport_error_is_retryable(
+                            &error.source,
+                        ) =>
+                    {
+                        work_budget
+                            .sleep_after_contention(
+                                "direct PUT metadata command transport retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
+                        continue;
+                    }
+                    Err(error)
                         if matches!(
                             self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
                                 pg_id,
@@ -3133,10 +3165,19 @@ impl StorageCluster {
                 }
             }
 
-            self.release_metadata_command_bucket_write_reservation(&command)
-                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-            self.remove_pending_metadata_command_for_bucket(pg_id, command.bucket_name(), &command)
+            if self
+                .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                    pg_id, &command,
+                )
+                .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+            {
+                self.remove_pending_metadata_command_for_bucket(
+                    pg_id,
+                    command.bucket_name(),
+                    &command,
+                )
                 .map_err(ObjectPgActionError::from)?;
+            }
             self.emit_metadata_command_recovery_outcome_for_command(pg_id, &command, "applied");
             break command;
         };

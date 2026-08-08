@@ -417,15 +417,20 @@ impl super::StorageCluster {
             work_budget.check("object metadata command apply retry budget exhausted")?;
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(()) => {
-                    self.release_applied_metadata_command_bucket_write_reservations(&command)
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                    self.remove_pending_metadata_command_for_bucket_with_work_budget(
-                        pg_id,
-                        command.bucket_name(),
-                        &command,
-                        &mut work_budget,
-                    )
-                    .map_err(ObjectPgActionError::from)?;
+                    if self
+                        .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                            pg_id, &command,
+                        )
+                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                    {
+                        self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                            pg_id,
+                            command.bucket_name(),
+                            &command,
+                            &mut work_budget,
+                        )
+                        .map_err(ObjectPgActionError::from)?;
+                    }
                     self.after_object_metadata_command_applied(&command);
                     #[cfg(test)]
                     crate::node::maybe_run_after_object_metadata_command_publish_hook(
@@ -438,6 +443,14 @@ impl super::StorageCluster {
                         applied_nodes,
                         source,
                     } = error;
+                    if metadata_command_apply_transport_error_is_retryable(&source) {
+                        work_budget
+                            .sleep_after_contention(
+                                "object metadata command transport retry budget exhausted",
+                            )
+                            .map_err(ObjectPgActionError::Store)?;
+                        continue;
+                    }
                     match self
                         .retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
                             pg_id,
@@ -448,17 +461,20 @@ impl super::StorageCluster {
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                     {
                         Some(true) => {
-                            self.release_applied_metadata_command_bucket_write_reservations(
-                                &command,
-                            )
-                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                            self.remove_pending_metadata_command_for_bucket_with_work_budget(
-                                pg_id,
-                                command.bucket_name(),
-                                &command,
-                                &mut work_budget,
-                            )
-                            .map_err(ObjectPgActionError::from)?;
+                            if self
+                                .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                                    pg_id, &command,
+                                )
+                                .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                            {
+                                self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                                    pg_id,
+                                    command.bucket_name(),
+                                    &command,
+                                    &mut work_budget,
+                                )
+                                .map_err(ObjectPgActionError::from)?;
+                            }
                             self.after_object_metadata_command_applied(&command);
                             return Ok(());
                         }

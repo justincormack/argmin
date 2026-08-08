@@ -4368,15 +4368,34 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
 
     let _serial = lock_metadata_command_apply_hook_test();
     let reserve_apply_count = Arc::new(AtomicUsize::new(0));
+    let fail_commit_replica_once = Arc::new(AtomicBool::new(true));
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
+    let hook_session_id = session_id.clone();
     let reserve_apply_count_hook = Arc::clone(&reserve_apply_count);
+    let fail_commit_replica_once_hook = Arc::clone(&fail_commit_replica_once);
     let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
-        move |_node_id, command| {
+        move |node_id, command| {
             if let MetadataCommandPayload::ReserveObjectVersion(reservation) = command.payload() {
                 if reservation.bucket == hook_bucket && reservation.key == hook_key {
                     reserve_apply_count_hook.fetch_add(1, Ordering::SeqCst);
                 }
+            }
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.generation_reservation_id == hook_session_id
+                        && node_id == NodeId::new(0)
+                        && fail_commit_replica_once_hook.swap(false, Ordering::SeqCst)
+            ) {
+                return Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "apply metadata command",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    detail: crate::error::StorageNodeFailureDetail::new(
+                        "injected replica response timeout after primary apply",
+                    ),
+                });
             }
             Ok(())
         },
@@ -4401,6 +4420,10 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
         .unwrap()
         .unwrap();
     drop(hook_guard);
+    assert!(
+        !fail_commit_replica_once.load(Ordering::SeqCst),
+        "versioned stream PUT must exercise the post-primary transport retry"
+    );
     assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
     assert_eq!(
         reserve_apply_count.load(Ordering::SeqCst),
@@ -4426,6 +4449,8 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
             Err(crate::MetadataError::StreamSessionNotFound { .. })
         ));
     }
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
 }
 
 #[test]

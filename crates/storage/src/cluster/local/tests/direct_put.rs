@@ -1262,6 +1262,110 @@ fn direct_put_committed_response_loss_retry_returns_existing_commit() {
 }
 
 #[test]
+fn versioned_direct_put_retries_replica_timeout_after_primary_commit() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("direct-timeout");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let data = b"versioned direct PUT replica timeout";
+    let payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Enabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(data),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let fail_replica_once = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let fail_replica_once_hook = Arc::clone(&fail_replica_once);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.bucket == hook_bucket
+                        && commit.object.key == hook_key
+                        && node_id == NodeId::new(0)
+                        && fail_replica_once_hook.swap(false, Ordering::SeqCst)
+            ) {
+                return Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "apply metadata command",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    detail: crate::error::StorageNodeFailureDetail::new(
+                        "injected direct PUT replica timeout after primary apply",
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let outcome = route
+        .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+    drop(hook_guard);
+    assert!(
+        !fail_replica_once.load(Ordering::SeqCst),
+        "direct PUT must exercise the post-primary transport retry"
+    );
+    assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        let live = stored.as_live().expect("direct PUT object should be live");
+        assert_eq!(live.version_id, outcome.version_id);
+        assert_eq!(live.generation_id, generation_id);
+        assert_eq!(live.size, data.len() as u64);
+    }
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
 fn direct_put_overwrite_committed_response_loss_retry_preserves_reclaim_generation() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

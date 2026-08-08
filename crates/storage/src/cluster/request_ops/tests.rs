@@ -125,6 +125,53 @@ mod bounded_pg_scan_tests {
 mod pending_command_terminal_cleanup_tests {
     use super::*;
 
+    fn remote_failure(code: StorageRpcErrorCode) -> BucketSnapshotLoadError {
+        StoreError::StorageRpc {
+            node_id: 7,
+            operation: "test metadata command apply",
+            failure: code,
+            detail: crate::error::StorageNodeFailureDetail::new("test remote failure"),
+        }
+        .into()
+    }
+
+    #[test]
+    fn metadata_command_apply_retries_only_remote_transient_failures() {
+        assert!(metadata_command_apply_transport_error_is_retryable(
+            &remote_failure(StorageRpcErrorCode::TransportTimeout)
+        ));
+        assert!(metadata_command_apply_transport_error_is_retryable(
+            &remote_failure(StorageRpcErrorCode::TransportClosed)
+        ));
+        assert!(metadata_command_apply_transport_error_is_retryable(
+            &remote_failure(StorageRpcErrorCode::MetadataCommandContention)
+        ));
+        assert!(!metadata_command_apply_transport_error_is_retryable(
+            &StoreError::Io {
+                context: "test local storage failure",
+                source: std::io::Error::other("test local storage failure"),
+            }
+            .into()
+        ));
+    }
+
+    #[test]
+    fn applied_command_release_defers_metadata_contention_but_not_invariants() {
+        assert!(applied_metadata_command_cleanup_error_is_retryable(
+            &BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationConflict {
+                    reservation_id: "reservation".to_string(),
+                },
+            )
+        ));
+        assert!(!applied_metadata_command_cleanup_error_is_retryable(
+            &BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                context: "test terminal cleanup",
+                reason: "test invariant".to_string(),
+            })
+        ));
+    }
+
     #[test]
     fn pending_slot_remove_retries_response_loss_after_remote_removal() {
         let mut pending = true;

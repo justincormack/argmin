@@ -4531,6 +4531,30 @@ impl StorageCluster {
         Ok(())
     }
 
+    fn release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        match self.release_applied_metadata_command_bucket_write_reservations(command) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if request_ops::applied_metadata_command_cleanup_error_is_retryable(&error) =>
+            {
+                request_ops::emit_metadata_command_terminal_cleanup_deferred(
+                    pg_id,
+                    "applied command reservation release failed transiently",
+                    match &error {
+                        BucketSnapshotLoadError::Store(error) => Some(error),
+                        BucketSnapshotLoadError::Metadata(_) => None,
+                    },
+                );
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn release_stream_create_bucket_write_reservation_proof(
         &self,
         proof: &BucketWriteReservationProof,

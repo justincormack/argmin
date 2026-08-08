@@ -111,6 +111,34 @@ fn metadata_command_terminal_cleanup_error_is_retryable(error: &StoreError) -> b
     )
 }
 
+pub(super) fn metadata_command_apply_transport_error_is_retryable(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    matches!(
+        error,
+        BucketSnapshotLoadError::Store(
+            StoreError::StorageRpcResourceExhausted { .. }
+                | StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::TransportTimeout
+                        | StorageRpcErrorCode::TransportClosed
+                        | StorageRpcErrorCode::MetadataCommandContention,
+                    ..
+                }
+        )
+    )
+}
+
+pub(super) fn applied_metadata_command_cleanup_error_is_retryable(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    match error {
+        BucketSnapshotLoadError::Store(error) => {
+            metadata_command_terminal_cleanup_error_is_retryable(error)
+        }
+        BucketSnapshotLoadError::Metadata(error) => error.is_command_contention(),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PendingMetadataCommandTerminalCleanup {
     Removed,
@@ -118,7 +146,7 @@ pub(super) enum PendingMetadataCommandTerminalCleanup {
     Deferred,
 }
 
-fn emit_metadata_command_terminal_cleanup_deferred(
+pub(super) fn emit_metadata_command_terminal_cleanup_deferred(
     pg_id: PgId,
     reason: &'static str,
     error: Option<&StoreError>,

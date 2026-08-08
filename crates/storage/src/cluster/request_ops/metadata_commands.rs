@@ -1392,24 +1392,29 @@ impl super::StorageCluster {
             };
             match apply_result {
                 Ok(()) => {
-                    self.release_applied_metadata_command_bucket_write_reservations(&command)?;
-                    match route_mode {
-                        MetadataCommandRouteMode::Normal => self
-                            .remove_pending_metadata_command_for_bucket_with_work_budget(
-                                pg_id,
-                                command_bucket,
-                                &command,
-                                work_budget,
-                            ),
-                        MetadataCommandRouteMode::Recovery => self
-                            .remove_pending_metadata_command_for_bucket_recovery(
-                                execution_route,
-                                pg_id,
-                                command_bucket,
-                                &command,
-                                work_budget,
-                            ),
-                    }?;
+                    if self
+                        .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                            pg_id, &command,
+                        )?
+                    {
+                        match route_mode {
+                            MetadataCommandRouteMode::Normal => self
+                                .remove_pending_metadata_command_for_bucket_with_work_budget(
+                                    pg_id,
+                                    command_bucket,
+                                    &command,
+                                    work_budget,
+                                ),
+                            MetadataCommandRouteMode::Recovery => self
+                                .remove_pending_metadata_command_for_bucket_recovery(
+                                    execution_route,
+                                    pg_id,
+                                    command_bucket,
+                                    &command,
+                                    work_budget,
+                                ),
+                        }?;
+                    }
                     return Ok(FinishPendingMetadataCommandResult::Applied);
                 }
                 Err(error) => {
@@ -1417,6 +1422,12 @@ impl super::StorageCluster {
                         applied_nodes,
                         source,
                     } = error;
+                    if metadata_command_apply_transport_error_is_retryable(&source) {
+                        work_budget.sleep_after_contention(
+                            "metadata command transport retry budget exhausted",
+                        )?;
+                        continue;
+                    }
                     if retry_partial_exact_conflict
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command, &source,
@@ -1437,26 +1448,29 @@ impl super::StorageCluster {
                                     pg_id, &command, route_mode,
                                 )?
                         {
-                            self.release_applied_metadata_command_bucket_write_reservations(
-                                &command,
-                            )?;
-                            match route_mode {
-                                MetadataCommandRouteMode::Normal => self
-                                    .remove_pending_metadata_command_for_bucket_with_work_budget(
-                                        pg_id,
-                                        command_bucket,
-                                        &command,
-                                        work_budget,
-                                    ),
-                                MetadataCommandRouteMode::Recovery => self
-                                    .remove_pending_metadata_command_for_bucket_recovery(
-                                        execution_route,
-                                        pg_id,
-                                        command_bucket,
-                                        &command,
-                                        work_budget,
-                                    ),
-                            }?;
+                            if self
+                                .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                                    pg_id, &command,
+                                )?
+                            {
+                                match route_mode {
+                                    MetadataCommandRouteMode::Normal => self
+                                        .remove_pending_metadata_command_for_bucket_with_work_budget(
+                                            pg_id,
+                                            command_bucket,
+                                            &command,
+                                            work_budget,
+                                        ),
+                                    MetadataCommandRouteMode::Recovery => self
+                                        .remove_pending_metadata_command_for_bucket_recovery(
+                                            execution_route,
+                                            pg_id,
+                                            command_bucket,
+                                            &command,
+                                            work_budget,
+                                        ),
+                                }?;
+                            }
                             return Ok(FinishPendingMetadataCommandResult::Applied);
                         }
                         if exact_conflict_retryable && applied_nodes > 0 {

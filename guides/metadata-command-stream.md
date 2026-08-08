@@ -100,6 +100,13 @@ For a new metadata mutation:
    is visible enough for retry/recovery and acting-set convergence has been
    proven, or an explicit command path owns an equivalent cleanup proof.
 
+A retryable remote apply failure retries the exact installed command under the
+caller's existing work budget; it must not allocate a replacement command or
+rerun request preparation. After acting-set application has converged,
+transient reservation-release failure is terminal cleanup rather than a failed
+mutation outcome. The primary pending slot remains durable so command recovery
+can retry the release, and is removed only after that cleanup succeeds.
+
 Any process routed to the same PG primary must observe the same unresolved
 slot. Retrying through a different coordinator must therefore converge the same
 command instead of allocating a different command.
