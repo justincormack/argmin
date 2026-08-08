@@ -2261,8 +2261,19 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        continue to select only logical bucket/object subjects and command kinds. The boundary
        checker rejects raw implementation-error types anywhere in the public metadata-command
        support trait and pins the state-capture method to the opaque failure.
-       The lifecycle, multipart, and object/checksum test-support families still require the same
-       conversion before the raw error exports can be removed.
+       The lifecycle/reclaim test-support error sub-slice completed on 2026-08-08. Bucket-metadata
+       holds, lifecycle claim setup, durable upload-state transitions, lifecycle object evidence,
+       payload leases, and reclaim-root setup and observation now return `TestStorageFailure` when
+       they do not already use the narrower bucket failure contracts. Storage retains and
+       interprets missing reservations before conversion, and consumes all other routing,
+       metadata, payload-snapshot, lease, and reclaim errors inside the owner. Validation detail
+       for impossible test states is reduced to the bounded `invalid_request` label; owner-local
+       coverage pins its `Debug`, `Display`, and error-source redaction. The boundary checker scans
+       the complete public lifecycle trait and pins every public lifecycle/reclaim helper to the
+       opaque failure. Stream-session and multipart-upload inventory helpers remain together in
+       the multipart test-support slice rather than being split by their use in cleanup tests.
+       The multipart and object/checksum test-support families still require the same conversion
+       before the raw error exports can be removed.
        The three concrete error types remain public storage exports only because storage still has
        public low-level or test-support signatures which name them. Continue by converting or
        restricting those owner APIs one bounded family at a time, then remove the root exports and

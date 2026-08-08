@@ -5995,6 +5995,47 @@ fail_with_matches \
     "Cross-crate metadata-command test support must consume raw storage errors inside storage and return only TestStorageFailure" \
     "$metadata_command_test_support_error_leaks"
 
+lifecycle_test_support_error_leaks=$(
+    {
+        awk '
+        /^    pub trait StorageClusterLifecycleTestSupport/ {
+            in_lifecycle_support = 1
+        }
+        /^    impl StorageClusterLifecycleTestSupport/ {
+            in_lifecycle_support = 0
+        }
+        in_lifecycle_support && /(ObjectPgActionError|MetadataError|StoreError)/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        ' crates/storage/src/lib.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+(capture_lifecycle_object_observation|acquire_lifecycle_object_payload_lease|lifecycle_object_has_reclaim_root|capture_object_payload_reclaim_subject|seed_segmented_object_payload_reclaim|acquire_object_payload_reclaim_lease|object_payload_has_reclaim_root|object_payload_reclaim_root_count_for)(?s:[^;{]{0,500})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/lib.rs \
+            || true
+        for method in \
+            capture_lifecycle_object_observation \
+            acquire_lifecycle_object_payload_lease \
+            lifecycle_object_has_reclaim_root \
+            capture_object_payload_reclaim_subject \
+            seed_segmented_object_payload_reclaim \
+            acquire_object_payload_reclaim_lease \
+            object_payload_has_reclaim_root \
+            object_payload_reclaim_root_count_for
+        do
+            if ! rg -q -U \
+                "^[[:space:]]*pub[[:space:]]+fn[[:space:]]+${method}(?s:[^;{]{0,500})Result<[^;{]*TestStorageFailure>" \
+                crates/storage/src/lib.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/lib.rs: public lifecycle/reclaim helper ${method} must return TestStorageFailure"
+            fi
+        done
+    }
+)
+fail_with_matches \
+    "Cross-crate lifecycle and payload-reclaim test support must consume raw storage errors inside storage and return only opaque failures" \
+    "$lifecycle_test_support_error_leaks"
+
 metadata_command_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for)|struct[[:space:]]+MetadataCommandApplyTestContext|type[[:space:]]+MetadataCommandApplyContextTestHook)\b'
 
 scan_public_metadata_command_test_surface() {

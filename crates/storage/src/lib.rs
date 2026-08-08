@@ -262,6 +262,22 @@ pub mod test_support {
             }
             assert!(std::error::Error::source(&failure).is_none());
         }
+
+        #[test]
+        fn object_pg_validation_detail_is_redacted() {
+            const SECRET_REASON: &str = "secret lifecycle test-support validation detail";
+            let failure =
+                TestStorageFailure::from_object_pg_action(ObjectPgActionError::InvalidRequest {
+                    reason: SECRET_REASON.to_string(),
+                });
+
+            assert_eq!(failure.diagnostic_cause_label(), "invalid_request");
+            for rendered in [format!("{failure}"), format!("{failure:?}")] {
+                assert!(rendered.contains("invalid_request"));
+                assert!(!rendered.contains(SECRET_REASON));
+            }
+            assert!(std::error::Error::source(&failure).is_none());
+        }
     }
 
     /// Opaque failure selected by a higher-layer deterministic test hook.
@@ -1131,7 +1147,7 @@ pub mod test_support {
         fn test_hold_bucket_metadata(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketMetadataHoldGuard<'_>, StoreError>;
+        ) -> Result<TestBucketMetadataHoldGuard<'_>, TestStorageFailure>;
 
         fn test_bucket_presence(
             &self,
@@ -1184,7 +1200,7 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             session_id: &SessionId,
-        ) -> Result<bool, ObjectPgActionError>;
+        ) -> Result<bool, TestStorageFailure>;
 
         fn test_bucket_delete_finalize_outstanding_depth(&self) -> usize;
 
@@ -1193,14 +1209,14 @@ pub mod test_support {
         fn test_seed_stale_lifecycle_sweep_claim(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
 
         fn test_age_noncurrent_lifecycle_version(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
-        ) -> Result<TestLifecycleObjectObservation, ObjectPgActionError>;
+        ) -> Result<TestLifecycleObjectObservation, TestStorageFailure>;
 
         fn test_begin_durable_bucket_delete_drain(
             &self,
@@ -1212,21 +1228,21 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
 
         fn test_mark_multipart_upload_completing(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
 
         fn test_mark_stream_upload_stale(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             session_id: &SessionId,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
     }
 
     impl StorageClusterLifecycleTestSupport for StorageCluster {
@@ -1266,9 +1282,10 @@ pub mod test_support {
         fn test_hold_bucket_metadata(
             &self,
             bucket: &BucketName,
-        ) -> Result<TestBucketMetadataHoldGuard<'_>, StoreError> {
+        ) -> Result<TestBucketMetadataHoldGuard<'_>, TestStorageFailure> {
             Ok(TestBucketMetadataHoldGuard {
-                _inner: StorageCluster::test_lock_bucket_pg(self, bucket)?,
+                _inner: StorageCluster::test_lock_bucket_pg(self, bucket)
+                    .map_err(TestStorageFailure::from_store)?,
             })
         }
 
@@ -1389,7 +1406,7 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             session_id: &SessionId,
-        ) -> Result<bool, ObjectPgActionError> {
+        ) -> Result<bool, TestStorageFailure> {
             match StorageCluster::test_object_generation_reservation_for(
                 self, bucket, key, session_id,
             ) {
@@ -1397,7 +1414,7 @@ pub mod test_support {
                 Err(ObjectPgActionError::Metadata(
                     MetadataError::ObjectGenerationReservationNotFound { .. },
                 )) => Ok(false),
-                Err(error) => Err(error),
+                Err(error) => Err(TestStorageFailure::from_object_pg_action(error)),
             }
         }
 
@@ -1412,8 +1429,9 @@ pub mod test_support {
         fn test_seed_stale_lifecycle_sweep_claim(
             &self,
             bucket: &BucketName,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_seed_stale_lifecycle_sweep_claim(self, bucket)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_age_noncurrent_lifecycle_version(
@@ -1421,8 +1439,9 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
-        ) -> Result<TestLifecycleObjectObservation, ObjectPgActionError> {
-            StorageCluster::test_age_noncurrent_live_object(self, bucket, key, version_id, 1)?;
+        ) -> Result<TestLifecycleObjectObservation, TestStorageFailure> {
+            StorageCluster::test_age_noncurrent_live_object(self, bucket, key, version_id, 1)
+                .map_err(TestStorageFailure::from_object_pg_action)?;
             capture_lifecycle_object_observation(self, bucket, key, version_id)
         }
 
@@ -1439,8 +1458,9 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_mark_multipart_upload_aborting(self, bucket, key, upload_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_mark_multipart_upload_completing(
@@ -1448,8 +1468,9 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_mark_multipart_upload_completing(self, bucket, key, upload_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_mark_stream_upload_stale(
@@ -1457,8 +1478,9 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             session_id: &SessionId,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_mark_stream_upload_stale(self, bucket, key, session_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
     }
 
@@ -2540,21 +2562,28 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<TestLifecycleObjectObservation, ObjectPgActionError> {
-        let stored = cluster.test_get_object_version(bucket, key, version_id)?;
+    ) -> Result<TestLifecycleObjectObservation, TestStorageFailure> {
+        let stored = cluster
+            .test_get_object_version(bucket, key, version_id)
+            .map_err(TestStorageFailure::from_object_pg_action)?;
         let live = stored
             .as_live()
             .ok_or_else(|| ObjectPgActionError::InvalidRequest {
                 reason: "selected lifecycle object is not a live version".to_string(),
-            })?;
-        let payload = cluster.test_capture_object_payload(bucket, key, version_id)?;
+            })
+            .map_err(TestStorageFailure::from_object_pg_action)?;
+        let payload = cluster
+            .test_capture_object_payload(bucket, key, version_id)
+            .map_err(TestStorageFailure::from_object_pg_action)?;
         let (_, _, payload_generation) =
-            object_payload_subject(&payload).map_err(ObjectPgActionError::Store)?;
+            object_payload_subject(&payload).map_err(TestStorageFailure::from_store)?;
         if payload_generation != live.generation_id {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "object version changed while capturing lifecycle payload evidence"
-                    .to_string(),
-            });
+            return Err(TestStorageFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "object version changed while capturing lifecycle payload evidence"
+                        .to_string(),
+                },
+            ));
         }
         Ok(TestLifecycleObjectObservation {
             last_modified: live.last_modified,
@@ -2566,21 +2595,22 @@ pub mod test_support {
     pub fn acquire_lifecycle_object_payload_lease(
         cluster: &Arc<StorageCluster>,
         observation: &TestLifecycleObjectObservation,
-    ) -> Result<ObjectPayloadLease, ObjectPgActionError> {
+    ) -> Result<ObjectPayloadLease, TestStorageFailure> {
         cluster
             .test_acquire_object_payload_lease_for_snapshot(&observation.payload)
-            .map_err(ObjectPgActionError::Store)
+            .map_err(TestStorageFailure::from_store)
     }
 
     pub fn lifecycle_object_has_reclaim_root(
         cluster: &StorageCluster,
         observation: &TestLifecycleObjectObservation,
-    ) -> Result<bool, ObjectPgActionError> {
+    ) -> Result<bool, TestStorageFailure> {
         let (bucket, key, generation_id) =
-            object_payload_subject(&observation.payload).map_err(ObjectPgActionError::Store)?;
+            object_payload_subject(&observation.payload).map_err(TestStorageFailure::from_store)?;
         cluster
             .test_get_object_segments_reclaim(bucket, key, generation_id)
             .map(|reclaim| reclaim.is_some())
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn capture_object_payload_reclaim_subject(
@@ -2588,13 +2618,16 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: VersionId,
-    ) -> Result<TestObjectPayloadReclaimSubject, ObjectPgActionError> {
-        let stored = cluster.test_get_object_version(bucket, key, version_id)?;
+    ) -> Result<TestObjectPayloadReclaimSubject, TestStorageFailure> {
+        let stored = cluster
+            .test_get_object_version(bucket, key, version_id)
+            .map_err(TestStorageFailure::from_object_pg_action)?;
         let live = stored
             .as_live()
             .ok_or_else(|| ObjectPgActionError::InvalidRequest {
                 reason: "selected reclaim subject is not a live object version".to_string(),
-            })?;
+            })
+            .map_err(TestStorageFailure::from_object_pg_action)?;
         Ok(TestObjectPayloadReclaimSubject {
             bucket: bucket.clone(),
             key: key.clone(),
@@ -2606,18 +2639,22 @@ pub mod test_support {
         cluster: &StorageCluster,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<TestObjectPayloadReclaimSubject, ObjectPgActionError> {
-        let generation_id = cluster.test_next_unreferenced_object_generation(bucket, key)?;
+    ) -> Result<TestObjectPayloadReclaimSubject, TestStorageFailure> {
+        let generation_id = cluster
+            .test_next_unreferenced_object_generation(bucket, key)
+            .map_err(TestStorageFailure::from_object_pg_action)?;
         let subject = TestObjectPayloadReclaimSubject {
             bucket: bucket.clone(),
             key: key.clone(),
             generation_id,
         };
         if object_payload_has_reclaim_root(cluster, &subject)? {
-            return Err(ObjectPgActionError::InvalidRequest {
-                reason: "selected no-root reclaim subject already has durable reclaim metadata"
-                    .to_string(),
-            });
+            return Err(TestStorageFailure::from_object_pg_action(
+                ObjectPgActionError::InvalidRequest {
+                    reason: "selected no-root reclaim subject already has durable reclaim metadata"
+                        .to_string(),
+                },
+            ));
         }
         Ok(subject)
     }
@@ -2629,14 +2666,11 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         created_at: u64,
-    ) -> Result<TestObjectPayloadReclaimSubject, ObjectPgActionError> {
+    ) -> Result<TestObjectPayloadReclaimSubject, TestStorageFailure> {
         let subject = prepare_object_payload_reclaim_subject_without_root(cluster, bucket, key)?;
-        cluster.test_seed_segmented_payload_reclaim(
-            bucket,
-            key,
-            subject.generation_id,
-            created_at,
-        )?;
+        cluster
+            .test_seed_segmented_payload_reclaim(bucket, key, subject.generation_id, created_at)
+            .map_err(TestStorageFailure::from_object_pg_action)?;
         Ok(subject)
     }
 
@@ -2644,17 +2678,19 @@ pub mod test_support {
     pub fn acquire_object_payload_reclaim_lease(
         cluster: &Arc<StorageCluster>,
         subject: &TestObjectPayloadReclaimSubject,
-    ) -> Result<ObjectPayloadLease, ObjectPgActionError> {
+    ) -> Result<ObjectPayloadLease, TestStorageFailure> {
         cluster
             .acquire_object_payload_lease(&subject.bucket, &subject.key, subject.generation_id)
-            .map_err(ObjectPgActionError::Store)
+            .map_err(TestStorageFailure::from_store)
     }
 
     pub fn object_payload_has_reclaim_root(
         cluster: &StorageCluster,
         subject: &TestObjectPayloadReclaimSubject,
-    ) -> Result<bool, ObjectPgActionError> {
-        cluster.test_payload_reclaim_exists(&subject.bucket, &subject.key, subject.generation_id)
+    ) -> Result<bool, TestStorageFailure> {
+        cluster
+            .test_payload_reclaim_exists(&subject.bucket, &subject.key, subject.generation_id)
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn object_payload_reclaim_is_active(
@@ -2672,8 +2708,10 @@ pub mod test_support {
         cluster: &StorageCluster,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<usize, ObjectPgActionError> {
-        cluster.test_payload_reclaim_count_for_object(bucket, key)
+    ) -> Result<usize, TestStorageFailure> {
+        cluster
+            .test_payload_reclaim_count_for_object(bucket, key)
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn stream_upload_session_count_for_object(

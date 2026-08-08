@@ -1,7 +1,7 @@
 use super::*;
 use crate::test_support::{
-    MetadataCommandApplyTestKind, StorageClusterLifecycleTestSupport,
-    StorageClusterMetadataCommandTestSupport, StorageClusterObjectTestSupport,
+    MetadataCommandApplyTestKind, StorageClusterMetadataCommandTestSupport,
+    StorageClusterObjectTestSupport,
 };
 
 #[test]
@@ -2080,9 +2080,14 @@ fn semantic_lifecycle_aging_rejects_current_live_and_delete_marker_without_mutat
     let current_proof_before = cluster
         .test_object_pg_metadata_proof(&bucket, &key)
         .unwrap();
-    let current_err = cluster
-        .test_age_noncurrent_lifecycle_version(&bucket, &key, current.version_id)
-        .expect_err("a current live version must not be made artificially noncurrent");
+    let current_err = crate::StorageCluster::test_age_noncurrent_live_object(
+        &cluster,
+        &bucket,
+        &key,
+        current.version_id,
+        1,
+    )
+    .expect_err("a current live version must not be made artificially noncurrent");
     assert!(matches!(
         current_err,
         crate::ObjectPgActionError::Store(StoreError::IntegrityError {
@@ -2120,9 +2125,14 @@ fn semantic_lifecycle_aging_rejects_current_live_and_delete_marker_without_mutat
     let marker_proof_before = cluster
         .test_object_pg_metadata_proof(&bucket, &key)
         .unwrap();
-    let marker_err = cluster
-        .test_age_noncurrent_lifecycle_version(&bucket, &key, marker.version_id)
-        .expect_err("a delete marker must not be mutated by lifecycle aging");
+    let marker_err = crate::StorageCluster::test_age_noncurrent_live_object(
+        &cluster,
+        &bucket,
+        &key,
+        marker.version_id,
+        1,
+    )
+    .expect_err("a delete marker must not be mutated by lifecycle aging");
     assert!(matches!(
         marker_err,
         crate::ObjectPgActionError::Store(StoreError::IntegrityError {
