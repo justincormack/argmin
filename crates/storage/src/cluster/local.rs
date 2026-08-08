@@ -4712,7 +4712,7 @@ impl LocalClusterMap {
             })
     }
 
-    pub fn write_payload_shard(
+    pub(crate) fn write_payload_shard(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,
@@ -4735,7 +4735,7 @@ impl LocalClusterMap {
             .write_shard_with_effect_fence(data, effect_fence)
     }
 
-    pub fn repair_payload_shard(
+    pub(crate) fn repair_payload_shard(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,

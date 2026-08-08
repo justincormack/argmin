@@ -71,7 +71,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn write_payload_shard(
+    pub(crate) fn write_payload_shard(
         &self,
         location: ShardLocation,
         key: &ShardKey,

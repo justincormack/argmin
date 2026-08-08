@@ -4492,7 +4492,7 @@ fail_with_matches \
 
 cross_crate_raw_storage_error_transit=$(
     rg -n --color=never \
-        '\b(ObjectPgActionError|MetadataError|StoreError)\b' \
+        '\b(ObjectPgActionError|MetadataError|StoreError|ShardIoError)\b' \
         crates \
         -g '*.rs' \
         -g '!crates/storage/**' \
@@ -4501,6 +4501,36 @@ cross_crate_raw_storage_error_transit=$(
 fail_with_matches \
     "Concrete storage implementation errors must not cross into another crate, including through test hooks or generic ServerError adapters" \
     "$cross_crate_raw_storage_error_transit"
+
+raw_payload_shard_write_public_surface=$(
+    {
+        rg -n --color=never \
+            '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+(write_payload_shard|repair_payload_shard)\b' \
+            crates/storage/src/cluster/payload_operations.rs \
+            crates/storage/src/cluster/local.rs \
+            || true
+        if ! rg -q \
+            '^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+write_payload_shard\b' \
+            crates/storage/src/cluster/payload_operations.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster/payload_operations.rs: StorageCluster raw shard write must remain crate-private'
+        fi
+        for method in write_payload_shard repair_payload_shard
+        do
+            if ! rg -q \
+                "^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+${method}\\b" \
+                crates/storage/src/cluster/local.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster/local.rs: LocalClusterMap raw shard operation ${method} must remain crate-private"
+            fi
+        done
+    }
+)
+fail_with_matches \
+    "Physical payload shard writes and repairs must remain storage-private and expose no ShardIoError boundary" \
+    "$raw_payload_shard_write_public_surface"
 
 raw_payload_test_support_error_transit=$(
     {

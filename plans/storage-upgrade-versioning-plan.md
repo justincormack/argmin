@@ -2297,11 +2297,17 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        creation methods are crate-private. The boundary checker rejects raw errors throughout the
        public topology and stream-session traits, pins these three opaque return types, and requires
        their raw owner helpers to remain crate-private.
+       The physical shard-write visibility sub-slice completed on 2026-08-08. The raw
+       `StorageCluster` shard writer and `LocalClusterMap` shard writer and repair method are now
+       crate-private; all callers were already storage-owned payload placement, repair, tracing, or
+       owner-local tests. The boundary checker pins those three methods to crate visibility and the
+       repository-wide concrete-error scan now rejects `ShardIoError` outside storage alongside the
+       other raw implementation errors.
        A compiler visibility audit performed after that conversion proved the earlier final-export
        inventory incomplete. Making the raw enums crate-private still identifies owner-only public
-       methods for raw shard I/O, route-history reconstruction, stream and multipart primitives,
-       payload leases, and physical placement; these have no external production callers and must
-       be narrowed to crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
+       methods for route-history reconstruction, stream and multipart primitives, payload leases,
+       and physical placement; these have no external production callers and must be narrowed to
+       crate visibility. Finally, `ClusterBuildError::OpenLocalNode` and
        `StorageNodeServerError::Store` publicly embed `StoreError` and need storage-owned opaque
        diagnostics while preserving owner-local exact-error coverage. Complete those three bounded
        groups, rerun the compiler visibility audit with warnings denied, then make `StoreError`,
