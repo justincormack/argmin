@@ -681,9 +681,13 @@ fn multipart_state_observation_rejects_crossed_same_pg_key() {
         .unwrap()
         .unwrap();
 
-    let error =
-        crate::test_support::multipart_upload_state(&cluster, &bucket, &crossed_key, &upload_id)
-            .unwrap_err();
+    let error = crate::test_support::multipart_upload_state_raw_for_owner_test(
+        &cluster,
+        &bucket,
+        &crossed_key,
+        &upload_id,
+    )
+    .unwrap_err();
     assert!(matches!(
         error,
         crate::ObjectPgActionError::Store(StoreError::RouteCapabilitySubjectMismatch {

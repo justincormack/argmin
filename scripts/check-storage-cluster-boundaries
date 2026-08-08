@@ -6036,6 +6036,62 @@ fail_with_matches \
     "Cross-crate lifecycle and payload-reclaim test support must consume raw storage errors inside storage and return only opaque failures" \
     "$lifecycle_test_support_error_leaks"
 
+multipart_test_support_error_leaks=$(
+    {
+        awk '
+        /^    pub trait StorageClusterMultipartTestSupport/ {
+            in_multipart_support = 1
+        }
+        /^    impl StorageClusterMultipartTestSupport/ {
+            in_multipart_support = 0
+        }
+        in_multipart_support && /(ObjectPgActionError|MetadataError|StoreError)/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        ' crates/storage/src/lib.rs
+        rg -n -U --color=never \
+            '^[[:space:]]*pub[[:space:]]+fn[[:space:]]+(stream_upload_session_count_for_object|stream_upload_session_ids_for_object|stream_upload_session_exists|stream_upload_session_cleanup_after|stream_upload_session_count|upload_part_stream_session_count|multipart_upload_count_for_object|multipart_upload_count_for_bucket|multipart_upload_ids_for_object|multipart_upload_exists|multipart_upload_initiated_at|multipart_upload_has_owners|multipart_upload_matches_creation_metadata|capture_multipart_upload_generation_subject|completed_object_uses_multipart_upload_generation|multipart_upload_state)(?s:[^;{]{0,700})Result<[^;{]*(ObjectPgActionError|MetadataError|StoreError)' \
+            crates/storage/src/lib.rs \
+            || true
+        for method in \
+            stream_upload_session_count_for_object \
+            stream_upload_session_ids_for_object \
+            stream_upload_session_exists \
+            stream_upload_session_cleanup_after \
+            stream_upload_session_count \
+            upload_part_stream_session_count \
+            multipart_upload_count_for_object \
+            multipart_upload_count_for_bucket \
+            multipart_upload_ids_for_object \
+            multipart_upload_exists \
+            multipart_upload_initiated_at \
+            multipart_upload_has_owners \
+            multipart_upload_matches_creation_metadata \
+            capture_multipart_upload_generation_subject \
+            completed_object_uses_multipart_upload_generation \
+            multipart_upload_state
+        do
+            if ! rg -q -U \
+                "^[[:space:]]*pub[[:space:]]+fn[[:space:]]+${method}(?s:[^;{]{0,700})Result<[^;{]*TestStorageFailure>" \
+                crates/storage/src/lib.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/lib.rs: public multipart helper ${method} must return TestStorageFailure"
+            fi
+        done
+        if ! rg -q \
+            '^[[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+multipart_upload_state_raw_for_owner_test' \
+            crates/storage/src/lib.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/lib.rs: raw multipart state observation must remain crate-private for owner tests'
+        fi
+    }
+)
+fail_with_matches \
+    "Cross-crate multipart and stream-session test support must consume raw storage errors inside storage and return only opaque failures" \
+    "$multipart_test_support_error_leaks"
+
 metadata_command_public_test_surface_pattern='^[[:space:]]*pub[[:space:]]+(fn[[:space:]]+(test_object_pg_metadata_proof|test_install_before_metadata_command_apply_context_hook|test_bucket_pg_id_for|test_object_pg_id_for)|struct[[:space:]]+MetadataCommandApplyTestContext|type[[:space:]]+MetadataCommandApplyContextTestHook)\b'
 
 scan_public_metadata_command_test_surface() {

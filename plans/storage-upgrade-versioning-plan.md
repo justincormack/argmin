@@ -2271,9 +2271,19 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        coverage pins its `Debug`, `Display`, and error-source redaction. The boundary checker scans
        the complete public lifecycle trait and pins every public lifecycle/reclaim helper to the
        opaque failure. Stream-session and multipart-upload inventory helpers remain together in
-       the multipart test-support slice rather than being split by their use in cleanup tests.
-       The multipart and object/checksum test-support families still require the same conversion
-       before the raw error exports can be removed.
+       multipart test support rather than being split by their use in cleanup tests.
+       The multipart test-support error sub-slice completed on 2026-08-08. Completion candidates,
+       part observations, committed-object part lists, owner-defined corruption injection,
+       stream-session inventories, upload inventories and identities, creation-state observations,
+       and generation-binding checks now return `TestStorageFailure`. Storage interprets absent
+       uploads before conversion and consumes every other metadata, routing, stream-session,
+       manifest, and object-PG error inside the owner. The exact crossed-subject error regression
+       remains owner-local through a crate-private raw state observer; the cross-crate state
+       observer is opaque. The boundary checker scans the complete multipart trait, pins every
+       public stream-session and multipart helper to the opaque failure, and requires the raw
+       observer to remain crate-private.
+       The object/checksum test-support family still requires the same conversion before the raw
+       error exports can be removed.
        The three concrete error types remain public storage exports only because storage still has
        public low-level or test-support signatures which name them. Continue by converting or
        restricting those owner APIs one bounded family at a time, then remove the root exports and

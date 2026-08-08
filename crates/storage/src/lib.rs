@@ -1497,7 +1497,7 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<MultipartUploadCompletionCandidate, ObjectPgActionError>;
+        ) -> Result<MultipartUploadCompletionCandidate, TestStorageFailure>;
 
         fn test_get_multipart_part_observation(
             &self,
@@ -1505,14 +1505,14 @@ pub mod test_support {
             key: &ObjectKey,
             upload_id: &UploadId,
             part_number: u16,
-        ) -> Result<TestMultipartPartObservation, ObjectPgActionError>;
+        ) -> Result<TestMultipartPartObservation, TestStorageFailure>;
 
         fn test_get_object_part_numbers(
             &self,
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
-        ) -> Result<Vec<u32>, ObjectPgActionError>;
+        ) -> Result<Vec<u32>, TestStorageFailure>;
 
         fn test_inject_object_part_payload_checksum_mismatch(
             &self,
@@ -1520,7 +1520,7 @@ pub mod test_support {
             key: &ObjectKey,
             version_id: VersionId,
             part_number: u32,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
 
         fn test_inject_incomplete_multipart_manifest(
             &self,
@@ -1528,7 +1528,7 @@ pub mod test_support {
             key: &ObjectKey,
             version_id: VersionId,
             part_number: u32,
-        ) -> Result<(), ObjectPgActionError>;
+        ) -> Result<(), TestStorageFailure>;
     }
 
     impl StorageClusterMultipartTestSupport for StorageCluster {
@@ -1537,8 +1537,9 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             upload_id: &UploadId,
-        ) -> Result<MultipartUploadCompletionCandidate, ObjectPgActionError> {
+        ) -> Result<MultipartUploadCompletionCandidate, TestStorageFailure> {
             StorageCluster::test_get_multipart_completion_candidate(self, bucket, key, upload_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_get_multipart_part_observation(
@@ -1547,7 +1548,7 @@ pub mod test_support {
             key: &ObjectKey,
             upload_id: &UploadId,
             part_number: u16,
-        ) -> Result<TestMultipartPartObservation, ObjectPgActionError> {
+        ) -> Result<TestMultipartPartObservation, TestStorageFailure> {
             StorageCluster::test_get_multipart_part_observation(
                 self,
                 bucket,
@@ -1555,6 +1556,7 @@ pub mod test_support {
                 upload_id,
                 part_number,
             )
+            .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_get_object_part_numbers(
@@ -1562,8 +1564,9 @@ pub mod test_support {
             bucket: &BucketName,
             key: &ObjectKey,
             version_id: VersionId,
-        ) -> Result<Vec<u32>, ObjectPgActionError> {
+        ) -> Result<Vec<u32>, TestStorageFailure> {
             StorageCluster::test_get_object_part_numbers(self, bucket, key, version_id)
+                .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_inject_object_part_payload_checksum_mismatch(
@@ -1572,7 +1575,7 @@ pub mod test_support {
             key: &ObjectKey,
             version_id: VersionId,
             part_number: u32,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_inject_object_part_payload_checksum_mismatch(
                 self,
                 bucket,
@@ -1580,6 +1583,7 @@ pub mod test_support {
                 version_id,
                 part_number,
             )
+            .map_err(TestStorageFailure::from_object_pg_action)
         }
 
         fn test_inject_incomplete_multipart_manifest(
@@ -1588,7 +1592,7 @@ pub mod test_support {
             key: &ObjectKey,
             version_id: VersionId,
             part_number: u32,
-        ) -> Result<(), ObjectPgActionError> {
+        ) -> Result<(), TestStorageFailure> {
             StorageCluster::test_inject_incomplete_multipart_manifest(
                 self,
                 bucket,
@@ -1596,6 +1600,7 @@ pub mod test_support {
                 version_id,
                 part_number,
             )
+            .map_err(TestStorageFailure::from_object_pg_action)
         }
     }
 
@@ -2718,13 +2723,16 @@ pub mod test_support {
         cluster: &StorageCluster,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<usize, ObjectPgActionError> {
-        cluster.test_list_all_stream_uploads().map(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| session.bucket == *bucket && session.key == *key)
-                .count()
-        })
+    ) -> Result<usize, TestStorageFailure> {
+        cluster
+            .test_list_all_stream_uploads()
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| session.bucket == *bucket && session.key == *key)
+                    .count()
+            })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     /// Returns the logical session identities for one object without exposing
@@ -2733,16 +2741,19 @@ pub mod test_support {
         cluster: &StorageCluster,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<Vec<SessionId>, ObjectPgActionError> {
-        cluster.test_list_all_stream_uploads().map(|sessions| {
-            let mut session_ids = sessions
-                .into_iter()
-                .filter(|session| session.bucket == *bucket && session.key == *key)
-                .map(|session| session.session_id)
-                .collect::<Vec<_>>();
-            session_ids.sort();
-            session_ids
-        })
+    ) -> Result<Vec<SessionId>, TestStorageFailure> {
+        cluster
+            .test_list_all_stream_uploads()
+            .map(|sessions| {
+                let mut session_ids = sessions
+                    .into_iter()
+                    .filter(|session| session.bucket == *bucket && session.key == *key)
+                    .map(|session| session.session_id)
+                    .collect::<Vec<_>>();
+                session_ids.sort();
+                session_ids
+            })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn stream_upload_session_exists(
@@ -2750,14 +2761,17 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<bool, ObjectPgActionError> {
-        cluster.test_list_all_stream_uploads().map(|sessions| {
-            sessions.into_iter().any(|session| {
-                session.bucket == *bucket
-                    && session.key == *key
-                    && session.session_id == *session_id
+    ) -> Result<bool, TestStorageFailure> {
+        cluster
+            .test_list_all_stream_uploads()
+            .map(|sessions| {
+                sessions.into_iter().any(|session| {
+                    session.bucket == *bucket
+                        && session.key == *key
+                        && session.session_id == *session_id
+                })
             })
-        })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     /// Returns the durable cleanup deadline for one exact stream session.
@@ -2770,27 +2784,31 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         session_id: &SessionId,
-    ) -> Result<Option<u64>, ObjectPgActionError> {
-        cluster.test_list_all_stream_uploads().map(|sessions| {
-            sessions
-                .into_iter()
-                .find(|session| {
-                    session.bucket == *bucket
-                        && session.key == *key
-                        && session.session_id == *session_id
-                })
-                .and_then(|session| session.cleanup_after)
-        })
+    ) -> Result<Option<u64>, TestStorageFailure> {
+        cluster
+            .test_list_all_stream_uploads()
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .find(|session| {
+                        session.bucket == *bucket
+                            && session.key == *key
+                            && session.session_id == *session_id
+                    })
+                    .and_then(|session| session.cleanup_after)
+            })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     /// Returns the logical number of durable stream-upload sessions without
     /// exposing their storage-owned records to downstream crates.
     pub fn stream_upload_session_count(
         cluster: &StorageCluster,
-    ) -> Result<usize, ObjectPgActionError> {
+    ) -> Result<usize, TestStorageFailure> {
         cluster
             .test_list_all_stream_uploads()
             .map(|sessions| sessions.len())
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     /// Runs one storage-owned abandoned-session cleanup pass and returns the
@@ -2817,31 +2835,34 @@ pub mod test_support {
         key: &ObjectKey,
         upload_id: &UploadId,
         part_number: u32,
-    ) -> Result<usize, ObjectPgActionError> {
-        cluster.test_list_all_stream_uploads().map(|sessions| {
-            sessions
-                .into_iter()
-                .filter(|session| {
-                    session.bucket == *bucket
-                        && session.key == *key
-                        && matches!(
-                            &session.target,
-                            StreamUploadTarget::UploadPart {
-                                upload_id: target_upload_id,
-                                part_number: target_part_number,
-                            } if target_upload_id == upload_id
-                                && *target_part_number == part_number
-                        )
-                })
-                .count()
-        })
+    ) -> Result<usize, TestStorageFailure> {
+        cluster
+            .test_list_all_stream_uploads()
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| {
+                        session.bucket == *bucket
+                            && session.key == *key
+                            && matches!(
+                                &session.target,
+                                StreamUploadTarget::UploadPart {
+                                    upload_id: target_upload_id,
+                                    part_number: target_part_number,
+                                } if target_upload_id == upload_id
+                                    && *target_part_number == part_number
+                            )
+                    })
+                    .count()
+            })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn multipart_upload_count_for_object(
         cluster: &StorageCluster,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<usize, ObjectPgActionError> {
+    ) -> Result<usize, TestStorageFailure> {
         cluster
             .test_list_multipart_uploads_for_bucket(bucket)
             .map(|uploads| {
@@ -2850,22 +2871,24 @@ pub mod test_support {
                     .filter(|upload| upload.key == *key)
                     .count()
             })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn multipart_upload_count_for_bucket(
         cluster: &StorageCluster,
         bucket: &BucketName,
-    ) -> Result<usize, ObjectPgActionError> {
+    ) -> Result<usize, TestStorageFailure> {
         cluster
             .test_list_multipart_uploads_for_bucket(bucket)
             .map(|uploads| uploads.len())
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn multipart_upload_ids_for_object(
         cluster: &StorageCluster,
         bucket: &BucketName,
         key: &ObjectKey,
-    ) -> Result<Vec<UploadId>, ObjectPgActionError> {
+    ) -> Result<Vec<UploadId>, TestStorageFailure> {
         cluster
             .test_list_multipart_uploads_for_bucket(bucket)
             .map(|uploads| {
@@ -2875,6 +2898,7 @@ pub mod test_support {
                     .map(|upload| upload.upload_id)
                     .collect()
             })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn multipart_upload_exists(
@@ -2882,11 +2906,11 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<bool, ObjectPgActionError> {
+    ) -> Result<bool, TestStorageFailure> {
         match cluster.test_get_multipart_upload(bucket, key, upload_id) {
             Ok(_) => Ok(true),
             Err(ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => Ok(false),
-            Err(error) => Err(error),
+            Err(error) => Err(TestStorageFailure::from_object_pg_action(error)),
         }
     }
 
@@ -2895,10 +2919,11 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<u64, ObjectPgActionError> {
+    ) -> Result<u64, TestStorageFailure> {
         cluster
             .test_get_multipart_upload(bucket, key, upload_id)
             .map(|upload| upload.initiated_at)
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn multipart_upload_has_owners(
@@ -2908,12 +2933,13 @@ pub mod test_support {
         upload_id: &UploadId,
         expected_initiator: &OwnerIdentity,
         expected_owner: &OwnerIdentity,
-    ) -> Result<bool, ObjectPgActionError> {
+    ) -> Result<bool, TestStorageFailure> {
         cluster
             .test_get_multipart_upload(bucket, key, upload_id)
             .map(|upload| {
                 upload.initiator == *expected_initiator && upload.owner == *expected_owner
             })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn multipart_upload_matches_creation_metadata(
@@ -2924,7 +2950,7 @@ pub mod test_support {
         expected_tags: Option<&s3_types::TagSet>,
         expected_metadata: &SerializedMetadataBlob,
         expected_system_metadata: &SerializedSystemMetadataBlob,
-    ) -> Result<bool, ObjectPgActionError> {
+    ) -> Result<bool, TestStorageFailure> {
         cluster
             .test_get_multipart_upload(bucket, key, upload_id)
             .map(|upload| {
@@ -2932,6 +2958,7 @@ pub mod test_support {
                     && upload.metadata_blob == *expected_metadata
                     && upload.system_metadata_blob == *expected_system_metadata
             })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     /// Opaque storage-owned identity for the generation reserved by one
@@ -2959,7 +2986,7 @@ pub mod test_support {
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
-    ) -> Result<TestMultipartUploadGenerationSubject, ObjectPgActionError> {
+    ) -> Result<TestMultipartUploadGenerationSubject, TestStorageFailure> {
         cluster
             .test_get_multipart_upload(bucket, key, upload_id)
             .map(|upload| TestMultipartUploadGenerationSubject {
@@ -2967,20 +2994,23 @@ pub mod test_support {
                 key: upload.key,
                 generation_id: upload.object_generation_id,
             })
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn completed_object_uses_multipart_upload_generation(
         cluster: &StorageCluster,
         subject: &TestMultipartUploadGenerationSubject,
         version_id: VersionId,
-    ) -> Result<bool, ObjectPgActionError> {
-        let object = cluster.test_get_object_version(&subject.bucket, &subject.key, version_id)?;
+    ) -> Result<bool, TestStorageFailure> {
+        let object = cluster
+            .test_get_object_version(&subject.bucket, &subject.key, version_id)
+            .map_err(TestStorageFailure::from_object_pg_action)?;
         Ok(object
             .as_live()
             .is_some_and(|live| live.generation_id == subject.generation_id))
     }
 
-    pub fn multipart_upload_state(
+    pub(crate) fn multipart_upload_state_raw_for_owner_test(
         cluster: &StorageCluster,
         bucket: &BucketName,
         key: &ObjectKey,
@@ -2995,6 +3025,16 @@ pub mod test_support {
             ));
         }
         Ok(upload.state)
+    }
+
+    pub fn multipart_upload_state(
+        cluster: &StorageCluster,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<UploadState, TestStorageFailure> {
+        multipart_upload_state_raw_for_owner_test(cluster, bucket, key, upload_id)
+            .map_err(TestStorageFailure::from_object_pg_action)
     }
 
     pub fn enqueue_object_payload_reclaim(
