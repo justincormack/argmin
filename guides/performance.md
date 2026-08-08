@@ -102,7 +102,7 @@ The workload can be adjusted with:
 
 | Variable | Default | Meaning |
 |---|---:|---|
-| `SIZE_MIB` | `8` | Payload size for SHA-256 and established TLS records |
+| `SIZE_MIB` | `8` | Segment/payload size for SSE, SHA-256, and established TLS records |
 | `WARMUP_ITERS` | `4` | Untimed bulk-operation iterations |
 | `SAMPLE_ITERS` | `32` | Timed bulk operations in each sample |
 | `SIGV4_WARMUP_ITERS` | `10000` | Untimed SigV4 verification operations |
@@ -115,6 +115,7 @@ The summary fields measure distinct parts of the crypto surface:
 |---|---|
 | `summary_sigv4_payload_gib_s` | SHA-256 hashing of an S3 request payload |
 | `summary_sigv4_verify_requests_s` | Complete verification of a representative signed request |
+| `summary_sse_encrypt_gib_s` | SSE segment encryption through the selected AES-256-GCM provider |
 | `summary_tls13_seal_gib_s` | Encrypting application data through an established peer TLS connection |
 | `summary_tls13_open_gib_s` | Decrypting application data through an established peer TLS connection |
 | `summary_tls13_peer_limit_gib_s` | The lower of seal and open throughput |
@@ -122,8 +123,12 @@ The summary fields measure distinct parts of the crypto surface:
 The TLS measurements use the TLS 1.3 profile and ALPN used by internal storage
 RPC, but operate in memory. They exclude the handshake, sockets, network
 latency, framing outside rustls, and simultaneous bidirectional traffic. The
-benchmark also does not individually measure every provider primitive, such as
-MD5, HKDF, or random-number generation.
+SSE measurement mirrors the managed SSE-S3 per-segment write path, including
+AES key setup and the allocation and copy into the encrypted segment buffer. It
+excludes DEK generation and wrapping, checksums, erasure coding, and storage.
+SSE-C uses the same segment operation with different fixed associated data. The
+benchmark does not individually measure every provider primitive, such as MD5,
+HKDF, or random-number generation.
 
 When comparing ring with OpenSSL, verify the printed `crypto_provider` and
 `tls_crypto_provider` rather than inferring the provider from the command. For

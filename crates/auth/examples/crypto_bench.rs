@@ -3,6 +3,7 @@ use std::io::{self, Cursor, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use argmin_crypto::aead::{Aes256GcmKey, AES_256_GCM_KEY_LEN, AES_GCM_NONCE_LEN, AES_GCM_TAG_LEN};
 use auth::{
     authenticate_request, CredentialStore, ExpectedSigningRegion, IdentityProvider, SecretKey,
     SigningService,
@@ -23,6 +24,10 @@ const PATH: &str = "/benchmark/object";
 const QUERY: &str = "partNumber=1&uploadId=crypto-benchmark";
 const HOST: &str = "benchmark.s3.us-east-1.amazonaws.com";
 const STORAGE_RPC_ALPN: &[u8] = b"argmin-storage-rpc/1";
+const SSE_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
+const SSE_SEGMENT_NONCE_PREFIX: [u8; 6] = [0x42; 6];
+const SSE_SEGMENT_NONCE_SCOPE: [u8; 2] = [0; 2];
+const SSE_SEGMENT_KEY: [u8; AES_256_GCM_KEY_LEN] = [0x24; AES_256_GCM_KEY_LEN];
 
 #[derive(Debug, Clone, Copy)]
 struct Config {
@@ -61,6 +66,7 @@ fn main() -> Result<(), String> {
     println!("tls_crypto_provider={}", tls_provider::provider_name());
     println!("crypto_provider={}", argmin_crypto::provider_name());
     println!("sha256_backend={}", checksum::sha256::backend_name());
+    println!("sse_profile=segment-aes256-gcm");
     println!("tls_profile=storage-rpc-tls13");
     println!("block_size_bytes={}", config.block_size);
     println!("sample_iters={}", config.sample_iters);
@@ -79,6 +85,24 @@ fn main() -> Result<(), String> {
     );
     let payload_median =
         print_bulk_samples(&payload_samples, config.block_size, config.sample_iters);
+
+    println!();
+    println!("[sse segment encryption]");
+    let mut segment_index = 0_u32;
+    let sse_encrypt_samples = measure(
+        config.warmup_iters,
+        config.sample_iters,
+        config.samples,
+        || {
+            let ciphertext = sse_encrypt_segment(black_box(&data), segment_index);
+            segment_index = segment_index
+                .checked_add(1)
+                .expect("benchmark exhausted the SSE segment nonce space");
+            black_box(ciphertext);
+        },
+    );
+    let sse_encrypt_median =
+        print_bulk_samples(&sse_encrypt_samples, config.block_size, config.sample_iters);
 
     println!();
     println!("[sigv4 request verification]");
@@ -146,6 +170,7 @@ fn main() -> Result<(), String> {
     println!();
     println!("summary_sigv4_payload_gib_s={payload_median:.3}");
     println!("summary_sigv4_verify_requests_s={request_median:.0}");
+    println!("summary_sse_encrypt_gib_s={sse_encrypt_median:.3}");
     println!("summary_tls13_seal_gib_s={seal_median:.3}");
     println!("summary_tls13_open_gib_s={open_median:.3}");
     println!(
@@ -206,6 +231,25 @@ fn benchmark_data(size: usize) -> Vec<u8> {
     (0..size)
         .map(|index| (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) as u8)
         .collect()
+}
+
+fn sse_encrypt_segment(plaintext: &[u8], segment_index: u32) -> Vec<u8> {
+    // Keep this operation aligned with the SSE-S3/SSE-C segment write path:
+    // construct the AES key for the segment, copy into a new output buffer,
+    // and append the authentication tag in place.
+    let key = Aes256GcmKey::new(&SSE_SEGMENT_KEY).expect("benchmark SSE key must be valid");
+    let mut nonce = [0_u8; AES_GCM_NONCE_LEN];
+    let scope_start = SSE_SEGMENT_NONCE_PREFIX.len();
+    let index_start = scope_start + SSE_SEGMENT_NONCE_SCOPE.len();
+    nonce[..scope_start].copy_from_slice(&SSE_SEGMENT_NONCE_PREFIX);
+    nonce[scope_start..index_start].copy_from_slice(&SSE_SEGMENT_NONCE_SCOPE);
+    nonce[index_start..].copy_from_slice(&segment_index.to_be_bytes());
+
+    let mut ciphertext = plaintext.to_vec();
+    key.seal_in_place_append_tag(nonce, SSE_SEGMENT_AAD, &mut ciphertext)
+        .expect("benchmark SSE encryption must succeed");
+    assert_eq!(ciphertext.len(), plaintext.len() + AES_GCM_TAG_LEN);
+    ciphertext
 }
 
 fn signed_request() -> Result<(IdentityProvider, SignedRequest), String> {
