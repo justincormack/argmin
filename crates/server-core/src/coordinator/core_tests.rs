@@ -25,8 +25,7 @@ use storage::test_support::{
     StorageStreamSessionSweeperTestSupport as _,
 };
 use storage::{
-    ClusterEpoch, RouteMapValidity, StorageCluster, StorageClusterRouteHandle,
-    StorageClusterRuntimeMapHandle,
+    RouteMapValidity, StorageCluster, StorageClusterRouteHandle, StorageClusterRuntimeMapHandle,
 };
 
 const TEST_EVENT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -6498,11 +6497,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_after_partial_frontier() {
                     == storage::test_support::TestBucketDeletePostReservationProgress::MoreFrontiersRemain
                     && fail_after_first_frontier_for_hook.swap(false, Ordering::SeqCst)
                 {
-                    return Err(storage::StoreError::RouteMapExpired {
-                        cluster_epoch: ClusterEpoch::INITIAL,
-                        valid_until_ms: 0,
-                        now_ms: 1,
-                    });
+                    return Err(storage::test_support::injected_retryable_convergence_failure());
                 }
                 Ok(())
             },
@@ -6567,10 +6562,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_stream_cleanup_phase() {
         initial.test_install_before_bucket_delete_exact_drain_hook(Arc::new(move |start| {
             if start == storage::test_support::TestBucketDeleteExactDrainStart::Fresh {
                 initial_scan_ran_for_hook.store(true, Ordering::SeqCst);
-                return Err(storage::StoreError::Io {
-                    context: "unexpected initial exact-bucket drain during stream-cleanup adoption",
-                    source: std::io::Error::other("fresh exact-bucket drain"),
-                });
+                return Err(storage::test_support::injected_internal_storage_failure());
             }
             Ok(())
         }));
@@ -6631,11 +6623,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_reservation_wait_phase() {
         initial.test_install_before_bucket_delete_exact_drain_hook(Arc::new(move |start| {
             if start == storage::test_support::TestBucketDeleteExactDrainStart::Fresh {
                 initial_scan_ran_for_hook.store(true, Ordering::SeqCst);
-                return Err(storage::StoreError::Io {
-                    context:
-                        "unexpected initial exact-bucket drain during reservation-wait adoption",
-                    source: std::io::Error::other("fresh exact-bucket drain"),
-                });
+                return Err(storage::test_support::injected_internal_storage_failure());
             }
             Ok(())
         }));
@@ -6693,10 +6681,8 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_phase() {
     let _exact_drain_hook_guard =
         initial.test_install_before_bucket_delete_exact_drain_hook(Arc::new(move |start| {
             exact_drain_ran_for_hook.store(true, Ordering::SeqCst);
-            Err(storage::StoreError::Io {
-                context: "unexpected exact-bucket drain during final-visibility adoption",
-                source: std::io::Error::other(format!("exact drain start={start:?}")),
-            })
+            let _ = start;
+            Err(storage::test_support::injected_internal_storage_failure())
         }));
 
     let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
@@ -6741,10 +6727,7 @@ fn reclaim_worker_adopts_bucket_delete_begin_from_final_visibility_proven_phase(
     let _visibility_hook_guard =
         initial.test_install_before_bucket_delete_final_visibility_hook(Arc::new(move || {
             visibility_check_ran_for_hook.store(true, Ordering::SeqCst);
-            Err(storage::StoreError::Io {
-                context: "unexpected final visibility scan during proven worker adoption",
-                source: std::io::Error::other("final visibility should already be proven"),
-            })
+            Err(storage::test_support::injected_internal_storage_failure())
         }));
 
     let (_runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
@@ -9990,61 +9973,6 @@ fn rwlock_helpers_recover_after_panic() {
 }
 
 #[test]
-fn object_pg_command_contention_maps_to_slow_down() {
-    let bucket = trusted_bucket_name("contention-bucket");
-    let key = trusted_object_key("contention-key");
-
-    fn assert_maps_to_slow_down(error: storage::ObjectPgActionError) {
-        assert!(matches!(
-            Coordinator::map_object_pg_action_error(error),
-            ServerError::SlowDown
-        ));
-    }
-
-    let epoch = storage::ClusterEpoch::INITIAL;
-    assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
-        storage::StoreError::MetadataCommandLogConflict {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: epoch,
-            log_index: 3,
-        },
-    ));
-    assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
-        storage::StoreError::MetadataCommandPendingConflict {
-            pg_id: 2,
-            cluster_epoch: epoch,
-            existing_log_index: 3,
-            candidate_log_index: 4,
-        },
-    ));
-    assert_maps_to_slow_down(storage::ObjectPgActionError::Store(
-        storage::StoreError::MetadataCommandContention {
-            context: "pending command displaced during cleanup",
-        },
-    ));
-    assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
-        storage::MetadataError::ObjectGenerationReservationConflict {
-            reservation_id: "reservation".to_string(),
-            generation_id: 5,
-        },
-    ));
-    assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
-        storage::MetadataError::ObjectVersionReservationConflict {
-            version_id: storage::VersionId::from_u64(7),
-        },
-    ));
-    assert_maps_to_slow_down(storage::ObjectPgActionError::Metadata(
-        storage::MetadataError::StaleObjectWriteCommand {
-            bucket: bucket.clone(),
-            key: key.clone(),
-            write_sequence: 11,
-            generation_id: None,
-        },
-    ));
-}
-
-#[test]
 fn object_read_failure_kinds_map_exhaustively_to_s3_outcomes() {
     let bucket = trusted_bucket_name("read-failure-bucket");
     let key = trusted_object_key("read-failure-key");
@@ -10551,19 +10479,11 @@ fn bucket_write_drain_failure_flight_record_redacts_storage_diagnostic() {
 
 #[test]
 fn semantic_storage_failure_classes_map_to_s3_outcomes() {
-    fn failure(class: storage::StoreOperationFailureClass) -> storage::StoreError {
-        storage::test_support::store_error_for_operation_failure_class(class)
-    }
-
     for class in [
         storage::StoreOperationFailureClass::ResourceExhausted,
         storage::StoreOperationFailureClass::MetadataCommandContention,
         storage::StoreOperationFailureClass::RetryableConvergence,
     ] {
-        assert!(matches!(
-            super::map_store_error(failure(class)),
-            ServerError::SlowDown
-        ));
         assert!(matches!(
             super::map_store_failure(
                 storage::test_support::store_failure_for_operation_failure_class(class),
@@ -10572,18 +10492,6 @@ fn semantic_storage_failure_classes_map_to_s3_outcomes() {
         ));
     }
     assert!(matches!(
-        super::map_store_error_with_metadata_contention(
-            failure(storage::StoreOperationFailureClass::MetadataCommandContention),
-            super::MetadataContentionResponse::OperationAborted,
-        ),
-        ServerError::OperationAborted
-    ));
-    assert!(matches!(
-        super::map_store_error(failure(storage::StoreOperationFailureClass::Other)),
-        ServerError::Store(ref failure)
-            if failure.class() == storage::StoreOperationFailureClass::Other
-    ));
-    assert!(matches!(
         super::map_store_failure(
             storage::test_support::store_failure_for_operation_failure_class(
                 storage::StoreOperationFailureClass::Other,
@@ -10591,14 +10499,6 @@ fn semantic_storage_failure_classes_map_to_s3_outcomes() {
         ),
         ServerError::Store(ref failure)
             if failure.class() == storage::StoreOperationFailureClass::Other
-    ));
-
-    let resource_exhausted = || failure(storage::StoreOperationFailureClass::ResourceExhausted);
-    assert!(matches!(
-        Coordinator::map_object_pg_action_error(storage::ObjectPgActionError::Store(
-            resource_exhausted(),
-        )),
-        ServerError::SlowDown
     ));
     assert!(matches!(
         Coordinator::map_bucket_snapshot_load_error(
@@ -10626,12 +10526,6 @@ fn semantic_storage_failure_classes_map_to_s3_outcomes() {
     ));
 }
 
-fn injected_stale_shard_location() -> storage::StoreError {
-    storage::test_support::store_error_for_operation_failure_class(
-        storage::StoreOperationFailureClass::RetryableConvergence,
-    )
-}
-
 #[test]
 fn direct_put_payload_stale_shard_location_maps_to_slow_down() {
     let tmp = test_util::tempdir();
@@ -10642,7 +10536,9 @@ fn direct_put_payload_stale_shard_location_maps_to_slow_down() {
         .unwrap();
     let _hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &storage_cluster,
-        Arc::new(|_| Err(injected_stale_shard_location())),
+        Arc::new(|_| {
+            Err(storage::test_support::payload_shard_write_retryable_convergence_failure())
+        }),
     );
 
     let error = test_helpers::put_object(
@@ -10675,7 +10571,9 @@ fn stream_put_payload_stale_shard_location_maps_to_slow_down() {
     let session_id = begin_stream_put_test(&coord, "bucket", "stream").unwrap();
     let hook = storage::test_support::install_payload_shard_write_attempt_hook(
         &storage_cluster,
-        Arc::new(|_| Err(injected_stale_shard_location())),
+        Arc::new(|_| {
+            Err(storage::test_support::payload_shard_write_retryable_convergence_failure())
+        }),
     );
 
     let error = coord
@@ -13515,12 +13413,7 @@ fn direct_put_retry_converges_pending_partial_metadata_command() {
                 if kind == MetadataCommandApplyTestKind::CommitDirectPutObject
                     && fail_once_hook.swap(false, Ordering::SeqCst)
                 {
-                    return Err(storage::StoreError::Io {
-                        context: "injected coordinator direct put metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected coordinator direct put metadata command apply failure",
-                        ),
-                    });
+                    return Err(storage::test_support::injected_internal_storage_failure());
                 }
                 Ok(())
             }),

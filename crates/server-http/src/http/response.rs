@@ -193,7 +193,6 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::DirectPut(_)
         | ServerError::MultipartManagement(_)
         | ServerError::MultipartCompletion(_)
-        | ServerError::Metadata(_)
         | ServerError::Ec(_)
         | ServerError::MetadataBlobError { .. }
         | ServerError::InternalError { .. }
@@ -4918,7 +4917,11 @@ mod tests {
 
     #[test]
     fn error_response_500() {
-        let err = ServerError::Store(storage::StoreError::NotFound.into());
+        let err = ServerError::Store(
+            storage::test_support::store_failure_for_operation_failure_class(
+                storage::StoreOperationFailureClass::Other,
+            ),
+        );
         let resp = S3Response::error(&err, "/x", TEST_HOST_ID);
         assert_eq!(resp.status_code, 500);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
@@ -4998,6 +5001,7 @@ mod tests {
             storage::test_support::multipart_management_failure_diagnostic_fixture();
         let multipart_completion_error =
             storage::test_support::multipart_completion_failure_diagnostic_fixture();
+        let store_error = storage::test_support::store_failure_diagnostic_fixture();
         let cases: Vec<(ServerError, Vec<&str>)> = vec![
             (
                 ServerError::BucketWriteDrain(
@@ -5055,29 +5059,7 @@ mod tests {
                 ServerError::MultipartCompletion(multipart_completion_error.0),
                 multipart_completion_error.1.to_vec(),
             ),
-            (
-                ServerError::Store(
-                    storage::StoreError::Io {
-                        context: "read shard row",
-                        source: std::io::Error::other(
-                            "sqlite path /tmp/secret.db near table shards",
-                        ),
-                    }
-                    .into(),
-                ),
-                vec!["sqlite", "/tmp/secret.db", "read shard row", "table shards"],
-            ),
-            (
-                ServerError::Metadata(storage::error::MetadataError::NotImplemented {
-                    context: "sqlite path /tmp/secret.db UNIQUE constraint failed: objects.key",
-                }),
-                vec![
-                    "UNIQUE constraint",
-                    "objects.key",
-                    "/tmp/secret.db",
-                    "sqlite",
-                ],
-            ),
+            (ServerError::Store(store_error.0), store_error.1.to_vec()),
             (
                 internal_implementation_error.0,
                 internal_implementation_error.1.to_vec(),

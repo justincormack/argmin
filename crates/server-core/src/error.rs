@@ -2,10 +2,9 @@
 use s3_types::VersionId;
 use storage::error::{
     BucketListingFailure, BucketSnapshotLoadFailure, BucketWriteDrainFailure, DirectPutFailure,
-    LifecycleMaintenanceFailure, LifecycleMutationFailure, MetadataError,
-    MultipartCompletionFailure, MultipartManagementFailure, ObjectMetadataListingFailure,
-    ObjectMetadataMutationFailure, ObjectReadFailure, StoreError, StoreFailure,
-    StoreOperationFailureClass, StreamUploadFailure,
+    LifecycleMaintenanceFailure, LifecycleMutationFailure, MultipartCompletionFailure,
+    MultipartManagementFailure, ObjectMetadataListingFailure, ObjectMetadataMutationFailure,
+    ObjectReadFailure, StoreFailure, StreamUploadFailure,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,9 +88,6 @@ pub enum ServerError {
 
     #[error("multipart completion error: {0}")]
     MultipartCompletion(MultipartCompletionFailure),
-
-    #[error("metadata error: {0}")]
-    Metadata(MetadataError),
 
     #[error("EC error: {0}")]
     Ec(#[from] ec::EcError),
@@ -507,17 +503,6 @@ pub enum ServerError {
     },
 }
 
-impl From<StoreError> for ServerError {
-    fn from(error: StoreError) -> Self {
-        match error.operation_failure_class() {
-            StoreOperationFailureClass::ResourceExhausted => Self::SlowDown,
-            StoreOperationFailureClass::MetadataCommandContention
-            | StoreOperationFailureClass::RetryableConvergence
-            | StoreOperationFailureClass::Other => Self::Store(error.into()),
-        }
-    }
-}
-
 impl ServerError {
     pub const UNSUPPORTED_CHECKSUM_ALGORITHM_MESSAGE: &'static str = "Checksum algorithm provided is unsupported. Please try again with any of the valid types: [CRC32, CRC32C, CRC64NVME, MD5, SHA1, SHA256, SHA512, XXHASH128, XXHASH3, XXHASH64]";
 
@@ -547,7 +532,6 @@ impl ServerError {
             Self::DirectPut(error) => error.diagnostic_cause_label(),
             Self::MultipartManagement(error) => error.diagnostic_cause_label(),
             Self::MultipartCompletion(error) => error.diagnostic_cause_label(),
-            Self::Metadata(error) => metadata_error_diagnostic_cause_label(error),
             Self::Ec(_) => "ec_error",
             Self::MetadataBlobError { .. } => "metadata_blob_error",
             Self::InternalError { .. } => "internal_error",
@@ -623,10 +607,6 @@ impl ServerError {
             Self::MultipartCompletion(error) => format!(
                 "server_error>multipart_completion>{}",
                 error.diagnostic_cause_label()
-            ),
-            Self::Metadata(error) => format!(
-                "server_error>metadata_error>{}",
-                metadata_error_diagnostic_cause_chain(error)
             ),
             _ => format!("server_error>{}", self.diagnostic_cause_label()),
         }
@@ -807,7 +787,6 @@ impl ServerError {
             Self::DirectPut(_) => "InternalError",
             Self::MultipartManagement(_) => "InternalError",
             Self::MultipartCompletion(_) => "InternalError",
-            Self::Metadata(_) => "InternalError",
             Self::Ec(_) => "InternalError",
         }
     }
@@ -949,45 +928,6 @@ impl ServerError {
     }
 }
 
-fn metadata_error_diagnostic_cause_label(error: &MetadataError) -> &'static str {
-    match error {
-        MetadataError::BucketWriteDraining => "bucket_write_draining",
-        MetadataError::BucketWriteReservationConflict { .. } => "bucket_write_reservation_conflict",
-        MetadataError::BucketWriteDrainConflict { .. } => "bucket_write_drain_conflict",
-        MetadataError::ReclaimClaimConflict { .. } => "reclaim_claim_conflict",
-        MetadataError::ObjectGenerationReservationConflict { .. } => {
-            "object_generation_reservation_conflict"
-        }
-        MetadataError::ObjectVersionReservationConflict { .. } => {
-            "object_version_reservation_conflict"
-        }
-        MetadataError::StaleBucketMetadataCommand { .. } => "stale_bucket_metadata_command",
-        MetadataError::StaleObjectWriteCommand { .. } => "stale_object_write_command",
-        MetadataError::Db { .. } => "metadata_db_error",
-        _ => "metadata_error",
-    }
-}
-
-fn metadata_error_diagnostic_cause_chain(error: &MetadataError) -> String {
-    metadata_error_diagnostic_cause_label(error).to_string()
-}
-
-impl From<MetadataError> for ServerError {
-    fn from(e: MetadataError) -> Self {
-        match e {
-            MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload { upload_id },
-            MetadataError::InvalidBucketName { reason } => {
-                ServerError::InvalidBucketName { reason }
-            }
-            MetadataError::InvalidObjectKey { reason } => ServerError::InvalidArgument { reason },
-            MetadataError::StreamSegmentConflict { .. } => ServerError::InvalidRequest {
-                reason: "stream segment index already exists".to_string(),
-            },
-            other => ServerError::Metadata(other),
-        }
-    }
-}
-
 impl From<checksum::InvalidChecksumConfig> for ServerError {
     fn from(e: checksum::InvalidChecksumConfig) -> Self {
         ServerError::InvalidArgument { reason: e.reason }
@@ -1086,118 +1026,18 @@ mod tests {
 
     #[test]
     fn storage_diagnostics_use_bounded_categories_and_redact_implementation_errors() {
-        let log_conflict = ServerError::Store(
-            StoreError::MetadataCommandLogConflict {
-                node_id: 1,
-                pg_id: 2,
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                log_index: 3,
-            }
-            .into(),
-        );
+        let (store_failure, secret_fragments) =
+            storage::test_support::store_failure_diagnostic_fixture();
+        let store_failure = ServerError::Store(store_failure);
+        assert_eq!(store_failure.diagnostic_cause_label(), "store_io_failure");
         assert_eq!(
-            log_conflict.diagnostic_cause_label(),
-            "store_metadata_command_contention"
+            store_failure.diagnostic_cause_chain(),
+            "server_error>store_error>store_io_failure"
         );
-
-        let log_gap = ServerError::Store(
-            StoreError::MetadataCommandLogGap {
-                node_id: 1,
-                pg_id: 2,
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                log_index: 5,
-                expected_log_index: 4,
-            }
-            .into(),
-        );
-        assert_eq!(
-            log_gap.diagnostic_cause_label(),
-            "store_metadata_command_contention"
-        );
-
-        let pending_conflict = ServerError::Store(
-            StoreError::MetadataCommandPendingConflict {
-                pg_id: 2,
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                existing_log_index: 3,
-                candidate_log_index: 4,
-            }
-            .into(),
-        );
-        assert_eq!(
-            pending_conflict.diagnostic_cause_label(),
-            "store_metadata_command_contention"
-        );
-
-        let contention = ServerError::Store(
-            StoreError::MetadataCommandContention {
-                context: "pending command displaced during cleanup",
-            }
-            .into(),
-        );
-        assert_eq!(
-            contention.diagnostic_cause_label(),
-            "store_metadata_command_contention"
-        );
-
-        let shard_overload = ServerError::Store(
-            StoreError::ShardStore {
-                node_id: 1,
-                pg_id: 2,
-                cluster_epoch: storage::ClusterEpoch::INITIAL,
-                source: Box::new(StoreError::storage_node_resource_exhausted(
-                    1,
-                    "ReadHandlesAcquire",
-                )),
-            }
-            .into(),
-        );
-        assert_eq!(
-            shard_overload.diagnostic_cause_label(),
-            "store_resource_exhausted"
-        );
-        assert_eq!(
-            shard_overload.diagnostic_cause_chain(),
-            "server_error>store_error>store_resource_exhausted"
-        );
-        let rendered = format!("{shard_overload:?} {shard_overload}");
-        assert!(!rendered.contains("ReadHandlesAcquire"));
-        assert!(!rendered.contains("node_id"));
-        assert!(!rendered.contains("pg_id"));
-        let converted_overload = ServerError::from(StoreError::ShardStore {
-            node_id: 1,
-            pg_id: 2,
-            cluster_epoch: storage::ClusterEpoch::INITIAL,
-            source: Box::new(StoreError::storage_node_resource_exhausted(
-                1,
-                "ReadHandlesAcquire",
-            )),
-        });
-        assert!(matches!(converted_overload, ServerError::SlowDown));
-
-        let stale_bucket = ServerError::Metadata(MetadataError::StaleBucketMetadataCommand {
-            name: storage::BucketName::try_from("bucket".to_string()).unwrap(),
-            bucket_execution_generation: 7,
-        });
-        assert_eq!(
-            stale_bucket.diagnostic_cause_label(),
-            "stale_bucket_metadata_command"
-        );
-
-        let stale_object = ServerError::Metadata(MetadataError::StaleObjectWriteCommand {
-            bucket: storage::BucketName::try_from("bucket".to_string()).unwrap(),
-            key: storage::ObjectKey::try_from("key".to_string()).unwrap(),
-            write_sequence: 3,
-            generation_id: Some(9),
-        });
-        assert_eq!(
-            stale_object.diagnostic_cause_label(),
-            "stale_object_write_command"
-        );
-        assert_eq!(
-            stale_object.diagnostic_cause_chain(),
-            "server_error>metadata_error>stale_object_write_command"
-        );
+        let rendered = format!("{store_failure:?} {store_failure}");
+        for secret in secret_fragments {
+            assert!(!rendered.contains(secret));
+        }
 
         let snapshot = ServerError::BucketSnapshotLoad(
             storage::test_support::bucket_snapshot_load_failure_for_kind(
@@ -1725,7 +1565,11 @@ mod tests {
 
     #[test]
     fn s3_error_code_store() {
-        let err = ServerError::Store(StoreError::NotFound.into());
+        let err = ServerError::Store(
+            storage::test_support::store_failure_for_operation_failure_class(
+                storage::StoreOperationFailureClass::Other,
+            ),
+        );
         assert_eq!(err.s3_error_code(), "InternalError");
     }
 
@@ -1830,12 +1674,6 @@ mod tests {
         );
         assert_eq!(err.s3_error_code(), "InternalError");
         assert_eq!(err.http_status(), 500);
-    }
-
-    #[test]
-    fn s3_error_code_metadata() {
-        let err = ServerError::Metadata(MetadataError::ObjectNotFound);
-        assert_eq!(err.s3_error_code(), "InternalError");
     }
 
     #[test]
@@ -1955,7 +1793,12 @@ mod tests {
     #[test]
     fn http_status_500_wildcard() {
         assert_eq!(
-            ServerError::Store(StoreError::NotFound.into()).http_status(),
+            ServerError::Store(
+                storage::test_support::store_failure_for_operation_failure_class(
+                    storage::StoreOperationFailureClass::Other,
+                ),
+            )
+            .http_status(),
             500
         );
         assert_eq!(
@@ -1991,10 +1834,6 @@ mod tests {
             500
         );
         assert_eq!(
-            ServerError::Metadata(MetadataError::ObjectNotFound).http_status(),
-            500
-        );
-        assert_eq!(
             ServerError::MetadataBlobError { reason: "x".into() }.http_status(),
             500
         );
@@ -2002,24 +1841,6 @@ mod tests {
             ServerError::Ec(ec::EcError::InvalidConfig { reason: "x" }).http_status(),
             500
         );
-    }
-
-    #[test]
-    fn from_store_error() {
-        let err: ServerError = StoreError::NotFound.into();
-        assert!(matches!(err, ServerError::Store(_)));
-    }
-
-    #[test]
-    fn from_metadata_error() {
-        let err: ServerError = MetadataError::ObjectNotFound.into();
-        assert!(matches!(err, ServerError::Metadata(_)));
-    }
-
-    #[test]
-    fn from_invalid_object_key_metadata_error() {
-        let err: ServerError = MetadataError::InvalidObjectKey { reason: "x".into() }.into();
-        assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
     #[test]
@@ -2078,15 +1899,6 @@ mod tests {
         };
         assert_eq!(err.s3_error_code(), "EntityTooSmall");
         assert_eq!(err.http_status(), 400);
-    }
-
-    #[test]
-    fn from_metadata_no_such_upload() {
-        let err: ServerError = MetadataError::NoSuchUpload {
-            upload_id: "abc".to_string(),
-        }
-        .into();
-        assert!(matches!(err, ServerError::NoSuchUpload { .. }));
     }
 
     #[test]

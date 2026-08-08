@@ -91,36 +91,12 @@ impl MetadataContentionResponse {
     }
 }
 
-#[cfg(test)]
-pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
-    map_store_error_with_metadata_contention(error, MetadataContentionResponse::SlowDown)
-}
-
 pub(super) fn map_store_failure(error: storage::StoreFailure) -> ServerError {
     match error.class() {
         storage::StoreOperationFailureClass::ResourceExhausted
         | storage::StoreOperationFailureClass::MetadataCommandContention
         | storage::StoreOperationFailureClass::RetryableConvergence => ServerError::SlowDown,
         storage::StoreOperationFailureClass::Other => ServerError::Store(error),
-    }
-}
-
-/// Map storage failures without treating retryability as an S3 conflict.
-///
-/// `OperationAborted` describes an operation-specific resource conflict. It is
-/// not a generic retry signal, so callers must opt into it explicitly.
-#[cfg(test)]
-pub(super) fn map_store_error_with_metadata_contention(
-    error: storage::StoreError,
-    metadata_contention: MetadataContentionResponse,
-) -> ServerError {
-    match error.operation_failure_class() {
-        storage::StoreOperationFailureClass::ResourceExhausted
-        | storage::StoreOperationFailureClass::RetryableConvergence => ServerError::SlowDown,
-        storage::StoreOperationFailureClass::MetadataCommandContention => {
-            metadata_contention.into_server_error()
-        }
-        storage::StoreOperationFailureClass::Other => ServerError::Store(error.into()),
     }
 }
 
@@ -166,13 +142,6 @@ impl<'a> AdmittedStreamSegmentAppend<'a> {
             payload,
         }
     }
-}
-
-#[cfg(test)]
-pub(super) fn object_pg_action_error_is_metadata_command_contention(
-    error: &storage::ObjectPgActionError,
-) -> bool {
-    error.is_metadata_command_contention()
 }
 
 #[cfg(test)]

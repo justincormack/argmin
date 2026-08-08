@@ -192,6 +192,42 @@ pub mod test_support {
 
     use super::*;
 
+    /// Opaque failure selected by a higher-layer deterministic test hook.
+    pub struct TestInjectedStorageFailure {
+        error: StoreError,
+    }
+
+    impl TestInjectedStorageFailure {
+        fn new(error: StoreError) -> Self {
+            Self { error }
+        }
+
+        fn into_store_error(self) -> StoreError {
+            self.error
+        }
+    }
+
+    /// Inject a retryable convergence failure without exposing its route or PG
+    /// representation.
+    #[must_use]
+    pub fn injected_retryable_convergence_failure() -> TestInjectedStorageFailure {
+        TestInjectedStorageFailure::new(StoreError::RouteMapExpired {
+            cluster_epoch: ClusterEpoch::INITIAL,
+            valid_until_ms: 0,
+            now_ms: 1,
+        })
+    }
+
+    /// Inject an internal storage failure without exposing its implementation
+    /// representation.
+    #[must_use]
+    pub fn injected_internal_storage_failure() -> TestInjectedStorageFailure {
+        TestInjectedStorageFailure::new(StoreError::Io {
+            context: "injected opaque storage test failure",
+            source: std::io::Error::other("injected opaque storage test failure"),
+        })
+    }
+
     /// Open the storage-owned default cluster used by higher-layer unit tests.
     ///
     /// The physical topology is intentionally not configurable across the
@@ -625,8 +661,11 @@ pub mod test_support {
         }
     }
 
-    pub type TestMetadataCommandApplyHook =
-        Arc<dyn Fn(MetadataCommandApplyTestKind) -> Result<(), StoreError> + Send + Sync>;
+    pub type TestMetadataCommandApplyHook = Arc<
+        dyn Fn(MetadataCommandApplyTestKind) -> Result<(), TestInjectedStorageFailure>
+            + Send
+            + Sync,
+    >;
     pub type TestMetadataCommandApplyHookGuard =
         super::cluster::MetadataCommandApplyContextTestHookGuard;
 
@@ -714,7 +753,7 @@ pub mod test_support {
                     && context.bucket.as_ref() == Some(&bucket)
                     && context.key.is_none()
                 {
-                    hook(context.kind)?;
+                    hook(context.kind).map_err(TestInjectedStorageFailure::into_store_error)?;
                 }
                 Ok(())
             }))
@@ -738,7 +777,7 @@ pub mod test_support {
                     && context.bucket.as_ref() == Some(&bucket)
                     && context.key.as_ref() == Some(&key)
                 {
-                    hook(context.kind)?;
+                    hook(context.kind).map_err(TestInjectedStorageFailure::into_store_error)?;
                 }
                 Ok(())
             }))
@@ -759,12 +798,14 @@ pub mod test_support {
                 bucket,
                 Arc::new(move |observed_kind| {
                     if observed_kind == kind {
-                        return Err(StoreError::MetadataCommandLogConflict {
-                            node_id: primary_node.as_u32(),
-                            pg_id,
-                            cluster_epoch,
-                            log_index: 1,
-                        });
+                        return Err(TestInjectedStorageFailure::new(
+                            StoreError::MetadataCommandLogConflict {
+                                node_id: primary_node.as_u32(),
+                                pg_id,
+                                cluster_epoch,
+                                log_index: 1,
+                            },
+                        ));
                     }
                     Ok(())
                 }),
@@ -788,12 +829,14 @@ pub mod test_support {
                 key,
                 Arc::new(move |observed_kind| {
                     if observed_kind == kind {
-                        return Err(StoreError::MetadataCommandLogConflict {
-                            node_id: primary_node.as_u32(),
-                            pg_id,
-                            cluster_epoch,
-                            log_index: 1,
-                        });
+                        return Err(TestInjectedStorageFailure::new(
+                            StoreError::MetadataCommandLogConflict {
+                                node_id: primary_node.as_u32(),
+                                pg_id,
+                                cluster_epoch,
+                                log_index: 1,
+                            },
+                        ));
                     }
                     Ok(())
                 }),
@@ -818,12 +861,14 @@ pub mod test_support {
                 key,
                 Arc::new(move |observed_kind| {
                     if observed_kind == kind && pending_failure.swap(false, Ordering::SeqCst) {
-                        return Err(StoreError::MetadataCommandLogConflict {
-                            node_id: primary_node.as_u32(),
-                            pg_id,
-                            cluster_epoch,
-                            log_index: 1,
-                        });
+                        return Err(TestInjectedStorageFailure::new(
+                            StoreError::MetadataCommandLogConflict {
+                                node_id: primary_node.as_u32(),
+                                pg_id,
+                                cluster_epoch,
+                                log_index: 1,
+                            },
+                        ));
                     }
                     Ok(())
                 }),
@@ -849,11 +894,13 @@ pub mod test_support {
                 key,
                 Arc::new(move |observed_kind| {
                     if observed_kind == kind && pending_failure.swap(false, Ordering::SeqCst) {
-                        return Err(StoreError::StaleMetadataOperation {
-                            pg_id,
-                            operation_epoch,
-                            current_epoch,
-                        });
+                        return Err(TestInjectedStorageFailure::new(
+                            StoreError::StaleMetadataOperation {
+                                pg_id,
+                                operation_epoch,
+                                current_epoch,
+                            },
+                        ));
                     }
                     Ok(())
                 }),
@@ -1499,7 +1546,8 @@ pub mod test_support {
 
     mod payload_write;
     pub use payload_write::{
-        install_payload_shard_write_attempt_hook, TestPayloadShardWriteAttemptGuard,
+        install_payload_shard_write_attempt_hook,
+        payload_shard_write_retryable_convergence_failure, TestPayloadShardWriteAttemptGuard,
         TestPayloadShardWriteAttemptHook, TestPayloadShardWriteAttempts,
     };
 
@@ -1540,7 +1588,7 @@ pub mod test_support {
     /// Cross-crate tests use this to verify their protocol translation without
     /// depending on a PG, route, command-log, or RPC error variant.
     #[must_use]
-    pub fn store_error_for_operation_failure_class(
+    pub(crate) fn store_error_for_operation_failure_class(
         class: StoreOperationFailureClass,
     ) -> StoreError {
         match class {
@@ -1571,6 +1619,22 @@ pub mod test_support {
         class: StoreOperationFailureClass,
     ) -> StoreFailure {
         store_error_for_operation_failure_class(class).into()
+    }
+
+    /// Construct an opaque generic storage failure containing a bounded I/O
+    /// diagnostic and return the private fragments which must stay redacted.
+    #[must_use]
+    pub fn store_failure_diagnostic_fixture() -> (StoreFailure, &'static [&'static str]) {
+        const SECRET_CONTEXT: &str = "secret generic storage fixture operation";
+        const SECRET_SOURCE: &str = "secret generic storage fixture source";
+        (
+            StoreError::Io {
+                context: SECRET_CONTEXT,
+                source: std::io::Error::other(SECRET_SOURCE),
+            }
+            .into(),
+            &[SECRET_CONTEXT, SECRET_SOURCE],
+        )
     }
 
     /// Construct an opaque bucket-write drain failure from its logical outcome.
@@ -2783,12 +2847,27 @@ pub mod test_support {
     pub fn reclaim_object_payload_if_unleased(
         cluster: &StorageCluster,
         subject: &TestObjectPayloadReclaimSubject,
-    ) -> Result<bool, ObjectPgActionError> {
-        cluster.test_reclaim_object_payload_if_unleased(
-            &subject.bucket,
-            &subject.key,
-            subject.generation_id,
-        )
+    ) -> Result<bool, StoreFailure> {
+        cluster
+            .test_reclaim_object_payload_if_unleased(
+                &subject.bucket,
+                &subject.key,
+                subject.generation_id,
+            )
+            .map_err(|error| match error {
+                ObjectPgActionError::Store(error) => StoreFailure::from(error),
+                ObjectPgActionError::Metadata(error) => StoreFailure::from_metadata(error),
+                ObjectPgActionError::InvalidRequest { .. }
+                | ObjectPgActionError::StaleObjectReadSubject
+                | ObjectPgActionError::StaleDirectPutCommitSnapshot
+                | ObjectPgActionError::StaleStreamFinalizeSnapshot
+                | ObjectPgActionError::StaleMultipartCompletionSnapshot
+                | ObjectPgActionError::MultipartConditionalRequestConflict => {
+                    StoreFailure::from(StoreError::RouteCapabilitySubjectMismatch {
+                        operation: "observe payload reclaim test outcome",
+                    })
+                }
+            })
     }
 
     #[cfg(any(test, feature = "test-hooks"))]

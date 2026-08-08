@@ -1557,7 +1557,9 @@ mod tests {
         );
 
         trace.emit_error(&ServerError::Store(
-            storage::StoreError::storage_node_resource_exhausted(1, "ReadHandlesAcquire").into(),
+            storage::test_support::store_failure_for_operation_failure_class(
+                storage::StoreOperationFailureClass::ResourceExhausted,
+            ),
         ));
 
         assert_eq!(trace.status_code, 206);

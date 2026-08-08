@@ -1857,7 +1857,7 @@ payload_shard_delete_callers=$(
         | sed 's/^ *//'
 )
 expected_payload_shard_delete_callers=$(cat <<'EOF'
-1 crates/storage/src/cluster.rs:delete_placed_payload_shard_keys
+1 crates/storage/src/cluster/shard_maintenance.rs:delete_placed_payload_shard_keys
 EOF
 )
 if [[ "$payload_shard_delete_callers" != "$expected_payload_shard_delete_callers" ]]; then
@@ -1922,10 +1922,10 @@ payload_shard_read_callers=$(
         | sed 's/^ *//'
 )
 expected_payload_shard_read_callers=$(cat <<'EOF'
-1 crates/storage/src/cluster.rs:placed_segment_payload_shard_health_at_locations
-1 crates/storage/src/cluster.rs:try_load_placed_segment_shard
-1 crates/storage/src/cluster.rs:try_read_placed_segment_direct_into
-1 crates/storage/src/cluster.rs:validate_payload_shard_acks
+1 crates/storage/src/cluster/payload_operations.rs:validate_payload_shard_acks
+1 crates/storage/src/cluster/shard_maintenance.rs:placed_segment_payload_shard_health_at_locations
+1 crates/storage/src/cluster/shard_maintenance.rs:try_load_placed_segment_shard
+1 crates/storage/src/cluster/shard_maintenance.rs:try_read_placed_segment_direct_into
 EOF
 )
 if [[ "$payload_shard_read_callers" != "$expected_payload_shard_read_callers" ]]; then
@@ -3907,6 +3907,7 @@ coarse_payload_lease_callers=$(
     ' $(find crates/storage/src crates/server-core/src -type f -name '*.rs' \
         ! -path '*/tests/*' \
         ! -name 'tests.rs' \
+        ! -name 'test_rpc.rs' \
         ! -name '*_tests.rs' \
         | sort) \
         | sort \
@@ -4014,59 +4015,59 @@ recovery_drain_authority_uses=$(
         | sort
 )
 expected_recovery_drain_authority_uses=$(cat <<'EOF'
-crates/storage/src/cluster.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_execution_route
-crates/storage/src/cluster.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_execution_route
-crates/storage/src/cluster.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_proof_derivation
-crates/storage/src/cluster.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_reissue
-crates/storage/src/cluster.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_remove_pending
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_authority_inner:metadata_command_recovery_leader_constructor
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_authorized_recovery_route:metadata_command_authorized_drain_primitive
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_authorized_recovery_route:metadata_command_recovery_authority_constructor
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_authorized_recovery_route:metadata_command_recovery_invocation_constructor
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_local_recovery_route:metadata_command_authorized_drain_primitive
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_local_recovery_route:metadata_command_recovery_authority_constructor
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_local_recovery_route:metadata_command_recovery_invocation_constructor
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_recovery_authority:metadata_command_authorized_drain_primitive
-crates/storage/src/cluster.rs:drain_pending_metadata_command_with_recovery_authority:metadata_command_recovery_invocation_constructor
-crates/storage/src/cluster.rs:drain_pending_metadata_commands_for_current_map:metadata_command_local_recovery_drain
-crates/storage/src/cluster.rs:drain_pending_object_metadata_command_with_work_budget:metadata_command_authorized_drain_primitive
-crates/storage/src/cluster.rs:drain_pending_object_metadata_commands_for_exact_bucket_inner:metadata_command_recovery_authority_constructor
-crates/storage/src/cluster.rs:drain_pending_object_metadata_commands_for_exact_bucket_inner:metadata_command_recovery_authority_drain
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_apply
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_apply_reissued
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_proof_derivation
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_record_abandoned
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_record_abandoned
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_reissue
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_remove_pending
-crates/storage/src/cluster.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_remove_pending
-crates/storage/src/cluster.rs:finish_pending_metadata_command_with_recovery_leader:metadata_command_recovery_bucket_finisher
-crates/storage/src/cluster.rs:finish_pending_metadata_command_with_recovery_leader:metadata_command_recovery_execution_route
-crates/storage/src/cluster.rs:prepare_stream_segment_append_with_route_validation:metadata_command_recovery_authority_constructor
-crates/storage/src/cluster.rs:prepare_stream_segment_append_with_route_validation:metadata_command_recovery_authority_drain
-crates/storage/src/cluster.rs:recover_reported_pending_metadata_command:metadata_command_historical_recovery_drain
-crates/storage/src/cluster.rs:reissue_pending_metadata_command:metadata_command_recovery_reissue
-crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_if_due_raw:metadata_command_recovery_authority_constructor
-crates/storage/src/cluster/request_ops.rs:abort_multipart_upload_if_due_raw:metadata_command_recovery_authority_drain
-crates/storage/src/cluster/request_ops.rs:apply_metadata_command_to_acting_set_for_recovery:metadata_command_recovery_execution_route
-crates/storage/src/cluster/request_ops.rs:apply_reissued_metadata_command_to_acting_set_for_recovery:metadata_command_recovery_execution_route
-crates/storage/src/cluster/request_ops.rs:drain_pending_metadata_command_pg_slot_with_work_budget:metadata_command_recovery_authority_constructor
-crates/storage/src/cluster/request_ops.rs:drain_pending_metadata_command_pg_slot_with_work_budget:metadata_command_recovery_authority_drain
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget:metadata_command_recovery_execution_route
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_apply
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_apply_reissued
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_proof_derivation
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_record_abandoned
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_record_abandoned
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_reissue
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
-crates/storage/src/cluster/request_ops.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
-crates/storage/src/cluster/request_ops.rs:lookup_multipart_upload_management_with_route_validation:metadata_command_recovery_authority_constructor
-crates/storage/src/cluster/request_ops.rs:lookup_multipart_upload_management_with_route_validation:metadata_command_recovery_authority_drain
-crates/storage/src/cluster/request_ops.rs:metadata_command_has_abandoned_log_on_acting_set_for_recovery:metadata_command_recovery_execution_route
-crates/storage/src/cluster/request_ops.rs:record_abandoned_metadata_command_to_acting_set_for_recovery:metadata_command_recovery_execution_route
+crates/storage/src/cluster/metadata_operations.rs:drain_pending_metadata_commands_for_current_map:metadata_command_local_recovery_drain
+crates/storage/src/cluster/metadata_operations.rs:reissue_pending_metadata_command:metadata_command_recovery_reissue
+crates/storage/src/cluster/payload_operations.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_execution_route
+crates/storage/src/cluster/payload_operations.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_execution_route
+crates/storage/src/cluster/payload_operations.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_proof_derivation
+crates/storage/src/cluster/payload_operations.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_reissue
+crates/storage/src/cluster/payload_operations.rs:complete_abandoned_object_metadata_command:metadata_command_recovery_remove_pending
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_authority_inner:metadata_command_recovery_leader_constructor
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_authorized_recovery_route:metadata_command_authorized_drain_primitive
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_authorized_recovery_route:metadata_command_recovery_authority_constructor
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_authorized_recovery_route:metadata_command_recovery_invocation_constructor
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_local_recovery_route:metadata_command_authorized_drain_primitive
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_local_recovery_route:metadata_command_recovery_authority_constructor
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_local_recovery_route:metadata_command_recovery_invocation_constructor
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_recovery_authority:metadata_command_authorized_drain_primitive
+crates/storage/src/cluster/payload_operations.rs:drain_pending_metadata_command_with_recovery_authority:metadata_command_recovery_invocation_constructor
+crates/storage/src/cluster/payload_operations.rs:drain_pending_object_metadata_command_with_work_budget:metadata_command_authorized_drain_primitive
+crates/storage/src/cluster/payload_operations.rs:drain_pending_object_metadata_commands_for_exact_bucket_inner:metadata_command_recovery_authority_constructor
+crates/storage/src/cluster/payload_operations.rs:drain_pending_object_metadata_commands_for_exact_bucket_inner:metadata_command_recovery_authority_drain
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_apply
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_apply_reissued
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_proof_derivation
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_record_abandoned
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_record_abandoned
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_reissue
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_remove_pending
+crates/storage/src/cluster/payload_operations.rs:finish_object_pg_pending_slot_inner:metadata_command_recovery_remove_pending
+crates/storage/src/cluster/payload_operations.rs:finish_pending_metadata_command_with_recovery_leader:metadata_command_recovery_bucket_finisher
+crates/storage/src/cluster/payload_operations.rs:finish_pending_metadata_command_with_recovery_leader:metadata_command_recovery_execution_route
+crates/storage/src/cluster/payload_operations.rs:prepare_stream_segment_append_with_route_validation:metadata_command_recovery_authority_constructor
+crates/storage/src/cluster/payload_operations.rs:prepare_stream_segment_append_with_route_validation:metadata_command_recovery_authority_drain
+crates/storage/src/cluster/request_ops/metadata_commands.rs:apply_metadata_command_to_acting_set_for_recovery:metadata_command_recovery_execution_route
+crates/storage/src/cluster/request_ops/metadata_commands.rs:apply_reissued_metadata_command_to_acting_set_for_recovery:metadata_command_recovery_execution_route
+crates/storage/src/cluster/request_ops/metadata_commands.rs:drain_pending_metadata_command_pg_slot_with_work_budget:metadata_command_recovery_authority_constructor
+crates/storage/src/cluster/request_ops/metadata_commands.rs:drain_pending_metadata_command_pg_slot_with_work_budget:metadata_command_recovery_authority_drain
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget:metadata_command_recovery_execution_route
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_apply
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_apply_reissued
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_proof_derivation
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_record_abandoned
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_record_abandoned
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_reissue
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
+crates/storage/src/cluster/request_ops/metadata_commands.rs:finish_pending_metadata_command_to_acting_set_inner:metadata_command_recovery_remove_pending
+crates/storage/src/cluster/request_ops/metadata_commands.rs:metadata_command_has_abandoned_log_on_acting_set_for_recovery:metadata_command_recovery_execution_route
+crates/storage/src/cluster/request_ops/metadata_commands.rs:record_abandoned_metadata_command_to_acting_set_for_recovery:metadata_command_recovery_execution_route
+crates/storage/src/cluster/request_ops/multipart_operations.rs:abort_multipart_upload_if_due_raw:metadata_command_recovery_authority_constructor
+crates/storage/src/cluster/request_ops/multipart_operations.rs:abort_multipart_upload_if_due_raw:metadata_command_recovery_authority_drain
+crates/storage/src/cluster/request_ops/multipart_operations.rs:lookup_multipart_upload_management_with_route_validation:metadata_command_recovery_authority_constructor
+crates/storage/src/cluster/request_ops/multipart_operations.rs:lookup_multipart_upload_management_with_route_validation:metadata_command_recovery_authority_drain
+crates/storage/src/cluster/runtime_map.rs:recover_reported_pending_metadata_command:metadata_command_historical_recovery_drain
 EOF
 )
 if [[ "$recovery_drain_authority_uses" != "$expected_recovery_drain_authority_uses" ]]; then
@@ -4436,10 +4437,12 @@ raw_object_read_error_transit=$(
                 collecting_signature = 0
             }
         }
-        ' crates/storage/src/cluster.rs
+        ' crates/storage/src/cluster/operation_routes.rs
         rg -n -U --color=never \
-            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_object_if|load_object_read_snapshot_if|load_leased_object_read_snapshot_if|retain_object_payload_read|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|read_segment_payload_stored_bytes_into|read_object_payload_segment_stored_bytes_into|read_segment_payload_stored_bytes_at_placement_epoch_into)(?s:[^;{]{0,500})Result<[^;{]*(ObjectPgActionError|StoreError)' \
-            crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_object_if|load_object_read_snapshot_if|load_leased_object_read_snapshot_if|retain_object_payload_read|acquire_object_payload_read_lease|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|read_segment_payload_stored_bytes_into|read_object_payload_segment_stored_bytes_into|read_segment_payload_stored_bytes_at_placement_epoch_into)(?s:[^;{]{0,500})Result<[^;{]*(ObjectPgActionError|StoreError)' \
+            crates/storage/src/cluster/operation_routes.rs \
+            crates/storage/src/cluster/request_ops \
+            crates/storage/src/cluster/shard_maintenance.rs \
             || true
         rg -n -U --color=never \
             'fn read_checked_segment_payload(?s:.{0,1800})map_store_error' \
@@ -4468,31 +4471,36 @@ raw_object_read_error_transit=$(
         do
             if ! rg -q -U \
                 "^[[:space:]]*pub[[:space:]]+fn[[:space:]]+${method}(?s:[^;{]{0,400})Result<[[:space:]]*\\(\\),[[:space:]]*ObjectReadFailure>" \
-                crates/storage/src/cluster.rs
+                crates/storage/src/cluster
             then
                 printf '%s\n' \
-                    "crates/storage/src/cluster.rs: public ${method} must return ObjectReadFailure"
+                    "crates/storage/src/cluster: public ${method} must return ObjectReadFailure"
             fi
         done
         if ! rg -q -U \
-            '#\[cfg\(test\)\][[:space:]]*pub\(super\)[[:space:]]+fn[[:space:]]+map_store_error' \
-            crates/server-core/src/coordinator.rs
-        then
-            printf '%s\n' \
-                'crates/server-core/src/coordinator.rs: the raw StoreError adapter must remain test-only'
-        fi
-        if ! rg -q -U \
             '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+read_segment_payload_stored_bytes_into' \
-            crates/storage/src/cluster.rs
+            crates/storage/src/cluster/shard_maintenance.rs
         then
             printf '%s\n' \
-                'crates/storage/src/cluster.rs: the unbound physical segment reader must remain owner-test-only'
+                'crates/storage/src/cluster/shard_maintenance.rs: the unbound physical segment reader must remain owner-test-only'
         fi
     }
 )
 fail_with_matches \
     "Object-read authorization and payload reads must cross storage through opaque capabilities and ObjectReadFailure rather than forgeable physical requests or raw storage implementation errors" \
     "$raw_object_read_error_transit"
+
+cross_crate_raw_storage_error_transit=$(
+    rg -n --color=never \
+        '\b(ObjectPgActionError|MetadataError|StoreError)\b' \
+        crates \
+        -g '*.rs' \
+        -g '!crates/storage/**' \
+        || true
+)
+fail_with_matches \
+    "Concrete storage implementation errors must not cross into another crate, including through test hooks or generic ServerError adapters" \
+    "$cross_crate_raw_storage_error_transit"
 
 raw_object_metadata_mutation_error_transit=$(
     {
@@ -4582,10 +4590,10 @@ raw_stream_upload_error_transit=$(
         ' crates/storage/src/cluster.rs
         if ! rg -q -U \
             'pub\(crate\) fn abort_stream_upload_session(?s:.{0,300})ObjectPgActionError' \
-            crates/storage/src/cluster.rs
+            crates/storage/src/cluster/shard_maintenance.rs
         then
             printf '%s\n' \
-                'crates/storage/src/cluster.rs: raw stream-upload abort primitive must remain crate-private'
+                'crates/storage/src/cluster/shard_maintenance.rs: raw stream-upload abort primitive must remain crate-private'
         fi
         if ! rg -q -U \
             'trait StorageClusterStreamSessionTestSupport(?s:.{0,500})fn test_abort_stream_upload_session(?s:.{0,300})StreamUploadFailure' \
@@ -4670,10 +4678,10 @@ raw_direct_put_error_transit=$(
             || true
         if ! rg -q -U \
             'pub fn load_existing_live_object(?s:.{0,300})ObjectReadFailure' \
-            crates/storage/src/cluster/request_ops.rs
+            crates/storage/src/cluster/request_ops/bucket_operations.rs
         then
             printf '%s\n' \
-                'crates/storage/src/cluster/request_ops.rs: direct logical existing-object load must return ObjectReadFailure'
+                'crates/storage/src/cluster/request_ops/bucket_operations.rs: direct logical existing-object load must return ObjectReadFailure'
         fi
         if ! rg -q -U \
             'fn map_direct_put_failure(?s:.{0,300})error: storage::DirectPutFailure' \
@@ -4963,10 +4971,10 @@ http_storage_debug_representation_leaks=$(
             || true
         if ! rg -q -U \
             'pub fn metadata_checkpoint_diagnostic(?s:.{0,160})selector: &str' \
-            crates/storage/src/cluster/request_ops.rs
+            crates/storage/src/cluster/request_ops/diagnostics_test_support.rs
         then
             printf '%s\n' \
-                'crates/storage/src/cluster/request_ops.rs: metadata checkpoint diagnostic must accept an opaque selector string'
+                'crates/storage/src/cluster/request_ops/diagnostics_test_support.rs: metadata checkpoint diagnostic must accept an opaque selector string'
         fi
         if ! rg -q -U \
             'pub fn metadata_checkpoint_diagnostic(?s:.{0,160})selector: &str' \
@@ -5656,6 +5664,8 @@ route_authority_capability_leaks=$(
             -g '!crates/server-core/src/coordinator/core_tests.rs' \
             -g '!crates/server-core/src/coordinator/test_support.rs' \
             -g '!crates/server-http/src/http/serve.rs' \
+            -g '!crates/server-http/src/http/serve/tests.rs' \
+            -g '!crates/argmin-s3/src/main_tests.rs' \
             || true
         awk '
             /^mod tests \{/ { exit }

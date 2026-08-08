@@ -1,7 +1,9 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use crate::{StorageCluster, StoreError};
+use crate::StorageCluster;
+
+use super::TestInjectedStorageFailure;
 
 /// A deterministic action invoked at a storage-owned scheduling boundary.
 ///
@@ -11,7 +13,7 @@ use crate::{StorageCluster, StoreError};
 pub type TestStorageSchedulingAction = Arc<dyn Fn() + Send + Sync>;
 
 pub type TestStorageFallibleSchedulingAction =
-    Arc<dyn Fn() -> Result<(), StoreError> + Send + Sync>;
+    Arc<dyn Fn() -> Result<(), TestInjectedStorageFailure> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TestBucketDeletePostReservationProgress {
@@ -19,8 +21,11 @@ pub enum TestBucketDeletePostReservationProgress {
     FinalFrontierRecorded,
 }
 
-pub type TestBucketDeletePostReservationProgressAction =
-    Arc<dyn Fn(TestBucketDeletePostReservationProgress) -> Result<(), StoreError> + Send + Sync>;
+pub type TestBucketDeletePostReservationProgressAction = Arc<
+    dyn Fn(TestBucketDeletePostReservationProgress) -> Result<(), TestInjectedStorageFailure>
+        + Send
+        + Sync,
+>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TestBucketDeleteExactDrainStart {
@@ -28,8 +33,9 @@ pub enum TestBucketDeleteExactDrainStart {
     ResumedFromDurableProgress,
 }
 
-pub type TestBucketDeleteExactDrainSchedulingAction =
-    Arc<dyn Fn(TestBucketDeleteExactDrainStart) -> Result<(), StoreError> + Send + Sync>;
+pub type TestBucketDeleteExactDrainSchedulingAction = Arc<
+    dyn Fn(TestBucketDeleteExactDrainStart) -> Result<(), TestInjectedStorageFailure> + Send + Sync,
+>;
 
 /// Opaque lifetime guard for an installed storage scheduling action.
 pub struct TestStorageSchedulingGuard {
@@ -188,7 +194,10 @@ impl StorageClusterSchedulingTestSupport for StorageCluster {
         action: TestStorageFallibleSchedulingAction,
     ) -> TestStorageSchedulingGuard {
         TestStorageSchedulingGuard::new(
-            StorageCluster::test_install_before_bucket_delete_final_visibility_hook(self, action),
+            StorageCluster::test_install_before_bucket_delete_final_visibility_hook(
+                self,
+                Arc::new(move || action().map_err(TestInjectedStorageFailure::into_store_error)),
+            ),
         )
     }
 
@@ -198,7 +207,8 @@ impl StorageClusterSchedulingTestSupport for StorageCluster {
     ) -> TestStorageSchedulingGuard {
         TestStorageSchedulingGuard::new(
             StorageCluster::test_install_after_bucket_delete_final_visibility_proven_hook(
-                self, action,
+                self,
+                Arc::new(move || action().map_err(TestInjectedStorageFailure::into_store_error)),
             ),
         )
     }
@@ -216,7 +226,7 @@ impl StorageClusterSchedulingTestSupport for StorageCluster {
                     } else {
                         TestBucketDeletePostReservationProgress::FinalFrontierRecorded
                     };
-                    action(progress)
+                    action(progress).map_err(TestInjectedStorageFailure::into_store_error)
                 }),
             ),
         )
@@ -235,7 +245,7 @@ impl StorageClusterSchedulingTestSupport for StorageCluster {
                     } else {
                         TestBucketDeleteExactDrainStart::Fresh
                     };
-                    action(start)
+                    action(start).map_err(TestInjectedStorageFailure::into_store_error)
                 }),
             ),
         )

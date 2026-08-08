@@ -267,56 +267,6 @@ impl Coordinator {
         }
     }
 
-    #[cfg(test)]
-    pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
-        if super::object_pg_action_error_is_metadata_command_contention(&error) {
-            return ServerError::SlowDown;
-        }
-        match error {
-            storage::ObjectPgActionError::Store(error) => super::map_store_error(error),
-            storage::ObjectPgActionError::InvalidRequest { reason } => {
-                ServerError::InvalidRequest { reason }
-            }
-            storage::ObjectPgActionError::StaleObjectReadSubject => ServerError::InternalError {
-                reason: "stale object read subject escaped storage retry loop".to_string(),
-            },
-            storage::ObjectPgActionError::StaleDirectPutCommitSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale direct PUT commit snapshot escaped storage retry loop"
-                        .to_string(),
-                }
-            }
-            storage::ObjectPgActionError::StaleStreamFinalizeSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale stream finalize snapshot escaped storage retry loop".to_string(),
-                }
-            }
-            storage::ObjectPgActionError::StaleMultipartCompletionSnapshot => {
-                ServerError::InternalError {
-                    reason: "stale multipart completion snapshot escaped storage retry loop"
-                        .to_string(),
-                }
-            }
-            storage::ObjectPgActionError::MultipartConditionalRequestConflict => {
-                ServerError::InternalError {
-                    reason: "multipart conditional conflict escaped completion-specific mapping"
-                        .to_string(),
-                }
-            }
-            storage::ObjectPgActionError::Metadata(error) => match error {
-                storage::MetadataError::NoSuchUpload { upload_id } => {
-                    ServerError::NoSuchUpload { upload_id }
-                }
-                storage::MetadataError::StreamSegmentConflict { .. } => {
-                    ServerError::InvalidRequest {
-                        reason: "stream segment index already exists".to_string(),
-                    }
-                }
-                other => ServerError::Metadata(other),
-            },
-        }
-    }
-
     pub(super) fn map_upload_part_stream_error(
         upload_id: &UploadId,
         error: storage::StreamUploadFailure,

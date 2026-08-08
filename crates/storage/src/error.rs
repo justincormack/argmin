@@ -135,6 +135,52 @@ impl StoreFailure {
     pub const fn diagnostic_cause_label(&self) -> &'static str {
         self.diagnostic_category.cause_label()
     }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn from_metadata(error: MetadataError) -> Self {
+        match error {
+            MetadataError::BucketWriteReservationConflict { .. }
+            | MetadataError::BucketWriteReservationNotFound { .. }
+            | MetadataError::ObjectGenerationReservationConflict { .. }
+            | MetadataError::ObjectVersionReservationConflict { .. }
+            | MetadataError::StaleBucketMetadataCommand { .. }
+            | MetadataError::StaleObjectWriteCommand { .. } => Self {
+                class: StoreOperationFailureClass::MetadataCommandContention,
+                diagnostic_category: StoreFailureDiagnosticCategory::MetadataContention,
+            },
+            MetadataError::RouteEffectRejected { source } => source.into(),
+            MetadataError::Db { .. } => Self {
+                class: StoreOperationFailureClass::Other,
+                diagnostic_category: StoreFailureDiagnosticCategory::Database,
+            },
+            MetadataError::BucketNotFound { .. }
+            | MetadataError::InvalidBucketName { .. }
+            | MetadataError::InvalidObjectKey { .. }
+            | MetadataError::BucketAlreadyExists
+            | MetadataError::BucketNotEmpty
+            | MetadataError::BucketNotFinalizedForDelete { .. }
+            | MetadataError::BucketWriteDraining
+            | MetadataError::BucketWriteDrainConflict { .. }
+            | MetadataError::BucketWriteDrainNotFound { .. }
+            | MetadataError::ReclaimClaimConflict { .. }
+            | MetadataError::ReclaimClaimNotFound { .. }
+            | MetadataError::ObjectNotFound
+            | MetadataError::MethodNotAllowedOnDeleteMarker
+            | MetadataError::InvalidVersioningTransition { .. }
+            | MetadataError::NoSuchUpload { .. }
+            | MetadataError::UploadNotInProgress { .. }
+            | MetadataError::PartNotFound { .. }
+            | MetadataError::StreamSessionNotFound { .. }
+            | MetadataError::StreamSessionNotInProgress { .. }
+            | MetadataError::StreamSegmentConflict { .. }
+            | MetadataError::ObjectGenerationReservationNotFound { .. }
+            | MetadataError::NotImplemented { .. }
+            | MetadataError::InvariantViolation { .. } => Self {
+                class: StoreOperationFailureClass::Other,
+                diagnostic_category: StoreFailureDiagnosticCategory::InternalInvariant,
+            },
+        }
+    }
 }
 
 impl From<StoreError> for StoreFailure {

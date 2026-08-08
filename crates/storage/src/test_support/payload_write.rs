@@ -1,14 +1,32 @@
 use std::sync::{Arc, Mutex};
 
 use crate::cluster::PayloadShardWriteTestHookGuard;
-use crate::{ShardKey, ShardLocation, StorageCluster, StoreError};
+use crate::{ShardKey, ShardLocation, StorageCluster, StoreError, StoreFailure};
+
+/// Opaque storage-owned failure injected at the physical shard-write boundary.
+pub struct TestPayloadShardWriteFailure {
+    error: StoreError,
+}
+
+/// Construct a retryable-convergence failure without exposing its physical
+/// storage representation to the caller.
+#[must_use]
+pub fn payload_shard_write_retryable_convergence_failure() -> TestPayloadShardWriteFailure {
+    TestPayloadShardWriteFailure {
+        error: StoreError::RouteMapExpired {
+            cluster_epoch: crate::ClusterEpoch::INITIAL,
+            valid_until_ms: 1,
+            now_ms: 2,
+        },
+    }
+}
 
 /// Storage-owned callback invoked before each physical shard-write attempt.
 ///
 /// The callback receives only the one-based attempt number. Physical shard
 /// placement and identity remain private to storage.
 pub type TestPayloadShardWriteAttemptHook =
-    Arc<dyn Fn(usize) -> Result<(), StoreError> + Send + Sync>;
+    Arc<dyn Fn(usize) -> Result<(), TestPayloadShardWriteFailure> + Send + Sync>;
 
 /// Active physical shard-write observation scoped to one storage cluster.
 ///
@@ -49,7 +67,7 @@ impl TestPayloadShardWriteAttempts {
 
     /// Verify that neither durable acknowledgement rows nor shard files remain
     /// for any attempted write in the originating storage cluster.
-    pub fn all_absent(&self) -> Result<bool, StoreError> {
+    pub fn all_absent(&self) -> Result<bool, StoreFailure> {
         let attempted = self
             .attempted
             .lock()
@@ -57,10 +75,12 @@ impl TestPayloadShardWriteAttempts {
         for (location, key) in attempted.iter() {
             if self
                 .cluster
-                .test_placed_payload_shard_row_exists(*location, key)?
+                .test_placed_payload_shard_row_exists(*location, key)
+                .map_err(StoreFailure::from)?
                 || self
                     .cluster
-                    .test_placed_payload_shard_file_exists(*location, key)?
+                    .test_placed_payload_shard_file_exists(*location, key)
+                    .map_err(StoreFailure::from)?
             {
                 return Ok(false);
             }
@@ -86,7 +106,7 @@ pub fn install_payload_shard_write_attempt_hook(
                 attempted.push((*location, key.clone()));
                 attempted.len()
             };
-            hook(attempt)
+            hook(attempt).map_err(|failure| failure.error)
         },
     ));
     TestPayloadShardWriteAttemptGuard {

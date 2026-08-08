@@ -972,12 +972,14 @@ impl ReadRuntime {
         }
 
         let storage_node = self.storage_node();
-        let lease = storage_node.acquire_object_payload_read_lease(
-            bucket,
-            key,
-            generation_id,
-            segments.iter().map(|segment| &segment.storage_segment),
-        )?;
+        let lease = storage_node
+            .acquire_object_payload_read_lease(
+                bucket,
+                key,
+                generation_id,
+                segments.iter().map(|segment| &segment.storage_segment),
+            )
+            .map_err(super::map_object_read_failure)?;
         Ok(Some(PayloadLease { lease: Some(lease) }))
     }
 
@@ -1000,7 +1002,7 @@ impl ReadRuntime {
         subject: &storage::test_support::TestObjectPayloadReclaimSubject,
     ) -> Result<bool, ServerError> {
         storage::test_support::reclaim_object_payload_if_unleased(self.storage_node(), subject)
-            .map_err(Coordinator::map_object_pg_action_error)
+            .map_err(super::map_store_failure)
     }
 
     #[cfg(test)]

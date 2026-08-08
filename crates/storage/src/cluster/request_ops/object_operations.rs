@@ -2133,6 +2133,17 @@ impl super::StorageCluster {
         key: &ObjectKey,
         generation_id: GenerationId,
         segments: impl IntoIterator<Item = &'a ObjectPayloadSegment>,
+    ) -> Result<ObjectPayloadLease, ObjectReadFailure> {
+        self.acquire_object_payload_read_lease_inner(bucket, key, generation_id, segments)
+            .map_err(ObjectReadFailure::from_store)
+    }
+
+    pub(crate) fn acquire_object_payload_read_lease_inner<'a>(
+        self: &std::sync::Arc<Self>,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segments: impl IntoIterator<Item = &'a ObjectPayloadSegment>,
     ) -> Result<ObjectPayloadLease, StoreError> {
         let mut locations = Vec::new();
         for segment in segments {

@@ -2230,19 +2230,23 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        Owner-local crossed-segment, stale-cluster, classification, and redaction tests; the
        existing coordinator response and HTTP sanitization coverage; and the boundary checker
        prevent raw payload-read errors or a production generic adapter from crossing storage.
-       `ObjectPgActionError` still publicly carries implementation errors,
-       `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
-       adapters still destructure that raw operation wrapper. Replace these remaining surfaces
-       one operation family at a time with exhaustive
-       storage-owned semantic errors. Preserve only logical values required for S3 translation,
-       such as a bucket name, upload ID, part number, or operation-specific conflict; retain all
-       other implementation detail behind the existing bounded opaque diagnostic. Continue with
-       the remaining storage-maintenance/runtime operation families. Remove
-       `ServerError::Metadata(MetadataError)`, direct `StoreError` adapters, and the remaining
-       public raw error exports once no public storage signature requires them. Tests that
-       currently construct raw storage errors must use owner-provided semantic fixtures or move
-       to storage; Phase 5 completion must not be used to keep the production representations
-       public.
+       The cross-crate generic-error sub-slice completed on 2026-08-08. `server-core::ServerError`
+       no longer retains `MetadataError` or implements generic conversion from `MetadataError` or
+       `StoreError`; the obsolete raw object-PG and store-error translation adapters and their
+       representation-based tests were removed. The one remaining public payload-read lease now
+       returns `ObjectReadFailure`, including subject mismatch and route/placement failures. HTTP
+       redaction and coordinator policy tests consume storage-owned opaque fixtures. Cross-crate
+       shard-write, metadata-command, bucket-delete scheduling, and reclaim test hooks likewise
+       inject or return opaque storage-owned failures rather than letting higher layers construct
+       implementation errors. The boundary checker now rejects every `StoreError`,
+       `MetadataError`, or `ObjectPgActionError` reference outside storage, including test and
+       feature-gated code, and separately inventories the payload-read lease method.
+       The three concrete error types remain public storage exports only because storage still has
+       public low-level or test-support signatures which name them. Continue by converting or
+       restricting those owner APIs one bounded family at a time, then remove the root exports and
+       enforce their crate-private visibility. Preserve only logical values required for S3
+       translation, such as a bucket name, upload ID, part number, or operation-specific conflict;
+       retain all other implementation detail behind the existing bounded opaque diagnostics.
 
     2. **Complete — Debug-PG containment.** Completed on 2026-08-07. The bucket-delete,
        metadata-checkpoint, and object-payload-placement endpoints now consume opaque,

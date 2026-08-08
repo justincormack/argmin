@@ -591,7 +591,7 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
         (&bucket, &other_key, generation_id),
         (&bucket, &key, other_generation),
     ] {
-        let error = match cluster.acquire_object_payload_read_lease(
+        let error = match cluster.acquire_object_payload_read_lease_inner(
             lease_bucket,
             lease_key,
             lease_generation,
