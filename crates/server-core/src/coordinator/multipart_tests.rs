@@ -8029,10 +8029,13 @@ fn upload_part_copy_source_read_failure_aborts_destination_stream_session() {
     assert!(
         matches!(
             err,
-            ServerError::ObjectNotFound { .. } | ServerError::Store(_)
+            ServerError::ObjectRead(ref failure)
+                if failure.kind() == storage::ObjectReadFailureKind::InternalError
         ),
         "expected source read failure, got {err:?}"
     );
+    assert_eq!(err.http_status(), 500);
+    assert_eq!(err.s3_error_code(), "InternalError");
     assert_eq!(
         upload_part_stream_session_count(&coord, "bucket", "dst", &upload.upload_id, 1),
         0,
@@ -9175,9 +9178,11 @@ fn get_object_rejects_bad_segment_crc64() {
     let err = result.body.read_all().unwrap_err();
     assert!(matches!(
         err,
-        ServerError::Store(ref failure)
-            if failure.class() == storage::StoreOperationFailureClass::Other
+        ServerError::ObjectRead(ref failure)
+            if failure.kind() == storage::ObjectReadFailureKind::InternalError
     ));
+    assert_eq!(err.http_status(), 500);
+    assert_eq!(err.s3_error_code(), "InternalError");
 }
 
 #[test]

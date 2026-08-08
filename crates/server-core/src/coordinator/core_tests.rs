@@ -19970,8 +19970,8 @@ fn ec_drop_m_plus_one_shards_fails() {
     assert!(
         matches!(
             err,
-            ServerError::Store(ref failure)
-                if failure.class() == storage::StoreOperationFailureClass::Other
+            ServerError::ObjectRead(ref failure)
+                if failure.kind() == storage::ObjectReadFailureKind::InternalError
         ),
         "unrecoverable payload loss must not be reported as NoSuchKey: {err:?}"
     );

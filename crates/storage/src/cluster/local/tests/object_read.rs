@@ -505,9 +505,7 @@ fn retained_read_with_unavailable_lease_nodes(
             Ok(())
         }));
     let mut bytes = Vec::new();
-    retained
-        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
-        .map_err(crate::ObjectReadFailure::from_store)?;
+    retained.read_segment_payload_stored_bytes_into(&segment, &mut bytes)?;
     drop(retained);
     assert_eq!(
         cluster.object_payload_lease_holder_node_count(&bucket, &key, generation_id),
@@ -643,10 +641,23 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
         generation_id,
         [&crossed, &second]
     ));
+    let raw_error = retained
+        .read_segment_payload_stored_bytes_into_raw(&crossed, &mut Vec::new())
+        .unwrap_err();
+    assert!(matches!(
+        raw_error,
+        StoreError::PayloadShardSetMismatch { .. }
+    ));
     let error = retained
         .read_segment_payload_stored_bytes_into(&crossed, &mut Vec::new())
         .unwrap_err();
-    assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "store_integrity_failure");
+    assert_eq!(error.to_string(), "object read failed");
+    assert!(std::error::Error::source(&error).is_none());
+    let debug = format!("{error:?}");
+    assert!(!debug.contains("payload read is outside"));
+    assert!(!debug.contains("PayloadShardSetMismatch"));
 }
 
 #[test]
@@ -743,11 +754,26 @@ fn stale_cluster_rejects_an_opaque_payload_segment_before_reading() {
     )
     .unwrap();
 
+    let raw_error = stale_cluster
+        .read_segment_payload_stored_bytes_at_placement_epoch_into(
+            segment.placement_cluster_epoch(),
+            segment.stored_bytes_request(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        raw_error,
+        StoreError::StalePayloadOperation { .. }
+    ));
     let error = stale_cluster
         .read_object_payload_segment_stored_bytes_into(segment, &mut Vec::new())
         .unwrap_err();
 
-    assert!(matches!(error, StoreError::StalePayloadOperation { .. }));
+    assert_eq!(
+        error.kind(),
+        crate::ObjectReadFailureKind::RetryableConvergence
+    );
+    assert_eq!(error.diagnostic_cause_label(), "store_topology_failure");
 }
 
 #[test]

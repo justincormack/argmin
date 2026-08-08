@@ -2218,6 +2218,18 @@ Raft peer client and server transports are storage-owned and boundary-checked.
        Owner-local expiry, crossed-domain, remaining-validity, classification, and redaction
        regressions plus the repository boundary check prevent raw errors from returning through
        this common runtime authority seam or being routed back through `map_store_error`.
+       The object-payload read sub-slice completed on 2026-08-08. Both retained streaming-read
+       authority and cluster-backed opaque-segment reads now return the existing
+       `ObjectReadFailure`; the coordinator exhaustively preserves `SlowDown` for resource,
+       contention, and convergence outcomes while retaining internal read failures only through
+       the bounded storage-owned diagnostic category. The physical stored-byte request type, its
+       fields, and the inspection/repair methods that accept it are crate-private; placement-epoch
+       selection remains storage-private, and the unbound physical segment reader is
+       owner-test-only. This removed the final production caller of the generic raw
+       `map_store_error` adapter, which is now compiled only for legacy mapping regressions.
+       Owner-local crossed-segment, stale-cluster, classification, and redaction tests; the
+       existing coordinator response and HTTP sanitization coverage; and the boundary checker
+       prevent raw payload-read errors or a production generic adapter from crossing storage.
        `ObjectPgActionError` still publicly carries implementation errors,
        `server-core::ServerError` retains a concrete `MetadataError`, and coordinator translation
        adapters still destructure that raw operation wrapper. Replace these remaining surfaces

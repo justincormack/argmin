@@ -91,6 +91,7 @@ impl MetadataContentionResponse {
     }
 }
 
+#[cfg(test)]
 pub(super) fn map_store_error(error: storage::StoreError) -> ServerError {
     map_store_error_with_metadata_contention(error, MetadataContentionResponse::SlowDown)
 }
@@ -108,6 +109,7 @@ pub(super) fn map_store_failure(error: storage::StoreFailure) -> ServerError {
 ///
 /// `OperationAborted` describes an operation-specific resource conflict. It is
 /// not a generic retry signal, so callers must opt into it explicitly.
+#[cfg(test)]
 pub(super) fn map_store_error_with_metadata_contention(
     error: storage::StoreError,
     metadata_contention: MetadataContentionResponse,

@@ -2231,13 +2231,13 @@ pub struct EcShape {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct SegmentStoredBytesRequest {
-    pub data_pg_id: u32,
-    pub segment_okh: [u8; 16],
-    pub segment_vid: GenerationId,
-    pub stored_size: usize,
-    pub segment_crc64: u64,
-    pub ec: EcShape,
+pub(crate) struct SegmentStoredBytesRequest {
+    pub(crate) data_pg_id: u32,
+    pub(crate) segment_okh: [u8; 16],
+    pub(crate) segment_vid: GenerationId,
+    pub(crate) stored_size: usize,
+    pub(crate) segment_crc64: u64,
+    pub(crate) ec: EcShape,
 }
 
 /// Opaque storage-owned description of one persisted object payload segment.

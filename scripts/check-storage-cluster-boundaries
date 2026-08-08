@@ -4375,6 +4375,37 @@ fail_with_matches \
 
 raw_object_read_error_transit=$(
     {
+        rg -n -U --color=never \
+            'pub struct SegmentStoredBytesRequest|pub use types::(?s:[^;]*)\bSegmentStoredBytesRequest\b|^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+[A-Za-z0-9_]+(?s:[^;{]{0,700})\bSegmentStoredBytesRequest\b' \
+            crates/storage/src -g '*.rs' \
+            || true
+        awk '
+        /^pub\(crate\) struct SegmentStoredBytesRequest[[:space:]]*\{/ {
+            in_request = 1
+            next
+        }
+        in_request && /^}/ {
+            in_request = 0
+            next
+        }
+        in_request && /^[[:space:]]*pub[[:space:]]+/ {
+            print FILENAME ":" FNR ":" $0
+        }
+        ' crates/storage/src/types.rs
+        if ! rg -q \
+            '^pub\(crate\) struct SegmentStoredBytesRequest' \
+            crates/storage/src/types.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/types.rs: SegmentStoredBytesRequest must remain crate-private'
+        fi
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(crate\) use types::SegmentStoredBytesRequest;' \
+            crates/storage/src/lib.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/lib.rs: SegmentStoredBytesRequest root alias must remain owner-test-only and crate-private'
+        fi
         awk '
         /^impl ActiveObjectReadRoute/ {
             in_object_read_impl = 1
@@ -4407,8 +4438,12 @@ raw_object_read_error_transit=$(
         }
         ' crates/storage/src/cluster.rs
         rg -n -U --color=never \
-            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_object_if|load_object_read_snapshot_if|load_leased_object_read_snapshot_if|retain_object_payload_read|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if)(?s:.{0,500})Result<[^;{]*(ObjectPgActionError|StoreError)' \
+            '^[[:space:]]*pub[[:space:]]+((async|const|unsafe)[[:space:]]+)*fn[[:space:]]+(load_object_if|load_object_read_snapshot_if|load_leased_object_read_snapshot_if|retain_object_payload_read|get_object_tags_if|get_object_legal_hold_if|get_object_retention_if|read_segment_payload_stored_bytes_into|read_object_payload_segment_stored_bytes_into|read_segment_payload_stored_bytes_at_placement_epoch_into)(?s:[^;{]{0,500})Result<[^;{]*(ObjectPgActionError|StoreError)' \
             crates/storage/src/cluster.rs crates/storage/src/cluster/request_ops.rs \
+            || true
+        rg -n -U --color=never \
+            'fn read_checked_segment_payload(?s:.{0,1800})map_store_error' \
+            crates/server-core/src/coordinator/runtime.rs \
             || true
         rg -n --color=never '\bObjectPgActionError\b|\bMetadataError\b|\bStoreError\b' \
             crates/server-core/src/coordinator/authz.rs \
@@ -4427,10 +4462,36 @@ raw_object_read_error_transit=$(
             printf '%s\n' \
                 'crates/server-core/src/coordinator/authz/acl.rs: object-read response mapping must accept ObjectReadFailure'
         fi
+        for method in \
+            read_segment_payload_stored_bytes_into \
+            read_object_payload_segment_stored_bytes_into
+        do
+            if ! rg -q -U \
+                "^[[:space:]]*pub[[:space:]]+fn[[:space:]]+${method}(?s:[^;{]{0,400})Result<[[:space:]]*\\(\\),[[:space:]]*ObjectReadFailure>" \
+                crates/storage/src/cluster.rs
+            then
+                printf '%s\n' \
+                    "crates/storage/src/cluster.rs: public ${method} must return ObjectReadFailure"
+            fi
+        done
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(super\)[[:space:]]+fn[[:space:]]+map_store_error' \
+            crates/server-core/src/coordinator.rs
+        then
+            printf '%s\n' \
+                'crates/server-core/src/coordinator.rs: the raw StoreError adapter must remain test-only'
+        fi
+        if ! rg -q -U \
+            '#\[cfg\(test\)\][[:space:]]*pub\(crate\)[[:space:]]+fn[[:space:]]+read_segment_payload_stored_bytes_into' \
+            crates/storage/src/cluster.rs
+        then
+            printf '%s\n' \
+                'crates/storage/src/cluster.rs: the unbound physical segment reader must remain owner-test-only'
+        fi
     }
 )
 fail_with_matches \
-    "Object-read authorization must cross storage through ObjectReadFailure rather than raw storage implementation errors" \
+    "Object-read authorization and payload reads must cross storage through opaque capabilities and ObjectReadFailure rather than forgeable physical requests or raw storage implementation errors" \
     "$raw_object_read_error_transit"
 
 raw_object_metadata_mutation_error_transit=$(
@@ -4960,14 +5021,14 @@ fail_with_matches \
     "Exported storage wrapper diagnostics must use owner-provided bounded labels and redacted formatting instead of raw nested errors" \
     "$raw_storage_wrapper_diagnostic_formatting"
 
-raw_coordinator_payload_read_store_mapping=$(
+raw_coordinator_payload_read_mapping=$(
     awk '
     FNR == 1 {
         pending_test_cfg = 0
         in_test_cfg = 0
         in_payload_read_call = 0
         payload_read_call_start = ""
-        payload_read_has_store_mapper = 0
+        payload_read_has_object_read_mapper = 0
     }
     /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ || /^[[:space:]]*#\[cfg\(feature = "test-hooks"\)\]/ {
         pending_test_cfg = 1
@@ -4991,26 +5052,27 @@ raw_coordinator_payload_read_store_mapping=$(
         if (in_test_cfg) {
             next
         }
-        if (!in_payload_read_call && $0 ~ /read_segment_payload_stored_bytes_into[[:space:]]*\(/) {
+        if (!in_payload_read_call \
+            && $0 ~ /(read_segment_payload_stored_bytes_into|read_object_payload_segment_stored_bytes_into)[[:space:]]*\(/) {
             in_payload_read_call = 1
             payload_read_call_start = FILENAME ":" FNR ":" $0
-            payload_read_has_store_mapper = 0
+            payload_read_has_object_read_mapper = 0
         }
         if (in_payload_read_call \
-            && $0 ~ /map_err[[:space:]]*\([[:space:]]*super::map_store_error[[:space:]]*\)/) {
-            payload_read_has_store_mapper = 1
+            && $0 ~ /map_err[[:space:]]*\([[:space:]]*super::map_object_read_failure[[:space:]]*\)/) {
+            payload_read_has_object_read_mapper = 1
         }
         if (in_payload_read_call && $0 ~ /[?][[:space:]]*;/) {
-            if (!payload_read_has_store_mapper) {
+            if (!payload_read_has_object_read_mapper) {
                 print payload_read_call_start
             }
             in_payload_read_call = 0
             payload_read_call_start = ""
-            payload_read_has_store_mapper = 0
+            payload_read_has_object_read_mapper = 0
         } else if (in_payload_read_call && $0 ~ /;[[:space:]]*$/) {
             in_payload_read_call = 0
             payload_read_call_start = ""
-            payload_read_has_store_mapper = 0
+            payload_read_has_object_read_mapper = 0
         }
     }
     ' $(find crates/server-core/src/coordinator -type f -name '*.rs' \
@@ -5019,8 +5081,8 @@ raw_coordinator_payload_read_store_mapping=$(
         | sort)
 )
 fail_with_matches \
-    "Production coordinator payload reads must map storage errors through map_store_error before using ?" \
-    "$raw_coordinator_payload_read_store_mapping"
+    "Production coordinator payload reads must map opaque storage failures through map_object_read_failure before using ?" \
+    "$raw_coordinator_payload_read_mapping"
 
 
 unbudgeted_request_work_helpers=$(

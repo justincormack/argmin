@@ -1703,6 +1703,15 @@ impl RetainedObjectPayloadRead {
         &self,
         segment: &ObjectPayloadSegment,
         dst: &mut Vec<u8>,
+    ) -> Result<(), ObjectReadFailure> {
+        self.read_segment_payload_stored_bytes_into_raw(segment, dst)
+            .map_err(ObjectReadFailure::from_store)
+    }
+
+    fn read_segment_payload_stored_bytes_into_raw(
+        &self,
+        segment: &ObjectPayloadSegment,
+        dst: &mut Vec<u8>,
     ) -> Result<(), StoreError> {
         if !self.contains_segment(segment) {
             return Err(StoreError::PayloadShardSetMismatch {
@@ -17499,7 +17508,8 @@ impl StorageCluster {
         self.scavenge_abandoned_stream_sessions(max_age_ms).cleaned
     }
 
-    pub fn read_segment_payload_stored_bytes_into(
+    #[cfg(test)]
+    pub(crate) fn read_segment_payload_stored_bytes_into(
         &self,
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
@@ -17517,15 +17527,16 @@ impl StorageCluster {
         &self,
         segment: &ObjectPayloadSegment,
         dst: &mut Vec<u8>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<(), ObjectReadFailure> {
         self.read_segment_payload_stored_bytes_at_placement_epoch_into(
             segment.placement_cluster_epoch(),
             segment.stored_bytes_request(),
             dst,
         )
+        .map_err(ObjectReadFailure::from_store)
     }
 
-    pub fn read_segment_payload_stored_bytes_at_placement_epoch_into(
+    pub(crate) fn read_segment_payload_stored_bytes_at_placement_epoch_into(
         &self,
         placement_cluster_epoch: ClusterEpoch,
         req: SegmentStoredBytesRequest,
@@ -18287,7 +18298,7 @@ impl StorageCluster {
             })
     }
 
-    pub fn placed_segment_payload_shard_repair_targets(
+    pub(crate) fn placed_segment_payload_shard_repair_targets(
         &self,
         req: SegmentStoredBytesRequest,
     ) -> Result<Vec<ShardIndex>, StoreError> {
@@ -18298,7 +18309,7 @@ impl StorageCluster {
         Ok(health.repair_targets())
     }
 
-    pub fn placed_segment_payload_shard_health(
+    pub(crate) fn placed_segment_payload_shard_health(
         &self,
         req: SegmentStoredBytesRequest,
     ) -> Result<PlacedSegmentShardSetHealth, StoreError> {
@@ -18317,7 +18328,7 @@ impl StorageCluster {
         )
     }
 
-    pub fn placed_segment_payload_shard_health_for_pg_route_snapshot(
+    pub(crate) fn placed_segment_payload_shard_health_for_pg_route_snapshot(
         &self,
         route: &PgRouteSnapshot,
         req: SegmentStoredBytesRequest,

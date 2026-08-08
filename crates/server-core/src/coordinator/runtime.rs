@@ -1035,7 +1035,7 @@ impl ReadRuntime {
             ReadStorage::Cluster(storage_node) => storage_node
                 .read_object_payload_segment_stored_bytes_into(&segment.storage_segment, &mut buf),
         }
-        .map_err(super::map_store_error)?;
+        .map_err(super::map_object_read_failure)?;
         if matches!(segment.encryption, ObjectEncryption::None) {
             Ok(buf.into_shared())
         } else {

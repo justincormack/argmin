@@ -71,7 +71,7 @@ use crate::types::{
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::types::{
     ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    PlacedSegmentShardRepairWorkItem,
+    PlacedSegmentShardRepairWorkItem, SegmentStoredBytesRequest,
 };
 use crate::*;
 
