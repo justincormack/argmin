@@ -455,6 +455,20 @@ Its private fields bind the exact object snapshot, requested version, metadata
 route, originating cluster, and broad generation lease; callers may inspect the
 snapshot but cannot pair another snapshot with that lease. An
 `ActiveObjectReadRoute` can consume it only when all provenance matches.
+Broad-lease acquisition and exact snapshot loading are structurally colocated
+in one child module. The local-map acquisition primitive requires an opaque
+authority that binds the exact bucket, key, and generation loaded from the
+live subject. Its constructor is private to that complete workflow, so sibling
+request implementations cannot acquire or retain a coarse lease independently
+of the snapshot token. The token's representation and the consuming
+broad-to-narrow lease transition are defined in that same child module, rather
+than an ancestor module whose private fields would remain visible to its
+descendants. Surrounding cluster code can only inspect the immutable snapshot
+or call the opaque operations exposed on `ActiveObjectReadRoute`. Those
+operations are implemented inside the child module and derive the repair fence
+and route-validity checks directly from that route's admission; no production
+cluster helper accepts caller-supplied repair authority.
+
 CopyObject and UploadPartCopy reconstruct that exact admitted source route
 before consuming the handoff. Both forms derive every shard owner from the
 token's recorded placement epochs,
@@ -517,9 +531,10 @@ installed route; historical cleanup uses the exact reconstructed route at the
 payload's placement epoch. Both accept only a matching derived key from a
 staged-write owner or durable reclaim record before reaching the corresponding
 storage-node deletion fence, so a caller cannot combine a location from one
-placement with another segment's key. The remaining temporary semantic caller
-check keeps coarse generation leases inside the broad-to-narrow snapshot
-handoff.
+placement with another segment's key. No temporary semantic caller inventory
+remains: coarse generation-lease acquisition is enforced by the private
+broad-lease authority, and physical deletion is enforced by the placed-segment
+capability.
 
 Current-route segment reads use a separate storage-private placed-segment
 reader over the same exact derived subject. Callers select only a shard index,

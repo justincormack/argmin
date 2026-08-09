@@ -3930,13 +3930,18 @@ impl LocalClusterMap {
         self.try_acquire_object_payload_lease_inner(bucket, key, generation_id, false)
     }
 
-    pub(crate) fn try_acquire_available_object_payload_lease(
+    pub(in crate::cluster) fn try_acquire_available_object_payload_lease(
         &self,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
+        authority: &super::request_ops::leased_object_snapshot::BroadObjectPayloadLeaseAuthority<
+            '_,
+        >,
     ) -> Result<AcquiredObjectPayloadNodeLeases, StoreError> {
-        self.try_acquire_object_payload_lease_inner(bucket, key, generation_id, true)
+        self.try_acquire_object_payload_lease_inner(
+            authority.bucket(),
+            authority.key(),
+            authority.generation_id(),
+            true,
+        )
     }
 
     fn try_acquire_object_payload_lease_inner(

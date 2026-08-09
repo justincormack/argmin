@@ -668,7 +668,7 @@ fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
         assert!(matches!(error, StoreError::PayloadShardSetMismatch { .. }));
     }
     let (_, snapshot, leased_snapshot) = outcome.into_parts();
-    assert!(Arc::ptr_eq(&snapshot, &leased_snapshot.snapshot));
+    assert!(leased_snapshot.test_shares_snapshot(&snapshot));
     let mut retained = route
         .retain_object_payload_read(leased_snapshot)
         .unwrap()
@@ -765,9 +765,7 @@ fn retained_object_payload_read_rejects_an_omitted_snapshot_segment() {
         .unwrap();
     let (_, shared_snapshot, mut leased_snapshot) = outcome.into_parts();
     drop(shared_snapshot);
-    Arc::make_mut(&mut leased_snapshot.snapshot)
-        .object_segments
-        .clear();
+    leased_snapshot.test_clear_object_segments();
 
     let error = match route.retain_object_payload_read(leased_snapshot) {
         Ok(_) => panic!("incomplete payload snapshot unexpectedly retained read authority"),

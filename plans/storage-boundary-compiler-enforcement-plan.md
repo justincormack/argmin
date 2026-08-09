@@ -6811,14 +6811,13 @@ invocations (27 top-level and seven nested).
 
 Phase 6 remaining-check rationale inventory (2026-08-09):
 
-The 32 remaining checks form ten semantic cohorts. This table is the
+The 30 remaining checks form nine semantic cohorts. This table is the
 authoritative retention rationale; it replaces an implied requirement to keep
 every historical symbol ban merely because it already existed.
 
 | Cohort (actual checks) | Invariant | Why Rust visibility/types are insufficient | Why ordinary tests are insufficient | Stable inspected input |
 | --- | --- | --- | --- | --- |
 | Workspace feature graph (1) | Default production normal/build graphs cannot enable storage test support; every workspace package is classified fail closed. | Cargo permits any package feature to forward another package's feature, including through defaults. | Tests compile the graph they are run under and do not enumerate every production package's resolved feature set. | Cargo metadata/tree feature resolution plus the exhaustive package classification and miniature end-to-end fixture. |
-| Payload-read/delete migration fences (1) | Coarse leases exist only for the leased-snapshot handoff. | The raw lease operation is storage-private, but required callers remain siblings within the same crate. | Positive read/reclaim tests do not fail merely because an additional coarse-lease call site is introduced. | Production Rust call sites for the coarse generation lease, excluding owner-local tests. This is explicitly temporary and is deleted only with its capability/module migration. |
 | Metadata-command publisher/recovery classification (7) | Every live publisher has one registry marker, obtains the correct sealed class token, and uses its typed installer; recovery mutation stays within the audited leader-authority path. | Publisher mints and some recovery constructors remain `pub(crate)` within modules whose included implementation files share visibility. Sealing enforces class, but not canonical mint location. | Command convergence tests exercise known publishers and cannot prove that a new unmarked or differently classified publisher was not added. | The authoritative publisher registry, production macro markers/installers, direct token-mint references, recovery-authority entry points, and semantic adversarial fixtures. |
 | Intra-storage semantic boundaries (4) | Typed route failures are not flattened to generic IO; request paths retain shared work budgets; SQLite access remains in `pg_store`; process code does not know storage directory/file layout. | All participants are intentionally inside the storage crate for the first three rules, while filesystem spellings are not Rust types. | Tests may pass without exercising a newly added conversion, unbounded retry helper, database access, or duplicated path spelling. | Narrow conversion/helper call shapes, storage source imports, and process-layer physical layout literals. |
 | HTTP storage boundary (2) | HTTP uses opaque diagnostics and semantic EC support rather than physical PG/checkpoint/snapshot/placement or erasure-code representations. | Some logical storage and EC types are public for legitimate owner/server-core use, so visibility cannot express the dependency-layer rule. | HTTP behavior can remain correct while an internal diagnostic or test acquires forbidden physical authority. | `server-http` source and its Cargo dependency declaration. |
@@ -6897,6 +6896,37 @@ Phase 6 placed-segment shard-deletion slice (2026-08-09):
   transport, and deletes the matching remote shard through retained cleanup
   authority. The checker baseline is now 31 actual `fail_with_matches`
   invocations (27 top-level and four nested).
+
+Phase 6 broad snapshot-lease boundary slice (2026-08-09):
+
+- moved the exact leased-object snapshot workflow out of the shared
+  `request_ops` include scope into a real child module. Only the complete
+  snapshot-loading operation is visible to surrounding cluster code;
+- introduced `BroadObjectPayloadLeaseAuthority`, whose constructor and fields
+  are private to that child module and which binds the exact bucket, key, and
+  generation loaded from the live subject. The raw local-map broad-lease
+  acquisition requires this authority, so sibling request implementations
+  cannot acquire a coarse generation lease independently and cannot detach it
+  from the opaque `LeasedObjectReadSnapshot` handoff;
+- moved the `LeasedObjectReadSnapshot` representation and the complete
+  consuming broad-to-narrow transition into the same child module. The parent
+  reexports only the opaque token and result types; surrounding cluster code
+  can inspect the shared immutable snapshot or submit the token to the
+  provenance-checking admitted-route transition, but cannot access the broad
+  lease field through Rust's descendant access to ancestor-private items;
+- implemented the public admitted-route load and retain operations inside the
+  child module as well. They derive the repair fence and validity checks from
+  the route's captured admission before calling module-private cluster
+  transitions; no sibling production code can inject a raw fence, gate,
+  publication generation, or validation closure;
+- retained the separately feature-gated owner-local/test-support acquisition
+  path. Production feature-graph enforcement prevents that path from entering
+  normal or build dependency graphs; and
+- removed the final temporary payload lease caller inventory. Existing
+  owner-local tests continue to pin stale-snapshot retry, reclaim exclusion
+  before handoff, all-or-release behavior, exact subject/layout binding, and
+  broad-to-narrow release ordering. The checker baseline is now 30 actual
+  `fail_with_matches` invocations (26 top-level and four nested).
 
 For each remaining section, record:
 

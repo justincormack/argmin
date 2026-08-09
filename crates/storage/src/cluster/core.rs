@@ -1695,51 +1695,6 @@ impl Drop for RetainedObjectPayloadRead {
     }
 }
 
-pub struct LeasedObjectReadSnapshotOutcome<T> {
-    value: T,
-    leased_snapshot: LeasedObjectReadSnapshot,
-}
-
-impl<T> LeasedObjectReadSnapshotOutcome<T> {
-    pub fn snapshot(&self) -> &ObjectReadSnapshot {
-        self.leased_snapshot.snapshot.as_ref()
-    }
-
-    /// Split the authorization result into its value, shared immutable
-    /// snapshot, and non-cloneable payload handoff. The snapshot and handoff
-    /// refer to the same allocation rather than duplicating payload vectors.
-    pub fn into_parts(self) -> (T, Arc<ObjectReadSnapshot>, LeasedObjectReadSnapshot) {
-        let snapshot = Arc::clone(&self.leased_snapshot.snapshot);
-        (self.value, snapshot, self.leased_snapshot)
-    }
-}
-
-/// Non-cloneable proof that an exact object snapshot was loaded while its
-/// payload generation was protected by a broad deletion-exclusion lease.
-///
-/// The fields are private so callers cannot pair an arbitrary snapshot with a
-/// lease acquired for another version. A payload reader can be created only by
-/// consuming this value through the originating cluster or admitted route.
-/// Its immutable snapshot is shared with the authorization result so the
-/// handoff does not duplicate part or segment vectors.
-pub struct LeasedObjectReadSnapshot {
-    cluster: Arc<StorageCluster>,
-    bucket: BucketName,
-    key: ObjectKey,
-    version_id: Option<VersionId>,
-    snapshot_mode: ObjectReadSnapshotMode,
-    pg_id: ObjectMetadataPgId,
-    snapshot: Arc<ObjectReadSnapshot>,
-    payload_lease: Option<ObjectPayloadLease>,
-    repair_fence: Option<RetainedActiveRouteRepairFence>,
-}
-
-impl LeasedObjectReadSnapshot {
-    pub fn snapshot(&self) -> &ObjectReadSnapshot {
-        self.snapshot.as_ref()
-    }
-}
-
 impl ObjectPayloadLease {
     fn new(
         cluster: Weak<StorageCluster>,

@@ -78,6 +78,8 @@ use crate::types::{
 };
 use crate::*;
 
+pub(super) mod leased_object_snapshot;
+
 include!("request_ops/support.rs");
 include!("request_ops/metadata_commands.rs");
 include!("request_ops/bucket_delete.rs");

@@ -2056,32 +2056,6 @@ impl super::StorageCluster {
         ))
     }
 
-    fn acquire_available_object_payload_lease(
-        self: &std::sync::Arc<Self>,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        generation_id: GenerationId,
-    ) -> Result<ObjectPayloadLease, StoreError> {
-        let runtime_state = self.ensure_object_payload_lease_allowed(bucket, key, generation_id)?;
-        let acquired = self.local_map.try_acquire_available_object_payload_lease(
-            bucket,
-            key,
-            generation_id,
-        )?;
-        if acquired.node_leases.is_empty() {
-            return Err(StoreError::NotFound);
-        }
-        Ok(ObjectPayloadLease::new(
-            std::sync::Arc::downgrade(self),
-            acquired,
-            runtime_state,
-            bucket.clone(),
-            key.clone(),
-            generation_id,
-            self.object_metadata_pg_id(bucket, key),
-        ))
-    }
-
     pub(crate) fn acquire_object_payload_lease_for_shard_locations(
         self: &std::sync::Arc<Self>,
         bucket: &BucketName,

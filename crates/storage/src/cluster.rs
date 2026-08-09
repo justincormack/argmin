@@ -23,6 +23,9 @@ use local::{
     LocalClusterRuntimeState, LocalPlacedSegmentShardReader, LocalRouteMapLeaseSnapshot,
     MetadataCommandRecoveryAdmission, MetadataCommandRecoveryGuard,
 };
+pub use request_ops::leased_object_snapshot::{
+    LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome,
+};
 pub use request_ops::BucketIdentityGenerations;
 pub(crate) use request_ops::{DurableReclaimScanBatch, DurableReclaimScanOutcome};
 
@@ -96,8 +99,8 @@ use crate::types::{
     FinalizeStreamPutOutcome, GenerationId, InsertCurrentDeleteMarkerOutcome,
     ListedBucketMultipartUploads, ListedBucketObjectVersions, ListedBucketObjects,
     ListedMultipartParts, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPayloadSegment,
-    ObjectReadSnapshot, ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention,
-    ObjectSegmentRecord, OwnerIdentity, PgId, PgState, PlacedSegmentBackfillReferenceCursor,
+    ObjectReadSnapshotMode, ObjectReadSnapshotOutcome, ObjectRetention, ObjectSegmentRecord,
+    OwnerIdentity, PgId, PgState, PlacedSegmentBackfillReferenceCursor,
     PlacedSegmentShardBackfillClaimAcquire, PlacedSegmentShardBackfillClaimAcquireParams,
     PlacedSegmentShardBackfillClaimRecord, PlacedSegmentShardBackfillWorkItem,
     PlacedSegmentShardRepairClaimAcquire, PlacedSegmentShardRepairClaimAcquireParams,

@@ -291,66 +291,6 @@ impl ActiveObjectReadRoute<'_> {
             .map_err(ObjectReadFailure::from_object_pg_action)
     }
 
-    pub fn load_leased_object_read_snapshot_if<T, E>(
-        &self,
-        action: impl FnMut(&StoredObject) -> Result<T, E>,
-    ) -> Result<Result<LeasedObjectReadSnapshotOutcome<T>, E>, ObjectReadFailure> {
-        let route = ObjectReadMetadataRoute {
-            bucket: &self.bucket,
-            key: &self.key,
-            version_id: self.version_id,
-            snapshot_mode: self.snapshot_mode,
-            pg_id: self.pg_id,
-        };
-        let outcome = self
-            .admission
-            .cluster
-            .load_leased_object_read_snapshot_if_on_route(&route, action, || {
-                self.admission.require_valid_now_raw()
-            })
-            .map_err(ObjectReadFailure::from_object_pg_action)?;
-        Ok(outcome.map(|mut outcome| {
-            outcome.leased_snapshot.repair_fence = Some(RetainedActiveRouteRepairFence {
-                gate: self.admission._permit.gate.clone(),
-                publication_generation: self.admission._permit.gate.publication_generation(),
-                admitted_lease: self.admission.admitted_lease,
-            });
-            outcome
-        }))
-    }
-
-    /// Retain narrowly scoped payload authority for the exact snapshot loaded
-    /// through this route.
-    ///
-    /// The returned capability owns only deletion-exclusion leases and exact
-    /// segment descriptors. It does not retain this request's publication
-    /// admission and therefore cannot perform another object metadata lookup.
-    pub fn retain_object_payload_read(
-        &self,
-        leased_snapshot: LeasedObjectReadSnapshot,
-    ) -> Result<Option<RetainedObjectPayloadRead>, ObjectReadFailure> {
-        if !Arc::ptr_eq(&self.admission.cluster, &leased_snapshot.cluster)
-            || leased_snapshot.bucket != self.bucket
-            || leased_snapshot.key != self.key
-            || leased_snapshot.version_id != self.version_id
-            || leased_snapshot.snapshot_mode != self.snapshot_mode
-            || leased_snapshot.pg_id != self.pg_id
-        {
-            return Err(ObjectReadFailure::from_store(
-                StoreError::PayloadShardSetMismatch {
-                    reason: "leased object snapshot provenance does not match active read route"
-                        .to_string(),
-                },
-            ));
-        }
-        self.admission
-            .cluster
-            .retain_object_payload_read_from_leased_snapshot(leased_snapshot, || {
-                self.admission.require_valid_now_raw()
-            })
-            .map_err(ObjectReadFailure::from_store)
-    }
-
     #[cfg(feature = "test-hooks")]
     pub fn try_probe_object_pg_available(&self) -> Result<bool, ObjectReadFailure> {
         self.admission
