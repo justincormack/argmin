@@ -1785,9 +1785,10 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 1`; version zero is valid only with no user schema objects | Recorded |
 | Applied metadata-command envelope | `storage` | magic `argmin-metadata-command`; command encoding 6 | Evidence required; first owner audit recorded below |
 | Abandoned metadata-command record | `storage` | magic `argmin-metadata-command-abandoned`; abandoned-command encoding 1 | Evidence required; first owner audit recorded below |
-| Metadata-command log hash chain | `storage` | private `ARGMIN-METADATA-COMMAND-LOG-V1` hash domain; persisted hashes carry no marker | Design required: bind changes to every containing format or add an explicit private version |
-| Metadata checkpoint payload | `storage` | checkpoint encoding 1 exists only in the CRC domain and is not serialized | Design required: add a private marker/version or bind both database and RPC containers explicitly |
-| Canonical metadata state digest | `storage` | domain `argmin.metadata.pg-state`; encoding 4 is hashed and carried by checkpoints, while replica/proof digests are untagged | Design required: bind or carry the version across every durable, cross-process, and route-authority digest/identity container |
+| Metadata-command log hash chain | `storage` | private `ARGMIN-METADATA-COMMAND-LOG-V1` hash domain; target opaque fixed-width `MetadataCommandLogHash` carrier version 1 | Design recorded below: PG rows remain schema-bound while every exported proof carries the independent hash version and value |
+| Metadata checkpoint payload | `storage` | current unframed checkpoint encoding 1 exists only in the CRC domain; target private `ARGMCPKT` frame version 2 | Design recorded below: reserve version 1 for the existing unframed representation and make framed version 2 the authoritative checkpoint boundary |
+| Canonical metadata state digest | `storage` | current domain `argmin.metadata.pg-state` encoding 4; target opaque fixed-width `CanonicalStateDigest` carrier version 5 in the coordinated tag/ACL slice | Design recorded below: replica state and every exported proof carry the independent state-encoding version and value |
+| Storage-node persisted runtime configuration | `storage` | canonical text beginning `argmin-storage-node-runtime-config-v4`; PG read routes contain unversioned proof integers | Evidence required; round-trip, bounded-read, publication, and restart behavior exist, but exact current text and old/new rejection are not sealed |
 | Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 16 | Evidence required; exact v16 bytes and resealed v15/v17 fixtures exist, but streaming rejection precedence remains unpinned |
 | Storage-node RPC authentication binding | `storage` | magic `ARGSRPCB`; binding encoding 2 | Evidence required; signed old/new fixtures exist, but rejection is not typed and current bytes are not sealed |
 | Storage-node RPC authenticated transport frame | `storage` | magic `ARGSRPCA`; transport encoding 1 | Evidence required; transport/profile containment is complete, but current bytes and typed rejection are not pinned |
@@ -1840,7 +1841,7 @@ self-describing record has an older-version reader or a default-version fallback
 | --- | --- | --- | --- | --- | --- |
 | Applied metadata-command envelope | Private `METADATA_COMMAND_MAGIC` followed by little-endian `METADATA_COMMAND_ENCODING_VERSION = 6` in `metadata_command.rs` | `canonical_command_bytes()`, reached through `MetadataCommandEnvelope::command_bytes()` before pending-slot, applied-log, transfer, or storage-RPC publication | `decode_metadata_command_log_entry_header()` for retained/applied log inspection and `decode_metadata_command_envelope()` for pending-slot, scavenger, transfer, and storage-RPC use; persistence paths verify the separately stored CRC64 before either decoder | Stable CRC64 fixtures cover every current payload kind and representative nested branches, providing sealed current-byte evidence; every fixture round-trips the header and full-envelope decoders. The header test rejects the prior version 5, trailing bytes, and an unknown payload kind. Owner-local persistence tests prove resealed malformed payloads fail closed without applying metadata. | Replace free-form decoder `String` failures with a private typed format error. Add missing/truncated marker and version, malformed magic, and too-new version 7 cases. Add checksummed persistence and framed-RPC fixtures with old and new unsupported versions resealed, proving version rejection occurs before dispatch or mutation rather than being masked by checksum failure. |
 | Abandoned metadata-command record | Private `ABANDONED_METADATA_COMMAND_MAGIC` followed by little-endian `ABANDONED_METADATA_COMMAND_ENCODING_VERSION = 1` in `metadata_command.rs` | `abandoned_command_log_bytes()`, reached through `MetadataCommandEnvelope::abandoned_log_bytes()` before terminal-log persistence | `decode_metadata_command_log_entry_header()` after the separately stored CRC64 is verified by `PgStore::verify_metadata_command_log_entry()` | The current writer/reader round-trip is covered, and direct decoder fixtures reject versions 0 and 2. Retained-log and recovery tests cover logical abandoned records and fail-closed malformed-row behavior. | Use the same private typed format error as applied envelopes. Add a fixed current-byte fixture pinning the complete record, including the original-command checksum. Add missing/truncated marker and version plus malformed-magic cases. Add resealed persisted versions 0 and 2 and prove rejection occurs before recovery, state mutation, or publication. |
-| Metadata-command log hash chain | Private `ARGMIN-METADATA-COMMAND-LOG-V1` domain inside `metadata_command_log_hash()`; the output is an untagged CRC64 | Applied publication and contiguous-tail advancement compute the hash before publishing it in the log row and replica state; abandoned rows may first be recorded with null chain fields and are hashed when the contiguous tail advances | Log-suffix validation and abandoned-tail recovery recompute the chain before advancing durable replica state; transfer reconstruction also requires matching retained hashes | Corrupt durable hash and unproven-prefix tests establish fail-closed recovery and transfer behavior. | Add an exact current hash golden covering the domain, field order, and little-endian encoding. Decide whether to give the hash an explicit private versioned carrier or bind it to every containing format. The latter set includes at least the PG SQLite schema, metadata checkpoint, storage-RPC frame, and the control-plane state, command, snapshot, and RPC formats that serialize `PgMetadataProof`. Record and enforce every dependency selected by that decision. |
+| Metadata-command log hash chain | Private `ARGMIN-METADATA-COMMAND-LOG-V1` domain inside `metadata_command_log_hash()`; the output is an untagged CRC64 | Applied publication and contiguous-tail advancement compute the hash before publishing it in the log row and replica state; abandoned rows may first be recorded with null chain fields and are hashed when the contiguous tail advances | Log-suffix validation and abandoned-tail recovery recompute the chain before advancing durable replica state; transfer reconstruction also requires matching retained hashes | Corrupt durable hash and unproven-prefix tests establish fail-closed recovery and transfer behavior. | Add an exact current hash golden covering the domain, field order, and little-endian encoding. Introduce a storage-owned opaque `MetadataCommandLogHash` containing private version 1 and the `u64` value. The PG schema remains authoritative for raw log-row hash columns, while replica state persists the version beside its applied hash and every exported `PgMetadataProof` carries the complete opaque value. Readers reject a noncurrent version before suffix validation, transfer, route certification, or publication. The one-time carrier-shape change advances each direct proof container; later hash-algorithm changes advance only this inner version while the fixed version-plus-`u64` shape remains unchanged. |
 
 The applied envelope is persisted in pending-slot and metadata-command-log rows and is nested inside
 storage-RPC and peering-transfer payloads, but it carries its own marker and version. Its version is
@@ -1857,22 +1858,90 @@ canonical digest hierarchy. Neither currently has a complete self-describing ver
 
 | Format | Defining marker | Current writer | First rejecting reader | Existing permanent evidence | Evidence still required |
 | --- | --- | --- | --- | --- | --- |
-| Metadata checkpoint payload | `METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION = 1` and domain `argmin.metadata.command-checkpoint` are private in `pg_store::command_log`, but version 1 is only an input to `metadata_command_checkpoint_crc64()` and is absent from `encode_metadata_command_checkpoint_payload()` | `PgStore::metadata_command_checkpoint()` constructs and verifies the logical checkpoint; `record_metadata_command_checkpoint()` encodes the payload for SQLite, and the same private codec is nested in storage-RPC checkpoint messages | There is no checkpoint-format version reader. `decode_metadata_command_checkpoint_payload()` starts with the cluster epoch and can reject the embedded canonical-state version, while `MetadataCommandCheckpoint::verify()` recomputes the CRC using the current hidden checkpoint constant. An older checkpoint can therefore become only a decode or checksum failure, never `UnsupportedCheckpointEncoding`; that validation variant is currently unreachable. | Owner tests cover logical verification, SQLite catalogue persistence, RPC round-trips, corrupted payload exclusion, tampered-checkpoint rejection, resealed semantic corruption, and rollback before destination mutation. | Choose an explicit private checkpoint marker/version or formally bind the untagged payload to both PG schema version 1 and storage-RPC frame version 16. Add a sealed current payload fixture and old/new version rejection before catalogue acceptance, RPC dispatch, or checkpoint installation. Remove the unreachable checkpoint-version error if outer binding is selected, or make it the typed rejection point if a marker is added. |
-| Canonical metadata state digest | `METADATA_CANONICAL_PG_STATE_DOMAIN = argmin.metadata.pg-state` and `METADATA_CANONICAL_STATE_ENCODING_VERSION = 4` are private; version 4 is hashed into the state digest and serialized as `canonical_state_encoding_version` in checkpoints | SQLite digest triggers and owner refresh paths produce tagged row digests, table digests, and the final state digest; `PgStore::metadata_command_checkpoint()` always writes version 4 into exported checkpoints | `MetadataCommandCheckpoint::verify()` and the private checkpoint decoder reject a checkpoint-carried canonical-state version other than 4 before semantic verification or table allocation. Raw `metadata_command_replica_state.state_digest` and every `PgMetadataProof` carry only the resulting `u64`, so those durable, cross-process, and route-authority digest paths have no version rejection point. | The digest-table inventory is explicit; tests cover incremental/cache equivalence, every materialized table family, checkpoint export/install, typed rejection of canonical-state version 3 in both logical and RPC checkpoint paths, and rollback for tampered and resealed-invalid checkpoints. | Add exact current row, table, and final-state digest goldens, plus too-new canonical-state version 5 and deterministic install/publication no-mutation coverage for resealed old/new state versions. Decide whether all changes to the row/table/state digest hierarchy advance every containing boundary, or carry an explicit canonical-state version with replica state and `PgMetadataProof`. The containing set includes the PG schema; checkpoint and storage-RPC formats; control-plane state, command, snapshot, and RPC formats; runtime-map content and current-state digest domains; the static route-map digest used directly as a standalone identity; the combined standalone-route identity; and the containing standalone identity and initialization-marker artifact format. The chosen rule must cover cached table digests, command pre/post-state digests, metadata transfer and checkpoint proofs, and both dynamic and static route-authority certification. |
+| Metadata checkpoint payload | `METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION = 1` and domain `argmin.metadata.command-checkpoint` are private in `pg_store::command_log`, but version 1 is only an input to `metadata_command_checkpoint_crc64()` and is absent from `encode_metadata_command_checkpoint_payload()` | `PgStore::metadata_command_checkpoint()` constructs and verifies the logical checkpoint; `record_metadata_command_checkpoint()` encodes the payload for SQLite, and the same private codec is nested in storage-RPC checkpoint messages | There is no checkpoint-format version reader. `decode_metadata_command_checkpoint_payload()` starts with the cluster epoch and can reject the embedded canonical-state version, while `MetadataCommandCheckpoint::verify()` recomputes the CRC using the current hidden checkpoint constant. An older checkpoint can therefore become only a decode or checksum failure, never `UnsupportedCheckpointEncoding`; that validation variant is currently unreachable. | Owner tests cover logical verification, SQLite catalogue persistence, RPC round-trips, corrupted payload exclusion, tampered-checkpoint rejection, resealed semantic corruption, and rollback before destination mutation. | Reserve checkpoint encoding 1 for the existing unframed bytes. Add a private fixed `ARGMCPKT` magic followed by a big-endian `u16` checkpoint version 2, and include that marker/version in the checkpoint integrity seal. Move the codec behind a checkpoint-owned typed truncated/unknown-magic/unsupported-version/integrity/semantic error. Add a sealed current v2 frame and correctly resealed framed versions 1 and 3 through catalogue load, authenticated RPC, and checkpoint installation, plus direct unframed-v1 rejection as missing magic. Prove rejection before any checkpoint-owned table/block allocation, logical checkpoint construction, operation dispatch, destination mutation, or publication; the outer RPC framing may first read its already bounded payload. The inner checkpoint version is authoritative; PG and RPC containers advance only for this initial unframed-to-framed change or a later change to their own field shape. |
+| Canonical metadata state digest | `METADATA_CANONICAL_PG_STATE_DOMAIN = argmin.metadata.pg-state` and `METADATA_CANONICAL_STATE_ENCODING_VERSION = 4` are private; version 4 is hashed into the state digest and serialized as `canonical_state_encoding_version` in checkpoints | SQLite digest triggers and owner refresh paths produce tagged row digests, table digests, and the final state digest; `PgStore::metadata_command_checkpoint()` always writes version 4 into exported checkpoints | `MetadataCommandCheckpoint::verify()` and the private checkpoint decoder reject a checkpoint-carried canonical-state version other than 4 before semantic verification or table allocation. Raw `metadata_command_replica_state.state_digest` and every `PgMetadataProof` carry only the resulting `u64`, so those durable, cross-process, and route-authority digest paths have no version rejection point. | The digest-table inventory is explicit; tests cover incremental/cache equivalence, every materialized table family, checkpoint export/install, typed rejection of canonical-state version 3 in both logical and RPC checkpoint paths, and rollback for tampered and resealed-invalid checkpoints. | Add exact current row, table, and final-state digest goldens plus too-new version 5 and deterministic install/publication no-mutation coverage. Introduce an opaque storage-owned `CanonicalStateDigest` containing the private encoding version and `u64` value. Persist the version beside replica state, carry the complete value in checkpoints and every `PgMetadataProof`, and require exact-version equality before command pre/post-state validation, transfer, route certification, or publication. Raw materialized rows, cached table digests, and command-log pre/post-state columns remain bound to the PG schema. The one-time carrier-shape change advances each direct proof container and route-digest grammar; later canonical-state changes advance only the inner version while the fixed version-plus-`u64` shape remains unchanged. |
 
 The row-value tags, table-digest tags, table inventory, column order, and blob/text length encoding are
 subformats of canonical-state encoding 4 rather than independent public versions. Any incompatible
-change to them must advance the canonical-state boundary selected above. The checkpoint checksum is
-an integrity seal, not a substitute for a readable format marker.
+change to them advances `CanonicalStateDigest`'s inner version. The checkpoint checksum remains an
+integrity seal, not a substitute for its readable frame marker.
 
-`digest_pg_routes()` hashes every `PgMetadataProof`, including its untagged `state_digest`, into both
-`argmin/runtime-map-content/v2` and `argmin/runtime-map-current-state/v2`. The same route encoding is
-used by `argmin/static-route-map-content/v2`. That static digest is used directly as a standalone
-route identity or composed with another identity through
-`argmin/standalone-combined-route-identity/v2`; the result is published through the version-2
-standalone identity/initialization artifacts. Those existing v2 fixtures remain recorded for the
-current proof semantics, but a future canonical-state semantic change cannot leave any of these
-carrier versions unchanged.
+#### Metadata checkpoint and proof-carrier design decision (2026-08-09)
+
+Use independent storage-owned inner versions rather than binding every future change to every
+outer container:
+
+- `MetadataCommandLogHash` is an opaque fixed-width value containing private `u8` encoding version
+  1 and one `u64` hash. Its version is independent of the current metadata-command envelope
+  version 6 and the coordinated target version 7.
+- `CanonicalStateDigest` is an opaque fixed-width value containing the canonical-state encoding
+  version as a private `u8` and one `u64` digest. Existing evidence describes unqualified
+  version-4 values; the coordinated carrier/tag/ACL implementation first writes the opaque value
+  as version 5 because the canonical row bytes change in that same slice.
+- `MetadataCommandCheckpoint` is encoded only through a private `ARGMCPKT` plus big-endian `u16`
+  version-2 frame. Version 1 remains assigned to the current unframed bytes; the v2 marker/version
+  participates in the integrity seal.
+- `PgMetadataProof` contains the applied index plus the two opaque versioned values. It does not
+  expose constructors or fields that can combine an unqualified hash or digest with a proof.
+
+Binary container codecs write each fixed-width carrier as exactly one `u8` version followed by its
+`u64` value using that container's established byte order for the value. Text containers write the
+canonical unsigned-decimal `u8` version as its own field immediately before the canonical
+unsigned-decimal `u64` value. Route-digest v3 hashes the `u8` version before the corresponding
+`u64` value in that order. There is no public universal carrier byte codec. Exact-version equality
+is required before hash/digest comparison. Empty/genesis proofs are constructed by the owner with
+both current versions; zero is not a versionless escape.
+
+Raw SQLite `metadata_command_log` hash and pre/post-state columns, cached row/table digests, and
+materialized metadata rows remain integer implementation details bound to the PG schema. The
+replica-state row adds both version columns and decodes its integers into the opaque types. Every
+production value leaving the PG owner—including replica state, checkpoint state, retained command
+ranges, transfer bases, expected pre/post-state values, and recovery evidence—uses the typed values
+or carries an exact typed base proof that unambiguously governs the contained raw range. A batch
+without such version context is invalid. This prevents different algorithms from being compared
+merely because they both currently produce `u64`.
+
+The carrier introduction and tag/ACL framing form one atomic baseline change. They advance this
+exact direct dependency set together:
+
+- PG schema 1 to 2, adding the replica-state version columns and binding all raw PG digest/hash
+  columns to that schema while selecting the framed tag/ACL rows;
+- applied metadata-command envelope 6 to 7 for the newly framed tag/ACL values;
+- canonical metadata-state encoding 4 to 5 and checkpoint frame 2, with checkpoints carrying both
+  versioned proof values and the framed canonical rows;
+- storage-node persisted runtime configuration v4 to v5, adding both proof versions to every
+  present metadata-read route;
+- storage-RPC frame v16 to v17 for proof, expected-digest, retained-range, transfer, recovery, and
+  checkpoint payloads;
+- control-plane logical state v27 to v28, command envelope v14 to v15, and control-plane RPC v13
+  to v14 wherever they directly encode a `PgMetadataProof` or either carrier;
+- runtime-map content/current-state, static-route-map, and standalone-combined-route digest domains
+  from v2 to v3 because their canonical proof grammar changes; and
+- the standalone identity/initialization artifact from v2 to v3 so an artifact using the previous
+  hidden route-identity grammar reaches typed version rejection rather than an identity mismatch.
+
+The replicated snapshot frame remains v1 because it contains the already self-describing logical
+state; Raft restart/WAL/peer containers likewise retain their versions when they contain only a
+self-describing control-plane state, command, or snapshot frame. Storage/control-plane
+authentication bindings retain their versions when their framed payload grammar is unchanged.
+Their exact fixtures must still be updated to prove the new current nested versions are present.
+
+After this one-time change, advancing log-hash version 1 or canonical-state version 5 does not
+advance an outer format while the version-plus-`u64` carrier shape and its position remain stable.
+Route digests naturally change because they hash both inner versions and values, but their v3
+grammar remains unchanged. A change in carrier width, ordering, optionality, or container field
+position still advances that direct container. Changing checkpoint payload structure advances only
+checkpoint frame v2 unless a containing length/framing rule also changes. There are no fallback
+readers and no mixed-version comparison or translation paths.
+
+#### Storage-node persisted runtime-config evidence inventory (2026-08-09)
+
+The proof-carrier audit found one additional independently versioned direct container that the
+initial Phase 2 matrix omitted.
+
+| Format | Defining marker | Current writer | First rejecting reader | Existing permanent evidence | Evidence still required |
+| --- | --- | --- | --- | --- | --- |
+| Storage-node persisted runtime configuration | Private first line `argmin-storage-node-runtime-config-v4`, followed by canonical labeled text fields and route records; a present metadata-read route currently stores node, log index, unversioned log hash, and unversioned state digest as decimal integers | `StorageNodeProcessConfig::persist_control_plane_runtime_config()` calls `encode_control_plane_runtime_config()`, writes and syncs a private staging file, atomically replaces the current file, and syncs the directory before an installed refresh becomes the restart baseline | The bounded regular-file loader requires the exact combined v4 magic before parsing node/epoch/validity/EC/path/PG/route state. It cannot distinguish unknown magic from an unsupported version. Route parsing constructs `PgMetadataProof` directly from the two unqualified integers before startup installs the persisted configuration. | Owner tests cover logical round-trip, bounded count parsing, file size/type/symlink/FIFO rejection, staging replacement, refresh publication, persisted restart, mismatch detection, and installation/admission ordering. The main round-trip has no metadata-read proof, and no exact v4 text or old/new version fixture exists. | Before replacement, seal exact v4 text containing current and historical routes with present and absent read proofs and add typed unknown-magic versus unsupported-v3/v5 rejection through restart. In the coordinated slice, advance to v5 and encode both inner proof versions beside their values. Add exact v5 text, missing/partial carrier rejection, noncurrent log/state version cases, atomic publication and restart fixtures, and prove rejection before route-authority installation or storage access. Later inner-version changes preserve runtime-config v5 while its field count/order remains unchanged. |
 
 #### Storage-node RPC and authentication evidence inventory (2026-08-09)
 
@@ -2097,15 +2166,15 @@ shared container versions advance once, not in successive baseline changes:
 - Applied metadata-command encoding 6 advances to 7.
 - Storage-node RPC frame encoding 16 advances to 17.
 - Canonical metadata-state encoding 4 advances to 5.
-- Metadata-checkpoint encoding 1 and every durable, cross-process, control-plane, route-digest,
-  static-route, combined-route, and standalone-identity carrier identified by the canonical-state
-  audit advance according to that audit's selected explicit-carrier or coordinated-binding rule.
+- Metadata-checkpoint encoding 1 advances to the self-describing `ARGMCPKT` frame version 2, and
+  the independent log-hash/state-digest carriers plus their exact one-time direct container
+  versions advance as listed in the selected proof-carrier decision above.
 
-The implementation slice is gated on completing the metadata-checkpoint and canonical-state
-carrier decisions above; those decisions must assign every exact downstream target version before
-the first writer changes. The slice then updates all writers and first readers atomically. Because
-upgrades are unsupported, unframed XML/grant strings and inner versions 0 or 2 are corruption—not
-legacy inputs—and no migration or fallback parser is added.
+The metadata-checkpoint and canonical-state carrier gate is now complete and assigns every direct
+target version above. The implementation slice updates the proof carriers, checkpoint frame,
+tag/ACL carriers, direct containers, writers, and first readers atomically. Because upgrades are
+unsupported, unframed XML/grant strings and inner versions 0 or 2 are corruption—not legacy
+inputs—and no migration or fallback parser is added.
 
 Required evidence for the coordinated slice:
 
@@ -2126,10 +2195,12 @@ Required evidence for the coordinated slice:
 
 After the initial coordinated advancement, the inner frame is authoritative for tag/ACL payload
 syntax. A later inner-only payload change need not advance PG, command, or RPC versions when their
-opaque length-prefixed text field grammar is unchanged, but it must advance canonical-state and
-every digest/proof/identity carrier if equivalent logical state would produce a different digest.
-Changing a containing field shape, SQLite storage class, or outer validation order still advances
-that containing format. This rule prevents both redundant version coupling and silent digest drift.
+opaque length-prefixed text field grammar is unchanged. If equivalent logical state produces a
+different canonical digest, it advances the inner `CanonicalStateDigest` version; route and
+identity digest values then change because their stable v3 grammar hashes that inner version, but
+their outer versions do not advance. Changing a containing field shape, SQLite storage class, or
+outer validation order still advances that containing format. This rule prevents both redundant
+version coupling and silent digest drift.
 
 #### Static manifest and outer-identity evidence inventory (2026-08-09)
 
@@ -2175,11 +2246,12 @@ The evidence audit proceeds in this bounded order after Phase 1 containment is c
    checksum-metadata families and the static-manifest/digest/identity family are recorded above;
    the temporary-credential envelope was already recorded by its owner.
 4. **Design complete:** replace unframed tag XML and ACL strings with the two `s3-types`-owned text
-   frames recorded above. Implement them together only after the checkpoint/canonical-state gate
-   assigns every downstream version advance.
+   frames recorded above. The checkpoint/log-hash/state-digest carrier gate now selects independent
+   inner versions and assigns the exact one-time downstream advances.
 5. Implement only the gaps proven by the matrix, one owner and one coherent format family at a
-   time, updating the row to `Recorded` with its permanent test evidence. The tag/ACL carrier slice
-   is one coherent family because it advances the same outer formats once.
+   time, updating the row to `Recorded` with its permanent test evidence. Start with the atomic
+   checkpoint/proof/tag/ACL baseline slice recorded above: it introduces the inner carriers and
+   advances their shared direct containers once. Subsequent evidence work remains owner-bounded.
 
 Phase 2 is complete only when every row is `Recorded`, no representation relies on an implicit
 version assumption, and the audit finds no older-version parser, default-version fallback, or
