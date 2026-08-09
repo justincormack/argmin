@@ -1773,7 +1773,9 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Metadata-command log hash chain | `storage` | private `ARGMIN-METADATA-COMMAND-LOG-V1` hash domain; persisted hashes carry no marker | Design required: bind changes to every containing format or add an explicit private version |
 | Metadata checkpoint payload | `storage` | checkpoint encoding 1 exists only in the CRC domain and is not serialized | Design required: add a private marker/version or bind both database and RPC containers explicitly |
 | Canonical metadata state digest | `storage` | domain `argmin.metadata.pg-state`; encoding 4 is hashed and carried by checkpoints, while replica/proof digests are untagged | Design required: bind or carry the version across every durable, cross-process, and route-authority digest/identity container |
-| Storage-node RPC and authentication | `storage` | frame encoding 16; auth binding 2; auth transport envelope 1 | Evidence required; transport/profile and wire-error containment are complete. Item 14 removed the superseded per-subject tag-read message kind and advanced the private frame baseline from 15 to 16; exact v16 bytes and resealed v15/v17 rejection fixtures pin the new boundary. |
+| Storage-node RPC frame | `storage` | magic `argmin-storage-rpc-frame`; frame encoding 16 | Evidence required; exact v16 bytes and resealed v15/v17 fixtures exist, but streaming rejection precedence remains unpinned |
+| Storage-node RPC authentication binding | `storage` | magic `ARGSRPCB`; binding encoding 2 | Evidence required; signed old/new fixtures exist, but rejection is not typed and current bytes are not sealed |
+| Storage-node RPC authenticated transport frame | `storage` | magic `ARGSRPCA`; transport encoding 1 | Evidence required; transport/profile containment is complete, but current bytes and typed rejection are not pinned |
 | Control-plane logical state, commands, and snapshots | `storage` | state 27; command 14; snapshot 1 | Evidence required; topology and administration workflow containment are complete |
 | Control-plane RPC and authentication | `storage` | RPC 13; shared authentication envelope 1 | Evidence required |
 | Single-authority control-plane durable artifacts | `storage` | clock checkpoint 2; state identity 1; initialized marker 1; journal file 2; journal record 2 | Evidence required |
@@ -1833,6 +1835,31 @@ standalone identity/initialization artifacts. Those existing v2 fixtures remain 
 current proof semantics, but a future canonical-state semantic change cannot leave any of these
 carrier versions unchanged.
 
+#### Storage-node RPC and authentication evidence inventory (2026-08-09)
+
+The former combined storage-node RPC row contains three storage-specific formats. The outer
+transport frame carries a shared control-plane authentication envelope whose payload is the
+storage-specific binding, and that binding embeds the storage-RPC frame. The shared authentication
+envelope is a fourth format and remains in the later shared authentication-envelope audit rather
+than being counted twice here.
+
+| Format | Defining marker | Current writer | First rejecting reader | Existing permanent evidence | Evidence still required |
+| --- | --- | --- | --- | --- | --- |
+| Storage-node RPC frame | Private length-prefixed `STORAGE_RPC_FRAME_MAGIC = argmin-storage-rpc-frame` followed by little-endian `STORAGE_RPC_FRAME_ENCODING_VERSION = 16` | `encode_storage_rpc_frame()` writes v16 and seals version, request ID, message kind, payload length, and payload with CRC64 before Unix or authenticated binding publication | `decode_storage_rpc_frame()` returns typed `UnknownMagic`, `UnsupportedVersion`, checksum, and structural errors before payload decoding. The unauthenticated streaming reader reconstructs a frame and delegates to it, but currently parses the message kind and payload length before the version is validated. Authenticated requests reach the same decoder inside `decode_binding()` after the signed envelope is authenticated. | An exact v16 byte golden pins magic length, magic, little-endian version, field order, checksum, and payload. Resealed v15 and v17 frames return typed unsupported-version errors. Additional fixtures cover trailing bytes, unknown/retired kinds, kind tampering, checksum precedence, and payload bounds. | Add malformed-magic and truncated marker/version cases. Make the streaming reader validate magic and version before interpreting message kind or payload length, with crossed unsupported-version/unknown-kind/oversized-length fixtures. Add server-level unauthenticated and authenticated fixtures proving old/new frame versions cannot reach payload dispatch or mutation. |
+| Storage-node RPC authentication binding | Private fixed `STORAGE_RPC_AUTH_BINDING_MAGIC = ARGSRPCB` followed by big-endian `STORAGE_RPC_AUTH_BINDING_VERSION = 2`; it contains topology authority, target node, optional request transcript, and a complete v16 storage-RPC frame | `encode_binding()` is used by both request and response signing before the bytes become the payload of a shared `ControlPlaneAuthEnvelope` | `decode_binding()` runs only after the shared envelope has been decoded and its authenticator accepted. It checks magic/version before topology, transcript, and inner-frame parsing, but maps both unknown magic and unsupported version to `StorageRpcAuthRejectionReason::Malformed`. Failed binding verification prevents `VerifiedStorageRpcFrame` construction and server dispatch. | Signed, authenticator-valid fixtures mutate the binding to versions 0 and 3 and prove rejection is not masked by HMAC failure. Request/response tests cover exact topology, target, operation, sequence, direction, caller credential, and request-transcript binding. | Add a private typed unknown-magic/unsupported-binding-version distinction and missing/truncated marker/version fixtures. Add exact current request and response binding goldens, including absent and present transcript tags, plus either a fixed production-derived transcript digest or a full fixed request-to-response golden that derives the transcript from the exact request envelope. Add authenticated server no-dispatch fixtures for resealed versions 0 and 3. |
+| Storage-node RPC authenticated transport frame | Private fixed `STORAGE_RPC_AUTH_TRANSPORT_MAGIC = ARGSRPCA` followed by big-endian `STORAGE_RPC_AUTH_TRANSPORT_VERSION = 1`, envelope length, its bitwise complement, and the shared authenticated envelope | `write_storage_rpc_auth_transport_frame()` writes v1 before Unix or TLS stream publication | `read_storage_rpc_auth_transport_frame_len()` checks magic and version before length validation, byte-budget reservation, body allocation, authentication, or binding/frame decoding. It reports failures as free-form `io::Error` values rather than a typed format error. | Round-trip tests cover v1, versions 0 and 2, wrong legacy-frame magic, corrupt length complement, configured/process byte budgets, allocation ordering, and flush failure. | Introduce a private typed transport-frame error with separate truncated, unknown-magic, and unsupported-version cases. Add an exact v1 byte golden and missing/truncated marker/version fixtures. Use a valid signed inner envelope in old/new outer-version tests and add server-level evidence that rejection occurs before authentication or dispatch. |
+
+The request transcript uses the private byte domain
+`argmin/storage-rpc/request-transcript/v1\0`, including that trailing NUL byte, followed by the
+authenticated request-envelope length encoded as a big-endian `u64` and then the exact authenticated
+request-envelope bytes. Only the resulting untagged SHA-256 output is carried inside binding v2.
+Treat that transcript algorithm as a subformat of the binding: any incompatible transcript change
+must advance the binding version. Its evidence must include either a fixed transcript-digest golden
+over fixed envelope bytes or a fixed request-to-response golden that invokes the production
+transcript derivation; a binding fixture containing an arbitrary 32-byte transcript is insufficient.
+The topology digest and shared authentication envelope retain their own version boundaries and are
+not implicitly versioned by the binding.
+
 The evidence audit proceeds in this bounded order after Phase 1 containment is complete:
 
 1. **Complete:** storage-node TLS, topology, physical payload, maintenance workflow, control-plane
@@ -1840,7 +1867,7 @@ The evidence audit proceeds in this bounded order after Phase 1 containment is c
 2. **In progress:** expand each `storage` family above to one line per independently changeable
    format, recording its defining constant, writer, first rejecting reader, exact-current fixture,
    and unsupported-version fixtures. The metadata-command and metadata-checkpoint/canonical-state
-   families are recorded above.
+   families plus storage-node RPC/authentication are recorded above.
 3. Do the same for the `server-core`, `argmin-s3`, and `auth` rows, without exposing private
    constants or codecs to cross-crate tests.
 4. Decide the tag-XML and ACL-string strategy. If their containing formats are the version
