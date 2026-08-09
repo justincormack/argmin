@@ -6,7 +6,8 @@ use crate::config::{
     ConfiguredControlPlaneFrontendAuthCredential, ConfiguredControlPlaneRaftAuthCredential,
     ConfiguredControlPlaneRaftPeerListener, ConfiguredControlPlaneRaftPeerSocket,
     ConfiguredControlPlaneRpcListener, ConfiguredControlPlaneStorageAuthCredential,
-    ConfiguredStaticClusterIdentity, ConfiguredStorageNodeSocket, ServerConfig,
+    ConfiguredStaticClusterIdentity, ConfiguredStorageNodeSocket, ConfiguredTlsCertifiedKey,
+    ServerConfig,
 };
 use ec::EcConfig;
 use rustls::client::danger::ServerCertVerifier;
@@ -72,37 +73,7 @@ const CLUSTER_MANIFEST_MAX_SELECTED_MATERIAL_BYTES: u64 = 16 * 1024 * 1024;
 const TOPOLOGY_IDENTITY_DOMAIN: &str = "argmin-static-cluster-topology-v1";
 const PROCESS_IDENTITY_DOMAIN: &str = "argmin-static-cluster-process-identity-v1";
 const FULL_CONFIG_FINGERPRINT_DOMAIN: &str = "argmin-static-cluster-full-config-v1";
-const ENV_ONLY_CLUSTER_ENV_KEYS: &[&str] = &[
-    "ARGMIN_PROCESS_ROLE",
-    "ARGMIN_HOST_ID",
-    "ARGMIN_DATA_DIR",
-    "ARGMIN_PG_COUNT",
-    "ARGMIN_STORAGE_CLUSTER_EPOCH",
-    "ARGMIN_STORAGE_PG_IDS",
-    "ARGMIN_EC_K",
-    "ARGMIN_EC_M",
-    "ARGMIN_LOCAL_NODE_COUNT",
-    "ARGMIN_STORAGE_NODE_ID",
-    "ARGMIN_STORAGE_NODE_DATA_DIR",
-    "ARGMIN_STORAGE_NODE_SOCKET_PATH",
-    "ARGMIN_STORAGE_NODE_SOCKETS",
-    "ARGMIN_CONTROL_PLANE_STATE_PATH",
-    "ARGMIN_CONTROL_PLANE_SOCKET_PATH",
-    "ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS",
-    "ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID",
-    "ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS",
-    "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID",
-    "ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS",
-    "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID",
-    "ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS",
-    "ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT",
-    "ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME",
-    "ARGMIN_CONTROL_PLANE_RAFT_NODE_ID",
-    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
-    "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
-    "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
-    "ARGMIN_REGION",
-];
+const TEST_ENV_SHAPED_CONFIG: &str = "ARGMIN_TEST_ENV_SHAPED_CONFIG";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
@@ -174,6 +145,7 @@ enum AuthPrincipal {
 struct StaticClusterManifestInput {
     schema_version: u32,
     cluster: ClusterInput,
+    s3: S3Input,
     deployment: DeploymentInput,
     storage: StorageInput,
     raft: RaftInput,
@@ -187,6 +159,46 @@ struct StaticClusterManifestInput {
     tls_identities: Vec<TlsIdentityInput>,
     tls_trust_bundles: Vec<TlsTrustBundleInput>,
     auth_credentials: Vec<AuthCredentialInput>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct S3Input {
+    account_id: String,
+    access_key_id: String,
+    secret_access_key_ref: String,
+    sse_s3_wrapping_key_ref: String,
+    sse_c_validator_key_ref: Option<String>,
+    #[serde(default = "default_frontend_workers")]
+    workers: u32,
+    #[serde(default = "default_frontend_max_connections")]
+    max_connections: u32,
+    #[serde(default = "default_frontend_max_inflight_requests")]
+    max_inflight_requests: u32,
+    #[serde(default = "default_stream_read_chunk_size")]
+    stream_read_chunk_size: usize,
+    #[serde(default)]
+    panic_on_500: bool,
+    #[serde(default)]
+    abort_on_500: bool,
+    #[serde(default)]
+    local_debug_endpoint: bool,
+}
+
+const fn default_frontend_workers() -> u32 {
+    4
+}
+
+const fn default_frontend_max_connections() -> u32 {
+    512
+}
+
+const fn default_frontend_max_inflight_requests() -> u32 {
+    32
+}
+
+const fn default_stream_read_chunk_size() -> usize {
+    server_core::coordinator::INTERNAL_SEGMENT_SIZE
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq)]
@@ -255,6 +267,20 @@ struct ProcessInput {
     frontend_instance_id: Option<String>,
     admin_instance_id: Option<String>,
     maintenance_instance_id: Option<String>,
+    s3_listen_addr: Option<String>,
+    s3_tls_identity_id: Option<String>,
+    #[serde(default)]
+    trace_enabled: bool,
+    trace_filter: Option<String>,
+    trace_file: Option<PathBuf>,
+    #[serde(default)]
+    trace_sync: bool,
+    storage_node_rpc_admission_limit: Option<usize>,
+    storage_node_rpc_admission_wait_ms: Option<u64>,
+    storage_node_rpc_control_admission_wait_ms: Option<u64>,
+    control_plane_lease_scan_ms: Option<u64>,
+    control_plane_frontend_refresh_ms: Option<u64>,
+    control_plane_heartbeat_lease_ms: Option<u64>,
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq)]
@@ -406,6 +432,39 @@ pub(crate) struct ResolvedStaticClusterMaterial {
     auth_credentials: Vec<ResolvedStaticAuthCredential>,
     tls_identities: BTreeMap<String, ResolvedStaticTlsIdentity>,
     tls_trust_bundles: BTreeMap<String, ResolvedStaticTlsTrustBundle>,
+    s3: Option<ResolvedStaticS3Material>,
+}
+
+struct ResolvedStaticS3Material {
+    secret_access_key: String,
+    sse_s3_wrapping_key: String,
+    sse_c_validator_key: Option<String>,
+}
+
+impl fmt::Debug for ResolvedStaticS3Material {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedStaticS3Material")
+            .field("secret_access_key", &"<redacted>")
+            .field("sse_s3_wrapping_key", &"<redacted>")
+            .field(
+                "sse_c_validator_key",
+                &self.sse_c_validator_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+impl Drop for ResolvedStaticS3Material {
+    fn drop(&mut self) {
+        // SAFETY: replacing every byte with zero preserves the String UTF-8 invariant.
+        unsafe {
+            self.secret_access_key.as_mut_vec().fill(0);
+            self.sse_s3_wrapping_key.as_mut_vec().fill(0);
+            if let Some(key) = &mut self.sse_c_validator_key {
+                key.as_mut_vec().fill(0);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -543,6 +602,7 @@ impl fmt::Debug for ResolvedStaticClusterMaterial {
             .field("auth_credentials", &self.auth_credentials)
             .field("tls_identities", &self.tls_identities)
             .field("tls_trust_bundles", &self.tls_trust_bundles)
+            .field("s3", &self.s3)
             .finish()
     }
 }
@@ -615,6 +675,44 @@ impl ValidatedStaticClusterManifest {
         limits: StaticMaterialLimits,
     ) -> Result<ResolvedStaticClusterMaterial, String> {
         let mut material_budget = StaticMaterialBudget::new(limits);
+        let selected_process = &self.manifest.processes[self.selected_process_index];
+        let s3 = if selected_process.kind.has_frontend() {
+            let read_utf8_secret = |budget: &mut StaticMaterialBudget,
+                                    reference: &str,
+                                    label: &str|
+             -> Result<String, String> {
+                let bytes = budget.read(
+                    reference,
+                    CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+                    StaticMaterialFileAccess::Private,
+                    label,
+                )?;
+                String::from_utf8(bytes).map_err(|_| format!("{label} must contain valid UTF-8"))
+            };
+            Some(ResolvedStaticS3Material {
+                secret_access_key: read_utf8_secret(
+                    &mut material_budget,
+                    &self.manifest.s3.secret_access_key_ref,
+                    "S3 secret access key",
+                )?,
+                sse_s3_wrapping_key: read_utf8_secret(
+                    &mut material_budget,
+                    &self.manifest.s3.sse_s3_wrapping_key_ref,
+                    "SSE-S3 wrapping key",
+                )?,
+                sse_c_validator_key: self
+                    .manifest
+                    .s3
+                    .sse_c_validator_key_ref
+                    .as_deref()
+                    .map(|reference| {
+                        read_utf8_secret(&mut material_budget, reference, "SSE-C validator key")
+                    })
+                    .transpose()?,
+            })
+        } else {
+            None
+        };
         let required_principals = self.selected_process_auth_principals()?;
         let active_credentials = self
             .manifest
@@ -667,7 +765,6 @@ impl ValidatedStaticClusterManifest {
             })
             .collect::<Result<Vec<_>, String>>()?;
 
-        let selected_process = &self.manifest.processes[self.selected_process_index];
         let local_tcp_endpoints = self
             .manifest
             .endpoints
@@ -678,6 +775,7 @@ impl ValidatedStaticClusterManifest {
         let required_tls_identity_ids = local_tcp_endpoints
             .iter()
             .filter_map(|endpoint| endpoint.tls_identity_id.as_deref())
+            .chain(selected_process.s3_tls_identity_id.as_deref())
             .collect::<BTreeSet<_>>();
         let required_tls_trust_bundle_ids = self
             .selected_process_outbound_tls_protocols()
@@ -843,6 +941,7 @@ impl ValidatedStaticClusterManifest {
             auth_credentials,
             tls_identities,
             tls_trust_bundles,
+            s3,
         })
     }
 
@@ -1389,14 +1488,10 @@ impl ValidatedStaticClusterManifest {
         Ok(ConfiguredStaticControlPlaneRpcClients { endpoints })
     }
 
-    fn replicated_unix_control_plane_server_config<F>(
+    fn replicated_unix_control_plane_server_config(
         &self,
         material: &ResolvedStaticClusterMaterial,
-        get: F,
-    ) -> Result<ServerConfig, String>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
+    ) -> Result<ServerConfig, String> {
         if self.manifest.deployment.mode != DeploymentMode::Replicated {
             return Err(
                 "replicated control-plane mapping requires deployment mode replicated".to_string(),
@@ -1726,6 +1821,7 @@ impl ValidatedStaticClusterManifest {
         );
         manifest_values.insert("ARGMIN_REGION", self.manifest.cluster.region.clone());
         manifest_values.insert("ARGMIN_HOST_ID", selected.host_id.clone());
+        insert_process_observability_manifest_values(selected, &mut manifest_values);
         manifest_values.insert(
             "ARGMIN_CONTROL_PLANE_STATE_PATH",
             authority.state_path.to_string_lossy().into_owned(),
@@ -1743,9 +1839,7 @@ impl ValidatedStaticClusterManifest {
             "ARGMIN_CONTROL_PLANE_RAFT_NODE_ID",
             raft_node_id.to_string(),
         );
-        let mut config = ServerConfig::from_lookup(|key| {
-            manifest_values.get(key).cloned().or_else(|| get(key))
-        })?;
+        let mut config = ServerConfig::from_lookup(|key| manifest_values.get(key).cloned())?;
         config.control_plane_state_path = Some(authority.state_path.to_string_lossy().into_owned());
         config.control_plane_socket_path = Some(local_control_path);
         config.control_plane_clock_recovery_socket_path = Some(local_recovery_path);
@@ -1852,14 +1946,10 @@ impl ValidatedStaticClusterManifest {
             })
     }
 
-    fn replicated_data_process_server_config<F>(
+    fn replicated_data_process_server_config(
         &self,
         material: &ResolvedStaticClusterMaterial,
-        get: F,
-    ) -> Result<ServerConfig, String>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
+    ) -> Result<ServerConfig, String> {
         if self.manifest.deployment.mode != DeploymentMode::Replicated {
             return Err("replicated data-process mapping requires replicated mode".to_string());
         }
@@ -2329,7 +2419,9 @@ impl ValidatedStaticClusterManifest {
         );
         manifest_values.insert("ARGMIN_REGION", self.manifest.cluster.region.clone());
         manifest_values.insert("ARGMIN_HOST_ID", selected.host_id.clone());
+        insert_process_observability_manifest_values(selected, &mut manifest_values);
         manifest_values.insert("ARGMIN_CONTROL_PLANE_SOCKET_PATH", control_plane_endpoint);
+        self.insert_s3_manifest_values(material, &mut manifest_values)?;
         if let Some((storage_node, endpoint)) = &local_storage_endpoint {
             manifest_values.insert("ARGMIN_STORAGE_NODE_ID", "0".to_string());
             manifest_values.insert(
@@ -2338,9 +2430,8 @@ impl ValidatedStaticClusterManifest {
             );
             manifest_values.insert("ARGMIN_STORAGE_NODE_SOCKET_PATH", endpoint.clone());
         }
-        let mut config = ServerConfig::from_lookup(|key| {
-            manifest_values.get(key).cloned().or_else(|| get(key))
-        })?;
+        let mut config = ServerConfig::from_lookup(|key| manifest_values.get(key).cloned())?;
+        config.tls_certified_key = self.configured_s3_tls_certified_key(material)?;
         config.storage_node_ids = self
             .manifest
             .storage_nodes
@@ -2378,10 +2469,10 @@ impl ValidatedStaticClusterManifest {
         Ok(config)
     }
 
-    fn standalone_server_config<F>(&self, get: F) -> Result<ServerConfig, String>
-    where
-        F: Fn(&str) -> Option<String>,
-    {
+    fn standalone_server_config(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+    ) -> Result<ServerConfig, String> {
         if self.manifest.deployment.mode != DeploymentMode::Standalone {
             return Err(
                 "replicated cluster manifests require the static secret and transport runtime slices"
@@ -2389,7 +2480,6 @@ impl ValidatedStaticClusterManifest {
             );
         }
         if !self.manifest.auth_credentials.is_empty()
-            || !self.manifest.tls_identities.is_empty()
             || !self.manifest.tls_trust_bundles.is_empty()
             || self
                 .manifest
@@ -2446,10 +2536,11 @@ impl ValidatedStaticClusterManifest {
         manifest_values.insert("ARGMIN_LOCAL_NODE_COUNT", "1".to_string());
         manifest_values.insert("ARGMIN_REGION", self.manifest.cluster.region.clone());
         manifest_values.insert("ARGMIN_HOST_ID", selected.host_id.clone());
+        insert_process_observability_manifest_values(selected, &mut manifest_values);
+        self.insert_s3_manifest_values(material, &mut manifest_values)?;
 
-        let mut config = ServerConfig::from_lookup(|key| {
-            manifest_values.get(key).cloned().or_else(|| get(key))
-        })?;
+        let mut config = ServerConfig::from_lookup(|key| manifest_values.get(key).cloned())?;
+        config.tls_certified_key = self.configured_s3_tls_certified_key(material)?;
         config.storage_node_ids = vec![storage_node.node_id];
         config.storage_node_id = Some(storage_node.node_id);
         config.storage_node_data_dir = Some(storage_node.data_dir.to_string_lossy().into_owned());
@@ -2461,6 +2552,84 @@ impl ValidatedStaticClusterManifest {
             process_identity_digest: self.process_identity_digest.clone(),
         });
         Ok(config)
+    }
+
+    fn insert_s3_manifest_values(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+        values: &mut BTreeMap<&'static str, String>,
+    ) -> Result<(), String> {
+        let selected = &self.manifest.processes[self.selected_process_index];
+        if !selected.kind.has_frontend() {
+            return Ok(());
+        }
+        let material = material
+            .s3
+            .as_ref()
+            .ok_or_else(|| "selected frontend process did not resolve S3 secrets".to_string())?;
+        let listen_addr = selected
+            .s3_listen_addr
+            .as_ref()
+            .ok_or_else(|| "selected frontend process has no S3 listen address".to_string())?;
+        values.insert("ARGMIN_ACCOUNT_ID", self.manifest.s3.account_id.clone());
+        values.insert(
+            "ARGMIN_ACCESS_KEY_ID",
+            self.manifest.s3.access_key_id.clone(),
+        );
+        values.insert(
+            "ARGMIN_SECRET_ACCESS_KEY",
+            material.secret_access_key.clone(),
+        );
+        values.insert(
+            "ARGMIN_SSE_S3_WRAPPING_KEY",
+            material.sse_s3_wrapping_key.clone(),
+        );
+        if let Some(key) = &material.sse_c_validator_key {
+            values.insert("ARGMIN_SSE_C_VALIDATOR_KEY", key.clone());
+        }
+        values.insert("ARGMIN_LISTEN_ADDR", listen_addr.clone());
+        values.insert("ARGMIN_WORKERS", self.manifest.s3.workers.to_string());
+        values.insert(
+            "ARGMIN_MAX_CONNECTIONS",
+            self.manifest.s3.max_connections.to_string(),
+        );
+        values.insert(
+            "ARGMIN_MAX_INFLIGHT_REQUESTS",
+            self.manifest.s3.max_inflight_requests.to_string(),
+        );
+        values.insert(
+            "ARGMIN_STREAM_READ_CHUNK_SIZE",
+            self.manifest.s3.stream_read_chunk_size.to_string(),
+        );
+        values.insert(
+            "ARGMIN_PANIC_ON_500",
+            self.manifest.s3.panic_on_500.to_string(),
+        );
+        values.insert(
+            "ARGMIN_ABORT_ON_500",
+            self.manifest.s3.abort_on_500.to_string(),
+        );
+        values.insert(
+            "ARGMIN_LOCAL_DEBUG_ENDPOINT",
+            self.manifest.s3.local_debug_endpoint.to_string(),
+        );
+        Ok(())
+    }
+
+    fn configured_s3_tls_certified_key(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+    ) -> Result<Option<ConfiguredTlsCertifiedKey>, String> {
+        let selected = &self.manifest.processes[self.selected_process_index];
+        let Some(identity_id) = selected.s3_tls_identity_id.as_deref() else {
+            return Ok(None);
+        };
+        let identity = material.tls_identities.get(identity_id).ok_or_else(|| {
+            format!("selected process did not resolve S3 TLS identity {identity_id}")
+        })?;
+        Ok(Some(ConfiguredTlsCertifiedKey::new(Arc::clone(
+            &identity.certified_key,
+        ))))
     }
 
     #[cfg(test)]
@@ -2505,6 +2674,47 @@ where
     )
 }
 
+fn insert_process_observability_manifest_values(
+    process: &ProcessInput,
+    values: &mut BTreeMap<&'static str, String>,
+) {
+    values.insert("ARGMIN_TRACE", process.trace_enabled.to_string());
+    values.insert("ARGMIN_TRACE_SYNC", process.trace_sync.to_string());
+    if let Some(filter) = &process.trace_filter {
+        values.insert("ARGMIN_TRACE_FILTER", filter.clone());
+    }
+    if let Some(path) = &process.trace_file {
+        values.insert("ARGMIN_TRACE_FILE", path.to_string_lossy().into_owned());
+    }
+    if let Some(value) = process.storage_node_rpc_admission_limit {
+        values.insert("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT", value.to_string());
+    }
+    if let Some(value) = process.storage_node_rpc_admission_wait_ms {
+        values.insert(
+            "ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS",
+            value.to_string(),
+        );
+    }
+    if let Some(value) = process.storage_node_rpc_control_admission_wait_ms {
+        values.insert(
+            "ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS",
+            value.to_string(),
+        );
+    }
+    if let Some(value) = process.control_plane_lease_scan_ms {
+        values.insert("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", value.to_string());
+    }
+    if let Some(value) = process.control_plane_frontend_refresh_ms {
+        values.insert(
+            "ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS",
+            value.to_string(),
+        );
+    }
+    if let Some(value) = process.control_plane_heartbeat_lease_ms {
+        values.insert("ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS", value.to_string());
+    }
+}
+
 fn load_server_config_from_inputs_with_filesystem_validator<F, V>(
     config_path: Option<&Path>,
     process_id: Option<&str>,
@@ -2516,7 +2726,17 @@ where
     V: FnOnce(&ValidatedStaticClusterManifest) -> Result<(), String>,
 {
     let config = match (config_path, process_id) {
-        (None, None) => ServerConfig::from_lookup(get),
+        (None, None) => {
+            let feature_enabled_test_config = cfg!(feature = "test-unauthenticated-internal-rpc")
+                && get("ARGMIN_PROCESS_ROLE").is_some();
+            let debug_process_test_config =
+                cfg!(debug_assertions) && get(TEST_ENV_SHAPED_CONFIG).as_deref() == Some("1");
+            if feature_enabled_test_config || debug_process_test_config {
+                ServerConfig::from_lookup(get)
+            } else {
+                ServerConfig::from_standalone_lookup(get)
+            }
+        }
         (Some(_), None) => {
             Err("ARGMIN_PROCESS_ID is required with ARGMIN_CLUSTER_CONFIG_PATH".to_string())
         }
@@ -2524,27 +2744,20 @@ where
             Err("ARGMIN_CLUSTER_CONFIG_PATH is required with ARGMIN_PROCESS_ID".to_string())
         }
         (Some(config_path), Some(process_id)) => {
-            for key in ENV_ONLY_CLUSTER_ENV_KEYS {
-                if get(key).is_some() {
-                    return Err(format!(
-                        "{key} cannot be set when ARGMIN_CLUSTER_CONFIG_PATH is active"
-                    ));
-                }
-            }
             let manifest = load_static_cluster_manifest_structural(config_path, process_id)?;
             validate_filesystem(&manifest)?;
+            let material = manifest.resolve_selected_process_material()?;
             match manifest.manifest.deployment.mode {
-                DeploymentMode::Standalone => manifest.standalone_server_config(get),
+                DeploymentMode::Standalone => manifest.standalone_server_config(&material),
                 DeploymentMode::Replicated => {
-                    let material = manifest.resolve_selected_process_material()?;
                     match manifest.manifest.processes[manifest.selected_process_index].kind {
                         ProcessKind::ControlPlane => {
-                            manifest.replicated_unix_control_plane_server_config(&material, get)
+                            manifest.replicated_unix_control_plane_server_config(&material)
                         }
                         ProcessKind::Frontend
                         | ProcessKind::StorageNode
                         | ProcessKind::Combined => {
-                            manifest.replicated_data_process_server_config(&material, get)
+                            manifest.replicated_data_process_server_config(&material)
                         }
                         ProcessKind::AllInOne => {
                             Err("all-in-one process is invalid in replicated mode".to_string())
@@ -2661,6 +2874,24 @@ impl CanonicalEncoder {
 
     fn path(&mut self, tag: u16, value: &Path) {
         self.field(tag, value.as_os_str().as_encoded_bytes());
+    }
+
+    fn optional_path(&mut self, tag: u16, value: Option<&Path>) {
+        let mut encoded = Vec::new();
+        match value {
+            Some(value) => {
+                let bytes = value.as_os_str().as_encoded_bytes();
+                encoded.push(1);
+                encoded.extend_from_slice(
+                    &u64::try_from(bytes.len())
+                        .expect("validated manifest path length fits u64")
+                        .to_be_bytes(),
+                );
+                encoded.extend_from_slice(bytes);
+            }
+            None => encoded.push(0),
+        }
+        self.field(tag, &encoded);
     }
 
     fn u8(&mut self, tag: u16, value: u8) {
@@ -2850,7 +3081,28 @@ fn full_config_fingerprint(manifest: &StaticClusterManifestInput) -> String {
             .iter()
             .map(encode_auth_credential_full),
     );
+    encoder.field(17, &encode_s3_full(&manifest.s3));
     auth::canonical::sha256_hex(&encoder.finish())
+}
+
+fn encode_s3_full(s3: &S3Input) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::default();
+    encoder.string(1, &s3.account_id);
+    encoder.string(2, &s3.access_key_id);
+    encoder.string(3, &s3.secret_access_key_ref);
+    encoder.string(4, &s3.sse_s3_wrapping_key_ref);
+    encoder.optional_string(5, s3.sse_c_validator_key_ref.as_deref());
+    encoder.u32(6, s3.workers);
+    encoder.u32(7, s3.max_connections);
+    encoder.u32(8, s3.max_inflight_requests);
+    encoder.u64(
+        9,
+        u64::try_from(s3.stream_read_chunk_size).expect("usize fits u64 on supported targets"),
+    );
+    encoder.boolean(10, s3.panic_on_500);
+    encoder.boolean(11, s3.abort_on_500);
+    encoder.boolean(12, s3.local_debug_endpoint);
+    encoder.finish()
 }
 
 fn encode_deployment_topology(deployment: &DeploymentInput) -> Vec<u8> {
@@ -2940,7 +3192,26 @@ fn encode_process_topology(process: &ProcessInput) -> Vec<u8> {
 }
 
 fn encode_process_full(process: &ProcessInput) -> Vec<u8> {
-    encode_process_topology(process)
+    let mut encoder = CanonicalEncoder::default();
+    encoder.field(1, &encode_process_topology(process));
+    encoder.optional_string(2, process.s3_listen_addr.as_deref());
+    encoder.optional_string(3, process.s3_tls_identity_id.as_deref());
+    encoder.boolean(4, process.trace_enabled);
+    encoder.optional_string(5, process.trace_filter.as_deref());
+    encoder.optional_path(6, process.trace_file.as_deref());
+    encoder.boolean(7, process.trace_sync);
+    encoder.optional_u64(
+        8,
+        process
+            .storage_node_rpc_admission_limit
+            .map(|value| u64::try_from(value).expect("usize fits u64 on supported targets")),
+    );
+    encoder.optional_u64(9, process.storage_node_rpc_admission_wait_ms);
+    encoder.optional_u64(10, process.storage_node_rpc_control_admission_wait_ms);
+    encoder.optional_u64(11, process.control_plane_lease_scan_ms);
+    encoder.optional_u64(12, process.control_plane_frontend_refresh_ms);
+    encoder.optional_u64(13, process.control_plane_heartbeat_lease_ms);
+    encoder.finish()
 }
 
 fn encode_authority_topology(authority: &AuthorityInput) -> Vec<u8> {
@@ -3628,6 +3899,7 @@ fn validate_static_cluster_manifest(
         &authorities,
         &storage_nodes,
     )?;
+    validate_s3(&manifest.s3, &manifest.processes, &tls_identities)?;
     validate_auth_credentials(
         &manifest.auth_credentials,
         &processes,
@@ -3877,11 +4149,108 @@ fn validate_processes<'a>(
             &process.id,
             &mut maintenance_ids,
         )?;
+        if let Some(filter) = &process.trace_filter {
+            if filter.len() > CLUSTER_MANIFEST_MAX_URI_BYTES
+                || filter.bytes().any(|byte| byte.is_ascii_control())
+            {
+                return Err(format!(
+                    "process {} trace_filter exceeds its limit or contains control characters",
+                    process.id
+                ));
+            }
+        }
+        if let Some(path) = &process.trace_file {
+            normalize_absolute_path(path, "process trace file")?;
+        }
+        for (value, field) in [
+            (
+                process.storage_node_rpc_admission_limit.map(|value| {
+                    u64::try_from(value).expect("usize fits u64 on supported targets")
+                }),
+                "storage_node_rpc_admission_limit",
+            ),
+            (
+                process.storage_node_rpc_admission_wait_ms,
+                "storage_node_rpc_admission_wait_ms",
+            ),
+            (
+                process.storage_node_rpc_control_admission_wait_ms,
+                "storage_node_rpc_control_admission_wait_ms",
+            ),
+            (
+                process.control_plane_lease_scan_ms,
+                "control_plane_lease_scan_ms",
+            ),
+            (
+                process.control_plane_frontend_refresh_ms,
+                "control_plane_frontend_refresh_ms",
+            ),
+            (
+                process.control_plane_heartbeat_lease_ms,
+                "control_plane_heartbeat_lease_ms",
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(format!("process {} {field} must be nonzero", process.id));
+            }
+        }
         if result.insert(process.id.as_str(), process).is_some() {
             return Err(format!("duplicate process id {}", process.id));
         }
     }
     Ok(result)
+}
+
+fn validate_s3(
+    s3: &S3Input,
+    processes: &[ProcessInput],
+    tls_identities: &BTreeSet<&str>,
+) -> Result<(), String> {
+    if s3.account_id.len() != 12 || !s3.account_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("S3 account_id must be a 12-digit AWS account ID".to_string());
+    }
+    validate_identifier(
+        &s3.access_key_id,
+        CLUSTER_MANIFEST_MAX_ID_BYTES,
+        "S3 access_key_id",
+    )?;
+    validate_file_reference(&s3.secret_access_key_ref, "S3 secret access key reference")?;
+    validate_file_reference(&s3.sse_s3_wrapping_key_ref, "SSE-S3 wrapping key reference")?;
+    if let Some(reference) = &s3.sse_c_validator_key_ref {
+        validate_file_reference(reference, "SSE-C validator key reference")?;
+    }
+    require_nonzero(s3.workers, "S3 worker count")?;
+    require_nonzero(s3.max_connections, "S3 maximum connections")?;
+    require_nonzero(s3.max_inflight_requests, "S3 maximum in-flight requests")?;
+    require_nonzero(s3.stream_read_chunk_size, "S3 stream read chunk size")?;
+
+    for process in processes {
+        if process.kind.has_frontend() {
+            let listen_addr = process.s3_listen_addr.as_deref().ok_or_else(|| {
+                format!("frontend process {} requires s3_listen_addr", process.id)
+            })?;
+            listen_addr.parse::<SocketAddr>().map_err(|error| {
+                format!(
+                    "frontend process {} has invalid s3_listen_addr: {error}",
+                    process.id
+                )
+            })?;
+            if let Some(identity_id) = process.s3_tls_identity_id.as_deref() {
+                if !tls_identities.contains(identity_id) {
+                    return Err(format!(
+                        "frontend process {} references unknown S3 TLS identity {identity_id}",
+                        process.id
+                    ));
+                }
+            }
+        } else if process.s3_listen_addr.is_some() || process.s3_tls_identity_id.is_some() {
+            return Err(format!(
+                "non-frontend process {} cannot configure S3 listener fields",
+                process.id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_optional_role_id<'a>(
@@ -5840,6 +6209,32 @@ mod tests {
         materialized_replicated_manifest_from(selected_process_id, replicated_manifest())
     }
 
+    fn materialized_standalone_manifest() -> (test_util::TempDir, ValidatedStaticClusterManifest) {
+        let dir = test_util::tempdir();
+        let manifest = materialize_s3_manifest_secrets(dir.path(), standalone_manifest());
+        let validated = parse_static_cluster_manifest(&manifest, "all-1").unwrap();
+        (dir, validated)
+    }
+
+    fn materialize_s3_manifest_secrets(root: &Path, manifest: String) -> String {
+        let material_dir = root.join("s3-material");
+        private_dir(&material_dir);
+        write_material_file(
+            &material_dir.join("s3-secret-access-key"),
+            b"test-secret-access-key",
+            0o600,
+        );
+        write_material_file(
+            &material_dir.join("sse-s3-wrapping-key"),
+            b"dGVzdC13cmFwcGluZy1rZXk=",
+            0o600,
+        );
+        manifest.replace(
+            "/run/argmin-secrets",
+            material_dir.to_str().expect("temporary path is UTF-8"),
+        )
+    }
+
     fn materialized_replicated_manifest_from(
         selected_process_id: &str,
         manifest: String,
@@ -5889,6 +6284,16 @@ mod tests {
         write_material_file(
             &material_dir.join("frontend-1-maintenance.key"),
             b"frontend-1-maintenance-secret",
+            0o600,
+        );
+        write_material_file(
+            &material_dir.join("s3-secret-access-key"),
+            b"test-secret-access-key",
+            0o600,
+        );
+        write_material_file(
+            &material_dir.join("sse-s3-wrapping-key"),
+            b"dGVzdC13cmFwcGluZy1rZXk=",
             0o600,
         );
         let manifest = manifest
@@ -5956,6 +6361,12 @@ mod tests {
 schema_version = 1
 tls_identities = []
 tls_trust_bundles = []
+
+[s3]
+account_id = "111122223333"
+access_key_id = "test-access-key"
+secret_access_key_ref = "file:/run/argmin-secrets/s3-secret-access-key"
+sse_s3_wrapping_key_ref = "file:/run/argmin-secrets/sse-s3-wrapping-key"
 
 [cluster]
 id = "replicated-unix"
@@ -6135,6 +6546,14 @@ secret_ref = "file:/run/argmin-secrets/{credential_id}.key"
                 .collect(),
             tls_identities: BTreeMap::new(),
             tls_trust_bundles: BTreeMap::new(),
+            s3: manifest.manifest.processes[manifest.selected_process_index]
+                .kind
+                .has_frontend()
+                .then(|| ResolvedStaticS3Material {
+                    secret_access_key: "test-secret-access-key".to_string(),
+                    sse_s3_wrapping_key: "dGVzdC13cmFwcGluZy1rZXk=".to_string(),
+                    sse_c_validator_key: None,
+                }),
         }
     }
 
@@ -6144,6 +6563,12 @@ schema_version = 1
 tls_identities = []
 tls_trust_bundles = []
 auth_credentials = []
+
+[s3]
+account_id = "111122223333"
+access_key_id = "test-access-key"
+secret_access_key_ref = "file:/run/argmin-secrets/s3-secret-access-key"
+sse_s3_wrapping_key_ref = "file:/run/argmin-secrets/sse-s3-wrapping-key"
 
 [cluster]
 id = "test-cluster"
@@ -6185,6 +6610,7 @@ mount_path = "/srv/argmin"
 id = "all-1"
 host_id = "host-1"
 kind = "all-in-one"
+s3_listen_addr = "127.0.0.1:9000"
 
 [[authorities]]
 id = "authority-1"
@@ -6232,6 +6658,12 @@ transport_profile_id = "control"
     fn replicated_manifest() -> String {
         let mut manifest = r#"
 schema_version = 1
+
+[s3]
+account_id = "111122223333"
+access_key_id = "test-access-key"
+secret_access_key_ref = "file:/run/argmin-secrets/s3-secret-access-key"
+sse_s3_wrapping_key_ref = "file:/run/argmin-secrets/sse-s3-wrapping-key"
 
 [cluster]
 id = "replicated-cluster"
@@ -6466,6 +6898,7 @@ kind = "frontend"
 frontend_instance_id = "frontend-1"
 admin_instance_id = "frontend-1-admin"
 maintenance_instance_id = "frontend-1-maintenance"
+s3_listen_addr = "127.0.0.1:9000"
 
 [[auth_credentials]]
 principal = "frontend"
@@ -6509,6 +6942,7 @@ kind = "frontend"
 frontend_instance_id = "frontend-1"
 admin_instance_id = "frontend-1-admin"
 maintenance_instance_id = "frontend-1-maintenance"
+s3_listen_addr = "127.0.0.1:9000"
 
 [[auth_credentials]]
 principal = "frontend"
@@ -6596,17 +7030,12 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
     #[test]
     fn static_cluster_manifest_maps_standalone_deployment_to_all_in_one_process() {
         let manifest = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
-        let mut environment = standalone_runtime_environment();
-        environment.insert("ARGMIN_LISTEN_ADDR", "127.0.0.1:19000".to_string());
-        environment.insert("ARGMIN_WORKERS", "7".to_string());
-
-        let config = manifest
-            .standalone_server_config(|key| environment.get(key).cloned())
-            .unwrap();
+        let material = resolved_test_material(&manifest);
+        let config = manifest.standalone_server_config(&material).unwrap();
 
         assert_eq!(config.process_role, ProcessRole::AllInOne);
-        assert_eq!(config.listen_addr, "127.0.0.1:19000");
-        assert_eq!(config.workers, 7);
+        assert_eq!(config.listen_addr, "127.0.0.1:9000");
+        assert_eq!(config.workers, 4);
         assert_eq!(config.host_id.as_deref(), Some("host-1"));
         assert_eq!(config.region, "us-east-1");
         assert_eq!(config.data_dir, "/srv/argmin");
@@ -6641,6 +7070,46 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
     }
 
     #[test]
+    fn static_cluster_manifest_resolves_public_tls_without_path_reopening() {
+        let dir = test_util::tempdir();
+        let manifest = format!(
+            "{}{}",
+            standalone_manifest().replace("tls_identities = []", ""),
+            r#"
+[[tls_identities]]
+id = "public-s3"
+certificate_ref = "file:/run/argmin-secrets/public.crt"
+private_key_ref = "file:/run/argmin-secrets/public.key"
+"#
+        )
+        .replace(
+            "s3_listen_addr = \"127.0.0.1:9000\"",
+            "s3_listen_addr = \"127.0.0.1:9000\"\ns3_tls_identity_id = \"public-s3\"",
+        );
+        let manifest = materialize_s3_manifest_secrets(dir.path(), manifest);
+        let material_dir = dir.path().join("s3-material");
+        write_material_file(
+            &material_dir.join("public.crt"),
+            include_bytes!("../../s3-tests/testdata/localhost-cert.pem"),
+            0o644,
+        );
+        write_material_file(
+            &material_dir.join("public.key"),
+            include_bytes!("../../s3-tests/testdata/localhost-key.pem"),
+            0o600,
+        );
+        let manifest = parse_static_cluster_manifest(&manifest, "all-1").unwrap();
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+
+        let config = manifest.standalone_server_config(&material).unwrap();
+
+        assert!(config.tls_certified_key.is_some());
+        assert_eq!(config.tls_cert_path, None);
+        assert_eq!(config.tls_key_path, None);
+        assert!(crate::build_tls_acceptor(&config).unwrap().is_some());
+    }
+
+    #[test]
     fn static_cluster_manifest_maps_replicated_unix_control_plane_with_binary_auth() {
         let manifest_text =
             replicated_unix_manifest().replace("max_connections = 64", "max_connections = 17");
@@ -6660,12 +7129,8 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
                 accept_until_ms: None,
                 secret: vec![9, 8, 7],
             });
-        let environment = standalone_runtime_environment();
-
         let config = manifest
-            .replicated_unix_control_plane_server_config(&material, |key| {
-                environment.get(key).cloned()
-            })
+            .replicated_unix_control_plane_server_config(&material)
             .unwrap();
 
         assert_eq!(config.process_role, ProcessRole::ControlPlane);
@@ -6782,9 +7247,7 @@ secret_ref = "file:/run/argmin-secrets/frontend-1-maintenance.key"
         let reordered = parse_static_cluster_manifest(&reordered_authorities, "control-1").unwrap();
         let reordered_material = resolved_test_material(&reordered);
         let reordered_config = reordered
-            .replicated_unix_control_plane_server_config(&reordered_material, |key| {
-                environment.get(key).cloned()
-            })
+            .replicated_unix_control_plane_server_config(&reordered_material)
             .unwrap();
         assert_eq!(
             reordered_config
@@ -6837,7 +7300,7 @@ tls_server_name = "control-1.internal"
             let material = manifest.resolve_selected_process_material_at(1).unwrap();
 
             let config = manifest
-                .replicated_unix_control_plane_server_config(&material, |_| None)
+                .replicated_unix_control_plane_server_config(&material)
                 .unwrap();
             let listeners = if protocol == "control-plane" {
                 &config.control_plane_rpc_listeners
@@ -6900,7 +7363,7 @@ tls_server_name = "localhost""#,
         let material = manifest.resolve_selected_process_material_at(1).unwrap();
 
         let config = manifest
-            .replicated_unix_control_plane_server_config(&material, |_| None)
+            .replicated_unix_control_plane_server_config(&material)
             .unwrap();
 
         assert_eq!(config.control_plane_raft_peer_socket_path, None);
@@ -7001,7 +7464,7 @@ tls_server_name = "localhost""#,
         });
 
         let error = manifest
-            .replicated_unix_control_plane_server_config(&material, |_| None)
+            .replicated_unix_control_plane_server_config(&material)
             .unwrap_err();
 
         assert!(
@@ -7023,7 +7486,7 @@ tls_server_name = "localhost""#,
         });
 
         let error = manifest
-            .replicated_unix_control_plane_server_config(&material, |_| None)
+            .replicated_unix_control_plane_server_config(&material)
             .unwrap_err();
 
         assert!(
@@ -7336,6 +7799,7 @@ transport_profile_id = "internal"
             auth_credentials: Vec::new(),
             tls_identities: BTreeMap::new(),
             tls_trust_bundles: BTreeMap::new(),
+            s3: None,
         };
 
         let error = manifest
@@ -7461,10 +7925,8 @@ transport_profile_id = "internal"
             .replace("/run/argmin", socket_path.to_str().unwrap())
             .replace("initial_cluster_epoch = 1", "initial_cluster_epoch = 7");
         let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
-        let environment = standalone_runtime_environment();
-        let config = manifest
-            .standalone_server_config(|key| environment.get(key).cloned())
-            .unwrap();
+        let material = resolved_test_material(&manifest);
+        let config = manifest.standalone_server_config(&material).unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
         manifest.initialize_selected_storage().unwrap();
 
@@ -7490,10 +7952,8 @@ transport_profile_id = "internal"
             .replace("/srv/argmin", disk_path.to_str().unwrap())
             .replace("/run/argmin", socket_path.to_str().unwrap());
         let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
-        let environment = standalone_runtime_environment();
-        let config = manifest
-            .standalone_server_config(|key| environment.get(key).cloned())
-            .unwrap();
+        let material = resolved_test_material(&manifest);
+        let config = manifest.standalone_server_config(&material).unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
         manifest.initialize_selected_storage().unwrap();
         let first = crate::build_standalone_storage_cluster(&config, &ec_config).unwrap();
@@ -7525,10 +7985,8 @@ transport_profile_id = "internal"
             .replace("/srv/argmin", disk_path.to_str().unwrap())
             .replace("/run/argmin", socket_path.to_str().unwrap());
         let manifest = parse_static_cluster_manifest(&source, "all-1").unwrap();
-        let environment = standalone_runtime_environment();
-        let config = manifest
-            .standalone_server_config(|key| environment.get(key).cloned())
-            .unwrap();
+        let material = resolved_test_material(&manifest);
+        let config = manifest.standalone_server_config(&material).unwrap();
         let ec_config = EcConfig::new(config.ec_k, config.ec_m).unwrap();
 
         let error = match crate::build_standalone_storage_cluster(&config, &ec_config) {
@@ -7559,26 +8017,78 @@ transport_profile_id = "internal"
     }
 
     #[test]
-    fn static_cluster_runtime_loader_rejects_mixed_cluster_environment() {
-        let (_dir, path) = write_manifest(&standalone_manifest());
+    fn static_cluster_runtime_loader_ignores_standalone_topology_environment() {
+        let dir = test_util::tempdir();
+        let manifest = materialize_s3_manifest_secrets(dir.path(), standalone_manifest());
+        let path = dir.path().join("cluster.toml");
+        std::fs::write(&path, manifest).unwrap();
         let mut environment = standalone_runtime_environment();
         environment.insert("ARGMIN_PG_COUNT", "999".to_string());
-
-        let error = load_server_config_from_inputs(Some(&path), Some("all-1"), |key| {
-            environment.get(key).cloned()
-        })
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            "ARGMIN_PG_COUNT cannot be set when ARGMIN_CLUSTER_CONFIG_PATH is active"
+        environment.insert("ARGMIN_EC_K", "31".to_string());
+        environment.insert("ARGMIN_EC_M", "1".to_string());
+        environment.insert("ARGMIN_ACCOUNT_ID", "invalid".to_string());
+        environment.insert("ARGMIN_SECRET_ACCESS_KEY", "ignored-secret".to_string());
+        environment.insert(
+            "ARGMIN_SSE_S3_WRAPPING_KEY",
+            "ignored-wrapping-key".to_string(),
         );
-        assert!(!error.contains("999"));
+        environment.insert("ARGMIN_LISTEN_ADDR", "not-an-address".to_string());
+        environment.insert("ARGMIN_TLS_CERT_PATH", "/ignored/cert".to_string());
+        environment.insert("ARGMIN_TLS_KEY_PATH", "/ignored/key".to_string());
+        environment.insert("ARGMIN_WORKERS", "0".to_string());
+        environment.insert("ARGMIN_TRACE", "true".to_string());
+        environment.insert("ARGMIN_TRACE_FILE", "/ignored/trace".to_string());
+        environment.insert("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT", "0".to_string());
+        environment.insert("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "0".to_string());
+
+        let config = load_server_config_from_inputs_with_filesystem_validator(
+            Some(&path),
+            Some("all-1"),
+            |key| environment.get(key).cloned(),
+            |_manifest| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(config.pg_count, 16);
+        assert_eq!((config.ec_k, config.ec_m), (1, 0));
+        assert_eq!(config.account_id, "111122223333");
+        assert_eq!(config.secret_access_key.as_str(), "test-secret-access-key");
+        assert_eq!(
+            config.sse_s3_wrapping_key_b64.as_str(),
+            "dGVzdC13cmFwcGluZy1rZXk="
+        );
+        assert_eq!(config.listen_addr, "127.0.0.1:9000");
+        assert_eq!(config.tls_cert_path, None);
+        assert_eq!(config.tls_key_path, None);
+        assert_eq!(config.workers, 4);
+        assert!(!config.trace_enabled);
+        assert_eq!(config.trace_file, None);
     }
 
     #[test]
-    fn static_cluster_runtime_loader_keeps_env_only_compatibility_mode() {
+    fn static_cluster_runtime_loader_uses_fixed_embedded_standalone_topology() {
         let mut environment = standalone_runtime_environment();
+        environment.insert("ARGMIN_PG_COUNT", "3".to_string());
+        environment.insert("ARGMIN_EC_K", "8".to_string());
+        environment.insert("ARGMIN_EC_M", "4".to_string());
+        environment.insert("ARGMIN_LOCAL_NODE_COUNT", "12".to_string());
+
+        let config =
+            load_server_config_from_inputs(None, None, |key| environment.get(key).cloned())
+                .unwrap();
+
+        assert_eq!(config.process_role, ProcessRole::AllInOne);
+        assert_eq!(config.pg_count, 16);
+        assert_eq!((config.ec_k, config.ec_m), (1, 0));
+        assert_eq!(config.storage_node_ids, vec![0]);
+        assert_eq!(config.static_cluster_identity, None);
+    }
+
+    #[cfg(feature = "test-unauthenticated-internal-rpc")]
+    #[test]
+    fn test_feature_retains_environment_shaped_topology_for_uat() {
+        let mut environment = standalone_runtime_environment();
+        environment.insert("ARGMIN_PROCESS_ROLE", "all-in-one".to_string());
         environment.insert("ARGMIN_PG_COUNT", "3".to_string());
         environment.insert("ARGMIN_EC_K", "1".to_string());
         environment.insert("ARGMIN_EC_M", "0".to_string());
@@ -7588,10 +8098,9 @@ transport_profile_id = "internal"
             load_server_config_from_inputs(None, None, |key| environment.get(key).cloned())
                 .unwrap();
 
-        assert_eq!(config.process_role, ProcessRole::AllInOne);
         assert_eq!(config.pg_count, 3);
+        assert_eq!((config.ec_k, config.ec_m), (1, 0));
         assert_eq!(config.storage_node_ids, vec![0]);
-        assert_eq!(config.static_cluster_identity, None);
     }
 
     #[test]
@@ -7599,7 +8108,8 @@ transport_profile_id = "internal"
         let dir = test_util::tempdir();
         let mount_path = dir.path().join("disk");
         private_dir(&mount_path);
-        let manifest = standalone_manifest_on_mount(&mount_path);
+        let manifest =
+            materialize_s3_manifest_secrets(dir.path(), standalone_manifest_on_mount(&mount_path));
         let manifest_path = dir.path().join("cluster.toml");
         std::fs::write(&manifest_path, manifest).unwrap();
         let environment = standalone_runtime_environment();
@@ -7659,13 +8169,10 @@ transport_profile_id = "internal"
 
     #[test]
     fn static_cluster_runtime_maps_remote_storage_addresses_for_authority_bootstrap() {
-        let environment = standalone_runtime_environment();
         let (_dir, replicated) = materialized_replicated_manifest("control-1");
         let material = replicated.resolve_selected_process_material_at(1).unwrap();
         let config = replicated
-            .replicated_unix_control_plane_server_config(&material, |key| {
-                environment.get(key).cloned()
-            })
+            .replicated_unix_control_plane_server_config(&material)
             .unwrap();
         assert_eq!(
             config
@@ -7683,7 +8190,6 @@ transport_profile_id = "internal"
 
     #[test]
     fn static_cluster_storage_bootstrap_uses_globally_reachable_tcp_fallback() {
-        let environment = standalone_runtime_environment();
         let manifest = format!(
             "{}{}",
             replicated_manifest(),
@@ -7706,9 +8212,7 @@ transport_profile_id = "internal"
         let (_dir, replicated) = materialized_replicated_manifest_from("control-1", manifest);
         let material = replicated.resolve_selected_process_material_at(1).unwrap();
         let config = replicated
-            .replicated_unix_control_plane_server_config(&material, |key| {
-                environment.get(key).cloned()
-            })
+            .replicated_unix_control_plane_server_config(&material)
             .unwrap();
 
         assert_eq!(
@@ -7748,8 +8252,6 @@ transport_profile_id = "internal"
 
     #[test]
     fn static_cluster_runtime_loader_rejects_standalone_unresolved_credentials() {
-        let environment = standalone_runtime_environment();
-
         let credentialed = format!(
             "{}{}",
             replace_once(&standalone_manifest(), "auth_credentials = []", ""),
@@ -7765,8 +8267,9 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
 "#
         );
         let credentialed = parse_static_cluster_manifest(&credentialed, "all-1").unwrap();
+        let material = resolved_test_material(&credentialed);
         let error = credentialed
-            .standalone_server_config(|key| environment.get(key).cloned())
+            .standalone_server_config(&material)
             .unwrap_err();
         assert!(error.contains("no internal authentication or TLS material"));
     }
@@ -7797,7 +8300,7 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
             (
                 "ce30e19d641d6c43b6b2ee4da53c2a98e6a9e1966b6d157bf4542e7ea21e5a54",
                 "603ad39045e499b35843ed647010738665bf478d2d204af57df1337f38f4bf07",
-                "cb6dc09b42b395c656e772b9d187a0920ca3561b7af01031866d9c0e51f50d93",
+                "eba1830e2f4d9e50ce05dbba6a439e9384381545cbd91de817fd7b7d654e59dc",
             )
         );
 
@@ -7812,7 +8315,7 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
             (
                 "0d32b6801cdf4a4a37e9b8f294ed5d1f0e118edfccb6a6f5825e6f45962825ae",
                 "720ce6f51baf0752837a5250b5921c1dca2e4baff69b6c7ef4b1d7c4d5c62193",
-                "ef407ab87c3a309688bd3a42b147ba5389f3f4b37f8a6dfe94b9deb895d02a3c",
+                "8c5289c878434b3a0688e4e6fcce6d207f50cb06ee91a4c5194aa6afa492ba32",
             )
         );
     }
@@ -8640,13 +9143,14 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
 
     #[test]
     fn standalone_cluster_material_resolution_requires_no_auth_material() {
-        let manifest = parse_static_cluster_manifest(&standalone_manifest(), "all-1").unwrap();
+        let (_dir, manifest) = materialized_standalone_manifest();
 
         let material = manifest.resolve_selected_process_material_at(1).unwrap();
 
         assert_eq!(material.auth_credential_count(), 0);
         assert_eq!(material.tls_identity_count(), 0);
         assert_eq!(material.tls_trust_bundle_count(), 0);
+        assert!(material.s3.is_some());
     }
 
     #[test]
@@ -8658,7 +9162,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             .resolve_selected_process_material_at(1)
             .unwrap();
         let storage_config = storage_manifest
-            .replicated_data_process_server_config(&storage_material, |_| None)
+            .replicated_data_process_server_config(&storage_material)
             .unwrap();
 
         assert_eq!(storage_config.process_role, ProcessRole::StorageNode);
@@ -8689,11 +9193,8 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let frontend_material = frontend_manifest
             .resolve_selected_process_material_at(1)
             .unwrap();
-        let environment = standalone_runtime_environment();
         let frontend_config = frontend_manifest
-            .replicated_data_process_server_config(&frontend_material, |key| {
-                environment.get(key).cloned()
-            })
+            .replicated_data_process_server_config(&frontend_material)
             .unwrap();
 
         assert_eq!(frontend_config.process_role, ProcessRole::Frontend);
@@ -8738,7 +9239,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             .resolve_selected_process_material_at(1)
             .unwrap();
         let storage_config = storage_manifest
-            .replicated_data_process_server_config(&storage_material, |_| None)
+            .replicated_data_process_server_config(&storage_material)
             .unwrap();
 
         assert_eq!(storage_config.storage_rpc_listeners.len(), 1);
@@ -8759,11 +9260,8 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let frontend_material = frontend_manifest
             .resolve_selected_process_material_at(1)
             .unwrap();
-        let environment = standalone_runtime_environment();
         let frontend_config = frontend_manifest
-            .replicated_data_process_server_config(&frontend_material, |key| {
-                environment.get(key).cloned()
-            })
+            .replicated_data_process_server_config(&frontend_material)
             .unwrap();
 
         assert!(frontend_config.storage_rpc_listeners.is_empty());
@@ -8785,7 +9283,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             .iter()
             .all(|credential| { credential.principal.principal != AuthPrincipal::Maintenance }));
         manifest
-            .replicated_unix_control_plane_server_config(&material, |_| None)
+            .replicated_unix_control_plane_server_config(&material)
             .unwrap();
     }
 

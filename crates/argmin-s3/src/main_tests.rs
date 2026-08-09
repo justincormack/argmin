@@ -526,6 +526,7 @@ mod tests {
             listen_addr: "127.0.0.1:9000".to_string(),
             tls_cert_path: None,
             tls_key_path: None,
+            tls_certified_key: None,
             data_dir: "/tmp/argmin-test".to_string(),
             pg_count: 8,
             storage_node_ids: (0..6).collect(),
@@ -599,6 +600,10 @@ mod tests {
             panic_on_500: false,
             abort_on_500: false,
             local_debug_endpoint: false,
+            trace_enabled: false,
+            trace_filter: None,
+            trace_file: None,
+            trace_sync: false,
         }
     }
 
@@ -6016,6 +6021,28 @@ mod tests {
             format!("{install:?}"),
             "ControlPlanePgMetadataTransferInstall(<opaque>)"
         );
+    }
+
+    #[cfg(feature = "test-live-metadata-transfer-failpoints")]
+    #[test]
+    fn live_metadata_transfer_failpoints_are_explicit_test_command_values() {
+        use storage::LivePgMetadataTransferFailpoint;
+
+        assert!(matches!(
+            parse_live_metadata_transfer_failpoint(std::ffi::OsStr::new("after-fence")),
+            Some(LivePgMetadataTransferFailpoint::AfterFence)
+        ));
+        assert!(matches!(
+            parse_live_metadata_transfer_failpoint(std::ffi::OsStr::new(
+                "after-transfer-install"
+            )),
+            Some(LivePgMetadataTransferFailpoint::AfterTransferInstall)
+        ));
+        assert!(matches!(
+            parse_live_metadata_transfer_failpoint(std::ffi::OsStr::new("after-import")),
+            Some(LivePgMetadataTransferFailpoint::AfterImport)
+        ));
+        assert!(parse_live_metadata_transfer_failpoint(std::ffi::OsStr::new("unknown")).is_none());
     }
 
     #[test]

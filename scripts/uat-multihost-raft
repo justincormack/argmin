@@ -318,6 +318,9 @@ material_dir="$local_run/material"
 manifest_path="$local_run/cluster.toml"
 mkdir -p "$material_dir"
 chmod 700 "$local_run" "$material_dir"
+printf '%s' 'argmin-multihost-primary-secret' >"$material_dir/s3-secret-access-key"
+printf '%s' 'MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=' >"$material_dir/sse-s3-wrapping-key"
+chmod 600 "$material_dir/s3-secret-access-key" "$material_dir/sse-s3-wrapping-key"
 
 declare -a current_units=("" "" "")
 declare -a unit_generations=(0 0 0)
@@ -484,6 +487,12 @@ cluster_id="multihost-raft-$run_id"
 cat >"$manifest_path" <<EOF
 schema_version = 1
 
+[s3]
+account_id = "111122223333"
+access_key_id = "argmin-multihost-primary"
+secret_access_key_ref = "file:$remote_run/material/s3-secret-access-key"
+sse_s3_wrapping_key_ref = "file:$remote_run/material/sse-s3-wrapping-key"
+
 [cluster]
 id = "$cluster_id"
 topology_generation = 1
@@ -561,6 +570,10 @@ admin_instance_id = "control-$number-admin"
 id = "storage-$number"
 host_id = "host-$number"
 kind = "storage-node"
+control_plane_heartbeat_lease_ms = $heartbeat_lease_ms
+trace_enabled = true
+trace_filter = "storage"
+trace_file = "$remote_run/logs/storage-$number.trace"
 
 [[authorities]]
 id = "authority-$number"
@@ -663,6 +676,10 @@ kind = "frontend"
 frontend_instance_id = "frontend-$number"
 admin_instance_id = "frontend-$number-admin"
 maintenance_instance_id = "frontend-$number-maintenance"
+s3_listen_addr = "${addresses[$((number - 1))]}:$frontend_port"
+trace_enabled = true
+trace_filter = "server_http,server_core,storage"
+trace_file = "$remote_run/logs/frontend-$number.trace"
 
 [[auth_credentials]]
 principal = "frontend"
@@ -702,6 +719,8 @@ deploy_material=(
     "$material_dir/ca.crt"
     "$material_dir/server.crt"
     "$material_dir/server.key"
+    "$material_dir/s3-secret-access-key"
+    "$material_dir/sse-s3-wrapping-key"
 )
 for role in raft storage admin; do
     for number in 1 2 3; do
@@ -730,6 +749,8 @@ for index in 0 1 2; do
     sensitive_paths=(
         "$remote_run/cluster.toml"
         "$remote_run/material/server.key"
+        "$remote_run/material/s3-secret-access-key"
+        "$remote_run/material/sse-s3-wrapping-key"
     )
     for role in raft storage admin; do
         for number in 1 2 3; do
@@ -835,10 +856,6 @@ start_storage() {
         --property "StandardError=append:$remote_run/logs/storage-$number.log" \
         --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         --setenv "ARGMIN_PROCESS_ID=storage-$number" \
-        --setenv "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS=$heartbeat_lease_ms" \
-        --setenv "ARGMIN_TRACE=1" \
-        --setenv "ARGMIN_TRACE_FILTER=storage" \
-        --setenv "ARGMIN_TRACE_FILE=$remote_run/logs/storage-$number.trace" \
         "$remote_run/argmin-s3"
 }
 
@@ -903,14 +920,6 @@ start_frontend() {
         --property "StandardError=append:$remote_run/logs/frontend-$number.log" \
         --setenv "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         --setenv "ARGMIN_PROCESS_ID=frontend-$number" \
-        --setenv "ARGMIN_ACCOUNT_ID=111122223333" \
-        --setenv "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
-        --setenv "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
-        --setenv "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
-        --setenv "ARGMIN_LISTEN_ADDR=${addresses[$index]}:$frontend_port" \
-        --setenv "ARGMIN_TRACE=1" \
-        --setenv "ARGMIN_TRACE_FILTER=server_http,server_core,storage" \
-        --setenv "ARGMIN_TRACE_FILE=$remote_run/logs/frontend-$number.trace" \
         "$remote_run/argmin-s3"
 }
 
@@ -997,10 +1006,6 @@ frontend_read_command() {
     remote_exec_quiet "${hosts[$index]}" env \
         "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         "ARGMIN_PROCESS_ID=frontend-$number" \
-        "ARGMIN_ACCOUNT_ID=111122223333" \
-        "ARGMIN_ACCESS_KEY_ID=argmin-multihost-primary" \
-        "ARGMIN_SECRET_ACCESS_KEY=argmin-multihost-primary-secret" \
-        "ARGMIN_SSE_S3_WRAPPING_KEY=MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=" \
         "$remote_run/argmin-s3" "$@"
 }
 

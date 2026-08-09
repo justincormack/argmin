@@ -28,7 +28,7 @@ use auth::{AccountIdentity, ConfiguredPrincipalIdentity, CredentialStore, Stored
 use ec::EcConfig;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-#[cfg(test)]
+use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use server_core::coordinator::Coordinator;
 use server_core::sse::{
@@ -152,21 +152,48 @@ fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
 }
 
 fn build_tls_acceptor(config: &ServerConfig) -> Result<Option<TlsAcceptor>, String> {
-    let (Some(cert_path), Some(key_path)) = (&config.tls_cert_path, &config.tls_key_path) else {
+    if config.tls_certified_key.is_none()
+        && config.tls_cert_path.is_none()
+        && config.tls_key_path.is_none()
+    {
         return Ok(None);
-    };
+    }
+    if config.tls_certified_key.is_some()
+        && (config.tls_cert_path.is_some() || config.tls_key_path.is_some())
+    {
+        return Err("public TLS cannot use both resolved and path-based credentials".to_string());
+    }
 
-    let certs = load_certs(cert_path)?;
-    let key = load_private_key(key_path)?;
-    let mut server_config =
-        rustls::ServerConfig::builder_with_provider(tls_provider::configured_provider())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| format!("failed to select TLS protocol versions: {e}"))?
-            .with_no_client_auth()
+    let builder = rustls::ServerConfig::builder_with_provider(tls_provider::configured_provider())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("failed to select TLS protocol versions: {e}"))?
+        .with_no_client_auth();
+    let mut server_config = if let Some(certified_key) = &config.tls_certified_key {
+        builder.with_cert_resolver(Arc::new(SingleTlsCertificateResolver(
+            certified_key.certified_key(),
+        )))
+    } else {
+        let (Some(cert_path), Some(key_path)) = (&config.tls_cert_path, &config.tls_key_path)
+        else {
+            return Err("public TLS certificate and key paths must be configured together".into());
+        };
+        let certs = load_certs(cert_path)?;
+        let key = load_private_key(key_path)?;
+        builder
             .with_single_cert(certs, key)
-            .map_err(|e| format!("failed to build TLS config: {e}"))?;
+            .map_err(|e| format!("failed to build TLS config: {e}"))?
+    };
     server_config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(Some(TlsAcceptor::from(Arc::new(server_config))))
+}
+
+#[derive(Debug)]
+struct SingleTlsCertificateResolver(Arc<CertifiedKey>);
+
+impl ResolvesServerCert for SingleTlsCertificateResolver {
+    fn resolve(&self, _client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
 }
 
 fn authorization_profile(profile: ConfiguredCredentialProfile) -> auth::AuthorizationProfile {
@@ -314,6 +341,12 @@ async fn async_main() {
             std::process::exit(1);
         }
     };
+    observability::configure_with_options(
+        config.trace_enabled,
+        config.trace_filter.as_deref(),
+        config.trace_file.as_deref(),
+        config.trace_sync,
+    );
     observability::install_panic_flight_recorder_hook();
     let host_id = config
         .host_id
@@ -857,34 +890,56 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
             );
             return Some(2);
         };
-        return match transfer_control_plane_pg_metadata_live(Path::new(&path), pg_id, acting_set) {
-            Ok(summary) => {
-                if summary.already_completed() {
-                    eprintln!(
-                        "control-plane PG {} metadata transfer already completed at epoch {} with acting primary node {}",
-                        pg_id,
-                        summary.destination_epoch(),
-                        summary.source_node_id()
-                    );
-                } else {
-                    eprintln!(
-                        "control-plane transferred PG {} metadata from node {} epoch {} to epoch {} with imported proof {}:{}:{}",
-                        pg_id,
-                        summary.source_node_id(),
-                        summary.source_epoch(),
-                        summary.destination_epoch(),
-                        summary.imported_log_index(),
-                        summary.imported_log_hash(),
-                        summary.imported_state_digest()
-                    );
-                }
-                Some(0)
-            }
-            Err(error) => {
-                eprintln!("{error}");
-                Some(1)
-            }
+        return Some(run_control_plane_pg_metadata_transfer_command(
+            Path::new(&path),
+            pg_id,
+            acting_set,
+            None,
+        ));
+    }
+
+    #[cfg(feature = "test-live-metadata-transfer-failpoints")]
+    if command == "test-control-plane-transfer-pg-metadata-live-with-failpoint" {
+        let Some(failpoint) = args
+            .next()
+            .as_deref()
+            .and_then(parse_live_metadata_transfer_failpoint)
+        else {
+            eprintln!(
+                "usage: argmin-s3 {} <after-fence|after-transfer-install|after-import> <socket-path> <pg-id> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
         };
+        let Some(path) = args.next() else {
+            eprintln!(
+                "usage: argmin-s3 {} <after-fence|after-transfer-install|after-import> <socket-path> <pg-id> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        let Some((pg_id, acting_set)) = parse_control_plane_pg_acting_set_args(args) else {
+            eprintln!(
+                "usage: argmin-s3 {} <after-fence|after-transfer-install|after-import> <socket-path> <pg-id> <node-id>...",
+                command.to_string_lossy()
+            );
+            return Some(2);
+        };
+        return Some(run_control_plane_pg_metadata_transfer_command(
+            Path::new(&path),
+            pg_id,
+            acting_set,
+            Some(failpoint),
+        ));
+    }
+
+    #[cfg(not(feature = "test-live-metadata-transfer-failpoints"))]
+    if command == "test-control-plane-transfer-pg-metadata-live-with-failpoint" {
+        eprintln!(
+            "{} requires an argmin-s3 build with the test-live-metadata-transfer-failpoints feature",
+            command.to_string_lossy()
+        );
+        return Some(2);
     }
 
     let live = if command == "control-plane-set-pg-acting-set" {
@@ -930,6 +985,56 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
             eprintln!("{error}");
             Some(1)
         }
+    }
+}
+
+fn run_control_plane_pg_metadata_transfer_command(
+    socket_path: &Path,
+    pg_id: u32,
+    acting_set: Vec<u32>,
+    failpoint: Option<storage::LivePgMetadataTransferFailpoint>,
+) -> i32 {
+    match transfer_control_plane_pg_metadata_live(socket_path, pg_id, acting_set, failpoint) {
+        Ok(summary) => {
+            if summary.already_completed() {
+                eprintln!(
+                    "control-plane PG {} metadata transfer already completed at epoch {} with acting primary node {}",
+                    pg_id,
+                    summary.destination_epoch(),
+                    summary.source_node_id()
+                );
+            } else {
+                eprintln!(
+                    "control-plane transferred PG {} metadata from node {} epoch {} to epoch {} with imported proof {}:{}:{}",
+                    pg_id,
+                    summary.source_node_id(),
+                    summary.source_epoch(),
+                    summary.destination_epoch(),
+                    summary.imported_log_index(),
+                    summary.imported_log_hash(),
+                    summary.imported_state_digest()
+                );
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+#[cfg(feature = "test-live-metadata-transfer-failpoints")]
+fn parse_live_metadata_transfer_failpoint(
+    value: &std::ffi::OsStr,
+) -> Option<storage::LivePgMetadataTransferFailpoint> {
+    match value.to_str()? {
+        "after-fence" => Some(storage::LivePgMetadataTransferFailpoint::AfterFence),
+        "after-transfer-install" => {
+            Some(storage::LivePgMetadataTransferFailpoint::AfterTransferInstall)
+        }
+        "after-import" => Some(storage::LivePgMetadataTransferFailpoint::AfterImport),
+        _ => None,
     }
 }
 
@@ -1079,28 +1184,11 @@ fn set_control_plane_pg_acting_set_with_metadata_transfer_live(
         .map_err(|error| error.to_string())
 }
 
-fn configured_live_metadata_transfer_failpoint(
-) -> Result<Option<storage::LivePgMetadataTransferFailpoint>, String> {
-    let Ok(value) = std::env::var("ARGMIN_METADATA_TRANSFER_FAILPOINT") else {
-        return Ok(None);
-    };
-    match value.as_str() {
-        "" => Ok(None),
-        "after-fence" => Ok(Some(storage::LivePgMetadataTransferFailpoint::AfterFence)),
-        "after-transfer-install" => Ok(Some(
-            storage::LivePgMetadataTransferFailpoint::AfterTransferInstall,
-        )),
-        "after-import" => Ok(Some(storage::LivePgMetadataTransferFailpoint::AfterImport)),
-        _ => Err(format!(
-            "ARGMIN_METADATA_TRANSFER_FAILPOINT must be after-fence, after-transfer-install, or after-import, got {value:?}"
-        )),
-    }
-}
-
 fn transfer_control_plane_pg_metadata_live(
     socket_path: &Path,
     pg_id: u32,
     acting_set: Vec<u32>,
+    failpoint: Option<storage::LivePgMetadataTransferFailpoint>,
 ) -> Result<storage::LivePgMetadataTransferSummary, String> {
     let config = static_cluster_config::load_server_config_from_environment()
         .map_err(|error| format!("configuration error: {error}"))?;
@@ -1149,7 +1237,7 @@ fn transfer_control_plane_pg_metadata_live(
             auth,
         )
     }
-    .with_failpoint(configured_live_metadata_transfer_failpoint()?);
+    .with_failpoint(failpoint);
     transfer
         .transfer(pg_id, acting_set)
         .map_err(|error| error.to_string())

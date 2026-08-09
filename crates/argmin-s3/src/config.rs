@@ -26,6 +26,8 @@ use storage::{
 
 const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
 const MAX_LOCAL_NODE_COUNT: u32 = 4_096;
+const STANDALONE_EC_K: &str = "1";
+const STANDALONE_EC_M: &str = "0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProcessRole {
@@ -386,6 +388,28 @@ pub(crate) struct ConfiguredStaticClusterIdentity {
     pub(crate) process_identity_digest: String,
 }
 
+#[derive(Clone)]
+pub(crate) struct ConfiguredTlsCertifiedKey(Arc<CertifiedKey>);
+
+impl ConfiguredTlsCertifiedKey {
+    pub(crate) fn new(certified_key: Arc<CertifiedKey>) -> Self {
+        Self(certified_key)
+    }
+
+    pub(crate) fn certified_key(&self) -> Arc<CertifiedKey> {
+        Arc::clone(&self.0)
+    }
+}
+
+impl fmt::Debug for ConfiguredTlsCertifiedKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ConfiguredTlsCertifiedKey")
+            .field("certificate_count", &self.0.cert.len())
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct SecretConfigValue(String);
 
@@ -443,6 +467,7 @@ pub(crate) struct ServerConfig {
     pub(crate) listen_addr: String,
     pub(crate) tls_cert_path: Option<String>,
     pub(crate) tls_key_path: Option<String>,
+    pub(crate) tls_certified_key: Option<ConfiguredTlsCertifiedKey>,
     pub(crate) data_dir: String,
     pub(crate) pg_count: u32,
     pub(crate) storage_node_ids: Vec<u32>,
@@ -516,6 +541,10 @@ pub(crate) struct ServerConfig {
     pub(crate) panic_on_500: bool,
     pub(crate) abort_on_500: bool,
     pub(crate) local_debug_endpoint: bool,
+    pub(crate) trace_enabled: bool,
+    pub(crate) trace_filter: Option<String>,
+    pub(crate) trace_file: Option<String>,
+    pub(crate) trace_sync: bool,
 }
 
 impl ServerConfig {
@@ -568,64 +597,23 @@ impl ServerConfig {
         }
     }
 
-    /// Resolve configuration values from an environment-style lookup.
+    /// Resolve the public embedded-standalone environment configuration.
     ///
-    /// Required: `ARGMIN_ACCOUNT_ID`, `ARGMIN_ACCESS_KEY_ID`,
-    /// `ARGMIN_SECRET_ACCESS_KEY`
-    /// Optional (with defaults):
-    ///   `ARGMIN_HOST_ID` (random stable-for-process host ID)
-    ///   `ARGMIN_LISTEN_ADDR` (127.0.0.1:9000)
-    ///   `ARGMIN_TLS_CERT_PATH` / `ARGMIN_TLS_KEY_PATH` (unset)
-    ///   `ARGMIN_DATA_DIR` (./data)
-    ///   `ARGMIN_PG_COUNT` (16)
-    ///   `ARGMIN_STORAGE_CLUSTER_EPOCH` (1)
-    ///   `ARGMIN_STORAGE_PG_IDS` (all PGs in `0..ARGMIN_PG_COUNT`)
-    ///   `ARGMIN_STORAGE_NODE_SOCKETS` (`node_id=/absolute/socket,...`, required for static frontend/combined routing, optional initial control-plane bootstrap membership)
-    ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` (1024)
-    ///   `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS` (250)
-    ///   `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` (1000)
-    ///   `ARGMIN_CONTROL_PLANE_STATE_PATH` (required for control-plane role)
-    ///   `ARGMIN_CONTROL_PLANE_SOCKET_PATH` (required for control-plane role, optional dynamic route source for frontend/storage roles)
-    ///   `ARGMIN_CONTROL_PLANE_CLIENT_SOCKET_PATHS` (comma-separated absolute Unix sockets used by frontend/storage/admin clients for replicated-authority routing)
-    ///   `ARGMIN_CONTROL_PLANE_AUTH_CLUSTER_ID` (required when control-plane internal auth credentials are configured)
-    ///   `ARGMIN_CONTROL_PLANE_STORAGE_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, optional authenticated storage-node heartbeat refresh)
-    ///   `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_INSTANCE_ID` (required for frontend roles when frontend control-plane auth credentials are configured)
-    ///   `ARGMIN_CONTROL_PLANE_FRONTEND_AUTH_CREDENTIALS` (`instance_id=credential_id:version:secret,...`, optional authenticated frontend runtime-map reads)
-    ///   `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_INSTANCE_ID` (optional local admin signing principal)
-    ///   `ARGMIN_CONTROL_PLANE_ADMIN_AUTH_CREDENTIALS` (`instance_id=credential_id:version:secret,...`, required for control-plane role when any Unix control-plane auth is configured)
-    ///   `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` (false)
-    ///   `ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME` (optional experimental Raft cluster identity)
-    ///   `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` (1 when experimental Raft is enabled)
-    ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH` (optional local experimental Raft peer socket)
-    ///   `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS` (`node_id=/absolute/socket,...`, optional experimental Raft peer map)
-    ///   `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` (`node_id=credential_id:version:secret,...`, required for multi-node experimental Raft peer auth)
-    ///   `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` (250)
-    ///   `ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS` (250)
-    ///   `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` (2000)
-    ///   `ARGMIN_EC_K` (4)
-    ///   `ARGMIN_EC_M` (2)
-    ///   `ARGMIN_LOCAL_NODE_COUNT` (`ARGMIN_EC_K + ARGMIN_EC_M`)
-    ///   `ARGMIN_REGION` (us-east-1)
-    ///   `ARGMIN_WORKERS` (4)
-    ///   `ARGMIN_MAX_CONNECTIONS` (512)
-    ///   `ARGMIN_MAX_INFLIGHT_REQUESTS` (32)
-    ///   `ARGMIN_STREAM_READ_CHUNK_SIZE` (8388608)
-    ///   `ARGMIN_PANIC_ON_500` (false)
-    ///   `ARGMIN_ABORT_ON_500` (false)
-    ///   `ARGMIN_LOCAL_DEBUG_ENDPOINT` (false, requires test or
-    ///   local-debug-endpoints build and loopback listen addr)
+    /// Standalone topology is deliberately fixed. The broad environment-shaped
+    /// parser below remains an internal adapter for manifest resolution and
+    /// feature-gated topology tests, but its topology and internal-process keys
+    /// are not part of the public no-manifest configuration surface.
+    pub(crate) fn from_standalone_lookup<F: Fn(&str) -> Option<String>>(
+        get: F,
+    ) -> Result<Self, String> {
+        Self::from_lookup(|key| standalone_environment_value(&get, key))
+    }
+
+    /// Resolve configuration values from an internal environment-shaped lookup.
     ///
-    /// UAT-only optional credentials for running `s3-tests` against the
-    /// standalone binary:
-    ///   `ARGMIN_UAT_ALT_ACCOUNT_ID`
-    ///   `ARGMIN_UAT_ALT_ACCESS_KEY_ID`
-    ///   `ARGMIN_UAT_ALT_SECRET_ACCESS_KEY`
-    ///   `ARGMIN_UAT_SECOND_ACCESS_KEY_ID`
-    ///   `ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY`
-    ///   `ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID`
-    ///   `ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY`
-    /// Build configuration from an arbitrary key-lookup function.
-    /// Used by the environment/static-manifest loader and directly by tests.
+    /// The typed manifest mapper and feature-gated tests use this seam to
+    /// construct internal process configurations without exposing those keys
+    /// as production environment options.
     pub(crate) fn from_lookup<F: Fn(&str) -> Option<String>>(get: F) -> Result<Self, String> {
         let process_role = match get("ARGMIN_PROCESS_ROLE") {
             Some(value) => parse_process_role(&value)?,
@@ -840,6 +828,16 @@ impl ServerConfig {
                     .to_string(),
             );
         }
+        let trace_enabled = match get("ARGMIN_TRACE") {
+            Some(value) => parse_bool_env("ARGMIN_TRACE", &value)?,
+            None => false,
+        };
+        let trace_filter = get("ARGMIN_TRACE_FILTER");
+        let trace_file = get("ARGMIN_TRACE_FILE");
+        let trace_sync = match get("ARGMIN_TRACE_SYNC") {
+            Some(value) => parse_bool_env("ARGMIN_TRACE_SYNC", &value)?,
+            None => false,
+        };
 
         if pg_count == 0 {
             return Err("ARGMIN_PG_COUNT must be > 0".to_string());
@@ -1186,6 +1184,7 @@ impl ServerConfig {
             listen_addr,
             tls_cert_path,
             tls_key_path,
+            tls_certified_key: None,
             data_dir,
             pg_count,
             storage_node_ids,
@@ -1256,6 +1255,10 @@ impl ServerConfig {
             panic_on_500,
             abort_on_500,
             local_debug_endpoint,
+            trace_enabled,
+            trace_filter,
+            trace_file,
+            trace_sync,
         })
     }
 }
@@ -1265,6 +1268,46 @@ fn parse_bool_env(name: &str, value: &str) -> Result<bool, String> {
         "1" | "true" | "TRUE" | "True" | "yes" | "YES" | "Yes" | "on" | "ON" | "On" => Ok(true),
         "0" | "false" | "FALSE" | "False" | "no" | "NO" | "No" | "off" | "OFF" | "Off" => Ok(false),
         _ => Err(format!("{name} must be a boolean value")),
+    }
+}
+
+fn standalone_environment_value<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    key: &str,
+) -> Option<String> {
+    match key {
+        "ARGMIN_EC_K" => Some(STANDALONE_EC_K.to_string()),
+        "ARGMIN_EC_M" => Some(STANDALONE_EC_M.to_string()),
+        "ARGMIN_ACCOUNT_ID"
+        | "ARGMIN_ACCESS_KEY_ID"
+        | "ARGMIN_SECRET_ACCESS_KEY"
+        | "ARGMIN_SSE_S3_WRAPPING_KEY"
+        | "ARGMIN_SSE_C_VALIDATOR_KEY"
+        | "ARGMIN_HOST_ID"
+        | "ARGMIN_REGION"
+        | "ARGMIN_LISTEN_ADDR"
+        | "ARGMIN_TLS_CERT_PATH"
+        | "ARGMIN_TLS_KEY_PATH"
+        | "ARGMIN_DATA_DIR"
+        | "ARGMIN_WORKERS"
+        | "ARGMIN_MAX_CONNECTIONS"
+        | "ARGMIN_MAX_INFLIGHT_REQUESTS"
+        | "ARGMIN_STREAM_READ_CHUNK_SIZE"
+        | "ARGMIN_PANIC_ON_500"
+        | "ARGMIN_ABORT_ON_500"
+        | "ARGMIN_LOCAL_DEBUG_ENDPOINT"
+        | "ARGMIN_TRACE"
+        | "ARGMIN_TRACE_FILTER"
+        | "ARGMIN_TRACE_FILE"
+        | "ARGMIN_TRACE_SYNC"
+        | "ARGMIN_UAT_ALT_ACCOUNT_ID"
+        | "ARGMIN_UAT_ALT_ACCESS_KEY_ID"
+        | "ARGMIN_UAT_ALT_SECRET_ACCESS_KEY"
+        | "ARGMIN_UAT_SECOND_ACCESS_KEY_ID"
+        | "ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY"
+        | "ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID"
+        | "ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY" => get(key),
+        _ => None,
     }
 }
 
@@ -2235,6 +2278,51 @@ mod tests {
             cfg.sse_s3_wrapping_key_b64.as_str(),
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
         );
+    }
+
+    #[test]
+    fn standalone_environment_has_fixed_topology_and_ignores_internal_process_settings() {
+        let cfg = ServerConfig::from_standalone_lookup(make_required_env(&[
+            ("ARGMIN_PROCESS_ROLE", "frontend"),
+            ("ARGMIN_DATA_DIR", "/srv/argmin-standalone"),
+            ("ARGMIN_REGION", "eu-west-1"),
+            ("ARGMIN_PG_COUNT", "not-a-number"),
+            ("ARGMIN_STORAGE_CLUSTER_EPOCH", "0"),
+            ("ARGMIN_STORAGE_PG_IDS", "not-a-pg"),
+            ("ARGMIN_EC_K", "not-a-number"),
+            ("ARGMIN_EC_M", "not-a-number"),
+            ("ARGMIN_LOCAL_NODE_COUNT", "0"),
+            ("ARGMIN_STORAGE_NODE_ID", "not-a-number"),
+            ("ARGMIN_STORAGE_NODE_DATA_DIR", "/ignored"),
+            ("ARGMIN_STORAGE_NODE_SOCKET_PATH", "relative.sock"),
+            ("ARGMIN_STORAGE_NODE_SOCKETS", "not-a-map"),
+            ("ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT", "0"),
+            ("ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS", "0"),
+            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/ignored"),
+        ]))
+        .unwrap();
+
+        assert_eq!(cfg.process_role, ProcessRole::AllInOne);
+        assert_eq!(cfg.data_dir, "/srv/argmin-standalone");
+        assert_eq!(cfg.region, "eu-west-1");
+        assert_eq!(cfg.pg_count, 16);
+        assert_eq!(cfg.storage_cluster_epoch, 1);
+        assert_eq!(cfg.storage_pg_ids, (0..16).collect::<Vec<_>>());
+        assert_eq!((cfg.ec_k, cfg.ec_m), (1, 0));
+        assert_eq!(cfg.storage_node_ids, vec![0]);
+        assert_eq!(cfg.storage_node_id, None);
+        assert_eq!(cfg.storage_node_data_dir, None);
+        assert_eq!(cfg.storage_node_socket_path, None);
+        assert!(cfg.storage_node_sockets.is_empty());
+        assert_eq!(
+            cfg.storage_node_rpc_admission_limit,
+            LocalUnixStorageNodeClientConfig::DEFAULT_RPC_ADMISSION_LIMIT
+        );
+        assert_eq!(
+            cfg.control_plane_lease_scan_interval,
+            Duration::from_millis(250)
+        );
+        assert_eq!(cfg.control_plane_state_path, None);
     }
 
     #[test]

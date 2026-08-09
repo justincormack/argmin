@@ -25,6 +25,7 @@ openssl = [
 ]
 local-debug-endpoints = ["server-http/local-debug-endpoints"]
 test-unauthenticated-internal-rpc = []
+test-live-metadata-transfer-failpoints = []
 deep-tracing = [
     "auth/deep-tracing",
     "ec/deep-tracing",

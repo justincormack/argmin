@@ -283,6 +283,7 @@ impl ChildGuard {
             .env("ARGMIN_ACCOUNT_ID", "123456789012")
             .env("ARGMIN_ACCESS_KEY_ID", "process-test-access")
             .env("ARGMIN_SECRET_ACCESS_KEY", "process-test-secret")
+            .env("ARGMIN_TEST_ENV_SHAPED_CONFIG", "1")
             .env("ARGMIN_PROCESS_ROLE", "control-plane")
             .env("ARGMIN_DATA_DIR", data_dir)
             .env("ARGMIN_PG_COUNT", "1")
@@ -353,10 +354,6 @@ impl ChildGuard {
         let child = Command::new(bin)
             .env("ARGMIN_CLUSTER_CONFIG_PATH", manifest_path)
             .env("ARGMIN_PROCESS_ID", process_id)
-            .env("ARGMIN_ACCOUNT_ID", "123456789012")
-            .env("ARGMIN_ACCESS_KEY_ID", "process-test-access")
-            .env("ARGMIN_SECRET_ACCESS_KEY", "process-test-secret")
-            .env("ARGMIN_SSE_S3_WRAPPING_KEY", "dGVzdC13cmFwcGluZy1rZXk=")
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()
@@ -431,10 +428,6 @@ fn run_static_control_plane_command(
         .args(args)
         .env("ARGMIN_CLUSTER_CONFIG_PATH", manifest_path)
         .env("ARGMIN_PROCESS_ID", process_id)
-        .env("ARGMIN_ACCOUNT_ID", "123456789012")
-        .env("ARGMIN_ACCESS_KEY_ID", "process-test-access")
-        .env("ARGMIN_SECRET_ACCESS_KEY", "process-test-secret")
-        .env("ARGMIN_SSE_S3_WRAPPING_KEY", "dGVzdC13cmFwcGluZy1rZXk=")
         .output()
         .expect("static control-plane command should run")
 }
@@ -1312,6 +1305,14 @@ fn write_static_tcp_process_manifest(test_dir: &Path, ports: &[u16]) -> PathBuf 
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
     }
+    for (name, value) in [
+        ("s3-secret-access-key", "process-test-secret"),
+        ("sse-s3-wrapping-key", "dGVzdC13cmFwcGluZy1rZXk="),
+    ] {
+        let path = material_dir.join(name);
+        fs::write(&path, value).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+    }
 
     let cluster_id = format!(
         "static-tcp-process-{}-{}",
@@ -1323,6 +1324,12 @@ fn write_static_tcp_process_manifest(test_dir: &Path, ports: &[u16]) -> PathBuf 
     );
     let mut manifest = format!(
         r#"schema_version = 1
+
+[s3]
+account_id = "123456789012"
+access_key_id = "process-test-access"
+secret_access_key_ref = "file:{s3_secret}"
+sse_s3_wrapping_key_ref = "file:{sse_s3_key}"
 
 [cluster]
 id = "{cluster_id}"
@@ -1371,6 +1378,8 @@ private_key_ref = "file:{key}"
         ca = material_dir.join("cluster-ca.pem").display(),
         cert = material_dir.join("localhost.crt").display(),
         key = material_dir.join("localhost.key").display(),
+        s3_secret = material_dir.join("s3-secret-access-key").display(),
+        sse_s3_key = material_dir.join("sse-s3-wrapping-key").display(),
     );
 
     for number in 1..=3_u16 {

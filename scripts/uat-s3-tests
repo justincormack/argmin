@@ -1064,8 +1064,8 @@ transfer_pg_metadata_expect_injected_failure() {
     local pg_id="$3"
     shift 3
     echo "== argmin-s3 UAT transfer PG $pg_id metadata injected failure: $label ($failpoint) =="
-    print_command env ARGMIN_METADATA_TRANSFER_FAILPOINT="$failpoint" "${server_cmd[@]}" control-plane-transfer-pg-metadata-live "$control_plane_socket_path" "$pg_id" "$@"
-    if env ARGMIN_METADATA_TRANSFER_FAILPOINT="$failpoint" "${server_cmd[@]}" control-plane-transfer-pg-metadata-live "$control_plane_socket_path" "$pg_id" "$@"; then
+    print_command "${server_cmd[@]}" test-control-plane-transfer-pg-metadata-live-with-failpoint "$failpoint" "$control_plane_socket_path" "$pg_id" "$@"
+    if "${server_cmd[@]}" test-control-plane-transfer-pg-metadata-live-with-failpoint "$failpoint" "$control_plane_socket_path" "$pg_id" "$@"; then
         die "metadata transfer failpoint $failpoint unexpectedly succeeded"
     fi
 }
@@ -2347,6 +2347,10 @@ if [[ -n "$server_binary" ]]; then
 elif [[ "$topology" == "multihost" ]]; then
     build_cmd=(cargo build -p argmin-s3 --features test-unauthenticated-internal-rpc)
     uat_build_variant=test-unauthenticated-internal-rpc
+    if [[ "$smoke" == "metadata-pg-migration-failover" ]]; then
+        build_cmd+=(--features test-live-metadata-transfer-failpoints)
+        uat_build_variant="${uat_build_variant}-test-live-metadata-transfer-failpoints"
+    fi
     if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
         build_cmd+=(--features deep-tracing)
         uat_build_variant="${uat_build_variant}-deep-tracing"
@@ -2369,6 +2373,9 @@ elif [[ "$topology" == "multihost" ]]; then
     server_cmd=("$built_binary")
 else
     server_cmd=(cargo run -p argmin-s3)
+    if [[ "$smoke" == "metadata-pg-migration-failover" ]]; then
+        server_cmd+=(--features test-live-metadata-transfer-failpoints)
+    fi
     if [[ -n "${ARGMIN_TRACE:-}" || -n "${ARGMIN_TRACE_FILE:-}" ]]; then
         server_cmd+=(--features deep-tracing)
     fi

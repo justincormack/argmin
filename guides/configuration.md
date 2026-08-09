@@ -44,6 +44,10 @@ not required by storage-only or control-plane-only processes.
 | `ARGMIN_MAX_CONNECTIONS` | `512` | Maximum concurrent public TCP connections |
 | `ARGMIN_MAX_INFLIGHT_REQUESTS` | `32` | Maximum concurrent in-flight S3 requests |
 | `ARGMIN_STREAM_READ_CHUNK_SIZE` | `8388608` | HTTP streaming read chunk size in bytes |
+| `ARGMIN_TRACE` | `false` | Enable structured trace output |
+| `ARGMIN_TRACE_FILTER` | *(unset)* | Comma-separated trace targets |
+| `ARGMIN_TRACE_FILE` | *(unset; stderr)* | Trace output file |
+| `ARGMIN_TRACE_SYNC` | `false` | Flush trace output synchronously |
 
 `ARGMIN_TLS_CERT_PATH` and `ARGMIN_TLS_KEY_PATH` must either both be set or
 both be unset. They configure the public S3 listener only. Internal TCP TLS is
@@ -59,45 +63,16 @@ The wrapping and validator keys are durable data dependencies, not disposable
 startup tokens. Keep `ARGMIN_SSE_S3_WRAPPING_KEY` stable for existing SSE-S3
 objects and `ARGMIN_SSE_C_VALIDATOR_KEY` stable for existing SSE-C objects.
 
-### Local topology and process settings
+### Standalone storage
 
 | Variable | Default | Description |
 |---|---|---|
-| `ARGMIN_PROCESS_ROLE` | `all-in-one` | The standard environment-only runtime supports `all-in-one`; split process roles require a cluster manifest |
 | `ARGMIN_DATA_DIR` | `./data` | Standalone data directory |
-| `ARGMIN_PG_COUNT` | `16` | Placement-group count |
-| `ARGMIN_EC_K` | `4` | Erasure-coding data shards |
-| `ARGMIN_EC_M` | `2` | Erasure-coding parity shards |
-| `ARGMIN_LOCAL_NODE_COUNT` | `ARGMIN_EC_K + ARGMIN_EC_M` | Environment-only local topology node count; maximum 4096 |
-| `ARGMIN_STORAGE_CLUSTER_EPOCH` | `1` | Static storage topology epoch |
-| `ARGMIN_STORAGE_PG_IDS` | all PGs | Comma-separated PG ids opened by a storage process |
-| `ARGMIN_STORAGE_NODE_ID` | role-dependent | Required for `storage-node` and `combined` roles |
-| `ARGMIN_STORAGE_NODE_DATA_DIR` | `ARGMIN_DATA_DIR/node-NNNN` | Storage process data directory |
-| `ARGMIN_STORAGE_NODE_SOCKET_PATH` | role-dependent | Required absolute Unix socket path for a storage process |
-| `ARGMIN_STORAGE_NODE_SOCKETS` | role-dependent | Comma-separated `node_id=/absolute/socket` map used by remote frontend routing |
 
-`ARGMIN_PG_COUNT` and `ARGMIN_LOCAL_NODE_COUNT` participate in placement.
-Changing them for an existing data directory without a supported migration can
-route existing buckets or objects to different PGs. Treat the PG count, EC
-shape, and local node count as cluster-creation settings.
-
-### Internal scheduling settings
-
-| Variable | Default | Description |
-|---|---|---|
-| `ARGMIN_STORAGE_NODE_RPC_ADMISSION_LIMIT` | `1024` | Shared storage RPC admission limit |
-| `ARGMIN_STORAGE_NODE_RPC_ADMISSION_WAIT_MS` | `250` | Bulk storage RPC admission wait |
-| `ARGMIN_STORAGE_NODE_RPC_CONTROL_ADMISSION_WAIT_MS` | `1000` | Control-class storage RPC admission wait |
-| `ARGMIN_CONTROL_PLANE_LEASE_SCAN_MS` | `250` | Control-plane lease scan interval |
-| `ARGMIN_CONTROL_PLANE_FRONTEND_REFRESH_MS` | `250` | Frontend runtime-map refresh interval |
-| `ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS` | `2000` | Storage-node heartbeat lease duration |
-
-Environment-only split-process configuration is not a supported deployment
-mode. The standard binary rejects frontend, storage-node, combined, and
-control-plane process roles unless their complete authenticated internal RPC
-configuration came from a replicated cluster manifest. Development harnesses
-that exercise an environment-shaped process topology are documented in
-the [testing guide](testing.md).
+Environment-only mode always runs one embedded storage node with 16 placement
+groups, EC `1+0`, and the initial cluster epoch. It has no storage RPC or
+control-plane endpoints. Topology and internal process settings are available
+only through a cluster manifest.
 
 ### Standalone example
 
@@ -131,12 +106,11 @@ manifest contents, while `ARGMIN_PROCESS_ID` selects exactly one
 a process restart. The manifest must be a regular file, is opened without
 following a final symlink, and is limited to 4 MiB.
 
-When manifest mode is active, Argmin rejects environment variables that could
-override cluster identity, topology, placement, internal endpoints,
-control-plane authentication, or Raft policy. Public S3 credentials, public
-listener settings, frontend resource limits, encryption keys, and local
-diagnostics remain environment-configured where relevant to the selected
-process.
+The manifest is the complete process configuration. After the two environment
+variables above select the file and process, no other environment variable
+changes a manifest process. S3 credentials and encryption material use the
+same permission-checked `file:` references as internal credentials and TLS
+keys.
 
 ### Validation and initialization
 
@@ -187,6 +161,7 @@ The top-level manifest is closed and versioned:
 |---|---|
 | `schema_version` | Must be `1` |
 | `[cluster]` | Stable cluster id, topology generation, and region |
+| `[s3]` | Public S3 identity, secret references, and frontend resource policy |
 | `[deployment]` | `standalone` or `replicated` and its failure-domain policy |
 | `[storage]` | PG count, EC shape, and initial cluster epoch |
 | `[raft]` | Append batching and snapshot limits |
@@ -223,6 +198,7 @@ Scalar sections use these fields:
 | Section | Fields |
 |---|---|
 | `[cluster]` | `id` (string), `topology_generation` (nonzero integer), `region` (string) |
+| `[s3]` | `account_id`, `access_key_id`, `secret_access_key_ref`, and `sse_s3_wrapping_key_ref`; optional `sse_c_validator_key_ref`, `workers`, `max_connections`, `max_inflight_requests`, `stream_read_chunk_size`, `panic_on_500`, `abort_on_500`, and `local_debug_endpoint` |
 | `[deployment]` | `mode`, `failure_domain`, `failure_tolerance` (integer) |
 | `[storage]` | `pg_count` (nonzero integer), `ec_data_shards`, `ec_parity_shards`, `initial_cluster_epoch` (nonzero integer) |
 | `[raft]` | `max_append_entries`, `max_append_bytes`, `max_snapshot_bytes` |
@@ -234,13 +210,25 @@ Array records use these fields:
 | `[[transport_profiles]]` | `id`, `max_frame_bytes`, `max_connections`, `connect_timeout_ms`, `io_timeout_ms` | none |
 | `[[hosts]]` | `id` | none |
 | `[[disks]]` | `id`, `host_id`, `mount_path` | none |
-| `[[processes]]` | `id`, `host_id`, `kind` | `frontend_instance_id`, `admin_instance_id`, and `maintenance_instance_id` when the process performs those authenticated roles |
+| `[[processes]]` | `id`, `host_id`, `kind` | `s3_listen_addr` for frontend-capable processes; optional `s3_tls_identity_id`; `frontend_instance_id`, `admin_instance_id`, and `maintenance_instance_id` when the process performs those authenticated roles |
 | `[[authorities]]` | `id`, `kind`, `process_id`, `disk_id`, `state_path` | `raft_node_id` for `raft-voter`; omitted for `single` |
 | `[[storage_nodes]]` | `node_id`, `process_id`, `disk_id`, `data_dir` | none |
 | `[[endpoints]]` | `id`, `owner_process_id`, `protocol`, `priority`, `listen`, `advertise`, `transport_profile_id` | `tls_identity_id`, `tls_trust_bundle_id`, and `tls_server_name` together for TCP; all omitted for Unix |
 | `[[tls_identities]]` | `id`, `certificate_ref`, `private_key_ref` | none |
 | `[[tls_trust_bundles]]` | `id`, `ca_bundle_ref` | none |
 | `[[auth_credentials]]` | `principal`, `credential_id`, `credential_version`, `use_for_signing`, `accept_from_ms`, `secret_ref` | `node_id` for Raft/storage nodes or `instance_id` for frontend/admin/maintenance; optional `accept_until_ms` |
+
+Every process may also set `trace_enabled`, `trace_filter`, `trace_file`, and
+`trace_sync`. `trace_file`, when present, must be absolute. Advanced process
+tuning fields are `storage_node_rpc_admission_limit`,
+`storage_node_rpc_admission_wait_ms`,
+`storage_node_rpc_control_admission_wait_ms`, `control_plane_lease_scan_ms`,
+`control_plane_frontend_refresh_ms`, and
+`control_plane_heartbeat_lease_ms`. Omitted settings use the compiled defaults.
+
+The optional `[s3]` resource fields default to 4 workers, 512 connections, 32
+in-flight requests, an 8 MiB stream-read chunk, and disabled diagnostic
+failure actions and local debug endpoint.
 
 The process role matrix is exact:
 
@@ -343,6 +331,8 @@ Version 1 accepts only absolute file references:
 
 ```toml
 secret_ref = "file:/run/argmin-secrets/storage-1-v1.key"
+secret_access_key_ref = "file:/run/argmin-secrets/s3-secret-access-key"
+sse_s3_wrapping_key_ref = "file:/run/argmin-secrets/sse-s3-wrapping-key"
 certificate_ref = "file:/run/argmin-secrets/host-1.crt"
 private_key_ref = "file:/run/argmin-secrets/host-1.key"
 ca_bundle_ref = "file:/run/argmin-secrets/cluster-ca.crt"
@@ -549,6 +539,12 @@ tls_identities = []
 tls_trust_bundles = []
 auth_credentials = []
 
+[s3]
+account_id = "111122223333"
+access_key_id = "admin"
+secret_access_key_ref = "file:/etc/argmin/s3/secret-access-key"
+sse_s3_wrapping_key_ref = "file:/etc/argmin/s3/sse-s3-wrapping-key"
+
 [cluster]
 id = "example-standalone"
 topology_generation = 1
@@ -589,6 +585,7 @@ mount_path = "/srv/argmin"
 id = "all-1"
 host_id = "host-1"
 kind = "all-in-one"
+s3_listen_addr = "127.0.0.1:9000"
 
 [[authorities]]
 id = "authority-1"
@@ -631,7 +628,7 @@ advertise = "unix:///run/argmin/storage.sock"
 transport_profile_id = "local"
 ```
 
-Initialize and run this process with the frontend environment settings:
+Initialize and run this process:
 
 ```bash
 ./target/release/argmin-s3 initialize-cluster-state \
@@ -639,10 +636,6 @@ Initialize and run this process with the frontend environment settings:
 
 ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
 ARGMIN_PROCESS_ID=all-1 \
-ARGMIN_ACCOUNT_ID=111122223333 \
-ARGMIN_ACCESS_KEY_ID=admin \
-ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
-ARGMIN_SSE_S3_WRAPPING_KEY='<base64-encoded-32-byte-secret>' \
   ./target/release/argmin-s3
 ```
 
@@ -683,7 +676,7 @@ processes = [
   { id = "storage-1", host_id = "host-1", kind = "storage-node" },
   { id = "storage-2", host_id = "host-2", kind = "storage-node" },
   { id = "storage-3", host_id = "host-3", kind = "storage-node" },
-  { id = "frontend-1", host_id = "host-1", kind = "frontend", frontend_instance_id = "frontend-1", admin_instance_id = "frontend-1-admin", maintenance_instance_id = "frontend-1-maintenance" },
+  { id = "frontend-1", host_id = "host-1", kind = "frontend", frontend_instance_id = "frontend-1", admin_instance_id = "frontend-1-admin", maintenance_instance_id = "frontend-1-maintenance", s3_listen_addr = "0.0.0.0:9000" },
 ]
 
 authorities = [
@@ -738,6 +731,12 @@ auth_credentials = [
   { principal = "admin", instance_id = "control-3-admin", credential_id = "control-3-admin", credential_version = 1, use_for_signing = true, accept_from_ms = 0, secret_ref = "file:/etc/argmin/auth/control-3-admin.key" },
 ]
 
+[s3]
+account_id = "111122223333"
+access_key_id = "admin"
+secret_access_key_ref = "file:/etc/argmin/s3/secret-access-key"
+sse_s3_wrapping_key_ref = "file:/etc/argmin/s3/sse-s3-wrapping-key"
+
 [cluster]
 id = "example-replicated"
 topology_generation = 1
@@ -785,8 +784,8 @@ selected host. For host 1, for example:
 ```
 
 Run every process with `ARGMIN_CLUSTER_CONFIG_PATH` and its own
-`ARGMIN_PROCESS_ID`. Supply the S3 account, access-key, secret-key, and
-wrapping-key settings only to `frontend-1`; control-plane and storage-only
-processes neither need nor should receive that material. Start all three voters
-and storage nodes; the initial Raft establishment wait does not impose a fixed
-deadline, so hosts may be brought up at different times.
+`ARGMIN_PROCESS_ID`. Install the S3 secret and wrapping-key files only on
+frontend hosts; control-plane and storage-only processes do not resolve them.
+Start all three voters and storage nodes; the initial Raft establishment wait
+does not impose a fixed deadline, so hosts may be brought up at different
+times.
