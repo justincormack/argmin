@@ -83,6 +83,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(any(test, debug_assertions))]
 fn should_dump_panic_on_500_flight_recorder() -> bool {
     #[cfg(test)]
     {
@@ -91,6 +92,29 @@ fn should_dump_panic_on_500_flight_recorder() -> bool {
         }
     }
     true
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseFailureDiagnostics {
+    #[cfg(any(test, debug_assertions))]
+    panic_on_500: bool,
+    #[cfg(any(test, debug_assertions))]
+    abort_on_500: bool,
+}
+
+impl ResponseFailureDiagnostics {
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) const fn new(panic_on_500: bool, abort_on_500: bool) -> Self {
+        Self {
+            panic_on_500,
+            abort_on_500,
+        }
+    }
+
+    #[cfg(not(any(test, debug_assertions)))]
+    pub(crate) const fn disabled() -> Self {
+        Self {}
+    }
 }
 
 pub(crate) fn new_request_trace_context() -> observability::TraceContext {
@@ -5262,16 +5286,16 @@ pub(crate) fn s3_response_to_hyper(
     resp: S3Response,
     admission: Option<HttpRequestAdmission>,
     stream_read_chunk_size: usize,
-    panic_on_500: bool,
-    abort_on_500: bool,
+    failure_diagnostics: ResponseFailureDiagnostics,
     trace_meta: ResponseTraceMeta,
 ) -> http::Response<S3HyperBody> {
     let (permit, inflight_requests_guard) = admission
         .map(HttpRequestAdmission::into_parts)
         .unwrap_or((None, None));
 
-    fn fail_on_500_diagnostic(message: String, panic_on_500: bool, abort_on_500: bool) {
-        if abort_on_500 {
+    #[cfg(any(test, debug_assertions))]
+    fn fail_on_500_diagnostic(message: String, diagnostics: ResponseFailureDiagnostics) {
+        if diagnostics.abort_on_500 {
             use std::io::Write as _;
 
             static ABORT_DIAGNOSTIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -5287,7 +5311,7 @@ pub(crate) fn s3_response_to_hyper(
             }
             std::process::abort();
         }
-        if panic_on_500 {
+        if diagnostics.panic_on_500 {
             if should_dump_panic_on_500_flight_recorder() {
                 observability::dump_flight_recorder_to_stderr("panic-on-500");
             }
@@ -5299,10 +5323,10 @@ pub(crate) fn s3_response_to_hyper(
         reason: String,
         permit: Option<OwnedSemaphorePermit>,
         inflight_requests_guard: Option<observability::InflightRequestsGuard>,
-        panic_on_500: bool,
-        abort_on_500: bool,
+        _failure_diagnostics: ResponseFailureDiagnostics,
         trace_meta: ResponseTraceMeta,
     ) -> http::Response<S3HyperBody> {
+        #[cfg(any(test, debug_assertions))]
         let diagnostic_message = format!(
             "HTTP response conversion produced InternalError for {} {} (has_query={}): {reason}",
             trace_meta.method,
@@ -5321,8 +5345,9 @@ pub(crate) fn s3_response_to_hyper(
         if let Some(diagnostic) = &error_diagnostic {
             trace.emit_error_diagnostic(diagnostic);
         }
-        if panic_on_500 || abort_on_500 {
-            fail_on_500_diagnostic(diagnostic_message, panic_on_500, abort_on_500);
+        #[cfg(any(test, debug_assertions))]
+        if _failure_diagnostics.panic_on_500 || _failure_diagnostics.abort_on_500 {
+            fail_on_500_diagnostic(diagnostic_message, _failure_diagnostics);
         }
         let mut response = http::Response::new(S3HyperBody::buffered(
             resp.body,
@@ -5361,7 +5386,10 @@ pub(crate) fn s3_response_to_hyper(
     } else {
         resp.body.len() as u64
     };
-    if (panic_on_500 || abort_on_500) && resp.status_code == 500 {
+    #[cfg(any(test, debug_assertions))]
+    if (failure_diagnostics.panic_on_500 || failure_diagnostics.abort_on_500)
+        && resp.status_code == 500
+    {
         let body = String::from_utf8_lossy(&resp.body);
         let diagnostic_suffix = resp
             .error_diagnostic
@@ -5408,8 +5436,7 @@ pub(crate) fn s3_response_to_hyper(
                 trace_meta.query.has_query(),
                 diagnostic_suffix
             ),
-            panic_on_500,
-            abort_on_500,
+            failure_diagnostics,
         );
     }
     let status = match http::StatusCode::from_u16(resp.status_code) {
@@ -5419,8 +5446,7 @@ pub(crate) fn s3_response_to_hyper(
                 format!("invalid response status code {}: {err}", resp.status_code),
                 permit,
                 inflight_requests_guard,
-                panic_on_500,
-                abort_on_500,
+                failure_diagnostics,
                 trace_meta,
             )
         }
@@ -5437,8 +5463,7 @@ pub(crate) fn s3_response_to_hyper(
                     format!("invalid response header name {name:?}: {err}"),
                     permit,
                     inflight_requests_guard,
-                    panic_on_500,
-                    abort_on_500,
+                    failure_diagnostics,
                     trace_meta,
                 )
             }
@@ -5450,8 +5475,7 @@ pub(crate) fn s3_response_to_hyper(
                     format!("invalid response header value for {name}: {err}"),
                     permit,
                     inflight_requests_guard,
-                    panic_on_500,
-                    abort_on_500,
+                    failure_diagnostics,
                     trace_meta,
                 )
             }

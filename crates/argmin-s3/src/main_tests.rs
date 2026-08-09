@@ -597,8 +597,11 @@ mod tests {
             max_connections: 512,
             max_inflight_requests: 32,
             stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
+            #[cfg(debug_assertions)]
             panic_on_500: false,
+            #[cfg(debug_assertions)]
             abort_on_500: false,
+            #[cfg(feature = "local-debug-endpoints")]
             local_debug_endpoint: false,
             trace_enabled: false,
             trace_filter: None,

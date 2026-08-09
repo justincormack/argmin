@@ -204,11 +204,13 @@ pub struct ServeConfig {
     ///
     /// This is a diagnostic mode for local conformance/stress runs where SDK
     /// retries can otherwise hide transient internal errors.
+    #[cfg(any(test, debug_assertions))]
     pub panic_on_500: bool,
     /// Abort the process instead of returning HTTP 500 responses.
     ///
     /// This is stricter than `panic_on_500`: it makes hidden 500s fail the
     /// whole local test process instead of only dropping one request task.
+    #[cfg(any(test, debug_assertions))]
     pub abort_on_500: bool,
     /// Enable local operator-only diagnostics endpoints.
     ///
@@ -216,6 +218,7 @@ pub struct ServeConfig {
     /// expose bounded counters and an explicit flight-recorder stderr dump
     /// trigger; they do not return request headers, payload bytes, keys, or
     /// recorder details over HTTP.
+    #[cfg(any(test, feature = "local-debug-endpoints"))]
     pub local_debug_endpoint: bool,
     /// Status source for frontend control-plane runtime-map refresh diagnostics.
     pub frontend_runtime_map_refresh_status:
@@ -230,8 +233,11 @@ impl Default for ServeConfig {
             body_idle_timeout: Duration::from_secs(30),
             pre_auth_body_timeout: Duration::from_secs(60),
             stream_read_chunk_size: server_core::coordinator::INTERNAL_SEGMENT_SIZE,
+            #[cfg(any(test, debug_assertions))]
             panic_on_500: false,
+            #[cfg(any(test, debug_assertions))]
             abort_on_500: false,
+            #[cfg(any(test, feature = "local-debug-endpoints"))]
             local_debug_endpoint: false,
             frontend_runtime_map_refresh_status: None,
         }
@@ -3872,12 +3878,18 @@ fn response_to_hyper_with_request_body(
     if retain_unread_request_body {
         resp = close_response_connection(resp);
     }
+    #[cfg(any(test, debug_assertions))]
+    let failure_diagnostics = super::ResponseFailureDiagnostics::new(
+        state.config.panic_on_500,
+        state.config.abort_on_500,
+    );
+    #[cfg(not(any(test, debug_assertions)))]
+    let failure_diagnostics = super::ResponseFailureDiagnostics::disabled();
     let mut response = s3_response_to_hyper(
         resp,
         admission,
         state.config.stream_read_chunk_size,
-        state.config.panic_on_500,
-        state.config.abort_on_500,
+        failure_diagnostics,
         response_trace,
     );
     if retain_unread_request_body {

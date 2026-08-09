@@ -3853,7 +3853,7 @@ async fn run_frontend_server(
     };
 
     process_info!(
-        "argmin-s3 listening on {}://{} (TLS provider {}, EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight effective {} in-flight, storage RPC admission {} bulk wait {} ms control wait {} ms, read chunk {} bytes, panic-on-500 {}, abort-on-500 {}, local-debug {}, region {}, host id {})",
+        "argmin-s3 listening on {}://{} (TLS provider {}, EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight effective {} in-flight, storage RPC admission {} bulk wait {} ms control wait {} ms, read chunk {} bytes, region {}, host id {})",
         scheme,
         config.listen_addr,
         tls_provider::provider_name(),
@@ -3870,17 +3870,17 @@ async fn run_frontend_server(
             .storage_node_rpc_control_admission_wait_timeout
             .as_millis(),
         config.stream_read_chunk_size,
-        config.panic_on_500,
-        config.abort_on_500,
-        config.local_debug_endpoint,
         config.region,
         host_id
     );
 
     let serve_config = server_http::http::serve::ServeConfig {
         stream_read_chunk_size: config.stream_read_chunk_size,
+        #[cfg(debug_assertions)]
         panic_on_500: config.panic_on_500,
+        #[cfg(debug_assertions)]
         abort_on_500: config.abort_on_500,
+        #[cfg(feature = "local-debug-endpoints")]
         local_debug_endpoint: config.local_debug_endpoint,
         frontend_runtime_map_refresh_status,
         ..server_http::http::serve::ServeConfig::default()

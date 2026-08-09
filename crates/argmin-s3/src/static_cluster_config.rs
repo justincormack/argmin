@@ -177,10 +177,13 @@ struct S3Input {
     max_inflight_requests: u32,
     #[serde(default = "default_stream_read_chunk_size")]
     stream_read_chunk_size: usize,
+    #[cfg(debug_assertions)]
     #[serde(default)]
     panic_on_500: bool,
+    #[cfg(debug_assertions)]
     #[serde(default)]
     abort_on_500: bool,
+    #[cfg(feature = "local-debug-endpoints")]
     #[serde(default)]
     local_debug_endpoint: bool,
 }
@@ -2601,14 +2604,17 @@ impl ValidatedStaticClusterManifest {
             "ARGMIN_STREAM_READ_CHUNK_SIZE",
             self.manifest.s3.stream_read_chunk_size.to_string(),
         );
+        #[cfg(debug_assertions)]
         values.insert(
             "ARGMIN_PANIC_ON_500",
             self.manifest.s3.panic_on_500.to_string(),
         );
+        #[cfg(debug_assertions)]
         values.insert(
             "ARGMIN_ABORT_ON_500",
             self.manifest.s3.abort_on_500.to_string(),
         );
+        #[cfg(feature = "local-debug-endpoints")]
         values.insert(
             "ARGMIN_LOCAL_DEBUG_ENDPOINT",
             self.manifest.s3.local_debug_endpoint.to_string(),
@@ -3099,9 +3105,18 @@ fn encode_s3_full(s3: &S3Input) -> Vec<u8> {
         9,
         u64::try_from(s3.stream_read_chunk_size).expect("usize fits u64 on supported targets"),
     );
+    #[cfg(debug_assertions)]
     encoder.boolean(10, s3.panic_on_500);
+    #[cfg(not(debug_assertions))]
+    encoder.boolean(10, false);
+    #[cfg(debug_assertions)]
     encoder.boolean(11, s3.abort_on_500);
+    #[cfg(not(debug_assertions))]
+    encoder.boolean(11, false);
+    #[cfg(feature = "local-debug-endpoints")]
     encoder.boolean(12, s3.local_debug_endpoint);
+    #[cfg(not(feature = "local-debug-endpoints"))]
+    encoder.boolean(12, false);
     encoder.finish()
 }
 
@@ -4223,7 +4238,6 @@ fn validate_s3(
     require_nonzero(s3.max_connections, "S3 maximum connections")?;
     require_nonzero(s3.max_inflight_requests, "S3 maximum in-flight requests")?;
     require_nonzero(s3.stream_read_chunk_size, "S3 stream read chunk size")?;
-
     for process in processes {
         if process.kind.has_frontend() {
             let listen_addr = process.s3_listen_addr.as_deref().ok_or_else(|| {

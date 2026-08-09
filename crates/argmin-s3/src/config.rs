@@ -6,6 +6,7 @@ use ec::EcConfig;
 use rustls::sign::CertifiedKey;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+#[cfg(feature = "local-debug-endpoints")]
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -24,7 +25,6 @@ use storage::{
     StorageRpcServerAuthConfig,
 };
 
-const LOCAL_DEBUG_ENDPOINT_COMPILED_IN: bool = cfg!(any(test, feature = "local-debug-endpoints"));
 const MAX_LOCAL_NODE_COUNT: u32 = 4_096;
 const STANDALONE_EC_K: &str = "1";
 const STANDALONE_EC_M: &str = "0";
@@ -538,8 +538,11 @@ pub(crate) struct ServerConfig {
     pub(crate) max_connections: u32,
     pub(crate) max_inflight_requests: u32,
     pub(crate) stream_read_chunk_size: usize,
+    #[cfg(debug_assertions)]
     pub(crate) panic_on_500: bool,
+    #[cfg(debug_assertions)]
     pub(crate) abort_on_500: bool,
+    #[cfg(feature = "local-debug-endpoints")]
     pub(crate) local_debug_endpoint: bool,
     pub(crate) trace_enabled: bool,
     pub(crate) trace_filter: Option<String>,
@@ -810,24 +813,21 @@ impl ServerConfig {
             .unwrap_or_else(|| server_core::coordinator::INTERNAL_SEGMENT_SIZE.to_string())
             .parse()
             .map_err(|e| format!("invalid ARGMIN_STREAM_READ_CHUNK_SIZE: {e}"))?;
+        #[cfg(debug_assertions)]
         let panic_on_500 = match get("ARGMIN_PANIC_ON_500") {
             Some(value) => parse_bool_env("ARGMIN_PANIC_ON_500", &value)?,
             None => false,
         };
+        #[cfg(debug_assertions)]
         let abort_on_500 = match get("ARGMIN_ABORT_ON_500") {
             Some(value) => parse_bool_env("ARGMIN_ABORT_ON_500", &value)?,
             None => false,
         };
+        #[cfg(feature = "local-debug-endpoints")]
         let local_debug_endpoint = match get("ARGMIN_LOCAL_DEBUG_ENDPOINT") {
             Some(value) => parse_bool_env("ARGMIN_LOCAL_DEBUG_ENDPOINT", &value)?,
             None => false,
         };
-        if local_debug_endpoint && !LOCAL_DEBUG_ENDPOINT_COMPILED_IN {
-            return Err(
-                "ARGMIN_LOCAL_DEBUG_ENDPOINT requires a test build or the local-debug-endpoints feature"
-                    .to_string(),
-            );
-        }
         let trace_enabled = match get("ARGMIN_TRACE") {
             Some(value) => parse_bool_env("ARGMIN_TRACE", &value)?,
             None => false,
@@ -1135,6 +1135,7 @@ impl ServerConfig {
         if stream_read_chunk_size == 0 {
             return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
+        #[cfg(feature = "local-debug-endpoints")]
         if local_debug_endpoint {
             if !process_role.has_frontend() {
                 return Err(
@@ -1252,8 +1253,11 @@ impl ServerConfig {
             max_connections,
             max_inflight_requests,
             stream_read_chunk_size,
+            #[cfg(debug_assertions)]
             panic_on_500,
+            #[cfg(debug_assertions)]
             abort_on_500,
+            #[cfg(feature = "local-debug-endpoints")]
             local_debug_endpoint,
             trace_enabled,
             trace_filter,
@@ -1293,9 +1297,6 @@ fn standalone_environment_value<F: Fn(&str) -> Option<String>>(
         | "ARGMIN_MAX_CONNECTIONS"
         | "ARGMIN_MAX_INFLIGHT_REQUESTS"
         | "ARGMIN_STREAM_READ_CHUNK_SIZE"
-        | "ARGMIN_PANIC_ON_500"
-        | "ARGMIN_ABORT_ON_500"
-        | "ARGMIN_LOCAL_DEBUG_ENDPOINT"
         | "ARGMIN_TRACE"
         | "ARGMIN_TRACE_FILTER"
         | "ARGMIN_TRACE_FILE"
@@ -1307,6 +1308,10 @@ fn standalone_environment_value<F: Fn(&str) -> Option<String>>(
         | "ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY"
         | "ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID"
         | "ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY" => get(key),
+        #[cfg(debug_assertions)]
+        "ARGMIN_PANIC_ON_500" | "ARGMIN_ABORT_ON_500" => get(key),
+        #[cfg(feature = "local-debug-endpoints")]
+        "ARGMIN_LOCAL_DEBUG_ENDPOINT" => get(key),
         _ => None,
     }
 }
@@ -2268,8 +2273,11 @@ mod tests {
             cfg.stream_read_chunk_size,
             server_core::coordinator::INTERNAL_SEGMENT_SIZE
         );
-        assert!(!cfg.panic_on_500);
-        assert!(!cfg.abort_on_500);
+        #[cfg(debug_assertions)]
+        {
+            assert!(!cfg.panic_on_500);
+            assert!(!cfg.abort_on_500);
+        }
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key.as_str(), "SECRET");
         assert_eq!(cfg.host_id, None);
@@ -4385,6 +4393,7 @@ mod tests {
         assert!(err.contains("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0"));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn panic_on_500_accepts_boolean_values() {
         let cfg = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PANIC_ON_500", "true")]))
@@ -4396,6 +4405,7 @@ mod tests {
         assert!(!cfg.panic_on_500);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn panic_on_500_rejects_invalid_boolean() {
         let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_PANIC_ON_500", "maybe")]))
@@ -4403,6 +4413,7 @@ mod tests {
         assert!(err.contains("ARGMIN_PANIC_ON_500"));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn abort_on_500_accepts_boolean_values() {
         let cfg =
@@ -4414,6 +4425,7 @@ mod tests {
         assert!(!cfg.abort_on_500);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn abort_on_500_rejects_invalid_boolean() {
         let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_ABORT_ON_500", "maybe")]))
@@ -4421,12 +4433,14 @@ mod tests {
         assert!(err.contains("ARGMIN_ABORT_ON_500"));
     }
 
+    #[cfg(feature = "local-debug-endpoints")]
     #[test]
     fn local_debug_endpoint_defaults_to_disabled() {
         let cfg = ServerConfig::from_lookup(make_required_env(&[])).unwrap();
         assert!(!cfg.local_debug_endpoint);
     }
 
+    #[cfg(feature = "local-debug-endpoints")]
     #[test]
     fn local_debug_endpoint_accepts_loopback_frontend_listener() {
         let cfg = ServerConfig::from_lookup(make_required_env(&[(
@@ -4444,6 +4458,7 @@ mod tests {
         assert!(cfg.local_debug_endpoint);
     }
 
+    #[cfg(feature = "local-debug-endpoints")]
     #[test]
     fn local_debug_endpoint_rejects_non_loopback_listener() {
         let err = ServerConfig::from_lookup(make_required_env(&[
@@ -4455,6 +4470,7 @@ mod tests {
         assert!(err.contains("loopback"));
     }
 
+    #[cfg(feature = "local-debug-endpoints")]
     #[test]
     fn local_debug_endpoint_rejects_storage_node_only_role() {
         let err = ServerConfig::from_lookup(make_required_env(&[

@@ -293,8 +293,9 @@ The wrapper:
   - `ARGMIN_UAT_SECOND_SECRET_ACCESS_KEY`
   - `ARGMIN_UAT_OWNER_ROOT_ACCESS_KEY_ID`
   - `ARGMIN_UAT_OWNER_ROOT_SECRET_ACCESS_KEY`
-- enables `ARGMIN_ABORT_ON_500=1` by default so internal server errors are not
-  hidden by SDK retries during local acceptance runs
+- enables `ARGMIN_ABORT_ON_500=1` for script-built debug binaries so internal
+  server errors are not hidden by SDK retries during local acceptance runs;
+  release and externally supplied binaries default it to false
 
 These UAT variables exist only to drive acceptance and conformance testing.
 They are deliberately not a production account-management API.
@@ -345,11 +346,13 @@ The wrapper provides deterministic default credentials. Override them with the
 same environment variables if a specific test setup needs stable names or
 secrets across runs.
 
-`ARGMIN_PANIC_ON_500` and `ARGMIN_ABORT_ON_500` are diagnostic server options,
-not normal production behavior. Both default to false in `argmin-s3` itself.
-The UAT wrapper and embedded local `s3-tests` server enable abort-on-500 so
-hidden 500s fail the whole local test process at the point the server produces
-the internal error.
+`ARGMIN_PANIC_ON_500` and `ARGMIN_ABORT_ON_500` are debug/test-only diagnostic
+server options and are not compiled into production release binaries. Both
+default to false in debug/test builds. The UAT wrapper enables abort-on-500 for
+binaries it builds in the debug profile, and the debug-profile embedded local
+`s3-tests` server enables it so hidden 500s fail the whole local test process at
+the point the server produces the internal error. Release-profile `s3-tests`
+uses the default server configuration without abort-on-500.
 
 The UAT wrapper also enables the local debug endpoint on the frontend process
 by default for debug binaries it builds itself, and builds those spawned
@@ -357,9 +360,10 @@ by default for debug binaries it builds itself, and builds those spawned
 doing so. `--release` and `--binary` runs default to the endpoint disabled
 because release builds must not include the feature and the wrapper cannot add
 features to an already-built binary. Smoke runs that depend on debug metrics or
-hooks reject `--release` and `--binary`. A default production build rejects
-`ARGMIN_LOCAL_DEBUG_ENDPOINT=1` at startup; feature-enabled test/debug builds
-still require a loopback frontend listener. On any UAT failure it asks
+hooks reject `--release` and `--binary`. The wrapper rejects an incompatible
+UAT request before startup; the production binary itself does not compile in
+or read `ARGMIN_LOCAL_DEBUG_ENDPOINT`. Feature-enabled debug builds still
+require a loopback frontend listener. On any UAT failure it asks
 `POST /__argmin/debug/flight-recorder/dump` to write the bounded, redacted
 flight recorder to the frontend log before the process group is stopped. This
 keeps intermittent full-suite races diagnosable without exposing debug state on

@@ -22,11 +22,15 @@ Environment-only mode is selected when neither `ARGMIN_CLUSTER_CONFIG_PATH`
 nor `ARGMIN_PROCESS_ID` is set. It is the shortest way to run an all-in-one
 standalone server.
 
-### S3 and frontend settings
+A standalone server is one `argmin-s3` operating-system process that accepts
+S3 requests and embeds both the storage engine and the metadata/control
+authority. It uses one local data directory, starts no separate cluster
+processes, and provides no Argmin-managed node or disk redundancy.
 
-These settings apply to every process with a frontend role. The account,
-credential, and SSE-S3 key settings are required for those processes and are
-not required by storage-only or control-plane-only processes.
+### Standalone server settings
+
+These settings configure that single standalone server. The account,
+credential, and SSE-S3 wrapping-key settings are always required.
 
 | Variable | Default | Description |
 |---|---|---|
@@ -40,10 +44,13 @@ not required by storage-only or control-plane-only processes.
 | `ARGMIN_LISTEN_ADDR` | `127.0.0.1:9000` | Public S3 listen address |
 | `ARGMIN_TLS_CERT_PATH` | *(unset)* | PEM certificate chain for direct HTTPS |
 | `ARGMIN_TLS_KEY_PATH` | *(unset)* | PEM private key for direct HTTPS |
-| `ARGMIN_WORKERS` | `4` | Frontend worker count |
+| `ARGMIN_WORKERS` | `4` | Server worker count |
 | `ARGMIN_MAX_CONNECTIONS` | `512` | Maximum concurrent public TCP connections |
 | `ARGMIN_MAX_INFLIGHT_REQUESTS` | `32` | Maximum concurrent in-flight S3 requests |
 | `ARGMIN_STREAM_READ_CHUNK_SIZE` | `8388608` | HTTP streaming read chunk size in bytes |
+| `ARGMIN_PANIC_ON_500` | `false` | Debug/test builds only: panic when an HTTP 500 response would be returned; absent from release binaries |
+| `ARGMIN_ABORT_ON_500` | `false` | Debug/test builds only: abort when an HTTP 500 response would be returned; absent from release binaries |
+| `ARGMIN_LOCAL_DEBUG_ENDPOINT` | `false` | Debug builds with `local-debug-endpoints` only: enable loopback diagnostic routes; the routes and setting are absent from release binaries |
 | `ARGMIN_TRACE` | `false` | Enable structured trace output |
 | `ARGMIN_TRACE_FILTER` | *(unset)* | Comma-separated trace targets |
 | `ARGMIN_TRACE_FILE` | *(unset; stderr)* | Trace output file |
@@ -121,8 +128,8 @@ secrets:
 argmin-s3 validate-cluster-config /etc/argmin/cluster.toml control-1
 ```
 
-Validate the selected process's credential files, TLS identities, trust
-bundles, and certificate relationships:
+Validate the selected process's S3 and SSE secret files, internal credential
+files, TLS identities, trust bundles, and certificate relationships:
 
 ```bash
 argmin-s3 validate-cluster-material /etc/argmin/cluster.toml control-1
@@ -198,7 +205,7 @@ Scalar sections use these fields:
 | Section | Fields |
 |---|---|
 | `[cluster]` | `id` (string), `topology_generation` (nonzero integer), `region` (string) |
-| `[s3]` | `account_id`, `access_key_id`, `secret_access_key_ref`, and `sse_s3_wrapping_key_ref`; optional `sse_c_validator_key_ref`, `workers`, `max_connections`, `max_inflight_requests`, `stream_read_chunk_size`, `panic_on_500`, `abort_on_500`, and `local_debug_endpoint` |
+| `[s3]` | `account_id`, `access_key_id`, `secret_access_key_ref`, and `sse_s3_wrapping_key_ref`; optional `sse_c_validator_key_ref`, `workers`, `max_connections`, `max_inflight_requests`, and `stream_read_chunk_size`; debug-only `panic_on_500` and `abort_on_500`; `local_debug_endpoint` only with the debug-only `local-debug-endpoints` feature |
 | `[deployment]` | `mode`, `failure_domain`, `failure_tolerance` (integer) |
 | `[storage]` | `pg_count` (nonzero integer), `ec_data_shards`, `ec_parity_shards`, `initial_cluster_epoch` (nonzero integer) |
 | `[raft]` | `max_append_entries`, `max_append_bytes`, `max_snapshot_bytes` |
@@ -226,9 +233,15 @@ tuning fields are `storage_node_rpc_admission_limit`,
 `control_plane_frontend_refresh_ms`, and
 `control_plane_heartbeat_lease_ms`. Omitted settings use the compiled defaults.
 
-The optional `[s3]` resource fields default to 4 workers, 512 connections, 32
-in-flight requests, an 8 MiB stream-read chunk, and disabled diagnostic
-failure actions and local debug endpoint.
+The production `[s3]` schema defaults to 4 workers, 512 connections, 32
+in-flight requests, and an 8 MiB stream-read chunk. Debug builds also default
+their diagnostic failure actions to disabled; feature-enabled debug builds
+default the local debug endpoint to disabled.
+
+Production release binaries do not compile in `panic_on_500`, `abort_on_500`,
+or the local debug routes and their setting. `local_debug_endpoint` requires a
+debug build compiled with `local-debug-endpoints`, and every S3 listener using
+it must be bound to a loopback address.
 
 The process role matrix is exact:
 
@@ -631,6 +644,10 @@ transport_profile_id = "local"
 Initialize and run this process:
 
 ```bash
+./target/release/argmin-s3 validate-cluster-config \
+  /etc/argmin/cluster.toml all-1
+./target/release/argmin-s3 validate-cluster-material \
+  /etc/argmin/cluster.toml all-1
 ./target/release/argmin-s3 initialize-cluster-state \
   /etc/argmin/cluster.toml all-1
 
@@ -771,21 +788,28 @@ selected host. For host 1, for example:
 ```bash
 ./target/release/argmin-s3 validate-cluster-config \
   /etc/argmin/cluster.toml control-1
+./target/release/argmin-s3 validate-cluster-material \
+  /etc/argmin/cluster.toml control-1
 ./target/release/argmin-s3 initialize-cluster-state \
   /etc/argmin/cluster.toml control-1
 
 ./target/release/argmin-s3 validate-cluster-config \
+  /etc/argmin/cluster.toml storage-1
+./target/release/argmin-s3 validate-cluster-material \
   /etc/argmin/cluster.toml storage-1
 ./target/release/argmin-s3 initialize-cluster-state \
   /etc/argmin/cluster.toml storage-1
 
 ./target/release/argmin-s3 validate-cluster-config \
   /etc/argmin/cluster.toml frontend-1
+./target/release/argmin-s3 validate-cluster-material \
+  /etc/argmin/cluster.toml frontend-1
 ```
 
 Run every process with `ARGMIN_CLUSTER_CONFIG_PATH` and its own
-`ARGMIN_PROCESS_ID`. Install the S3 secret and wrapping-key files only on
-frontend hosts; control-plane and storage-only processes do not resolve them.
+`ARGMIN_PROCESS_ID`. Install the S3 secret, wrapping-key, and optional SSE-C
+validator files only on frontend hosts; control-plane and storage-only
+processes do not resolve them.
 Start all three voters and storage nodes; the initial Raft establishment wait
 does not impose a fixed deadline, so hosts may be brought up at different
 times.

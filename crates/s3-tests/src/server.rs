@@ -380,6 +380,7 @@ impl TestServer {
 
         // Spawn the server as a background task
         let serve_config = server_http::http::serve::ServeConfig {
+            #[cfg(debug_assertions)]
             abort_on_500: true,
             ..server_http::http::serve::ServeConfig::default()
         };
@@ -414,6 +415,7 @@ impl TestServer {
                 TEST_MAX_CONNECTIONS,
                 TEST_MAX_INFLIGHT_REQUESTS,
                 server_http::http::serve::ServeConfig {
+                    #[cfg(debug_assertions)]
                     abort_on_500: true,
                     ..server_http::http::serve::ServeConfig::default()
                 },

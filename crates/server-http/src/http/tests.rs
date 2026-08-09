@@ -1242,8 +1242,7 @@ mod tests {
             resp,
             None,
             8192,
-            false,
-            false,
+            ResponseFailureDiagnostics::new(false, false),
             ResponseTraceMeta::new(
                 crate::http::new_request_trace_context(),
                 Arc::<str>::from("host-id"),
@@ -1279,8 +1278,7 @@ mod tests {
             },
             Some(admission),
             8192,
-            false,
-            false,
+            ResponseFailureDiagnostics::new(false, false),
             ResponseTraceMeta::new(
                 crate::http::new_request_trace_context(),
                 Arc::<str>::from("host-id"),
@@ -1321,8 +1319,7 @@ mod tests {
                     resp,
                     None,
                     8192,
-                    true,
-                    false,
+                    ResponseFailureDiagnostics::new(true, false),
                     ResponseTraceMeta::new(
                         observability::TraceContext::from_ids(observability::TraceContextIds {
                             trace_id: "trace-conversion-error".to_string(),
@@ -1407,8 +1404,7 @@ mod tests {
                     resp,
                     None,
                     8192,
-                    true,
-                    false,
+                    ResponseFailureDiagnostics::new(true, false),
                     ResponseTraceMeta::new(
                         crate::http::new_request_trace_context(),
                         Arc::<str>::from("host-id"),
@@ -1448,8 +1444,7 @@ mod tests {
             resp,
             None,
             8192,
-            false,
-            false,
+            ResponseFailureDiagnostics::new(false, false),
             ResponseTraceMeta::new(
                 crate::http::new_request_trace_context(),
                 Arc::<str>::from("host-id"),
@@ -1511,8 +1506,7 @@ mod tests {
             resp,
             None,
             8192,
-            false,
-            false,
+            ResponseFailureDiagnostics::new(false, false),
             ResponseTraceMeta::new(
                 observability::TraceContext::from_ids(observability::TraceContextIds {
                     trace_id: "0123456789abcdef0123456789abcdef".to_string(),
