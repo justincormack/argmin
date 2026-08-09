@@ -1593,11 +1593,12 @@ pub(crate) fn encode_multipart_upload_match_request(
 
 pub(crate) fn decode_multipart_upload_match_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMultipartUploadMatchRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let object = decoder.read_rpc_object_request()?;
     let request = decoder.read_create_multipart_upload_req()?;
-    let expected_command = decoder.read_optional_create_multipart_upload_command()?;
+    let expected_command = decoder.read_optional_create_multipart_upload_command(authority)?;
     decoder.finish()?;
     validate_create_multipart_upload_request_identity(&object, &request)?;
     if expected_command

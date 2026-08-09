@@ -128,6 +128,27 @@ impl CreateBucketCommandBuildAuthority {
     }
 }
 
+/// Node-runtime authority to mint a multipart-upload creation command.
+///
+/// Applying this root object-metadata command creates its own generation
+/// reservation, so there is no complete pre-existing durable subject from
+/// which application can reconstruct every caller-selected field. Only the
+/// scoped storage-node builder may mint this authority.
+pub(crate) struct CreateMultipartUploadCommandBuildAuthority {
+    _private: (),
+}
+
+impl CreateMultipartUploadCommandBuildAuthority {
+    pub(in crate::node_runtime) const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_test() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Authority to turn canonical command bytes into a typed command envelope.
 ///
 /// Byte validation alone is harmless, but returning an envelope confers the

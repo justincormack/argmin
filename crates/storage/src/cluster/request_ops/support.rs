@@ -1213,8 +1213,8 @@ fn metadata_command_apply_test_context(
         ),
         MetadataCommandPayload::CreateMultipartUpload(command) => (
             MetadataCommandApplyTestKind::CreateMultipartUpload,
-            Some(command.upload.bucket.clone()),
-            Some(command.upload.key.clone()),
+            Some(command.upload().bucket.clone()),
+            Some(command.upload().key.clone()),
         ),
         MetadataCommandPayload::AbortMultipartUpload(command) => (
             MetadataCommandApplyTestKind::AbortMultipartUpload,

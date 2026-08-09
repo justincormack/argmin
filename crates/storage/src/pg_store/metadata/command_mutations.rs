@@ -680,13 +680,13 @@ impl PgStore {
         &self,
         command: &CreateMultipartUploadCommand,
     ) -> Result<(), MetadataError> {
-        if command.upload.state != UploadState::InProgress {
+        if command.upload().state != UploadState::InProgress {
             return Err(MetadataError::InvariantViolation {
                 context: "create multipart upload command state mismatch",
                 reason: "metadata state does not satisfy the operation invariant".into(),
             });
         }
-        self.create_multipart_upload_explicit(&command.upload)
+        self.create_multipart_upload_explicit(command.upload())
     }
 
     fn parse_multipart_object_identity(

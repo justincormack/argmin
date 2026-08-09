@@ -3014,7 +3014,7 @@ fn metadata_command_apply_tracks_multipart_upload_create_digest() {
             MetadataCommandLogIndex::new(1).unwrap(),
         ),
         MetadataCommandPayload::CreateMultipartUpload(Box::new(
-            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
                 create,
                 GenerationId::new(1).unwrap(),
                 Some(MultipartObjectIdentity::Live {
@@ -5625,7 +5625,7 @@ fn pending_metadata_command_slot_rejects_proofless_create_multipart_upload() {
             MetadataCommandLogIndex::new(1).unwrap(),
         ),
         MetadataCommandPayload::CreateMultipartUpload(Box::new(
-            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
                 CreateMultipartUploadReq {
                     upload_id,
                     bucket: bucket.clone(),

@@ -1695,12 +1695,13 @@ impl CommitStreamPartCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateMultipartUploadCommand {
-    pub(crate) upload: MultipartUploadRecord,
-    pub(crate) bucket_write_reservation: BucketWriteReservationProof,
+    upload: MultipartUploadRecord,
+    bucket_write_reservation: BucketWriteReservationProof,
 }
 
 impl CreateMultipartUploadCommand {
     pub(crate) fn from_request_with_bucket_write_reservation(
+        _authority: crate::node_runtime::CreateMultipartUploadCommandBuildAuthority,
         request: CreateMultipartUploadReq,
         object_generation_id: GenerationId,
         initiated_object_identity: Option<crate::MultipartObjectIdentity>,
@@ -1729,6 +1730,82 @@ impl CreateMultipartUploadCommand {
             },
             bucket_write_reservation,
         }
+    }
+
+    pub(crate) fn from_decoded_parts(
+        _authority: &crate::node_runtime::MetadataCommandDecodeAuthority,
+        upload: MultipartUploadRecord,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Self {
+        Self {
+            upload,
+            bucket_write_reservation,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_request_with_bucket_write_reservation_for_test(
+        request: CreateMultipartUploadReq,
+        object_generation_id: GenerationId,
+        initiated_object_identity: Option<crate::MultipartObjectIdentity>,
+        initiated_at_millis: u64,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Self {
+        Self::from_request_with_bucket_write_reservation(
+            crate::node_runtime::CreateMultipartUploadCommandBuildAuthority::new_for_test(),
+            request,
+            object_generation_id,
+            initiated_object_identity,
+            initiated_at_millis,
+            bucket_write_reservation,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_parts_for_test(
+        upload: MultipartUploadRecord,
+        bucket_write_reservation: BucketWriteReservationProof,
+    ) -> Self {
+        Self::from_decoded_parts(
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+            upload,
+            bucket_write_reservation,
+        )
+    }
+
+    pub(crate) fn upload(&self) -> &MultipartUploadRecord {
+        &self.upload
+    }
+
+    pub(crate) fn bucket_write_reservation(&self) -> &BucketWriteReservationProof {
+        &self.bucket_write_reservation
+    }
+
+    pub(crate) fn with_ordered_upload_id(
+        mut self,
+        upload_id_key: &crate::MultipartUploadIdKey,
+        command_id: MetadataCommandId,
+    ) -> Self {
+        self.upload.upload_id = upload_id_key.with_listing_position(
+            &self.upload.bucket,
+            &self.upload.key,
+            &self.upload.upload_id,
+            command_id.cluster_epoch().get(),
+            command_id.log_index().get(),
+        );
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn upload_mut_for_test(&mut self) -> &mut MultipartUploadRecord {
+        &mut self.upload
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bucket_write_reservation_mut_for_test(
+        &mut self,
+    ) -> &mut BucketWriteReservationProof {
+        &mut self.bucket_write_reservation
     }
 
     pub(crate) fn matches_request(&self, request: &CreateMultipartUploadReq) -> bool {
@@ -6215,7 +6292,7 @@ mod tests {
                 },
             })),
             MetadataCommandPayload::CreateMultipartUpload(Box::new(
-                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
                     CreateMultipartUploadReq {
                         upload_id: upload_id.clone(),
                         bucket: bucket.clone(),

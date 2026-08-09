@@ -5494,7 +5494,7 @@ fn command_bucket_write_reservation_proof(
             Some(&marker.bucket_write_reservation)
         }
         crate::metadata_command::MetadataCommandPayload::CreateMultipartUpload(create) => {
-            Some(&create.bucket_write_reservation)
+            Some(create.bucket_write_reservation())
         }
         crate::metadata_command::MetadataCommandPayload::AbortMultipartUpload(abort) => {
             Some(&abort.bucket_write_reservation)

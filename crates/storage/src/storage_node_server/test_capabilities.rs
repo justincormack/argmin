@@ -1157,10 +1157,11 @@
             }
             other => panic!("mismatched expected upload must fail: {other:?}"),
         }
-        let expected_multipart_command = crate::metadata_command::CreateMultipartUploadCommand {
-            upload: multipart_upload.clone(),
-            bucket_write_reservation: create_multipart_proof.clone(),
-        };
+        let expected_multipart_command =
+            crate::metadata_command::CreateMultipartUploadCommand::from_parts_for_test(
+                multipart_upload.clone(),
+                create_multipart_proof.clone(),
+            );
         assert_eq!(
             crate::clock::with_time_override(1_000, || {
                 primary_route.matching_multipart_upload_initiated_at(
@@ -1417,7 +1418,7 @@
             other => panic!("mismatched multipart create request must fail: {other:?}"),
         }
         let mut mismatched_expected_command = expected_multipart_command.clone();
-        mismatched_expected_command.upload.key =
+        mismatched_expected_command.upload_mut_for_test().key =
             crate::tests::object_key("different-expected-command-key");
         let mismatched_expected_match = crate::clock::with_time_override(1_000, || {
             primary_route.matching_multipart_upload_initiated_at(
@@ -1436,7 +1437,7 @@
         }
         let mut mismatched_expected_proof = expected_multipart_command.clone();
         mismatched_expected_proof
-            .bucket_write_reservation
+            .bucket_write_reservation_mut_for_test()
             .operation_kind = "put-object-metadata".to_string();
         let mismatched_expected_match = crate::clock::with_time_override(1_000, || {
             primary_route.matching_multipart_upload_initiated_at(
@@ -1522,11 +1523,11 @@
         else {
             panic!("active object route must build a create multipart upload command");
         };
-        assert_eq!(create_multipart.upload.bucket, bucket);
-        assert_eq!(create_multipart.upload.key, key);
+        assert_eq!(create_multipart.upload().bucket, bucket);
+        assert_eq!(create_multipart.upload().key, key);
         assert_eq!(
-            create_multipart.bucket_write_reservation,
-            create_multipart_proof
+            create_multipart.bucket_write_reservation(),
+            &create_multipart_proof
         );
 
         let mut mismatched_create_request = new_multipart_request.clone();

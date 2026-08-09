@@ -1699,10 +1699,10 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
             match command.payload() {
                 MetadataCommandPayload::CreateMultipartUpload(create)
                     if crate::MultipartUploadIdKey::has_same_issuance_identity(
-                        &create.upload.upload_id,
+                        &create.upload().upload_id,
                         &hook_upload_id,
                     ) && crate::MultipartUploadIdKey::listing_position(
-                        &create.upload.upload_id,
+                        &create.upload().upload_id,
                     )
                     .is_some_and(|position| position != (0, 0))
                         && node_id == NodeId::new(0)
@@ -1753,7 +1753,7 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
     let MetadataCommandPayload::CreateMultipartUpload(pending_create) = pending.payload() else {
         panic!("pending command should create the multipart upload");
     };
-    let ordered_upload_id = pending_create.upload.upload_id.clone();
+    let ordered_upload_id = pending_create.upload().upload_id.clone();
     assert_ne!(ordered_upload_id, provisional_upload_id);
     assert!(upload_id_key.authenticates(&bucket, &key, &ordered_upload_id));
     assert_eq!(
@@ -1854,7 +1854,7 @@ fn multipart_create_partial_apply_reopens_and_converges() {
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::CreateMultipartUpload(create)
-                    if create.upload.upload_id == hook_upload_id
+                    if create.upload().upload_id == hook_upload_id
                         && node_id == NodeId::new(1)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
@@ -1902,7 +1902,7 @@ fn multipart_create_partial_apply_reopens_and_converges() {
         matches!(
             pending.payload(),
             MetadataCommandPayload::CreateMultipartUpload(create)
-                if create.bucket_write_reservation.operation_kind == "create-multipart-upload"
+                if create.bucket_write_reservation().operation_kind == "create-multipart-upload"
         ),
         "partial multipart create command must carry the bucket write reservation proof"
     );

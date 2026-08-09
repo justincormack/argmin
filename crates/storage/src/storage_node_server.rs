@@ -1361,7 +1361,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::ObjectMultipartUploadMatch => {
-                match decode_multipart_upload_match_request(&frame.payload) {
+                match decode_multipart_upload_match_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => self.multipart_upload_match_response(route_permit, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,

@@ -626,7 +626,7 @@ fn multipart_upload_matches_command(
     existing: &MultipartUploadRecord,
     create: &CreateMultipartUploadCommand,
 ) -> bool {
-    *existing == create.upload
+    existing == create.upload()
 }
 
 fn reject_duplicate_stream_segment_index(

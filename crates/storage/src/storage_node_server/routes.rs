@@ -1845,7 +1845,8 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
     ) -> Result<Option<u64>, StorageNodeObjectRouteError> {
         self.require_create_multipart_upload_subject(request, "multipart upload match")?;
         if let Some(command) = expected_command {
-            if command.upload.bucket != *self.route.bucket || command.upload.key != *self.route.key
+            if command.upload().bucket != *self.route.bucket
+                || command.upload().key != *self.route.key
             {
                 return Err(StorageNodeObjectRouteError::Route(
                     StorageRpcErrorResponse {
@@ -1865,7 +1866,7 @@ impl StorageNodeActivePrimaryObjectRoute<'_> {
                 ));
             }
             self.require_object_mutation_proof(
-                &command.bucket_write_reservation,
+                command.bucket_write_reservation(),
                 CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
                 "multipart upload match",
             )?;

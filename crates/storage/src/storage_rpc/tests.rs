@@ -4590,7 +4590,7 @@ mod tests {
         let mut ordered_request = request.clone();
         ordered_request.upload_id = ordered_upload_id;
         let expected_command =
-            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
                 ordered_request,
                 GenerationId::new(9).unwrap(),
                 None,
@@ -4625,7 +4625,11 @@ mod tests {
 
         let bytes = encode_multipart_upload_match_request(&rpc_request).unwrap();
         assert_eq!(
-            decode_multipart_upload_match_request(&bytes).unwrap(),
+            decode_multipart_upload_match_request(
+                &bytes,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap(),
             rpc_request
         );
     }

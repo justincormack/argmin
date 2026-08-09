@@ -1451,10 +1451,13 @@ impl<'a> StorageRpcDecoder<'a> {
 
     fn read_optional_create_multipart_upload_command(
         &mut self,
+        authority: &MetadataCommandDecodeAuthority,
     ) -> Result<Option<CreateMultipartUploadCommand>, StorageRpcPayloadError> {
         match self.read_u8()? {
             0 => Ok(None),
-            1 => Ok(Some(self.read_create_multipart_upload_command()?)),
+            1 => Ok(Some(
+                self.read_create_multipart_upload_command(authority)?,
+            )),
             _ => Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
                 "invalid optional multipart upload command tag",
             )),
@@ -1463,11 +1466,13 @@ impl<'a> StorageRpcDecoder<'a> {
 
     fn read_create_multipart_upload_command(
         &mut self,
+        authority: &MetadataCommandDecodeAuthority,
     ) -> Result<CreateMultipartUploadCommand, StorageRpcPayloadError> {
-        Ok(CreateMultipartUploadCommand {
-            upload: self.read_multipart_upload_record()?,
-            bucket_write_reservation: self.read_bucket_write_reservation_proof()?,
-        })
+        Ok(CreateMultipartUploadCommand::from_decoded_parts(
+            authority,
+            self.read_multipart_upload_record()?,
+            self.read_bucket_write_reservation_proof()?,
+        ))
     }
 
     fn read_multipart_upload_record(

@@ -398,7 +398,7 @@ fn multipart_creation_fanout_rejects_live_crossed_reservation_subjects() {
                 map.test_next_metadata_command_log_index(pg_id),
             ),
             MetadataCommandPayload::CreateMultipartUpload(Box::new(
-                crate::metadata_command::CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                crate::metadata_command::CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
                     request.clone(),
                     crate::GenerationId::MIN,
                     None,

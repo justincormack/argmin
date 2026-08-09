@@ -3380,11 +3380,11 @@ impl LocalMultipartUploadCreationMetadataRoute<'_> {
         command: &CreateMultipartUploadCommand,
         operation: &'static str,
     ) -> Result<(), ObjectPgActionError> {
-        if command.upload.bucket != self.bucket
-            || command.upload.key != self.key
+        if command.upload().bucket != self.bucket
+            || command.upload().key != self.key
             || !command.matches_request(create)
             || !command
-                .bucket_write_reservation
+                .bucket_write_reservation()
                 .matches_exact_mutation_subject(
                     self.route_cluster_epoch,
                     &self.bucket,
@@ -3414,7 +3414,7 @@ impl MultipartUploadCreationMetadataRoute for LocalMultipartUploadCreationMetada
         }
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         let upload_id =
-            expected_command.map_or(&create.upload_id, |command| &command.upload.upload_id);
+            expected_command.map_or(&create.upload_id, |command| &command.upload().upload_id);
         match pg.get_multipart_upload(upload_id) {
             Ok(existing)
                 if expected_command.is_some_and(|command| {
@@ -3482,6 +3482,7 @@ impl MultipartUploadCreationMetadataRoute for LocalMultipartUploadCreationMetada
             command_id,
             MetadataCommandPayload::CreateMultipartUpload(Box::new(
                 CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                    crate::node_runtime::CreateMultipartUploadCommandBuildAuthority::new(),
                     request.request.clone(),
                     object_generation_id,
                     current

@@ -4051,7 +4051,8 @@ impl PgMetadataStore for PgStore {
     #[cfg(test)]
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError> {
         let object_generation_id = self.next_generation_id(&req.bucket, &req.key)?;
-        let command = CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+        let command =
+            CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
             req.clone(),
             object_generation_id,
             None,
@@ -4069,7 +4070,7 @@ impl PgMetadataStore for PgStore {
                 target_context: Some(req.key.as_str().to_string()),
             },
         );
-        self.create_multipart_upload_explicit(&command.upload)
+        self.create_multipart_upload_explicit(command.upload())
     }
 
     fn get_multipart_upload(

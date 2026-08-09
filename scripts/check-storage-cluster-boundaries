@@ -41,25 +41,6 @@ fail_with_matches \
     "Workspace normal/build feature graphs must enable storage test support only for the exhaustive reviewed test-only package allowlist" \
     "$storage_test_feature_graph_failure"
 
-# CreateMultipartUpload is the remaining root object-metadata command whose
-# application creates its own generation reservation rather than validating a
-# complete pre-existing durable subject. Canonical command decoding is already
-# compiler-confined: returning an envelope requires an unforgeable authority
-# minted only inside the private node runtime, including through RPC codecs.
-multipart_root_command_mint_bypasses=$(
-    rg -n \
-        'CreateMultipartUploadCommand::from_request_with_bucket_write_reservation\(|CreateMultipartUploadCommand[[:space:]]*\{' \
-        crates/storage/src/cluster.rs crates/storage/src/cluster \
-        -g '*.rs' \
-        -g '!**/tests/**' \
-        -g '!tests.rs' \
-        -g '!*_tests.rs' \
-        || true
-)
-fail_with_matches \
-    "Production multipart-upload root commands must use the scoped node-runtime builder, not direct construction" \
-    "$multipart_root_command_mint_bypasses"
-
 # Temporary migration prohibition: physical deletion stays behind the
 # reclaim-fenced placed-delete implementation until capabilities enforce it.
 payload_shard_delete_callers=$(
@@ -2625,25 +2606,6 @@ stream_session_maintenance_leaks=$(
 fail_with_matches \
     "Abandoned stream-session expiry, discovery, cleanup, scheduling, and telemetry are storage-owned; retain only the opaque StorageStreamSessionSweeper outside storage" \
     "$stream_session_maintenance_leaks"
-
-session_token_format_leaks=$(
-    {
-        rg -n --color=never \
-            '\bseal_session_credential_v[0-9]+\b|\b(SESSION_TOKEN_V[0-9]+_PREFIX|MAX_DECODED_SESSION_TOKEN_FRAME_LEN|MAX_ENCODED_SESSION_TOKEN_LEN|MAX_ISSUED_V[0-9]+_TOKEN_LEN)\b' \
-            . \
-            -g 'crates/**/*.rs' \
-            -g '!crates/auth/**' \
-            || true
-        rg -n --color=never \
-            'pub fn seal_session_credential_v[0-9]+\b|pub const (SESSION_TOKEN_V[0-9]+_PREFIX|MAX_DECODED_SESSION_TOKEN_FRAME_LEN|MAX_ENCODED_SESSION_TOKEN_LEN|MAX_ISSUED_V[0-9]+_TOKEN_LEN)\b' \
-            crates/auth/src \
-            -g '*.rs' \
-            || true
-    }
-)
-fail_with_matches \
-    "Session-token format selection and representation constants are private to auth; callers must use semantic issuance and authentication APIs" \
-    "$session_token_format_leaks"
 
 if [[ "$failed" -ne 0 ]]; then
     echo

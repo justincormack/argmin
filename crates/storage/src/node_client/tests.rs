@@ -2324,16 +2324,16 @@ fn local_multipart_creation_metadata_route_binds_exact_object_subject() {
     proof.operation_kind = CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
     let pg = storage_node.get_pg(correct_pg.get()).unwrap();
     PgMetadataStore::create_multipart_upload(&*pg, &request).unwrap();
-    let expected_command = CreateMultipartUploadCommand {
-        upload: PgMetadataStore::get_multipart_upload(&*pg, &request.upload_id).unwrap(),
-        bucket_write_reservation: proof.clone(),
-    };
+    let expected_command = CreateMultipartUploadCommand::from_parts_for_test(
+        PgMetadataStore::get_multipart_upload(&*pg, &request.upload_id).unwrap(),
+        proof.clone(),
+    );
     drop(pg);
     assert_eq!(
         route
             .matching_multipart_upload_initiated_at(&request, Some(&expected_command))
             .unwrap(),
-        Some(expected_command.upload.initiated_at)
+        Some(expected_command.upload().initiated_at)
     );
     let mut crossed_id = request.clone();
     crossed_id.upload_id = crate::tests::multipart_upload_id("multipart-creation-route-crossed-id");

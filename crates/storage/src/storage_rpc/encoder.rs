@@ -1050,8 +1050,8 @@ fn put_optional_create_multipart_upload_command(
 }
 
 fn put_create_multipart_upload_command(out: &mut Vec<u8>, command: &CreateMultipartUploadCommand) {
-    put_multipart_upload_record(out, &command.upload);
-    put_bucket_write_reservation_proof(out, &command.bucket_write_reservation);
+    put_multipart_upload_record(out, command.upload());
+    put_bucket_write_reservation_proof(out, command.bucket_write_reservation());
 }
 
 fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord) {

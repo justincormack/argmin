@@ -372,7 +372,7 @@ impl UnixStorageNodeClient {
                 "positive multipart upload match requires expected command".to_string(),
             )));
         };
-        if initiated_at != expected_command.upload.initiated_at {
+        if initiated_at != expected_command.upload().initiated_at {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 "validate multipart upload match response",
                 "multipart upload match timestamp does not match expected command".to_string(),
@@ -882,7 +882,7 @@ impl UnixStorageNodeClient {
                 "response command payload is not create multipart upload".to_string(),
             )));
         };
-        let upload = &create.upload;
+        let upload = create.upload();
         if upload.upload_id != request.request.upload_id
             || upload.bucket != *bucket
             || upload.key != *key
@@ -897,7 +897,7 @@ impl UnixStorageNodeClient {
             || upload.object_lock != request.request.object_lock
             || upload.checksum != request.request.checksum
             || upload.encryption != request.request.encryption
-            || create.bucket_write_reservation != *request.bucket_write_reservation
+            || create.bucket_write_reservation() != request.bucket_write_reservation
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 context,

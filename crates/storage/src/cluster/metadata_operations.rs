@@ -4363,7 +4363,7 @@ impl StorageCluster {
                 Some(&marker.bucket_write_reservation)
             }
             MetadataCommandPayload::CreateMultipartUpload(create) => {
-                Some(&create.bucket_write_reservation)
+                Some(create.bucket_write_reservation())
             }
             MetadataCommandPayload::AbortMultipartUpload(abort) => {
                 Some(&abort.bucket_write_reservation)
@@ -4449,9 +4449,9 @@ impl StorageCluster {
             MetadataCommandPayload::CreateMultipartUpload(create) => proof
                 .matches_exact_mutation_subject(
                     command.id().cluster_epoch(),
-                    &create.upload.bucket,
+                    &create.upload().bucket,
                     crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
-                    Some(create.upload.key.as_str()),
+                    Some(create.upload().key.as_str()),
                 ),
             MetadataCommandPayload::CreateStreamUpload(create) => proof
                 .matches_exact_mutation_subject(

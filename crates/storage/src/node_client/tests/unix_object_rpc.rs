@@ -262,13 +262,14 @@ fn unix_multipart_creation_route_rejects_foreign_authority_before_rpc() {
     let mut proof = test_bucket_write_reservation_proof(bucket.clone(), &key);
     proof.operation_kind =
         crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string();
-    let expected_command = CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
-        request.clone(),
-        GenerationId::MIN,
-        None,
-        1,
-        proof.clone(),
-    );
+    let expected_command =
+        CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
+            request.clone(),
+            GenerationId::MIN,
+            None,
+            1,
+            proof.clone(),
+        );
     let mut crossed_id = request.clone();
     crossed_id.upload_id = crate::tests::multipart_upload_id("unix-multipart-create-crossed-id");
     let mut crossed_metadata = request.clone();
@@ -3998,17 +3999,23 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     else {
         panic!("expected create multipart upload command");
     };
-    assert_eq!(multipart_create.upload.bucket, bucket);
-    assert_eq!(multipart_create.upload.key, key);
-    assert_eq!(multipart_create.bucket_write_reservation, multipart_proof);
+    assert_eq!(multipart_create.upload().bucket, bucket);
+    assert_eq!(multipart_create.upload().key, key);
+    assert_eq!(
+        multipart_create.bucket_write_reservation(),
+        &multipart_proof
+    );
     client
         .validate_multipart_upload_match_response(
-            Some(multipart_create.upload.initiated_at),
+            Some(multipart_create.upload().initiated_at),
             Some(multipart_create.as_ref()),
         )
         .unwrap();
     let err = client
-        .validate_multipart_upload_match_response(Some(multipart_create.upload.initiated_at), None)
+        .validate_multipart_upload_match_response(
+            Some(multipart_create.upload().initiated_at),
+            None,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -4019,7 +4026,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     ));
     let err = client
         .validate_multipart_upload_match_response(
-            Some(multipart_create.upload.initiated_at + 1),
+            Some(multipart_create.upload().initiated_at + 1),
             Some(multipart_create.as_ref()),
         )
         .unwrap_err();
@@ -4037,7 +4044,7 @@ fn unix_object_mutation_metadata_client_loads_snapshots_and_builds_commands() {
     else {
         panic!("expected create multipart upload command");
     };
-    bad_multipart_create.upload.owner = OwnerIdentity::from_principal("other-owner");
+    bad_multipart_create.upload_mut_for_test().owner = OwnerIdentity::from_principal("other-owner");
     let bad_multipart_command =
         MetadataCommandEnvelope::new(multipart_command.id(), bad_multipart_payload);
     let err = client
@@ -5118,7 +5125,7 @@ fn unix_object_mutation_client_loads_multipart_upload_over_rpc() {
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateMultipartUpload(Box::new(
-                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
+                CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
                     create,
                     GenerationId::new(1).unwrap(),
                     None,
@@ -5186,26 +5193,27 @@ fn unix_multipart_creation_match_accepts_ordered_command_for_provisional_id() {
     };
     let mut ordered_request = request.clone();
     ordered_request.upload_id = ordered_upload_id;
-    let expected_command = CreateMultipartUploadCommand::from_request_with_bucket_write_reservation(
-        ordered_request,
-        GenerationId::new(1).unwrap(),
-        None,
-        123,
-        BucketWriteReservationProof {
-            bucket: bucket.clone(),
-            reservation_id: "reservation-1".to_string(),
-            owner_token: "owner-token".to_string(),
-            cluster_epoch: ClusterEpoch::INITIAL,
-            bucket_execution_generation: 1,
-            bucket_incarnation_generation: 1,
-            operation_kind:
-                crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
-                    .to_string(),
-            created_at: 100,
-            lease_deadline: 200,
-            target_context: Some(key.as_str().to_string()),
-        },
-    );
+    let expected_command =
+        CreateMultipartUploadCommand::from_request_with_bucket_write_reservation_for_test(
+            ordered_request,
+            GenerationId::new(1).unwrap(),
+            None,
+            123,
+            BucketWriteReservationProof {
+                bucket: bucket.clone(),
+                reservation_id: "reservation-1".to_string(),
+                owner_token: "owner-token".to_string(),
+                cluster_epoch: ClusterEpoch::INITIAL,
+                bucket_execution_generation: 1,
+                bucket_incarnation_generation: 1,
+                operation_kind:
+                    crate::metadata_command::CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND
+                        .to_string(),
+                created_at: 100,
+                lease_deadline: 200,
+                target_context: Some(key.as_str().to_string()),
+            },
+        );
     {
         let node = SharedStorageNode::open_with_default_ec_shape(
             &config.data_dir,

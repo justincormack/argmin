@@ -6600,6 +6600,37 @@ Phase 6 node-client/route-adoption removal slice (2026-08-09):
 The checker baseline after this slice is 92 actual `fail_with_matches`
 invocations (85 top-level and seven nested).
 
+Phase 6 root-command and private-representation slice (2026-08-09):
+
+- replaced the remaining CreateMultipartUpload constructor/literal scan with
+  `CreateMultipartUploadCommandBuildAuthority`. Its production constructor is
+  visible only inside the private `node_runtime` tree, and the local scoped
+  object route must supply it when constructing the command;
+- made the command's upload and reservation fields private. Read-only accessors
+  preserve apply, fanout, validation, and encoding, while the one production
+  transformation computes the ordered upload ID inside the command type from
+  the hidden issuance key and command ID. Test-only factories and mutation
+  accessors remain owner-local;
+- bound the multipart-match RPC decoder to
+  `MetadataCommandDecodeAuthority`. That request carries an expected root
+  command without wrapping it in an envelope, so the earlier envelope-only
+  decoder audit did not cover it. Authenticated server dispatch now supplies
+  the node-runtime authority before the typed command can be reconstructed;
+- removed the session-token representation source scan. The auth crate keeps
+  the representation module private, reexports only bounded status/error
+  types, and exposes semantic issuance and authentication APIs. Changing token
+  format remains covered by auth codec, format, and round-trip tests rather
+  than by the storage boundary checker; and
+- retained the exact recovery-drain authority inventory for now. The authority
+  implementation is a child module, but its `pub(super)` constructors are
+  reachable from every cluster implementation file because those files are
+  `include!`d into one parent module. Removing that inventory would therefore
+  overstate compiler enforcement. It can be retired only after recovery
+  minting is structurally isolated from publisher code.
+
+The checker baseline after this slice is 90 actual `fail_with_matches`
+invocations (83 top-level and seven nested).
+
 For each remaining section, record:
 
 - the invariant

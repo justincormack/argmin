@@ -811,7 +811,7 @@ impl super::StorageCluster {
                         value,
                         upload_id: applied_create.map_or_else(
                             || create.upload_id.clone(),
-                            |command| command.upload.upload_id.clone(),
+                            |command| command.upload().upload_id.clone(),
                         ),
                         initiated_at,
                     })));
@@ -846,15 +846,10 @@ impl super::StorageCluster {
                     else {
                         unreachable!("multipart create command changed payload kind");
                     };
-                    let ordered_upload_id = upload_id_key.with_listing_position(
-                        &create.bucket,
-                        &create.key,
-                        &create.upload_id,
-                        command.id().cluster_epoch().get(),
-                        command.id().log_index().get(),
-                    );
-                    let mut ordered_command = provisional_command.as_ref().clone();
-                    ordered_command.upload.upload_id = ordered_upload_id;
+                    let ordered_command = provisional_command
+                        .as_ref()
+                        .clone()
+                        .with_ordered_upload_id(&upload_id_key, command.id());
                     command = MetadataCommandEnvelope::new(
                         command.id(),
                         MetadataCommandPayload::CreateMultipartUpload(Box::new(ordered_command)),
@@ -906,10 +901,10 @@ impl super::StorageCluster {
                 else {
                     unreachable!("multipart create command changed payload kind");
                 };
-                let initiated_at = create_command.upload.initiated_at;
+                let initiated_at = create_command.upload().initiated_at;
                 Ok(Ok(Attempt::Complete(CreateMultipartUploadOutcome {
                     value,
-                    upload_id: create_command.upload.upload_id.clone(),
+                    upload_id: create_command.upload().upload_id.clone(),
                     initiated_at,
                 })))
             })();
