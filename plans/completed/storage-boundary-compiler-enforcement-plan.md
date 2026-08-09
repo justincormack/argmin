@@ -1,13 +1,13 @@
 # Storage Boundary Compiler-Enforcement Plan
 
-Status: active — Phases 0–5 complete; Phase 6 inventory in progress
+Status: complete — Phases 0–6 complete
 
 Related plans:
 
-- [static-cluster-configuration-plan.md](completed/static-cluster-configuration-plan.md)
-- [control-plane-auth-identity-plan.md](control-plane-auth-identity-plan.md)
-- [multihost-followup-plan.md](multihost-followup-plan.md)
-- [storage-upgrade-versioning-plan.md](storage-upgrade-versioning-plan.md)
+- [static-cluster-configuration-plan.md](static-cluster-configuration-plan.md)
+- [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md)
+- [multihost-followup-plan.md](../multihost-followup-plan.md)
+- [storage-upgrade-versioning-plan.md](../storage-upgrade-versioning-plan.md)
 
 ## Goal
 
@@ -6390,7 +6390,7 @@ Completion:
 - textual scans for public test hooks are retired only where module visibility,
   feature graphs, or typed test-support APIs enforce the same invariant
 
-### Phase 6 — shrink and redefine the boundary check
+### Phase 6 — shrink and redefine the boundary check (complete)
 
 Phase 6 inventory baseline (2026-08-08):
 
@@ -6797,14 +6797,16 @@ Phase 6 error-representation follow-up slice (2026-08-09):
   rule. That rule constrains a semantic conversion *inside* the storage crate,
   where visibility cannot distinguish a typed route error from an accidental
   string-flattening conversion; and
-- deferred the object-encryption, user/system metadata, tag, and ACL codec
-  checks to the still-open Phase 2 evidence/format work in
-  `storage-upgrade-versioning-plan.md`. In particular, tag and ACL carriers
-  are part of the planned coordinated framed-carrier and containing-format
-  version advance. Phase 6 must not weaken those ownership guards while that
-  representation change remains open. Reclassify the four checks only after
-  the versioning plan records the final carrier boundary and permanent
-  evidence.
+- retained the object-encryption, user/system metadata, tag, and ACL codec
+  checks. The completed containment inventory in
+  `storage-upgrade-versioning-plan.md` records their current owners, opaque
+  carrier boundaries, exact-current evidence, and containing formats. Phase 2
+  of that plan remains active: in particular, the selected framed tag/ACL
+  carriers and coordinated containing-format version advances have not
+  landed. These checks are permanent cross-crate ownership guards, and also
+  keep the current unframed representations frozen while that format work is
+  open. Behavior tests pin the bytes; the checks prevent another crate from
+  becoming an unrecorded interpreter or producer before or after the advance.
 
 The checker baseline after this slice is 34 actual `fail_with_matches`
 invocations (27 top-level and seven nested).
@@ -6823,7 +6825,7 @@ every historical symbol ban merely because it already existed.
 | HTTP storage boundary (2) | HTTP uses opaque diagnostics and semantic EC support rather than physical PG/checkpoint/snapshot/placement or erasure-code representations. | Some logical storage and EC types are public for legitimate owner/server-core use, so visibility cannot express the dependency-layer rule. | HTTP behavior can remain correct while an internal diagnostic or test acquires forbidden physical authority. | `server-http` source and its Cargo dependency declaration. |
 | Live-transfer opacity (2) | Public transfer capabilities remain opaque, non-`Clone`, non-`Debug`, and cannot act as the unrestricted runtime-map source. | Rust permits a future public field, trait implementation, or derive on an intentionally public type. | Runtime transfer tests do not prove negative trait/API properties for downstream callers. | The four public live-transfer facade declarations and trait implementations, with compile-fail doctests for linear/debug properties. |
 | Manual/operator/control-plane facades (7) | Process administration uses logical opaque PG, Raft, clock, and control-plane facades and typed retry/error classifications rather than reconstructing proofs, transport state, or remote diagnostic policy. | Several lower logical control-plane values are public for other legitimate storage/control-plane integrations; Rust has no per-caller policy for `argmin-s3`. | Happy-path administration tests cannot prove that a parallel raw dispatch or diagnostic-string policy was not introduced. | Production `argmin-s3` dispatch call sites plus the bounded public facade declarations and typed error classifiers. |
-| Nested metadata codecs (4) | Encryption bytes, metadata blobs, canonical tag XML, and ACL durable strings remain confined to their recorded format owners and approved opaque carrier boundary. | Metadata carriers and ACL codecs currently cross crate boundaries by design, and tag/ACL framing is still being changed by the versioning plan. | Codec goldens prove bytes and rejection behavior but do not prevent an additional crate from interpreting or constructing the representation. | Codec declarations and cross-crate uses, pending the final Phase 2 carrier/version evidence in `storage-upgrade-versioning-plan.md`. |
+| Nested metadata codecs (4) | Encryption bytes, metadata blobs, canonical tag XML, and ACL durable strings remain confined to their recorded format owners and approved opaque carrier boundary. The current tag/ACL representations remain frozen until their planned framed replacements and coordinated container advances land. | The ownership design intentionally crosses selected crate boundaries, so visibility cannot express which crate owns interpretation and which may only transport the opaque value. | Exact-current goldens and rejection matrices prove bytes and behavior but do not prevent an additional crate from becoming an unrecorded interpreter or producer. | The codec declarations and cross-crate uses, paired with the current owner-local goldens, containing-format inventory, and still-active Phase 2 format gates in `storage-upgrade-versioning-plan.md`. |
 | Dynamic/static route authority (1) | Only the process bootstrap owns dynamic runtime-map publication; request consumers cannot upgrade a route handle; standalone identity files and mutation protocol remain storage-owned; `legacy-local` cannot return. | Both static request handles and dynamic publication handles are public capabilities needed by the process layer, while file names and role spellings are not type-level properties. | Route transition and restart tests do not reject an additional consumer, duplicated file protocol, or parser role. | Production runtime-handle consumers, standalone type consumers/file spellings and mutation sites, and process-role parsing. Deleted constructor spellings and the crate-private authorized constructor are no longer scanned. |
 | Curated cross-crate test support (2) | Feature-gated public test support cannot expose physical PG/node/shard/route/proof/claim/durable-row/generation/EC-shape authority, including through aliases or reexports. | Several forbidden types are public production types, so ordinary privacy and private-interface lints cannot stop the curated test namespace from reexporting them. | Tests consuming the intended facade do not enumerate all public declarations or transitive aliases. | Recursive declaration-semantic scan of `storage::test_support` plus outcome-based adversarial fixtures. |
 
@@ -6926,7 +6928,43 @@ Phase 6 broad snapshot-lease boundary slice (2026-08-09):
   owner-local tests continue to pin stale-snapshot retry, reclaim exclusion
   before handoff, all-or-release behavior, exact subject/layout binding, and
   broad-to-narrow release ordering. The checker baseline is now 30 actual
-  `fail_with_matches` invocations (26 top-level and four nested).
+  `fail_with_matches` invocations.
+
+Final Phase 6 completion audit (2026-08-09):
+
+- audited every surviving invocation against the nine-cohort rationale table.
+  The checker contains 30 actual `fail_with_matches` invocations (27
+  top-level and three nested) in 849 lines, down from the 7,181-line,
+  224-check transitional baseline;
+- confirmed that no temporary payload/read/delete caller inventory,
+  discovered-file inventory, historical node-client method list, or private
+  representation inventory remains. The exact recovery-authority inventory
+  is retained deliberately: recovery constructors and lower mutation entry
+  points share storage-internal visibility, so this is the semantic review
+  boundary for the leader-bound recovery path rather than migration tracking;
+- replaced the two remaining exact fixture-output comparisons with semantic
+  adversarial outcomes. Publisher fixtures now require each authority-bypass
+  class while proving test-only scopes stay invisible. Curated test-support
+  fixtures isolate aliases, reexports, multiline declarations, unions,
+  associated types, and trait implementations in separate source files, so
+  every parser boundary must independently produce its expected semantic
+  diagnostic while comments, literals, and method bodies remain ignored.
+  Fixture line changes and additional independent cases no longer require
+  copying a complete diagnostic transcript;
+- reconciled the four nested-codec checks with the active versioning plan.
+  Current ownership containment and exact-current evidence are complete, but
+  the framed tag/ACL carriers and coordinated version advances remain open.
+  The retained checks protect both the permanent ownership boundary and the
+  frozen current representation while that separate work proceeds; and
+- re-audited the overall completion criteria. Raw stores and node engines are
+  private; production node access is role- and route-capability-bound;
+  authenticated RPC dispatch constructs the same server-local capabilities;
+  publisher and recovery mutation are typed and centrally validated; test
+  hooks are absent from production feature graphs; and every remaining shell
+  check covers a semantic source/configuration property which Rust or Cargo
+  does not otherwise reject. The boundary check, shell syntax validation,
+  formatting, strict workspace Clippy, all 24 storage compile-fail doctests,
+  and all 8,180 workspace tests pass. Phase 6 and this plan are complete.
 
 For each remaining section, record:
 
@@ -6935,10 +6973,9 @@ For each remaining section, record:
 - why an ordinary unit or integration test is insufficient
 - the stable input being inspected
 
-Expected long-term survivors are small semantic checks such as:
+The retained long-term checks are semantic checks for:
 
 - format/encoding version coordination
-- temporary prohibitions while a migration is incomplete
 - feature/dependency configuration that Cargo does not otherwise reject
 - documentation consistency that cannot be generated from Rust definitions
 

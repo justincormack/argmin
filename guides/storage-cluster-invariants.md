@@ -330,6 +330,25 @@ are backed by apply-time validation of their exact reservation, durable
 preimage, generation, or cleanup snapshot; those invariants remain covered by
 recovery and malformed-envelope tests rather than route-method name scans.
 
+## Residual boundary-check role
+
+The storage boundary checker is no longer a parallel inventory of production
+methods, test files, or physical payload callers. Rust privacy and scoped
+capabilities enforce those boundaries. Its retained rules cover only semantic
+properties which the compiler does not otherwise reject: resolved Cargo
+feature graphs, canonical metadata-command publisher/recovery classification,
+selected same-crate conversion and retry-budget rules, process/HTTP dependency
+direction, opacity of intentionally public transfer and administration
+facades, nested-codec ownership, route-publication ownership, and the curated
+cross-crate test-support surface.
+
+Recovery is the one deliberately exact storage-internal authority inventory.
+Its leader proof, derivative command chain, and lower mutation entry points
+share crate/module visibility, so adding or moving an authority-bearing use is
+an architectural review event. All former temporary shard-read, shard-delete,
+payload-lease, discovered-file, and historical method-name inventories are
+gone.
+
 ## Storage operation-class matrix
 
 The table below records the storage operation classes and representative

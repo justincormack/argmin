@@ -2501,7 +2501,7 @@ Raft peer client and server transports are storage-owned and boundary-checked.
     the removed storage-node policy.
 14. **Complete — production error, debug, and dependency containment.** Completed on 2026-08-08.
     The Phase 5 test-support
-    work in `storage-boundary-compiler-enforcement-plan.md` completed on 2026-08-07. Raw
+    work in `completed/storage-boundary-compiler-enforcement-plan.md` completed on 2026-08-07. Raw
     stream/direct-PUT cleanup assertions, UploadPartCopy shard-loss injection, backfill and
     retained-placement fixtures, lifecycle/reclaim generation observations, and broad multipart
     state-model records are now storage-owner tests or opaque/logical owner-defined scenarios.

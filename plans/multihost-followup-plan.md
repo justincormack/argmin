@@ -11,7 +11,7 @@ Related documents:
 - [distributed correctness review, July 2026](completed/distributed-correctness-review-2026-07.md)
 - [distributed correctness confidence review, July 2026](completed/distributed-correctness-confidence-review-2026-07.md)
 - [control-plane authentication and identity plan](control-plane-auth-identity-plan.md)
-- [storage boundary compiler-enforcement plan](storage-boundary-compiler-enforcement-plan.md)
+- [storage boundary compiler-enforcement plan](completed/storage-boundary-compiler-enforcement-plan.md)
 - [immutable placement capacity weights](immutable-placement-capacity-weights.md)
 - [production backpressure plan](production-backpressure-plan.md)
 - [DeleteBucket reservation classification](delete-bucket-reservation-classification-plan.md)

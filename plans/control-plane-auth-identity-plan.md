@@ -756,7 +756,7 @@ Do not expose secrets, MACs, raw credential material, or full internal payloads.
   Its authenticated process-role permission is only the outer authorization
   layer; trusted PG roles and request-scoped route/payload capabilities remain
   owned by
-  [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md)
+  [storage-boundary-compiler-enforcement-plan.md](completed/storage-boundary-compiler-enforcement-plan.md)
   and are reconstructed from local state after RPC authentication.
   Compatibility with pre-release artifacts that lack auth configuration is also
   out of scope.

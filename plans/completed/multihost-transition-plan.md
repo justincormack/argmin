@@ -12679,7 +12679,7 @@ Post-12.4 sequencing for TCP transport and production-shaped config:
   shard writes and transfer/bootstrap checkpoint installation remain denied to
   maintenance. This table is not a substitute for the non-forgeable PG roles
   and request-scoped route/payload capabilities in
-  [storage-boundary-compiler-enforcement-plan.md](../storage-boundary-compiler-enforcement-plan.md);
+  [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md);
   authenticated Unix/TCP dispatch must validate and construct those local
   capabilities before storage effects. Because the full nested frame is
   covered, its route epoch,

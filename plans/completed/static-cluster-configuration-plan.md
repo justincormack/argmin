@@ -9,7 +9,7 @@ Related plans:
 
 - [multihost-followup-plan.md](../multihost-followup-plan.md)
 - [control-plane-auth-identity-plan.md](../control-plane-auth-identity-plan.md)
-- [storage-boundary-compiler-enforcement-plan.md](../storage-boundary-compiler-enforcement-plan.md)
+- [storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md)
 
 ## Purpose
 
@@ -545,7 +545,7 @@ hosted by a control-plane process.
 
 These configured roles and their permitted outbound protocol families are not
 the request-scoped storage route capabilities defined by
-[storage-boundary-compiler-enforcement-plan.md](../storage-boundary-compiler-enforcement-plan.md),
+[storage-boundary-compiler-enforcement-plan.md](storage-boundary-compiler-enforcement-plan.md),
 which are derived only from live local routing state and are never read from
 the manifest.
 

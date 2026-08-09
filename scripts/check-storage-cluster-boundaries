@@ -61,53 +61,63 @@ publisher_scanner_fixture=$(
     awk -f scripts/check-storage-cluster-boundary-publishers.awk \
         scripts/fixtures/storage-boundary-publishers/inline-test-items.rs
 )
-expected_publisher_scanner_fixture=$(cat <<'EOF'
-MARKER	FixtureProductionPublisher:production_publisher_after_inline_test_module
-PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:production_publisher_after_inline_test_module:FixtureProductionPublisher:try_set_pending_metadata_command_for_bucket
-MARKER	LiveFeaturePublisher:production_feature_publisher_must_remain_visible
-PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:production_feature_publisher_must_remain_visible:LiveFeaturePublisher:try_install_pending_metadata_command_for_bucket
-MARKER	TypedSnapshotPublisher:typed_snapshot_sensitive_publisher_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_snapshot_sensitive_publisher_without_marker_is_rejected:install_snapshot_sensitive_metadata_command_or_drain
-MARKER	TypedSnapshotBucketControlPublisher:typed_snapshot_sensitive_bucket_control_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_snapshot_sensitive_bucket_control_without_marker_is_rejected:install_snapshot_sensitive_bucket_control_command_or_drain
-MARKER	TypedSnapshotBucketPgPublisher:typed_snapshot_sensitive_bucket_pg_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_snapshot_sensitive_bucket_pg_without_marker_is_rejected:install_snapshot_sensitive_bucket_pg_command_or_drain
-MARKER	TypedAllocatorPublisher:typed_allocator_cleanup_publisher_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_allocator_cleanup_publisher_without_marker_is_rejected:install_allocator_cleanup_metadata_command_with_fresh_id
-MARKER	TypedTerminalSessionPublisher:typed_terminal_session_publisher_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_terminal_session_publisher_without_marker_is_rejected:install_terminal_session_retry_metadata_command
-MARKER	TypedMatchingOutcomePublisher:typed_matching_outcome_publisher_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_matching_outcome_publisher_without_marker_is_rejected:install_matching_outcome_retry_metadata_command
-MARKER	TypedApplyValidatedPublisher:typed_apply_validated_publisher_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_apply_validated_publisher_without_marker_is_rejected:install_apply_validated_metadata_command_with_fresh_id
-MARKER	TypedGenericDrainPublisher:typed_generic_drain_is_not_shell_inventoried
-TYPED_MISSING_MARKER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:typed_generic_drain_without_marker_is_rejected:drain_pending_object_metadata_commands_for_publisher
-MARKER	RawGenericDrainPublisher:raw_generic_drain_from_publisher_is_rejected
-PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:raw_generic_drain_from_publisher_is_rejected:RawGenericDrainPublisher:raw_pending_object_metadata_command_drain
-PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:raw_generic_drain_from_unmarked_wrapper_is_rejected:<missing>:raw_pending_object_metadata_command_drain
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:raw_inner_drain_from_unmarked_wrapper_is_rejected:metadata_command_authorized_drain_primitive
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_authority_construction_from_unmarked_wrapper_is_rejected:metadata_command_recovery_authority_constructor
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_authority_constructor_function_item_is_rejected:metadata_command_recovery_authority_constructor
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_invocation_construction_from_unmarked_wrapper_is_rejected:metadata_command_recovery_invocation_constructor
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_wrapper_from_unmarked_wrapper_is_rejected:metadata_command_local_recovery_drain
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_execution_route_from_unmarked_wrapper_is_rejected:metadata_command_recovery_execution_route
-PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_execution_route_struct_literal_is_rejected:<missing>:metadata_command_execution_route_struct_literal
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_proof_derivation_from_unmarked_wrapper_is_rejected:metadata_command_recovery_proof_derivation
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_leader_construction_from_unmarked_wrapper_is_rejected:metadata_command_recovery_leader_constructor
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_apply_from_unmarked_wrapper_is_rejected:metadata_command_recovery_apply
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_reissued_apply_from_unmarked_wrapper_is_rejected:metadata_command_recovery_apply_reissued
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_abandon_from_unmarked_wrapper_is_rejected:metadata_command_recovery_record_abandoned
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_pending_removal_from_unmarked_wrapper_is_rejected:metadata_command_recovery_remove_pending
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_reissue_from_unmarked_wrapper_is_rejected:metadata_command_recovery_reissue
-RECOVERY_DRAIN_USE	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:recovery_bucket_finisher_from_unmarked_wrapper_is_rejected:metadata_command_recovery_bucket_finisher
-PUBLISHER	scripts/fixtures/storage-boundary-publishers/inline-test-items.rs:retired_recovery_finisher_from_unmarked_wrapper_is_rejected:<missing>:retired_metadata_command_recovery_finisher
-EOF
+publisher_scanner_fixture_failure=""
+publisher_fixture_required_patterns=(
+    $'^MARKER\tFixtureProductionPublisher:production_publisher_after_inline_test_module$'
+    $'^PUBLISHER\t.*:production_publisher_after_inline_test_module:FixtureProductionPublisher:try_set_pending_metadata_command_for_bucket$'
+    $'^MARKER\tLiveFeaturePublisher:production_feature_publisher_must_remain_visible$'
+    $'^PUBLISHER\t.*:production_feature_publisher_must_remain_visible:LiveFeaturePublisher:try_install_pending_metadata_command_for_bucket$'
+    $'^MARKER\tTypedSnapshotPublisher:typed_snapshot_sensitive_publisher_is_not_shell_inventoried$'
+    $'^MARKER\tTypedSnapshotBucketControlPublisher:typed_snapshot_sensitive_bucket_control_is_not_shell_inventoried$'
+    $'^MARKER\tTypedSnapshotBucketPgPublisher:typed_snapshot_sensitive_bucket_pg_is_not_shell_inventoried$'
+    $'^MARKER\tTypedAllocatorPublisher:typed_allocator_cleanup_publisher_is_not_shell_inventoried$'
+    $'^MARKER\tTypedTerminalSessionPublisher:typed_terminal_session_publisher_is_not_shell_inventoried$'
+    $'^MARKER\tTypedMatchingOutcomePublisher:typed_matching_outcome_publisher_is_not_shell_inventoried$'
+    $'^MARKER\tTypedApplyValidatedPublisher:typed_apply_validated_publisher_is_not_shell_inventoried$'
+    $'^MARKER\tTypedGenericDrainPublisher:typed_generic_drain_is_not_shell_inventoried$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_snapshot_sensitive_publisher_without_marker_is_rejected:install_snapshot_sensitive_metadata_command_or_drain$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_snapshot_sensitive_bucket_control_without_marker_is_rejected:install_snapshot_sensitive_bucket_control_command_or_drain$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_snapshot_sensitive_bucket_pg_without_marker_is_rejected:install_snapshot_sensitive_bucket_pg_command_or_drain$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_allocator_cleanup_publisher_without_marker_is_rejected:install_allocator_cleanup_metadata_command_with_fresh_id$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_terminal_session_publisher_without_marker_is_rejected:install_terminal_session_retry_metadata_command$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_matching_outcome_publisher_without_marker_is_rejected:install_matching_outcome_retry_metadata_command$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_apply_validated_publisher_without_marker_is_rejected:install_apply_validated_metadata_command_with_fresh_id$'
+    $'^TYPED_MISSING_MARKER\t.*:typed_generic_drain_without_marker_is_rejected:drain_pending_object_metadata_commands_for_publisher$'
+    $'^MARKER\tRawGenericDrainPublisher:raw_generic_drain_from_publisher_is_rejected$'
+    $'^PUBLISHER\t.*:raw_generic_drain_from_publisher_is_rejected:RawGenericDrainPublisher:raw_pending_object_metadata_command_drain$'
+    $'^PUBLISHER\t.*:raw_generic_drain_from_unmarked_wrapper_is_rejected:<missing>:raw_pending_object_metadata_command_drain$'
+    $'^RECOVERY_DRAIN_USE\t.*:raw_inner_drain_from_unmarked_wrapper_is_rejected:metadata_command_authorized_drain_primitive$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_authority_construction_from_unmarked_wrapper_is_rejected:metadata_command_recovery_authority_constructor$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_authority_constructor_function_item_is_rejected:metadata_command_recovery_authority_constructor$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_invocation_construction_from_unmarked_wrapper_is_rejected:metadata_command_recovery_invocation_constructor$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_wrapper_from_unmarked_wrapper_is_rejected:metadata_command_local_recovery_drain$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_execution_route_from_unmarked_wrapper_is_rejected:metadata_command_recovery_execution_route$'
+    $'^PUBLISHER\t.*:recovery_execution_route_struct_literal_is_rejected:<missing>:metadata_command_execution_route_struct_literal$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_proof_derivation_from_unmarked_wrapper_is_rejected:metadata_command_recovery_proof_derivation$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_leader_construction_from_unmarked_wrapper_is_rejected:metadata_command_recovery_leader_constructor$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_apply_from_unmarked_wrapper_is_rejected:metadata_command_recovery_apply$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_reissued_apply_from_unmarked_wrapper_is_rejected:metadata_command_recovery_apply_reissued$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_abandon_from_unmarked_wrapper_is_rejected:metadata_command_recovery_record_abandoned$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_pending_removal_from_unmarked_wrapper_is_rejected:metadata_command_recovery_remove_pending$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_reissue_from_unmarked_wrapper_is_rejected:metadata_command_recovery_reissue$'
+    $'^RECOVERY_DRAIN_USE\t.*:recovery_bucket_finisher_from_unmarked_wrapper_is_rejected:metadata_command_recovery_bucket_finisher$'
+    $'^PUBLISHER\t.*:retired_recovery_finisher_from_unmarked_wrapper_is_rejected:<missing>:retired_metadata_command_recovery_finisher$'
 )
-if [[ "$publisher_scanner_fixture" != "$expected_publisher_scanner_fixture" ]]; then
-    fail_with_matches \
-        "Publisher scanner fixture changed; test-only scopes must be excluded without hiding production-feature publishers" \
-        "$publisher_scanner_fixture"
+for pattern in "${publisher_fixture_required_patterns[@]}"; do
+    if ! rg -q -- "$pattern" <<<"$publisher_scanner_fixture"; then
+        publisher_scanner_fixture_failure+="missing semantic fixture outcome: $pattern"$'\n'
+    fi
+done
+if rg -q 'TestOnly(Module|Item)Publisher' <<<"$publisher_scanner_fixture"; then
+    publisher_scanner_fixture_failure+="test-only publisher escaped cfg filtering"$'\n'
 fi
+if rg -q $'^(PUBLISHER|TYPED_MISSING_MARKER)\t.*:typed_.*_is_not_shell_inventoried:' \
+    <<<"$publisher_scanner_fixture"; then
+    publisher_scanner_fixture_failure+="typed publisher with a marker was misclassified"$'\n'
+fi
+fail_with_matches \
+    "Publisher scanner fixture must reject every authority bypass while excluding test-only scopes" \
+    "${publisher_scanner_fixture_failure%$'\n'}"
 
 recovery_drain_authority_uses=$(
     printf '%s\n' "$publisher_scan_output" \
@@ -790,44 +800,45 @@ test_support_physical_api_fixture=$(
         scripts/fixtures/storage-boundary-test-support-api/test_support \
         scripts/fixtures/storage-boundary-test-support-api
 )
-expected_test_support_physical_api_fixture='scripts/fixtures/storage-boundary-test-support-api/lib.rs:18:HiddenRoute
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:18:PgRouteSnapshot
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:21:ExportedRoute
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:21:HiddenRoute
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:22:wildcard-import
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:25:ShardKey
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:29:LifecycleSweepClaimRecord
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:32:PgRouteSnapshot
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:32:RawRouteObservation
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:34:PgId
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:9:ImportedLayout
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:9:PayloadLayout
-scripts/fixtures/storage-boundary-test-support-api/lib.rs:9:RoutedPg
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/api.rs:3:NestedLayout
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/api.rs:5:BucketWriteReservationProof
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:11:EcShape
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:15:CommentRenamed
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:15:EcShape
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:16:wildcard-import
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:17:CommentRenamed
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:1:EcShape
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:1:Renamed
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:25:PgId
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:31:Item
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:31:PgId
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:38:EcShape
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:4:wildcard-import
-scripts/fixtures/storage-boundary-test-support-api/test_support/nested/split_visibility.rs:7:Renamed'
 test_support_physical_api_fixture_failure=""
-if [[ "$test_support_physical_api_fixture" != "$expected_test_support_physical_api_fixture" ]]; then
-    test_support_physical_api_fixture_failure=$test_support_physical_api_fixture
-    if [[ -z "$test_support_physical_api_fixture_failure" ]]; then
-        test_support_physical_api_fixture_failure="fixture scan returned no matches"
+test_support_fixture_required_patterns=(
+    'lib\.rs:[0-9]+:PayloadLayout$'
+    'lib\.rs:[0-9]+:RoutedPg$'
+    'lib\.rs:[0-9]+:ImportedLayout$'
+    'lib\.rs:[0-9]+:HiddenRoute$'
+    'lib\.rs:[0-9]+:ExportedRoute$'
+    'lib\.rs:[0-9]+:wildcard-import$'
+    'lib\.rs:[0-9]+:ShardKey$'
+    'lib\.rs:[0-9]+:LifecycleSweepClaimRecord$'
+    'lib\.rs:[0-9]+:RawRouteObservation$'
+    'lib\.rs:[0-9]+:PgId$'
+    'nested/api\.rs:[0-9]+:NestedLayout$'
+    'nested/api\.rs:[0-9]+:BucketWriteReservationProof$'
+    'nested/split_alias\.rs:[0-9]+:SplitAlias$'
+    'nested/split_alias\.rs:[0-9]+:EcShape$'
+    'nested/split_wildcard\.rs:[0-9]+:wildcard-import$'
+    'nested/split_function\.rs:[0-9]+:EcShape$'
+    'nested/split_trait_method\.rs:[0-9]+:EcShape$'
+    'nested/comment_alias\.rs:[0-9]+:CommentAlias$'
+    'nested/comment_alias\.rs:[0-9]+:EcShape$'
+    'nested/comment_wildcard\.rs:[0-9]+:wildcard-import$'
+    'nested/comment_function\.rs:[0-9]+:EcShape$'
+    'nested/union\.rs:[0-9]+:PgId$'
+    'nested/associated_type\.rs:[0-9]+:Item$'
+    'nested/associated_type\.rs:[0-9]+:PgId$'
+    'nested/impl_header\.rs:[0-9]+:EcShape$'
+)
+for pattern in "${test_support_fixture_required_patterns[@]}"; do
+    if ! rg -q -- "$pattern" <<<"$test_support_physical_api_fixture"; then
+        test_support_physical_api_fixture_failure+="missing semantic fixture outcome: $pattern"$'\n'
     fi
+done
+if rg -q 'nested/safe_syntax\.rs:' <<<"$test_support_physical_api_fixture"; then
+    test_support_physical_api_fixture_failure+="comments, literals, or implementation bodies produced a false public-API diagnostic"$'\n'
 fi
 fail_with_matches \
-    "Curated test-support API scanner must resolve aliases and recursively reject physical types in nested storage::test_support modules" \
-    "$test_support_physical_api_fixture_failure"
+    "Curated test-support API scanner must reject every physical API shape without scanning comments, literals, or implementation bodies" \
+    "${test_support_physical_api_fixture_failure%$'\n'}"
 
 if [[ "$failed" -ne 0 ]]; then
     echo
