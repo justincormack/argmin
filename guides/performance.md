@@ -1,5 +1,17 @@
 # Performance Guide
 
+While some performance work has taken place, this has not been a high priority.
+Most of the performance however is due to necessary work, such as writing disks,
+fsync, and the erasure coding, encryption and checksum paths documented below.
+
+In general, with SSDs, most storage servers are network bound, so this is the
+key to bear in mind for throughput.
+
+There are not yet optimisations for small objects, either on the read side
+or batched fsync on the write side.
+
+## Benchmarks
+
 Argmin provides focused benchmarks for the CPU-heavy checksum, erasure-coding,
 SigV4, and peer TLS paths. These benchmarks are useful for checking runtime
 backend selection and comparing machines or cryptography providers. They are

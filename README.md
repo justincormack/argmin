@@ -3,7 +3,9 @@
 S3-compatible object storage written in Rust.
 
 Current status: not yet suited for production use, fine for local use cases like CI. There is
-still work to do to get this production ready, see [plans](plans/) for details.
+still work to do to get this production ready, see [plans](plans/) for details. Currently
+upgrades are not supported, this will be supported from the first tagged version, which
+should happen shortly.
 
 AI notice: this code was written with AI, with detailed care, attention and supervision.
 
