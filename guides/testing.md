@@ -23,6 +23,7 @@ cargo test -p server-http -- --nocapture
 
 # Broad local verification.
 cargo nextest run
+cargo test -p storage --doc
 ./scripts/check-storage-cluster-boundaries
 cargo clippy --all-targets --all-features -- -D warnings
 

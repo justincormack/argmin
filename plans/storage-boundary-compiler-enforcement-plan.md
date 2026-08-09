@@ -6401,8 +6401,9 @@ Phase 6 inventory baseline (2026-08-08):
   construction are now storage-private. The inventory therefore treats a
   source scan which merely restates that visibility as redundant rather than
   as continuing enforcement;
-- `scripts/check-storage-cluster-boundaries` is 7,181 lines and has 216
-  `fail_with_matches` sections, three exact production shard-caller
+- `scripts/check-storage-cluster-boundaries` is 7,181 lines and has 224 actual
+  `fail_with_matches` invocations (216 top-level and eight nested), three exact
+  production shard-caller
   inventories, one discovered-file inventory, two publisher/recovery
   inventories, one publisher registry comparison, and eight exact fixture
   output inventories. This is the transitional baseline, not the intended
@@ -6499,7 +6500,49 @@ Phase 6 raw-error removal slice (2026-08-08):
   `cargo check -p storage --no-default-features --features ring`, not a
   provider-free build.
 
-The checker baseline after this slice is 198 `fail_with_matches` sections.
+The checker baseline after this slice is 206 actual `fail_with_matches`
+invocations (198 top-level and eight nested). Phase 6 uses actual invocation
+count consistently; the top-level count is retained parenthetically only to
+make the older inventory convention traceable.
+
+Phase 6 physical/opaque-boundary removal slice (2026-08-09):
+
+- removed 85 actual checks (84 top-level and one nested) and 1,880 net lines
+  which inventoried private physical payload records, multipart internals,
+  topology/control-plane/Raft assembly
+  fields, opaque capability fields and formatting implementations, exact
+  source-file membership, and already-removed legacy symbols. These checks
+  prescribed names, fields, files, or implementation shapes which are no
+  longer part of the cross-crate boundary;
+- the structural replacements are storage-private representation types and
+  fields, private raw node/store/placement methods, structurally linear public
+  multipart capabilities, and owner-local behavior, provenance, redaction,
+  and non-mutation tests. Multipart authorization candidates and capabilities
+  carry a private non-`Clone` marker and have compile-fail API examples; the
+  cloneable multipart-upload-ID authority carries a private non-comparable
+  marker and a compile-fail equality example. Standard CI runs
+  `cargo test -p storage --doc` after Nextest, so removing a marker or adding a
+  manual trait implementation fails the ordinary CI path. Thus an accidental
+  derive cannot make one-use authority reusable or expose hidden-key equality.
+  Moving an implementation between storage source files or renaming a private
+  helper no longer requires refreshing a parallel shell inventory;
+- removed the two remaining public-method spelling scans for low-level shard
+  reads and storage-node lease/reclaim primitives. Those methods are
+  crate-local, so making an external caller compile is the authoritative
+  boundary. Their production *use* remains constrained by the semantic caller
+  inventories below;
+- deliberately retained the three temporary exact caller inventories for
+  physical shard deletion, raw shard reads, and segment payload reads. They
+  identify incomplete capability migrations and reject a new bypass even when
+  the underlying primitive remains correctly private. The coarse generation
+  lease caller rule is retained for the same reason: it pins the required
+  broad-to-narrow leased-snapshot handoff rather than a visibility fact; and
+- deleted the discovered coordinator payload-read file inventory. File
+  membership is not an authority boundary, and the opaque read types plus the
+  retained segment-read caller rule enforce the relevant behavior.
+
+The checker baseline after this slice is 121 actual `fail_with_matches`
+invocations (114 top-level and seven nested).
 
 For each remaining section, record:
 
@@ -6535,6 +6578,7 @@ Each phase must run:
 - `cargo fmt --all`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo nextest run`
+- `cargo test -p storage --doc` for negative public capability contracts
 
 Boundary-changing phases also require:
 

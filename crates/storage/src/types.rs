@@ -623,17 +623,39 @@ impl std::fmt::Debug for MultipartUploadIdKey {
 /// The durable signing key, ID encoding, and issuance operations remain private to storage.
 /// Higher layers may ask only the logical authorization questions needed to reproduce S3
 /// behavior for terminal or nonexistent uploads.
+///
+/// The authority is cloneable because bucket snapshots and response state share it, but it is
+/// deliberately not comparable: equality would expose whether two opaque authorities retain the
+/// same hidden signing key.
+///
+/// ```compile_fail
+/// use storage::MultipartUploadIdAuthority;
+///
+/// fn require_equality<T: PartialEq>() {}
+/// require_equality::<MultipartUploadIdAuthority>();
+/// ```
 #[derive(Clone)]
-pub struct MultipartUploadIdAuthority(MultipartUploadIdKey);
+pub struct MultipartUploadIdAuthority {
+    key: MultipartUploadIdKey,
+    _non_comparable: NonComparableAuthorityMarker,
+}
+
+/// Prevents an accidental `PartialEq`/`Eq` derive from comparing opaque key material while
+/// retaining the authority's intentional `Clone` implementation.
+#[derive(Clone)]
+struct NonComparableAuthorityMarker;
 
 impl MultipartUploadIdAuthority {
     fn new(key: MultipartUploadIdKey) -> Self {
-        Self(key)
+        Self {
+            key,
+            _non_comparable: NonComparableAuthorityMarker,
+        }
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn for_test() -> Self {
-        Self(MultipartUploadIdKey::from_bytes(
+        Self::new(MultipartUploadIdKey::from_bytes(
             [1; MULTIPART_UPLOAD_ID_KEY_LEN],
         ))
     }
@@ -645,7 +667,7 @@ impl MultipartUploadIdAuthority {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> bool {
-        self.0.authenticates(bucket, key, upload_id)
+        self.key.authenticates(bucket, key, upload_id)
     }
 
     #[must_use]
@@ -654,7 +676,7 @@ impl MultipartUploadIdAuthority {
         upload_id: &UploadId,
         initiator_principal: &str,
     ) -> bool {
-        self.0
+        self.key
             .was_issued_for_principal(upload_id, initiator_principal)
     }
 }
@@ -4967,6 +4989,13 @@ pub(crate) struct AbortingMultipartUploadBucketWitness {
 
 // ── Multipart upload types ─────────────────────────────────────────
 
+/// Zero-sized structural guard carried by multipart authorization candidates and capabilities.
+///
+/// It deliberately implements neither `Clone` nor `Copy`. Because it is a private field, an
+/// accidental derive on an enclosing public capability fails to compile instead of silently
+/// turning one authorization decision into reusable authority.
+struct LinearMultipartCapabilityMarker;
+
 /// Multipart upload state machine.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5115,7 +5144,14 @@ pub(crate) enum MultipartUploadManagementLookup {
 /// Storage retains the complete durable upload record. Higher layers may inspect only the
 /// logical ownership identities needed for authorization, then consume an in-progress candidate
 /// into the capability required by the storage-owned abort mutation.
-pub struct MultipartUploadAbortCandidate(MultipartUploadRecord);
+///
+/// ```compile_fail
+/// use storage::MultipartUploadAbortCandidate;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<MultipartUploadAbortCandidate>();
+/// ```
+pub struct MultipartUploadAbortCandidate(MultipartUploadRecord, LinearMultipartCapabilityMarker);
 
 impl MultipartUploadAbortCandidate {
     #[must_use]
@@ -5173,11 +5209,18 @@ impl MultipartUploadAuthorizationIdentity {
 }
 
 /// Opaque capability authorizing mutation of one exact in-progress upload by abort.
-pub struct AuthorizedMultipartUploadAbort(MultipartUploadRecord);
+///
+/// ```compile_fail
+/// use storage::AuthorizedMultipartUploadAbort;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<AuthorizedMultipartUploadAbort>();
+/// ```
+pub struct AuthorizedMultipartUploadAbort(MultipartUploadRecord, LinearMultipartCapabilityMarker);
 
 impl AuthorizedMultipartUploadAbort {
     pub(crate) fn assume_authorized(upload: MultipartUploadRecord) -> Self {
-        Self(upload)
+        Self(upload, LinearMultipartCapabilityMarker)
     }
 
     pub(crate) fn record(&self) -> &MultipartUploadRecord {
@@ -5211,9 +5254,9 @@ pub enum MultipartUploadAbortLookup {
 impl MultipartUploadAbortLookup {
     pub(crate) fn from_management_lookup(lookup: MultipartUploadManagementLookup) -> Self {
         match lookup {
-            MultipartUploadManagementLookup::InProgress(upload) => {
-                Self::InProgress(Box::new(MultipartUploadAbortCandidate(*upload)))
-            }
+            MultipartUploadManagementLookup::InProgress(upload) => Self::InProgress(Box::new(
+                MultipartUploadAbortCandidate(*upload, LinearMultipartCapabilityMarker),
+            )),
             MultipartUploadManagementLookup::NonInProgress(upload) => {
                 Self::NonInProgress(MultipartUploadAuthorizationIdentity::from_upload(*upload))
             }
@@ -5228,7 +5271,17 @@ impl MultipartUploadAbortLookup {
 /// Storage retains the complete durable upload record. Higher layers may inspect only the
 /// logical ownership identities needed for authorization, then consume the candidate into the
 /// capability required by the storage-owned listing operation.
-pub struct MultipartUploadListPartsCandidate(MultipartUploadRecord);
+///
+/// ```compile_fail
+/// use storage::MultipartUploadListPartsCandidate;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<MultipartUploadListPartsCandidate>();
+/// ```
+pub struct MultipartUploadListPartsCandidate(
+    MultipartUploadRecord,
+    LinearMultipartCapabilityMarker,
+);
 
 impl MultipartUploadListPartsCandidate {
     #[must_use]
@@ -5256,11 +5309,21 @@ impl std::fmt::Debug for MultipartUploadListPartsCandidate {
 }
 
 /// Opaque capability authorizing ListParts for one exact in-progress upload.
-pub struct AuthorizedMultipartUploadListParts(MultipartUploadRecord);
+///
+/// ```compile_fail
+/// use storage::AuthorizedMultipartUploadListParts;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<AuthorizedMultipartUploadListParts>();
+/// ```
+pub struct AuthorizedMultipartUploadListParts(
+    MultipartUploadRecord,
+    LinearMultipartCapabilityMarker,
+);
 
 impl AuthorizedMultipartUploadListParts {
     pub(crate) fn assume_authorized(upload: MultipartUploadRecord) -> Self {
-        Self(upload)
+        Self(upload, LinearMultipartCapabilityMarker)
     }
 
     pub(crate) fn record(&self) -> &MultipartUploadRecord {
@@ -5288,9 +5351,9 @@ pub enum MultipartUploadListPartsLookup {
 impl MultipartUploadListPartsLookup {
     pub(crate) fn from_management_lookup(lookup: MultipartUploadManagementLookup) -> Self {
         match lookup {
-            MultipartUploadManagementLookup::InProgress(upload) => {
-                Self::InProgress(Box::new(MultipartUploadListPartsCandidate(*upload)))
-            }
+            MultipartUploadManagementLookup::InProgress(upload) => Self::InProgress(Box::new(
+                MultipartUploadListPartsCandidate(*upload, LinearMultipartCapabilityMarker),
+            )),
             MultipartUploadManagementLookup::NonInProgress(upload) => {
                 Self::NonInProgress(MultipartUploadAuthorizationIdentity::from_upload(*upload))
             }
@@ -5306,11 +5369,18 @@ impl MultipartUploadListPartsLookup {
 /// logical ownership, object key, checksum configuration, and encryption state required by the
 /// S3 authorization and encryption layers, then consume the candidate into the capability
 /// required to create the storage-owned part stream session.
-pub struct MultipartUploadPartCandidate(MultipartUploadRecord);
+///
+/// ```compile_fail
+/// use storage::MultipartUploadPartCandidate;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<MultipartUploadPartCandidate>();
+/// ```
+pub struct MultipartUploadPartCandidate(MultipartUploadRecord, LinearMultipartCapabilityMarker);
 
 impl MultipartUploadPartCandidate {
     pub(crate) fn from_record(upload: MultipartUploadRecord) -> Self {
-        Self(upload)
+        Self(upload, LinearMultipartCapabilityMarker)
     }
 
     #[must_use]
@@ -5353,9 +5423,17 @@ impl std::fmt::Debug for MultipartUploadPartCandidate {
 }
 
 /// Opaque capability authorizing stream-session creation for one exact in-progress upload.
+///
+/// ```compile_fail
+/// use storage::AuthorizedMultipartUploadPart;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<AuthorizedMultipartUploadPart>();
+/// ```
 pub struct AuthorizedMultipartUploadPart {
     upload: MultipartUploadRecord,
     part_number: u32,
+    _linear: LinearMultipartCapabilityMarker,
 }
 
 impl AuthorizedMultipartUploadPart {
@@ -5363,6 +5441,7 @@ impl AuthorizedMultipartUploadPart {
         Self {
             upload,
             part_number,
+            _linear: LinearMultipartCapabilityMarker,
         }
     }
 
@@ -5418,11 +5497,21 @@ impl MultipartUploadCompletionContext {
 }
 
 /// Opaque in-progress upload used while authorizing CompleteMultipartUpload.
-pub struct MultipartUploadCompletionCandidate(MultipartUploadRecord);
+///
+/// ```compile_fail
+/// use storage::MultipartUploadCompletionCandidate;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<MultipartUploadCompletionCandidate>();
+/// ```
+pub struct MultipartUploadCompletionCandidate(
+    MultipartUploadRecord,
+    LinearMultipartCapabilityMarker,
+);
 
 impl MultipartUploadCompletionCandidate {
     pub(crate) fn from_record(upload: MultipartUploadRecord) -> Self {
-        Self(upload)
+        Self(upload, LinearMultipartCapabilityMarker)
     }
 
     #[must_use]
@@ -5473,11 +5562,21 @@ impl std::fmt::Debug for MultipartUploadCompletionCandidate {
 }
 
 /// Linear capability authorizing snapshot acquisition for one exact in-progress upload.
-pub struct AuthorizedMultipartUploadCompletion(MultipartUploadRecord);
+///
+/// ```compile_fail
+/// use storage::AuthorizedMultipartUploadCompletion;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<AuthorizedMultipartUploadCompletion>();
+/// ```
+pub struct AuthorizedMultipartUploadCompletion(
+    MultipartUploadRecord,
+    LinearMultipartCapabilityMarker,
+);
 
 impl AuthorizedMultipartUploadCompletion {
     pub(crate) fn assume_authorized(upload: MultipartUploadRecord) -> Self {
-        Self(upload)
+        Self(upload, LinearMultipartCapabilityMarker)
     }
 
     pub(crate) fn into_record(self) -> MultipartUploadRecord {
@@ -5494,7 +5593,17 @@ impl std::fmt::Debug for AuthorizedMultipartUploadCompletion {
 }
 
 /// Opaque completed-upload replay state used while authorizing terminal replay.
-pub struct MultipartCompletionReplayCandidate(MultipartCompletionReplay);
+///
+/// ```compile_fail
+/// use storage::MultipartCompletionReplayCandidate;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<MultipartCompletionReplayCandidate>();
+/// ```
+pub struct MultipartCompletionReplayCandidate(
+    MultipartCompletionReplay,
+    LinearMultipartCapabilityMarker,
+);
 
 impl MultipartCompletionReplayCandidate {
     #[must_use]
@@ -5514,6 +5623,7 @@ impl MultipartCompletionReplayCandidate {
             last_modified: replay.last_modified,
             tags: replay.tags.map(|tags| (*tags).clone()),
             encryption: replay.encryption,
+            _linear: LinearMultipartCapabilityMarker,
         }
     }
 }
@@ -5527,6 +5637,13 @@ impl std::fmt::Debug for MultipartCompletionReplayCandidate {
 }
 
 /// Logical replay projection returned after CompleteMultipartUpload authorization.
+///
+/// ```compile_fail
+/// use storage::AuthorizedMultipartCompletionReplay;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<AuthorizedMultipartCompletionReplay>();
+/// ```
 pub struct AuthorizedMultipartCompletionReplay {
     upload_id: UploadId,
     fingerprint: MultipartCompletionFingerprint,
@@ -5536,6 +5653,7 @@ pub struct AuthorizedMultipartCompletionReplay {
     last_modified: u64,
     tags: Option<s3_types::TagSet>,
     encryption: ObjectEncryption,
+    _linear: LinearMultipartCapabilityMarker,
 }
 
 impl AuthorizedMultipartCompletionReplay {
@@ -5602,9 +5720,9 @@ impl MultipartUploadCompletionLookup {
             MultipartUploadManagementLookup::InProgress(upload) => Self::InProgress(Box::new(
                 MultipartUploadCompletionCandidate::from_record(*upload),
             )),
-            MultipartUploadManagementLookup::Replay(replay) => {
-                Self::Replay(Box::new(MultipartCompletionReplayCandidate(*replay)))
-            }
+            MultipartUploadManagementLookup::Replay(replay) => Self::Replay(Box::new(
+                MultipartCompletionReplayCandidate(*replay, LinearMultipartCapabilityMarker),
+            )),
             MultipartUploadManagementLookup::NonInProgress(_)
             | MultipartUploadManagementLookup::Missing => Self::Unavailable,
         }
@@ -5799,9 +5917,17 @@ struct MultipartCompletionCommitDefaults {
 }
 
 /// Completion snapshot bound to the exact upload authorized by the caller.
+///
+/// ```compile_fail
+/// use storage::AuthorizedMultipartCompletionSnapshot;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<AuthorizedMultipartCompletionSnapshot>();
+/// ```
 pub struct AuthorizedMultipartCompletionSnapshot {
     snapshot: MultipartCompletionSnapshot,
     defaults: MultipartCompletionCommitDefaults,
+    _linear: LinearMultipartCapabilityMarker,
 }
 
 impl AuthorizedMultipartCompletionSnapshot {
@@ -5818,6 +5944,7 @@ impl AuthorizedMultipartCompletionSnapshot {
                 tags: upload.tags,
                 metadata_blob: upload.metadata_blob,
             },
+            _linear: LinearMultipartCapabilityMarker,
         }
     }
 

@@ -279,11 +279,15 @@ and proves that the command is included before Peering while a later old-epoch
 command cannot change the metadata proof after deadline and successor
 activation.
 
-## StorageCluster Method Matrix
+## Storage operation-class matrix
 
-The method list below is exhaustive for the public `StorageCluster` surface.
-Additions to `StorageCluster` should update this matrix and the boundary check
-script in the same change.
+The table below records the storage operation classes and representative
+owner-side entry points used by the architecture. It is not an exhaustive
+public-API or source-file inventory: an entry may be a private implementation
+detail behind a typed route or opaque operation, and moving or renaming one
+does not require a boundary-check allowlist update. Rust visibility, scoped
+capability types, and the focused semantic checks described below define the
+actual boundary.
 
 | Methods | Class |
 |---|---|
@@ -315,7 +319,6 @@ script in the same change.
 | `create_upload_part_stream_session_with_route_validation`, `prepare_stream_segment_append_with_route_validation`, `finalize_upload_part_stream_with_route_validation` | Epoch-fenced routed object metadata PG effects for streamed UploadPart staging creation, segment-VID allocation, and finalization. Ordinary UploadPart and UploadPartCopy carry their immutable admitted effect fence to reservation, allocator, shard-write, and pending-command boundaries. `CreateStreamUpload` apply revalidates UploadPart targets against the current in-progress MPU row on each acting node |
 | `load_multipart_upload`, `load_in_progress_multipart_upload`, `try_load_in_progress_multipart_upload`, `load_in_progress_multipart_upload_for_listing`, `load_multipart_completion_snapshot`, `load_multipart_completion_preflight`, `list_multipart_parts_for_upload`, `lookup_abort_multipart_upload` | Epoch-fenced routed metadata PG |
 | `list_multipart_uploads_for_bucket` | Epoch-fenced routed metadata PG fanout |
-| `test_from_local_map_with_epoch`, `test_install_before_stream_abort_storage_hook`, `test_install_after_direct_put_metadata_publish_hook`, `test_install_before_placed_payload_shard_delete_hook`, `test_install_before_metadata_primary_payload_ack_delete_hook`, `test_install_best_effort_payload_cleanup_error_hook`, `test_install_before_metadata_command_apply_hook`, `test_install_before_abort_multipart_pending_install_hook`, `test_install_before_stream_put_create_pending_install_hook`, `test_install_before_stream_put_create_command_id_hook`, `test_install_before_bucket_delete_command_id_hook`, `test_install_before_metadata_command_apply_context_hook`, `test_apply_metadata_command_to_acting_set_from_origin`, `test_establish_multipart_completion_barrier`, `test_pg_ids`, `object_payload_lease_count`, `bucket_object_payload_lease_count`, `try_take_reclaim_work`, `test_default_payload_ec_scratch_allocation_count`, `test_bucket_pg_id_for`, `test_head_bucket_raw`, `test_object_pg_id_for`, `test_data_pg_id_for`, `test_object_generation_reservation_for`, `test_multipart_part_data_pg_id_for`, `test_get_object_meta`, `test_get_multipart_upload`, `test_get_multipart_part`, `test_list_multipart_parts`, `test_list_multipart_uploads_for_bucket`, `test_replace_live_object_segments`, `test_get_object_parts`, `test_replace_object_parts`, `test_get_object_version`, `test_get_object_segments_reclaim`, `test_payload_reclaim_exists`, `test_list_bucket_payload_reclaim_roots`, `test_force_became_noncurrent_at`, `test_create_and_enqueue_deleting_bucket_finalize`, `test_enqueue_current_bucket_delete_finalize`, `test_enqueue_missing_bucket_delete_finalize`, `test_reenqueue_bucket_delete_finalize`, `test_delete_bucket_metadata`, `test_get_all_multipart_part_segments_for_upload`, `test_set_upload_state`, `test_list_stream_segments`, `test_force_stream_upload_created_at`, `test_list_all_stream_uploads`, `test_create_stream_upload`, `test_shard_exists`, `test_lock_bucket_pg`, `test_placed_payload_shard_file_exists`, `test_payload_shard_file_path`, `test_payload_shard_file_exists` | Test hook |
 
 ## Associated Token Types
 
@@ -381,6 +384,13 @@ heartbeat adapter is test/test-hook-only.
 one multipart bucket/key/object-metadata-PG tuple. In addition to multipart
 control and completion, UploadPartCopy uses it for destination session
 creation, encrypted shard placement, segment append, and part finalization.
+Multipart authorization candidates and the operation-specific capabilities
+derived from them carry a private non-`Clone` marker, so consuming a candidate
+cannot accidentally become reusable merely because its retained durable
+record is cloneable. The multipart-upload-ID authority is intentionally
+cloneable for bucket snapshot/response sharing, but carries a separate
+non-comparable marker so equality cannot expose whether two authorities retain
+the same hidden signing key.
 The route binds the authorized upload row to the destination subject and
 carries the immutable request effect fence through every fresh durable
 reservation, segment-VID allocation, shard-file, and pending-command effect.
@@ -436,12 +446,14 @@ fails, the client retries from a fresh snapshot.
 
 Storage-node read-handle and reclaim-fence primitives are crate-local. The
 production surface is `StorageCluster` read-handle acquisition plus the
-placed-delete reclaim helper; boundary checks reject public low-level payload
-read APIs and public storage-node handle/fence APIs. Production payload-byte
-reads stay inside segment readers after acquiring read handles, except for the
-write-side publish validator, which performs an explicit placed read to prove
-acknowledged shard files still match their `WriteAck` before publishing
-metadata.
+placed-delete reclaim helper; Rust visibility prevents downstream use of the
+low-level payload-read and storage-node handle/fence APIs. Temporary semantic
+caller checks additionally keep physical shard deletion behind the placed
+reclaim fence, raw shard reads inside the storage segment reader or publish
+validator, and payload-byte reads behind `ReadRuntime` after handle
+acquisition. The write-side publish validator performs its explicit placed
+read to prove acknowledged shard files still match their `WriteAck` before
+publishing metadata.
 
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,
 and `ReleasedObjectPayloadLease::enqueue_object_payload_reclaim` are release
