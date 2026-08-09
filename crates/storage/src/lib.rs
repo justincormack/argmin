@@ -3614,22 +3614,21 @@ pub use types::{
     PutBucketSubresource, PutDeleteMarkerReq, PutLiveObjectReq, PutLiveObjectValidationError,
     PutObjectReq, RawChecksum, RetentionPeriod, RouteMapValidUntilMs, RouteMapValidity,
     SerializedBucketTagSet, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
-    SessionId, SessionIdError, ShardData, ShardIndex, ShardKey, ShardScavengerObservation,
-    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
-    ShardStat, ShardStatus, SseCustomerObjectState, SseS3ObjectState, StorageClass,
-    StoredLegalHoldStatus, StoredObject, StreamPartFinalizeInput, StreamPartFinalizeSnapshot,
-    StreamPutCommitInput, StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot,
-    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadKind, StreamUploadRecord,
-    StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
-    UploadId, UploadIdError, UploadState, VersionId, WriteAck, WrittenShardAck,
-    MULTIPART_PART_SEGMENT_STAGING_VERSION_ID, OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN,
-    OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN,
-    OBJECT_ENCRYPTION_SEGMENT_TAG_LEN, OBJECT_ENCRYPTION_WRAPPED_DEK_LEN,
-    OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN, SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN,
-    SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN,
-    SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
-    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_CHECKSUM_NONCE_LEN,
-    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN,
+    SessionId, SessionIdError, ShardData, ShardIndex, ShardKey, ShardStat, ShardStatus,
+    SseCustomerObjectState, SseS3ObjectState, StorageClass, StoredLegalHoldStatus, StoredObject,
+    StreamPartFinalizeInput, StreamPartFinalizeSnapshot, StreamPutCommitInput,
+    StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot, StreamSegmentAppendInput,
+    StreamSegmentAppendOutcome, StreamUploadKind, StreamUploadRecord, StreamUploadRecordPage,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadIdError,
+    UploadState, VersionId, WriteAck, WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
+    OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN,
+    OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN, OBJECT_ENCRYPTION_SEGMENT_TAG_LEN,
+    OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,
+    SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN, SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN,
+    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
+    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
+    SSE_S3_WRAP_NONCE_LEN,
 };
 pub(crate) use types::{
     AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, CommitDirectPutObjectReq,
@@ -3652,6 +3651,10 @@ pub(crate) use types::{
     ObjectSegmentsReclaimRecord, PlacedSegmentShardBackfillClaimAcquire,
     PlacedSegmentShardBackfillClaimAcquireParams, PlacedSegmentShardBackfillClaimRecord,
     PlacedSegmentShardBackfillRecord, PlacedSegmentShardBackfillWorkItem,
+};
+#[cfg(test)]
+pub(crate) use types::{
+    ShardScavengerObservationKey, ShardScavengerObservationReason, ShardScavengerObservationRecord,
 };
 pub(crate) use types::{StreamUploadPartSnapshot, StreamUploadPartStorageSnapshot};
 

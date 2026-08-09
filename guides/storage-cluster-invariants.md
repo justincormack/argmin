@@ -498,3 +498,12 @@ local-cluster runtime state because enqueueing after the final release is part
 of the already-acquired token workflow, not new metadata work. Durable reclaim
 metadata remains the retry source, and read handles only decide whether storage
 nodes may physically delete local shard files now.
+
+Maintenance queue rows, scan cursors, claims, physical repair/backfill plans,
+scavenger observations, and stream-session cleanup transitions are
+storage-private. Other crates can schedule these workflows only through the
+opaque `StorageReclaimSweeper`, `StorageShardScavengerSweeper`,
+`StorageShardRepairSweeper`, `StorageShardBackfillSweeper`, and
+`StorageStreamSessionSweeper` facades. `StorageMaintenanceAdmission` is the
+deliberate shared admission interface for lifecycle cleanup and the opaque
+sweepers; it does not expose their durable records or physical operations.

@@ -6718,6 +6718,32 @@ Phase 6 test-support duplicate-inventory slice (2026-08-09):
 The checker baseline after this slice is 52 actual `fail_with_matches`
 invocations (45 top-level and seven nested).
 
+Phase 6 maintenance-facade slice (2026-08-09):
+
+- audited reclaim, shard-scavenger, shard-repair, shard-backfill, and abandoned
+  stream-session maintenance surfaces. Their queue rows, durable roots, scan
+  cursors and summaries, claim records, physical plans, retry transitions, and
+  raw mutators are already crate-private;
+- closed the remaining visibility gap by making the four physical
+  `ShardScavengerObservation*` representations crate-private and removing
+  their crate-root exports. Their RPC codecs and node-client interfaces remain
+  storage-internal;
+- retained the deliberate public semantic boundary:
+  `StorageReclaimSweeper`, `StorageShardScavengerSweeper`,
+  `StorageShardRepairSweeper`, `StorageShardBackfillSweeper`, and
+  `StorageStreamSessionSweeper` are opaque lifecycle-owned worker facades, and
+  `StorageMaintenanceAdmission` is the bounded admission interface shared by
+  those workers and server-core lifecycle cleanup; and
+- removed six symbol/source inventories for reclaim internals, backfill scan
+  state, shard scavenging, shard repair, shard backfill, and stream-session
+  cleanup. Rust visibility now rejects those representation and raw-operation
+  leaks, while owner-local tests cover worker scheduling, convergence,
+  recovery, and physical effects without maintaining a parallel spelling
+  allowlist.
+
+The checker baseline after this slice is 46 actual `fail_with_matches`
+invocations (39 top-level and seven nested).
+
 For each remaining section, record:
 
 - the invariant

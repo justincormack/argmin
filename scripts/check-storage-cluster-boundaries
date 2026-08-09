@@ -1025,28 +1025,6 @@ fail_with_matches \
     "Raft restart artifacts, WAL representations, layout helpers, and explicit-WAL constructors are private to storage; use durable authority constructors or opaque semantic test inspection" \
     "$raft_durable_format_leaks"
 
-reclaim_maintenance_boundary_leaks=$(
-    {
-        rg -n --color=never \
-            'storage::(cluster::|types::)?(ReclaimWorkItem|BucketDeleteBeginRoot|BucketDeleteFinalizeRoot|BucketDeleteFinalizeClaimRecord|BucketDeleteAttemptOutcomeKind|BucketDeleteAttemptOutcomeRecord|BucketDeleteAttemptPhase|BucketDeleteDebug[A-Za-z]*|DurableReclaimScanBatch|DurableReclaimScanOutcome|MultipartReclaimPartRecord|MultipartReclaimPartSegmentRecord|MultipartReclaimRecord|ObjectPayloadReclaimAttempt|ObjectPayloadReclaimClaimRecord|ObjectPayloadReclaimKind|ObjectSegmentsReclaimRecord|ObjectSegmentsReclaimSegmentRecord|PayloadReclaimRoot)\b|\.(bucket_delete_debug_snapshot|try_take_reclaim_work|finish_object_payload_reclaim_work|finish_bucket_delete_finalize_work|enqueue_durable_reclaim_work_batch_excluding|wait_for_queued_reclaim_work_poll|wake_reclaim_workers|continue_adopted_bucket_delete|reclaim_object_payload_if_unleased_with_outcome)\(' \
-            . \
-            -g 'crates/**/*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n --color=never \
-            '^[[:space:]]*pub fn (try_take_reclaim_work|finish_object_payload_reclaim_work|finish_bucket_delete_finalize_work|enqueue_durable_reclaim_work_batch_excluding|wait_for_queued_reclaim_work_poll|wake_reclaim_workers|continue_adopted_bucket_delete|reclaim_object_payload_if_unleased_with_outcome)\(' \
-            crates/storage/src/cluster/request_ops.rs \
-            || true
-        rg -n --color=never \
-            '^[[:space:]]*pub (struct|enum) (BucketDeleteFinalizeClaimRecord|BucketDeleteAttemptOutcomeKind|BucketDeleteAttemptOutcomeRecord|BucketDeleteAttemptPhase|BucketDeleteDebug[A-Za-z]*|MultipartReclaimPartRecord|MultipartReclaimPartSegmentRecord|MultipartReclaimRecord|ObjectPayloadReclaimClaimRecord|ObjectPayloadReclaimKind|ObjectSegmentsReclaimRecord|ObjectSegmentsReclaimSegmentRecord|PayloadReclaimRoot)\b' \
-            crates/storage/src/types.rs \
-            || true
-    }
-)
-fail_with_matches \
-    "Reclaim queues, durable scan state, claims, cleanup roots, debug snapshots, and physical worker transitions are storage-owned; use StorageReclaimSweeper, BucketDeleteDiagnostic, or explicit Test-prefixed facilities" \
-    "$reclaim_maintenance_boundary_leaks"
-
 object_encryption_codec_leaks=$(
     {
         rg -n --color=never \
@@ -1221,24 +1199,6 @@ fail_with_matches \
     "Static construction and standalone durable binding must remain storage-owned and explicit; generic route-handle construction cannot be public, request consumers receive only StorageClusterRouteHandle, no request handle can be upgraded to dynamic publication authority, and the obsolete legacy-local role cannot return" \
     "$route_authority_capability_leaks"
 
-backfill_candidate_scan_state_leaks=$(
-    {
-        rg -n --color=never \
-            '\bPlacedSegmentShardBackfillCandidate(ScanCursor|EnqueueSummary)\b|\benqueue_placed_segment_shard_backfills_from_scavenger_references(_with_cursor_and_limit)?\b' \
-            crates \
-            -g '*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n --color=never \
-            'pub[[:space:]]+(struct[[:space:]]+PlacedSegmentShardBackfillCandidate(ScanCursor|EnqueueSummary)|fn[[:space:]]+enqueue_placed_segment_shard_backfills_from_scavenger_references(_with_cursor_and_limit)?)\b' \
-            crates/storage/src/cluster.rs \
-            || true
-    }
-)
-fail_with_matches \
-    "Backfill candidate cursor, scan summary, and enqueue transition are storage-owned; scheduling remains inside StorageShardScavengerSweeper" \
-    "$backfill_candidate_scan_state_leaks"
-
 test_support_api_scanner=scripts/check-storage-test-support-api.awk
 
 scan_storage_test_support_api() {
@@ -1312,98 +1272,6 @@ fi
 fail_with_matches \
     "Curated test-support API scanner must resolve aliases and recursively reject physical types in nested storage::test_support modules" \
     "$test_support_physical_api_fixture_failure"
-
-shard_scavenger_maintenance_leaks=$(
-    rg -n --color=never \
-        '\b(StorageBackfillCandidateScanner|BackgroundWorkAdmission|BackgroundWorkClass|audit_shard_storage_for_scavenger|record_routine_metadata_command_checkpoints)\b|struct[[:space:]]+ShardScavengerSweeper\b' \
-        crates/server-core crates/server-http crates/argmin-s3 crates/s3-tests \
-        -g '*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Shard auditing, candidate discovery, routine checkpoint scheduling, and maintenance admission policy are storage-owned; retain only opaque maintenance admission and sweeper capabilities outside storage" \
-    "$shard_scavenger_maintenance_leaks"
-
-shard_repair_maintenance_leaks=$(
-    {
-        rg -n --color=never \
-            '\b(PlacedSegmentShardRepair(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem)|try_take_placed_segment_shard_repair_work|wait_for_placed_segment_shard_repair_work|wake_placed_segment_shard_repair_workers|enqueue_durable_placed_segment_shard_repair_work|acquire_placed_segment_shard_repair_claim|complete_placed_segment_shard_repair_claim|record_placed_segment_shard_repair_claim_error|repair_placed_segment_payload_shard|repair_placed_segment_payload_shards|repair_placed_segment_payload_shards_if_needed|repair_placed_segment_payload_shards_if_needed_preserving_repair_rows)\b' \
-            crates \
-            -g '*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n --color=never \
-            'pub[[:space:]]+fn[[:space:]]+(try_take_placed_segment_shard_repair_work|wait_for_placed_segment_shard_repair_work|wake_placed_segment_shard_repair_workers|enqueue_durable_placed_segment_shard_repair_work|list_placed_segment_shard_repairs|acquire_placed_segment_shard_repair_claim|complete_placed_segment_shard_repair_claim|record_placed_segment_shard_repair_claim_error|repair_placed_segment_payload_shard|repair_placed_segment_payload_shards|repair_placed_segment_payload_shards_if_needed|repair_placed_segment_payload_shards_if_needed_preserving_repair_rows)\b' \
-            crates/storage/src \
-            -g '*.rs' \
-            || true
-        rg -n --color=never \
-            'pub[[:space:]]+(struct[[:space:]]+PlacedSegmentShardRepair(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem)|const[[:space:]]+PLACED_SEGMENT_SHARD_REPAIR_)' \
-            crates/storage/src/types.rs \
-            || true
-        rg -n --color=never \
-            'struct[[:space:]]+ShardRepairSweeper\b|\bSHARD_REPAIR_(DURABLE_SCAN_INTERVAL|CLAIM_LEASE_MILLIS|ERROR_BACKOFF_MILLIS|CLAIM_COUNTER|SWEEPER_REGISTRY)\b' \
-            crates/server-core crates/server-http crates/argmin-s3 crates/s3-tests \
-            -g '*.rs' \
-            || true
-    }
-)
-fail_with_matches \
-    "Shard-repair discovery, queueing, claims, retry policy, execution, scheduling, and telemetry are storage-owned; retain only the opaque StorageShardRepairSweeper outside storage" \
-    "$shard_repair_maintenance_leaks"
-
-shard_backfill_maintenance_leaks=$(
-    {
-        rg -n --color=never \
-            '\b(PlacedSegmentShardBackfill(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem|CopyTarget|Plan)|record_placed_segment_shard_backfill|list_placed_segment_shard_backfills|placed_segment_shard_backfill_(exists|backlog_depth|source_is_referenced)|acquire_(next_)?placed_segment_shard_backfill_claim(_with_cursor)?|complete_placed_segment_shard_backfill_claim|record_placed_segment_shard_backfill_claim_error|resolve_placed_segment_shard_backfill|backfill_placed_segment_payload_shard_(direct_copies|for_work_item)|backfill_placed_segment_payload_shards)\b' \
-            crates \
-            -g '*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n --color=never \
-            'pub[[:space:]]+fn[[:space:]]+(record_placed_segment_shard_backfill|list_placed_segment_shard_backfills|placed_segment_shard_backfill_(exists|backlog_depth|source_is_referenced)|acquire_(next_)?placed_segment_shard_backfill_claim(_with_cursor)?|complete_placed_segment_shard_backfill_claim|record_placed_segment_shard_backfill_claim_error|resolve_placed_segment_shard_backfill|backfill_placed_segment_payload_shard_(direct_copies|for_work_item)|backfill_placed_segment_payload_shards)\b' \
-            crates/storage/src/cluster.rs \
-            || true
-        rg -n --color=never \
-            'pub[[:space:]]+(struct[[:space:]]+PlacedSegmentShardBackfill(ClaimAcquireParams|ClaimAcquire|ClaimRecord|Record|WorkItem|CopyTarget|Plan)|const[[:space:]]+PLACED_SEGMENT_SHARD_BACKFILL_)' \
-            crates/storage/src \
-            -g '*.rs' \
-            || true
-        rg -n --color=never \
-            'struct[[:space:]]+ShardBackfillSweeper\b|\bSHARD_BACKFILL_(DURABLE_SCAN_INTERVAL|CLAIM_LEASE_MILLIS|ERROR_BACKOFF_MILLIS|CLAIM_COUNTER|SWEEPER_REGISTRY)\b' \
-            crates/server-core crates/server-http crates/argmin-s3 crates/s3-tests \
-            -g '*.rs' \
-            || true
-    }
-)
-fail_with_matches \
-    "Shard-backfill claims, fairness state, admission, retry policy, physical execution, scheduling, and telemetry are storage-owned; retain only the opaque StorageShardBackfillSweeper and logical test facilities outside storage" \
-    "$shard_backfill_maintenance_leaks"
-
-stream_session_maintenance_leaks=$(
-    {
-        rg -n --color=never \
-            '\bscavenge_abandoned_stream_sessions\b|\bSTREAM_SESSION_(SWEEP_INTERVAL|SCAVENGE_MAX_AGE)' \
-            crates \
-            -g '*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n --color=never \
-            'pub[[:space:]]+fn[[:space:]]+scavenge_abandoned_stream_sessions\b|pub[[:space:]]+struct[[:space:]]+StreamSessionSweeper\b' \
-            crates/storage/src \
-            -g '*.rs' \
-            || true
-        rg -n --color=never \
-            '\bBackgroundWorkClass::StreamSessionCleanup\b|struct[[:space:]]+StreamSessionSweeper\b' \
-            crates/server-core/src \
-            -g '*.rs' \
-            || true
-    }
-)
-fail_with_matches \
-    "Abandoned stream-session expiry, discovery, cleanup, scheduling, and telemetry are storage-owned; retain only the opaque StorageStreamSessionSweeper outside storage" \
-    "$stream_session_maintenance_leaks"
 
 if [[ "$failed" -ne 0 ]]; then
     echo

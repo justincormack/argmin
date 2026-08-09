@@ -2099,7 +2099,7 @@ impl ShardStatus {
 /// Non-authoritative reason for a physical shard scavenger audit observation.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShardScavengerObservationReason {
+pub(crate) enum ShardScavengerObservationReason {
     /// A shard file exists on disk but the data-PG `shards` row is absent.
     FileWithoutShardRow = 0,
     /// A data-PG `shards` row exists but the shard file is absent.
@@ -2111,7 +2111,7 @@ pub enum ShardScavengerObservationReason {
 }
 
 impl ShardScavengerObservationReason {
-    pub fn from_u8(v: u8) -> Option<Self> {
+    pub(crate) fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::FileWithoutShardRow),
             1 => Some(Self::ShardRowWithoutFile),
@@ -2124,39 +2124,39 @@ impl ShardScavengerObservationReason {
 
 /// Physical location identity for a shard scavenger audit observation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ShardScavengerObservationKey {
-    pub node_id: u32,
-    pub data_pg_id: u32,
-    pub shard_index: ShardIndex,
-    pub shard_key: ShardKey,
+pub(crate) struct ShardScavengerObservationKey {
+    pub(crate) node_id: u32,
+    pub(crate) data_pg_id: u32,
+    pub(crate) shard_index: ShardIndex,
+    pub(crate) shard_key: ShardKey,
 }
 
 /// Input for recording one shard scavenger audit observation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardScavengerObservationRecord {
-    pub key: ShardScavengerObservationKey,
-    pub data_size: Option<u64>,
-    pub crc64: Option<u64>,
-    pub file_exists: bool,
-    pub shard_row_exists: bool,
-    pub reason: ShardScavengerObservationReason,
-    pub last_error: Option<String>,
+pub(crate) struct ShardScavengerObservationRecord {
+    pub(crate) key: ShardScavengerObservationKey,
+    pub(crate) data_size: Option<u64>,
+    pub(crate) crc64: Option<u64>,
+    pub(crate) file_exists: bool,
+    pub(crate) shard_row_exists: bool,
+    pub(crate) reason: ShardScavengerObservationReason,
+    pub(crate) last_error: Option<String>,
 }
 
 /// Non-authoritative audit row for an apparent physical shard orphan.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ShardScavengerObservation {
-    pub key: ShardScavengerObservationKey,
-    pub first_seen_at: u64,
-    pub last_seen_at: u64,
-    pub observation_count: u64,
-    pub data_size: Option<u64>,
-    pub crc64: Option<u64>,
-    pub file_exists: bool,
-    pub shard_row_exists: bool,
-    pub reason: ShardScavengerObservationReason,
-    pub last_error: Option<String>,
-    pub resolved_at: Option<u64>,
+pub(crate) struct ShardScavengerObservation {
+    pub(crate) key: ShardScavengerObservationKey,
+    pub(crate) first_seen_at: u64,
+    pub(crate) last_seen_at: u64,
+    pub(crate) observation_count: u64,
+    pub(crate) data_size: Option<u64>,
+    pub(crate) crc64: Option<u64>,
+    pub(crate) file_exists: bool,
+    pub(crate) shard_row_exists: bool,
+    pub(crate) reason: ShardScavengerObservationReason,
+    pub(crate) last_error: Option<String>,
+    pub(crate) resolved_at: Option<u64>,
 }
 
 /// Object lifecycle state.
