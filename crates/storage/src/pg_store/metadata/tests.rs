@@ -4238,6 +4238,12 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
         previous_version_checkpoint.verify(),
         Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 3 })
     );
+    let mut future_version_checkpoint = checkpoint.clone();
+    future_version_checkpoint.canonical_state_encoding_version = 5;
+    assert_eq!(
+        future_version_checkpoint.verify(),
+        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 5 })
+    );
     assert_eq!(
         checkpoint
             .table_digests
@@ -4936,6 +4942,54 @@ fn install_metadata_transfer_checkpoint_base_rejects_tampered_checkpoint_without
             .metadata_command_replica_state_can_initialize()
             .unwrap(),
         "failed checkpoint install must leave destination empty"
+    );
+}
+
+#[test]
+fn install_metadata_transfer_checkpoint_base_rejects_future_state_encoding_without_publication() {
+    let source_tmp = test_util::tempdir();
+    let source = PgStore::open(source_tmp.path(), 1).unwrap();
+    let bucket = trusted_bucket_name("metadata-checkpoint-install-future-state");
+    let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+    source
+        .apply_metadata_command_and_record(0, &command)
+        .unwrap();
+    let mut checkpoint = source
+        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    checkpoint.canonical_state_encoding_version = 5;
+
+    let destination_tmp = test_util::tempdir();
+    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
+    let before = destination.metadata_command_replica_state().unwrap();
+    let destination_epoch = ClusterEpoch::new(29).unwrap();
+    let err = destination
+        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::MetadataCheckpointInvalid {
+            pg_id: 1,
+            cluster_epoch,
+            reason,
+            ..
+        } if cluster_epoch == destination_epoch
+            && reason == "UnsupportedStateEncoding { actual: 5 }"
+    ));
+    assert_eq!(
+        destination.metadata_command_replica_state().unwrap(),
+        before,
+        "unsupported state encoding must not publish replica state"
+    );
+    assert!(
+        destination
+            .metadata_command_replica_state_can_initialize()
+            .unwrap(),
+        "unsupported state encoding must leave the destination empty"
+    );
+    assert!(
+        destination.head_bucket_raw(&bucket).is_err(),
+        "unsupported state encoding must not install materialized rows"
     );
 }
 

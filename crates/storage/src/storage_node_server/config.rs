@@ -65,6 +65,9 @@ impl StorageNodeControlPlaneRefresh {
 
 impl StorageNodeProcessConfig {
     const CONTROL_PLANE_RUNTIME_CONFIG_FILE: &'static str = "control-plane-runtime-config-v1";
+    const CONTROL_PLANE_RUNTIME_CONFIG_MAGIC_PREFIX: &'static str =
+        "argmin-storage-node-runtime-config-v";
+    const CONTROL_PLANE_RUNTIME_CONFIG_VERSION: u16 = 4;
 
     pub fn new(parts: StorageNodeProcessConfigParts) -> Result<Self, StorageNodeServerError> {
         let config = Self {
@@ -768,7 +771,11 @@ fn validate_process_config_matches_persisted_runtime_config(
 
 fn encode_control_plane_runtime_config(config: &StorageNodeProcessConfig) -> String {
     let mut out = String::new();
-    out.push_str("argmin-storage-node-runtime-config-v4\n");
+    out.push_str(StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_MAGIC_PREFIX);
+    out.push_str(
+        &StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_VERSION.to_string(),
+    );
+    out.push('\n');
     out.push_str(&format!("node_id {}\n", config.node_id.as_u32()));
     out.push_str(&format!("cluster_epoch {}\n", config.cluster_epoch.get()));
     match config.route_map_validity {
@@ -862,9 +869,7 @@ fn decode_control_plane_runtime_config(
     let magic = lines
         .next()
         .ok_or_else(|| runtime_config_invalid(path, "empty config"))?;
-    if magic != "argmin-storage-node-runtime-config-v4" {
-        return Err(runtime_config_invalid(path, "invalid magic"));
-    }
+    validate_control_plane_runtime_config_magic(path, magic)?;
     let node_id = NodeId::new(parse_labeled_u32(path, lines.next(), "node_id")?);
     let cluster_epoch = parse_labeled_cluster_epoch(path, lines.next(), "cluster_epoch")?;
     let route_map_validity = parse_labeled_route_map_validity(path, lines.next())?;
@@ -1234,6 +1239,35 @@ fn runtime_config_invalid(path: &Path, message: impl Into<String>) -> StorageNod
         path: path.to_path_buf(),
         message: message.into(),
     }
+}
+
+fn validate_control_plane_runtime_config_magic(
+    path: &Path,
+    magic: &str,
+) -> Result<(), StorageNodeServerError> {
+    let Some(version_text) =
+        magic.strip_prefix(StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_MAGIC_PREFIX)
+    else {
+        return Err(StorageNodeServerError::RuntimeConfigUnknownMagic {
+            path: path.to_path_buf(),
+        });
+    };
+    let Some(version) = version_text
+        .parse::<u16>()
+        .ok()
+        .filter(|version| version.to_string() == version_text)
+    else {
+        return Err(StorageNodeServerError::RuntimeConfigUnknownMagic {
+            path: path.to_path_buf(),
+        });
+    };
+    if version != StorageNodeProcessConfig::CONTROL_PLANE_RUNTIME_CONFIG_VERSION {
+        return Err(StorageNodeServerError::RuntimeConfigUnsupportedVersion {
+            path: path.to_path_buf(),
+            actual: version,
+        });
+    }
+    Ok(())
 }
 
 fn pg_state_code(state: PgState) -> u8 {
@@ -1613,6 +1647,12 @@ pub enum StorageNodeServerError {
     },
     #[error("invalid storage-node control-plane runtime config {path:?}: {message}")]
     RuntimeConfigInvalid { path: PathBuf, message: String },
+    #[error("storage-node control-plane runtime config {path:?} has unknown magic")]
+    RuntimeConfigUnknownMagic { path: PathBuf },
+    #[error(
+        "storage-node control-plane runtime config {path:?} has unsupported version {actual}"
+    )]
+    RuntimeConfigUnsupportedVersion { path: PathBuf, actual: u16 },
     #[error(
         "storage-node process configuration does not match persisted control-plane runtime config {path:?}"
     )]

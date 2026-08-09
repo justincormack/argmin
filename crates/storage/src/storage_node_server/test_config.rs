@@ -592,6 +592,73 @@
     }
 
     #[test]
+    fn storage_node_control_plane_runtime_config_distinguishes_unknown_magic() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        let path = tmp.path().join("runtime-config");
+        for magic in [
+            "not-a-storage-node-runtime-config",
+            "argmin-storage-node-runtime-config-v03",
+            "argmin-storage-node-runtime-config-vx",
+        ] {
+            let raw = encode_control_plane_runtime_config(&config).replacen(
+                "argmin-storage-node-runtime-config-v4",
+                magic,
+                1,
+            );
+            assert!(matches!(
+                decode_control_plane_runtime_config(
+                    &path,
+                    config.data_dir.clone(),
+                    config.default_ec_shape,
+                    &raw,
+                ),
+                Err(StorageNodeServerError::RuntimeConfigUnknownMagic {
+                    path: error_path
+                }) if error_path == path
+            ));
+        }
+    }
+
+    #[test]
+    fn storage_node_restart_rejects_unsupported_runtime_config_before_storage_open() {
+        for version in [3_u16, 5] {
+            let tmp = test_util::tempdir();
+            let config = test_config(&tmp);
+            prepare_private_data_dir(&config.data_dir).unwrap();
+            let path = control_plane_runtime_config_path(&config.data_dir);
+            let raw = encode_control_plane_runtime_config(&config).replacen(
+                "argmin-storage-node-runtime-config-v4",
+                &format!("argmin-storage-node-runtime-config-v{version}"),
+                1,
+            );
+            fs::write(&path, raw).unwrap();
+
+            assert!(matches!(
+                StorageNodeBootstrap::open_control_plane_managed(
+                    config.node_id,
+                    &config.data_dir,
+                    &config.pg_ids,
+                    config.default_ec_shape,
+                    &config.socket_path,
+                ),
+                Err(StorageNodeServerError::RuntimeConfigUnsupportedVersion {
+                    path: error_path,
+                    actual,
+                }) if error_path == path && actual == version
+            ));
+            assert!(
+                !config.data_dir.join(STORAGE_NODE_INCARNATION_FILE).exists(),
+                "unsupported runtime config v{version} must not advance the node incarnation"
+            );
+            assert!(
+                !storage_node_pg_dir(&config.data_dir, config.pg_ids[0]).exists(),
+                "unsupported runtime config v{version} must not open PG storage"
+            );
+        }
+    }
+
+    #[test]
     fn storage_node_control_plane_runtime_config_rejects_reserved_validity_deadline() {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);

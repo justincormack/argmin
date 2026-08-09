@@ -1161,6 +1161,33 @@ mod tests {
             )
         );
 
+        let mut future_version_request = request.clone();
+        future_version_request
+            .checkpoint
+            .canonical_state_encoding_version = 5;
+        let bytes =
+            encode_metadata_command_transfer_checkpoint_base_request(&future_version_request)
+                .unwrap();
+        assert_eq!(
+            decode_metadata_command_transfer_checkpoint_base_request(&bytes),
+            Err(
+                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
+                    actual: 5,
+                }
+            )
+        );
+        let bytes =
+            encode_metadata_command_checkpoint_payload(&future_version_request.checkpoint)
+                .unwrap();
+        assert_eq!(
+            decode_metadata_command_checkpoint_payload(&bytes),
+            Err(
+                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
+                    actual: 5,
+                }
+            )
+        );
+
         let candidates_request = StorageRpcMetadataCommandCheckpointCandidatesRequest {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(3).unwrap(),

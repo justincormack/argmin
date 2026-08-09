@@ -364,16 +364,16 @@ impl StorageNodeBootstrap {
         let data_dir = data_dir.into();
         let configured_socket_path = configured_socket_path.into();
         let data_dir_guard = StorageNodeDataDirGuard::acquire(&data_dir)?;
-        let node_incarnation = advance_storage_node_incarnation(&data_dir)?;
-        let node =
-            SharedStorageNode::open_with_default_ec_shape(&data_dir, pg_ids, default_ec_shape)?;
-        node.recover_pg_metadata_command_state(node_id)?;
         let startup_runtime_config = StorageNodeProcessConfig::load_control_plane_runtime_config(
             &data_dir,
             node_id,
             default_ec_shape,
             &configured_socket_path,
         )?;
+        let node_incarnation = advance_storage_node_incarnation(&data_dir)?;
+        let node =
+            SharedStorageNode::open_with_default_ec_shape(&data_dir, pg_ids, default_ec_shape)?;
+        node.recover_pg_metadata_command_state(node_id)?;
         Ok(Self {
             node,
             node_id,
