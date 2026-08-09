@@ -6631,6 +6631,29 @@ Phase 6 root-command and private-representation slice (2026-08-09):
 The checker baseline after this slice is 90 actual `fail_with_matches`
 invocations (83 top-level and seven nested).
 
+Phase 6 stream-command representation slice (2026-08-09):
+
+- removed four source scans which prescribed the field types used by stream
+  creation and terminal cleanup commands, required one reservation-proof
+  spelling, and prohibited one direct vector-comparison spelling;
+- made `StreamUploadCommandRecord` and `TerminalStreamCleanupRecord`
+  crate-private and removed their crate-root exports. They are command-owned
+  persistence representations with no downstream consumer; the public
+  request-facing stream snapshot continues to expose only the runtime record
+  needed by `server-core`;
+- the distinct command record types now make runtime allocator/session records
+  and terminal cleanup records non-interchangeable at compile time. Required
+  reservation proofs remain non-optional in each publishing command type, and
+  central apply/recovery validation plus the existing malformed-command tests
+  enforce proof identity and cleanup equality. A regex over field spelling or
+  comparison syntax added no independent boundary; and
+- deliberately retained the generic route-error conversion rule immediately
+  following this cohort. It is a semantic error-classification prohibition,
+  not a representation visibility check, and needs its own disposition.
+
+The checker baseline after this slice is 86 actual `fail_with_matches`
+invocations (79 top-level and seven nested).
+
 For each remaining section, record:
 
 - the invariant

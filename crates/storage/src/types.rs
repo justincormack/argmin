@@ -6628,14 +6628,14 @@ pub struct StreamUploadRecordPage {
 /// command so retry matching must handle allocator state explicitly instead of
 /// accidentally comparing broad runtime records.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StreamUploadCommandRecord {
-    pub session_id: SessionId,
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub target: StreamUploadTarget,
-    pub state: StreamUploadState,
-    pub created_at: u64,
-    pub encryption: ObjectEncryption,
+pub(crate) struct StreamUploadCommandRecord {
+    pub(crate) session_id: SessionId,
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) target: StreamUploadTarget,
+    pub(crate) state: StreamUploadState,
+    pub(crate) created_at: u64,
+    pub(crate) encryption: ObjectEncryption,
 }
 
 impl From<&StreamUploadRecord> for StreamUploadCommandRecord {
@@ -6658,14 +6658,14 @@ impl From<&StreamUploadRecord> for StreamUploadCommandRecord {
 /// of this record. Terminal MPU commands validate and delete the session, but
 /// do not own the stream segment VID floor.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalStreamCleanupRecord {
-    pub session_id: SessionId,
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub target: StreamUploadTarget,
-    pub state: StreamUploadState,
-    pub created_at: u64,
-    pub encryption: ObjectEncryption,
+pub(crate) struct TerminalStreamCleanupRecord {
+    pub(crate) session_id: SessionId,
+    pub(crate) bucket: BucketName,
+    pub(crate) key: ObjectKey,
+    pub(crate) target: StreamUploadTarget,
+    pub(crate) state: StreamUploadState,
+    pub(crate) created_at: u64,
+    pub(crate) encryption: ObjectEncryption,
 }
 
 impl From<&StreamUploadRecord> for TerminalStreamCleanupRecord {

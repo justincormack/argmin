@@ -3565,6 +3565,9 @@ pub(crate) use types::MultipartUploadIdKey;
 #[cfg(test)]
 pub(crate) use types::SegmentStoredBytesRequest;
 #[cfg(test)]
+pub(crate) use types::StreamUploadCommandRecord;
+pub(crate) use types::TerminalStreamCleanupRecord;
+#[cfg(test)]
 pub(crate) use types::UPLOAD_ID_LEN;
 pub use types::{
     key_prefix_upper_bound, object_key_common_prefix, object_key_prefix_upper_bound, AclGrants,
@@ -3613,18 +3616,17 @@ pub use types::{
     ShardStat, ShardStatus, SseCustomerObjectState, SseS3ObjectState, StorageClass,
     StoredLegalHoldStatus, StoredObject, StreamPartFinalizeInput, StreamPartFinalizeSnapshot,
     StreamPutCommitInput, StreamPutFinalizeSnapshot, StreamPutFinalizeStorageSnapshot,
-    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadCommandRecord,
-    StreamUploadKind, StreamUploadRecord, StreamUploadRecordPage, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadIdError,
-    UploadState, VersionId, WriteAck, WrittenShardAck, MULTIPART_PART_SEGMENT_STAGING_VERSION_ID,
-    OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN,
-    OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN, OBJECT_ENCRYPTION_SEGMENT_TAG_LEN,
-    OBJECT_ENCRYPTION_WRAPPED_DEK_LEN, OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN,
-    SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN, SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN,
-    SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
-    SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
-    SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN,
-    SSE_S3_WRAP_NONCE_LEN,
+    StreamSegmentAppendInput, StreamSegmentAppendOutcome, StreamUploadKind, StreamUploadRecord,
+    StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    UploadId, UploadIdError, UploadState, VersionId, WriteAck, WrittenShardAck,
+    MULTIPART_PART_SEGMENT_STAGING_VERSION_ID, OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN,
+    OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN, OBJECT_ENCRYPTION_SEGMENT_NONCE_SCOPE_LEN,
+    OBJECT_ENCRYPTION_SEGMENT_TAG_LEN, OBJECT_ENCRYPTION_WRAPPED_DEK_LEN,
+    OBJECT_ENCRYPTION_WRAP_NONCE_LEN, SESSION_ID_LEN, SHARD_KEY_HEX_LEN, SHARD_KEY_HEX_PREFIX_LEN,
+    SHARD_KEY_LEN, SSE_C_CHECKSUM_NONCE_LEN, SSE_C_SEGMENT_NONCE_PREFIX_LEN,
+    SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN, SSE_C_VALIDATOR_SALT_LEN,
+    SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN, SSE_S3_CHECKSUM_NONCE_LEN,
+    SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAPPED_DEK_LEN, SSE_S3_WRAP_NONCE_LEN,
 };
 pub(crate) use types::{
     AbortMultipartUploadCleanup, AuthorizedMultipartUploadRecord, CommitDirectPutObjectReq,
