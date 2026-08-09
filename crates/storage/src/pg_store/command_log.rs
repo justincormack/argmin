@@ -5511,3 +5511,51 @@ impl PgStore {
         }
     }
 }
+
+#[cfg(test)]
+mod canonical_format_baseline_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_metadata_state_v4_digests_are_stable() {
+        let table = &METADATA_DIGEST_TABLES[0];
+        assert_eq!(table.name, "bucket_subresources");
+        let values = vec![
+            MetadataCheckpointValue::Text(b"bucket".to_vec()),
+            MetadataCheckpointValue::Integer(7),
+            MetadataCheckpointValue::Text(b"<Tagging/>".to_vec()),
+            MetadataCheckpointValue::Integer(-2),
+            MetadataCheckpointValue::Null,
+        ];
+        let row_digest = PgStore::metadata_checkpoint_row_digest(table, &values);
+
+        let table_digest = metadata_table_digest_from_stats(
+            table,
+            MetadataTableDigestStats {
+                row_count: 1,
+                row_hash_xor: row_digest,
+                row_hash_sum: row_digest,
+            },
+        );
+
+        let mut state_hasher = checksum::crc64::Hasher::new();
+        PgStore::digest_canonical_pg_state_header(&mut state_hasher);
+        for (index, table) in METADATA_DIGEST_TABLES.iter().enumerate() {
+            PgStore::digest_metadata_table_digest_entry(
+                &mut state_hasher,
+                table,
+                0x1000_0000_0000_0000_u64 + index as u64,
+            );
+        }
+        let state_digest = state_hasher.finalize();
+
+        assert_eq!(
+            (row_digest, table_digest, state_digest),
+            (
+                0x8e12_8dbf_237c_be5e,
+                0x64a9_e3d9_b3ad_266d,
+                0x3ddb_6ba2_89f9_16ac,
+            )
+        );
+    }
+}

@@ -6,6 +6,16 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn hex_bytes(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        out
+    }
+
     fn metadata_command_decode_authority_for_test() -> MetadataCommandDecodeAuthority {
         MetadataCommandDecodeAuthority::new_for_test()
     }
@@ -1059,6 +1069,10 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_transfer_matching_state_request(&request);
+        assert_eq!(
+            hex_bytes(&bytes),
+            "0700000003000000000000000b00000004000000000000002e16000000000000d204000000000000"
+        );
         let decoded = decode_metadata_command_transfer_matching_state_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
@@ -1066,48 +1080,12 @@ mod tests {
 
     #[test]
     fn metadata_command_transfer_checkpoint_base_request_round_trips() {
-        let checkpoint = MetadataCommandCheckpoint {
-            cluster_epoch: ClusterEpoch::new(3).unwrap(),
-            pg_id: PgId::new(11),
-            applied_log_index: 7,
-            applied_log_hash: 0x1234,
-            state_digest: 0x5678,
-            canonical_state_encoding_version: METADATA_CANONICAL_STATE_ENCODING_VERSION,
-            table_digests: vec![MetadataCheckpointTableDigest {
-                table_name: "buckets".to_string(),
-                row_count: 1,
-                row_hash_xor: 0x11,
-                row_hash_sum: 0x11,
-                table_digest: 0x22,
-            }],
-            table_blocks: vec![MetadataCheckpointTableBlock {
-                table_name: "buckets".to_string(),
-                columns: vec![
-                    "name".to_string(),
-                    "created_at".to_string(),
-                    "ratio".to_string(),
-                    "body".to_string(),
-                    "missing".to_string(),
-                ],
-                order_columns: vec!["name".to_string()],
-                filter: "all_rows".to_string(),
-                rows: vec![MetadataCheckpointRow {
-                    values: vec![
-                        MetadataCheckpointValue::Text(b"bucket".to_vec()),
-                        MetadataCheckpointValue::Integer(-7),
-                        MetadataCheckpointValue::RealBits(1.25f64.to_bits()),
-                        MetadataCheckpointValue::Blob(vec![1, 2, 3]),
-                        MetadataCheckpointValue::Null,
-                    ],
-                    row_digest: 0x33,
-                }],
-                row_count: 1,
-                row_hash_xor: 0x33,
-                row_hash_sum: 0x33,
-                table_digest: 0x44,
-            }],
-            checkpoint_crc64: 0x99,
-        };
+        let tmp = test_util::tempdir();
+        let store = crate::PgStore::open(tmp.path(), 11).unwrap();
+        let checkpoint = store
+            .metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
+            .unwrap();
+        checkpoint.verify().unwrap();
         let request = StorageRpcMetadataCommandTransferCheckpointBaseRequest {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(4).unwrap(),
@@ -1129,6 +1107,29 @@ mod tests {
         assert_eq!(decoded, response);
 
         let bytes = encode_metadata_command_checkpoint_payload(&request.checkpoint).unwrap();
+        let payload_sha256: [u8; 32] = checksum::compute_checksum(
+            checksum::ChecksumAlgorithm::Sha256,
+            &bytes,
+        )
+        .bytes()
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            (
+                request.checkpoint.checkpoint_crc64,
+                bytes.len(),
+                payload_sha256,
+            ),
+            (
+                0xbb86_c2bd_95b1_a72b,
+                6_700,
+                [
+                    196, 136, 121, 248, 27, 80, 19, 40, 205, 18, 144, 248, 93, 254, 104,
+                    52, 62, 85, 25, 37, 232, 236, 209, 106, 65, 213, 101, 85, 191, 100, 68,
+                    162,
+                ],
+            )
+        );
         let decoded = decode_metadata_command_checkpoint_payload(&bytes).unwrap();
 
         assert_eq!(decoded, request.checkpoint);

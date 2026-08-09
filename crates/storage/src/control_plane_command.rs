@@ -1923,6 +1923,28 @@ impl<'a> PayloadReader<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pg_metadata_proof_command_encoding_is_stable() {
+        let proof = PgMetadataProof {
+            applied_log_index: 0x0102_0304_0506_0708,
+            applied_log_hash: 0x1112_1314_1516_1718,
+            state_digest: 0x2122_2324_2526_2728,
+        };
+        let mut bytes = Vec::new();
+        write_pg_metadata_proof(&mut bytes, proof);
+
+        assert_eq!(
+            bytes,
+            [
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+                0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+            ]
+        );
+        let mut reader = PayloadReader::new(&bytes);
+        assert_eq!(read_pg_metadata_proof(&mut reader).unwrap(), proof);
+        assert_eq!(reader.remaining_len(), 0);
+    }
+
     fn sample_commands() -> Vec<ControlPlaneCommand> {
         let proof = PgMetadataProof {
             applied_log_index: 7,

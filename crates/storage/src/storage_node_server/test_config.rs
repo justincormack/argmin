@@ -499,6 +499,7 @@
         let mut config = test_config(&tmp);
         config.cluster_epoch = ClusterEpoch::new(9).unwrap();
         config.route_map_validity = RouteMapValidity::until_ms(12_345).unwrap();
+        config.socket_path = PathBuf::from("/run/argmin/storage-7.sock");
         config.pg_ids = vec![0, 2];
         config.pg_routes = vec![
             StorageNodePgRoute {
@@ -516,7 +517,14 @@
                 state: PgState::Peering,
                 primary_node_id: NodeId::new(8),
                 metadata_transfer_destination_epoch: None,
-                metadata_read_route: None,
+                metadata_read_route: Some(crate::control_plane::PgMetadataReadRoute::new(
+                    NodeId::new(7),
+                    crate::control_plane::PgMetadataProof {
+                        applied_log_index: 101,
+                        applied_log_hash: 202,
+                        state_digest: 303,
+                    },
+                )),
                 acting_set: vec![NodeId::new(8), NodeId::new(7)],
             },
         ];
@@ -527,7 +535,14 @@
                 state: PgState::Active,
                 primary_node_id: NodeId::new(7),
                 metadata_transfer_destination_epoch: None,
-                metadata_read_route: None,
+                metadata_read_route: Some(crate::control_plane::PgMetadataReadRoute::new(
+                    NodeId::new(8),
+                    crate::control_plane::PgMetadataProof {
+                        applied_log_index: 404,
+                        applied_log_hash: 505,
+                        state_digest: 606,
+                    },
+                )),
                 acting_set: vec![NodeId::new(7), NodeId::new(8)],
             },
             StorageNodePgRoute {
@@ -540,6 +555,28 @@
                 acting_set: vec![NodeId::new(8), NodeId::new(7)],
             },
         ];
+
+        assert_eq!(
+            encode_control_plane_runtime_config(&config),
+            concat!(
+                "argmin-storage-node-runtime-config-v4\n",
+                "node_id 7\n",
+                "cluster_epoch 9\n",
+                "route_map_validity until 12345\n",
+                "ec_shape 4 2\n",
+                "socket_path 2f72756e2f6172676d696e2f73746f726167652d372e736f636b\n",
+                "pg_ids 2\n",
+                "0\n",
+                "2\n",
+                "pg_routes 2\n",
+                "0 9 1 7 - - - - - 2 7 8\n",
+                "2 9 2 8 - 7 101 202 303 2 8 7\n",
+                "historical_pg_routes 2\n",
+                "0 3 1 7 - 8 404 505 606 2 7 8\n",
+                "2 6 2 8 - - - - - 2 8 7\n",
+                "pending_metadata_command_recoveries 0\n",
+            )
+        );
 
         config.persist_control_plane_runtime_config().unwrap();
         let loaded = StorageNodeProcessConfig::load_control_plane_runtime_config(

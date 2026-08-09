@@ -5521,6 +5521,19 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_log_hash_v1_encoding_is_stable() {
+        let hash = metadata_command_log_hash(
+            ClusterEpoch::new(0x0102_0304_0506_0708).unwrap(),
+            PgId::new(0x1112_1314),
+            MetadataCommandLogIndex::new(0x2122_2324_2526_2728).unwrap(),
+            0x3132_3334_3536_3738,
+            0x4142_4344_4546_4748,
+        );
+
+        assert_eq!(hash, 0x4fb4_2acb_1485_311e);
+    }
+
+    #[test]
     fn metadata_command_log_entry_header_decodes_applied_and_abandoned_rows() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
