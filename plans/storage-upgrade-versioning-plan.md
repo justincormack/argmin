@@ -527,10 +527,10 @@ The object-tag XML is embedded in these storage-owned containing formats:
 | Canonical PG state | encoding version 4 | The tag columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry tag columns and bind them into row, table, state, and checkpoint digests. |
 
-An incompatible change to the canonical object-tag XML is prohibited until the Phase 2 design
-gate chooses and records one of two strategies: introduce an explicit private inner version, or
-treat the complete set of containing formats above as the version boundary and advance every one
-of them together. The current decoders have no legacy or prefix fallback.
+The Phase 2 gate below selects an explicit `s3-types`-owned inner frame rather than treating these
+storage containers as the permanent tag version boundary. Until that frame and its coordinated
+initial container-version advances land, the current unframed XML remains frozen. The replacement
+does not add a legacy or prefix fallback.
 
 Bucket tags use the same `s3-types` logical values and exact `TagSet::to_xml()` representation,
 with their separate 50-tag cardinality enforced by `storage::SerializedBucketTagSet`. The public
@@ -555,11 +555,10 @@ The bucket-tag XML is embedded in these storage-owned containing formats:
 | Canonical PG state | encoding version 4 | The bucket-subresource body participates in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the bucket-subresource row and bind it into row, table, state, and checkpoint digests. |
 
-The Phase 2 tag decision applies jointly to object and bucket tags because they share this
-canonical XML. An incompatible change must either introduce one private tag inner version and
-advance all affected containers, or advance every object-tag and bucket-tag containing format as
-the deliberate version boundary. Current decoders have no old-version, prefix, or alternate-XML
-fallback.
+The selected inner frame applies jointly to object and bucket tags because they share one logical
+tag representation. Its first introduction advances every affected container in one coherent
+slice. Current unframed XML and unsupported framed versions are then rejected rather than retained
+as alternate representations.
 
 ### Nested Durable Codec Inventory: ACL Grants (2026-07-28)
 
@@ -588,9 +587,10 @@ The ACL representation is embedded in these storage-owned containing formats:
 | Canonical PG state | encoding version 4 | The three persisted ACL columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry all three ACL columns and bind them into row, table, state, and checkpoint digests. |
 
-An incompatible ACL representation change is prohibited until the Phase 2 design gate chooses and
-records either a private inner version or deliberate coordinated advancement of every containing
-format above. Current decoders have no old-version, prefix, or normalizing fallback.
+The Phase 2 gate below selects an explicit `s3-types`-owned inner frame. Its first introduction
+advances every affected container together; the empty ACL is no longer an empty durable string but
+an explicit current frame with an empty canonical payload. Current unframed strings and unsupported
+framed versions are rejected rather than accepted through a fallback.
 
 ### Nested Durable Codec Inventory: Object Encryption State (2026-07-28)
 
@@ -1819,8 +1819,8 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | SSE-C checksum-sealing profile | `server-core` | AES-256-GCM with 12-byte nonce, 16-byte tag, and AAD `argmin:sse-c:checksum:v1`, selected by outer SSE-C state 3 | Evidence required; randomized round-trip and persisted logical behavior exist, but no exact cryptographic vector or malformed-inner production-read fixture exists |
 | SSE-S3 checksum-sealing profile | `server-core` | AES-256-GCM with 12-byte nonce, 16-byte tag, and AAD `argmin:sse-s3:checksum:v1`, selected by outer SSE-S3 state 1 | Evidence required; one exact cryptographic vector and unit round-trip exist, but persisted logical and malformed-inner production-read evidence is incomplete |
 | Object encryption state | `storage` | SSE-C 3; SSE-S3 1, selected by a typed outer discriminator | Evidence required; exact outer bytes and version rejection are pinned, but canonical empty-checksum carrier validation remains outstanding below |
-| Object-tag and bucket-tag canonical XML | `s3-types` | no independent marker; exact canonical XML is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
-| ACL canonical string | `s3-types` | no independent marker; exact canonical string is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
+| Object-tag and bucket-tag durable carrier | `s3-types` | currently unframed canonical XML; target private text frame `ARGMIN-TAGSET/1\n` plus owner-private canonical payload | Design recorded below; implementation and coordinated initial container-version advancement remain required |
+| ACL-grants durable carrier | `s3-types` | currently unframed canonical grant lines; target private text frame `ARGMIN-ACL-GRANTS/1\n` plus owner-private canonical payload | Design recorded below; implementation and coordinated initial container-version advancement remain required |
 | Static cluster manifest and static identities | `argmin-s3` | manifest schema 1; storage identity 1; control-plane identity 2 | Evidence required; the storage-topology subdocument is interpreted through the contained storage-owned builder |
 | Temporary-credential session token | `auth` | `ARGST1` envelope / version 1 | Recorded |
 | Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Evidence required; all three identifiers and protocol-profile constructors are owner-private and boundary-checked |
@@ -2047,6 +2047,85 @@ encryption-state version. Rejecting noncanonical absent carriers while retaining
 existing zero/empty representation is explicitly not such a change and preserves the current
 versions. No rule introduces a fallback decrypter or accepts an older plaintext frame.
 
+#### Tag and ACL inner-carrier design decision (2026-08-09)
+
+The current durable tag representation is also the AWS response XML, and the current ACL
+representation is an unframed line grammar. Although both parsers are exact and owner-local, their
+versions are implicit in five storage-owned containers. Permanent outer-only binding would make
+those storage versions stand in for `s3-types` representation ownership and would keep tag
+persistence coupled to HTTP response serialization. The selected design is therefore an explicit
+private inner frame for each logical family.
+
+| Family | Selected target frame | Owner and logical invariant | First rejecting reader |
+| --- | --- | --- | --- |
+| Object and bucket tags | Exact ASCII header `ARGMIN-TAGSET/1\n`, followed by an owner-private canonical tag XML payload. Object and bucket tags share identical frame bytes for the same ordered logical tags; storage still applies the typed 10-tag or 50-tag cardinality before construction and during decode. The empty tag set contains the complete header and canonical empty payload. | `s3-types` owns the private magic/version, durable payload writer/parser, tag grammar, order, and duplicate/cardinality validation. HTTP continues to serialize the logical `TagSet` as AWS XML through a distinct response path; storage production code may no longer persist `TagSet::to_xml()` output directly. | The owner reader recognizes the fixed `ARGMIN-TAGSET/` magic, then parses one nonempty, overflow-checked canonical decimal version token terminated by exactly one newline. Missing delimiters, empty/nondigit/overflow tokens, and leading zeroes return a typed malformed-or-noncanonical-version result; a canonical decimal other than 1 returns typed unsupported-version. Both occur before XML parsing or logical construction. The reader then requires the exact owner-private canonical payload and no trailing bytes. |
+| ACL grants | Exact ASCII header `ARGMIN-ACL-GRANTS/1\n`, followed by the existing owner-private canonical grant-line payload. The empty ACL is the header with an empty payload rather than an empty durable string. | `s3-types` owns the private magic/version, grantee and permission tags, canonical sorting/deduplication, canonical-user spelling, and exact payload parser. HTTP and `server-core` continue to use only logical `AclGrants`. | The owner reader recognizes the fixed `ARGMIN-ACL-GRANTS/` magic, then applies the same nonempty, overflow-checked canonical-decimal and exact-newline grammar. Missing delimiters, empty/nondigit/overflow tokens, and leading zeroes return typed malformed-or-noncanonical-version; a canonical decimal other than 1 returns typed unsupported-version. Both occur before parsing any grant. The reader then requires the exact canonical payload and no alternate line endings, reordering, duplication, normalization, or trailing bytes. |
+
+The target remains a text frame deliberately: it preserves the existing SQLite `TEXT` columns and
+generic bucket-subresource body without a new dependency or a mixed SQLite storage class. The
+header separates durable bytes from AWS response XML and supplies an owner-readable version; the
+payload remains human-inspectable and reuses the already proven logical validation. A later binary
+carrier would be an incompatible inner version rather than an unmarked rewrite.
+
+Ownership and API requirements:
+
+- Replace the unframed public codec methods with opaque `s3-types` stored-tag and stored-ACL
+  carriers. Their version constants, header parser, and payload codecs remain private to the owner.
+- Storage's object and bucket tag carriers wrap the owner carrier plus its logical projection.
+  Storage persists/transmits only the framed text and never interprets the header or payload.
+  ACL-bearing storage paths likewise convert through the owner carrier at every row, command, RPC,
+  digest, and checkpoint boundary.
+- The boundary checker allows durable-carrier byte access only in `s3-types` owner code/tests and
+  the `storage` persistence boundary, rejecting it in every other crate. It rejects
+  `TagSet::to_xml()` in storage production persistence paths, rejects the removed unframed ACL/tag
+  codec methods, and rejects making the owner marker/version public. Negative fixtures cover
+  qualified, method-call, multiline-impl, and conversion-trait bypasses.
+- Cross-crate tests construct logical `TagSet` or `AclGrants` values. Exact frame and impossible
+  representation tests remain in `s3-types`; storage tests inject malformed frames only through
+  owner-local row/command/RPC/checkpoint facilities.
+
+The first framing change alters every current persisted and transmitted value even though the
+SQLite column types and outer field shapes remain text. Implement tags and ACLs together so their
+shared container versions advance once, not in successive baseline changes:
+
+- PG SQLite schema version 1 advances to 2.
+- Applied metadata-command encoding 6 advances to 7.
+- Storage-node RPC frame encoding 16 advances to 17.
+- Canonical metadata-state encoding 4 advances to 5.
+- Metadata-checkpoint encoding 1 and every durable, cross-process, control-plane, route-digest,
+  static-route, combined-route, and standalone-identity carrier identified by the canonical-state
+  audit advance according to that audit's selected explicit-carrier or coordinated-binding rule.
+
+The implementation slice is gated on completing the metadata-checkpoint and canonical-state
+carrier decisions above; those decisions must assign every exact downstream target version before
+the first writer changes. The slice then updates all writers and first readers atomically. Because
+upgrades are unsupported, unframed XML/grant strings and inner versions 0 or 2 are corruption—not
+legacy inputs—and no migration or fallback parser is added.
+
+Required evidence for the coordinated slice:
+
+- Owner exact-byte goldens for empty and representative v1 frames, every ACL grantee/permission,
+  ordered Unicode tags and escaping, and both tag cardinality profiles.
+- Typed missing/truncated/unknown-magic/malformed-or-noncanonical-version/unsupported-version/
+  malformed-payload/noncanonical-payload fixtures. For both frames, the version-token matrix
+  includes a missing newline delimiter, empty token, `/x\n`, `/01\n`, numeric overflow, and a
+  noncanonical line ending, all rejected before payload parsing. Canonical versions 0 and 2 carry
+  otherwise valid payloads and reach the distinct unsupported-version result.
+- Owner round trips plus storage row, applied-command, authenticated-RPC, canonical-digest, and
+  fully resealed checkpoint fixtures proving unsupported inner versions fail before recovery,
+  dispatch, authorization use, mutation, digest publication, checkpoint installation, or serving.
+- Read-after-write tests for objects, multipart uploads, buckets, and bucket tagging, plus unchanged
+  AWS-facing tag XML and ACL response tests proving the durable split does not alter S3 behavior.
+- Exact current fixtures for every newly advanced outer format and unsupported immediately older
+  and newer versions at each authoritative reader.
+
+After the initial coordinated advancement, the inner frame is authoritative for tag/ACL payload
+syntax. A later inner-only payload change need not advance PG, command, or RPC versions when their
+opaque length-prefixed text field grammar is unchanged, but it must advance canonical-state and
+every digest/proof/identity carrier if equivalent logical state would produce a different digest.
+Changing a containing field shape, SQLite storage class, or outer validation order still advances
+that containing format. This rule prevents both redundant version coupling and silent digest drift.
+
 The evidence audit proceeds in this bounded order after Phase 1 containment is complete:
 
 1. **Complete:** storage-node TLS, topology, physical payload, maintenance workflow, control-plane
@@ -2061,12 +2140,12 @@ The evidence audit proceeds in this bounded order after Phase 1 containment is c
 3. Do the same for the remaining `server-core`, `argmin-s3`, and `auth` rows, without exposing
    private constants or codecs to cross-crate tests. The shared checksum-tag and encrypted
    checksum-metadata families are recorded above.
-4. Decide the tag-XML and ACL-string strategy. If their containing formats are the version
-   boundary, record that as a deliberate invariant and require every incompatible canonical-codec
-   change to advance every listed container. Otherwise introduce a private framed carrier and
-   advance the current containing formats in the same slice.
+4. **Design complete:** replace unframed tag XML and ACL strings with the two `s3-types`-owned text
+   frames recorded above. Implement them together only after the checkpoint/canonical-state gate
+   assigns every downstream version advance.
 5. Implement only the gaps proven by the matrix, one owner and one coherent format family at a
-   time, updating the row to `Recorded` with its permanent test evidence.
+   time, updating the row to `Recorded` with its permanent test evidence. The tag/ACL carrier slice
+   is one coherent family because it advances the same outer formats once.
 
 Phase 2 is complete only when every row is `Recorded`, no representation relies on an implicit
 version assumption, and the audit finds no older-version parser, default-version fallback, or
