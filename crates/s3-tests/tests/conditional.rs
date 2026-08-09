@@ -2426,8 +2426,20 @@ fn test_delete_object_ifmatch_races_current_replacement_across_versioning_states
         let same_put = same_put
             .unwrap_or_else(|error| panic!("unversioned same-ETag replacement failed: {error:?}"));
         assert_eq!(same_put.e_tag(), Some(same_etag.as_str()));
-        same_delete
-            .unwrap_or_else(|error| panic!("unversioned same-ETag delete failed: {error:?}"));
+        let same_delete_succeeded = match same_delete {
+            Ok(_) => true,
+            Err(error) => {
+                assert_eq!(
+                    error
+                        .raw_response()
+                        .map(|response| response.status().as_u16()),
+                    Some(409),
+                    "{error:?}"
+                );
+                assert_eq!(error.code(), Some("ConditionalRequestConflict"));
+                false
+            }
+        };
         match client
             .get_object()
             .bucket(&bucket)
@@ -2450,6 +2462,10 @@ fn test_delete_object_ifmatch_races_current_replacement_across_versioning_states
                 );
             }
             Err(error) => {
+                assert!(
+                    same_delete_succeeded,
+                    "a rejected delete cannot remove the successful replacement"
+                );
                 assert_eq!(
                     error
                         .raw_response()

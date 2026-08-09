@@ -234,9 +234,17 @@ For each matrix:
   replayable; a competing call may instead return `NoSuchUpload`. Distinct
   uploads to one key both complete successfully, with last-writer object state
   and replay retained only for the current unversioned object. UploadPart
-  replacement versus completion is serializable: either completion publishes
-  the original part and replacement returns `NoSuchUpload`, or replacement is
-  retained and completion of the old ETag returns `InvalidPart`.
+  replacement versus completion either publishes the original part and retires
+  the upload, or retains the replacement and rejects completion of the old ETag
+  with `InvalidPart`. In the first branch the overlapping replacement can
+  return either `NoSuchUpload` or success even though the original manifest is
+  the one published; object bytes, upload visibility, and completion replay pin
+  the terminal state rather than inferring it from the replacement
+  acknowledgement alone. An initial completion can likewise report
+  `InvalidPart` while an immediate retry of its original manifest succeeds;
+  that branch must publish the original bytes and retire the upload, while a
+  repeated `InvalidPart` leaves the replacement available for corrected
+  completion.
   Deterministic coordinator regressions pin completion races after
   authorization, after snapshot lookup, and before commit. Completion restarts
   terminal-transition races once and uses a separate elapsed-time
@@ -640,14 +648,14 @@ choice.
   the complete replacement visible and permits the conditional delete to have
   serialized first, to return settled `PreconditionFailed`, or to return
   `ConditionalRequestConflict` when AWS detects the overlapping generation.
-  Same-ETag unversioned replacement remains ETag-based: repeated AWS runs
-  serialized the delete successfully, with final state determined by which
-  successful mutation was last. Suspended null replacement exposes the
-  stronger overlap branch: even identical bytes and ETag can return
-  `ConditionalRequestConflict`; both DeleteObject and DeleteObjects pin that
-  branch, with the latter requiring any conflict to be a per-entry error while
-  its matched canary entry succeeds. A successful delete publishes the null marker
-  and a successful later replacement publishes the null live version.
+  Same-ETag unversioned replacement remains ETag-based for settled condition
+  evaluation, but an overlapping generation can still return
+  `ConditionalRequestConflict`; both DeleteObject and DeleteObjects accept that
+  branch, with the latter requiring it to be a per-entry error while its
+  matched canary entry succeeds. Suspended null replacement exposes the same
+  overlap branch even with identical bytes and ETag. A successful delete
+  publishes the null marker and a successful later replacement publishes the
+  null live version.
   Retained numbered versions, exact marker/version IDs, latest flags, metadata,
   and bytes are asserted for every branch.
 

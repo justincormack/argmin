@@ -6677,7 +6677,7 @@ fn test_simultaneous_different_complete_multipart_uploads_publish_one_manifest()
 }
 
 #[test]
-fn test_upload_part_replacement_racing_completion_is_serializable() {
+fn test_upload_part_replacement_racing_completion_has_consistent_terminal_state() {
     s3_tests::run(async {
         for attempt in 0..10 {
             let client = CTX.client();
@@ -6747,8 +6747,16 @@ fn test_upload_part_replacement_racing_completion_is_serializable() {
 
             match completion {
                 Ok(completed) => {
-                    assert_eq!(err_status(&replacement), 404);
-                    assert_s3_err_code(&replacement, "NoSuchUpload");
+                    match &replacement {
+                        Ok(replaced) => assert!(
+                            replaced.e_tag().is_some(),
+                            "successful replacement attempt {attempt} omitted its ETag"
+                        ),
+                        Err(_) => {
+                            assert_eq!(err_status(&replacement), 404);
+                            assert_s3_err_code(&replacement, "NoSuchUpload");
+                        }
+                    }
                     assert_eq!(
                         get_state.unwrap_or_else(|err| panic!(
                             "completion-winning attempt {attempt} did not publish its object: {err:?}"
@@ -6781,26 +6789,77 @@ fn test_upload_part_replacement_racing_completion_is_serializable() {
                     assert_eq!(listed.parts().len(), 1);
                     assert_eq!(listed.parts()[0].part_number(), Some(1));
                     assert_eq!(listed.parts()[0].e_tag(), replacement.e_tag());
-                    assert_eq!(err_status(&retry), 400);
-                    assert_s3_err_code(&retry, "InvalidPart");
+                    match retry {
+                        Ok(retried) => {
+                            assert_object_contents_and_etag(
+                                &bucket,
+                                key,
+                                retried.e_tag().unwrap(),
+                                b"original part",
+                            )
+                            .await;
+                            assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+                            let replay = send_single_part_completion(
+                                client,
+                                &bucket,
+                                key,
+                                &upload_id,
+                                1,
+                                &original_etag,
+                            )
+                            .await
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "successful original-manifest retry in attempt {attempt} did not replay: {err:?}"
+                                )
+                            });
+                            assert_eq!(replay.e_tag(), retried.e_tag());
+                        }
+                        Err(error) => {
+                            let status = error
+                                .raw_response()
+                                .map(|response| response.status().as_u16());
+                            assert!(
+                                matches!(status, Some(200 | 400)),
+                                "InvalidPart must use status 400 or an embedded-error status 200: {error:?}"
+                            );
+                            assert_eq!(error.code(), Some("InvalidPart"));
 
-                    let corrected = send_single_part_completion(
-                        client,
-                        &bucket,
-                        key,
-                        &upload_id,
-                        1,
-                        replacement.e_tag().unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                    assert_object_contents_and_etag(
-                        &bucket,
-                        key,
-                        corrected.e_tag().unwrap(),
-                        b"replacement part",
-                    )
-                    .await;
+                            let corrected = send_single_part_completion(
+                                client,
+                                &bucket,
+                                key,
+                                &upload_id,
+                                1,
+                                replacement.e_tag().unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                            assert_object_contents_and_etag(
+                                &bucket,
+                                key,
+                                corrected.e_tag().unwrap(),
+                                b"replacement part",
+                            )
+                            .await;
+                            assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+                            let replay = send_single_part_completion(
+                                client,
+                                &bucket,
+                                key,
+                                &upload_id,
+                                1,
+                                replacement.e_tag().unwrap(),
+                            )
+                            .await
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "corrected completion in attempt {attempt} did not replay: {err:?}"
+                                )
+                            });
+                            assert_eq!(replay.e_tag(), corrected.e_tag());
+                        }
+                    }
                     cleanup(&bucket, &[key]).await;
                 }
             }

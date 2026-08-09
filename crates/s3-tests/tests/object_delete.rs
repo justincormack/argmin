@@ -774,12 +774,18 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
         assert_eq!(same_put.e_tag(), same_original.e_tag());
         let same_outcome =
             classify_conditional_delete_objects_entry(&same_delete, same_key, same_canary);
-        assert!(matches!(
-            same_outcome,
+        let same_delete_succeeded = match same_outcome {
             ConditionalDeleteObjectsEntryOutcome::Deleted {
-                delete_marker_version_id: None
+                delete_marker_version_id,
+            } => {
+                assert_eq!(delete_marker_version_id, None);
+                true
             }
-        ));
+            ConditionalDeleteObjectsEntryOutcome::Rejected { code } => {
+                assert_eq!(code, "ConditionalRequestConflict");
+                false
+            }
+        };
         match client
             .get_object()
             .bucket(&bucket)
@@ -798,6 +804,10 @@ fn test_multi_object_delete_ifmatch_races_current_replacement_across_versioning_
                 );
             }
             Err(error) => {
+                assert!(
+                    same_delete_succeeded,
+                    "a rejected batch delete cannot remove the successful replacement"
+                );
                 assert_eq!(
                     error
                         .raw_response()
