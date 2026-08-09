@@ -454,6 +454,21 @@ fn control_plane_raft_authority_checkpoint_compacts_wal_prefix() {
 
         let artifact =
             ControlPlaneRaftRestartArtifact::load_durable_artifact(&artifact_path).unwrap();
+        let status = authority.status().await.unwrap();
+        let status_offsets = status
+            .durable_wal_offsets()
+            .expect("WAL-backed authority status should report durable offsets");
+        assert_eq!(status_offsets.base_offset(), artifact.wal_replay_offset);
+        assert!(
+            status_offsets.clean_len() >= artifact.wal_replay_offset,
+            "status WAL clean length {} should not precede checkpoint replay offset {}",
+            status_offsets.clean_len(),
+            artifact.wal_replay_offset
+        );
+
+        // A completed sync may become visible on disk immediately before the
+        // durability lane publishes its cached offsets. Read the published
+        // status first and prove that the physical WAL covers that prefix.
         let compacted_bytes = fs::read(&wal_path).unwrap();
         let (wal_base_offset, _) =
             ControlPlaneRaftWalFile::decode_file_header(&compacted_bytes).unwrap();
@@ -466,25 +481,11 @@ fn control_plane_raft_authority_checkpoint_compacts_wal_prefix() {
                 "compacted WAL clean length {compacted_clean_len} should not precede checkpoint replay offset {}",
                 artifact.wal_replay_offset
             );
-        let status = authority.status().await.unwrap();
-        assert_eq!(
-            status
-                .durable_wal_offsets()
-                .map(ControlPlaneRaftWalOffsets::base_offset),
-            Some(artifact.wal_replay_offset)
-        );
         assert!(
-                matches!(
-                    status
-                        .durable_wal_offsets()
-                        .map(ControlPlaneRaftWalOffsets::clean_len),
-                    Some(status_clean_len) if status_clean_len >= compacted_clean_len
-                ),
-                "status WAL clean length {:?} should be at least compacted clean length {compacted_clean_len}",
-                status
-                    .durable_wal_offsets()
-                    .map(ControlPlaneRaftWalOffsets::clean_len)
-            );
+            compacted_clean_len >= status_offsets.clean_len(),
+            "compacted WAL clean length {compacted_clean_len} should cover published status clean length {}",
+            status_offsets.clean_len()
+        );
         artifact
             .restore_with_wal_file(test_raft_wal_file(&wal_path, "test-cluster", 1))
             .expect("checkpoint artifact should restore after WAL compaction");
