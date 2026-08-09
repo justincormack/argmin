@@ -126,6 +126,22 @@ fn assert_bucket_was_not_created(bucket: &str) {
     );
 }
 
+fn head_bucket_error_shape(status: u16, region: Option<&str>) -> s3_tests::shape::ShapeSpec {
+    let spec = shape()
+        .status(status)
+        .headers([
+            ("x-amz-request-id", "{request_id}"),
+            ("x-amz-id-2", "{host_id}"),
+            ("content-type", "application/xml"),
+        ])
+        .body_empty();
+    if let Some(region) = region {
+        spec.header("x-amz-bucket-region", region)
+    } else {
+        spec
+    }
+}
+
 async fn wait_for_account_regional_namespace_visibility(
     bucket: &str,
     credentials: s3_tests::SignedRequestCredentials<'_>,
@@ -375,7 +391,6 @@ fn test_account_regional_bucket_rejects_mismatched_account_suffix() {
                      <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
                 ),
         );
-        assert_bucket_was_not_created(&bucket);
     });
 }
 
@@ -453,7 +468,6 @@ fn test_account_regional_bucket_rejects_mismatched_region_suffix() {
                      <RequestId>{request_id}</RequestId><HostId>{host_id}</HostId></Error>",
                 ),
         );
-        assert_bucket_was_not_created(&bucket);
     });
 }
 
@@ -583,6 +597,68 @@ fn test_bucket_delete_then_recreate() {
 }
 
 // ── HeadBucket ───────────────────────────────────────────────────────
+
+#[test]
+fn test_missing_account_regional_head_bucket_routes_by_suffix() {
+    s3_tests::run(async {
+        let own_region_bucket = account_regional_bucket_name(CTX.account_id(), CTX.region());
+        let foreign_account_bucket =
+            account_regional_bucket_name(CTX.alt_account_id(), CTX.region());
+        let other_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let foreign_region_bucket = account_regional_bucket_name(CTX.account_id(), other_region);
+
+        assert_shape(
+            "HeadBucket missing account-regional bucket in caller account and region",
+            &raw_bucket("HEAD", &own_region_bucket, None),
+            &head_bucket_error_shape(404, None),
+        );
+        assert_shape(
+            "HeadBucket missing account-regional bucket in foreign account",
+            &raw_bucket("HEAD", &foreign_account_bucket, None),
+            &head_bucket_error_shape(403, Some(CTX.region())),
+        );
+        assert_shape(
+            "HeadBucket missing account-regional bucket in foreign region",
+            &raw_bucket("HEAD", &foreign_region_bucket, None),
+            &head_bucket_error_shape(301, Some(other_region)),
+        );
+    });
+}
+
+#[test]
+fn test_cross_account_head_account_regional_bucket_does_not_reveal_existence() {
+    s3_tests::run(async {
+        let existing_bucket = unique_alt_account_regional_bucket();
+        let missing_bucket = unique_alt_account_regional_bucket();
+        let created = create_account_regional_bucket_with_credentials(
+            &existing_bucket,
+            raw_alt_credentials(),
+        );
+        assert_eq!(
+            created.status, 200,
+            "failed to create alternate-account bucket: {created:#?}"
+        );
+        wait_for_account_regional_namespace_visibility(&existing_bucket, raw_alt_credentials())
+            .await;
+
+        let existing = raw_bucket("HEAD", &existing_bucket, None);
+        let missing = raw_bucket("HEAD", &missing_bucket, None);
+        s3_tests::delete_bucket_retrying_operation_aborted(CTX.alt_client(), &existing_bucket)
+            .await;
+
+        for (label, response) in [("existing", &existing), ("missing", &missing)] {
+            assert_shape(
+                &format!("HeadBucket {label} foreign account-regional bucket"),
+                response,
+                &head_bucket_error_shape(403, Some(CTX.region())),
+            );
+        }
+    });
+}
 
 #[test]
 fn test_bucket_head() {

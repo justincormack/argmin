@@ -939,6 +939,15 @@ fn create_bucket_account_regional_rejects_mismatched_account_suffix() {
         }
         other => panic!("expected InvalidBucketNamespace, got {other:?}"),
     }
+    assert!(
+        coord
+            .list_buckets(&ListBucketsRequest {
+                requester: test_helpers::requester("111122223333"),
+            })
+            .unwrap()
+            .is_empty(),
+        "namespace validation failure must not create a bucket"
+    );
 }
 
 #[test]
@@ -967,6 +976,15 @@ fn create_bucket_account_regional_rejects_mismatched_region_suffix() {
         }
         other => panic!("expected InvalidBucketNamespace, got {other:?}"),
     }
+    assert!(
+        coord
+            .list_buckets(&ListBucketsRequest {
+                requester: test_helpers::requester("111122223333"),
+            })
+            .unwrap()
+            .is_empty(),
+        "namespace validation failure must not create a bucket"
+    );
 }
 
 #[test]

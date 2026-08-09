@@ -1998,7 +1998,7 @@ fn test_missing_account_regional_bucket_wrong_region_returns_header_malformed() 
 
         assert_eq!(status, 400, "expected 400, got {status}: {body}");
         assert_error_code(&body, "AuthorizationHeaderMalformed");
-        assert_eq!(bucket_region.as_deref(), None);
+        assert_eq!(bucket_region.as_deref(), Some(CTX.region()));
         assert!(
             body.contains(&format!(
                 "<Message>The authorization header is malformed; the region '{wrong_region}' is wrong; expecting '{}'</Message>",

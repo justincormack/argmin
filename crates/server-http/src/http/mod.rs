@@ -50,9 +50,10 @@ use router::{
     ServiceOperation, ServiceRouteError,
 };
 use s3_types::{
-    requires_sigv4, BucketLifecycleConfiguration, BucketNamespace, LegalHoldStatus, ObjectLockMode,
-    ObjectLockState, ObjectRetention, StoredLegalHoldStatus, VersionId, WebsiteRedirectLocation,
-    WebsiteRedirectLocationError, WEBSITE_REDIRECT_LOCATION_HEADER_NAME,
+    parse_account_regional_bucket_name, requires_sigv4, BucketLifecycleConfiguration,
+    BucketNamespace, LegalHoldStatus, ObjectLockMode, ObjectLockState, ObjectRetention,
+    StoredLegalHoldStatus, VersionId, WebsiteRedirectLocation, WebsiteRedirectLocationError,
+    WEBSITE_REDIRECT_LOCATION_HEADER_NAME,
 };
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
@@ -1082,9 +1083,10 @@ impl HttpFrontend {
         let s3_operation = operation.s3();
         let actual_cors_bucket = s3_operation.and_then(S3Operation::bucket_name).cloned();
         // AWS reveals the bucket region on the pinned header/presigned
-        // credential errors only for bucket-scoped requests to existing
-        // buckets. Object-scoped requests, POST/streaming writes, and unknown
-        // buckets omit the header.
+        // credential errors for bucket-scoped requests to existing buckets.
+        // A valid account-regional suffix also supplies the region hint for a
+        // header-auth region error even when the bucket is missing. Object-
+        // scoped requests and POST/streaming writes omit the header.
         let auth_error_bucket_region_bucket = if s3_operation
             .is_some_and(|operation| operation.object_key().is_none())
             && !matches!(s3_operation, Some(S3Operation::PostObject { .. }))
@@ -1188,6 +1190,7 @@ impl HttpFrontend {
                     self.coordinator
                         .bucket_exists_on_admitted_route(admission, bucket)
                         .unwrap_or(false)
+                        || self.account_regional_bucket_region_is_known(bucket)
                 })
             });
         let mut resp = {
@@ -1414,6 +1417,11 @@ impl HttpFrontend {
             .as_ref()
             .map(auth::AuthenticatedIdentity::account)
             .ok_or(ServerError::AccessDenied)
+    }
+
+    fn account_regional_bucket_region_is_known(&self, bucket: &BucketName) -> bool {
+        parse_account_regional_bucket_name(bucket.as_str())
+            .is_some_and(|name| name.region() == self.coordinator.region())
     }
 }
 
@@ -1804,11 +1812,27 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
+                let conceal_account_regional_missing =
+                    if let Some(name) = parse_account_regional_bucket_name(bucket.as_str()) {
+                        if name.region() != self.coordinator.region() {
+                            return Ok(S3Response::head_bucket_region_redirect(name.region()));
+                        }
+                        !auth.identity.as_ref().is_some_and(|identity| {
+                            identity.account().account_id() == Some(name.account_id())
+                        })
+                    } else {
+                        false
+                    };
                 let requester = self.requester_from_auth(auth, req)?;
-                let info = self.coordinator.head_bucket_on_admitted_route(
+                let info = match self.coordinator.head_bucket_on_admitted_route(
                     storage_route_admission,
                     &bucket_request(&bucket, requester, expected_bucket_owner)?,
-                )?;
+                ) {
+                    Err(ServerError::BucketNotFound { .. }) if conceal_account_regional_missing => {
+                        return Err(ServerError::AccessDenied);
+                    }
+                    result => result?,
+                };
                 Ok(S3Response::head_bucket(&info, self.coordinator.region()))
             }
             S3Operation::GetBucketLocation { bucket } => {
@@ -3710,6 +3734,7 @@ impl HttpFrontend {
                                 .bucket_exists_on_admitted_route(&admission, &bucket)
                                 .unwrap_or(false)
                         })
+                        || self.account_regional_bucket_region_is_known(&bucket)
                 } else {
                     false
                 };

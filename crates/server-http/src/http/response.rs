@@ -2094,6 +2094,15 @@ impl S3Response {
             .header("x-amz-bucket-region", region)
     }
 
+    /// Build the empty `HeadBucket` response used when an account-regional
+    /// bucket-name suffix routes the request to another region.
+    #[must_use]
+    pub fn head_bucket_region_redirect(region: &str) -> Self {
+        Self::new(301)
+            .header("Content-Type", "application/xml")
+            .header("x-amz-bucket-region", region)
+    }
+
     /// Build a response for `GetBucketLocation`.
     #[must_use]
     pub fn get_bucket_location(region: &str) -> Self {
