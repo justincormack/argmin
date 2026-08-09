@@ -486,8 +486,8 @@ The same nested bytes are embedded in these storage-owned containing formats:
 | Containing format | Current baseline | Metadata embedding |
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store user and system metadata blob columns. |
-| Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry both opaque blobs. |
-| Storage-node RPC | frame encoding version 12 | Logical object, multipart, and stream request/response payloads carry both opaque blobs. |
+| Metadata command | encoding version 6 | Object, multipart-upload, and stream-session command values carry both opaque blobs. |
+| Storage-node RPC | frame encoding version 16 | Logical object, multipart, and stream request/response payloads carry both opaque blobs. |
 | Canonical PG state | encoding version 4 | The metadata columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the metadata columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -495,8 +495,8 @@ Changing either metadata encoding requires a new inner version and coordinated a
 every containing format that can persist, replay, hash, or transmit the changed bytes. There are
 no old-version or prefix-decoding fallbacks. The separately encrypted checksum projection used
 by SSE-C and SSE-S3 is a private `server-core` version-1 codec nested inside the storage-owned
-encryption state; changing it also requires advancing the corresponding encryption inner version
-and all of that format's containing versions.
+encryption state; changing it also requires advancing both encryption-state versions and all of
+their containing versions.
 
 ### Nested Durable Codec Inventory: Object Tags (2026-07-28)
 
@@ -522,8 +522,8 @@ The object-tag XML is embedded in these storage-owned containing formats:
 | Containing format | Current baseline | Object-tag embedding |
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store optional canonical object-tag XML. |
-| Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry the opaque tag set. |
-| Storage-node RPC | frame encoding version 12 | Logical object, multipart, stream, mutation, and tag-read payloads carry the opaque tag set. |
+| Metadata command | encoding version 6 | Object, multipart-upload, and stream-session command values carry the opaque tag set. |
+| Storage-node RPC | frame encoding version 16 | Logical object, multipart, stream, mutation, and tag-read payloads carry the opaque tag set. |
 | Canonical PG state | encoding version 4 | The tag columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry tag columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -550,8 +550,8 @@ The bucket-tag XML is embedded in these storage-owned containing formats:
 | Containing format | Current baseline | Bucket-tag embedding |
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `bucket_subresources` stores canonical bucket-tag XML under the private tagging discriminator. |
-| Metadata command | encoding version 5 | Bucket-subresource put/delete commands carry the discriminated typed tag mutation. |
-| Storage-node RPC | frame encoding version 12 | Bucket snapshots, typed reads, and subresource mutations carry the opaque bucket-tag set. |
+| Metadata command | encoding version 6 | Bucket-subresource put/delete commands carry the discriminated typed tag mutation. |
+| Storage-node RPC | frame encoding version 16 | Bucket snapshots, typed reads, and subresource mutations carry the opaque bucket-tag set. |
 | Canonical PG state | encoding version 4 | The bucket-subresource body participates in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the bucket-subresource row and bind it into row, table, state, and checkpoint digests. |
 
@@ -583,8 +583,8 @@ The ACL representation is embedded in these storage-owned containing formats:
 | Containing format | Current baseline | ACL embedding |
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `buckets`, `objects`, and `multipart_uploads` store canonical ACL strings. |
-| Metadata command | encoding version 5 | Bucket, object, multipart-upload, create, commit, and ACL mutation records carry canonical ACL strings. |
-| Storage-node RPC | frame encoding version 12 | Logical bucket, object, multipart, stream-commit, and ACL mutation messages carry canonical ACL strings. |
+| Metadata command | encoding version 6 | Bucket, object, multipart-upload, create, commit, and ACL mutation records carry canonical ACL strings. |
+| Storage-node RPC | frame encoding version 16 | Logical bucket, object, multipart, stream-commit, and ACL mutation messages carry canonical ACL strings. |
 | Canonical PG state | encoding version 4 | The three persisted ACL columns participate in canonical row and state digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry all three ACL columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -614,8 +614,8 @@ The same nested bytes are embedded in these storage-owned containing formats:
 | Containing format | Current baseline | Encryption-state embedding |
 | --- | --- | --- |
 | PG SQLite schema | schema version 1 | `objects`, `multipart_uploads`, and `stream_uploads` store `encryption_type` plus `encryption_state`. |
-| Metadata command | encoding version 5 | Object, multipart-upload, and stream-session command values carry the discriminator and nested state bytes. |
-| Storage-node RPC | frame encoding version 12 | Logical object, multipart, and stream request/response payloads carry the discriminator and nested state bytes. |
+| Metadata command | encoding version 6 | Object, multipart-upload, and stream-session command values carry the discriminator and nested state bytes. |
+| Storage-node RPC | frame encoding version 16 | Logical object, multipart, and stream request/response payloads carry the discriminator and nested state bytes. |
 | Canonical PG state | encoding version 4 | The three table representations above include both encryption columns in canonical digests. |
 | Metadata command checkpoint | encoding version 1 | Checkpoint table blocks carry the raw encryption columns and bind them into row, table, state, and checkpoint digests. |
 
@@ -626,7 +626,18 @@ version; this containment work does not add fallback readers. Malformed nested-s
 inside `storage`, while cross-crate tests exercise only logical encryption behavior. Storage also
 enforces the nested checksum-metadata length when logical state is constructed, so every public
 state is encodable, and exact-byte goldens pin the discriminator, inner version, field order,
-endianness, and length encoding for all three encryption variants.
+endianness, and length encoding for all three encryption variants. It does not yet require the
+writer's canonical zero nonce when the encrypted checksum payload is empty.
+
+The sealed checksum payload is a separate nested format audited in Phase 2 below. A change to its
+self-versioned plaintext frame advances that inner version plus both outer encryption-state
+versions and their containing formats under the coordinated nested-format rule above. A change to
+the untagged AES-GCM algorithm, nonce/tag sizes, AAD domain, or canonical absent-ciphertext
+representation advances the applicable SSE-C or SSE-S3 outer state version, because no inner
+profile selector can be read before authentication. Enforcing the current writer's existing zero
+nonce plus empty ciphertext as the sole accepted absent representation is decoder hardening, not a
+representation change, and preserves SSE-C v3 and SSE-S3 v1. The existing rule advances containing
+formats only when the canonical representation itself changes.
 
 ### RPC Boundary Inventory (2026-07-27)
 
@@ -1803,8 +1814,11 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Raft WAL frame and records | `storage` | magic `ARGMINCPRAFTWAL`; frame/record encoding 1 | Evidence required; every record kind round-trips and malformed/version-2 rejection exists, but current bytes, version 0, typed rejection, and production replay evidence are incomplete |
 | Standalone route identity and initialization marker | `storage` | static route-map digest 2; combined-route digest 2; shared artifact format 2 with distinct identity/initialization magic values | Recorded: exact current identity, marker, static digest, and combined digest fixtures; separate marker magic/version failures; exact old/new unsupported-version fixtures; deterministic post-metadata truncation/extension rejection for both artifacts |
 | User and system object metadata | `server-core` | user metadata 1; system metadata 1 | Recorded |
-| Checksum metadata embedded in SSE-C and SSE-S3 state | `server-core` | checksum metadata 1 | Evidence required |
-| Object encryption state | `storage` | SSE-C 3; SSE-S3 1, selected by a typed outer discriminator | Recorded |
+| Shared checksum algorithm/type tag encoding | `checksum` | untagged `u8` algorithm tags 0-9, type tags 0-1, and absent-type sentinel 255 | Design recorded below: current direct enum casts bind every containing format; an owner-local exact tag table and per-container evidence remain required |
+| Encrypted checksum-metadata plaintext frame | `server-core` | checksum metadata 1; version, algorithm/type tags, big-endian `u16` UTF-8 value length, and value | Evidence required; direct versions 0/2 rejection and one encrypted current vector exist, but the exact plaintext corpus, typed rejection, and key-aware object-read evidence are incomplete |
+| SSE-C checksum-sealing profile | `server-core` | AES-256-GCM with 12-byte nonce, 16-byte tag, and AAD `argmin:sse-c:checksum:v1`, selected by outer SSE-C state 3 | Evidence required; randomized round-trip and persisted logical behavior exist, but no exact cryptographic vector or malformed-inner production-read fixture exists |
+| SSE-S3 checksum-sealing profile | `server-core` | AES-256-GCM with 12-byte nonce, 16-byte tag, and AAD `argmin:sse-s3:checksum:v1`, selected by outer SSE-S3 state 1 | Evidence required; one exact cryptographic vector and unit round-trip exist, but persisted logical and malformed-inner production-read evidence is incomplete |
+| Object encryption state | `storage` | SSE-C 3; SSE-S3 1, selected by a typed outer discriminator | Evidence required; exact outer bytes and version rejection are pinned, but canonical empty-checksum carrier validation remains outstanding below |
 | Object-tag and bucket-tag canonical XML | `s3-types` | no independent marker; exact canonical XML is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
 | ACL canonical string | `s3-types` | no independent marker; exact canonical string is embedded in versioned storage formats | Design required: formalize outer-version binding or add a private inner frame |
 | Static cluster manifest and static identities | `argmin-s3` | manifest schema 1; storage identity 1; control-plane identity 2 | Evidence required; the storage-topology subdocument is interpreted through the contained storage-owned builder |
@@ -2006,6 +2020,33 @@ a shared logical-value change advances exactly the restart/peer/WAL containers l
 preceding audit. Sentinel v1 remains independent unless its own durable existence or identity
 semantics change. None of these rules permits an older reader or default-version fallback.
 
+#### Encrypted checksum-metadata evidence inventory (2026-08-09)
+
+Encrypted object checksums combine one checksum-owned logical tag table, one shared
+`server-core` plaintext frame, and two independently selected sealing profiles. The storage-owned
+SSE-C and SSE-S3 states carry only a nonce and bounded opaque ciphertext; `storage` cannot inspect
+the authenticated plaintext during row, command, RPC, checkpoint, or restart validation. The
+first semantic reader is therefore the key-aware `server-core` object-read path, not a storage
+decoder.
+
+| Format | Defining representation | Current writer | First rejecting reader | Existing permanent evidence | Evidence still required |
+| --- | --- | --- | --- | --- | --- |
+| Shared checksum algorithm/type tags | `checksum::ChecksumAlgorithm` has explicit `u8` tags 0 through 9; `ChecksumType` has tags 0 and 1; optional checksum type uses 255 for absent. The representation has no independent marker. | `server-core` directly casts these enums into system-metadata v1 and encrypted-checksum plaintext v1. `storage` directly casts them into PG schema-v1 multipart columns, metadata-command v6, and storage-RPC v16; the PG values also enter canonical-state v4 and metadata-checkpoint v1. | Each containing decoder invokes `ChecksumAlgorithm::from_u8()` and `ChecksumType::from_u8()` only after its own outer version has been accepted. PG row decoding validates the integer columns, while canonical-state/checkpoint verification binds their raw values. | `server-core`'s system-metadata exact-byte corpus pins all ten algorithm tags, both type tags, and the absent sentinel. The `checksum` owner tests round-trip every algorithm and explicitly pin the two type tags, but coordinated algorithm renumbering would still pass the owner test. Metadata-command, RPC, PG, canonical-state, and checkpoint tests cover representative logical checksum configurations rather than one cross-container exact tag corpus. | Treat `checksum` as the sole owner of this shared nested tag table and add an owner-local exact tag fixture. Add a fixed representative tag fixture in every direct containing format. With the current shared encoding, any incompatible tag change advances system-metadata v1, encrypted-checksum plaintext v1, both outer encryption-state versions and their recorded containers, PG schema v1, metadata-command v6, storage-RPC v16, canonical-state v4, and metadata-checkpoint v1, plus the already recorded carriers of canonical-state semantics. A representation-neutral refactor from direct enum casts to checksum-owned conversion methods may preserve every byte without advancing a version. |
+| Encrypted checksum-metadata plaintext | Private `SSE_C_CHECKSUM_METADATA_VERSION = 1`—despite its historical name, it is shared by SSE-C and SSE-S3—followed by algorithm tag, checksum-type tag or 255, big-endian `u16` UTF-8 value length, and the exact value bytes. Absence is represented outside the frame by empty ciphertext. | `encrypt_checksum_with_dek()` calls `encode_checksum_metadata()` only for a present logical checksum, then seals those bytes under the selected profile. `Coordinator::prepare_stored_system_metadata()` removes the cleartext checksum from system metadata before attaching the sealed value to the object-encryption state for PutObject, streaming PutObject, or CompleteMultipartUpload. | `decrypt_checksum_with_dek()` first authenticates/decrypts the selected profile, then `decode_checksum_metadata()` checks minimum length, exact version 1, algorithm/type tags, exact declared length, and UTF-8. `deserialize_visible_system_metadata()` invokes it for SSE-S3 automatically and for SSE-C only after valid customer-key headers are supplied, before returning read/list metadata or using source metadata for CopyObject. Failures are free-form `ServerError::InternalError`. | Unit tests round-trip one SHA-256/FULL_OBJECT frame through each profile and directly reject structurally current plaintext versions 0 and 2. The fixed SSE-S3 ciphertext vector indirectly seals one exact current plaintext. The complete tag table is pinned only through the separate system-metadata codec. There is no exact plaintext corpus or malformed algorithm/type/length/UTF-8 matrix. | Rename the private version constant to reflect the shared format without changing bytes. Introduce a private typed truncated/unsupported-version/invalid-tag/invalid-length/invalid-UTF-8 result and map it to a redacted internal server failure. Add exact v1 plaintext fixtures covering every shared tag, absent type, empty and multibyte values, and the effective 65,514-byte accepted/65,515-byte rejected value boundary. Encrypt correctly formed versions 0 and 2 under each current profile, embed them in current outer states, and prove key-aware Head/Get and Copy source reads reject before metadata response or destination mutation. An incompatible field-layout change advances plaintext v1, both outer encryption-state versions, and every recorded outer container. |
+| SSE-C checksum-sealing profile | AES-256-GCM with a 12-byte random nonce, 16-byte authentication tag, and exact AAD `argmin:sse-c:checksum:v1`. The ciphertext has no profile marker; storage-owned SSE-C state v3 selects this profile and stores the nonce plus a big-endian `u16` ciphertext length. | `SseCustomerWriteContext::seal_checksum_metadata()` uses the per-object DEK already wrapped by the customer-derived key, writes the current plaintext, generates the checksum nonce, seals with the SSE-C AAD, and constructs the bounded outer state. An absent checksum is written as a zero nonce and empty ciphertext. | With valid SSE-C request headers, `decrypt_sse_customer_checksum()` validates the customer-key proof, unwraps the per-object DEK, authenticates the exact nonce/AAD/ciphertext, and only then invokes the plaintext reader. Without SSE-C headers the checksum intentionally remains hidden; a wrong key is rejected before decryption. | Randomized unit round-trip proves current sealing/opening. A coordinator test proves a persisted checksum is absent from cleartext system metadata, is recovered by HeadObject with the right key, and is denied with the wrong key. Storage exact-byte tests pin the outer v3 nonce/ciphertext carrier, but no fixed SSE-C cryptographic vector pins the checksum AAD, algorithm, tag, or nonce use. | Add a fixed SSE-C vector covering plaintext, derived/wrapped DEK inputs, nonce, exact AAD, ciphertext, and tag, plus wrong-nonce/AAD/ciphertext/tag rejection. Add owner-spanning logical persistence/read evidence using the fixed profile. Tighten construction and decode to accept only the current writer's zero-nonce/empty-ciphertext absent representation; this preserves SSE-C state v3 and every containing version because it rejects bytes the current writer has never emitted. The plaintext encoder currently accepts values through 65,535 bytes, while the outer `u16` must also contain the five-byte plaintext header and sixteen-byte GCM tag; centralize and test the effective 65,514-byte value bound before encryption. A future change to the sealing algorithm, nonce/tag size, AAD, or canonical absent representation advances outer SSE-C state v3 and all of its recorded containing formats. |
+| SSE-S3 checksum-sealing profile | AES-256-GCM with a 12-byte random nonce, 16-byte authentication tag, and exact AAD `argmin:sse-s3:checksum:v1`. The ciphertext has no profile marker; storage-owned SSE-S3 state v1 selects this profile and stores the nonce plus a big-endian `u16` ciphertext length. | `ManagedEncryptionWriteContext::seal_checksum_metadata()` uses the per-object DEK wrapped under the selected managed key, then invokes the same plaintext writer and sealing primitive with the distinct managed AAD. An absent checksum is written as a zero nonce and empty ciphertext. | `decrypt_managed_encryption_checksum()` resolves the retained wrapping-key ID, unwraps the per-object DEK, authenticates the exact nonce/AAD/ciphertext, and invokes the shared plaintext reader before checksum metadata is returned by read/list/copy paths. | Unit round-trip covers current managed sealing. `sse_s3_wire_format_vectors_stay_stable` pins a complete fixed wrapping, segment, and checksum vector, including the current checksum plaintext, nonce, AAD, ciphertext, and authentication tag. There is no persisted coordinator-level checksum read, tamper matrix, malformed-inner fixture, or absent-carrier canonicality test. | Retain the exact current vector and add wrong-nonce/AAD/ciphertext/tag rejection plus persisted PutObject/Head/Get/Copy evidence. Tighten construction and decode to accept only the current writer's zero-nonce/empty-ciphertext absent representation; this preserves SSE-S3 state v1 and every containing version because it rejects bytes the current writer has never emitted. Apply the same 65,514-byte effective value bound as SSE-C and exercise encrypted plaintext versions 0 and 2 through the managed production read path. A future change to the sealing algorithm, nonce/tag size, AAD, or canonical absent representation advances outer SSE-S3 state v1 and all of its recorded containing formats. |
+
+The checksum tag table is a `checksum`-owned shared nested representation, not an accidental
+property of Rust enum declaration order. Until direct casts are replaced by owner-controlled
+conversion methods, every listed containing version is bound to those numeric values. Plaintext
+checksum framing has its own version inside the authenticated ciphertext, while the repository's
+coordinated nested-format rule also advances both outer encryption-state families for an
+incompatible plaintext change. The sealing profiles cannot select a replacement algorithm or AAD
+before decrypting the payload, so a profile-only change advances the applicable outer
+encryption-state version. Rejecting noncanonical absent carriers while retaining the writer's
+existing zero/empty representation is explicitly not such a change and preserves the current
+versions. No rule introduces a fallback decrypter or accepts an older plaintext frame.
+
 The evidence audit proceeds in this bounded order after Phase 1 containment is complete:
 
 1. **Complete:** storage-node TLS, topology, physical payload, maintenance workflow, control-plane
@@ -2017,8 +2058,9 @@ The evidence audit proceeds in this bounded order after Phase 1 containment is c
    single-authority journal hash-chain binding and durable artifacts, control-plane RPC/shared
    authentication, Raft peer transport/RPC/shared logical values, and Raft restart/sentinel/WAL
    artifacts are recorded above.
-3. Do the same for the `server-core`, `argmin-s3`, and `auth` rows, without exposing private
-   constants or codecs to cross-crate tests.
+3. Do the same for the remaining `server-core`, `argmin-s3`, and `auth` rows, without exposing
+   private constants or codecs to cross-crate tests. The shared checksum-tag and encrypted
+   checksum-metadata families are recorded above.
 4. Decide the tag-XML and ACL-string strategy. If their containing formats are the version
    boundary, record that as a deliberate invariant and require every incompatible canonical-codec
    change to advance every listed container. Otherwise introduce a private framed carrier and
