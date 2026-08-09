@@ -96,6 +96,7 @@ impl StorageCluster {
             .repair_payload_shard(self.operation_epoch(), location, key, data)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_payload_shard(
         &self,
         location: ShardLocation,
@@ -103,7 +104,7 @@ impl StorageCluster {
         expected: WriteAck,
     ) -> Result<Vec<u8>, ShardIoError> {
         self.local_map
-            .read_payload_shard(self.operation_epoch(), location, key, expected)
+            .test_read_payload_shard(self.operation_epoch(), location, key, expected)
     }
 
     fn read_payload_shard_for_historical_inspection_self_validating(
@@ -4433,14 +4434,17 @@ impl StorageCluster {
             shard_ack_route.validate_shard_ack(key, *ack)?;
         }
 
-        let placement_key = segment_payload_placement_key(segment_okh, segment_vid);
-        let locations = self
-            .place_payload_shards(data_pg, ec, &placement_key)
-            .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
+        let reader = self
+            .current_placed_segment_shard_reader(
+                data_pg_id,
+                ec,
+                segment_okh,
+                segment_vid,
+            )
+            .map_err(ObjectPgActionError::Store)?;
         for (key, ack) in shard_batch {
-            let location = Self::placed_payload_shard_location(&locations, key)
-                .map_err(ObjectPgActionError::Store)?;
-            self.read_payload_shard(location, key, *ack)
+            reader
+                .read(usize::from(key.shard_index().get()), *ack)
                 .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
         }
         Ok(())

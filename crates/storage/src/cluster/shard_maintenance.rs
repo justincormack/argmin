@@ -1900,6 +1900,24 @@ impl StorageCluster {
         let shard_size = padded / k;
         let mut shards = Vec::with_capacity(ec_config.total_shards());
         let mut valid_shards = 0usize;
+        let current_reader = match read_mode {
+            PlacedSegmentShardHealthReadMode::CurrentRoute => {
+                let reader = self.current_placed_segment_shard_reader(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                )?;
+                if reader.locations() != locations {
+                    return Err(StoreError::PayloadShardSetMismatch {
+                        reason: "current segment health locations do not match installed placement"
+                            .to_string(),
+                    });
+                }
+                Some(reader)
+            }
+            PlacedSegmentShardHealthReadMode::HistoricalInspection => None,
+        };
 
         for shard_index in 0..ec_config.total_shards() as u8 {
             let shard_key = ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index);
@@ -1925,7 +1943,10 @@ impl StorageCluster {
                 Ok(ack) if ack.stored_size == shard_size as u64 => {
                     let read_result = match read_mode {
                         PlacedSegmentShardHealthReadMode::CurrentRoute => {
-                            self.read_payload_shard(location, &shard_key, ack)
+                            current_reader
+                                .as_ref()
+                                .expect("current read mode constructs a placed reader")
+                                .read(usize::from(shard_index), ack)
                         }
                         PlacedSegmentShardHealthReadMode::HistoricalInspection => self
                             .read_payload_shard_for_historical_inspection(
@@ -2402,15 +2423,25 @@ impl StorageCluster {
         req: SegmentStoredBytesRequest,
         dst: &mut Vec<u8>,
     ) -> Result<bool, StoreError> {
-        let locations = self.segment_payload_locations(&req)?;
+        let reader = self.current_placed_segment_shard_reader(
+            req.data_pg_id,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+        )?;
         let k = req.ec.k as usize;
         let padded = req.stored_size.div_ceil(k) * k;
         let shard_size = padded / k;
         dst.resize(padded, 0);
-        let mut direct_shards = Vec::with_capacity(k);
-        for (shard_index, location) in locations.iter().take(k).enumerate() {
-            let shard_key =
-                ShardKey::new(&req.segment_okh, req.segment_vid.get(), shard_index as u8);
+        let mut direct_acks = Vec::with_capacity(k);
+        for shard_index in 0..k {
+            let shard_key = reader
+                .shard_key(shard_index)
+                .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                    reason: format!(
+                        "direct read shard index {shard_index} is outside installed placement"
+                    ),
+                })?;
             let ack = match self.load_payload_shard_ack(req.data_pg_id, &shard_key) {
                 Ok(ack) => ack,
                 Err(StoreError::NotFound) => return Ok(false),
@@ -2419,16 +2450,9 @@ impl StorageCluster {
             if ack.stored_size != shard_size as u64 {
                 return Ok(false);
             }
-            direct_shards.push((*location, shard_key, ack));
+            direct_acks.push(ack);
         }
-        let handle_entries: Vec<_> = direct_shards
-            .iter()
-            .map(|(location, shard_key, _)| (*location, shard_key.clone()))
-            .collect();
-        let mut read_handles = match self
-            .local_map
-            .acquire_payload_shard_read_handles(self.operation_epoch(), &handle_entries)
-        {
+        let mut read_handles = match reader.acquire_read_handles(0..k) {
             Ok(read_handles) => read_handles,
             Err(error) => {
                 let _ = placed_segment_recoverable_shard_error(error)?;
@@ -2436,23 +2460,23 @@ impl StorageCluster {
             }
         };
 
-        for (shard_index, (location, shard_key, ack)) in direct_shards.iter().enumerate() {
+        for (shard_index, ack) in direct_acks.into_iter().enumerate() {
             let start = shard_index * shard_size;
             let end = start + shard_size;
-            if let Err(error) =
-                self.maybe_run_before_placed_payload_shard_read_hook(*location, shard_key)
+            let location = read_handles
+                .location(shard_index)
+                .expect("leased direct-read shard is inside installed placement");
+            let shard_key = read_handles
+                .shard_key(shard_index)
+                .expect("leased direct-read shard has a derived key");
+            if let Err(error) = self
+                .maybe_run_before_placed_payload_shard_read_hook(location, &shard_key)
             {
                 read_handles.release().map_err(shard_io_error_to_store)?;
                 let _ = placed_segment_recoverable_shard_error(error)?;
                 return Ok(false);
             }
-            match self.local_map.read_payload_shard_into_without_handle(
-                self.operation_epoch(),
-                *location,
-                shard_key,
-                *ack,
-                &mut dst[start..end],
-            ) {
+            match read_handles.read_into(shard_index, ack, &mut dst[start..end]) {
                 Ok(()) => {}
                 Err(error) => {
                     read_handles.release().map_err(shard_io_error_to_store)?;
@@ -2478,7 +2502,12 @@ impl StorageCluster {
         let m = req.ec.m as usize;
         let padded = req.stored_size.div_ceil(k) * k;
         let shard_size = padded / k;
-        let locations = self.segment_payload_locations(&req)?;
+        let reader = self.current_placed_segment_shard_reader(
+            req.data_pg_id,
+            req.ec,
+            &req.segment_okh,
+            req.segment_vid,
+        )?;
         let mut all_shards = vec![None; k + m];
         let mut present_count = 0usize;
         let mut repair_targets = Vec::new();
@@ -2486,9 +2515,7 @@ impl StorageCluster {
         for shard_index in 0..k {
             self.try_load_placed_segment_shard(
                 req.data_pg_id,
-                &req.segment_okh,
-                req.segment_vid,
-                &locations,
+                &reader,
                 shard_index,
                 shard_size,
                 &mut all_shards,
@@ -2504,9 +2531,7 @@ impl StorageCluster {
                 }
                 self.try_load_placed_segment_shard(
                     req.data_pg_id,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    &locations,
+                    &reader,
                     shard_index,
                     shard_size,
                     &mut all_shards,
@@ -2616,19 +2641,19 @@ impl StorageCluster {
     fn try_load_placed_segment_shard(
         &self,
         data_pg_id: u32,
-        segment_okh: &[u8; 16],
-        segment_vid: GenerationId,
-        locations: &[ShardLocation],
+        reader: &LocalPlacedSegmentShardReader<'_>,
         shard_index: usize,
         shard_size: usize,
         all_shards: &mut [Option<Vec<u8>>],
         present_count: &mut usize,
         repair_targets: Option<&mut Vec<ShardIndex>>,
     ) -> Result<(), StoreError> {
-        let Some(location) = locations.get(shard_index).copied() else {
+        let Some(location) = reader.location(shard_index) else {
             return Ok(());
         };
-        let shard_key = ShardKey::new(segment_okh, segment_vid.get(), shard_index as u8);
+        let Some(shard_key) = reader.shard_key(shard_index) else {
+            return Ok(());
+        };
         let ack = match self.load_payload_shard_ack(data_pg_id, &shard_key) {
             Ok(ack) => ack,
             Err(StoreError::NotFound) => {
@@ -2651,7 +2676,7 @@ impl StorageCluster {
             }
             return Ok(());
         }
-        match self.read_payload_shard(location, &shard_key, ack) {
+        match reader.read(shard_index, ack) {
             Ok(shard) => {
                 all_shards[shard_index] = Some(shard);
                 *present_count += 1;
@@ -2829,6 +2854,25 @@ impl StorageCluster {
             &req.segment_okh,
             req.segment_vid,
         )
+    }
+
+    fn current_placed_segment_shard_reader(
+        &self,
+        data_pg_id: u32,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<LocalPlacedSegmentShardReader<'_>, StoreError> {
+        let data_pg = self.validated_data_pg(PgId::new(data_pg_id))?;
+        self.local_map
+            .open_placed_segment_shard_reader(
+                self.operation_epoch(),
+                data_pg,
+                ec,
+                segment_okh,
+                segment_vid,
+            )
+            .map_err(cluster_build_error_to_store)
     }
 
     pub(crate) fn segment_payload_shard_locations(

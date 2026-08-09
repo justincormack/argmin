@@ -1058,6 +1058,149 @@ impl Drop for LocalShardReadHandleSet {
     }
 }
 
+/// Storage-owned current-route reader for one exact placed payload segment.
+///
+/// Construction derives every location and shard key from the segment
+/// request. Parent cluster code can inspect or read only by shard index and
+/// cannot pair an arbitrary location with an unrelated key.
+pub(super) struct LocalPlacedSegmentShardReader<'a> {
+    cluster_map: &'a LocalClusterMap,
+    operation_epoch: ClusterEpoch,
+    data_pg_id: DataPgId,
+    segment_okh: [u8; 16],
+    segment_vid: GenerationId,
+    locations: Vec<ShardLocation>,
+}
+
+impl<'a> LocalPlacedSegmentShardReader<'a> {
+    pub(super) fn locations(&self) -> &[ShardLocation] {
+        &self.locations
+    }
+
+    pub(super) fn location(&self, shard_index: usize) -> Option<ShardLocation> {
+        self.locations.get(shard_index).copied()
+    }
+
+    pub(super) fn shard_key(&self, shard_index: usize) -> Option<ShardKey> {
+        let location = self.location(shard_index)?;
+        Some(ShardKey::new(
+            &self.segment_okh,
+            self.segment_vid.get(),
+            location.shard_index().get(),
+        ))
+    }
+
+    pub(super) fn read(
+        &self,
+        shard_index: usize,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        let (location, key) = self.location_and_key(shard_index)?;
+        self.cluster_map
+            .read_payload_shard(self.operation_epoch, location, &key, expected)
+    }
+
+    pub(super) fn acquire_read_handles(
+        self,
+        shard_indices: impl IntoIterator<Item = usize>,
+    ) -> Result<LocalPlacedSegmentShardReadHandles<'a>, ShardIoError> {
+        let mut leased_shard_indices = BTreeSet::new();
+        let mut entries = Vec::new();
+        for shard_index in shard_indices {
+            if !leased_shard_indices.insert(shard_index) {
+                return Err(self.shard_subject_mismatch(format!(
+                    "shard index {shard_index} was requested more than once"
+                )));
+            }
+            entries.push(self.location_and_key(shard_index)?);
+        }
+        let read_handles = self
+            .cluster_map
+            .acquire_payload_shard_read_handles(self.operation_epoch, &entries)?;
+        Ok(LocalPlacedSegmentShardReadHandles {
+            reader: self,
+            read_handles,
+            leased_shard_indices,
+        })
+    }
+
+    fn location_and_key(
+        &self,
+        shard_index: usize,
+    ) -> Result<(ShardLocation, ShardKey), ShardIoError> {
+        let Some(location) = self.location(shard_index) else {
+            return Err(self.shard_subject_mismatch(format!(
+                "shard index {shard_index} is outside the placed segment's {} locations",
+                self.locations.len()
+            )));
+        };
+        let key = ShardKey::new(
+            &self.segment_okh,
+            self.segment_vid.get(),
+            location.shard_index().get(),
+        );
+        Ok((location, key))
+    }
+
+    fn shard_subject_mismatch(&self, reason: String) -> ShardIoError {
+        ShardIoError::Store {
+            node_id: 0,
+            pg_id: self.data_pg_id.get(),
+            cluster_epoch: self.operation_epoch,
+            source: StoreError::PayloadShardSetMismatch { reason },
+        }
+    }
+}
+
+pub(super) struct LocalPlacedSegmentShardReadHandles<'a> {
+    reader: LocalPlacedSegmentShardReader<'a>,
+    read_handles: LocalShardReadHandleSet,
+    leased_shard_indices: BTreeSet<usize>,
+}
+
+impl LocalPlacedSegmentShardReadHandles<'_> {
+    pub(super) fn location(&self, shard_index: usize) -> Option<ShardLocation> {
+        if !self.leased_shard_indices.contains(&shard_index) {
+            return None;
+        }
+        self.reader.location(shard_index)
+    }
+
+    pub(super) fn shard_key(&self, shard_index: usize) -> Option<ShardKey> {
+        if !self.leased_shard_indices.contains(&shard_index) {
+            return None;
+        }
+        self.reader.shard_key(shard_index)
+    }
+
+    pub(super) fn read_into(
+        &self,
+        shard_index: usize,
+        expected: WriteAck,
+        dst: &mut [u8],
+    ) -> Result<(), ShardIoError> {
+        if !self.leased_shard_indices.contains(&shard_index) {
+            return Err(self.reader.shard_subject_mismatch(format!(
+                "shard index {shard_index} is not protected by this read-handle set"
+            )));
+        }
+        let (location, key) = self.reader.location_and_key(shard_index)?;
+        self.reader
+            .cluster_map
+            .read_payload_shard_into_without_handle(
+                self.reader.operation_epoch,
+                location,
+                &key,
+                expected,
+                dst,
+            )
+    }
+
+    pub(super) fn release(&mut self) -> Result<(), ShardIoError> {
+        self.read_handles.release()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPgRoute {
     cluster_epoch: ClusterEpoch,
@@ -4745,7 +4888,28 @@ impl LocalClusterMap {
             .repair_shard(data)
     }
 
-    pub(crate) fn read_payload_shard(
+    pub(super) fn open_placed_segment_shard_reader(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<LocalPlacedSegmentShardReader<'_>, ClusterBuildError> {
+        let placement_key = super::segment_payload_placement_key(segment_okh, segment_vid);
+        let locations =
+            self.place_payload_shards(operation_epoch, data_pg_id, ec, &placement_key)?;
+        Ok(LocalPlacedSegmentShardReader {
+            cluster_map: self,
+            operation_epoch,
+            data_pg_id,
+            segment_okh: *segment_okh,
+            segment_vid,
+            locations,
+        })
+    }
+
+    fn read_payload_shard(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,
@@ -4754,6 +4918,17 @@ impl LocalClusterMap {
     ) -> Result<Vec<u8>, ShardIoError> {
         self.shard_node_client(operation_epoch, location, key)?
             .read_shard(expected)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_read_payload_shard(
+        &self,
+        operation_epoch: ClusterEpoch,
+        location: ShardLocation,
+        key: &ShardKey,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        self.read_payload_shard(operation_epoch, location, key, expected)
     }
 
     pub(crate) fn read_payload_shard_for_historical_inspection(
@@ -4869,7 +5044,7 @@ impl LocalClusterMap {
             .read_shard_into(expected, dst)
     }
 
-    pub(crate) fn acquire_payload_shard_read_handles(
+    fn acquire_payload_shard_read_handles(
         &self,
         operation_epoch: ClusterEpoch,
         entries: &[(ShardLocation, ShardKey)],
@@ -4914,7 +5089,7 @@ impl LocalClusterMap {
         Ok(handle_set)
     }
 
-    pub(crate) fn read_payload_shard_into_without_handle(
+    fn read_payload_shard_into_without_handle(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,

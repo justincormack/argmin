@@ -511,10 +511,15 @@ production surface is `StorageCluster` read-handle acquisition plus the
 placed-delete reclaim helper; Rust visibility prevents downstream use of the
 low-level payload-read and storage-node handle/fence APIs. Temporary semantic
 caller checks additionally keep physical shard deletion behind the placed
-reclaim fence, raw shard reads inside the storage segment reader or publish
-validator, and coarse generation leases inside the broad-to-narrow snapshot
-handoff. The write-side publish validator performs its explicit placed read to
-prove acknowledged shard files still match their `WriteAck` before publishing
+reclaim fence and coarse generation leases inside the broad-to-narrow snapshot
+handoff. Current-route segment reads use a storage-private placed-segment
+reader which derives every shard location and key from the typed data PG, EC
+shape, segment identity, and payload generation. Callers select only a shard
+index, so they cannot combine a location from one placement with a key from
+another segment. A batched reader additionally retains the exact shard-index
+subset for which read handles were acquired and rejects access to every other
+index. The write-side publish validator uses the same reader to prove
+acknowledged shard files still match their `WriteAck` before publishing
 metadata.
 
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,

@@ -20,8 +20,8 @@ pub use local::{
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientConfig,
 };
 use local::{
-    LocalClusterRuntimeState, LocalRouteMapLeaseSnapshot, MetadataCommandRecoveryAdmission,
-    MetadataCommandRecoveryGuard,
+    LocalClusterRuntimeState, LocalPlacedSegmentShardReader, LocalRouteMapLeaseSnapshot,
+    MetadataCommandRecoveryAdmission, MetadataCommandRecoveryGuard,
 };
 pub use request_ops::BucketIdentityGenerations;
 pub(crate) use request_ops::{DurableReclaimScanBatch, DurableReclaimScanOutcome};
