@@ -107,6 +107,50 @@ impl From<ObjectMetadataPgId> for PgId {
     }
 }
 
+/// Node-runtime authority to mint the initial durable record for a bucket.
+///
+/// Unlike mutations of an existing bucket, CreateBucket has no durable
+/// subject against which command application can reconstruct or validate the
+/// caller-selected creation timestamp and execution generation.  The private
+/// constructor confines that choice to an installed storage-node runtime.
+pub(crate) struct CreateBucketCommandBuildAuthority {
+    _private: (),
+}
+
+impl CreateBucketCommandBuildAuthority {
+    pub(in crate::node_runtime) const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_test() -> Self {
+        Self { _private: () }
+    }
+}
+
+/// Authority to turn canonical command bytes into a typed command envelope.
+///
+/// Byte validation alone is harmless, but returning an envelope confers the
+/// ability to apply every metadata-command variant, including root commands
+/// whose ordinary constructors require narrower capabilities.  Only the
+/// private node-runtime implementation may mint this authority. Storage RPC
+/// codecs must receive it from that boundary, while durable stores are
+/// themselves descendants of the boundary.
+pub(crate) struct MetadataCommandDecodeAuthority {
+    _private: (),
+}
+
+impl MetadataCommandDecodeAuthority {
+    pub(in crate::node_runtime) const fn new() -> Self {
+        Self { _private: () }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn new_for_test() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Exact retained stream-abort command produced by validated node state.
 ///
 /// Construction is confined to the private node-runtime boundary shared by

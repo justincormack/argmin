@@ -574,7 +574,7 @@ fn create_bucket_rehydrates_durable_pending_slot_after_reopen() {
             .storage_node()
             .get_pg(1)
             .unwrap();
-        let command = CreateBucketCommand::from_config(
+        let command = CreateBucketCommand::from_config_for_test(
             &config,
             123,
             primary_pg

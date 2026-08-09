@@ -992,7 +992,11 @@
             .unwrap()
             .unwrap();
         let decoded =
-            crate::storage_rpc::decode_metadata_command_log_entry_range_response(&payload).unwrap();
+            crate::storage_rpc::decode_metadata_command_log_entry_range_response(
+                &payload,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap();
         assert_eq!(decoded.entries, expected);
     }
 
@@ -2427,14 +2431,21 @@
             .unwrap()
             .unwrap();
         let entries =
-            crate::storage_rpc::decode_metadata_command_log_entry_range_response(&entries_payload)
-                .unwrap();
+            crate::storage_rpc::decode_metadata_command_log_entry_range_response(
+                &entries_payload,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap();
         assert_eq!(entries.entries, expected_entries);
 
         let pending_payload = decode_storage_rpc_response_payload(&pending_response.payload)
             .unwrap()
             .unwrap();
-        let pending = decode_metadata_command_pending_envelope_response(&pending_payload).unwrap();
+        let pending = decode_metadata_command_pending_envelope_response(
+            &pending_payload,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         assert_eq!(pending.command, Some(pending_command));
 
         let validate_payload = decode_storage_rpc_response_payload(&validate_response.payload)
@@ -2560,7 +2571,11 @@
             .unwrap()
             .unwrap();
         let decoded_pending =
-            decode_metadata_command_pending_envelope_response(&pending_payload).unwrap();
+            decode_metadata_command_pending_envelope_response(
+                &pending_payload,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap();
         assert_eq!(
             decoded_pending.command.unwrap().command_bytes(),
             pending.command_bytes()
@@ -2792,7 +2807,7 @@
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&create_config, 123, 1).unwrap(),
             ),
         );
         pg.apply_metadata_command_and_record(7, &create).unwrap();
@@ -2892,7 +2907,7 @@
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&create_config, 123, 1).unwrap(),
             ),
         );
         pg.apply_metadata_command_and_record(7, &create).unwrap();
@@ -2997,7 +3012,7 @@
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&create_config, 123, 1).unwrap(),
             ),
         );
         pg.apply_metadata_command_and_record(7, &create).unwrap();
@@ -3462,7 +3477,11 @@
         let payload = decode_storage_rpc_response_payload(&response.payload)
             .unwrap()
             .unwrap();
-        let decoded = decode_bucket_mark_deleting_command_build_response(&payload).unwrap();
+        let decoded = decode_bucket_mark_deleting_command_build_response(
+            &payload,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         match decoded.outcome {
             StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(info) => {
                 assert_eq!(info.name, bucket);
@@ -4383,3 +4402,6 @@
         join.join().unwrap();
         assert_eq!(server.read_handle_count(first_location), 0);
     }
+fn metadata_command_decode_authority_for_test() -> MetadataCommandDecodeAuthority {
+    MetadataCommandDecodeAuthority::new_for_test()
+}

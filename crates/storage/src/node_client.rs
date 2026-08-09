@@ -10,6 +10,8 @@ use s3_types::{AclGrants, BucketVersioningState};
 
 use super::engine::SharedStorageNode;
 use super::BucketPgId;
+use super::CreateBucketCommandBuildAuthority;
+use super::MetadataCommandDecodeAuthority;
 use super::ObjectMetadataPgId;
 use super::ObjectMetadataScanPgId;
 use super::PreparedRetainedStreamUploadAbort;
@@ -1590,13 +1592,16 @@ impl UnixStorageNodeClient {
                 payload,
             )
             .map_err(BucketSnapshotLoadError::Store)?;
-        let response =
-            decode_bucket_metadata_control_command_build_response(&response).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode bucket metadata control command build response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_bucket_metadata_control_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket metadata control command build response",
+                error.to_string(),
+            ))
+        })?;
         self.validate_bucket_metadata_control_command_build_response(
             response.command,
             bucket,

@@ -1,14 +1,16 @@
 use crate::{
     cluster::ShardLocation,
     metadata_command::{
-        decode_metadata_command_envelope, BucketPropertyMutation, BucketSubresourceMutation,
-        BucketWriteReservationProof, CreateMultipartUploadCommand, CreateStreamUploadCommand,
-        DeleteObjectVersionTarget, MetadataCommandAcceptance, MetadataCommandLogHashRangeEntry,
-        MetadataCommandLogIndex, MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
+        decode_metadata_command_envelope, validate_metadata_command_envelope_bytes,
+        BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
+        CreateMultipartUploadCommand, CreateStreamUploadCommand, DeleteObjectVersionTarget,
+        MetadataCommandAcceptance, MetadataCommandLogHashRangeEntry, MetadataCommandLogIndex,
+        MetadataCommandLogRangeEntry, MetadataCommandLogRangeEntryKind,
         MetadataCommandReplicaState, MetadataTransferCommand, ObjectPayloadReclaimClaimProof,
         ObjectPayloadReclaimCommand, PutObjectMetadataMutation,
         COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
     },
+    node_runtime::MetadataCommandDecodeAuthority,
     pg_store::{
         MetadataCheckpointRow, MetadataCheckpointTableBlock, MetadataCheckpointTableDigest,
         MetadataCheckpointValue, MetadataCommandCheckpoint, MetadataCommandLogCompactionStatus,

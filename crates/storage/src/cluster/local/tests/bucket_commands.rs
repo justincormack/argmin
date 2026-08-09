@@ -656,7 +656,7 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create)
-                    if create.bucket.name == hook_bucket
+                    if create.bucket().name == hook_bucket
                         && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
@@ -804,7 +804,7 @@ fn create_bucket_retries_partial_exact_command_conflict() {
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create)
-                    if create.bucket.name == hook_bucket
+                    if create.bucket().name == hook_bucket
                         && node_id == NodeId::new(2)
                         && !applied_by_hook_guard.swap(true, Ordering::SeqCst) =>
                 {
@@ -883,7 +883,7 @@ fn create_bucket_retries_partial_exact_command_conflict_on_first_replica() {
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create)
-                    if create.bucket.name == hook_bucket
+                    if create.bucket().name == hook_bucket
                         && node_id == NodeId::new(0)
                         && !applied_by_hook_guard.swap(true, Ordering::SeqCst) =>
                 {
@@ -961,7 +961,7 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create)
-                    if create.bucket.name == first_bucket_for_hook
+                    if create.bucket().name == first_bucket_for_hook
                         && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {

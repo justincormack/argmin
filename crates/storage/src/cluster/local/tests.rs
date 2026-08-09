@@ -787,7 +787,7 @@ fn create_bucket_metadata_command(
             MetadataCommandLogIndex::new(log_index).unwrap(),
         ),
         MetadataCommandPayload::CreateBucket(
-            CreateBucketCommand::from_config(&config, 1_234, log_index).unwrap(),
+            CreateBucketCommand::from_config_for_test(&config, 1_234, log_index).unwrap(),
         ),
     )
 }
@@ -820,7 +820,7 @@ fn create_bucket_metadata_command_with_epoch(
             MetadataCommandLogIndex::new(log_index).unwrap(),
         ),
         MetadataCommandPayload::CreateBucket(
-            CreateBucketCommand::from_config(&config, 1_234, log_index).unwrap(),
+            CreateBucketCommand::from_config_for_test(&config, 1_234, log_index).unwrap(),
         ),
     )
 }

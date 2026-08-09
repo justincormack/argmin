@@ -103,7 +103,8 @@ fn create_bucket_probe_command(
             MetadataCommandLogIndex::new(log_index).unwrap(),
         ),
         MetadataCommandPayload::CreateBucket(
-            CreateBucketCommand::from_config(&config, 123, bucket_execution_generation).unwrap(),
+            CreateBucketCommand::from_config_for_test(&config, 123, bucket_execution_generation)
+                .unwrap(),
         ),
     )
 }

@@ -6423,7 +6423,7 @@ compiler boundary rather than close an export gap.
 | Cohort | Transitional contents | Present enforcement | Preliminary Phase 6 disposition |
 | --- | --- | --- | --- |
 | Workspace feature graph | One exhaustive normal/build dependency-feature check, including a miniature Cargo fixture | Cargo does not reject a production package enabling another package's test feature, and Rust visibility does not see the resolved feature graph | **Retain.** This is a stable semantic configuration check. Keep the exhaustive workspace classification and empty reviewed allowlist. |
-| Node-client and route adoption | Thirty historical source scans covering `SharedStorageNode`, `single_node`, bridge helpers, raw PG-store calls, and operation-specific node-client/route methods | Role-specific node-client traits, private stores/nodes, scoped route capabilities, and private constructors now provide the production boundary | **Remove after a visibility audit.** Delete method-name and call-shape scans once the audit confirms no public or cross-module raw route/store authority remains. Do not preserve the historical operation list. |
+| Node-client and route adoption | Thirty historical source scans covering `SharedStorageNode`, `single_node`, bridge helpers, raw PG-store calls, and operation-specific node-client/route methods | Role-specific node-client traits, private stores/nodes, scoped route capabilities, and apply-time command validation provide most of the production boundary; root command minting requires a separate audit | **Remove after a visibility audit.** Delete receiver and route-method call-shape scans once the audit confirms no public or cross-module raw route/store authority remains. Make root command mints structurally unforgeable, or retain a focused semantic prohibition until they are. Do not preserve the historical operation list as a general allowlist. |
 | Physical payload and opaque operation APIs | Eighty-five checks covering placed shard reads/writes, multipart records, upload capabilities, topology/control-plane/Raft assembly, opaque fields, `Debug`/equality derivations, and removed legacy paths | Storage-private physical types and methods, opaque one-use capabilities, redacted owner-defined formatting, and owner-local tests now enforce almost all of this cohort | **Mostly remove.** Compiler visibility and focused type/unit tests replace name and field inventories. The three explicitly temporary shard read/delete caller inventories remain open until their comments' capability migrations complete; the discovered `server-core` payload-read file inventory is deleted because file membership is not an invariant. |
 | Metadata-command publisher and recovery classification | Seven source checks plus the publisher scanner fixture, exact recovery-drain authority inventory, and registry/live-publisher comparison | Sealed class-specific tokens and typed installer outcomes enforce publisher class and behavior, but each token's `__from_registry_marker` mint is still `pub(crate)` and can be called or captured by any storage module; one registry also supplies the human classification | **Split.** Retain the direct-constructor/reference guard until token minting is structurally unforgeable. Independently retain the registry/documentation consistency check until the guide is generated from the authoritative registry. Remove function-count, wrapper, and exact recovery-call inventories where private authority types already reject misuse. |
 | Error and production-facade ownership | Fifty-six checks covering raw storage errors, coordinator mapping adapters, diagnostics, placement/lease primitives, control-plane/Raft administration, metadata transfer, codecs, and worker internals | The completed versioning item 14 makes concrete errors and raw operation wrappers crate-private and exposes bounded opaque failures/facades | **Remove by owner boundary.** First confirm public exports and dependency edges with the compiler; then delete concrete-type, method-name, error-mapping, field, and formatting scans. Retain behavior/redaction tests, not a parallel list of private symbols. |
@@ -6543,6 +6543,62 @@ Phase 6 physical/opaque-boundary removal slice (2026-08-09):
 
 The checker baseline after this slice is 121 actual `fail_with_matches`
 invocations (114 top-level and seven nested).
+
+Phase 6 node-client/route-adoption removal slice (2026-08-09):
+
+- removed the 30 historical node-client receiver/name checks and 1,767 lines
+  which inventoried `SharedStorageNode`, `single_node`, the test bridge,
+  removed lock/finisher names, raw PG-store calls, and each operation-specific
+  node-client or scoped-route method;
+- the visibility audit confirms that the raw embedded engine is now a private
+  descendant of `node_runtime`. `SharedStorageNode` reaches cluster code only
+  through the test-hook facade, while `LocalStorageNodeClient` is declared
+  `pub(in crate::node_runtime)` and cannot be named by cluster routing.
+  Production feature graphs cannot enable the test facade;
+- production `LocalNodeStore` exposes only role-specific trait objects. Their
+  stateful operations are available on subject-bound route traits returned by
+  the corresponding opener, rather than on an aggregate client. Using a raw
+  engine operation, the wrong role, or an operation without first constructing
+  its scoped route is therefore rejected by Rust method/type visibility;
+- the command-construction audit found one real exception to that method-level
+  argument. CreateBucket has no existing durable subject from which apply can
+  reconstruct its caller-selected creation timestamp and execution
+  generation. `CreateBucketCommand` now has a private record and its factory
+  requires `CreateBucketCommandBuildAuthority`, whose constructor is visible
+  only to descendants of `node_runtime`; test fixtures use an explicitly
+  test-only factory. Canonical decoding is now structurally confined too:
+  returning a `MetadataCommandEnvelope`, directly or through an RPC response
+  decoder, requires `MetadataCommandDecodeAuthority`, whose production
+  constructor is visible only inside the private node runtime. Byte-only
+  canonical validation remains available without conferring a command;
+- the other removed command-builder groups were checked against central apply
+  and recovery validation. Direct PUT binds its generation reservation and
+  stream proof; object metadata binds the complete immutable preimage;
+  deletes and delete-marker insertion bind their exact durable target and
+  reclaim snapshot; multipart completion and abort bind their reservation,
+  upload, parts, segments, sessions, and cleanup. Their old route-method scans
+  duplicated those state-machine invariants. CreateMultipartUpload remains the
+  second root-style exception because applying it creates its own generation
+  reservation. A focused constructor/literal prohibition remains until that
+  mint also becomes structurally unforgeable;
+- canonical command decoding remains necessary at durable-log and
+  authenticated storage-RPC input boundaries. Those paths now consume the
+  node-runtime decode authority, including every public-to-the-crate RPC codec
+  which returns an envelope directly or inside another response type. The
+  compiler therefore rejects direct and transitive decoded-command minting by
+  production cluster publishers;
+- raw `PgMetadataStore` access is likewise confined to the test facade. The
+  embedded and Unix parity, wrong-PG, subject-binding, deadline, recovery, and
+  non-mutation tests remain the behavioral proof for those typed routes; and
+- no historical route-method allowlist remains. Adding or renaming a method
+  on a private implementation no longer changes boundary validity; exposing a
+  production escape requires an explicit Rust visibility/facade change which
+  is reviewed at the actual boundary. The one retained root-command rule now
+  inspects only direct CreateMultipartUpload minting; decoded command minting
+  is a compiler boundary rather than a source scan.
+
+The checker baseline after this slice is 92 actual `fail_with_matches`
+invocations (85 top-level and seven nested).
 
 For each remaining section, record:
 

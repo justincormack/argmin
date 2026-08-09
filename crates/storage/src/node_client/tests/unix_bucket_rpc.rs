@@ -1502,7 +1502,7 @@ fn unix_create_bucket_build_response_rejects_mismatched_identity() {
     let bad_command = MetadataCommandEnvelope::new(
         command_id,
         MetadataCommandPayload::CreateBucket(
-            CreateBucketCommand::from_config(&bad_config, 123, 1).unwrap(),
+            CreateBucketCommand::from_config_for_test(&bad_config, 123, 1).unwrap(),
         ),
     );
     let err = client
@@ -1717,7 +1717,7 @@ fn unix_mark_bucket_deleting_build_response_rejects_mismatched_identity() {
     let wrong_payload_command = MetadataCommandEnvelope::new(
         command_id,
         MetadataCommandPayload::CreateBucket(
-            CreateBucketCommand::from_config(&create_bucket_config, 123, 1).unwrap(),
+            CreateBucketCommand::from_config_for_test(&create_bucket_config, 123, 1).unwrap(),
         ),
     );
 

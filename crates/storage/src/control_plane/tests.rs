@@ -2008,7 +2008,7 @@ fn logged_create_bucket_command(
             MetadataCommandLogIndex::new(log_index).unwrap(),
         ),
         MetadataCommandPayload::CreateBucket(
-            CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+            CreateBucketCommand::from_config_for_test(&config, 123, 1).unwrap(),
         ),
     )
 }

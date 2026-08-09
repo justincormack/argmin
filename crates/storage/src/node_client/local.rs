@@ -1126,6 +1126,7 @@ impl LocalStorageNodeClient {
         }
         let bucket_execution_generation = pg.next_bucket_execution_generation_candidate()?;
         let command = CreateBucketCommand::from_config(
+            CreateBucketCommandBuildAuthority::new(),
             config,
             crate::clock::current_time_millis(),
             bucket_execution_generation,

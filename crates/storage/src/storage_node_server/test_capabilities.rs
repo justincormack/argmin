@@ -3538,7 +3538,7 @@
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&create_config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&create_config, 123, 1).unwrap(),
             ),
         );
         {

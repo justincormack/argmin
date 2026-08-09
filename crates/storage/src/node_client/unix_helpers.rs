@@ -285,12 +285,13 @@ impl UnixStorageNodeClient {
                 ));
             }
         };
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(
-                    self.rpc_payload_error(decode_context, error.to_string()),
-                )
-            })?;
+        let response = decode_object_metadata_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            ObjectPgActionError::Store(self.rpc_payload_error(decode_context, error.to_string()))
+        })?;
         match response.outcome {
             StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
                 validate(&command)?;

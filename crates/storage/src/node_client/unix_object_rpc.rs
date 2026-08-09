@@ -2683,7 +2683,11 @@ impl DirectPutMetadataRoute for UnixDirectPutMetadataRoute<'_> {
             .client
             .rpc_request(StorageRpcMessageKind::DirectPutCommitCommandBuild, payload)
             .map_err(ObjectPgActionError::Store)?;
-        let response = decode_direct_put_command_build_response(&response).map_err(|error| {
+        let response = decode_direct_put_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
             ObjectPgActionError::Store(self.client.rpc_payload_error(
                 "decode direct PUT commit command build response",
                 error.to_string(),
@@ -2790,13 +2794,16 @@ impl UnixStorageNodeClient {
                 encode_stream_upload_session_request(&request),
             )
             .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.rpc_payload_error(
-                    "decode retained stream upload abort prepare response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_object_metadata_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            ObjectPgActionError::Store(self.rpc_payload_error(
+                "decode retained stream upload abort prepare response",
+                error.to_string(),
+            ))
+        })?;
         match response.outcome {
             StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
                 let prepared = self.validate_retained_stream_upload_abort_prepare_command(
@@ -3042,13 +3049,16 @@ impl PutObjectMetadataRoute for UnixPutObjectMetadataRoute<'_> {
                 payload,
             )
             .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.client.rpc_payload_error(
-                    "decode object metadata PUT command build response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_object_metadata_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode object metadata PUT command build response",
+                error.to_string(),
+            ))
+        })?;
         match response.outcome {
             StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
                 self.client.validate_put_object_metadata_command_response(
@@ -4707,13 +4717,16 @@ impl StreamPutFinalizationMetadataRoute for UnixStreamPutFinalizationMetadataRou
                 payload,
             )
             .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.client.rpc_payload_error(
-                    "decode stream PUT commit command build response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_object_metadata_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode stream PUT commit command build response",
+                error.to_string(),
+            ))
+        })?;
         match response.outcome {
             StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
                 self.client.validate_stream_put_commit_command_response(
@@ -4838,13 +4851,16 @@ impl StreamPartFinalizationMetadataRoute for UnixStreamPartFinalizationMetadataR
                 payload,
             )
             .map_err(ObjectPgActionError::Store)?;
-        let response =
-            decode_object_metadata_command_build_response(&response).map_err(|error| {
-                ObjectPgActionError::Store(self.client.rpc_payload_error(
-                    "decode stream part commit command build response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_object_metadata_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode stream part commit command build response",
+                error.to_string(),
+            ))
+        })?;
         match response.outcome {
             StorageRpcObjectMetadataCommandBuildOutcome::Command(command) => {
                 self.client.validate_stream_part_commit_command_response(

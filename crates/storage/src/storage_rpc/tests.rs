@@ -3,6 +3,10 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn metadata_command_decode_authority_for_test() -> MetadataCommandDecodeAuthority {
+        MetadataCommandDecodeAuthority::new_for_test()
+    }
+
     struct FlushFailureWriter;
 
     impl Write for FlushFailureWriter {
@@ -586,7 +590,10 @@ mod tests {
         );
 
         assert!(matches!(
-            decode_create_bucket_command_build_response(&bytes),
+            decode_create_bucket_command_build_response(
+                &bytes,
+                &metadata_command_decode_authority_for_test(),
+            ),
             Err(StorageRpcPayloadError::PayloadTooLarge {
                 len,
                 limit,
@@ -606,7 +613,11 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_request(&request).unwrap();
-        let decoded = decode_metadata_command_request(&bytes).unwrap();
+        let decoded = decode_metadata_command_request(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, request);
         assert_eq!(decoded.command.command_bytes(), command.command_bytes());
@@ -636,7 +647,7 @@ mod tests {
         bytes[12..16].copy_from_slice(&(request.pg_id.get() + 1).to_le_bytes());
 
         assert!(matches!(
-            decode_metadata_command_request(&bytes),
+            decode_metadata_command_request(&bytes, &metadata_command_decode_authority_for_test()),
             Err(StorageRpcPayloadError::MetadataCommandRouteMismatch(_))
         ));
     }
@@ -670,7 +681,11 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_recovery_request(&request).unwrap();
-        let decoded = decode_metadata_command_recovery_request(&bytes).unwrap();
+        let decoded = decode_metadata_command_recovery_request(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, request);
         assert_eq!(
@@ -700,7 +715,11 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_pending_slot_request(&request).unwrap();
-        let decoded = decode_metadata_command_pending_slot_request(&bytes).unwrap();
+        let decoded = decode_metadata_command_pending_slot_request(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, request);
         assert_eq!(decoded.command.command_bytes(), command.command_bytes());
@@ -719,7 +738,10 @@ mod tests {
         let wire_len = nonconservative_wire.len();
         nonconservative_wire[wire_len - 8..].copy_from_slice(&4_001_u64.to_be_bytes());
         assert!(matches!(
-            decode_metadata_command_pending_slot_request(&nonconservative_wire),
+            decode_metadata_command_pending_slot_request(
+                &nonconservative_wire,
+                &metadata_command_decode_authority_for_test(),
+            ),
             Err(StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(_))
         ));
     }
@@ -745,7 +767,11 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_pending_slot_replace_request(&request).unwrap();
-        let decoded = decode_metadata_command_pending_slot_replace_request(&bytes).unwrap();
+        let decoded = decode_metadata_command_pending_slot_replace_request(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, request);
         assert_eq!(decoded.previous.command_bytes(), previous.command_bytes());
@@ -788,7 +814,11 @@ mod tests {
         let bytes =
             encode_metadata_command_recovery_pending_slot_replace_request(&request).unwrap();
         let decoded =
-            decode_metadata_command_recovery_pending_slot_replace_request(&bytes).unwrap();
+            decode_metadata_command_recovery_pending_slot_replace_request(
+                &bytes,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap();
 
         assert_eq!(decoded, request);
     }
@@ -984,7 +1014,11 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_transfer_adopt_request(&request).unwrap();
-        let decoded = decode_metadata_command_transfer_adopt_request(&bytes).unwrap();
+        let decoded = decode_metadata_command_transfer_adopt_request(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, request);
         assert_eq!(
@@ -1414,7 +1448,11 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_log_entry_range_response(&response).unwrap();
-        let decoded = decode_metadata_command_log_entry_range_response(&bytes).unwrap();
+        let decoded = decode_metadata_command_log_entry_range_response(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, response);
     }
@@ -1451,7 +1489,10 @@ mod tests {
         put_u8(&mut bytes, 9);
 
         assert!(matches!(
-            decode_metadata_command_log_entry_range_response(&bytes),
+            decode_metadata_command_log_entry_range_response(
+                &bytes,
+                &metadata_command_decode_authority_for_test(),
+            ),
             Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown metadata command entry range kind"
             ))
@@ -1468,7 +1509,11 @@ mod tests {
             },
         ] {
             let bytes = encode_metadata_command_pending_envelope_response(&response);
-            let decoded = decode_metadata_command_pending_envelope_response(&bytes).unwrap();
+            let decoded = decode_metadata_command_pending_envelope_response(
+                &bytes,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap();
 
             assert_eq!(decoded, response);
         }
@@ -1486,7 +1531,11 @@ mod tests {
         };
 
         let bytes = encode_metadata_command_matching_applied_request(&request).unwrap();
-        let decoded = decode_metadata_command_matching_applied_request(&bytes).unwrap();
+        let decoded = decode_metadata_command_matching_applied_request(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, request);
         assert_eq!(decoded.command.command_bytes(), command.command_bytes());
@@ -4013,7 +4062,11 @@ mod tests {
             ),
         };
         let bytes = encode_bucket_mark_deleting_command_build_response(&already_deleting);
-        let decoded = decode_bucket_mark_deleting_command_build_response(&bytes).unwrap();
+        let decoded = decode_bucket_mark_deleting_command_build_response(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         match decoded.outcome {
             StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(info) => {
                 assert_eq!(info.name.as_str(), "bucket");
@@ -4030,7 +4083,11 @@ mod tests {
             outcome: StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(Box::new(command)),
         };
         let bytes = encode_bucket_mark_deleting_command_build_response(&command_response);
-        let decoded = decode_bucket_mark_deleting_command_build_response(&bytes).unwrap();
+        let decoded = decode_bucket_mark_deleting_command_build_response(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         match decoded.outcome {
             StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(command) => {
                 assert_eq!(command.id(), command_id);
@@ -4052,7 +4109,11 @@ mod tests {
             mutation: StorageRpcBucketMetadataControlMutation::MarkDeleting,
         };
         let bytes = encode_bucket_metadata_control_pending_match_request(&pending_match).unwrap();
-        let decoded = decode_bucket_metadata_control_pending_match_request(&bytes).unwrap();
+        let decoded = decode_bucket_metadata_control_pending_match_request(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         assert_eq!(decoded, pending_match);
     }
 
@@ -4953,7 +5014,11 @@ mod tests {
             outcome: StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
         };
         let bytes = encode_direct_put_command_build_response(&response);
-        let decoded = decode_direct_put_command_build_response(&bytes).unwrap();
+        let decoded = decode_direct_put_command_build_response(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         assert_eq!(decoded, response);
 
         let response = StorageRpcDirectPutCommandBuildResponse {
@@ -4965,7 +5030,11 @@ mod tests {
             },
         };
         let bytes = encode_direct_put_command_build_response(&response);
-        let decoded = decode_direct_put_command_build_response(&bytes).unwrap();
+        let decoded = decode_direct_put_command_build_response(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         assert_eq!(decoded, response);
     }
 
@@ -4981,7 +5050,11 @@ mod tests {
         };
 
         let bytes = encode_object_metadata_command_build_response(&response);
-        let decoded = decode_object_metadata_command_build_response(&bytes).unwrap();
+        let decoded = decode_object_metadata_command_build_response(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
 
         assert_eq!(decoded, response);
     }
@@ -5062,7 +5135,11 @@ mod tests {
             command,
         };
         let bytes = encode_multipart_completion_barrier_command_build_response(&response);
-        let decoded = decode_multipart_completion_barrier_command_build_response(&bytes).unwrap();
+        let decoded = decode_multipart_completion_barrier_command_build_response(
+            &bytes,
+            &metadata_command_decode_authority_for_test(),
+        )
+        .unwrap();
         assert_eq!(decoded.barrier_sequence, 11);
         assert_eq!(decoded.command, response.command);
     }
@@ -5099,7 +5176,7 @@ mod tests {
     fn test_metadata_command() -> MetadataCommandEnvelope {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
-        let command = CreateBucketCommand::from_config(
+        let command = CreateBucketCommand::from_config_for_test(
             &CreateBucketConfig {
                 name: "bucket",
                 owner_principal: "owner",

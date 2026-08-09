@@ -2307,42 +2307,44 @@ impl PgStore {
                     log_index: raw_log_index,
                 });
             }
-            let kind =
-                match header.kind() {
-                    MetadataCommandLogEntryKind::Applied => {
-                        if entry.abandoned {
-                            return Err(StoreError::MetadataCommandLogConflict {
-                                node_id,
-                                pg_id: self.pg_id,
-                                cluster_epoch,
-                                log_index: raw_log_index,
-                            });
-                        }
-                        let command = decode_metadata_command_envelope(&entry.command_bytes)
-                            .map_err(|_| StoreError::MetadataCommandLogConflict {
-                                node_id,
-                                pg_id: self.pg_id,
-                                cluster_epoch,
-                                log_index: raw_log_index,
-                            })?;
-                        MetadataCommandLogRangeEntryKind::Applied(Box::new(command))
+            let kind = match header.kind() {
+                MetadataCommandLogEntryKind::Applied => {
+                    if entry.abandoned {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id,
+                            pg_id: self.pg_id,
+                            cluster_epoch,
+                            log_index: raw_log_index,
+                        });
                     }
-                    MetadataCommandLogEntryKind::Abandoned {
+                    let command = decode_metadata_command_envelope(
+                        &entry.command_bytes,
+                        &MetadataCommandDecodeAuthority::new(),
+                    )
+                    .map_err(|_| StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch,
+                        log_index: raw_log_index,
+                    })?;
+                    MetadataCommandLogRangeEntryKind::Applied(Box::new(command))
+                }
+                MetadataCommandLogEntryKind::Abandoned {
+                    original_command_checksum,
+                } => {
+                    if !entry.abandoned {
+                        return Err(StoreError::MetadataCommandLogConflict {
+                            node_id,
+                            pg_id: self.pg_id,
+                            cluster_epoch,
+                            log_index: raw_log_index,
+                        });
+                    }
+                    MetadataCommandLogRangeEntryKind::Abandoned {
                         original_command_checksum,
-                    } => {
-                        if !entry.abandoned {
-                            return Err(StoreError::MetadataCommandLogConflict {
-                                node_id,
-                                pg_id: self.pg_id,
-                                cluster_epoch,
-                                log_index: raw_log_index,
-                            });
-                        }
-                        MetadataCommandLogRangeEntryKind::Abandoned {
-                            original_command_checksum,
-                        }
                     }
-                };
+                }
+            };
             entries.push(MetadataCommandLogRangeEntry {
                 log_index: raw_log_index,
                 previous_log_hash,
@@ -2569,13 +2571,15 @@ impl PgStore {
                 computed_checksum,
             });
         }
-        let command = decode_metadata_command_envelope(&slot.command_bytes).map_err(|_| {
-            StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch,
-                log_index: slot.id.log_index().get(),
-            }
+        let command = decode_metadata_command_envelope(
+            &slot.command_bytes,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|_| StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id: self.pg_id,
+            cluster_epoch,
+            log_index: slot.id.log_index().get(),
         })?;
         if command.id() != slot.id || command.checksum_crc64() != slot.command_checksum {
             return Err(StoreError::MetadataCommandLogConflict {
@@ -3951,7 +3955,10 @@ impl PgStore {
         scope_bucket: &BucketName,
         slot: &PendingMetadataCommandSlot,
     ) -> bool {
-        let Ok(command) = decode_metadata_command_envelope(&slot.command_bytes) else {
+        let Ok(command) = decode_metadata_command_envelope(
+            &slot.command_bytes,
+            &MetadataCommandDecodeAuthority::new(),
+        ) else {
             return false;
         };
         command.id() == slot.id

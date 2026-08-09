@@ -1730,11 +1730,13 @@ impl PgStore {
         else {
             return Ok(());
         };
-        let command = decode_metadata_command_envelope(&command_bytes).map_err(|reason| {
-            StoreError::ShardScavengerScanIncomplete {
-                context: "decode pending metadata command for shard scavenger references",
-                errors: reason,
-            }
+        let command = decode_metadata_command_envelope(
+            &command_bytes,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|reason| StoreError::ShardScavengerScanIncomplete {
+            context: "decode pending metadata command for shard scavenger references",
+            errors: reason,
         })?;
         self.extend_scavenger_command_payload_references(references, command.payload())
     }

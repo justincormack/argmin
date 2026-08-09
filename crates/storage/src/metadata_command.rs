@@ -675,11 +675,12 @@ impl BucketRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateBucketCommand {
-    pub(crate) bucket: BucketRecord,
+    bucket: BucketRecord,
 }
 
 impl CreateBucketCommand {
     pub(crate) fn from_config(
+        _authority: crate::node_runtime::CreateBucketCommandBuildAuthority,
         config: &CreateBucketConfig<'_>,
         created_at_millis: u64,
         bucket_execution_generation: u64,
@@ -691,6 +692,24 @@ impl CreateBucketCommand {
                 bucket_execution_generation,
             )?,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_config_for_test(
+        config: &CreateBucketConfig<'_>,
+        created_at_millis: u64,
+        bucket_execution_generation: u64,
+    ) -> Result<Self, String> {
+        Self::from_config(
+            crate::node_runtime::CreateBucketCommandBuildAuthority::new_for_test(),
+            config,
+            created_at_millis,
+            bucket_execution_generation,
+        )
+    }
+
+    pub(crate) fn bucket(&self) -> &BucketRecord {
+        &self.bucket
     }
 
     pub(crate) fn matches_create_config(&self, config: &CreateBucketConfig<'_>) -> bool {
@@ -1952,9 +1971,7 @@ pub(crate) fn decode_metadata_command_log_entry_header(
     Err("unknown metadata command log entry magic".to_string())
 }
 
-pub(crate) fn decode_metadata_command_envelope(
-    bytes: &[u8],
-) -> Result<MetadataCommandEnvelope, String> {
+fn decode_metadata_command_envelope_inner(bytes: &[u8]) -> Result<MetadataCommandEnvelope, String> {
     let mut decoder = MetadataCommandLogEntryDecoder::new(bytes);
     let magic = decoder.read_bytes()?;
     if magic != METADATA_COMMAND_MAGIC {
@@ -1977,6 +1994,19 @@ pub(crate) fn decode_metadata_command_envelope(
         return Err("decoded metadata command did not round-trip canonical bytes".to_string());
     }
     Ok(envelope)
+}
+
+/// Validates canonical command bytes without conferring a typed command.
+pub(crate) fn validate_metadata_command_envelope_bytes(bytes: &[u8]) -> Result<(), String> {
+    decode_metadata_command_envelope_inner(bytes).map(|_| ())
+}
+
+/// Decodes a typed command only for a caller admitted by the node runtime.
+pub(crate) fn decode_metadata_command_envelope(
+    bytes: &[u8],
+    _authority: &crate::node_runtime::MetadataCommandDecodeAuthority,
+) -> Result<MetadataCommandEnvelope, String> {
+    decode_metadata_command_envelope_inner(bytes)
 }
 
 fn canonical_command_bytes(id: MetadataCommandId, payload: &MetadataCommandPayload) -> Vec<u8> {
@@ -4696,6 +4726,15 @@ mod tests {
         SSE_S3_WRAP_NONCE_LEN,
     };
 
+    fn decode_metadata_command_envelope_for_test(
+        bytes: &[u8],
+    ) -> Result<MetadataCommandEnvelope, String> {
+        decode_metadata_command_envelope(
+            bytes,
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
+        )
+    }
+
     #[test]
     fn snapshot_sensitive_publisher_marker_returns_typed_registry_token() {
         fn require_snapshot_sensitive(_publisher: impl SnapshotSensitiveMetadataCommandPublisher) {}
@@ -4854,8 +4893,8 @@ mod tests {
     }
 
     fn assert_full_envelope_decoder_round_trips(envelope: &MetadataCommandEnvelope) {
-        let decoded =
-            decode_metadata_command_envelope(&envelope.command_bytes()).unwrap_or_else(|error| {
+        let decoded = decode_metadata_command_envelope_for_test(&envelope.command_bytes())
+            .unwrap_or_else(|error| {
                 panic!(
                     "full {} metadata command envelope must decode: {error}",
                     envelope.payload().kind_name()
@@ -5007,7 +5046,7 @@ mod tests {
         proofless_bytes.truncate(proofless_bytes.len() - required_proof_suffix.len());
 
         assert!(
-            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            decode_metadata_command_envelope_for_test(&proofless_bytes).is_err(),
             "proofless direct PUT command bytes must fail full envelope decode"
         );
         assert!(
@@ -5113,7 +5152,7 @@ mod tests {
         proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
 
         assert!(
-            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            decode_metadata_command_envelope_for_test(&proofless_bytes).is_err(),
             "proofless stream-create command bytes must fail full envelope decode"
         );
         assert!(
@@ -5189,7 +5228,7 @@ mod tests {
         proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
 
         assert!(
-            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            decode_metadata_command_envelope_for_test(&proofless_bytes).is_err(),
             "proofless complete-multipart command bytes must fail full envelope decode"
         );
         assert!(
@@ -5253,7 +5292,7 @@ mod tests {
         proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
 
         assert!(
-            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            decode_metadata_command_envelope_for_test(&proofless_bytes).is_err(),
             "proofless put-object-metadata command bytes must fail full envelope decode"
         );
         assert!(
@@ -5301,7 +5340,7 @@ mod tests {
         proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
 
         assert!(
-            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            decode_metadata_command_envelope_for_test(&proofless_bytes).is_err(),
             "proofless delete-object-version command bytes must fail full envelope decode"
         );
         assert!(
@@ -5351,7 +5390,7 @@ mod tests {
         proofless_bytes.truncate(proofless_bytes.len() - proof_bytes.len());
 
         assert!(
-            decode_metadata_command_envelope(&proofless_bytes).is_err(),
+            decode_metadata_command_envelope_for_test(&proofless_bytes).is_err(),
             "proofless insert-delete-marker command bytes must fail full envelope decode"
         );
         assert!(
@@ -5364,7 +5403,7 @@ mod tests {
     fn metadata_command_canonical_encoding_is_stable() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
-        let mut command = CreateBucketCommand::from_config(
+        let mut command = CreateBucketCommand::from_config_for_test(
             &CreateBucketConfig {
                 name: "bucket",
                 owner_principal: "owner",
@@ -5405,7 +5444,7 @@ mod tests {
     fn metadata_command_log_entry_header_decodes_applied_and_abandoned_rows() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
-        let command = CreateBucketCommand::from_config(
+        let command = CreateBucketCommand::from_config_for_test(
             &CreateBucketConfig {
                 name: "bucket",
                 owner_principal: "owner",
@@ -5441,7 +5480,7 @@ mod tests {
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
         old_version[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_le_bytes());
         assert_eq!(
-            decode_metadata_command_envelope(&old_version),
+            decode_metadata_command_envelope_for_test(&old_version),
             Err("unsupported metadata command encoding version 5".to_string())
         );
         assert_eq!(

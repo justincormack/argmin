@@ -10,11 +10,8 @@ pub(crate) fn encode_metadata_command_item(
     if checksum::crc64::checksum(&item.command_bytes) != item.command_checksum {
         return Err(StorageRpcPayloadError::MetadataCommandChecksumMismatch);
     }
-    let envelope = decode_metadata_command_envelope(&item.command_bytes)
+    validate_metadata_command_envelope_bytes(&item.command_bytes)
         .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
-    if envelope.checksum_crc64() != item.command_checksum {
-        return Err(StorageRpcPayloadError::MetadataCommandChecksumMismatch);
-    }
     let mut out = Vec::new();
     put_u64(&mut out, item.command_checksum);
     put_bytes(&mut out, &item.command_bytes);
@@ -37,11 +34,8 @@ fn validate_metadata_command_item(
     if checksum::crc64::checksum(&command_bytes) != command_checksum {
         return Err(StorageRpcPayloadError::MetadataCommandChecksumMismatch);
     }
-    let envelope = decode_metadata_command_envelope(&command_bytes)
+    validate_metadata_command_envelope_bytes(&command_bytes)
         .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)?;
-    if envelope.checksum_crc64() != command_checksum {
-        return Err(StorageRpcPayloadError::MetadataCommandChecksumMismatch);
-    }
     Ok(StorageRpcMetadataCommandItem {
         command_checksum,
         command_bytes,
@@ -50,8 +44,9 @@ fn validate_metadata_command_item(
 
 fn metadata_command_envelope_from_item(
     item: &StorageRpcMetadataCommandItem,
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<crate::metadata_command::MetadataCommandEnvelope, StorageRpcPayloadError> {
-    decode_metadata_command_envelope(&item.command_bytes)
+    decode_metadata_command_envelope(&item.command_bytes, authority)
         .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
 }
 
@@ -74,6 +69,7 @@ pub(crate) fn encode_metadata_command_request(
 
 pub(crate) fn decode_metadata_command_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
@@ -81,7 +77,7 @@ pub(crate) fn decode_metadata_command_request(
     let pg_id = PgId::new(decoder.read_u32()?);
     let item = decoder.read_metadata_command_item()?;
     decoder.finish()?;
-    let command = metadata_command_envelope_from_item(&item)?;
+    let command = metadata_command_envelope_from_item(&item, authority)?;
     validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
     Ok(StorageRpcMetadataCommandRequest {
         node_id,
@@ -137,23 +133,26 @@ pub(crate) fn encode_metadata_command_recovery_request(
 
 pub(crate) fn decode_metadata_command_recovery_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandRecoveryRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let authorized_source =
-        metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?)?;
+        metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?, authority)?;
     let abandoned_source = match decoder.read_u8()? {
         0 => None,
         1 => Some(metadata_command_envelope_from_item(
             &decoder.read_metadata_command_item()?,
+            authority,
         )?),
         _ => {
             return Err(StorageRpcPayloadError::InvalidMetadataCommandEnvelope);
         }
     };
-    let command = metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?)?;
+    let command =
+        metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?, authority)?;
     decoder.finish()?;
     validate_metadata_command_route(cluster_epoch, pg_id, authorized_source.id())?;
     if let Some(abandoned_source) = abandoned_source.as_ref() {
@@ -2807,11 +2806,12 @@ pub(crate) fn encode_object_metadata_command_build_response(
 
 pub(crate) fn decode_object_metadata_command_build_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcObjectMetadataCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
         0 => StorageRpcObjectMetadataCommandBuildOutcome::Command(Box::new(
-            decoder.read_metadata_command_envelope_response_item()?,
+            decoder.read_metadata_command_envelope_response_item(authority)?,
         )),
         1 => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
         2 => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
@@ -2912,11 +2912,12 @@ pub(crate) fn encode_direct_put_command_build_response(
 
 pub(crate) fn decode_direct_put_command_build_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcDirectPutCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
         0 => StorageRpcDirectPutCommandBuildOutcome::Command(Box::new(
-            decoder.read_metadata_command_envelope_response_item()?,
+            decoder.read_metadata_command_envelope_response_item(authority)?,
         )),
         1 => StorageRpcDirectPutCommandBuildOutcome::StaleSnapshot,
         2 => StorageRpcDirectPutCommandBuildOutcome::LogConflict {
@@ -3096,10 +3097,11 @@ pub(crate) fn encode_bucket_metadata_control_pending_match_request(
 
 pub(crate) fn decode_bucket_metadata_control_pending_match_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let bucket = decoder.read_bucket_request()?;
-    let command = decoder.read_metadata_command_envelope_bytes()?;
+    let command = decoder.read_metadata_command_envelope_bytes(authority)?;
     let mutation = decoder.read_bucket_metadata_control_mutation()?;
     decoder.finish()?;
     if command.id().cluster_epoch() != bucket.cluster_epoch || command.id().pg_id() != bucket.pg_id
@@ -3297,12 +3299,13 @@ pub(crate) fn encode_create_bucket_command_build_response(
 
 pub(crate) fn decode_create_bucket_command_build_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcCreateBucketCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
         0 => StorageRpcCreateBucketCommandBuildOutcome::Exists(decoder.read_bucket_info()?),
         1 => {
-            let command = decoder.read_metadata_command_envelope_bytes()?;
+            let command = decoder.read_metadata_command_envelope_bytes(authority)?;
             StorageRpcCreateBucketCommandBuildOutcome::Command(Box::new(command))
         }
         _ => {
@@ -3326,10 +3329,11 @@ pub(crate) fn encode_multipart_completion_barrier_command_build_response(
 
 pub(crate) fn decode_multipart_completion_barrier_command_build_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMultipartCompletionBarrierCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let barrier_sequence = decoder.read_u64()?;
-    let command = decoder.read_metadata_command_envelope_bytes()?;
+    let command = decoder.read_metadata_command_envelope_bytes(authority)?;
     decoder.finish()?;
     Ok(StorageRpcMultipartCompletionBarrierCommandBuildResponse {
         barrier_sequence,
@@ -3347,9 +3351,10 @@ pub(crate) fn encode_bucket_metadata_control_command_build_response(
 
 pub(crate) fn decode_bucket_metadata_control_command_build_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let command = decoder.read_metadata_command_envelope_bytes()?;
+    let command = decoder.read_metadata_command_envelope_bytes(authority)?;
     decoder.finish()?;
     Ok(StorageRpcBucketMetadataControlCommandBuildResponse { command })
 }
@@ -3373,6 +3378,7 @@ pub(crate) fn encode_bucket_mark_deleting_command_build_response(
 
 pub(crate) fn decode_bucket_mark_deleting_command_build_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcBucketMarkDeletingCommandBuildResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
@@ -3380,7 +3386,7 @@ pub(crate) fn decode_bucket_mark_deleting_command_build_response(
             decoder.read_bucket_info()?,
         ),
         1 => {
-            let command = decoder.read_metadata_command_envelope_bytes()?;
+            let command = decoder.read_metadata_command_envelope_bytes(authority)?;
             StorageRpcBucketMarkDeletingCommandBuildOutcome::Command(Box::new(command))
         }
         _ => {

@@ -1113,13 +1113,16 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             StorageRpcMessageKind::MetadataCommandPendingEnvelope,
             payload,
         )?;
-        let response =
-            decode_metadata_command_pending_envelope_response(&response).map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command pending envelope response",
-                    error.to_string(),
-                )
-            })?;
+        let response = decode_metadata_command_pending_envelope_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command pending envelope response",
+                error.to_string(),
+            )
+        })?;
         if let Some(command) = response.command.as_ref() {
             if command.id().cluster_epoch() != self.cluster_epoch || command.id().pg_id() != pg_id {
                 return Err(self.rpc_payload_error(
@@ -1538,14 +1541,17 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             StorageRpcMessageKind::MetadataCommandRetainedLogEntries,
             payload,
         )?;
-        decode_metadata_command_log_entry_range_response(&response)
-            .map(|response| response.entries)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command retained log entries response",
-                    error.to_string(),
-                )
-            })
+        decode_metadata_command_log_entry_range_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map(|response| response.entries)
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command retained log entries response",
+                error.to_string(),
+            )
+        })
     }
 
     fn has_matching_applied_metadata_command_log_entry(

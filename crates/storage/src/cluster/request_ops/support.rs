@@ -1113,7 +1113,7 @@ fn metadata_command_apply_test_context(
     let (kind, bucket, key) = match command.payload() {
         MetadataCommandPayload::CreateBucket(command) => (
             MetadataCommandApplyTestKind::CreateBucket,
-            Some(command.bucket.name.clone()),
+            Some(command.bucket().name.clone()),
             None,
         ),
         MetadataCommandPayload::PutBucketVersioning(command) => (

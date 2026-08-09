@@ -50,6 +50,7 @@ use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, DurableBucketWriteReservationHeartbeat, PgMetadataStore,
     ShardStore,
 };
+use crate::node_runtime::MetadataCommandDecodeAuthority;
 use crate::types::*;
 use placement::NodeId;
 

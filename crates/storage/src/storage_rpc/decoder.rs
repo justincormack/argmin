@@ -69,11 +69,12 @@ impl<'a> StorageRpcDecoder<'a> {
 
     fn read_metadata_command_envelope_bytes(
         &mut self,
+        authority: &MetadataCommandDecodeAuthority,
     ) -> Result<crate::metadata_command::MetadataCommandEnvelope, StorageRpcPayloadError> {
         let command_bytes = self
             .read_bytes_with_payload_limit(STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN)?
             .to_vec();
-        decode_metadata_command_envelope(&command_bytes)
+        decode_metadata_command_envelope(&command_bytes, authority)
             .map_err(|_| StorageRpcPayloadError::InvalidMetadataCommandEnvelope)
     }
 
@@ -2046,9 +2047,10 @@ impl<'a> StorageRpcDecoder<'a> {
 
     fn read_metadata_command_envelope_response_item(
         &mut self,
+        authority: &MetadataCommandDecodeAuthority,
     ) -> Result<crate::metadata_command::MetadataCommandEnvelope, StorageRpcPayloadError> {
         let item = self.read_metadata_command_item()?;
-        metadata_command_envelope_from_item(&item)
+        metadata_command_envelope_from_item(&item, authority)
     }
 
     fn read_live_object_record(&mut self) -> Result<LiveObjectRecord, StorageRpcPayloadError> {

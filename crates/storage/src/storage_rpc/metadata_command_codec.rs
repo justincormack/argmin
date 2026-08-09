@@ -39,13 +39,14 @@ pub(crate) fn encode_metadata_command_pending_slot_request(
 
 pub(crate) fn decode_metadata_command_pending_slot_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandPendingSlotRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let item = decoder.read_metadata_command_item()?;
-    let command = metadata_command_envelope_from_item(&item)?;
+    let command = metadata_command_envelope_from_item(&item, authority)?;
     validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
     let scope_bucket = match decoder.read_u8()? {
         0 => None,
@@ -131,16 +132,17 @@ pub(crate) fn encode_metadata_command_pending_slot_replace_request(
 
 pub(crate) fn decode_metadata_command_pending_slot_replace_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandPendingSlotReplaceRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let previous_item = decoder.read_metadata_command_item()?;
-    let previous = metadata_command_envelope_from_item(&previous_item)?;
+    let previous = metadata_command_envelope_from_item(&previous_item, authority)?;
     validate_metadata_command_route(cluster_epoch, pg_id, previous.id())?;
     let replacement_item = decoder.read_metadata_command_item()?;
-    let replacement = metadata_command_envelope_from_item(&replacement_item)?;
+    let replacement = metadata_command_envelope_from_item(&replacement_item, authority)?;
     validate_metadata_command_route(cluster_epoch, pg_id, replacement.id())?;
     let scope_bucket = match decoder.read_u8()? {
         0 => None,
@@ -216,14 +218,16 @@ pub(crate) fn encode_metadata_command_recovery_pending_slot_replace_request(
 
 pub(crate) fn decode_metadata_command_recovery_pending_slot_replace_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let authorized_source =
-        metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?)?;
+        metadata_command_envelope_from_item(&decoder.read_metadata_command_item()?, authority)?;
     let abandoned_source = match decoder.read_u8()? {
         0 => None,
         1 => Some(metadata_command_envelope_from_item(
             &decoder.read_metadata_command_item()?,
+            authority,
         )?),
         _ => {
             return Err(
@@ -234,7 +238,10 @@ pub(crate) fn decode_metadata_command_recovery_pending_slot_replace_request(
         }
     };
     let ordinary_offset = bytes.len() - decoder.remaining_len();
-    let ordinary = decode_metadata_command_pending_slot_replace_request(&bytes[ordinary_offset..])?;
+    let ordinary = decode_metadata_command_pending_slot_replace_request(
+        &bytes[ordinary_offset..],
+        authority,
+    )?;
     validate_metadata_command_route(
         ordinary.cluster_epoch,
         ordinary.pg_id,
@@ -587,6 +594,7 @@ pub(crate) fn encode_metadata_command_log_entry_range_response(
 
 pub(crate) fn decode_metadata_command_log_entry_range_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandLogEntryRangeResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let count = decoder.read_u32()?;
@@ -626,7 +634,7 @@ pub(crate) fn decode_metadata_command_log_entry_range_response(
         let kind = match decoder.read_u8()? {
             0 => {
                 let item = decoder.read_metadata_command_item()?;
-                let command = metadata_command_envelope_from_item(&item)?;
+                let command = metadata_command_envelope_from_item(&item, authority)?;
                 if command.id().log_index().get() != log_index {
                     return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                         "metadata command entry range applied command log index mismatch",
@@ -730,13 +738,14 @@ pub(crate) fn encode_metadata_command_pending_envelope_response(
 
 pub(crate) fn decode_metadata_command_pending_envelope_response(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandPendingEnvelopeResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let command = match decoder.read_u8()? {
         0 => None,
         1 => {
             let item = decoder.read_metadata_command_item()?;
-            Some(metadata_command_envelope_from_item(&item)?)
+            Some(metadata_command_envelope_from_item(&item, authority)?)
         }
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
@@ -764,13 +773,14 @@ pub(crate) fn encode_metadata_command_matching_applied_request(
 
 pub(crate) fn decode_metadata_command_matching_applied_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandMatchingAppliedRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let item = decoder.read_metadata_command_item()?;
-    let command = metadata_command_envelope_from_item(&item)?;
+    let command = metadata_command_envelope_from_item(&item, authority)?;
     validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
     let expected_previous_log_hash = decoder.read_u64()?;
     decoder.finish()?;
@@ -1111,6 +1121,7 @@ pub(crate) fn encode_metadata_command_transfer_adopt_request(
 
 pub(crate) fn decode_metadata_command_transfer_adopt_request(
     bytes: &[u8],
+    authority: &MetadataCommandDecodeAuthority,
 ) -> Result<StorageRpcMetadataCommandTransferAdoptRequest, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let node_id = NodeId::new(decoder.read_u32()?);
@@ -1123,7 +1134,7 @@ pub(crate) fn decode_metadata_command_transfer_adopt_request(
         let pre_state_digest = decoder.read_u64()?;
         let post_state_digest = decoder.read_u64()?;
         let item = decoder.read_metadata_command_item()?;
-        let command = metadata_command_envelope_from_item(&item)?;
+        let command = metadata_command_envelope_from_item(&item, authority)?;
         validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
         commands.push(MetadataTransferCommand {
             command,

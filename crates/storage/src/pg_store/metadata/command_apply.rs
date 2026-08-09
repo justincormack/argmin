@@ -677,11 +677,11 @@ impl PgStore {
         &self,
         command: &CreateBucketCommand,
     ) -> Result<(), MetadataError> {
-        match self.insert_bucket_record_explicit(&command.bucket) {
+        match self.insert_bucket_record_explicit(command.bucket()) {
             Ok(()) => Ok(()),
             Err(MetadataError::BucketAlreadyExists) => {
-                let existing = self.head_bucket_record_raw(&command.bucket.name)?;
-                if existing.command_metadata_eq(&command.bucket) {
+                let existing = self.head_bucket_record_raw(&command.bucket().name)?;
+                if existing.command_metadata_eq(command.bucket()) {
                     Ok(())
                 } else {
                     Err(MetadataError::BucketAlreadyExists)

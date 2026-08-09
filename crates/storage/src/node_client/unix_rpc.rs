@@ -2357,14 +2357,17 @@ impl UnixStorageNodeClient {
             StorageRpcMessageKind::MetadataCommandRetainedLogEntries,
             payload,
         )?;
-        decode_metadata_command_log_entry_range_response(&response)
-            .map(|response| response.entries)
-            .map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command retained log entries response",
-                    error.to_string(),
-                )
-            })
+        decode_metadata_command_log_entry_range_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map(|response| response.entries)
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command retained log entries response",
+                error.to_string(),
+            )
+        })
     }
 
     pub(crate) fn pending_metadata_command_envelope_at_epoch(
@@ -2382,13 +2385,16 @@ impl UnixStorageNodeClient {
             StorageRpcMessageKind::MetadataCommandPendingEnvelope,
             payload,
         )?;
-        let response =
-            decode_metadata_command_pending_envelope_response(&response).map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command pending envelope response",
-                    error.to_string(),
-                )
-            })?;
+        let response = decode_metadata_command_pending_envelope_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command pending envelope response",
+                error.to_string(),
+            )
+        })?;
         if let Some(command) = response.command.as_ref() {
             if command.id().cluster_epoch() != cluster_epoch || command.id().pg_id() != pg_id {
                 return Err(self.rpc_payload_error(
@@ -4236,7 +4242,11 @@ impl UnixStorageNodeClient {
         let response = self
             .rpc_request(StorageRpcMessageKind::BucketCreateCommandBuild, payload)
             .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_create_bucket_command_build_response(&response).map_err(|error| {
+        let response = decode_create_bucket_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
             BucketSnapshotLoadError::Store(self.rpc_payload_error(
                 "decode create-bucket command build response",
                 error.to_string(),
@@ -4281,13 +4291,16 @@ impl UnixStorageNodeClient {
                 payload,
             )
             .map_err(BucketSnapshotLoadError::Store)?;
-        let response = decode_multipart_completion_barrier_command_build_response(&response)
-            .map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode multipart completion barrier command build response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_multipart_completion_barrier_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode multipart completion barrier command build response",
+                error.to_string(),
+            ))
+        })?;
         self.validate_multipart_completion_barrier_command_build_response(
             response.barrier_sequence,
             response.command,
@@ -4346,13 +4359,16 @@ impl UnixStorageNodeClient {
                 payload,
             )
             .map_err(BucketSnapshotLoadError::Store)?;
-        let response =
-            decode_bucket_mark_deleting_command_build_response(&response).map_err(|error| {
-                BucketSnapshotLoadError::Store(self.rpc_payload_error(
-                    "decode bucket mark-deleting command build response",
-                    error.to_string(),
-                ))
-            })?;
+        let response = decode_bucket_mark_deleting_command_build_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                "decode bucket mark-deleting command build response",
+                error.to_string(),
+            ))
+        })?;
         match response.outcome {
             StorageRpcBucketMarkDeletingCommandBuildOutcome::AlreadyDeleting(info) => {
                 self.validate_mark_bucket_deleting_already_deleting_response(&info, bucket)?;

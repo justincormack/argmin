@@ -2481,7 +2481,7 @@ fn zero_apply_command_failure_records_tombstone_for_later_hash_chain_convergence
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create)
-                    if create.bucket.name == first_bucket_for_hook
+                    if create.bucket().name == first_bucket_for_hook
                         && node_id == NodeId::new(1)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
@@ -6051,7 +6051,7 @@ fn create_bucket_metadata_command_at_epoch(
             MetadataCommandLogIndex::new(log_index).unwrap(),
         ),
         MetadataCommandPayload::CreateBucket(
-            CreateBucketCommand::from_config(&config, 1_234, log_index).unwrap(),
+            CreateBucketCommand::from_config_for_test(&config, 1_234, log_index).unwrap(),
         ),
     )
 }

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use super::clients::LocalStorageNodeClient;
 use super::engine::SharedStorageNode;
+use super::MetadataCommandDecodeAuthority;
 use super::PreparedRetainedStreamUploadAbort;
 use crate::cluster::ShardLocation;
 use crate::control_plane::{
@@ -717,6 +718,7 @@ impl StorageNodeConnectionHandler {
         route_permit: &StorageNodeRouteAdmissionPermit,
         frame: &StorageRpcFrame,
     ) -> Result<StorageRpcFrame, StorageNodeServerError> {
+        let command_decode_authority = MetadataCommandDecodeAuthority::new();
         let payload = match frame.kind {
             StorageRpcMessageKind::Health => {
                 if frame.payload.is_empty() {
@@ -1872,7 +1874,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandAcceptance => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => self.metadata_command_acceptance_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -1881,7 +1883,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandAbandonAcceptance => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => {
                         self.metadata_command_abandon_acceptance_response(session, request)
                     }
@@ -1892,7 +1894,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotInsert => {
-                match decode_metadata_command_pending_slot_request(&frame.payload) {
+                match decode_metadata_command_pending_slot_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => {
                         self.metadata_command_pending_slot_insert_response(session, request)
                     }
@@ -1903,7 +1908,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert => {
-                match decode_metadata_command_pending_slot_request(&frame.payload) {
+                match decode_metadata_command_pending_slot_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => self
                         .metadata_command_bucket_control_pending_slot_insert_response(
                             session, request,
@@ -1915,7 +1923,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => {
                         self.metadata_command_pending_slot_remove_response(session, request)
                     }
@@ -1926,7 +1934,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {
-                match decode_metadata_command_pending_slot_replace_request(&frame.payload) {
+                match decode_metadata_command_pending_slot_replace_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => {
                         self.metadata_command_pending_slot_replace_response(session, request)
                     }
@@ -1937,8 +1948,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace => {
-                match decode_metadata_command_recovery_pending_slot_replace_request(&frame.payload)
-                {
+                match decode_metadata_command_recovery_pending_slot_replace_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => self
                         .metadata_command_recovery_pending_slot_replace_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
@@ -2026,7 +2039,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandTransferStateAdopt => {
-                match decode_metadata_command_transfer_adopt_request(&frame.payload) {
+                match decode_metadata_command_transfer_adopt_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => {
                         self.metadata_command_transfer_state_adopt_response(session, request)
                     }
@@ -2111,7 +2127,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandAppliedLogHashes => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => self.metadata_command_applied_hashes_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -2120,7 +2136,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandMatchingAppliedLog => {
-                match decode_metadata_command_matching_applied_request(&frame.payload) {
+                match decode_metadata_command_matching_applied_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => {
                         self.metadata_command_matching_applied_response(session, request)
                     }
@@ -2131,7 +2150,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandAbandoned => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => self.metadata_command_abandoned_response(session, request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -2140,7 +2159,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandRecordAbandoned => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => {
                         self.metadata_command_record_abandoned_response(session, request)
                     }
@@ -2151,7 +2170,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandApplyAndRecord => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => {
                         self.metadata_command_apply_and_record_response(session, request)
                     }
@@ -2162,7 +2181,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandRetainedAbortApply => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => self.metadata_command_retained_abort_apply_response(
                         session,
                         route_permit,
@@ -2175,7 +2194,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandRetainedAbortFinish => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => self.metadata_command_retained_abort_finish_response(
                         session,
                         route_permit,
@@ -2188,7 +2207,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord => {
-                match decode_metadata_command_recovery_request(&frame.payload) {
+                match decode_metadata_command_recovery_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => {
                         self.metadata_command_recovery_apply_and_record_response(session, request)
                     }
@@ -2199,7 +2221,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned => {
-                match decode_metadata_command_recovery_request(&frame.payload) {
+                match decode_metadata_command_recovery_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => {
                         self.metadata_command_recovery_record_abandoned_response(session, request)
                     }
@@ -2210,7 +2235,7 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandPeeringReplayApplyAndRecord => {
-                match decode_metadata_command_request(&frame.payload) {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => self.metadata_command_peering_replay_apply_and_record_response(
                         session, request,
                     ),
@@ -2280,7 +2305,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::BucketMetadataControlPendingMatch => {
-                match decode_bucket_metadata_control_pending_match_request(&frame.payload) {
+                match decode_bucket_metadata_control_pending_match_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => self.bucket_metadata_control_pending_match_response(request),
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,

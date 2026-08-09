@@ -279,6 +279,36 @@ and proves that the command is included before Peering while a later old-epoch
 command cannot change the metadata proof after deadline and successor
 activation.
 
+## Node-runtime compiler boundary
+
+The raw embedded node, PG stores, and aggregate local node client are
+descendants of the private `node_runtime` module. `SharedStorageNode` is
+available to cluster code only through the test-hook facade, and
+`LocalStorageNodeClient` uses descendant-only visibility. Production cluster
+routing therefore receives only the role-specific node-client traits exposed
+by `LocalNodeStore`. Stateful operations live on subject-bound route traits
+returned by the matching role opener, so the compiler rejects an operation on
+the wrong role or without its scoped subject/PG authority. Embedded and RPC
+implementations satisfy the same traits; the boundary does not depend on a
+source-level receiver-name inventory.
+
+Command minting is audited separately from method visibility. CreateBucket is
+the unique bucket-root command with no existing durable subject from which its
+timestamp and execution generation can be reconstructed. Its record is
+private and its constructor consumes an unforgeable authority whose mint is
+visible only inside `node_runtime`. Canonical bytes may be validated without
+minting a command, but returning a decoded `MetadataCommandEnvelope` requires
+`MetadataCommandDecodeAuthority`. Its constructor is likewise confined to the
+private node runtime, and every envelope-producing storage-RPC decoder must
+receive that authority, so cluster publishers cannot bypass a typed factory
+through either the raw decoder or an indirect response codec. The remaining
+focused semantic rule protects CreateMultipartUpload, the object-root
+exception, by rejecting cluster-side direct construction outside its
+subject-scoped node-runtime builder. Other migrated object command builders
+are backed by apply-time validation of their exact reservation, durable
+preimage, generation, or cleanup snapshot; those invariants remain covered by
+recovery and malformed-envelope tests rather than route-method name scans.
+
 ## Storage operation-class matrix
 
 The table below records the storage operation classes and representative

@@ -2484,7 +2484,7 @@ mod tests {
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&config, 123, 1).unwrap(),
             ),
         );
         {
@@ -2527,7 +2527,7 @@ mod tests {
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&config, 123, 1).unwrap(),
             ),
         );
         let metadata_state = {
@@ -2585,7 +2585,7 @@ mod tests {
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&config, 123, 1).unwrap(),
             ),
         );
         {
@@ -2663,7 +2663,7 @@ mod tests {
                 MetadataCommandLogIndex::new(1).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&config, 123, 1).unwrap(),
+                CreateBucketCommand::from_config_for_test(&config, 123, 1).unwrap(),
             ),
         )
     }
@@ -2805,7 +2805,7 @@ mod tests {
                         MetadataCommandLogIndex::new(index).unwrap(),
                     ),
                     MetadataCommandPayload::CreateBucket(
-                        CreateBucketCommand::from_config(&config, 123, index).unwrap(),
+                        CreateBucketCommand::from_config_for_test(&config, 123, index).unwrap(),
                     ),
                 );
                 pg.record_metadata_command_applied(7, &command).unwrap();

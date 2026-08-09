@@ -885,7 +885,7 @@ mod tests {
                 MetadataCommandLogIndex::new(log_index).unwrap(),
             ),
             MetadataCommandPayload::CreateBucket(
-                CreateBucketCommand::from_config(&config, 1, log_index).unwrap(),
+                CreateBucketCommand::from_config_for_test(&config, 1, log_index).unwrap(),
             ),
         )
     }
