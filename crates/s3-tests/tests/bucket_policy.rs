@@ -11,8 +11,8 @@ use aws_sdk_s3::types::{
     ServerSideEncryptionRule, Tag, Tagging, Type, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
-    disable_bucket_public_access_block, err_status, object_url,
+    assert_complete_multipart_sdk_error, assert_s3_err_code, cleanup_versioned_bucket,
+    create_public_bucket, disable_bucket_public_access_block, err_status, object_url,
     post_object_raw_to_test_endpoint_with_headers, presign_url_with_credentials,
     put_bucket_lifecycle_with_md5, raw_alt_object_request, raw_anonymous, raw_bucket,
     raw_fetch_url, send_signed_request, send_signed_request_with_credentials,
@@ -377,6 +377,30 @@ where
                 .err()
                 .and_then(|err| err.raw_response().map(|r| r.status().as_u16()))
                 == Some(403)
+        },
+    )
+    .await;
+}
+
+async fn eventually_complete_multipart_access_denied<T, E, F, Fut>(description: &str, mut op: F)
+where
+    E: std::fmt::Debug + ProvideErrorMetadata,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    eventually_result_matches(
+        description,
+        20,
+        std::time::Duration::from_millis(200),
+        &mut op,
+        |result| {
+            let Some(error) = result.as_ref().err() else {
+                return false;
+            };
+            let status = error
+                .raw_response()
+                .map(|response| response.status().as_u16());
+            matches!(status, Some(200 | 403)) && error.code() == Some("AccessDenied")
         },
     )
     .await;
@@ -7793,8 +7817,7 @@ fn test_bucket_policy_complete_multipart_does_not_reuse_destination_sse_c_header
             )
             .send()
             .await;
-        assert_eq!(err_status(&complete), 403);
-        assert_s3_err_code(&complete, "AccessDenied");
+        assert_complete_multipart_sdk_error(&complete, 403, "AccessDenied");
         client
             .abort_multipart_upload()
             .bucket(&bucket)
@@ -17080,7 +17103,7 @@ fn test_bucket_policy_complete_multipart_upload_if_none_match_condition() {
 
         let (denied_upload_id, denied_part_etag) =
             prepare_single_part_multipart_upload(alt_client, &bucket, key, b"denied").await;
-        eventually_access_denied(
+        eventually_complete_multipart_access_denied(
             "CompleteMultipartUpload denied without required If-None-Match condition",
             || {
                 alt_client
@@ -17185,7 +17208,7 @@ fn test_bucket_policy_complete_multipart_upload_if_match_condition() {
 
         let (denied_upload_id, denied_part_etag) =
             prepare_single_part_multipart_upload(alt_client, &bucket, key, b"denied").await;
-        eventually_access_denied(
+        eventually_complete_multipart_access_denied(
             "CompleteMultipartUpload denied without required If-Match condition",
             || {
                 alt_client

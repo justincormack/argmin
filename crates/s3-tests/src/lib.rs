@@ -9,6 +9,7 @@ pub mod uat_pg_backfill_support;
 
 pub use aws_sdk_s3;
 pub use helpers::{
+    assert_complete_multipart_raw_error, assert_complete_multipart_sdk_error,
     assert_raw_bucket_location, assert_s3_err_code, bucket_location_url, bucket_prefix,
     cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     create_account_regional_bucket_with_credentials, create_acl_enabled_bucket, create_boe_bucket,

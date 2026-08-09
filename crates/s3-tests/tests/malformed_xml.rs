@@ -42,6 +42,13 @@ fn assert_error_body(body: &str, expected_template: String) {
     );
 }
 
+fn assert_complete_multipart_error_status(status: u16, expected_status: u16, body: &str) {
+    assert!(
+        status == expected_status || status == 200,
+        "CompleteMultipartUpload error used status {status}, expected {expected_status} or embedded-error status 200: {body}"
+    );
+}
+
 // ── SigV4 signing ──────────────────────────────────────────────────────
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -511,7 +518,7 @@ fn test_complete_multipart_malformed_xml() {
         );
         let body = b"<CompleteMultipartUpload>not a part</CompleteMultipartUpload>";
         let (status, body_text) = signed_post(&url, body, &[]);
-        assert_eq!(status, 400, "body: {body_text}");
+        assert_complete_multipart_error_status(status, 400, &body_text);
         assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
 
         // Abort the upload to clean up.
@@ -554,7 +561,7 @@ fn test_complete_multipart_missing_part_number() {
             <Part><ETag>\"abc\"</ETag></Part>\
             </CompleteMultipartUpload>";
         let (status, body_text) = signed_post(&url, body, &[]);
-        assert_eq!(status, 400, "body: {body_text}");
+        assert_complete_multipart_error_status(status, 400, &body_text);
         assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
 
         let _ = client
@@ -796,7 +803,7 @@ fn test_complete_multipart_invalid_part_number() {
             <Part><PartNumber>abc</PartNumber><ETag>\"x\"</ETag></Part>\
             </CompleteMultipartUpload>";
         let (status, body_text) = signed_post(&url, body, &[]);
-        assert_eq!(status, 400, "body: {body_text}");
+        assert_complete_multipart_error_status(status, 400, &body_text);
         assert_error_body(&body_text, expected_error::malformed_xml_no_decl());
 
         let _ = client

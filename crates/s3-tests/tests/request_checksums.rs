@@ -1024,7 +1024,12 @@ fn test_complete_multipart_upload_body_limit_matches_aws() {
                 assert_eq!(response.status, 200, "body: {}", response.body);
                 cleanup_bucket_with_keys(&bucket, &[key.as_str()]).await;
             } else {
-                assert_eq!(response.status, 400, "body: {}", response.body);
+                assert!(
+                    matches!(response.status, 200 | 400),
+                    "CompleteMultipartUpload MaxMessageLengthExceeded used status {}, expected 400 or embedded-error status 200: {}",
+                    response.status,
+                    response.body
+                );
                 assert_max_message_length(&response.body, 2_621_440);
                 abort_multipart_upload(&bucket, &key, &upload_id).await;
                 cleanup_bucket(&bucket).await;

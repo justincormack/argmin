@@ -21,7 +21,8 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
-    assert_s3_err_code, copy_source_with_version, err_status, is_retryable_operation_contention,
+    assert_complete_multipart_raw_error, assert_complete_multipart_sdk_error, assert_s3_err_code,
+    copy_source_with_version, err_status, is_retryable_operation_contention,
     is_sdk_stream_disconnect_or_status, object_url, presign_url, raw_bucket, raw_object_query,
     send_signed_request, send_signed_request_with_credentials,
     shape::{
@@ -486,6 +487,42 @@ async fn assert_list_parts_no_such_upload(bucket: &str, key: &str, upload_id: &s
     assert_s3_err_code(&result, "NoSuchUpload");
 }
 
+async fn assert_list_parts_eventually_no_such_upload_after_completion(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let result = CTX
+            .client()
+            .list_parts()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send_retrying_operation_aborted("list parts after successful raced completion")
+            .await;
+        match &result {
+            Err(_) => {
+                assert_eq!(
+                    err_status(&result),
+                    404,
+                    "unexpected ListParts result after successful completion: {result:?}"
+                );
+                assert_s3_err_code(&result, "NoSuchUpload");
+                return;
+            }
+            Ok(_) if tokio::time::Instant::now() >= deadline => {
+                panic!(
+                    "ListParts continued to expose upload {upload_id} for 10 seconds after successful completion: {result:?}"
+                );
+            }
+            Ok(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
 async fn assert_multipart_parts_preserved(
     bucket: &str,
     key: &str,
@@ -536,22 +573,14 @@ async fn assert_object_contents_and_etag(
     );
 }
 
-fn assert_complete_multipart_processing_error_shape(
+fn assert_complete_multipart_error_shape(
     operation: &str,
     response: &RawResponse,
     error_status: u16,
+    error_code: &str,
     expected_body: String,
 ) {
-    // AWS documents that CompleteMultipartUpload may commit a 200 response
-    // before processing finishes and then embed an error in the body. The SDK
-    // handles both forms automatically; raw shape tests must do so explicitly.
-    // The local server completes processing before sending headers and uses the
-    // ordinary error status.
-    assert!(
-        response.status == error_status || response.status == 200,
-        "{operation}: expected status {error_status} or embedded-error status 200, got {}",
-        response.status
-    );
+    assert_complete_multipart_raw_error(response, error_status, error_code);
     assert_shape(
         operation,
         response,
@@ -596,6 +625,15 @@ fn assert_invalid_upload_id_no_such_upload(response: &RawResponse, invalid_uploa
         "unexpected response body: {}",
         response.body
     );
+    assert_no_such_upload_body(response, invalid_upload_id);
+}
+
+fn assert_complete_multipart_no_such_upload(response: &RawResponse, upload_id: &str) {
+    assert_complete_multipart_raw_error(response, 404, "NoSuchUpload");
+    assert_no_such_upload_body(response, upload_id);
+}
+
+fn assert_no_such_upload_body(response: &RawResponse, upload_id: &str) {
     assert!(
         response.body.contains("<Code>NoSuchUpload</Code>"),
         "unexpected response body: {}",
@@ -611,7 +649,7 @@ fn assert_invalid_upload_id_no_such_upload(response: &RawResponse, invalid_uploa
     assert!(
         response
             .body
-            .contains(&format!("<UploadId>{invalid_upload_id}</UploadId>")),
+            .contains(&format!("<UploadId>{upload_id}</UploadId>")),
         "unexpected response body: {}",
         response.body
     );
@@ -646,12 +684,12 @@ fn assert_listing_invalid_argument(
     );
 }
 
-fn assert_malformed_xml(response: &RawResponse) {
-    assert_eq!(
-        response.status, 400,
-        "unexpected response body: {}",
-        response.body
-    );
+fn assert_complete_multipart_malformed_xml(response: &RawResponse) {
+    assert_complete_multipart_raw_error(response, 400, "MalformedXML");
+    assert_malformed_xml_body(response);
+}
+
+fn assert_malformed_xml_body(response: &RawResponse) {
     assert!(
         response.body.contains("<Code>MalformedXML</Code>"),
         "unexpected response body: {}",
@@ -1580,7 +1618,7 @@ fn test_complete_multipart_upload_invalid_present_upload_id_overlong_message() {
             [("content-type", "application/xml")],
             primary_credentials(),
         );
-        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
+        assert_complete_multipart_no_such_upload(&response, &invalid_upload_id);
 
         cleanup(&bucket, &[]).await;
     });
@@ -1895,7 +1933,11 @@ fn test_multipart_upload_id_authorization_precedence() {
                 headers,
                 alt_credentials(),
             );
-            assert_access_denied(&valid_response);
+            if operation == "CompleteMultipartUpload" {
+                assert_complete_multipart_raw_error(&valid_response, 403, "AccessDenied");
+            } else {
+                assert_access_denied(&valid_response);
+            }
 
             let invalid_url = object_url(CTX.endpoint(), &bucket, key, Some(&invalid_query));
             let invalid_response = send_signed_request_with_credentials(
@@ -1905,12 +1947,18 @@ fn test_multipart_upload_id_authorization_precedence() {
                 headers,
                 alt_credentials(),
             );
-            assert_invalid_upload_id_no_such_upload(&invalid_response, &invalid_upload_id);
+            if operation == "CompleteMultipartUpload" {
+                assert_complete_multipart_no_such_upload(&invalid_response, &invalid_upload_id);
+            } else {
+                assert_invalid_upload_id_no_such_upload(&invalid_response, &invalid_upload_id);
+            }
 
-            assert_ne!(
-                valid_response.status, invalid_response.status,
-                "{operation} did not distinguish authorization from upload-ID validation"
-            );
+            if operation != "CompleteMultipartUpload" {
+                assert_ne!(
+                    valid_response.status, invalid_response.status,
+                    "{operation} did not distinguish authorization from upload-ID validation"
+                );
+            }
         }
 
         let parts = client
@@ -2458,7 +2506,7 @@ fn test_complete_multipart_upload_xml_precedence() {
                 [("content-type", "application/xml")],
                 credentials,
             );
-            assert_malformed_xml(&valid_response);
+            assert_complete_multipart_malformed_xml(&valid_response);
 
             let invalid_url = object_url(
                 CTX.endpoint(),
@@ -2473,7 +2521,7 @@ fn test_complete_multipart_upload_xml_precedence() {
                 [("content-type", "application/xml")],
                 credentials,
             );
-            assert_invalid_upload_id_no_such_upload(&invalid_response, &invalid_upload_id);
+            assert_complete_multipart_no_such_upload(&invalid_response, &invalid_upload_id);
         }
 
         assert_multipart_parts_preserved(
@@ -2699,7 +2747,7 @@ fn test_multipart_terminal_retries() {
             &changed_completion_body,
             &[],
         );
-        assert_invalid_upload_id_no_such_upload(&changed_completion, &completed_upload_id);
+        assert_complete_multipart_no_such_upload(&changed_completion, &completed_upload_id);
 
         let probe = |completed_replays: bool, aborts_are_idempotent: bool| {
             let complete_completed = raw_complete_upload(
@@ -2719,7 +2767,7 @@ fn test_multipart_terminal_retries() {
                     Some(completed_result_etag)
                 );
             } else {
-                assert_invalid_upload_id_no_such_upload(&complete_completed, &completed_upload_id);
+                assert_complete_multipart_no_such_upload(&complete_completed, &completed_upload_id);
             }
 
             let abort_completed = raw_multipart_query(
@@ -2753,7 +2801,7 @@ fn test_multipart_terminal_retries() {
                     Some(completed_result_etag)
                 );
             } else {
-                assert_invalid_upload_id_no_such_upload(
+                assert_complete_multipart_no_such_upload(
                     &complete_completed_after_abort,
                     &completed_upload_id,
                 );
@@ -2761,7 +2809,7 @@ fn test_multipart_terminal_retries() {
 
             let complete_aborted =
                 raw_complete_upload(&bucket, aborted_key, &aborted_upload_id, &aborted_body, &[]);
-            assert_invalid_upload_id_no_such_upload(&complete_aborted, &aborted_upload_id);
+            assert_complete_multipart_no_such_upload(&complete_aborted, &aborted_upload_id);
 
             let abort_aborted = raw_multipart_query(
                 "DELETE",
@@ -2779,7 +2827,7 @@ fn test_multipart_terminal_retries() {
 
             let complete_aborted_after_abort =
                 raw_complete_upload(&bucket, aborted_key, &aborted_upload_id, &aborted_body, &[]);
-            assert_invalid_upload_id_no_such_upload(
+            assert_complete_multipart_no_such_upload(
                 &complete_aborted_after_abort,
                 &aborted_upload_id,
             );
@@ -2824,7 +2872,7 @@ fn test_multipart_terminal_retries() {
         probe(false, true);
         let malformed_xml =
             raw_complete_upload(&bucket, completed_key, &completed_upload_id, "<", &[]);
-        assert_malformed_xml(&malformed_xml);
+        assert_complete_multipart_malformed_xml(&malformed_xml);
         let malformed_expected_size = raw_complete_upload(
             &bucket,
             completed_key,
@@ -2832,10 +2880,7 @@ fn test_multipart_terminal_retries() {
             &completed_body,
             &[("x-amz-mp-object-size", "bad")],
         );
-        assert_eq!(
-            malformed_expected_size.status, 400,
-            "malformed expected-size header after overwrite: {malformed_expected_size:?}"
-        );
+        assert_complete_multipart_raw_error(&malformed_expected_size, 400, "InvalidRequest");
         assert_eq!(
             xml_tag_text(&malformed_expected_size.body, "Code"),
             Some("InvalidRequest")
@@ -2943,7 +2988,7 @@ fn test_multipart_terminal_completion_replay_versioned_history() {
                     "{history}: {replay:?}"
                 );
             } else {
-                assert_invalid_upload_id_no_such_upload(&replay, &upload_id);
+                assert_complete_multipart_no_such_upload(&replay, &upload_id);
             }
         };
 
@@ -3364,8 +3409,9 @@ fn test_terminal_completion_replay_header_matrix() {
             (
                 "empty If-Match",
                 vec![("if-match", "")],
+                400,
+                "InvalidArgument",
                 shape()
-                    .status(400)
                     .headers(error_response_headers())
                     .body(
                         "<Error><Code>InvalidArgument</Code>\
@@ -3377,8 +3423,9 @@ fn test_terminal_completion_replay_header_matrix() {
             (
                 "specific matching If-None-Match",
                 vec![("if-none-match", completed_etag.as_str())],
+                501,
+                "NotImplemented",
                 shape()
-                    .status(501)
                     .headers(error_response_headers())
                     .header("cache-control", "no-store")
                     .body(
@@ -3392,8 +3439,9 @@ fn test_terminal_completion_replay_header_matrix() {
             (
                 "specific mismatched If-None-Match",
                 vec![("if-none-match", "\"wrong\"")],
+                501,
+                "NotImplemented",
                 shape()
-                    .status(501)
                     .headers(error_response_headers())
                     .header("cache-control", "no-store")
                     .body(
@@ -3407,8 +3455,9 @@ fn test_terminal_completion_replay_header_matrix() {
             (
                 "empty If-None-Match",
                 vec![("if-none-match", "")],
+                501,
+                "NotImplemented",
                 shape()
-                    .status(501)
                     .headers(error_response_headers())
                     .header("cache-control", "no-store")
                     .body(
@@ -3422,8 +3471,9 @@ fn test_terminal_completion_replay_header_matrix() {
             (
                 "malformed aggregate checksum",
                 vec![("x-amz-checksum-sha256", "bad")],
+                400,
+                "InvalidRequest",
                 shape()
-                    .status(400)
                     .headers(error_response_headers())
                     .body(expected_error::complete_multipart_checksum_header_invalid(
                         "x-amz-checksum-sha256",
@@ -3432,8 +3482,9 @@ fn test_terminal_completion_replay_header_matrix() {
             (
                 "malformed expected size",
                 vec![("x-amz-mp-object-size", "bad")],
+                400,
+                "InvalidRequest",
                 shape()
-                    .status(400)
                     .headers(error_response_headers())
                     .body(
                         "<Error><Code>InvalidRequest</Code>\
@@ -3442,10 +3493,11 @@ fn test_terminal_completion_replay_header_matrix() {
                     ),
             ),
         ];
-        for (label, headers, expected) in malformed_cases {
+        for (label, headers, expected_status, expected_code, expected) in malformed_cases {
             let response =
                 raw_complete_upload(&bucket, key, &upload_id, &completion_body, &headers);
-            assert_shape(label, &response, &expected);
+            assert_complete_multipart_raw_error(&response, expected_status, expected_code);
+            assert_shape(label, &response, &expected.status(response.status));
         }
 
         let claimed_key = "terminal-retry-header-matrix-claimed";
@@ -3567,13 +3619,13 @@ fn test_multipart_terminal_completion_replay_obeys_current_explicit_deny() {
         let mut denied = false;
         for attempt in 0..60 {
             let response = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
-            match response.status {
-                403 => {
-                    assert_access_denied(&response);
+            match (response.status, xml_tag_text(&response.body, "Code")) {
+                (403 | 200, Some("AccessDenied")) => {
+                    assert_complete_multipart_raw_error(&response, 403, "AccessDenied");
                     denied = true;
                     break;
                 }
-                200 if attempt + 1 < 60 => {
+                (200, None) if attempt + 1 < 60 => {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 _ => panic!("terminal replay did not converge to explicit deny: {response:?}"),
@@ -3593,12 +3645,13 @@ fn test_multipart_terminal_completion_replay_obeys_current_explicit_deny() {
         let mut allowed = false;
         for attempt in 0..60 {
             let response = raw_complete_upload(&bucket, key, &upload_id, &completion_body, &[]);
-            match response.status {
-                200 => {
+            match (response.status, xml_tag_text(&response.body, "Code")) {
+                (200, None) => {
                     allowed = true;
                     break;
                 }
-                403 if attempt + 1 < 60 => {
+                (403 | 200, Some("AccessDenied")) if attempt + 1 < 60 => {
+                    assert_complete_multipart_raw_error(&response, 403, "AccessDenied");
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
                 _ => panic!("terminal replay did not recover after policy removal: {response:?}"),
@@ -6117,11 +6170,7 @@ fn test_complete_multipart_maximum_part_count() {
         };
 
         let at_limit = raw_complete_upload(&bucket, key, upload_id, &completion_body(10_000), &[]);
-        assert!(
-            at_limit.status == 400 || at_limit.status == 200,
-            "at-limit response: {at_limit:?}"
-        );
-        assert_eq!(xml_tag_text(&at_limit.body, "Code"), Some("InvalidPart"));
+        assert_complete_multipart_raw_error(&at_limit, 400, "InvalidPart");
         assert_eq!(xml_tag_text(&at_limit.body, "UploadId"), Some(upload_id));
         assert_eq!(
             xml_tag_text(&at_limit.body, "ETag"),
@@ -6135,15 +6184,15 @@ fn test_complete_multipart_maximum_part_count() {
 
         let above_limit =
             raw_complete_upload(&bucket, key, upload_id, &completion_body(10_001), &[]);
-        assert_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload above maximum part count",
             &above_limit,
-            &shape().status(400).headers(error_response_headers()).body(
-                expected_error::invalid_argument_with_value_no_decl(
-                    "The CompleteMultipartUpload reqeust contains for than 10000 parts.",
-                    "CompleteMultipartUpload",
-                    "CompleteMultipartUpload",
-                ),
+            400,
+            "InvalidArgument",
+            expected_error::invalid_argument_with_value_no_decl(
+                "The CompleteMultipartUpload reqeust contains for than 10000 parts.",
+                "CompleteMultipartUpload",
+                "CompleteMultipartUpload",
             ),
         );
         assert_multipart_parts_preserved(&bucket, key, upload_id, &[]).await;
@@ -6471,7 +6520,7 @@ fn test_complete_multipart_upload_racing_abort_is_serializable() {
             assert_eq!(err_status(&list), 404);
             assert_s3_err_code(&list, "NoSuchUpload");
 
-            match complete {
+            match &complete {
                 Ok(completed) => {
                     if let Err(err) = &abort {
                         assert_eq!(err.code(), Some("NoSuchUpload"));
@@ -6489,15 +6538,14 @@ fn test_complete_multipart_upload_racing_abort_is_serializable() {
                     assert_eq!(replay.e_tag(), completed.e_tag());
                     cleanup(&bucket, &[key]).await;
                 }
-                Err(err) => {
-                    assert_eq!(err.code(), Some("NoSuchUpload"));
+                Err(_) => {
+                    assert_complete_multipart_sdk_error(&complete, 404, "NoSuchUpload");
                     abort.expect(
                         "the winning raced abort must succeed when completion returns NoSuchUpload",
                     );
                     assert_eq!(err_status(&get), 404);
                     assert_s3_err_code(&get, "NoSuchKey");
-                    assert_eq!(err_status(&retry), 404);
-                    assert_s3_err_code(&retry, "NoSuchUpload");
+                    assert_complete_multipart_sdk_error(&retry, 404, "NoSuchUpload");
                     cleanup(&bucket, &[]).await;
                 }
             }
@@ -6621,8 +6669,7 @@ fn test_simultaneous_different_complete_multipart_uploads_publish_one_manifest()
                     .await;
             for completion in [&first, &second] {
                 if completion.is_err() {
-                    assert_eq!(err_status(completion), 404);
-                    assert_s3_err_code(completion, "NoSuchUpload");
+                    assert_complete_multipart_sdk_error(completion, 404, "NoSuchUpload");
                 }
             }
 
@@ -6640,8 +6687,7 @@ fn test_simultaneous_different_complete_multipart_uploads_publish_one_manifest()
                     });
                     assert_eq!(first.e_tag(), replay.e_tag());
                     assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
-                    assert_eq!(err_status(&second_retry), 404);
-                    assert_s3_err_code(&second_retry, "NoSuchUpload");
+                    assert_complete_multipart_sdk_error(&second_retry, 404, "NoSuchUpload");
                     if let Ok(second) = second {
                         assert!(second.e_tag().is_some());
                     }
@@ -6659,8 +6705,7 @@ fn test_simultaneous_different_complete_multipart_uploads_publish_one_manifest()
                     });
                     assert_eq!(second.e_tag(), replay.e_tag());
                     assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
-                    assert_eq!(err_status(&first_retry), 404);
-                    assert_s3_err_code(&first_retry, "NoSuchUpload");
+                    assert_complete_multipart_sdk_error(&first_retry, 404, "NoSuchUpload");
                     if let Ok(first) = first {
                         assert!(first.e_tag().is_some());
                     }
@@ -6745,7 +6790,7 @@ fn test_upload_part_replacement_racing_completion_has_consistent_terminal_state(
                 send_single_part_completion(client, &bucket, key, &upload_id, 1, &original_etag)
                     .await;
 
-            match completion {
+            match &completion {
                 Ok(completed) => {
                     match &replacement {
                         Ok(replaced) => assert!(
@@ -6763,8 +6808,18 @@ fn test_upload_part_replacement_racing_completion_has_consistent_terminal_state(
                         )),
                         Bytes::from_static(b"original part")
                     );
-                    assert_eq!(err_status(&list), 404);
-                    assert_s3_err_code(&list, "NoSuchUpload");
+                    match &list {
+                        Err(_) => {
+                            assert_eq!(err_status(&list), 404);
+                            assert_s3_err_code(&list, "NoSuchUpload");
+                        }
+                        Ok(_) => {
+                            assert_list_parts_eventually_no_such_upload_after_completion(
+                                &bucket, key, &upload_id,
+                            )
+                            .await;
+                        }
+                    }
                     let replay = retry.unwrap_or_else(|err| {
                         panic!(
                             "completion-winning attempt {attempt} did not replay successfully: {err:?}"
@@ -6773,8 +6828,8 @@ fn test_upload_part_replacement_racing_completion_has_consistent_terminal_state(
                     assert_eq!(replay.e_tag(), completed.e_tag());
                     cleanup(&bucket, &[key]).await;
                 }
-                Err(err) => {
-                    assert_eq!(err.code(), Some("InvalidPart"));
+                Err(_) => {
+                    assert_complete_multipart_sdk_error(&completion, 400, "InvalidPart");
                     let replacement = replacement.unwrap_or_else(|err| {
                         panic!(
                             "replacement-winning attempt {attempt} did not return success: {err:?}"
@@ -6798,7 +6853,10 @@ fn test_upload_part_replacement_racing_completion_has_consistent_terminal_state(
                                 b"original part",
                             )
                             .await;
-                            assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+                            assert_list_parts_eventually_no_such_upload_after_completion(
+                                &bucket, key, &upload_id,
+                            )
+                            .await;
                             let replay = send_single_part_completion(
                                 client,
                                 &bucket,
@@ -6815,16 +6873,8 @@ fn test_upload_part_replacement_racing_completion_has_consistent_terminal_state(
                             });
                             assert_eq!(replay.e_tag(), retried.e_tag());
                         }
-                        Err(error) => {
-                            let status = error
-                                .raw_response()
-                                .map(|response| response.status().as_u16());
-                            assert!(
-                                matches!(status, Some(200 | 400)),
-                                "InvalidPart must use status 400 or an embedded-error status 200: {error:?}"
-                            );
-                            assert_eq!(error.code(), Some("InvalidPart"));
-
+                        Err(_) => {
+                            assert_complete_multipart_sdk_error(&retry, 400, "InvalidPart");
                             let corrected = send_single_part_completion(
                                 client,
                                 &bucket,
@@ -6842,7 +6892,10 @@ fn test_upload_part_replacement_racing_completion_has_consistent_terminal_state(
                                 b"replacement part",
                             )
                             .await;
-                            assert_list_parts_no_such_upload(&bucket, key, &upload_id).await;
+                            assert_list_parts_eventually_no_such_upload_after_completion(
+                                &bucket, key, &upload_id,
+                            )
+                            .await;
                             let replay = send_single_part_completion(
                                 client,
                                 &bucket,
@@ -7037,8 +7090,7 @@ fn test_simultaneous_completions_of_distinct_uploads_to_same_key() {
                     });
                     assert_eq!(first.e_tag(), replay.e_tag());
                     assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
-                    assert_eq!(err_status(&second_retry), 404);
-                    assert_s3_err_code(&second_retry, "NoSuchUpload");
+                    assert_complete_multipart_sdk_error(&second_retry, 404, "NoSuchUpload");
                     assert!(second.e_tag().is_some());
                 }
                 b"second upload" => {
@@ -7049,8 +7101,7 @@ fn test_simultaneous_completions_of_distinct_uploads_to_same_key() {
                     });
                     assert_eq!(second.e_tag(), replay.e_tag());
                     assert_eq!(replay.e_tag(), Some(object_etag.as_str()));
-                    assert_eq!(err_status(&first_retry), 404);
-                    assert_s3_err_code(&first_retry, "NoSuchUpload");
+                    assert_complete_multipart_sdk_error(&first_retry, 404, "NoSuchUpload");
                     assert!(first.e_tag().is_some());
                 }
                 other => panic!(
@@ -7397,21 +7448,30 @@ fn test_conditional_completion_racing_object_replacement_is_serializable() {
                         client, &bucket, key, &upload_id, 1, &part_etag,
                     )
                     .await;
-                    assert_eq!(err_status(&replay), 404);
-                    assert_s3_err_code(&replay, "NoSuchUpload");
+                    assert_complete_multipart_sdk_error(&replay, 404, "NoSuchUpload");
                 }
                 Err(_) => {
                     // AWS documents both conditional failure modes for
                     // CompleteMultipartUpload: 412 when the ETag does not
                     // match, and 409 when a conflicting operation wins while
                     // completion is in progress.
-                    match err_status(&completion) {
-                        409 => {
-                            assert_s3_err_code(&completion, "ConditionalRequestConflict");
+                    match completion.as_ref().unwrap_err().code() {
+                        Some("ConditionalRequestConflict") => {
+                            assert_complete_multipart_sdk_error(
+                                &completion,
+                                409,
+                                "ConditionalRequestConflict",
+                            );
                         }
-                        412 => assert_s3_err_code(&completion, "PreconditionFailed"),
-                        status => {
-                            panic!("raced conditional completion returned {status}: {completion:?}")
+                        Some("PreconditionFailed") => {
+                            assert_complete_multipart_sdk_error(
+                                &completion,
+                                412,
+                                "PreconditionFailed",
+                            );
+                        }
+                        code => {
+                            panic!("raced conditional completion returned {code:?}: {completion:?}")
                         }
                     }
                     let listed = client
@@ -7434,8 +7494,11 @@ fn test_conditional_completion_racing_object_replacement_is_serializable() {
                         .multipart_upload(single_part_completion(&part_etag, 1))
                         .send()
                         .await;
-                    assert_eq!(err_status(&corrected), 409);
-                    assert_s3_err_code(&corrected, "ConditionalRequestConflict");
+                    assert_complete_multipart_sdk_error(
+                        &corrected,
+                        409,
+                        "ConditionalRequestConflict",
+                    );
                     let listed = client
                         .list_parts()
                         .bucket(&bucket)
@@ -7501,11 +7564,7 @@ fn test_complete_multipart_if_none_match_conflicts_after_post_initiation_delete(
             &completion_body,
             &[("if-none-match", "*")],
         );
-        assert_eq!(conflict.status, 409, "{conflict:?}");
-        assert_eq!(
-            xml_tag_text(&conflict.body, "Code"),
-            Some("ConditionalRequestConflict")
-        );
+        assert_complete_multipart_raw_error(&conflict, 409, "ConditionalRequestConflict");
         assert_eq!(
             xml_tag_text(&conflict.body, "Message"),
             Some(
@@ -7681,8 +7740,7 @@ fn test_conditional_completion_detects_replaced_suspended_null_delete_marker() {
             .multipart_upload(single_part_completion(&part_etag, 1))
             .send()
             .await;
-        assert_eq!(err_status(&completion), 409);
-        assert_s3_err_code(&completion, "ConditionalRequestConflict");
+        assert_complete_multipart_sdk_error(&completion, 409, "ConditionalRequestConflict");
         let listed = client
             .list_parts()
             .bucket(&bucket)
@@ -8105,8 +8163,7 @@ fn test_complete_multipart_upload_rejects_mismatched_expected_object_size() {
             .send_retrying_operation_aborted("S3 operation during multipart test")
             .await;
 
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "InvalidRequest");
+        assert_complete_multipart_sdk_error(&result, 400, "InvalidRequest");
 
         assert_multipart_parts_preserved(
             &bucket,
@@ -9870,8 +9927,7 @@ fn assert_terminal_completion_replay(
 ) {
     let replay = raw_complete_upload(bucket, key, upload_id, completion_body, &[]);
     let Some((expected_etag, expected_version_id)) = expected else {
-        assert_eq!(replay.status, 404, "{history}: {replay:?}");
-        assert_invalid_upload_id_no_such_upload(&replay, upload_id);
+        assert_complete_multipart_no_such_upload(&replay, upload_id);
         return;
     };
     assert_eq!(replay.status, 200, "{history}: {replay:?}");
@@ -10085,75 +10141,62 @@ fn test_complete_multipart_validation_precedence() {
 
         for (name, body, headers) in cases {
             let response = raw_complete_upload(&bucket, key, &upload_id, &body, &headers);
-            let (expected_status, expected_code, expected_message, may_be_embedded) = match name {
+            let (expected_status, expected_code, expected_message) = match name {
                 "invalid expected-size header before xml" => (
                     400,
                     "InvalidRequest",
                     "Value for x-amz-mp-object-size header is invalid: 'bad'",
-                    false,
                 ),
                 "invalid checksum header versus xml" => (
                     400,
                     "InvalidRequest",
                     "Value for x-amz-checksum-sha256 header is invalid.",
-                    false,
                 ),
                 "conflicting conditions versus xml" => (
                     501,
                     "NotImplemented",
                     "A header you provided implies functionality that is not implemented",
-                    false,
                 ),
                 "part order versus missing part" | "part order versus object checksum" => (
                     400,
                     "InvalidPartOrder",
                     "The list of parts was not in ascending order. Parts must be ordered by part number.",
-                    true,
                 ),
                 "missing part versus condition" => (
                     400,
                     "InvalidPart",
                     "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
-                    true,
                 ),
                 "missing part versus object checksum"
                 | "expected size versus object checksum" => (
                     400,
                     "BadDigest",
                     "The sha256 you specified did not match the calculated checksum.",
-                    true,
                 ),
                 "object checksum versus etag" | "etag versus condition"
                 | "etag versus missing checksum" => (
                     400,
                     "InvalidPart",
                     "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
-                    true,
                 ),
                 "missing checksum versus condition" | "missing checksum versus size" => (
                     400,
                     "InvalidRequest",
                     "The upload was created using a sha256 checksum. The complete request must include the checksum for each part. It was missing for part 1 in the request.",
-                    true,
                 ),
                 "condition versus size" | "size versus expected size" => (
                     400,
                     "EntityTooSmall",
                     "Your proposed upload is smaller than the minimum allowed size",
-                    true,
                 ),
                 "condition versus expected size" => (
                     400,
                     "InvalidRequest",
                     "The provided 'x-amz-mp-object-size' header value 999 does not match what was computed: 100",
-                    true,
                 ),
                 _ => unreachable!("unhandled precedence case {name}"),
             };
-            assert!(
-                response.status == expected_status || (may_be_embedded && response.status == 200),
-                "{name}: unexpected response: {response:?}"
-            );
+            assert_complete_multipart_raw_error(&response, expected_status, expected_code);
             assert_eq!(
                 xml_tag_text(&response.body, "Code"),
                 Some(expected_code),
@@ -10197,12 +10240,7 @@ fn test_complete_multipart_validation_precedence() {
                         "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
                     )
             };
-            assert_eq!(response.status, expected_status, "{name}: {response:?}");
-            assert_eq!(
-                xml_tag_text(&response.body, "Code"),
-                Some(expected_code),
-                "{name}: {response:?}"
-            );
+            assert_complete_multipart_raw_error(&response, expected_status, expected_code);
             assert_eq!(
                 xml_tag_text(&response.body, "Message"),
                 Some(expected_message),
@@ -10221,15 +10259,7 @@ fn test_complete_multipart_validation_precedence() {
             ),
             &[("x-amz-checksum-crc32", "AAAAAA==")],
         );
-        assert!(
-            checksum_algorithm_mismatch.status == 400
-                || checksum_algorithm_mismatch.status == 200,
-            "checksum algorithm mismatch versus missing part checksum: {checksum_algorithm_mismatch:?}"
-        );
-        assert_eq!(
-            xml_tag_text(&checksum_algorithm_mismatch.body, "Code"),
-            Some("InvalidRequest")
-        );
+        assert_complete_multipart_raw_error(&checksum_algorithm_mismatch, 400, "InvalidRequest");
         assert_eq!(
             xml_tag_text(&checksum_algorithm_mismatch.body, "Message"),
             Some(
@@ -10248,20 +10278,31 @@ fn test_complete_multipart_validation_precedence() {
             ),
             &[],
         );
-        match (
-            checksum_part_number_gap.status,
-            xml_tag_text(&checksum_part_number_gap.body, "Code"),
-        ) {
-            (500 | 200, Some("InternalError")) => assert_eq!(
-                xml_tag_text(&checksum_part_number_gap.body, "Message"),
-                Some("We encountered an internal error. Please try again.")
-            ),
-            (400, Some("InvalidRequest")) => assert_eq!(
+        match xml_tag_text(&checksum_part_number_gap.body, "Code") {
+            Some("InternalError") => {
+                assert_complete_multipart_raw_error(
+                    &checksum_part_number_gap,
+                    500,
+                    "InternalError",
+                );
+                assert_eq!(
+                    xml_tag_text(&checksum_part_number_gap.body, "Message"),
+                    Some("We encountered an internal error. Please try again.")
+                );
+            }
+            Some("InvalidRequest") => {
+                assert_complete_multipart_raw_error(
+                    &checksum_part_number_gap,
+                    400,
+                    "InvalidRequest",
+                );
+                assert_eq!(
                 xml_tag_text(&checksum_part_number_gap.body, "Message"),
                 Some("Part numbers must be consecutive and begin with 1 when a checksum is used.")
-            ),
-            result => {
-                panic!("checksum part-number gap returned {result:?}: {checksum_part_number_gap:?}")
+                );
+            }
+            code => {
+                panic!("checksum part-number gap returned {code:?}: {checksum_part_number_gap:?}")
             }
         }
 
@@ -10638,12 +10679,12 @@ fn test_complete_multipart_no_such_upload_error_shape() {
             &single_part_complete_body("\"ffffffffffffffff\""),
             &[],
         );
-        assert_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload NoSuchUpload",
             &response,
-            &shape().status(404).headers(error_response_headers()).body(
-                expected_error::complete_multipart_no_such_upload(&upload_id),
-            ),
+            404,
+            "NoSuchUpload",
+            expected_error::complete_multipart_no_such_upload(&upload_id),
         );
 
         s3_tests::delete_bucket_retrying_operation_aborted(client, &bucket).await;
@@ -10674,13 +10715,12 @@ fn test_complete_multipart_upload_rejects_managed_encryption_request_headers() {
             &complete_body,
             &[("x-amz-server-side-encryption", "AES256")],
         );
-        assert_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload rejects x-amz-server-side-encryption request header",
             &sse_response,
-            &shape()
-                .status(400)
-                .headers(error_response_headers())
-                .body(invalid_sse_body.as_str()),
+            400,
+            "InvalidArgument",
+            invalid_sse_body,
         );
 
         let invalid_kms_key_body = expected_error::invalid_argument_no_decl(
@@ -10697,13 +10737,12 @@ fn test_complete_multipart_upload_rejects_managed_encryption_request_headers() {
                 "arn:aws:kms:us-east-1:111122223333:key/example",
             )],
         );
-        assert_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload rejects x-amz-server-side-encryption-aws-kms-key-id request header",
             &kms_key_response,
-            &shape()
-                .status(400)
-                .headers(error_response_headers())
-                .body(invalid_kms_key_body.as_str()),
+            400,
+            "InvalidArgument",
+            invalid_kms_key_body,
         );
 
         raw_abort_upload(&bucket, key, &upload_id);
@@ -10728,10 +10767,11 @@ fn test_complete_multipart_invalid_part_error_shape() {
             &single_part_complete_body("\"ffffffffffffffff\""),
             &[],
         );
-        assert_complete_multipart_processing_error_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload InvalidPart",
             &response,
             400,
+            "InvalidPart",
             expected_error::complete_multipart_invalid_part(&upload_id, 1, "ffffffffffffffff"),
         );
 
@@ -10769,10 +10809,11 @@ fn test_complete_multipart_invalid_part_order_error_shape() {
             ),
             &[],
         );
-        assert_complete_multipart_processing_error_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload InvalidPartOrder",
             &response,
             400,
+            "InvalidPartOrder",
             expected_error::complete_multipart_invalid_part_order(&upload_id),
         );
 
@@ -10841,10 +10882,11 @@ fn test_complete_multipart_entity_too_small_error_shape() {
             &[],
         );
         // The error echoes the first offending part's ETag without quotes.
-        assert_complete_multipart_processing_error_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload EntityTooSmall",
             &response,
             400,
+            "EntityTooSmall",
             expected_error::complete_multipart_entity_too_small(
                 100,
                 5242880,
@@ -10922,10 +10964,11 @@ fn test_complete_multipart_checksum_mismatch_error_shape() {
             &valid_body,
             &[("x-amz-checksum-sha256", "bad")],
         );
-        assert_complete_multipart_processing_error_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload checksum header invalid",
             &response,
             400,
+            "InvalidRequest",
             expected_error::complete_multipart_checksum_header_invalid("x-amz-checksum-sha256"),
         );
 
@@ -10983,10 +11026,11 @@ fn test_complete_multipart_missing_part_checksum_error_shape() {
             &single_part_complete_body(&etag),
             &[],
         );
-        assert_complete_multipart_processing_error_shape(
+        assert_complete_multipart_error_shape(
             "CompleteMultipartUpload missing part checksum",
             &response,
             400,
+            "InvalidRequest",
             expected_error::complete_multipart_missing_part_checksum("sha256", 1),
         );
 

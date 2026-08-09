@@ -8,8 +8,8 @@ use aws_smithy_types::body::SdkBody;
 use bytes::Bytes;
 use http_body_1x::{Body, Frame, SizeHint};
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
-    raw_alt_object_request, raw_object_with,
+    assert_complete_multipart_sdk_error, assert_s3_err_code, cleanup_versioned_bucket,
+    copy_source_with_version, err_status, raw_alt_object_request, raw_object_with,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     unique_bucket, RawAltObjectRequest, SendRetryingOperationAborted, CTX,
 };
@@ -1811,7 +1811,7 @@ fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
             )
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
-        assert_eq!(err_status(&result), 412);
+        assert_complete_multipart_sdk_error(&result, 412, "PreconditionFailed");
         assert_conditional_multipart_part_preserved(&bucket, "obj", &upload_id, &part_etag).await;
 
         let resp = CTX
@@ -1929,7 +1929,7 @@ fn test_complete_multipart_ifmatch_failed() {
             )
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
-        assert_eq!(err_status(&result), 412);
+        assert_complete_multipart_sdk_error(&result, 412, "PreconditionFailed");
         assert_conditional_multipart_part_preserved(&bucket, "obj", &upload_id, &part_etag).await;
 
         let resp = CTX
@@ -2003,8 +2003,7 @@ fn test_complete_multipart_ifmatch_nonexisted_failed() {
             )
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
-        assert!(matches!(err_status(&result), 200 | 404), "{result:?}");
-        assert_s3_err_code(&result, "NoSuchKey");
+        assert_complete_multipart_sdk_error(&result, 404, "NoSuchKey");
         assert_conditional_multipart_part_preserved(&bucket, "obj", &upload_id, &part_etag).await;
         let get = CTX
             .client()
@@ -2105,7 +2104,7 @@ fn test_complete_multipart_ifnonmatch_current_object_in_versioned_bucket() {
             )
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
-        assert_eq!(err_status(&result), 412);
+        assert_complete_multipart_sdk_error(&result, 412, "PreconditionFailed");
         client
             .abort_multipart_upload()
             .bucket(&bucket)
@@ -2175,7 +2174,7 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
             )
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
-        assert_eq!(err_status(&stale), 412);
+        assert_complete_multipart_sdk_error(&stale, 412, "PreconditionFailed");
         client
             .abort_multipart_upload()
             .bucket(&bucket)

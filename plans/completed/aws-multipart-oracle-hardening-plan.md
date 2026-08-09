@@ -53,10 +53,12 @@ For each matrix:
 - [x] Apply the same state assertions to `InvalidPartOrder`, `EntityTooSmall`,
   checksum failures, expected-size failures, conditional failures, and malformed
   completion bodies. Raw response-shape tests explicitly accept AWS's documented
-  CompleteMultipartUpload behavior where a processing failure may use either
-  its ordinary error status or an error body embedded in HTTP 200. SDK-based
-  tests assert the modeled error code and accept either transport form; the local
-  server uses ordinary error statuses.
+  CompleteMultipartUpload behavior for every error, regardless of its apparent
+  validation point: the response may use either its ordinary error status or an
+  error body embedded in HTTP 200. Shared raw and SDK assertions always require
+  the exact modeled error code as well as one of those transport forms, so an
+  ordinary successful 200 cannot pass. The local server uses ordinary error
+  statuses.
 - [x] Determine AWS precedence when several completion errors coexist; include
   upload existence, XML shape, part order, missing part, ETag, part size,
   checksum, condition, and expected object size. The oracle matrix also pins
@@ -245,7 +247,12 @@ For each matrix:
   `InvalidPart` while an immediate retry of its original manifest succeeds;
   that branch must publish the original bytes and retire the upload, while a
   repeated `InvalidPart` leaves the replacement available for corrected
-  completion.
+  completion. Under full-suite AWS load, a successful completion that published
+  the original bytes was once followed immediately by a stale successful
+  `ListParts` response for the same upload. The raced oracle repeats only that
+  observed non-converged `ListParts` result under a ten-second bound and still
+  requires exact `404 NoSuchUpload`; unexpected errors fail immediately, and
+  completion replay continues to pin the terminal result.
   Deterministic coordinator regressions pin completion races after
   authorization, after snapshot lookup, and before commit. Completion restarts
   terminal-transition races once and uses a separate elapsed-time

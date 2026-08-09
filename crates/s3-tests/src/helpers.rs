@@ -3623,6 +3623,53 @@ pub fn err_status<T, E: std::fmt::Debug>(
     }
 }
 
+/// Assert an SDK-modeled `CompleteMultipartUpload` error.
+///
+/// AWS may send the operation's normal error status, or commit HTTP 200 before
+/// processing finishes and embed the error in the response body. The SDK
+/// recognizes the latter as an error but preserves the raw HTTP status. Always
+/// require the exact S3 error code so an ordinary successful 200 cannot pass.
+pub fn assert_complete_multipart_sdk_error<
+    T: std::fmt::Debug,
+    E: std::fmt::Debug + ProvideErrorMetadata,
+>(
+    result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
+    expected_status: u16,
+    expected_code: &str,
+) {
+    let actual_status = err_status(result);
+    assert!(
+        actual_status == expected_status || actual_status == 200,
+        "CompleteMultipartUpload error {expected_code} used status {actual_status}, expected {expected_status} or embedded-error status 200: {result:?}"
+    );
+    assert_eq!(
+        result.as_ref().unwrap_err().code(),
+        Some(expected_code),
+        "unexpected CompleteMultipartUpload result: {result:?}"
+    );
+}
+
+/// Assert a raw HTTP `CompleteMultipartUpload` error.
+///
+/// As with [`assert_complete_multipart_sdk_error`], HTTP 200 is valid only as
+/// the envelope for the exact expected error code.
+pub fn assert_complete_multipart_raw_error(
+    response: &RawResponse,
+    expected_status: u16,
+    expected_code: &str,
+) {
+    assert!(
+        response.status == expected_status || response.status == 200,
+        "CompleteMultipartUpload error {expected_code} used status {}, expected {expected_status} or embedded-error status 200: {response:?}",
+        response.status
+    );
+    assert_eq!(
+        crate::shape::xml_tag_text(&response.body, "Code"),
+        Some(expected_code),
+        "unexpected CompleteMultipartUpload response: {response:?}"
+    );
+}
+
 /// Return true for SDK errors caused by the server closing an in-flight request body.
 ///
 /// Some tests intentionally race a streaming request against a server-side state
@@ -3668,6 +3715,44 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
+
+    fn raw_complete_error(status: u16, code: &str) -> RawResponse {
+        RawResponse {
+            status,
+            headers: Vec::new(),
+            body: format!("<Error><Code>{code}</Code></Error>"),
+            body_read_error: None,
+        }
+    }
+
+    #[test]
+    fn complete_multipart_raw_error_accepts_normal_and_embedded_statuses() {
+        assert_complete_multipart_raw_error(
+            &raw_complete_error(404, "NoSuchUpload"),
+            404,
+            "NoSuchUpload",
+        );
+        assert_complete_multipart_raw_error(
+            &raw_complete_error(200, "NoSuchUpload"),
+            404,
+            "NoSuchUpload",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected CompleteMultipartUpload response")]
+    fn complete_multipart_raw_error_rejects_successful_200() {
+        assert_complete_multipart_raw_error(
+            &RawResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: "<CompleteMultipartUploadResult/>".to_string(),
+                body_read_error: None,
+            },
+            404,
+            "NoSuchUpload",
+        );
+    }
 
     fn fake_delete_objects_request(keys: &[&str]) -> Delete {
         Delete::builder()

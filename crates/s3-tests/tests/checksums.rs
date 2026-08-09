@@ -7,8 +7,8 @@ use aws_sdk_s3::types::{
 use checksum::ChecksumAlgorithm as LocalChecksumAlgorithm;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, err_status, raw_object_with,
-    retrying_operation_aborted, send_signed_request,
+    assert_complete_multipart_sdk_error, assert_s3_err_code, cleanup_versioned_bucket, err_status,
+    raw_object_with, retrying_operation_aborted, send_signed_request,
     shape::{assert_shape, error_response_headers, expected_error, shape},
     unique_bucket, SendRetryingOperationAborted, CTX,
 };
@@ -2591,7 +2591,10 @@ fn test_complete_multipart_new_object_checksum_without_create_algorithm_rejected
                 body.as_bytes(),
                 &[(checksum_header_name(&aws_algo), checksum.as_str())],
             );
-            assert_eq!(status, 400, "body: {body_text}");
+            assert!(
+                matches!(status, 200 | 400),
+                "CompleteMultipartUpload InvalidRequest used status {status}, expected 400 or embedded-error status 200: {body_text}"
+            );
             assert_error_code(&body_text, "InvalidRequest");
             assert_error_message(
                 &body_text,
@@ -2921,8 +2924,7 @@ fn test_complete_multipart_new_part_checksum_without_create_algorithm_is_accepte
             )
             .send()
             .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "InvalidPart");
+        assert_complete_multipart_sdk_error(&result, 400, "InvalidPart");
 
         let _ = client
             .abort_multipart_upload()
@@ -3163,8 +3165,7 @@ fn test_complete_multipart_configured_new_object_checksum_header_mismatch_reject
             )
             .send()
             .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "BadDigest");
+        assert_complete_multipart_sdk_error(&result, 400, "BadDigest");
 
         let _ = client
             .abort_multipart_upload()
@@ -3456,8 +3457,7 @@ fn test_multipart_checksum_sha256() {
             )
             .send()
             .await;
-        assert_eq!(err_status(&malformed_result), 400);
-        assert_s3_err_code(&malformed_result, "InvalidRequest");
+        assert_complete_multipart_sdk_error(&malformed_result, 400, "InvalidRequest");
 
         // CompleteMultipartUpload with a validly encoded but wrong checksum should fail.
         let wrong_sha256 = encode_base64(&[0u8; 32]);
@@ -3480,8 +3480,7 @@ fn test_multipart_checksum_sha256() {
             )
             .send()
             .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "BadDigest");
+        assert_complete_multipart_sdk_error(&result, 400, "BadDigest");
         assert_checksum_completion_preserved_upload(&bucket, key, upload_id, resp.e_tag().unwrap())
             .await;
 
@@ -3551,8 +3550,7 @@ fn test_multipart_checksum_sha256() {
             )
             .send()
             .await;
-        assert_eq!(err_status(&result2), 400);
-        assert_s3_err_code(&result2, "InvalidRequest");
+        assert_complete_multipart_sdk_error(&result2, 400, "InvalidRequest");
         assert_checksum_completion_preserved_upload(
             &bucket,
             key2,
