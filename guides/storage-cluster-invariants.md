@@ -85,6 +85,13 @@ Every public `StorageCluster` operation must fit one of these classes:
 - Best-effort cleanup may suppress cleanup errors, but typed route/control-plane
   errors must not collapse into `NotFound` or generic IO before the suppression
   point.
+- Concrete storage implementation errors (`StoreError`, `MetadataError`,
+  `ObjectPgActionError`, and `ShardIoError`) are crate-private. Public storage
+  operations return operation-specific opaque failures or bounded semantic
+  classifications; coordinator and HTTP code cannot match, render, or retain
+  the implementation errors. Rust visibility is the boundary. Owner-local
+  tests, rather than a cross-crate source-symbol inventory, pin classification,
+  redaction, error sources, and protocol mapping.
 - Physical shard absence, CRC corruption, and length corruption are recoverable
   only inside the EC read paths that explicitly opt into reconstruction.
 - Token release is not new work. Acquiring a token requires a current handle;

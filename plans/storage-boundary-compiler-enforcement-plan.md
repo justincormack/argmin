@@ -6361,7 +6361,7 @@ Final Phase 5 completion audit (2026-08-07):
   aliases or renamed/named reexports. Public wildcard reexports are forbidden
   at this boundary. Ordinary production configuration types used to construct
   test clusters are not test-support exceptions;
-- `cargo check -p storage --no-default-features`,
+- `cargo check -p storage --no-default-features --features ring`,
   `cargo check -p server-core --features test-utils`, the fail-closed feature
   graph, and the complete storage boundary checker pass. The affected scratch
   reuse regressions also pass; and
@@ -6469,6 +6469,37 @@ Implementation order from this inventory:
    fixtures; and
 6. update `guides/storage-cluster-invariants.md` with the resulting structural
    boundary and a short table of the final semantic checks.
+
+Phase 6 raw-error removal slice (2026-08-08):
+
+- removed 18 checks and 899 lines which scanned coordinator/storage operation
+  signatures and call sites for `StoreError`, `MetadataError`,
+  `ObjectPgActionError`, `ShardIoError`, or the operation-specific private
+  predecessors now replaced by opaque failures. This includes the obsolete
+  negative fixture for publicly exposing a raw storage error;
+- the compiler replacement is explicit: all four concrete errors are
+  `pub(crate)`, the error module has no public reexport, raw route/lease/stream
+  primitives are private, and public operations expose bounded failures such
+  as `StoreFailure`, `ObjectReadFailure`, `ObjectMetadataMutationFailure`,
+  `StreamUploadFailure`, `DirectPutFailure`, multipart/listing failures, and
+  lifecycle failures. Cross-crate code cannot name or receive the removed raw
+  error types;
+- retained owner-local behavior and redaction tests remain responsible for
+  exact classification, display, sources, and HTTP mapping. The deleted source
+  scans did not test those behaviors; they duplicated signature visibility or
+  prescribed one mapper spelling; and
+- deliberately retained neighboring semantic checks include generic
+  route/control-plane-to-IO collapse, request-work-budget use, database-module
+  ownership, storage-layout ownership, and opaque diagnostic formatting. They
+  need their own Phase 6 classification and were not justified merely by the
+  raw-error visibility audit; and
+- corrected the Phase 5 validation record to select the required crypto
+  provider explicitly. `storage` intentionally fails when neither `ring` nor
+  `openssl` is enabled, so the minimal-default validation command is
+  `cargo check -p storage --no-default-features --features ring`, not a
+  provider-free build.
+
+The checker baseline after this slice is 198 `fail_with_matches` sections.
 
 For each remaining section, record:
 
