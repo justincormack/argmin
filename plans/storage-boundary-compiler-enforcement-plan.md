@@ -6654,6 +6654,35 @@ Phase 6 stream-command representation slice (2026-08-09):
 The checker baseline after this slice is 86 actual `fail_with_matches`
 invocations (79 top-level and seven nested).
 
+Phase 6 residual private-physical-surface slice (2026-08-09):
+
+- removed five remaining source inventories which prescribed the visibility,
+  names, and source locations of raw shard write/repair operations,
+  route-history reconstruction helpers, dormant direct stream/multipart
+  primitives, payload-lease helpers, and physical placement selectors;
+- the audited representations (`ShardIoError`, shard locations and health,
+  reclaim/lease observations, and physical PG selectors) are crate-private.
+  The raw route-history query and reconstruction helpers are likewise
+  crate-private, while their bounded summary/reference result types remain a
+  deliberate public interface. Raw operations are crate-private or
+  owner-test-gated, so downstream access is rejected by Rust; the retained
+  exhaustive feature-graph check separately proves that default production
+  normal/build graphs do not enable the test facade;
+- removed the embedded UAT symbol/test-name inventory from the physical
+  placement block. Cargo's required-feature compilation boundary keeps the
+  topology UAT opt-in, while the workspace feature-graph check rejects
+  `storage/test-hooks` from default production normal/build graphs. It does not
+  claim exclusivity across every optional feature definition. The ordinary
+  Rust tests enforce UAT behavior without a second list of test function
+  spellings; and
+- retained the exact physical shard delete/read and segment-read caller
+  inventories, plus the coarse-to-narrow payload-lease handoff prohibition.
+  Those four checks constrain production authority flow while the capability
+  migrations remain incomplete; they are not visibility restatements.
+
+The checker baseline after this slice is 81 actual `fail_with_matches`
+invocations (74 top-level and seven nested).
+
 For each remaining section, record:
 
 - the invariant
