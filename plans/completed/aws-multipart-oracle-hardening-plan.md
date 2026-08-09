@@ -55,7 +55,8 @@ For each matrix:
   completion bodies. Raw response-shape tests explicitly accept AWS's documented
   CompleteMultipartUpload behavior where a processing failure may use either
   its ordinary error status or an error body embedded in HTTP 200. SDK-based
-  tests already handle both forms; the local server uses ordinary error statuses.
+  tests assert the modeled error code and accept either transport form; the local
+  server uses ordinary error statuses.
 - [x] Determine AWS precedence when several completion errors coexist; include
   upload existence, XML shape, part order, missing part, ETag, part size,
   checksum, condition, and expected object size. The oracle matrix also pins
@@ -376,8 +377,14 @@ choice.
   or suspended bucket omits the header; and explicitly selecting
   `versionId=null` returns `null` in both bucket states. Exact source version and
   marker history is unchanged, and every rejection publishes neither a
-  destination nor a part. Both malformed source date headers are ignored by
-  both operations, with the successful destination or part state verified.
+  destination nor a part. AWS's documented first-enable versioning propagation
+  window can send a subsequent implicit-current CopyObject or UploadPartCopy to
+  a still-unconverged endpoint even after a readiness PUT and GET succeeded.
+  The enabled-source oracle retries only that transient `NoSuchKey`, proves
+  each failed attempt publishes neither a destination nor a part, and still
+  requires bounded convergence to the exact version header, ETag, and bytes.
+  Both malformed source date headers are ignored by both operations, with the
+  successful destination or part state verified.
   AWS-facing CopyObject probes establish the permitted replacement and
   deletion orderings: replacement publishes exactly one complete old or new
   source snapshot, while deletion either publishes the complete old snapshot

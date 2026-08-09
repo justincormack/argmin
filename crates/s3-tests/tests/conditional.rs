@@ -2003,7 +2003,8 @@ fn test_complete_multipart_ifmatch_nonexisted_failed() {
             )
             .send_retrying_operation_aborted("complete conditional multipart upload")
             .await;
-        assert_eq!(err_status(&result), 404);
+        assert!(matches!(err_status(&result), 200 | 404), "{result:?}");
+        assert_s3_err_code(&result, "NoSuchKey");
         assert_conditional_multipart_part_preserved(&bucket, "obj", &upload_id, &part_etag).await;
         let get = CTX
             .client()
@@ -3740,20 +3741,59 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
             copy_source: String,
             destination_bucket: &str,
             label: &str,
+            retry_first_enable_propagation: bool,
             expected_source_version: Option<&str>,
             expected_etag: &str,
             expected_body: &[u8],
         ) {
+            // AWS documents intermittent NoSuchKey responses while a bucket's
+            // first versioning enablement propagates. A successful readiness
+            // request can reach a different endpoint from either copy path.
+            const PROPAGATION_RETRY_DELAY: Duration = Duration::from_millis(250);
+            const MAX_PROPAGATION_RETRIES: usize = 40;
+
             let client = CTX.client();
             let copy_key = format!("copy-source-version-{label}");
-            let copy = client
-                .copy_object()
-                .bucket(destination_bucket)
-                .key(&copy_key)
-                .copy_source(&copy_source)
-                .send()
-                .await
-                .unwrap_or_else(|error| panic!("{label} CopyObject failed: {error:?}"));
+            let mut copy_retries = 0;
+            let copy = loop {
+                match client
+                    .copy_object()
+                    .bucket(destination_bucket)
+                    .key(&copy_key)
+                    .copy_source(&copy_source)
+                    .send()
+                    .await
+                {
+                    Ok(copy) => break copy,
+                    Err(error)
+                        if retry_first_enable_propagation && error.code() == Some("NoSuchKey") =>
+                    {
+                        assert_eq!(
+                            error
+                                .raw_response()
+                                .map(|response| response.status().as_u16()),
+                            Some(404),
+                            "{error:?}"
+                        );
+                        let destination = client
+                            .get_object()
+                            .bucket(destination_bucket)
+                            .key(&copy_key)
+                            .send_retrying_operation_aborted(
+                                "check destination after versioning propagation CopyObject error",
+                            )
+                            .await;
+                        assert_s3_err_code(&destination, "NoSuchKey");
+                        assert!(
+                            copy_retries < MAX_PROPAGATION_RETRIES,
+                            "{label} CopyObject remained non-converged after {copy_retries} retries: {error:?}"
+                        );
+                        copy_retries += 1;
+                        tokio::time::sleep(PROPAGATION_RETRY_DELAY).await;
+                    }
+                    Err(error) => panic!("{label} CopyObject failed: {error:?}"),
+                }
+            };
             assert_eq!(
                 copy.copy_source_version_id(),
                 expected_source_version,
@@ -3779,16 +3819,53 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
                 .await
                 .unwrap();
             let upload_id = upload.upload_id().unwrap();
-            let part = client
-                .upload_part_copy()
-                .bucket(destination_bucket)
-                .key(&upload_key)
-                .upload_id(upload_id)
-                .part_number(1)
-                .copy_source(&copy_source)
-                .send()
-                .await
-                .unwrap_or_else(|error| panic!("{label} UploadPartCopy failed: {error:?}"));
+            let mut part_retries = 0;
+            let part = loop {
+                match client
+                    .upload_part_copy()
+                    .bucket(destination_bucket)
+                    .key(&upload_key)
+                    .upload_id(upload_id)
+                    .part_number(1)
+                    .copy_source(&copy_source)
+                    .send()
+                    .await
+                {
+                    Ok(part) => break part,
+                    Err(error)
+                        if retry_first_enable_propagation && error.code() == Some("NoSuchKey") =>
+                    {
+                        assert_eq!(
+                            error
+                                .raw_response()
+                                .map(|response| response.status().as_u16()),
+                            Some(404),
+                            "{error:?}"
+                        );
+                        let parts = client
+                            .list_parts()
+                            .bucket(destination_bucket)
+                            .key(&upload_key)
+                            .upload_id(upload_id)
+                            .send_retrying_operation_aborted(
+                                "list parts after versioning propagation UploadPartCopy error",
+                            )
+                            .await
+                            .unwrap();
+                        assert!(
+                            parts.parts().is_empty(),
+                            "{label} UploadPartCopy NoSuchKey published a part"
+                        );
+                        assert!(
+                            part_retries < MAX_PROPAGATION_RETRIES,
+                            "{label} UploadPartCopy remained non-converged after {part_retries} retries: {error:?}"
+                        );
+                        part_retries += 1;
+                        tokio::time::sleep(PROPAGATION_RETRY_DELAY).await;
+                    }
+                    Err(error) => panic!("{label} UploadPartCopy failed: {error:?}"),
+                }
+            };
             assert_eq!(
                 part.copy_source_version_id(),
                 expected_source_version,
@@ -3830,6 +3907,7 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
             format!("{source_bucket}/disabled"),
             &destination_bucket,
             "disabled",
+            false,
             None,
             &disabled_etag,
             b"disabled source",
@@ -3839,6 +3917,7 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
             copy_source_with_version(&source_bucket, "disabled", "null"),
             &destination_bucket,
             "disabled-explicit-null",
+            false,
             Some("null"),
             &disabled_etag,
             b"disabled source",
@@ -3864,6 +3943,7 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
             format!("{source_bucket}/enabled"),
             &destination_bucket,
             "enabled",
+            true,
             Some(&enabled_version),
             &enabled_etag,
             b"enabled source",
@@ -3899,6 +3979,7 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
             format!("{source_bucket}/suspended"),
             &destination_bucket,
             "suspended",
+            false,
             None,
             &suspended_etag,
             b"suspended source",
@@ -3908,6 +3989,7 @@ fn test_copy_source_version_header_follows_source_bucket_versioning() {
             copy_source_with_version(&source_bucket, "suspended", "null"),
             &destination_bucket,
             "suspended-explicit-null",
+            false,
             Some("null"),
             &suspended_etag,
             b"suspended source",
