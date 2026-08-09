@@ -6818,7 +6818,7 @@ every historical symbol ban merely because it already existed.
 | Cohort (actual checks) | Invariant | Why Rust visibility/types are insufficient | Why ordinary tests are insufficient | Stable inspected input |
 | --- | --- | --- | --- | --- |
 | Workspace feature graph (1) | Default production normal/build graphs cannot enable storage test support; every workspace package is classified fail closed. | Cargo permits any package feature to forward another package's feature, including through defaults. | Tests compile the graph they are run under and do not enumerate every production package's resolved feature set. | Cargo metadata/tree feature resolution plus the exhaustive package classification and miniature end-to-end fixture. |
-| Payload-read/delete migration fences (2) | Physical deletion stays behind reclaim fencing; coarse leases exist only for the leased-snapshot handoff. | The raw operations are storage-private, but several required callers remain siblings within the same crate. | Positive read/reclaim tests do not fail merely because an additional unfenced call site is introduced. | Production Rust call sites for the two named low-level effects, excluding owner-local tests. These are explicitly temporary and are deleted only with their capability/module migrations. |
+| Payload-read/delete migration fences (1) | Coarse leases exist only for the leased-snapshot handoff. | The raw lease operation is storage-private, but required callers remain siblings within the same crate. | Positive read/reclaim tests do not fail merely because an additional coarse-lease call site is introduced. | Production Rust call sites for the coarse generation lease, excluding owner-local tests. This is explicitly temporary and is deleted only with its capability/module migration. |
 | Metadata-command publisher/recovery classification (7) | Every live publisher has one registry marker, obtains the correct sealed class token, and uses its typed installer; recovery mutation stays within the audited leader-authority path. | Publisher mints and some recovery constructors remain `pub(crate)` within modules whose included implementation files share visibility. Sealing enforces class, but not canonical mint location. | Command convergence tests exercise known publishers and cannot prove that a new unmarked or differently classified publisher was not added. | The authoritative publisher registry, production macro markers/installers, direct token-mint references, recovery-authority entry points, and semantic adversarial fixtures. |
 | Intra-storage semantic boundaries (4) | Typed route failures are not flattened to generic IO; request paths retain shared work budgets; SQLite access remains in `pg_store`; process code does not know storage directory/file layout. | All participants are intentionally inside the storage crate for the first three rules, while filesystem spellings are not Rust types. | Tests may pass without exercising a newly added conversion, unbounded retry helper, database access, or duplicated path spelling. | Narrow conversion/helper call shapes, storage source imports, and process-layer physical layout literals. |
 | HTTP storage boundary (2) | HTTP uses opaque diagnostics and semantic EC support rather than physical PG/checkpoint/snapshot/placement or erasure-code representations. | Some logical storage and EC types are public for legitimate owner/server-core use, so visibility cannot express the dependency-layer rule. | HTTP behavior can remain correct while an internal diagnostic or test acquires forbidden physical authority. | `server-http` source and its Cargo dependency declaration. |
@@ -6872,6 +6872,31 @@ Phase 6 placed-segment shard-reader slice (2026-08-09):
   sibling caller therefore cannot recreate arbitrary key/location pairing or
   escape the deletion-exclusion subset. The checker baseline is now 32 actual
   `fail_with_matches` invocations (27 top-level and five nested).
+
+Phase 6 placed-segment shard-deletion slice (2026-08-09):
+
+- introduced the storage-private `LocalPlacedSegmentShardDeleter` over the
+  same exact placed-segment subject as the reader. Current-route construction
+  derives locations from the installed route; retained-route construction
+  derives them from the exact reconstructed snapshot at the payload placement
+  epoch. Both derive the expected shard key from the typed data PG, EC shape,
+  segment OKH, payload generation, and shard index;
+- routed current-placement reclaim, unpublished staged-write cleanup, and
+  retained-epoch cleanup through the capability. A caller may supply a subset
+  of owned shard keys, but the capability rejects any key whose complete
+  segment identity does not match before reaching the corresponding
+  storage-node deletion fence;
+- made both raw local-map deletion primitives private. The current-route
+  primitive's only wider visibility is a `cfg(test)` owner-local probe used to
+  retain direct route-expiry and shard-index validation coverage; and
+- removed the exact physical-delete caller inventory. Owner-local coverage
+  crosses a same-index key from another segment, proves the delete is rejected
+  without touching either payload, then proves the matching segment alone can
+  be removed. An installed-Unix regression additionally derives an exact
+  historical placement from retained route state, rejects a crossed key before
+  transport, and deletes the matching remote shard through retained cleanup
+  authority. The checker baseline is now 31 actual `fail_with_matches`
+  invocations (27 top-level and four nested).
 
 For each remaining section, record:
 

@@ -153,6 +153,7 @@ impl StorageCluster {
             .read_payload_shard_into(self.operation_epoch(), location, key, expected, dst)
     }
 
+    #[cfg(test)]
     pub(crate) fn delete_payload_shard(
         &self,
         location: ShardLocation,

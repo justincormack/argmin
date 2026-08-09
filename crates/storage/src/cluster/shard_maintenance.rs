@@ -3003,17 +3003,22 @@ impl StorageCluster {
         generation_id: GenerationId,
         shard_keys: &[ShardKey],
     ) -> Result<(), ObjectPgActionError> {
-        let placement_key = segment_payload_placement_key(okh, generation_id);
-        let locations = self
-            .place_payload_shards(data_pg_id, ec, &placement_key)
+        let deleter = self
+            .local_map
+            .open_placed_segment_shard_deleter(
+                self.operation_epoch(),
+                data_pg_id,
+                ec,
+                okh,
+                generation_id,
+            )
             .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
 
         for shard_key in shard_keys {
-            let location = Self::placed_payload_shard_location(&locations, shard_key)
-                .map_err(ObjectPgActionError::Store)?;
             self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
                 .map_err(ObjectPgActionError::Store)?;
-            self.delete_payload_shard(location, shard_key)
+            deleter
+                .delete_matching_key(shard_key)
                 .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
         }
         Ok(())
@@ -3028,81 +3033,40 @@ impl StorageCluster {
         generation_id: GenerationId,
         shard_keys: &[ShardKey],
     ) {
-        let placement_key = segment_payload_placement_key(okh, generation_id);
-        let route = match self
+        let deleter = match self
             .local_map
-            .reconstructed_pg_route_at_epoch(data_pg_id.pg_id(), operation_epoch)
+            .open_retained_placed_segment_shard_deleter(
+                operation_epoch,
+                data_pg_id,
+                ec,
+                okh,
+                generation_id,
+            )
         {
-            Some(route) => route,
-            None => {
+            Ok(deleter) => deleter,
+            Err(error) => {
                 self.emit_best_effort_payload_cleanup_error(
                     "resolve retained payload placement route",
-                    &StoreError::PayloadShardSetMismatch {
-                        reason: format!(
-                            "PG {} route for cluster epoch {} is not retained",
-                            data_pg_id.get(),
-                            operation_epoch.get()
-                        ),
-                    },
+                    &error,
                 );
-                return;
-            }
-        };
-        if route.state() != PgState::Active {
-            self.emit_best_effort_payload_cleanup_error(
-                "resolve retained payload placement route",
-                &StoreError::PgNotActive {
-                    pg_id: data_pg_id.get(),
-                    cluster_epoch: route.cluster_epoch(),
-                    state: route.state(),
-                },
-            );
-            return;
-        }
-        let locations = match LocalClusterMap::place_payload_shards_for_pg_route(
-            operation_epoch,
-            data_pg_id,
-            ec,
-            &placement_key,
-            route.acting_set(),
-        ) {
-            Ok(locations) => locations,
-            Err(error) => {
-                let error = cluster_build_error_to_store(error);
-                self.emit_best_effort_payload_cleanup_error("place payload shards", &error);
                 return;
             }
         };
 
         for shard_key in shard_keys {
-            match Self::placed_payload_shard_location(&locations, shard_key) {
-                Ok(location) => {
-                    if let Err(error) =
-                        self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
-                    {
-                        self.emit_best_effort_payload_cleanup_error(
-                            "delete placed payload shard",
-                            &error,
-                        );
-                        continue;
-                    }
-                    if let Err(error) = self
-                        .local_map
-                        .delete_payload_shard_for_historical_cleanup(location, shard_key)
-                    {
-                        let error = shard_io_error_to_store(error);
-                        self.emit_best_effort_payload_cleanup_error(
-                            "delete placed payload shard",
-                            &error,
-                        );
-                    }
-                }
-                Err(error) => {
-                    self.emit_best_effort_payload_cleanup_error(
-                        "resolve placed payload shard",
-                        &error,
-                    );
-                }
+            if let Err(error) = self.maybe_run_before_placed_payload_shard_delete_hook(shard_key) {
+                self.emit_best_effort_payload_cleanup_error(
+                    "delete placed payload shard",
+                    &error,
+                );
+                continue;
+            }
+            if let Err(error) = deleter.delete_matching_key(shard_key) {
+                let error = shard_io_error_to_store(error);
+                self.emit_best_effort_payload_cleanup_error(
+                    "delete placed payload shard",
+                    &error,
+                );
             }
         }
     }
@@ -3213,47 +3177,23 @@ impl StorageCluster {
                 k: segment.ec_k,
                 m: segment.ec_m,
             };
-            let placement_key =
-                segment_payload_placement_key(&segment.segment_okh, segment.segment_vid);
-            let route = self
+            let deleter = self
                 .local_map
-                .reconstructed_pg_route_at_epoch(
-                    data_pg_id.pg_id(),
+                .open_retained_placed_segment_shard_deleter(
                     segment.placement_cluster_epoch,
+                    data_pg_id,
+                    ec,
+                    &segment.segment_okh,
+                    segment.segment_vid,
                 )
-                .ok_or_else(|| {
-                    ObjectPgActionError::Store(StoreError::PayloadShardSetMismatch {
-                        reason: format!(
-                            "PG {} route for staged stream cleanup epoch {} is not retained",
-                            data_pg_id.get(),
-                            segment.placement_cluster_epoch.get()
-                        ),
-                    })
-                })?;
-            if route.state() != PgState::Active {
-                return Err(ObjectPgActionError::Store(StoreError::PgNotActive {
-                    pg_id: data_pg_id.get(),
-                    cluster_epoch: route.cluster_epoch(),
-                    state: route.state(),
-                }));
-            }
-            let locations = LocalClusterMap::place_payload_shards_for_pg_route(
-                route.cluster_epoch(),
-                data_pg_id,
-                ec,
-                &placement_key,
-                route.acting_set(),
-            )
-            .map_err(|error| ObjectPgActionError::Store(cluster_build_error_to_store(error)))?;
+                .map_err(ObjectPgActionError::Store)?;
             let shard_keys =
                 Self::payload_shard_set_keys(&segment.segment_okh, segment.segment_vid, ec);
             for shard_key in &shard_keys {
-                let location = Self::placed_payload_shard_location(&locations, shard_key)
-                    .map_err(ObjectPgActionError::Store)?;
                 self.maybe_run_before_placed_payload_shard_delete_hook(shard_key)
                     .map_err(ObjectPgActionError::Store)?;
-                self.local_map
-                    .delete_payload_shard_for_historical_cleanup(location, shard_key)
+                deleter
+                    .delete_matching_key(shard_key)
                     .map_err(|error| ObjectPgActionError::Store(shard_io_error_to_store(error)))?;
             }
             let shard_ack_client = self

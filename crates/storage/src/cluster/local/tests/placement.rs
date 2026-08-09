@@ -259,6 +259,113 @@ fn placed_segment_reader_derives_exact_locations_and_keys() {
 }
 
 #[test]
+fn placed_segment_deleter_rejects_crossed_segment_keys() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1)];
+    let ec = EcShape { k: 1, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0], ec).unwrap();
+    let data_pg_id = DataPgId::new_for_test(PgId::new(0));
+    let first_okh = [29; 16];
+    let second_okh = [31; 16];
+    let first_generation = GenerationId::MIN;
+    let second_generation = GenerationId::new(2).unwrap();
+
+    let first_reader = map
+        .open_placed_segment_shard_reader(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            ec,
+            &first_okh,
+            first_generation,
+        )
+        .unwrap();
+    let second_reader = map
+        .open_placed_segment_shard_reader(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            ec,
+            &second_okh,
+            second_generation,
+        )
+        .unwrap();
+    let first_location = first_reader.location(0).unwrap();
+    let first_key = first_reader.shard_key(0).unwrap();
+    let second_location = second_reader.location(0).unwrap();
+    let second_key = second_reader.shard_key(0).unwrap();
+    let first_ack = map
+        .write_payload_shard(
+            ClusterEpoch::INITIAL,
+            first_location,
+            &first_key,
+            b"first payload",
+        )
+        .unwrap();
+    let second_ack = map
+        .write_payload_shard(
+            ClusterEpoch::INITIAL,
+            second_location,
+            &second_key,
+            b"second payload",
+        )
+        .unwrap();
+
+    let first_deleter = map
+        .open_placed_segment_shard_deleter(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            ec,
+            &first_okh,
+            first_generation,
+        )
+        .unwrap();
+    let err = first_deleter.delete_matching_key(&second_key).unwrap_err();
+    assert!(matches!(
+        err,
+        ShardIoError::Store {
+            source: StoreError::PayloadShardSetMismatch { reason },
+            ..
+        } if reason == "shard key does not match placed segment identity at shard index 0"
+    ));
+    let retained_first_deleter = map
+        .open_retained_placed_segment_shard_deleter(
+            ClusterEpoch::INITIAL,
+            data_pg_id,
+            ec,
+            &first_okh,
+            first_generation,
+        )
+        .unwrap();
+    let retained_err = retained_first_deleter
+        .delete_matching_key(&second_key)
+        .unwrap_err();
+    assert!(matches!(
+        retained_err,
+        ShardIoError::Store {
+            source: StoreError::PayloadShardSetMismatch { reason },
+            ..
+        } if reason == "shard key does not match placed segment identity at shard index 0"
+    ));
+    assert_eq!(first_reader.read(0, first_ack).unwrap(), b"first payload");
+    assert_eq!(
+        second_reader.read(0, second_ack).unwrap(),
+        b"second payload"
+    );
+
+    first_deleter.delete_matching_key(&first_key).unwrap();
+    assert!(matches!(
+        first_reader.read(0, first_ack),
+        Err(ShardIoError::Store {
+            source: StoreError::NotFound,
+            ..
+        })
+    ));
+    assert_eq!(
+        second_reader.read(0, second_ack).unwrap(),
+        b"second payload"
+    );
+}
+
+#[test]
 fn places_payload_shards_for_explicit_pg_route_without_current_route_lookup() {
     let tmp = test_util::tempdir();
     let node_ids = [

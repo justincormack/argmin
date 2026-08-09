@@ -507,20 +507,27 @@ Phase 9.5 keeps these handles volatile: if the process/node serving the read
 fails, the client retries from a fresh snapshot.
 
 Storage-node read-handle and reclaim-fence primitives are crate-local. The
-production surface is `StorageCluster` read-handle acquisition plus the
-placed-delete reclaim helper; Rust visibility prevents downstream use of the
-low-level payload-read and storage-node handle/fence APIs. Temporary semantic
-caller checks additionally keep physical shard deletion behind the placed
-reclaim fence and coarse generation leases inside the broad-to-narrow snapshot
-handoff. Current-route segment reads use a storage-private placed-segment
-reader which derives every shard location and key from the typed data PG, EC
-shape, segment identity, and payload generation. Callers select only a shard
-index, so they cannot combine a location from one placement with a key from
-another segment. A batched reader additionally retains the exact shard-index
-subset for which read handles were acquired and rejects access to every other
-index. The write-side publish validator uses the same reader to prove
-acknowledged shard files still match their `WriteAck` before publishing
-metadata.
+production surface is `StorageCluster` read-handle acquisition plus a
+storage-owned placed-segment deletion capability; Rust visibility prevents
+downstream use of the low-level payload-read, current-route delete,
+retained-route delete, and storage-node handle/fence APIs. The deletion
+capability derives every location and shard key from the typed data PG, EC
+shape, segment identity, and payload generation. Current deletion uses the
+installed route; historical cleanup uses the exact reconstructed route at the
+payload's placement epoch. Both accept only a matching derived key from a
+staged-write owner or durable reclaim record before reaching the corresponding
+storage-node deletion fence, so a caller cannot combine a location from one
+placement with another segment's key. The remaining temporary semantic caller
+check keeps coarse generation leases inside the broad-to-narrow snapshot
+handoff.
+
+Current-route segment reads use a separate storage-private placed-segment
+reader over the same exact derived subject. Callers select only a shard index,
+so they cannot combine a location from one placement with a key from another
+segment. A batched reader additionally retains the exact shard-index subset
+for which read handles were acquired and rejects access to every other index.
+The write-side publish validator uses the same reader to prove acknowledged
+shard files still match their `WriteAck` before publishing metadata.
 
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,
 and `ReleasedObjectPayloadLease::enqueue_object_payload_reclaim` are release

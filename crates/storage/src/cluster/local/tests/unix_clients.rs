@@ -11136,7 +11136,6 @@ fn non_current_epoch_unix_object_delete_fails_closed_without_remote_mutation() {
 fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let (_unix_client_test_guard, tmp) = unix_client_tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
-    let target_node = NodeId::new(1);
     let ec_shape = EcShape { k: 2, m: 1 };
     let current_epoch = ClusterEpoch::new(8).unwrap();
     let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
@@ -11152,6 +11151,19 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
     let remote_data_dir = tmp.path().join("historical-remote-node-1");
     let data_pg_id = DataPgId::new_for_test(PgId::new(0));
     let historical_epoch = ClusterEpoch::new(7).unwrap();
+    let segment_okh = [0x7b; 16];
+    let segment_vid = GenerationId::new(3).unwrap();
+    let placement_key = crate::cluster::segment_payload_placement_key(&segment_okh, segment_vid);
+    let locations = LocalClusterMap::place_payload_shards_for_pg_route(
+        historical_epoch,
+        data_pg_id,
+        ec_shape,
+        &placement_key,
+        &node_ids,
+    )
+    .unwrap();
+    let location = locations[0];
+    let target_node = location.node_id();
     let historical_route = crate::control_plane::PgRouteSnapshot::reconstructed(
         historical_epoch,
         data_pg_id.pg_id(),
@@ -11160,13 +11172,11 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
         PgState::Active,
     );
     map.test_install_historical_pg_routes([historical_route.clone()]);
-    let location = ShardLocation::new(
-        historical_epoch,
-        data_pg_id,
-        ShardIndex::new(0),
-        target_node,
+    let shard_key = ShardKey::new(
+        &segment_okh,
+        segment_vid.get(),
+        location.shard_index().get(),
     );
-    let shard_key = ShardKey::new(&[0x7b; 16], 3, location.shard_index().get());
     let payload = b"historical shard inspection over unix";
     let remote = SharedStorageNode::open_with_default_ec_shape(
         &remote_data_dir,
@@ -11259,8 +11269,34 @@ fn historical_payload_shard_inspection_can_route_to_unix_storage_node_client() {
         ),
         "frontend-local shard should remain absent: {local_read:?}"
     );
-    map.delete_payload_shard_for_historical_cleanup(location, &shard_key)
+    let deleter = map
+        .open_retained_placed_segment_shard_deleter(
+            historical_epoch,
+            data_pg_id,
+            ec_shape,
+            &segment_okh,
+            segment_vid,
+        )
         .unwrap();
+    let crossed_key = ShardKey::new(&[0x7c; 16], segment_vid.get(), location.shard_index().get());
+    let crossed_error = deleter.delete_matching_key(&crossed_key).unwrap_err();
+    assert!(matches!(
+        crossed_error,
+        ShardIoError::Store {
+            source: StoreError::PayloadShardSetMismatch { reason },
+            ..
+        } if reason == format!(
+            "shard key does not match placed segment identity at shard index {}",
+            location.shard_index().get()
+        )
+    ));
+    assert_eq!(
+        remote
+            .read_shard_file(data_pg_id.get(), &shard_key)
+            .unwrap(),
+        payload
+    );
+    deleter.delete_matching_key(&shard_key).unwrap();
     shard_ack_route.delete_retained_shard_ack().unwrap();
     assert!(matches!(
         remote.read_shard_file(data_pg_id.get(), &shard_key),

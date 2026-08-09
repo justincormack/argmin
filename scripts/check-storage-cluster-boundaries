@@ -41,64 +41,6 @@ fail_with_matches \
     "Workspace normal/build feature graphs must enable storage test support only for the exhaustive reviewed test-only package allowlist" \
     "$storage_test_feature_graph_failure"
 
-# Temporary migration prohibition: physical deletion stays behind the
-# reclaim-fenced placed-delete implementation until capabilities enforce it.
-payload_shard_delete_callers=$(
-    awk '
-    FNR == 1 {
-        current_fn = ""
-        pending_test_cfg = 0
-        in_test_module = 0
-    }
-    /^[[:space:]]*#\[cfg\(test\)\]/ || /^[[:space:]]*#\[cfg\(any\(test, feature = "test-hooks"\)\)\]/ {
-        pending_test_cfg = 1
-        next
-    }
-    /^[[:space:]]*mod tests[[:space:]]*\{/ && pending_test_cfg {
-        in_test_module = 1
-        pending_test_cfg = 0
-        next
-    }
-    pending_test_cfg \
-        && $0 !~ /^[[:space:]]*$/ \
-        && $0 !~ /^[[:space:]]*#\[/ \
-        && $0 !~ /^[[:space:]]*(pub[^[:space:]]*[[:space:]]+)?fn[[:space:]]+[A-Za-z0-9_]+/ {
-        pending_test_cfg = 0
-    }
-    in_test_module {
-        next
-    }
-    function update_function_context() {
-        if ($0 ~ /^    (pub(\([^)]*\))? |pub\(crate\) |pub\(super\) )?fn [A-Za-z0-9_]+/) {
-            current_fn = $0
-            sub(/^.*fn /, "", current_fn)
-            sub(/\(.*/, "", current_fn)
-        }
-    }
-    {
-        update_function_context()
-        if ($0 ~ /\.[[:space:]]*delete_payload_shard\(/ && current_fn != "delete_payload_shard") {
-            print FILENAME ":" current_fn
-        }
-    }
-    ' $(find crates/storage/src -type f -name '*.rs' \
-        ! -path '*/tests/*' \
-        ! -name '*_tests.rs' \
-        | sort) \
-        | sort \
-        | uniq -c \
-        | sed 's/^ *//'
-)
-expected_payload_shard_delete_callers=$(cat <<'EOF'
-1 crates/storage/src/cluster/shard_maintenance.rs:delete_placed_payload_shard_keys
-EOF
-)
-if [[ "$payload_shard_delete_callers" != "$expected_payload_shard_delete_callers" ]]; then
-    fail_with_matches \
-        "Physical payload shard deletes must stay behind the placed-delete reclaim fence helper" \
-        "$payload_shard_delete_callers"
-fi
-
 coarse_payload_lease_callers=$(
     awk '
     FNR == 1 {

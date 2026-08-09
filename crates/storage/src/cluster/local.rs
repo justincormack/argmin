@@ -1058,13 +1058,7 @@ impl Drop for LocalShardReadHandleSet {
     }
 }
 
-/// Storage-owned current-route reader for one exact placed payload segment.
-///
-/// Construction derives every location and shard key from the segment
-/// request. Parent cluster code can inspect or read only by shard index and
-/// cannot pair an arbitrary location with an unrelated key.
-pub(super) struct LocalPlacedSegmentShardReader<'a> {
-    cluster_map: &'a LocalClusterMap,
+struct LocalPlacedSegmentShardSubject {
     operation_epoch: ClusterEpoch,
     data_pg_id: DataPgId,
     segment_okh: [u8; 16],
@@ -1072,56 +1066,22 @@ pub(super) struct LocalPlacedSegmentShardReader<'a> {
     locations: Vec<ShardLocation>,
 }
 
-impl<'a> LocalPlacedSegmentShardReader<'a> {
-    pub(super) fn locations(&self) -> &[ShardLocation] {
+impl LocalPlacedSegmentShardSubject {
+    fn locations(&self) -> &[ShardLocation] {
         &self.locations
     }
 
-    pub(super) fn location(&self, shard_index: usize) -> Option<ShardLocation> {
+    fn location(&self, shard_index: usize) -> Option<ShardLocation> {
         self.locations.get(shard_index).copied()
     }
 
-    pub(super) fn shard_key(&self, shard_index: usize) -> Option<ShardKey> {
+    fn shard_key(&self, shard_index: usize) -> Option<ShardKey> {
         let location = self.location(shard_index)?;
         Some(ShardKey::new(
             &self.segment_okh,
             self.segment_vid.get(),
             location.shard_index().get(),
         ))
-    }
-
-    pub(super) fn read(
-        &self,
-        shard_index: usize,
-        expected: WriteAck,
-    ) -> Result<Vec<u8>, ShardIoError> {
-        let (location, key) = self.location_and_key(shard_index)?;
-        self.cluster_map
-            .read_payload_shard(self.operation_epoch, location, &key, expected)
-    }
-
-    pub(super) fn acquire_read_handles(
-        self,
-        shard_indices: impl IntoIterator<Item = usize>,
-    ) -> Result<LocalPlacedSegmentShardReadHandles<'a>, ShardIoError> {
-        let mut leased_shard_indices = BTreeSet::new();
-        let mut entries = Vec::new();
-        for shard_index in shard_indices {
-            if !leased_shard_indices.insert(shard_index) {
-                return Err(self.shard_subject_mismatch(format!(
-                    "shard index {shard_index} was requested more than once"
-                )));
-            }
-            entries.push(self.location_and_key(shard_index)?);
-        }
-        let read_handles = self
-            .cluster_map
-            .acquire_payload_shard_read_handles(self.operation_epoch, &entries)?;
-        Ok(LocalPlacedSegmentShardReadHandles {
-            reader: self,
-            read_handles,
-            leased_shard_indices,
-        })
     }
 
     fn location_and_key(
@@ -1152,6 +1112,107 @@ impl<'a> LocalPlacedSegmentShardReader<'a> {
     }
 }
 
+/// Storage-owned current-route reader for one exact placed payload segment.
+///
+/// Construction derives every location and shard key from the segment
+/// request. Parent cluster code can inspect or read only by shard index and
+/// cannot pair an arbitrary location with an unrelated key.
+pub(super) struct LocalPlacedSegmentShardReader<'a> {
+    cluster_map: &'a LocalClusterMap,
+    subject: LocalPlacedSegmentShardSubject,
+}
+
+impl<'a> LocalPlacedSegmentShardReader<'a> {
+    pub(super) fn locations(&self) -> &[ShardLocation] {
+        self.subject.locations()
+    }
+
+    pub(super) fn location(&self, shard_index: usize) -> Option<ShardLocation> {
+        self.subject.location(shard_index)
+    }
+
+    pub(super) fn shard_key(&self, shard_index: usize) -> Option<ShardKey> {
+        self.subject.shard_key(shard_index)
+    }
+
+    pub(super) fn read(
+        &self,
+        shard_index: usize,
+        expected: WriteAck,
+    ) -> Result<Vec<u8>, ShardIoError> {
+        let (location, key) = self.subject.location_and_key(shard_index)?;
+        self.cluster_map
+            .read_payload_shard(self.subject.operation_epoch, location, &key, expected)
+    }
+
+    pub(super) fn acquire_read_handles(
+        self,
+        shard_indices: impl IntoIterator<Item = usize>,
+    ) -> Result<LocalPlacedSegmentShardReadHandles<'a>, ShardIoError> {
+        let mut leased_shard_indices = BTreeSet::new();
+        let mut entries = Vec::new();
+        for shard_index in shard_indices {
+            if !leased_shard_indices.insert(shard_index) {
+                return Err(self.subject.shard_subject_mismatch(format!(
+                    "shard index {shard_index} was requested more than once"
+                )));
+            }
+            entries.push(self.subject.location_and_key(shard_index)?);
+        }
+        let read_handles = self
+            .cluster_map
+            .acquire_payload_shard_read_handles(self.subject.operation_epoch, &entries)?;
+        Ok(LocalPlacedSegmentShardReadHandles {
+            reader: self,
+            read_handles,
+            leased_shard_indices,
+        })
+    }
+}
+
+/// Storage-owned deleter for one exact placed payload segment.
+///
+/// The caller may present a subset of shard keys from staged-write ownership
+/// or a durable reclaim record, but cannot pair those keys with arbitrary
+/// locations. Current-route construction derives placement from the installed
+/// route; retained-route construction derives it from the exact reconstructed
+/// placement snapshot. Both require every key to match the segment identity
+/// before reaching the corresponding storage-node delete fence.
+pub(super) struct LocalPlacedSegmentShardDeleter<'a> {
+    cluster_map: &'a LocalClusterMap,
+    subject: LocalPlacedSegmentShardSubject,
+    route_kind: LocalPlacedSegmentShardDeleteRouteKind,
+}
+
+impl LocalPlacedSegmentShardDeleter<'_> {
+    pub(super) fn delete_matching_key(&self, key: &ShardKey) -> Result<(), ShardIoError> {
+        let shard_index = usize::from(key.shard_index().get());
+        let (location, expected_key) = self.subject.location_and_key(shard_index)?;
+        if *key != expected_key {
+            return Err(self.subject.shard_subject_mismatch(format!(
+                "shard key does not match placed segment identity at shard index {shard_index}"
+            )));
+        }
+        match self.route_kind {
+            LocalPlacedSegmentShardDeleteRouteKind::Current => {
+                self.cluster_map.delete_payload_shard_for_current_route(
+                    self.subject.operation_epoch,
+                    location,
+                    &expected_key,
+                )
+            }
+            LocalPlacedSegmentShardDeleteRouteKind::Retained => self
+                .cluster_map
+                .delete_payload_shard_for_historical_cleanup(location, &expected_key),
+        }
+    }
+}
+
+enum LocalPlacedSegmentShardDeleteRouteKind {
+    Current,
+    Retained,
+}
+
 pub(super) struct LocalPlacedSegmentShardReadHandles<'a> {
     reader: LocalPlacedSegmentShardReader<'a>,
     read_handles: LocalShardReadHandleSet,
@@ -1180,15 +1241,15 @@ impl LocalPlacedSegmentShardReadHandles<'_> {
         dst: &mut [u8],
     ) -> Result<(), ShardIoError> {
         if !self.leased_shard_indices.contains(&shard_index) {
-            return Err(self.reader.shard_subject_mismatch(format!(
+            return Err(self.reader.subject.shard_subject_mismatch(format!(
                 "shard index {shard_index} is not protected by this read-handle set"
             )));
         }
-        let (location, key) = self.reader.location_and_key(shard_index)?;
+        let (location, key) = self.reader.subject.location_and_key(shard_index)?;
         self.reader
             .cluster_map
             .read_payload_shard_into_without_handle(
-                self.reader.operation_epoch,
+                self.reader.subject.operation_epoch,
                 location,
                 &key,
                 expected,
@@ -4896,11 +4957,107 @@ impl LocalClusterMap {
         segment_okh: &[u8; 16],
         segment_vid: GenerationId,
     ) -> Result<LocalPlacedSegmentShardReader<'_>, ClusterBuildError> {
+        Ok(LocalPlacedSegmentShardReader {
+            cluster_map: self,
+            subject: self.placed_segment_shard_subject(
+                operation_epoch,
+                data_pg_id,
+                ec,
+                segment_okh,
+                segment_vid,
+            )?,
+        })
+    }
+
+    pub(super) fn open_placed_segment_shard_deleter(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<LocalPlacedSegmentShardDeleter<'_>, ClusterBuildError> {
+        Ok(LocalPlacedSegmentShardDeleter {
+            cluster_map: self,
+            subject: self.placed_segment_shard_subject(
+                operation_epoch,
+                data_pg_id,
+                ec,
+                segment_okh,
+                segment_vid,
+            )?,
+            route_kind: LocalPlacedSegmentShardDeleteRouteKind::Current,
+        })
+    }
+
+    pub(super) fn open_retained_placed_segment_shard_deleter(
+        &self,
+        placement_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<LocalPlacedSegmentShardDeleter<'_>, StoreError> {
+        let route = self
+            .reconstructed_pg_route_at_epoch(data_pg_id.pg_id(), placement_epoch)
+            .ok_or_else(|| StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "PG {} route for cluster epoch {} is not retained",
+                    data_pg_id.get(),
+                    placement_epoch.get()
+                ),
+            })?;
+        if route.cluster_epoch() != placement_epoch {
+            return Err(StoreError::PayloadShardSetMismatch {
+                reason: format!(
+                    "retained PG {} route epoch {} does not match payload placement epoch {}",
+                    data_pg_id.get(),
+                    route.cluster_epoch().get(),
+                    placement_epoch.get()
+                ),
+            });
+        }
+        if route.state() != PgState::Active {
+            return Err(StoreError::PgNotActive {
+                pg_id: data_pg_id.get(),
+                cluster_epoch: route.cluster_epoch(),
+                state: route.state(),
+            });
+        }
+        let placement_key = super::segment_payload_placement_key(segment_okh, segment_vid);
+        let locations = Self::place_payload_shards_for_pg_route(
+            placement_epoch,
+            data_pg_id,
+            ec,
+            &placement_key,
+            route.acting_set(),
+        )
+        .map_err(super::cluster_build_error_to_store)?;
+        Ok(LocalPlacedSegmentShardDeleter {
+            cluster_map: self,
+            subject: LocalPlacedSegmentShardSubject {
+                operation_epoch: placement_epoch,
+                data_pg_id,
+                segment_okh: *segment_okh,
+                segment_vid,
+                locations,
+            },
+            route_kind: LocalPlacedSegmentShardDeleteRouteKind::Retained,
+        })
+    }
+
+    fn placed_segment_shard_subject(
+        &self,
+        operation_epoch: ClusterEpoch,
+        data_pg_id: DataPgId,
+        ec: EcShape,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+    ) -> Result<LocalPlacedSegmentShardSubject, ClusterBuildError> {
         let placement_key = super::segment_payload_placement_key(segment_okh, segment_vid);
         let locations =
             self.place_payload_shards(operation_epoch, data_pg_id, ec, &placement_key)?;
-        Ok(LocalPlacedSegmentShardReader {
-            cluster_map: self,
+        Ok(LocalPlacedSegmentShardSubject {
             operation_epoch,
             data_pg_id,
             segment_okh: *segment_okh,
@@ -5101,7 +5258,7 @@ impl LocalClusterMap {
             .read_shard_into_without_handle(expected, dst)
     }
 
-    pub(crate) fn delete_payload_shard(
+    fn delete_payload_shard_for_current_route(
         &self,
         operation_epoch: ClusterEpoch,
         location: ShardLocation,
@@ -5111,7 +5268,17 @@ impl LocalClusterMap {
             .delete_shard()
     }
 
-    pub(crate) fn delete_payload_shard_for_historical_cleanup(
+    #[cfg(test)]
+    pub(super) fn delete_payload_shard(
+        &self,
+        operation_epoch: ClusterEpoch,
+        location: ShardLocation,
+        key: &ShardKey,
+    ) -> Result<(), ShardIoError> {
+        self.delete_payload_shard_for_current_route(operation_epoch, location, key)
+    }
+
+    fn delete_payload_shard_for_historical_cleanup(
         &self,
         location: ShardLocation,
         key: &ShardKey,
