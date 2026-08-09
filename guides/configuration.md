@@ -41,6 +41,7 @@ credential, and SSE-S3 wrapping-key settings are always required.
 | `ARGMIN_SSE_C_VALIDATOR_KEY` | *(unset)* | Base64-encoded 32-byte SSE-C validator secret; SSE-C is rejected when unset |
 | `ARGMIN_HOST_ID` | *(random at startup)* | S3 `HostId` / `x-amz-id-2`; set it to keep the value stable across restarts |
 | `ARGMIN_REGION` | `us-east-1` | AWS signing region |
+| `ARGMIN_DATA_DIR` | `./data` | Standalone data directory |
 | `ARGMIN_LISTEN_ADDR` | `127.0.0.1:9000` | Public S3 listen address |
 | `ARGMIN_TLS_CERT_PATH` | *(unset)* | PEM certificate chain for direct HTTPS |
 | `ARGMIN_TLS_KEY_PATH` | *(unset)* | PEM private key for direct HTTPS |
@@ -48,9 +49,6 @@ credential, and SSE-S3 wrapping-key settings are always required.
 | `ARGMIN_MAX_CONNECTIONS` | `512` | Maximum concurrent public TCP connections |
 | `ARGMIN_MAX_INFLIGHT_REQUESTS` | `32` | Maximum concurrent in-flight S3 requests |
 | `ARGMIN_STREAM_READ_CHUNK_SIZE` | `8388608` | HTTP streaming read chunk size in bytes |
-| `ARGMIN_PANIC_ON_500` | `false` | Debug/test builds only: panic when an HTTP 500 response would be returned; absent from release binaries |
-| `ARGMIN_ABORT_ON_500` | `false` | Debug/test builds only: abort when an HTTP 500 response would be returned; absent from release binaries |
-| `ARGMIN_LOCAL_DEBUG_ENDPOINT` | `false` | Debug builds with `local-debug-endpoints` only: enable loopback diagnostic routes; the routes and setting are absent from release binaries |
 | `ARGMIN_TRACE` | `false` | Enable structured trace output |
 | `ARGMIN_TRACE_FILTER` | *(unset)* | Comma-separated trace targets |
 | `ARGMIN_TRACE_FILE` | *(unset; stderr)* | Trace output file |
@@ -69,12 +67,6 @@ openssl rand -base64 32
 The wrapping and validator keys are durable data dependencies, not disposable
 startup tokens. Keep `ARGMIN_SSE_S3_WRAPPING_KEY` stable for existing SSE-S3
 objects and `ARGMIN_SSE_C_VALIDATOR_KEY` stable for existing SSE-C objects.
-
-### Standalone storage
-
-| Variable | Default | Description |
-|---|---|---|
-| `ARGMIN_DATA_DIR` | `./data` | Standalone data directory |
 
 Environment-only mode always runs one embedded storage node with 16 placement
 groups, EC `1+0`, and the initial cluster epoch. It has no storage RPC or
@@ -143,8 +135,8 @@ argmin-s3 initialize-cluster-state /etc/argmin/cluster.toml control-1
 
 For replicated storage processes this initializes the bound PG state. For a
 replicated control-plane process it initializes the unestablished Raft identity
-sidecar. In the current standalone manifest mapping it initializes only
-the selected storage identity and PG state; it does not create the declared
+sidecar. In the current standalone manifest mapping it initializes only the
+selected storage identity and PG state; it does not create the declared
 single-authority `state_path`.
 
 Run the selected process with:
@@ -205,7 +197,7 @@ Scalar sections use these fields:
 | Section | Fields |
 |---|---|
 | `[cluster]` | `id` (string), `topology_generation` (nonzero integer), `region` (string) |
-| `[s3]` | `account_id`, `access_key_id`, `secret_access_key_ref`, and `sse_s3_wrapping_key_ref`; optional `sse_c_validator_key_ref`, `workers`, `max_connections`, `max_inflight_requests`, and `stream_read_chunk_size`; debug-only `panic_on_500` and `abort_on_500`; `local_debug_endpoint` only with the debug-only `local-debug-endpoints` feature |
+| `[s3]` | `account_id`, `access_key_id`, `secret_access_key_ref`, and `sse_s3_wrapping_key_ref`; optional `sse_c_validator_key_ref`, `workers`, `max_connections`, `max_inflight_requests`, and `stream_read_chunk_size` |
 | `[deployment]` | `mode`, `failure_domain`, `failure_tolerance` (integer) |
 | `[storage]` | `pg_count` (nonzero integer), `ec_data_shards`, `ec_parity_shards`, `initial_cluster_epoch` (nonzero integer) |
 | `[raft]` | `max_append_entries`, `max_append_bytes`, `max_snapshot_bytes` |
@@ -234,14 +226,7 @@ tuning fields are `storage_node_rpc_admission_limit`,
 `control_plane_heartbeat_lease_ms`. Omitted settings use the compiled defaults.
 
 The production `[s3]` schema defaults to 4 workers, 512 connections, 32
-in-flight requests, and an 8 MiB stream-read chunk. Debug builds also default
-their diagnostic failure actions to disabled; feature-enabled debug builds
-default the local debug endpoint to disabled.
-
-Production release binaries do not compile in `panic_on_500`, `abort_on_500`,
-or the local debug routes and their setting. `local_debug_endpoint` requires a
-debug build compiled with `local-debug-endpoints`, and every S3 listener using
-it must be bound to a loopback address.
+in-flight requests, and an 8 MiB stream-read chunk.
 
 The process role matrix is exact:
 
@@ -533,137 +518,13 @@ digest, selected process id, and process-identity digest. Relocating state
 requires the complete matching state and identity evidence. Pointing an
 established process id at an empty destination fails closed.
 
-### Standalone manifest example
-
-This example describes the currently accepted all-in-one standalone manifest
-shape with EC 1+0. Replace the paths with paths owned by the dedicated service
-user.
-
-The current standalone runtime mapper activates the storage identity and data
-configuration only. The required `[[authorities]]` and `[[endpoints]]` records
-below are validated topology declarations, but the all-in-one standalone
-runtime uses its embedded authority: it does not create
-`/srv/argmin/control.state` or bind the three declared Unix sockets. Replicated
-process mappings do activate their declared authority state and endpoints.
-
-```toml
-schema_version = 1
-tls_identities = []
-tls_trust_bundles = []
-auth_credentials = []
-
-[s3]
-account_id = "111122223333"
-access_key_id = "admin"
-secret_access_key_ref = "file:/etc/argmin/s3/secret-access-key"
-sse_s3_wrapping_key_ref = "file:/etc/argmin/s3/sse-s3-wrapping-key"
-
-[cluster]
-id = "example-standalone"
-topology_generation = 1
-region = "us-east-1"
-
-[deployment]
-mode = "standalone"
-failure_domain = "none"
-failure_tolerance = 0
-
-[storage]
-pg_count = 16
-ec_data_shards = 1
-ec_parity_shards = 0
-initial_cluster_epoch = 1
-
-[raft]
-max_append_entries = 64
-max_append_bytes = 8388608
-max_snapshot_bytes = 16777216
-
-[[transport_profiles]]
-id = "local"
-max_frame_bytes = 8388648
-max_connections = 64
-connect_timeout_ms = 1000
-io_timeout_ms = 5000
-
-[[hosts]]
-id = "host-1"
-
-[[disks]]
-id = "disk-1"
-host_id = "host-1"
-mount_path = "/srv/argmin"
-
-[[processes]]
-id = "all-1"
-host_id = "host-1"
-kind = "all-in-one"
-s3_listen_addr = "127.0.0.1:9000"
-
-[[authorities]]
-id = "authority-1"
-kind = "single"
-process_id = "all-1"
-disk_id = "disk-1"
-state_path = "/srv/argmin/control.state"
-
-[[storage_nodes]]
-node_id = 1
-process_id = "all-1"
-disk_id = "disk-1"
-data_dir = "/srv/argmin/data"
-
-[[endpoints]]
-id = "control-1"
-owner_process_id = "all-1"
-protocol = "control-plane"
-priority = 10
-listen = "unix:///run/argmin/control.sock"
-advertise = "unix:///run/argmin/control.sock"
-transport_profile_id = "local"
-
-[[endpoints]]
-id = "clock-1"
-owner_process_id = "all-1"
-protocol = "authority-clock-recovery"
-priority = 10
-listen = "unix:///run/argmin/clock.sock"
-advertise = "unix:///run/argmin/clock.sock"
-transport_profile_id = "local"
-
-[[endpoints]]
-id = "storage-1"
-owner_process_id = "all-1"
-protocol = "storage-rpc"
-priority = 10
-listen = "unix:///run/argmin/storage.sock"
-advertise = "unix:///run/argmin/storage.sock"
-transport_profile_id = "local"
-```
-
-Initialize and run this process:
-
-```bash
-./target/release/argmin-s3 validate-cluster-config \
-  /etc/argmin/cluster.toml all-1
-./target/release/argmin-s3 validate-cluster-material \
-  /etc/argmin/cluster.toml all-1
-./target/release/argmin-s3 initialize-cluster-state \
-  /etc/argmin/cluster.toml all-1
-
-ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
-ARGMIN_PROCESS_ID=all-1 \
-  ./target/release/argmin-s3
-```
-
 ### Replicated manifest example
 
 This complete example describes three hosts, EC 2+1, three Raft voters, three
 storage nodes, and one frontend. It uses arrays of inline TOML tables to keep
-the repeated records compact; these are equivalent to the `[[record]]` form
-used in the standalone example. Replace the DNS names, paths, and material
-files for the deployment. Each host certificate must cover both advertised
-names for that host.
+the repeated records compact; these are equivalent to the `[[record]]` form.
+Replace the DNS names, paths, and material files for the deployment. Each host
+certificate must cover both advertised names for that host.
 
 ```toml
 schema_version = 1

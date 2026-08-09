@@ -6182,14 +6182,10 @@ mod tests {
     }
 
     #[test]
-    fn configuration_guide_manifest_examples_match_the_current_schema() {
-        for (heading, process_id) in [
-            ("### Standalone manifest example", "all-1"),
-            ("### Replicated manifest example", "control-1"),
-        ] {
-            parse_static_cluster_manifest(configuration_guide_toml_example(heading), process_id)
-                .unwrap_or_else(|error| panic!("configuration guide example {heading}: {error}"));
-        }
+    fn configuration_guide_manifest_example_matches_the_current_schema() {
+        let heading = "### Replicated manifest example";
+        parse_static_cluster_manifest(configuration_guide_toml_example(heading), "control-1")
+            .unwrap_or_else(|error| panic!("configuration guide example {heading}: {error}"));
     }
 
     #[test]
