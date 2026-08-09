@@ -31,14 +31,34 @@ enum LivePgMetadataTransferAdminDispatch {
     Authenticated(AuthenticatedUnixControlPlaneClient),
 }
 
+/// Prevents accidental `Clone` or `Debug` derives on authority-bearing live
+/// transfer capabilities. The public types remain opaque and linear across
+/// the process/storage boundary.
+struct OpaqueLivePgMetadataTransferCapabilityMarker;
+
 /// One authority-bound control-plane capability for live metadata transfer.
 ///
 /// Read and mutation credentials are bound to one retained transport client
 /// and their authenticated cluster identities are validated.
 /// The full runtime-map source interface is deliberately not implemented.
+///
+/// ```compile_fail
+/// use storage::LivePgMetadataTransferControlPlaneClient;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<LivePgMetadataTransferControlPlaneClient>();
+/// ```
+///
+/// ```compile_fail
+/// use storage::LivePgMetadataTransferControlPlaneClient;
+///
+/// fn require_debug<T: std::fmt::Debug>() {}
+/// require_debug::<LivePgMetadataTransferControlPlaneClient>();
+/// ```
 pub struct LivePgMetadataTransferControlPlaneClient {
     read: LivePgMetadataTransferReadDispatch,
     admin: LivePgMetadataTransferAdminDispatch,
+    _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
 }
 
 impl LivePgMetadataTransferControlPlaneClient {
@@ -75,7 +95,11 @@ impl LivePgMetadataTransferControlPlaneClient {
             ),
             None => LivePgMetadataTransferAdminDispatch::Plain(client),
         };
-        Ok(Self { read, admin })
+        Ok(Self {
+            read,
+            admin,
+            _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
+        })
     }
 
     pub fn with_frontend_client(
@@ -304,12 +328,27 @@ impl LivePgMetadataTransferSummary {
 /// The operation retains one authority-bound control-plane capability and the
 /// storage-node transport configuration so no runtime-map snapshot, PG route,
 /// transfer proof, or artifact crosses into the process layer.
+///
+/// ```compile_fail
+/// use storage::LivePgMetadataTransferAdmin;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<LivePgMetadataTransferAdmin>();
+/// ```
+///
+/// ```compile_fail
+/// use storage::LivePgMetadataTransferAdmin;
+///
+/// fn require_debug<T: std::fmt::Debug>() {}
+/// require_debug::<LivePgMetadataTransferAdmin>();
+/// ```
 pub struct LivePgMetadataTransferAdmin {
     control_plane: LivePgMetadataTransferControlPlaneClient,
     default_ec_shape: EcShape,
     admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     transport: LivePgMetadataTransferStorageTransport,
     failpoint: Option<LivePgMetadataTransferFailpoint>,
+    _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
     #[cfg(test)]
     after_transfer_install_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -328,6 +367,7 @@ impl LivePgMetadataTransferAdmin {
             admission_settings,
             transport: LivePgMetadataTransferStorageTransport::Unix { auth },
             failpoint: None,
+            _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             #[cfg(test)]
             after_transfer_install_hook: None,
         }
@@ -353,6 +393,7 @@ impl LivePgMetadataTransferAdmin {
                 auth,
             },
             failpoint: None,
+            _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             #[cfg(test)]
             after_transfer_install_hook: None,
         }
@@ -376,6 +417,7 @@ impl LivePgMetadataTransferAdmin {
                 import_pending_command_failures: std::sync::atomic::AtomicU64::new(0),
             },
             failpoint: None,
+            _opaque: OpaqueLivePgMetadataTransferCapabilityMarker,
             after_transfer_install_hook: None,
         }
     }

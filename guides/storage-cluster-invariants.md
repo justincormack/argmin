@@ -282,6 +282,24 @@ and proves that the command is included before Peering while a later old-epoch
 command cannot change the metadata proof after deadline and successor
 activation.
 
+## Control-plane administration boundary
+
+Process code administers PGs through the bounded control-plane bootstrap and
+logical admin clients. Metadata-transfer artifacts, retained transfer routes,
+retry state, RPC frames and workers, Raft-peer transport/authentication, and
+Raft restart/WAL formats remain private to storage. The public transfer
+operation accepts logical PG/node/proof inputs and returns an opaque result;
+it does not expose a runtime-map source or a raw transfer client. Its
+authority-bearing client and operation are linear, non-debuggable
+capabilities with private fields; compile-fail coverage and a focused semantic
+boundary check protect those properties because public Rust types can
+otherwise acquire new public fields or trait implementations.
+
+Raw RPC and Raft protocol tests are storage-owned. Cross-crate startup and
+administration tests use the same opaque clients as production, so they test
+the supported boundary rather than minting wire requests or interpreting
+private durable representations.
+
 ## Node-runtime compiler boundary
 
 The raw embedded node, PG stores, and aggregate local node client are

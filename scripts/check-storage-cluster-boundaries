@@ -723,37 +723,24 @@ fail_with_matches \
     "StoreError variants and storage-node failure classes are storage-owned; use StoreOperationFailureClass and opaque StoreFailure diagnostics" \
     "$store_error_policy_leaks"
 
-metadata_transfer_retry_policy_leaks=$(
-    rg -n --color=never \
-        '\bStorageNodeFailureClass\b|StoreError::' \
-        crates/argmin-s3/src \
-        -g '*.rs' \
-        || true
-)
-fail_with_matches \
-    "Live metadata-transfer retry classification is storage-owned; argmin-s3 must use the opaque live-transfer operation" \
-    "$metadata_transfer_retry_policy_leaks"
-
-metadata_transfer_representation_leaks=$(
-    rg -n --color=never \
-        '\bPgMetadataTransfer(Artifact|Error)\b|\.(metadata_transfer_(source|destination)_runtime_map|export_pg_metadata_transfer_artifact_for_live_transfer|import_pg_metadata_transfer_artifact_from_retained_log)\b|\b(MetadataTransfer(Export|Import)Context|metadata_transfer_peering_route|retry_pg_metadata_transfer_(export|import)|refresh_pg_metadata_transfer_(export|import)_route)\b' \
-        . \
-        -g 'crates/**/*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Live metadata-transfer routes, proofs, artifacts, reconstruction failures, and retry state machines are private to storage; use LivePgMetadataTransferAdmin" \
-    "$metadata_transfer_representation_leaks"
-
 metadata_transfer_opaque_surface_leaks=$(
-    rg -n -U --color=never \
-        'pub struct (LivePgMetadataTransfer(ReadClient|AdminClient|ControlPlaneClient|Admin|Summary|Error))\(pub|pub struct (LivePgMetadataTransfer(ReadClient|AdminClient|ControlPlaneClient|Admin|Summary|Error))[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:' \
-        crates/storage/src/live_pg_transfer.rs \
-        || true
+    {
+        rg -n -U --color=never \
+            'pub struct LivePgMetadataTransfer(ControlPlaneClient|Admin|Summary|Error)\(pub|pub struct LivePgMetadataTransfer(ControlPlaneClient|Admin|Summary|Error)[[:space:]]*\{[^}]*[[:space:]]pub[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*:' \
+            crates/storage/src/live_pg_transfer.rs \
+            || true
+        rg -n -U --color=never \
+            '#\[derive\([^]]*(Clone|Debug)[^]]*\)\][[:space:]]*pub struct LivePgMetadataTransfer(ControlPlaneClient|Admin)\b' \
+            crates/storage/src/live_pg_transfer.rs \
+            || true
+        rg -n -U --color=never \
+            'impl[[:space:]]+(std::fmt::|fmt::)?(Clone|Debug)[[:space:]]+for[[:space:]]+LivePgMetadataTransfer(ControlPlaneClient|Admin)\b' \
+            crates/storage/src/live_pg_transfer.rs \
+            || true
+    }
 )
 fail_with_matches \
-    "Live metadata-transfer facades must not expose retained clients, topology, proofs, artifacts, or diagnostics as public fields" \
+    "Public live metadata-transfer facades must retain private fields, and authority-bearing transfer capabilities must remain non-cloneable with no diagnostic Debug surface" \
     "$metadata_transfer_opaque_surface_leaks"
 
 metadata_transfer_runtime_map_trait_leaks=$(
@@ -911,30 +898,6 @@ fail_with_matches \
     "Operator administration facades must retain transport, clock state, and diagnostics opaquely and expose only their bounded logical operations" \
     "$operator_admin_opaque_surface_leaks"
 
-control_plane_client_wire_leaks=$(
-    rg -n --color=never \
-        '\bControlPlaneRpcFrame(Transport|Exchange|ExchangeError)\b|\bwith_frame_transport\b|\bconnect_unix_stream_until\b' \
-        . \
-        -g 'crates/**/*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Control-plane client framing and frame transport are private to storage; use ControlPlaneRpcClientEndpoint" \
-    "$control_plane_client_wire_leaks"
-
-control_plane_server_wire_leaks=$(
-    rg -n --color=never \
-        '\bControlPlaneRpc(Request|Response|WorkerPolicy|WorkerGuard|PreAuthByteBudget|Endpoint)\b|\bVerifiedControlPlaneRpcRequest\b|\bBoundControlPlaneRpcListener\b|\bspawn_control_plane_(tcp_)?rpc_worker\b|\b(handle_control_plane_unix_stream(_with_auth)?|read_control_plane_(unix_request|request_with_reservation)|verify_control_plane_(unix_request|authenticated_request)|write_control_plane_unix_response)\b|\bCONTROL_PLANE_RPC_TLS_ALPN\b' \
-        . \
-        -g 'crates/**/*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Control-plane server framing, admission, TLS profile, and workers are private to storage; use ControlPlaneRpcServerListener and ControlPlaneRpcServerPolicy" \
-    "$control_plane_server_wire_leaks"
-
 control_plane_error_representation_leaks=$(
     {
         rg -n --color=never \
@@ -958,72 +921,6 @@ control_plane_error_representation_leaks=$(
 fail_with_matches \
     "Raw control-plane transport/protocol errors and remote diagnostic text are storage-owned; preserve typed errors and use semantic ControlPlaneError classifications" \
     "$control_plane_error_representation_leaks"
-
-raft_peer_client_wire_leaks=$(
-    rg -n --color=never \
-        '\bControlPlaneRaftPeerFrame(Transport|Exchange|ExchangeError)\b|\bControlPlaneRaftPeerNetwork(Factory)?\b|\bStaticRaftTcpPeer(FrameTransport)?\b|\bexchange_static_raft_tcp_peer_frame\b' \
-        . \
-        -g 'crates/**/*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Raft peer client framing, TLS profile, and transport errors are private to storage; use ControlPlaneRaftPeerClientEndpoint" \
-    "$raft_peer_client_wire_leaks"
-
-raft_peer_server_transport_leaks=$(
-    rg -n --color=never \
-        '\bCONTROL_PLANE_RAFT_TLS_ALPN\b|\bControlPlaneRaftPeerServerListenerKind\b|\bExperimentalRaftPeer(BoundListener|Listener|RpcWorkerContext)\b' \
-        . \
-        -g 'crates/**/*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Raft peer server framing, TLS profile, admission, and workers are private to storage; use ControlPlaneRaftPeerBootstrap and ControlPlaneRaftPeerServerListenerInput" \
-    "$raft_peer_server_transport_leaks"
-
-raft_peer_bootstrap_bypasses=$(
-    {
-        rg -n --color=never \
-            '\bControlPlaneRaftPeer(AuthPolicy|AuthMetricsSnapshot|AuthStatusSnapshot|TransportPolicy|NetworkConfig|ServerListener|ServerPolicy|ServerConfigError|ServerError)\b|\bnew_experimental_(unix_peer_durable|peer_durable_network|peer_durable_pending_static_initialization_network)\b|\.(initialize_membership|initialize_single_node_membership)\(|\bspawn_experimental_raft_peer_listener_loop\b|\bbuild_experimental_raft_peer_(transport_policy|auth_policy)\b' \
-            . \
-            -g 'crates/**/*.rs' \
-            -g '!crates/storage/**' \
-            || true
-        rg -n --color=never \
-            '^[[:space:]]*pub (struct|enum) ControlPlaneRaftPeer(AuthPolicy|AuthMetricsSnapshot|AuthStatusSnapshot|TransportPolicy|NetworkConfig|ServerListener|ServerPolicy|ServerConfigError|ServerError)\b|^[[:space:]]*pub async fn (new_experimental_(unix_peer_durable|peer_durable_network|peer_durable_pending_static_initialization_network)|initialize_membership|initialize_single_node_membership)\b' \
-            crates/storage/src/control_plane_raft.rs \
-            || true
-    }
-)
-fail_with_matches \
-    "Raft peer authentication, topology policy, client/server pairing, and authority construction must remain behind ControlPlaneRaftPeerBootstrap" \
-    "$raft_peer_bootstrap_bypasses"
-
-raft_peer_representation_leaks=$(
-    rg -n --color=never \
-        '\bControlPlaneRaftPeer(FrameIdentity|FrameKind|RpcRequest|RpcResponse|SnapshotRequest|SnapshotResponse|TransportRejection)\b|\b(decode_control_plane_raft_peer_request_[a-z_]+|handle_control_plane_raft_peer_[a-z_]+|read_control_plane_raft_peer_transport_frame(_with_reservation)?|write_control_plane_raft_peer_transport_frame)\b|\bControlPlaneAuth(Envelope|EnvelopeInput|EnvelopeHeader|EnvelopeHeaderInput|SignInput|VerificationInput|Target)\b|\.raft\(\)' \
-        . \
-        -g 'crates/**/*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Raft frames, shared auth envelopes, raw handlers, and the OpenRaft handle are private to storage; use logical authority APIs or opaque test hooks" \
-    "$raft_peer_representation_leaks"
-
-raft_durable_format_leaks=$(
-    rg -n --color=never \
-        '\bControlPlaneRaft(RestartArtifact|LogStoreRestartArtifact|StateMachineRestartArtifact|Wal(File|FileConfig|Frame|Record|ReplayConfig))\b|\bdurable_artifact_wal_path\b|\bnew_experimental_[a-z_]*with_wal\b' \
-        . \
-        -g 'crates/**/*.rs' \
-        -g '!crates/storage/**' \
-        || true
-)
-fail_with_matches \
-    "Raft restart artifacts, WAL representations, layout helpers, and explicit-WAL constructors are private to storage; use durable authority constructors or opaque semantic test inspection" \
-    "$raft_durable_format_leaks"
 
 object_encryption_codec_leaks=$(
     {

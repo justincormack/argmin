@@ -1155,14 +1155,14 @@ impl ControlPlaneUnixAuthMetrics {
 }
 
 #[derive(Debug, Clone)]
-pub struct FencedPgMetadataTransferRuntimeMap {
+pub(crate) struct FencedPgMetadataTransferRuntimeMap {
     runtime_map: ClusterRuntimeMapSnapshot,
     source_primary_lease_deadline_ms: Option<u64>,
 }
 
 impl FencedPgMetadataTransferRuntimeMap {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         runtime_map: ClusterRuntimeMapSnapshot,
         source_primary_lease_deadline_ms: Option<u64>,
     ) -> Self {
@@ -1173,17 +1173,18 @@ impl FencedPgMetadataTransferRuntimeMap {
     }
 
     #[must_use]
-    pub fn runtime_map(&self) -> &ClusterRuntimeMapSnapshot {
+    pub(crate) fn runtime_map(&self) -> &ClusterRuntimeMapSnapshot {
         &self.runtime_map
     }
 
     #[must_use]
-    pub fn source_primary_lease_deadline_ms(&self) -> Option<u64> {
+    #[cfg(test)]
+    pub(crate) fn source_primary_lease_deadline_ms(&self) -> Option<u64> {
         self.source_primary_lease_deadline_ms
     }
 
     #[must_use]
-    pub fn into_parts(self) -> (ClusterRuntimeMapSnapshot, Option<u64>) {
+    pub(crate) fn into_parts(self) -> (ClusterRuntimeMapSnapshot, Option<u64>) {
         (self.runtime_map, self.source_primary_lease_deadline_ms)
     }
 }
@@ -2260,7 +2261,7 @@ impl UnixControlPlaneClient {
         }
     }
 
-    pub fn fence_pg_for_metadata_transfer_runtime_map_checked(
+    pub(crate) fn fence_pg_for_metadata_transfer_runtime_map_checked(
         &self,
         pg_id: PgId,
     ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
@@ -2315,7 +2316,7 @@ impl UnixControlPlaneClient {
         ))
     }
 
-    pub fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+    pub(crate) fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
         &self,
         pg_id: PgId,
     ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
@@ -2325,7 +2326,7 @@ impl UnixControlPlaneClient {
         })
     }
 
-    pub fn set_pg_acting_set_with_metadata_transfer(
+    pub(crate) fn set_pg_acting_set_with_metadata_transfer(
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
@@ -2353,7 +2354,7 @@ impl UnixControlPlaneClient {
         Ok(cluster_epoch)
     }
 
-    pub fn set_pg_acting_set_with_metadata_transfer_checked(
+    pub(crate) fn set_pg_acting_set_with_metadata_transfer_checked(
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
@@ -2380,7 +2381,7 @@ impl UnixControlPlaneClient {
         }
     }
 
-    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map(
+    pub(crate) fn set_pg_acting_set_with_metadata_transfer_runtime_map(
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
@@ -2515,7 +2516,7 @@ impl UnixControlPlaneClient {
         }
     }
 
-    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+    pub(crate) fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
@@ -3269,7 +3270,7 @@ impl AuthenticatedUnixControlPlaneClient {
         }
     }
 
-    pub fn fence_pg_for_metadata_transfer_runtime_map_checked(
+    pub(crate) fn fence_pg_for_metadata_transfer_runtime_map_checked(
         &self,
         pg_id: PgId,
         authority_now_ms: u64,
@@ -3283,7 +3284,7 @@ impl AuthenticatedUnixControlPlaneClient {
             .0)
     }
 
-    pub fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
+    pub(crate) fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
         &self,
         pg_id: PgId,
         authority_now_ms: u64,
@@ -3330,7 +3331,7 @@ impl AuthenticatedUnixControlPlaneClient {
         )
     }
 
-    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map(
+    pub(crate) fn set_pg_acting_set_with_metadata_transfer_runtime_map(
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
@@ -3363,7 +3364,7 @@ impl AuthenticatedUnixControlPlaneClient {
         )
     }
 
-    pub fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
+    pub(crate) fn set_pg_acting_set_with_metadata_transfer_runtime_map_checked(
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,
@@ -3410,7 +3411,7 @@ impl AuthenticatedUnixControlPlaneClient {
         }
     }
 
-    pub fn set_pg_acting_set_with_metadata_transfer_checked(
+    pub(crate) fn set_pg_acting_set_with_metadata_transfer_checked(
         &self,
         pg_id: PgId,
         acting_set: Vec<NodeId>,

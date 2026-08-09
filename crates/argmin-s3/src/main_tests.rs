@@ -5553,23 +5553,31 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         let socket_path = tmp.join("control-plane.sock");
         let fence_server = spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_500);
-        let client = UnixControlPlaneClient::new(&socket_path);
-        let fenced = client
-            .fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(PgId::new(13))
-            .expect("Unix metadata-transfer fence should succeed");
+        let admin_bootstrap = storage::ControlPlaneAdminClientBootstrap::with_socket_paths(
+            [socket_path.clone()],
+            storage::ControlPlaneAdminCredentialBinding::new(None, None, Vec::new()).unwrap(),
+        )
+        .unwrap();
+        let client = storage::ControlPlanePgAdminClient::from_bootstrap(&admin_bootstrap);
+        let fenced_epoch = ClusterEpoch::new(
+            client
+                .fence_for_metadata_transfer(13)
+                .expect("Unix metadata-transfer fence should succeed"),
+        )
+        .expect("Unix metadata-transfer fence must return a nonzero epoch");
         fence_server.join().unwrap();
-        assert_eq!(fenced.source_primary_lease_deadline_ms(), Some(41_100));
-        let fenced_epoch = fenced.runtime_map().cluster_epoch();
         assert!(fenced_epoch > active_epoch);
-        let fenced_route = fenced
-            .runtime_map()
-            .pg_routes()
-            .iter()
-            .find(|route| route.pg_id() == PgId::new(13))
+        let fenced_snapshot = harness
+            .control_plane
+            .current_snapshot()
+            .expect("fenced runtime map should remain readable");
+        assert_eq!(fenced_snapshot.cluster_epoch(), fenced_epoch);
+        let fenced_route = fenced_snapshot
+            .pg(PgId::new(13))
             .expect("fenced runtime map should include source PG");
         assert_eq!(fenced_route.state(), PgState::Peering);
         assert_eq!(fenced_route.acting_set(), &[NodeId::new(1)]);
-        assert_eq!(fenced_route.primary_lease_deadline_ms(), None);
+        assert_eq!(fenced_route.active_primary(), None);
         let durable_fence_deadline = harness
             .control_plane
             .block_on(harness.authority.durable_state_machine_snapshot_for_test())
@@ -5586,29 +5594,37 @@ mod tests {
         let transfer = PgMetadataTransferProof::new(active_epoch, active_proof);
         let install_server =
             spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 40_600);
-        let client = UnixControlPlaneClient::new(&socket_path);
         let expected_destination_epoch = ClusterEpoch::new(
-            fenced
-                .runtime_map()
-                .cluster_epoch()
-                .get()
-                .checked_add(1)
-                .unwrap(),
+            fenced_epoch.get().checked_add(1).unwrap(),
         )
         .unwrap();
-        let transfer_runtime_map = client
-            .set_pg_acting_set_with_metadata_transfer_runtime_map(
-                PgId::new(13),
-                vec![NodeId::new(2)],
-                transfer,
-                expected_destination_epoch,
-            )
-            .expect("Unix metadata-transfer acting set install should succeed");
+        let install = storage::ControlPlanePgMetadataTransferInstall::new(
+            13,
+            vec![2],
+            active_epoch.get(),
+            expected_destination_epoch.get(),
+            active_proof.applied_log_index,
+            active_proof.applied_log_hash,
+            active_proof.state_digest,
+            active_proof.applied_log_index,
+            active_proof.applied_log_hash,
+            active_proof.state_digest,
+        )
+        .unwrap();
+        let installed_epoch = ClusterEpoch::new(
+            client
+                .install_metadata_transfer(install)
+                .expect("Unix metadata-transfer acting set install should succeed"),
+        )
+        .expect("Unix metadata-transfer install must return a nonzero epoch");
         install_server.join().unwrap();
+        let transfer_runtime_map = harness
+            .control_plane
+            .current_snapshot()
+            .expect("transfer runtime map should remain readable");
+        assert_eq!(transfer_runtime_map.cluster_epoch(), installed_epoch);
         let transfer_route = transfer_runtime_map
-            .pg_routes()
-            .iter()
-            .find(|route| route.pg_id() == PgId::new(13))
+            .pg(PgId::new(13))
             .expect("transfer runtime map should include destination PG");
         assert_eq!(transfer_route.state(), PgState::Peering);
         assert_eq!(transfer_route.acting_set(), &[NodeId::new(2)]);

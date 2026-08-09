@@ -4579,7 +4579,7 @@ impl ClusterRuntimeMapSnapshot {
     /// Peering route still exactly matches the previously fenced route and,
     /// for a transfer in progress, names the exact historical source route.
     /// The resulting map cannot authorize an unrelated PG or source node.
-    pub fn metadata_transfer_source_runtime_map(
+    pub(crate) fn metadata_transfer_source_runtime_map(
         &self,
         expected_current_route: &PgRouteSnapshot,
         source_epoch: ClusterEpoch,
@@ -4668,7 +4668,7 @@ impl ClusterRuntimeMapSnapshot {
     ///
     /// The route must be observed through a serving authority read and must
     /// still carry the exact transfer authorization expected by the importer.
-    pub fn metadata_transfer_destination_runtime_map(
+    pub(crate) fn metadata_transfer_destination_runtime_map(
         &self,
         pg_id: PgId,
         acting_set: &[NodeId],

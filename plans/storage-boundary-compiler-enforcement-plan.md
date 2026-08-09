@@ -6744,6 +6744,40 @@ Phase 6 maintenance-facade slice (2026-08-09):
 The checker baseline after this slice is 46 actual `fail_with_matches`
 invocations (39 top-level and seven nested).
 
+Phase 6 control-plane transport and transfer-representation slice
+(2026-08-09):
+
+- audited live metadata transfer, control-plane RPC, Raft-peer transport, and
+  durable Raft-format surfaces. Transfer artifacts and reconstruction errors,
+  frame codecs and workers, authentication envelopes, OpenRaft handles, and
+  restart/WAL representations are already storage-private;
+- closed the remaining raw metadata-transfer client seam by making transfer
+  runtime-map construction, the fenced transfer result, and the raw Unix and
+  authenticated-Unix transfer methods crate-private. The process layer now
+  uses `ControlPlanePgAdminClient` and
+  `ControlPlanePgMetadataTransferInstall`; storage-owned RPC tests retain the
+  low-level protocol coverage;
+- removed nine spelling inventories for transfer retry/representation details,
+  control-plane client/server framing, Raft-peer
+  client/server/bootstrap/representation details, and durable Raft formats.
+  Rust visibility rejects those private implementation leaks without a
+  parallel list of their names;
+- retained a focused public-facade opacity check because storage intentionally
+  re-exports the live-transfer operation. Private fields and private linear
+  markers prevent construction and accidental derives today, while separate
+  compile-fail tests pin that both authority-bearing capabilities remain
+  non-`Clone` and non-`Debug`. The focused check rejects newly public fields or
+  explicit trait implementations, which Rust visibility alone cannot prevent;
+  and
+- retained the semantic checks that cannot yet be replaced by visibility:
+  live-transfer capabilities must not implement the unrestricted runtime-map
+  source trait, manual/operator administration must use bounded logical
+  facades, and process code must classify typed control-plane errors rather
+  than parse transport diagnostics.
+
+The checker baseline after this slice is 37 actual `fail_with_matches`
+invocations (30 top-level and seven nested).
+
 For each remaining section, record:
 
 - the invariant
