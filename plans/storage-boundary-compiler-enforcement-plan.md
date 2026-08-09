@@ -6778,6 +6778,37 @@ Phase 6 control-plane transport and transfer-representation slice
 The checker baseline after this slice is 37 actual `fail_with_matches`
 invocations (30 top-level and seven nested).
 
+Phase 6 error-representation follow-up slice (2026-08-09):
+
+- removed the three remaining source inventories for exported wrapper
+  formatting, storage-RPC wire errors, and downstream `StoreError` policy.
+  The completed versioning containment work makes `StoreError`,
+  `StorageNodeFailureClass`, `StorageNodeFailureDetail`,
+  `BucketSnapshotLoadError`, `ObjectPgActionError`, and the storage-RPC wire
+  error types crate-private, with no public crate-root reexport. Downstream
+  code can receive only bounded operation failures such as `StoreFailure` and
+  their semantic classification and diagnostic-label methods;
+- retained the owner-local classification and formatting tests. They exercise
+  every operation class, bounded diagnostic category, nested cause label, and
+  redacted `Debug`/`Display` surface, including the bucket-delete flight
+  record. Those behavior tests, plus compiler visibility, replace source scans
+  for one logging spelling or a hand-maintained list of private error names;
+- deliberately retained the generic route/control-plane-to-`StoreError::Io`
+  rule. That rule constrains a semantic conversion *inside* the storage crate,
+  where visibility cannot distinguish a typed route error from an accidental
+  string-flattening conversion; and
+- deferred the object-encryption, user/system metadata, tag, and ACL codec
+  checks to the still-open Phase 2 evidence/format work in
+  `storage-upgrade-versioning-plan.md`. In particular, tag and ACL carriers
+  are part of the planned coordinated framed-carrier and containing-format
+  version advance. Phase 6 must not weaken those ownership guards while that
+  representation change remains open. Reclassify the four checks only after
+  the versioning plan records the final carrier boundary and permanent
+  evidence.
+
+The checker baseline after this slice is 34 actual `fail_with_matches`
+invocations (27 top-level and seven nested).
+
 For each remaining section, record:
 
 - the invariant
