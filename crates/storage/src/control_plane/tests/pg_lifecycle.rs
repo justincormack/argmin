@@ -2051,6 +2051,192 @@ fn active_primary_heartbeat_pending_command_fences_pg_for_recovery() {
 }
 
 #[test]
+fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    authority
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
+
+    let affected_pg = PgId::new(34);
+    let unaffected_pg = PgId::new(35);
+    let affected_floor = PgMetadataProof {
+        applied_log_index: 90,
+        applied_log_hash: 0xabc,
+        state_digest: 0xdef,
+    };
+    let unaffected_proof = PgMetadataProof {
+        applied_log_index: 12,
+        applied_log_hash: 0x123,
+        state_digest: 0x456,
+    };
+
+    authority
+        .set_pg_acting_set(affected_pg, vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        affected_pg.get(),
+        PgState::Peering,
+        affected_floor,
+        false,
+        2_000,
+    );
+    authority
+        .complete_pg_peering(
+            affected_pg,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_001,
+        )
+        .unwrap();
+
+    authority
+        .set_pg_acting_set(unaffected_pg, vec![NodeId::new(1)])
+        .unwrap();
+    let mut peering =
+        heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_010);
+    peering.pg_observations = vec![
+        NodePgHeartbeatObservation {
+            pg_id: affected_pg,
+            state: PgState::Active,
+            metadata_proof: affected_floor,
+            pending_metadata_command: None,
+        },
+        NodePgHeartbeatObservation {
+            pg_id: unaffected_pg,
+            state: PgState::Peering,
+            metadata_proof: unaffected_proof,
+            pending_metadata_command: None,
+        },
+    ];
+    authority.heartbeat(peering, 2_010).unwrap();
+    authority
+        .complete_pg_peering(
+            unaffected_pg,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_011,
+        )
+        .unwrap();
+
+    let active_epoch = authority.snapshot().cluster_epoch();
+    let mut active = heartbeat_from_record(&authority, 1, active_epoch, 2_020);
+    active.requested_lease_duration_ms = 1_000;
+    active.pg_observations = vec![
+        NodePgHeartbeatObservation {
+            pg_id: affected_pg,
+            state: PgState::Active,
+            metadata_proof: affected_floor,
+            pending_metadata_command: None,
+        },
+        NodePgHeartbeatObservation {
+            pg_id: unaffected_pg,
+            state: PgState::Active,
+            metadata_proof: unaffected_proof,
+            pending_metadata_command: None,
+        },
+    ];
+    authority.heartbeat(active, 2_020).unwrap();
+    let previous_lease_deadline = authority
+        .snapshot()
+        .node(NodeId::new(1))
+        .unwrap()
+        .lease_deadline_ms()
+        .unwrap();
+
+    let reset_proof = PgMetadataProof {
+        applied_log_index: 2,
+        applied_log_hash: 0x789,
+        state_digest: affected_floor.state_digest,
+    };
+    let pending = test_pending_metadata_command(active_epoch);
+    let mut pending_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
+    pending_heartbeat.requested_lease_duration_ms = 1_000;
+    pending_heartbeat.pg_observations = vec![
+        NodePgHeartbeatObservation {
+            pg_id: affected_pg,
+            state: PgState::Active,
+            metadata_proof: reset_proof,
+            pending_metadata_command: Some(pending),
+        },
+        NodePgHeartbeatObservation {
+            pg_id: unaffected_pg,
+            state: PgState::Active,
+            metadata_proof: unaffected_proof,
+            pending_metadata_command: None,
+        },
+    ];
+    let refresh = authority
+        .refresh_node_heartbeat(pending_heartbeat, 2_030)
+        .unwrap();
+    assert!(!refresh.lease().serving());
+    assert_eq!(
+        authority.snapshot().pg(affected_pg).unwrap().state(),
+        PgState::Peering
+    );
+    assert_eq!(
+        authority.snapshot().pg(unaffected_pg).unwrap().state(),
+        PgState::Active
+    );
+    assert_eq!(
+        authority
+            .snapshot()
+            .pg(affected_pg)
+            .unwrap()
+            .peering_metadata_proof_floor(),
+        Some(affected_floor)
+    );
+    assert_eq!(
+        authority
+            .snapshot()
+            .pending_metadata_command_recoveries()
+            .tasks(),
+        &[PendingMetadataCommandRecoveryTask::new(
+            affected_pg,
+            PendingMetadataCommandRecovery::new(NodeId::new(1), pending),
+        )]
+    );
+
+    let peering_epoch = authority.snapshot().cluster_epoch();
+    let mut acknowledged = heartbeat_from_record(&authority, 1, peering_epoch, 2_040);
+    acknowledged.requested_lease_duration_ms = 1_000;
+    acknowledged.pg_observations = vec![
+        NodePgHeartbeatObservation {
+            pg_id: affected_pg,
+            state: PgState::Peering,
+            metadata_proof: reset_proof,
+            pending_metadata_command: Some(pending),
+        },
+        NodePgHeartbeatObservation {
+            pg_id: unaffected_pg,
+            state: PgState::Active,
+            metadata_proof: unaffected_proof,
+            pending_metadata_command: None,
+        },
+    ];
+    let lease = authority
+        .refresh_node_heartbeat(acknowledged, 2_040)
+        .unwrap()
+        .lease()
+        .clone();
+    assert!(lease.serving());
+    assert!(lease.lease_deadline_ms() > previous_lease_deadline);
+
+    let expiry = authority
+        .expire_heartbeat_leases(previous_lease_deadline + 1)
+        .unwrap();
+    assert!(expiry.expired_nodes().is_empty());
+    assert!(authority
+        .snapshot()
+        .active_pg_route(unaffected_pg, previous_lease_deadline + 1)
+        .is_ok());
+}
+
+#[test]
 fn peering_heartbeat_rejects_pending_command_without_historical_active_primary() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));

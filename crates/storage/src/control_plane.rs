@@ -8613,9 +8613,13 @@ fn validate_pg_heartbeat_observations(
         if pg.state == PgState::Active && observation.pending_metadata_command.is_some() {
             pending_active_pg_observations.push(*observation);
         }
+        // A validated pending command already requires this PG to enter
+        // Peering. Its proof may reflect partial or reissued work; retain the
+        // committed floor and require replica convergence there.
         if pg.state == PgState::Active
             && pg.active_primary == Some(node_id)
             && observation.state == PgState::Active
+            && observation.pending_metadata_command.is_none()
         {
             let expected = pg.active_metadata_proof.ok_or(
                 ControlPlaneError::ActivePgMissingMetadataProof {

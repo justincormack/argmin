@@ -185,6 +185,15 @@ unrelated PGs on the storage node from serving and participating in repair.
 - cover future-epoch pending evidence, corrupt metadata, missing payload,
   restart, and healthy-PG continuity.
 
+An overnight 200-PG migration/failover soak at `71ed13d4` exposed one
+containment gap at this boundary: a restarted primary reported a durable pending
+command together with a lower-index later-epoch proof. The authority rejected
+the whole heartbeat while the PG was still Active, allowing the node lease to
+expire and moving all 200 PGs to Peering. Pending-command validation now retains
+its exact historical-primary check but moves only the affected PG to Peering;
+the node heartbeat and unrelated Active PGs remain live while replica
+convergence validates the reset proof.
+
 ### 1.3 Make Peering Ancestry Explicit
 
 Current exact proofs, transfer provenance, retained logs, and checkpoint
