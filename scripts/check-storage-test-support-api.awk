@@ -582,6 +582,7 @@ BEGIN {
     forbidden["LocalClusterMap"] = 1
     forbidden["PgMetadataProof"] = 1
     forbidden["PgMetadataTransferProof"] = 1
+    forbidden["BucketWriteReservationProof"] = 1
     forbidden["GenerationId"] = 1
     forbidden["EcShape"] = 1
     forbidden["PayloadReclaimRoot"] = 1

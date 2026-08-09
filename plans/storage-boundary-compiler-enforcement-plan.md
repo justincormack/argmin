@@ -6683,6 +6683,41 @@ Phase 6 residual private-physical-surface slice (2026-08-09):
 The checker baseline after this slice is 81 actual `fail_with_matches`
 invocations (74 top-level and seven nested).
 
+Phase 6 test-support duplicate-inventory slice (2026-08-09):
+
+- removed 29 checks and 866 lines across the checker and its retired fixtures
+  which inventoried exact raw test-helper names, hook aliases and registries,
+  inherent adapter spellings, and per-trait opaque error return spellings;
+- the Phase 5 structural boundary now supplies the enforcement those lists
+  duplicated. Raw inherent adapters, callback aliases, registries, and guard
+  implementations are crate-private, while downstream tests can reach only
+  the curated, feature-gated `storage::test_support` namespace. That namespace
+  deliberately includes extension traits as well as scoped installer
+  functions, hook configurations, and opaque guards. The exhaustive
+  normal/build feature-graph check prevents the private test feature from
+  entering a default production graph, and all-feature compilation checks its
+  exported signatures against Rust visibility and private-interface lints;
+- retained the single declaration-semantic test-support API scanner and its
+  adversarial fixture. It recursively examines the curated namespace, resolves
+  aliases and reexports, and rejects public physical PG, node, shard, route,
+  proof, claim, durable-row, generation, and EC-shape types regardless of the
+  method or type name. This is the stable invariant which cannot be expressed
+  merely by hiding those types because several are deliberately public in the
+  production storage API;
+- deleted the exact-output fixtures for historical method-name scans. Renaming
+  a crate-private helper, adding a different owner-local test helper, or moving
+  an implementation between storage modules no longer changes boundary
+  validity. Owner-local positive and crossed-subject tests remain responsible
+  for each opaque scenario's behavior, lifetime, and non-mutation guarantees;
+  and
+- retained the maintenance-worker production-facade checks in this slice.
+  They constrain which semantic production capabilities may cross the storage
+  boundary and require a separate visibility/facade audit rather than being
+  removed merely because similarly named test helpers are private.
+
+The checker baseline after this slice is 52 actual `fail_with_matches`
+invocations (45 top-level and seven nested).
+
 For each remaining section, record:
 
 - the invariant
