@@ -2144,18 +2144,33 @@ impl super::StorageCluster {
         ))
     }
 
-    /// Acquires deletion exclusion for exactly the opaque payload segments a
-    /// caller intends to read. Storage owns placement and historical-route
-    /// expansion for those segments.
-    pub fn acquire_object_payload_read_lease<'a>(
+    /// Acquires subject-bound read authority for exactly the opaque payload
+    /// segments a caller intends to read. Storage owns placement,
+    /// historical-route expansion, and the deletion-exclusion lease.
+    pub fn acquire_object_payload_read<'a>(
         self: &std::sync::Arc<Self>,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
         segments: impl IntoIterator<Item = &'a ObjectPayloadSegment>,
-    ) -> Result<ObjectPayloadLease, ObjectReadFailure> {
-        self.acquire_object_payload_read_lease_inner(bucket, key, generation_id, segments)
-            .map_err(ObjectReadFailure::from_store)
+    ) -> Result<ActiveObjectPayloadRead, ObjectReadFailure> {
+        let segments = segments.into_iter().cloned().collect::<Vec<_>>();
+        let lease = self
+            .acquire_object_payload_read_lease_inner(
+                bucket,
+                key,
+                generation_id,
+                segments.iter(),
+            )
+            .map_err(ObjectReadFailure::from_store)?;
+        Ok(ActiveObjectPayloadRead {
+            cluster: std::sync::Arc::clone(self),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            segments,
+            lease: std::sync::Mutex::new(Some(lease)),
+        })
     }
 
     pub(crate) fn acquire_object_payload_read_lease_inner<'a>(

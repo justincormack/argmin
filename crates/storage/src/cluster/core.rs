@@ -1515,6 +1515,82 @@ pub struct ObjectPayloadLease {
     released: bool,
 }
 
+/// Subject-bound authority for reading an active object's selected payload
+/// segments while deletion exclusion remains held.
+///
+/// The capability owns both the exact segment descriptors and their narrow
+/// storage-node leases. Callers cannot use an independently retained lease to
+/// read another segment through a raw cluster handle.
+pub struct ActiveObjectPayloadRead {
+    cluster: Arc<StorageCluster>,
+    bucket: BucketName,
+    key: ObjectKey,
+    generation_id: GenerationId,
+    segments: Vec<ObjectPayloadSegment>,
+    lease: Mutex<Option<ObjectPayloadLease>>,
+}
+
+impl ActiveObjectPayloadRead {
+    fn matches_subject(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) -> bool {
+        self.bucket == *bucket && self.key == *key && self.generation_id == generation_id
+    }
+
+    fn contains_segment(&self, segment: &ObjectPayloadSegment) -> bool {
+        self.segments.contains(segment)
+    }
+
+    /// Verifies that every segment selected for a response belongs to this
+    /// lease-bound payload authority.
+    pub fn contains_object_payload_segments<'a>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segments: impl IntoIterator<Item = &'a ObjectPayloadSegment>,
+    ) -> bool {
+        self.matches_subject(bucket, key, generation_id)
+            && segments
+                .into_iter()
+                .all(|segment| self.contains_segment(segment))
+    }
+
+    pub fn read_segment_payload_stored_bytes_into(
+        &self,
+        segment: &ObjectPayloadSegment,
+        dst: &mut Vec<u8>,
+    ) -> Result<(), ObjectReadFailure> {
+        if !self.contains_segment(segment) {
+            return Err(ObjectReadFailure::from_store(
+                StoreError::PayloadShardSetMismatch {
+                    reason: "payload read is outside the active lease-bound segment set"
+                        .to_string(),
+                },
+            ));
+        }
+        self.cluster
+            .read_object_payload_segment_stored_bytes_into(segment, dst)
+    }
+}
+
+impl Drop for ActiveObjectPayloadRead {
+    fn drop(&mut self) {
+        let Some(lease) = self
+            .lease
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
+            return;
+        };
+        lease.release_and_schedule_reclaim_if_needed();
+    }
+}
+
 /// Subject-bound payload-read authority retained by a streaming response.
 ///
 /// This capability deliberately does not retain request route admission. It

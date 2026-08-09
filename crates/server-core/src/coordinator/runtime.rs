@@ -15,7 +15,9 @@ use storage::{
 };
 
 use super::payload::SharedPayloadBuffer;
-use super::read_core::{PayloadLease, ReadRuntime, ReadStorage, SegmentPayloadRecord};
+#[cfg(test)]
+use super::read_core::PayloadLease;
+use super::read_core::{ReadRuntime, ReadStorage, SegmentPayloadRecord};
 use super::TRACE_TARGET;
 use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
 use crate::error::ServerError;
@@ -196,7 +198,7 @@ impl ReadRuntime {
     pub(super) fn storage_node(&self) -> &Arc<StorageCluster> {
         match &self.storage {
             ReadStorage::Cluster(storage_node) => storage_node,
-            ReadStorage::Retained(_) => {
+            ReadStorage::Active(_) | ReadStorage::Retained(_) => {
                 panic!("raw storage operations require a cluster-backed read runtime")
             }
         }
@@ -953,37 +955,53 @@ impl ReadRuntime {
     }
 
     pub(super) fn prepare_object_payload_read<'a>(
-        &self,
+        mut self,
         bucket: &BucketName,
         key: &ObjectKey,
         generation_id: GenerationId,
         segments: impl IntoIterator<Item = &'a SegmentPayloadRecord>,
-    ) -> Result<Option<PayloadLease>, ServerError> {
+    ) -> Result<Self, ServerError> {
         let segments = segments.into_iter().collect::<Vec<_>>();
-        if let ReadStorage::Retained(retained) = &self.storage {
-            if !retained.contains_object_payload_segments(
-                bucket,
-                key,
-                generation_id,
-                segments.iter().map(|segment| &segment.storage_segment),
-            ) {
-                return Err(ServerError::InternalError {
-                    reason: "object body is outside its retained payload-read snapshot".to_string(),
-                });
+        match &self.storage {
+            ReadStorage::Retained(retained) => {
+                if !retained.contains_object_payload_segments(
+                    bucket,
+                    key,
+                    generation_id,
+                    segments.iter().map(|segment| &segment.storage_segment),
+                ) {
+                    return Err(ServerError::InternalError {
+                        reason: "object body is outside its retained payload-read snapshot"
+                            .to_string(),
+                    });
+                }
             }
-            return Ok(None);
+            ReadStorage::Active(active) => {
+                if !active.contains_object_payload_segments(
+                    bucket,
+                    key,
+                    generation_id,
+                    segments.iter().map(|segment| &segment.storage_segment),
+                ) {
+                    return Err(ServerError::InternalError {
+                        reason: "object body is outside its active payload-read authority"
+                            .to_string(),
+                    });
+                }
+            }
+            ReadStorage::Cluster(storage_node) => {
+                let active = storage_node
+                    .acquire_object_payload_read(
+                        bucket,
+                        key,
+                        generation_id,
+                        segments.iter().map(|segment| &segment.storage_segment),
+                    )
+                    .map_err(super::map_object_read_failure)?;
+                self.storage = ReadStorage::Active(Arc::new(active));
+            }
         }
-
-        let storage_node = self.storage_node();
-        let lease = storage_node
-            .acquire_object_payload_read_lease(
-                bucket,
-                key,
-                generation_id,
-                segments.iter().map(|segment| &segment.storage_segment),
-            )
-            .map_err(super::map_object_read_failure)?;
-        Ok(Some(PayloadLease { lease: Some(lease) }))
+        Ok(self)
     }
 
     #[cfg(test)]
@@ -1033,14 +1051,20 @@ impl ReadRuntime {
         sse_customer_request: Option<&SseCustomerRequest>,
     ) -> Result<Arc<SharedPayloadBuffer>, ServerError> {
         let mut buf = self.payload_buffer_pool.checkout(0);
-        match &self.storage {
-            ReadStorage::Retained(retained) => {
-                retained.read_segment_payload_stored_bytes_into(&segment.storage_segment, &mut buf)
-            }
-            ReadStorage::Cluster(storage_node) => storage_node
-                .read_object_payload_segment_stored_bytes_into(&segment.storage_segment, &mut buf),
-        }
-        .map_err(super::map_object_read_failure)?;
+        let read_result =
+            match &self.storage {
+                ReadStorage::Active(active) => active
+                    .read_segment_payload_stored_bytes_into(&segment.storage_segment, &mut buf),
+                ReadStorage::Retained(retained) => retained
+                    .read_segment_payload_stored_bytes_into(&segment.storage_segment, &mut buf),
+                ReadStorage::Cluster(_) => {
+                    return Err(ServerError::InternalError {
+                        reason: "payload read runtime was not prepared with lease-bound authority"
+                            .to_string(),
+                    });
+                }
+            };
+        read_result.map_err(super::map_object_read_failure)?;
         if matches!(segment.encryption, ObjectEncryption::None) {
             Ok(buf.into_shared())
         } else {

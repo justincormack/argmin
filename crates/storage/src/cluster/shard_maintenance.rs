@@ -746,7 +746,7 @@ impl StorageCluster {
 
     /// Reads one opaque persisted payload segment, including historical-route
     /// selection when its placement predates the current runtime map.
-    pub fn read_object_payload_segment_stored_bytes_into(
+    fn read_object_payload_segment_stored_bytes_into(
         &self,
         segment: &ObjectPayloadSegment,
         dst: &mut Vec<u8>,

@@ -3,8 +3,10 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
+use storage::ObjectPayloadLease;
 use storage::{
-    BucketName, GenerationId, ObjectEncryption, ObjectKey, ObjectPayloadLease,
+    ActiveObjectPayloadRead, BucketName, GenerationId, ObjectEncryption, ObjectKey,
     ObjectPayloadSegment, ObjectReadMultipartPart, RetainedObjectPayloadRead, StorageCluster,
 };
 
@@ -26,6 +28,7 @@ pub struct ReadChunk {
 #[derive(Clone)]
 pub(super) enum ReadStorage {
     Cluster(Arc<StorageCluster>),
+    Active(Arc<ActiveObjectPayloadRead>),
     Retained(Arc<RetainedObjectPayloadRead>),
 }
 
@@ -136,6 +139,7 @@ pub(super) enum ReadHandleInner {
     TestBuffered(Option<Vec<u8>>),
 }
 
+#[cfg(test)]
 pub(super) struct PayloadLease {
     pub(super) lease: Option<ObjectPayloadLease>,
 }
@@ -145,7 +149,6 @@ pub struct ReadHandle {
     bucket: String,
     key: String,
     inner: ReadHandleInner,
-    lease: Option<PayloadLease>,
     trace: Option<observability::TraceContext>,
     expected_size: usize,
     bytes_emitted: usize,
@@ -158,7 +161,6 @@ impl std::fmt::Debug for ReadHandle {
         f.debug_struct("ReadHandle")
             .field("bucket", &self.bucket)
             .field("key", &self.key)
-            .field("has_lease", &self.lease.is_some())
             .field("expected_size", &self.expected_size)
             .field("bytes_emitted", &self.bytes_emitted)
             .field("expected_crc64", &self.expected_crc64)
@@ -540,14 +542,13 @@ impl ReadHandle {
         } = ctx;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        let lease =
+        let runtime =
             runtime.prepare_object_payload_read(bucket, key, generation_id, segments.iter())?;
         let segments =
             Self::segment_slices_for_range(segments, 0, expected_size.saturating_sub(1), 0, None);
         Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -590,13 +591,12 @@ impl ReadHandle {
         let expected_size = end - start + 1;
         let bucket_owned = bucket.as_str().to_string();
         let key_owned = key.as_str().to_string();
-        let lease =
+        let runtime =
             runtime.prepare_object_payload_read(bucket, key, generation_id, segments.iter())?;
         let segments = Self::segment_slices_for_range(segments, start, end, 0, None);
         Ok(Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -621,7 +621,7 @@ impl ReadHandle {
         expected_size: usize,
         sse_customer_request: Option<SseCustomerRequest>,
     ) -> Result<Self, ServerError> {
-        let lease = runtime.prepare_object_payload_read(
+        let runtime = runtime.prepare_object_payload_read(
             bucket,
             key,
             generation_id,
@@ -632,7 +632,6 @@ impl ReadHandle {
         Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
-            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -661,7 +660,7 @@ impl ReadHandle {
     ) -> Result<Self, ServerError> {
         let (start, end) = range;
         let expected_size = end - start + 1;
-        let lease = runtime.prepare_object_payload_read(
+        let runtime = runtime.prepare_object_payload_read(
             bucket,
             key,
             generation_id,
@@ -671,7 +670,6 @@ impl ReadHandle {
         Ok(Self {
             bucket: bucket.as_str().to_string(),
             key: key.as_str().to_string(),
-            lease,
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -695,7 +693,6 @@ impl ReadHandle {
             bucket: "<buffered>".to_string(),
             key: "<buffered>".to_string(),
             inner: ReadHandleInner::TestBuffered(Some(data)),
-            lease: None,
             trace: observability::current_context(),
             expected_size: len,
             bytes_emitted: 0,

@@ -480,6 +480,17 @@ therefore remains valid if the storage nodes install a successor map before
 the body's first read. Dropping the final body reference releases the captured
 node sessions and performs the ordinary reclaim follow-up.
 
+`ActiveObjectPayloadRead` is the corresponding capability for cluster-backed
+body reads that do not retain an admitted snapshot across publication. Storage
+constructs it from the exact bucket, key, generation, and selected opaque
+segments, expands their historical placements, and acquires the required
+deletion-exclusion leases before returning it. The capability owns those
+leases and is the only public surface that can read its selected segment
+bytes; the raw cluster segment reader is private. Dropping the final shared
+capability releases its leases and schedules reclaim when required. Thus
+server-core cannot retain one lease while reading bytes through an unrelated
+cluster handle, and no source-level caller inventory is needed for this path.
+
 `ObjectPayloadLease::release` is the current active token release path. It must
 release against the actual storage-node sessions captured at acquisition time
 and must not depend on the frontend's current cluster epoch or runtime-map
@@ -501,10 +512,10 @@ placed-delete reclaim helper; Rust visibility prevents downstream use of the
 low-level payload-read and storage-node handle/fence APIs. Temporary semantic
 caller checks additionally keep physical shard deletion behind the placed
 reclaim fence, raw shard reads inside the storage segment reader or publish
-validator, and payload-byte reads behind `ReadRuntime` after handle
-acquisition. The write-side publish validator performs its explicit placed
-read to prove acknowledged shard files still match their `WriteAck` before
-publishing metadata.
+validator, and coarse generation leases inside the broad-to-narrow snapshot
+handoff. The write-side publish validator performs its explicit placed read to
+prove acknowledged shard files still match their `WriteAck` before publishing
+metadata.
 
 `ReleasedObjectPayloadLease::remaining`, `ReleasedObjectPayloadLease::payload_reclaim_exists`,
 and `ReleasedObjectPayloadLease::enqueue_object_payload_reclaim` are release

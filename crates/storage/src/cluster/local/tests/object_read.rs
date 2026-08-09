@@ -541,6 +541,68 @@ fn retained_read_rejects_a_leased_node_subset_below_ec_k() {
 }
 
 #[test]
+fn active_object_payload_read_binds_its_subject_segments_and_lease() {
+    let tmp = test_util::tempdir();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &trace_node_ids(),
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::BucketName::try_from("bucket".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("key".to_string()).unwrap();
+    write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Disabled,
+        [1; 16],
+        [1; 16],
+        b"active payload",
+    );
+
+    let snapshot = cluster
+        .load_object_read_snapshot_if(
+            &bucket,
+            &key,
+            None,
+            crate::ObjectReadSnapshotMode::FullPayloadLayout,
+            |_| Ok::<_, ()>(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    let live = snapshot.stored.as_live().unwrap();
+    let segment = snapshot.object_segments.first().unwrap().clone();
+    let active = cluster
+        .acquire_object_payload_read(&bucket, &key, live.generation_id, [&segment])
+        .unwrap();
+    assert!(active.contains_object_payload_segments(&bucket, &key, live.generation_id, [&segment]));
+
+    let mut bytes = Vec::new();
+    active
+        .read_segment_payload_stored_bytes_into(&segment, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, b"active payload");
+
+    let crossed = segment.with_test_segment_index(segment.segment_index() + 1);
+    assert!(!active.contains_object_payload_segments(
+        &bucket,
+        &key,
+        live.generation_id,
+        [&crossed]
+    ));
+    let error = active
+        .read_segment_payload_stored_bytes_into(&crossed, &mut Vec::new())
+        .unwrap_err();
+    assert_eq!(error.kind(), crate::ObjectReadFailureKind::InternalError);
+}
+
+#[test]
 fn retained_object_payload_read_binds_the_complete_logical_segment_layout() {
     let tmp = test_util::tempdir();
     let map = Arc::new(

@@ -89,10 +89,10 @@ mod traits {
 pub(crate) use cluster::DurableReclaimScanOutcome;
 pub use cluster::{
     ActiveBucketMetadataScan, ActiveBucketRoute, ActiveMultipartObjectRoute,
-    ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectReadRoute,
-    ActivePutObjectRoute, BucketIdentityGenerations, BucketWriteSnapshotAction,
-    LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome, LocalClusterMap,
-    LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
+    ActiveObjectMetadataMutationRoute, ActiveObjectMetadataScan, ActiveObjectPayloadRead,
+    ActiveObjectReadRoute, ActivePutObjectRoute, BucketIdentityGenerations,
+    BucketWriteSnapshotAction, LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome,
+    LocalClusterMap, LocalNodeStoreConfig, LocalPgRoute, LocalUnixMetadataCommandNodeClientConfig,
     LocalUnixShardNodeClientConfig, LocalUnixStorageNodeClientAdmissionSettings,
     LocalUnixStorageNodeClientConfig, ObjectPayloadLease, PreparedStandaloneEmbeddedTopology,
     ProcessLocalRegistryKey, ReleasedObjectPayloadLease, RetainedObjectPayloadRead,

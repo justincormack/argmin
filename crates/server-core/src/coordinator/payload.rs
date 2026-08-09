@@ -9,7 +9,9 @@ use std::sync::atomic::Ordering;
 use storage::EcShape;
 
 use super::lock_mutex_unpoisoned;
-use super::read_core::{PayloadLease, ReadChunk};
+#[cfg(test)]
+use super::read_core::PayloadLease;
+use super::read_core::ReadChunk;
 use super::INTERNAL_SEGMENT_SIZE;
 use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 
@@ -214,6 +216,7 @@ pub(super) fn max_stored_segment_size() -> usize {
     INTERNAL_SEGMENT_SIZE.saturating_add(SSE_C_SEGMENT_TAG_LEN)
 }
 
+#[cfg(test)]
 impl Drop for PayloadLease {
     fn drop(&mut self) {
         let Some(lease) = self.lease.take() else {

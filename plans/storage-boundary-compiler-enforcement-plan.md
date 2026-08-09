@@ -6811,14 +6811,14 @@ invocations (27 top-level and seven nested).
 
 Phase 6 remaining-check rationale inventory (2026-08-09):
 
-The 34 remaining checks form ten semantic cohorts. This table is the
+The 33 remaining checks form ten semantic cohorts. This table is the
 authoritative retention rationale; it replaces an implied requirement to keep
 every historical symbol ban merely because it already existed.
 
 | Cohort (actual checks) | Invariant | Why Rust visibility/types are insufficient | Why ordinary tests are insufficient | Stable inspected input |
 | --- | --- | --- | --- | --- |
 | Workspace feature graph (1) | Default production normal/build graphs cannot enable storage test support; every workspace package is classified fail closed. | Cargo permits any package feature to forward another package's feature, including through defaults. | Tests compile the graph they are run under and do not enumerate every production package's resolved feature set. | Cargo metadata/tree feature resolution plus the exhaustive package classification and miniature end-to-end fixture. |
-| Payload-read/delete migration fences (4) | Physical deletion stays behind reclaim fencing; shard reads stay behind placement/health validation; server-core payload bytes pass through the integrity/decryption runtime; coarse leases exist only for the leased-snapshot handoff. | The raw operations are storage-private, but several required callers remain siblings within the same crate, and the retained read capability is deliberately callable across the crate boundary. | Positive read/reclaim tests do not fail merely because an additional unfenced call site is introduced. | Production Rust call sites for the four named low-level effects, excluding owner-local tests. These are explicitly temporary and are deleted only with their capability/module migrations. |
+| Payload-read/delete migration fences (3) | Physical deletion stays behind reclaim fencing; shard reads stay behind placement/health validation; coarse leases exist only for the leased-snapshot handoff. | The raw operations are storage-private, but several required callers remain siblings within the same crate. | Positive read/reclaim tests do not fail merely because an additional unfenced call site is introduced. | Production Rust call sites for the three named low-level effects, excluding owner-local tests. These are explicitly temporary and are deleted only with their capability/module migrations. |
 | Metadata-command publisher/recovery classification (7) | Every live publisher has one registry marker, obtains the correct sealed class token, and uses its typed installer; recovery mutation stays within the audited leader-authority path. | Publisher mints and some recovery constructors remain `pub(crate)` within modules whose included implementation files share visibility. Sealing enforces class, but not canonical mint location. | Command convergence tests exercise known publishers and cannot prove that a new unmarked or differently classified publisher was not added. | The authoritative publisher registry, production macro markers/installers, direct token-mint references, recovery-authority entry points, and semantic adversarial fixtures. |
 | Intra-storage semantic boundaries (4) | Typed route failures are not flattened to generic IO; request paths retain shared work budgets; SQLite access remains in `pg_store`; process code does not know storage directory/file layout. | All participants are intentionally inside the storage crate for the first three rules, while filesystem spellings are not Rust types. | Tests may pass without exercising a newly added conversion, unbounded retry helper, database access, or duplicated path spelling. | Narrow conversion/helper call shapes, storage source imports, and process-layer physical layout literals. |
 | HTTP storage boundary (2) | HTTP uses opaque diagnostics and semantic EC support rather than physical PG/checkpoint/snapshot/placement or erasure-code representations. | Some logical storage and EC types are public for legitimate owner/server-core use, so visibility cannot express the dependency-layer rule. | HTTP behavior can remain correct while an internal diagnostic or test acquires forbidden physical authority. | `server-http` source and its Cargo dependency declaration. |
@@ -6834,6 +6834,23 @@ the invocation count. It no longer bans the deleted `from_local_map` and
 crate-private `from_authorized_cluster` constructor. The corresponding guide
 row now names the authority-checked static preparation/opening and static or
 dynamic handle constructors that actually exist.
+
+Phase 6 lease-bound active payload-read slice (2026-08-09):
+
+- replaced the public pairing of `StorageCluster`, selected segments, and an
+  independently held `ObjectPayloadLease` with `ActiveObjectPayloadRead`;
+- the storage-owned capability binds the exact bucket, key, generation, and
+  segment descriptors to the deletion-exclusion lease, validates every read
+  against that set, and releases plus schedules reclaim when the final shared
+  capability is dropped;
+- made the raw active cluster segment-byte reader private. `server-core`
+  prepares its read runtime by acquiring the capability and can read bytes
+  only through either that active capability or the existing retained-read
+  capability; and
+- removed the exact `ReadRuntime::read_checked_segment_payload` caller
+  inventory. The compiler now rejects cross-crate raw reads, while owner-local
+  crossed-segment coverage pins the capability subject. The checker baseline
+  is 33 actual `fail_with_matches` invocations (27 top-level and six nested).
 
 For each remaining section, record:
 
