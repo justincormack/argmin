@@ -2,10 +2,47 @@ use std::time::Duration;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ObjectCannedAcl};
-use s3_tests::{object_url, presign_url, SendRetryingOperationAborted, CTX};
+use s3_tests::{object_url, presign_url, Response, SendRetryingOperationAborted, CTX};
 
 fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
+}
+
+/// Retry an anonymous CORS GET while public ACL state reaches the data plane.
+///
+/// AWS can transiently return AccessDenied after the bucket and object public
+/// ACL writes have succeeded. Only that known 403 convergence result is
+/// retried; every other unexpected status fails immediately.
+async fn public_cors_get_eventually(
+    url: &str,
+    origin: &str,
+    expected_status: u16,
+    description: &str,
+) -> Response {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut response = agent()
+            .get(url)
+            .header("Origin", origin)
+            .call()
+            .expect("transport error");
+        let status = response.status().as_u16();
+        let body = response.body_mut().read_to_vec().unwrap_or_default();
+        if status == expected_status {
+            return response;
+        }
+        if status == 403 && attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to HTTP {expected_status} for {url}, last status {status}, body: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    unreachable!()
 }
 
 async fn setup_public_cors_bucket(rules: Vec<CorsRule>) -> String {
@@ -87,12 +124,9 @@ fn test_cors_actual_request_public_bucket() {
         .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .get(&url)
-            .header("Origin", "http://example.com")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_vec();
+        let resp =
+            public_cors_get_eventually(&url, "http://example.com", 200, "matching public CORS GET")
+                .await;
 
         assert_eq!(resp.status().as_u16(), 200);
         assert_eq!(
@@ -151,12 +185,13 @@ fn test_cors_actual_request_no_match() {
         .await;
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .get(&url)
-            .header("Origin", "http://other.com")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_vec();
+        let resp = public_cors_get_eventually(
+            &url,
+            "http://other.com",
+            200,
+            "non-matching public CORS GET",
+        )
+        .await;
 
         assert_eq!(resp.status().as_u16(), 200);
         assert!(
@@ -179,12 +214,13 @@ fn test_cors_actual_request_missing_object_headers() {
         let bucket = setup_public_cors_bucket(vec![rule]).await;
 
         let url = format!("{}/{}/missing", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .get(&url)
-            .header("Origin", "http://example.com")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_string();
+        let resp = public_cors_get_eventually(
+            &url,
+            "http://example.com",
+            404,
+            "missing-object public CORS GET",
+        )
+        .await;
 
         assert_eq!(resp.status().as_u16(), 404);
         assert_eq!(
@@ -275,12 +311,9 @@ fn test_cors_actual_request_origin_wildcard_matrix() {
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
         for (origin, expected_origin) in cases {
-            let mut resp = agent()
-                .get(&url)
-                .header("Origin", origin)
-                .call()
-                .expect("transport error");
-            let _ = resp.body_mut().read_to_vec();
+            let resp =
+                public_cors_get_eventually(&url, origin, 200, "public CORS wildcard-matrix GET")
+                    .await;
 
             assert_eq!(resp.status().as_u16(), 200, "origin={origin}");
             assert_eq!(
