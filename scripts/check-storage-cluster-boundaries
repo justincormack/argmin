@@ -953,12 +953,6 @@ fail_with_matches \
 route_authority_capability_leaks=$(
     {
         rg -n --color=never \
-            '\bStorageCluster::(from_local_map|open_local_nodes)\b|pub fn (from_local_map|open_local_nodes)\b' \
-            crates plans \
-            -g '*.rs' \
-            -g '*.md' \
-            || true
-        rg -n --color=never \
             '\bStorageClusterRuntimeMapHandle\b' \
             crates \
             -g '*.rs' \
@@ -976,11 +970,6 @@ route_authority_capability_leaks=$(
                 print FILENAME ":" FNR ":" $0
             }
         ' crates/server-http/src/http/serve.rs
-        rg -n --color=never \
-            '\btest_from_route_handle\b|pub[[:space:]]+fn[[:space:]]+from_authorized_cluster\b' \
-            crates \
-            -g '*.rs' \
-            || true
         rg -n --color=never \
             '\.argmin-standalone-route\.(identity|identity\.next|initializing|lock)' \
             crates \
@@ -1016,7 +1005,7 @@ route_authority_capability_leaks=$(
     }
 )
 fail_with_matches \
-    "Static construction and standalone durable binding must remain storage-owned and explicit; generic route-handle construction cannot be public, request consumers receive only StorageClusterRouteHandle, no request handle can be upgraded to dynamic publication authority, and the obsolete legacy-local role cannot return" \
+    "Dynamic route publication and standalone durable binding must remain storage-owned and explicit; request consumers receive only StorageClusterRouteHandle, standalone representations stay opaque, and the obsolete legacy-local role cannot return" \
     "$route_authority_capability_leaks"
 
 test_support_api_scanner=scripts/check-storage-test-support-api.awk

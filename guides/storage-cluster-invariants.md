@@ -342,7 +342,7 @@ actual boundary.
 
 | Methods | Class |
 |---|---|
-| `open_local_nodes`, `from_local_map` | Construction |
+| `prepare_standalone_embedded_topology` plus `PreparedStandaloneEmbeddedTopology::open`, `open_static_local_nodes`, `StorageClusterRouteHandle::from_static_cluster`, `StorageClusterRuntimeMapHandle::new` | Authority-checked static/dynamic construction |
 | `cluster_epoch`, `operation_epoch`, `metadata_node_id`, `local_node_count`, `local_node_ids`, `local_pg_route`, `local_pg_routes`, `process_local_registry_key`, `default_payload_ec_shape` | Read-only topology/config |
 | `place_payload_shards`, `payload_shard_node`, `write_payload_shard`, `read_payload_shard`, `read_payload_shard_into`, `delete_payload_shard`, `write_direct_put_segment_payload_shards`, `write_stream_segment_payload_shards`, `read_segment_payload_stored_bytes_into` | Payload placement/read/write/delete |
 | `delete_direct_put_segment_payload_shards` | Best-effort cleanup/worker queue |
