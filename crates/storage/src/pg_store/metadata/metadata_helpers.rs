@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl PgStore {
     pub fn load_bucket_execution_generations(
         &self,

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Integration tests for aws-chunked transfer encoding.
 use std::time::{SystemTime, UNIX_EPOCH};
 

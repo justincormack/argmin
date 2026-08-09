@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// AWS chunked transfer encoding decoder with optional per-chunk signature verification.
 ///
 /// Wire format:

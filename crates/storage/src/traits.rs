@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Trait definitions for the storage layer.
 use crate::error::{MetadataError, StoreError};
 use crate::metadata_command::BucketRecord;

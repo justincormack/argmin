@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #![no_main]
 
 use auth::canonical::{parse_iso8601_utc_seconds_with_options, Iso8601UtcOptions};

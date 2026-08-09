@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 pub(super) struct DurableBucketWriteReservation {
     node: Arc<dyn crate::node_client::BucketMetadataNodeClient>,
     pg_id: u32,

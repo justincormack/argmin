@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::control_plane::PgMetadataProof;
 use crate::error::{BucketSnapshotLoadError, PgMetadataTransferError, StoreError};
 use crate::metadata_command::{

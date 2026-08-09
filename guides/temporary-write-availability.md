@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Temporary Write Availability
 
 This guide records the current write-availability decision for transient node

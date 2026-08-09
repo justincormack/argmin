@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// HTTP frontend: parses requests, authenticates, dispatches to coordinator.
 pub mod chunked;
 pub mod conditional;

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 pub trait ControlPlaneStore {
     fn load(&self) -> Result<Option<ClusterControlSnapshot>, ControlPlaneError>;
     fn checkpoint(

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Portable absolute-deadline I/O for connected sockets.
 //!
 //! `SO_RCVTIMEO` and `SO_SNDTIMEO` are not a portable way to enforce an

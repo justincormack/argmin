@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// C2 metadata blob: stored in the object metadata DB row.
 ///
 /// Wire format (V1):

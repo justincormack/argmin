@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::config::PlacementError;
 use crate::topology::{Level, TopologyKey};
 use std::sync::Arc;

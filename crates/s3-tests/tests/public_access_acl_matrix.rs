@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Public access matrix tests for bucket ACL x object ACL behavior.
 //!
 //! These mirror the old Ceph matrix structure, but the expected write behavior

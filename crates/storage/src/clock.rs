@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::cell::Cell;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::marker::PhantomData;

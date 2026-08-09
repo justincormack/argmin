@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_default_payload_ec_scratch_allocation_count(&self) -> usize {

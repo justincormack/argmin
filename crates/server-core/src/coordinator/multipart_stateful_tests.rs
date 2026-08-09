@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::test_helpers;
 use super::test_support::{setup_coordinator_without_reclaim_sweeper, NO_WRITE};
 use super::test_topology::*;

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::num::NonZeroUsize;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};

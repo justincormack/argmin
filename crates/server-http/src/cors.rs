@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! CORS configuration types, matching logic, and response header builders.
 
 /// A single CORS rule within a bucket's CORS configuration.

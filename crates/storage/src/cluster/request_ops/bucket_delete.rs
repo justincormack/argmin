@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl super::StorageCluster {
     fn delete_bucket_from_acting_set(
         &self,

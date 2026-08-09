@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};

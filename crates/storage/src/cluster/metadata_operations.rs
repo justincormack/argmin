@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl StorageCluster {
     fn retain_object_payload_read_from_leased_snapshot(
         self: &Arc<Self>,

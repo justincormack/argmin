@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::env;
 
 const OPENSSL_3_0_0: u64 = 0x3000_0000;

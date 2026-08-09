@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 pub(crate) fn encode_shard_write_item(
     item: &StorageRpcShardWriteItem,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {

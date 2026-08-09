@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_types::{
     parse_account_regional_bucket_name, AccountIdentity, AclGrants, BucketNamespace,
     BucketVersioningState,

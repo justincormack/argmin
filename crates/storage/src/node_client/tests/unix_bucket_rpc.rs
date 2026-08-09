@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::control_plane::{PendingMetadataCommandObservation, PendingMetadataCommandRecovery};
 use crate::storage_rpc::{

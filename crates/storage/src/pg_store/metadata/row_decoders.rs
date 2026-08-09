@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[allow(dead_code)]
 fn bucket_write_reservation_from_row(
     row: &rusqlite::Row<'_>,

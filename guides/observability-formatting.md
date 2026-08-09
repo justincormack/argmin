@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Observability Formatting
 
 This guide defines how tracing and future logging must handle attacker-controlled

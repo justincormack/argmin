@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_types::{is_valid_aws_account_id, AccountIdentity};
 use std::sync::Arc;
 

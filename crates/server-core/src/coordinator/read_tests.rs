@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::test_helpers;
 use super::test_support::*;
 use super::*;

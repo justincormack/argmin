@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Atomic read/write integration tests (Ceph group 32).
 //!
 //! Verifies that S3 object writes are atomic from a reader's perspective:

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ControlPlaneAuthorityClockCheckpointBinding(
     [u8; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN],

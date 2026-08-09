@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 static NEXT_PROCESS_LOCAL_REGISTRY_KEY: AtomicU64 = AtomicU64::new(1);
 
 /// Opaque identity used only to share process-local state for one storage node.

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// S3 POST Object authentication (SigV4 form-based).
 ///
 /// SigV4 uses form fields: `x-amz-algorithm`, `x-amz-credential`, `x-amz-date`,

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use s3_tests::{

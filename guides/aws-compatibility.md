@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # AWS Compatibility Guide
 
 Argmin aims to match AWS S3 behavior as closely as possible on the implemented

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Condition-key resolver table.
 //!
 //! One row per supported AWS IAM condition key. Each row owns the knowledge

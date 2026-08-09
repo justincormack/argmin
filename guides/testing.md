@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Testing Guide
 
 This guide collects the main testing workflows for the repository:

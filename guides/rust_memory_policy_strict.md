@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # RUST MEMORY POLICY --- STRICT MODE
 
 *For Bounded, Backpressure-Driven Systems*

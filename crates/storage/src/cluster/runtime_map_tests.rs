@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(test)]
 mod runtime_map_refresh_invalidation_tests {
     use super::*;

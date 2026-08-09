@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 const STORAGE_RPC_FRAME_MAGIC: &[u8] = b"argmin-storage-rpc-frame";
 pub(crate) const STORAGE_RPC_FRAME_ENCODING_VERSION: u16 = 16;
 pub(crate) const STORAGE_RPC_MAX_PAYLOAD_LEN: usize = 64 * 1024 * 1024;

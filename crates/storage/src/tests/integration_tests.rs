@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::{bucket_name, multipart_upload_id, object_key, stream_session_id};
 use crate::metadata_command::{
     DeleteFinalizedBucketCommand, MetadataCommandEnvelope, MetadataCommandId,

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::control_plane::{
     format_snapshot, initial_cluster_bootstrap_map_digest, parse_snapshot,
     parse_snapshot_without_publication_validation, validate_control_plane_snapshot,

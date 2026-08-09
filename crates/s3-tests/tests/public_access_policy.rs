@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::delete_bucket_policy::{
     DeleteBucketPolicyError, DeleteBucketPolicyOutput,

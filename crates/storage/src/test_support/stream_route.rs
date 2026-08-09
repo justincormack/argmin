@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::TestStorageFailure;
 use crate::{
     ActiveMultipartObjectRoute, ActivePutObjectRoute, BucketName, ObjectEncryption, ObjectKey,

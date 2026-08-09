@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! CRC-32C (Castagnoli / iSCSI) checksum with combine support.
 //!
 //! Uses the native Rust implementation on all builds. On supported CPUs it

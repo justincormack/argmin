@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Byte range parsing for HTTP Range requests (RFC 7233).
 ///
 /// Only single-range support — S3 does not support multi-range requests.

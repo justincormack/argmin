@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl super::StorageCluster {
     fn open_bucket_write_reservation_route<'a>(
         &self,

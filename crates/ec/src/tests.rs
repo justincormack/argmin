@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::codec::{backend_name_for, supported_backends, Backend};
 use crate::self_test;
 use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};

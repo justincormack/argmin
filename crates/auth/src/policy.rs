@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Policy-language primitives shared by service-specific policy documents.
 //!
 //! S3 resource policies, IAM identity policies, role trust policies, and

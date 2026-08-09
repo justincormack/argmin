@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Object Concurrency Invariants
 
 Status: active guidance. This guide describes the lock-order and concurrency

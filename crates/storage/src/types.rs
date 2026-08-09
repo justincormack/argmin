@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Core types for the storage layer.
 use crate::error::StoreError;
 use argmin_crypto::hmac::Sha256Key;

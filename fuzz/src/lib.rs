@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use auth::{CredentialStore, IdentityProvider, SecretKey};
 
 pub fn split_input(data: &[u8], parts: usize) -> Vec<&[u8]> {

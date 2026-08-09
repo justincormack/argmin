@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl PgStore {
     fn apply_put_object_metadata_command(
         &self,

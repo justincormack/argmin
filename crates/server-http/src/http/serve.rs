@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
 use std::net::IpAddr;

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Checksum algorithm for multipart uploads.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

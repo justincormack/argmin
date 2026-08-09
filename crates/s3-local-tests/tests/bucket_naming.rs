@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use s3_tests::{

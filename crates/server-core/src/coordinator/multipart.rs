@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
 use std::time::Duration;
 #[cfg(not(test))]

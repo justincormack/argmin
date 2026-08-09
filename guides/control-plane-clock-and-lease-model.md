@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Control-plane clock and lease model
 
 This document defines the clock and failure assumptions for control-plane

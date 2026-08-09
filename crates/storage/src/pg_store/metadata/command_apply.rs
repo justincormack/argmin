@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl PgStore {
     #[cfg(test)]
     pub fn create_bucket_with_config(

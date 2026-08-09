@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl PgStore {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_insert_lifecycle_sweep_claim(

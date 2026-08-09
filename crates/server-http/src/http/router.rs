@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// S3 operation routing from HTTP method + path + query.
 use crate::error::ServerError;
 use crate::http::request::{query_has_key, query_has_param};

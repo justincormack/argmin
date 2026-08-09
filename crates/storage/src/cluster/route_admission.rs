@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 pub struct StorageCluster {
     local_map: Arc<LocalClusterMap>,
     operation_epoch: ClusterEpoch,

@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Bucket Write Drain
 
 Phase 9.4 replaces the current single-process bucket write-drain mechanism with

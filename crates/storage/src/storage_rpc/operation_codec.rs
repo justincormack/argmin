@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 pub(crate) fn encode_metadata_command_item(
     item: &StorageRpcMetadataCommandItem,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {

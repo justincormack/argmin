@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::{collections::BTreeSet, io::Write, path::Path, time::Duration};
 
 use s3_tests::uat_pg_backfill_support::{

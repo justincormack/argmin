@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::hint::black_box;
 use std::io::{self, Cursor, Read, Write};
 use std::sync::Arc;

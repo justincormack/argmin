@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Read-only AWS STS Query protocol oracle.
 //!
 //! This is an explicitly invoked AWS probe rather than an ordinary test

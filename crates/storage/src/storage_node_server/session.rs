@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 fn trace_storage_rpc_lifecycle(kind: StorageRpcMessageKind) -> bool {
     matches!(
         kind,

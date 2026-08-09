@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pure clock and lease rules shared by the control-plane authority and its consumers.
 //!
 //! The wire deadline remains an authority wall-clock timestamp. A process must bind it to

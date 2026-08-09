@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::operation::delete_objects::DeleteObjectsOutput;

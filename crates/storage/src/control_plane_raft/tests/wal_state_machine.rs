@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[test]
 fn control_plane_raft_wal_partial_write_failure_is_ambiguous() {
     let mut writer = PartialFailWriter {

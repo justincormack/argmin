@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::num::{NonZeroU32, NonZeroU64};
 
 use s3_types::{

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration tests targeting pg_store.rs code paths with low coverage.
 //!
 //! These tests exercise segment storage, large object handling, versioned

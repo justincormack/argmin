@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Backend-neutral cryptographic primitives used by Argmin.
 //!
 //! Production crates should use this crate rather than depending on a concrete

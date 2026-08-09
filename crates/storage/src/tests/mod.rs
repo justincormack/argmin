@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::types::{BucketName, ObjectKey, SessionId, UploadId, SESSION_ID_LEN, UPLOAD_ID_LEN};
 
 mod integration_tests;

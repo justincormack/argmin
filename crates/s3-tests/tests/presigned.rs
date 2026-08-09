@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::Duration;
 
 use auth::canonical::{canonical_query_string, canonical_request, string_to_sign};

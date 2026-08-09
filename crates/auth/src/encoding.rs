@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::borrow::Cow;
 
 const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";

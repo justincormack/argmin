@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::authz_types::AuthorizedPutObjectWrite;
 use super::read_core::ReadHandle;
 use crate::metadata_blob::MetadataBlob;

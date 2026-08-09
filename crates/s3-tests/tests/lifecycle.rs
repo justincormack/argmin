@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use base64::Engine;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

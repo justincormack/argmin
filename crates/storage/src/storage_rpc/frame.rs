@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 pub(crate) fn encode_storage_rpc_frame(
     request_id: u64,
     kind: StorageRpcMessageKind,

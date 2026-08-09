@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Typed IAM policy documents used by in-memory identity records.
 //!
 //! These constructors are the authorization-facing types. JSON parsing is a

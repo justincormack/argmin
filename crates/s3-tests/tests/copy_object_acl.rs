@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! CopyObject tests that intentionally exercise legacy ACL authorization.
 
 use aws_sdk_s3::types::{

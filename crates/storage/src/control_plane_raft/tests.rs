@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::future::Future;

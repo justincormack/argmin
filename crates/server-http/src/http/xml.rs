@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Hand-formatted XML for S3 responses with lightweight request XML parsing.
 use crate::coordinator::{
     BucketAcl, BucketObjectLockConfigurationUpdate, BucketSummary, ChecksumClaim, CompletePart,

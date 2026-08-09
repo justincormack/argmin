@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[derive(Clone)]
 struct StorageNodeRuntimeRouteState {
     config: Arc<StorageNodeProcessConfig>,

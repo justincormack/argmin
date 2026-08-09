@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(test)]
 use super::runtime::LifecycleSweepStats;
 use std::sync::Arc;

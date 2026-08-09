@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Golden response-shape assertions.
 //!
 //! These helpers pin the full shape of a raw response — status, the complete

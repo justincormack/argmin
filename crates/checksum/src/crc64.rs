@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! CRC-64/NVME (= CRC-64/Rocksoft) checksum.
 //!
 //! Uses the native Rust implementation on all builds. On supported CPUs it

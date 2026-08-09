@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::config::ConfiguredStaticClusterIdentity;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

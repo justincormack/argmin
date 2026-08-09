@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Core conditional request types and evaluation logic for S3 operations.
 ///
 /// Implements RFC 7232 §6 evaluation order for reads, plus S3-specific

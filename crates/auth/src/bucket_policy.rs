@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_types::{aws_account_id_from_principal, CanonicalUserId};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};

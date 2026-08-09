@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 #[cfg(test)]
 use s3_types::{AclGrants, LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus};

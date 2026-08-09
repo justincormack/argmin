@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
     let len = u32::try_from(bytes.len()).expect("storage RPC byte slice length must fit in u32");
     put_u32(out, len);

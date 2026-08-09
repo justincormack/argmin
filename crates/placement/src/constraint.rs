@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::cluster::NodeInfo;
 use crate::topology::Level;
 use std::sync::Arc;

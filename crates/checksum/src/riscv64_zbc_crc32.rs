@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared RISC-V Zbc folding kernel for 32-bit reflected CRCs.
 
 use core::arch::asm;

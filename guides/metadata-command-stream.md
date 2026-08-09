@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Metadata Command Stream
 
 This guide defines the target command-stream coordination model for Phase 9.2

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
 use s3_tests::{

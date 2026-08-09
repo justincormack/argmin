@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Compile-time rustls cryptography-provider selection.
 
 use std::fmt;

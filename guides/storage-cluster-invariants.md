@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Storage Cluster Invariants
 
 This guide pins down the storage-cluster boundary during the multihost

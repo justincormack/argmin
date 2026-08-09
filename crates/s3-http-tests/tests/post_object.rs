@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_http_tests::{create_bucket, run, unique_bucket, CTX};
 use s3_tests::{
     delete_bucket_retrying_operation_aborted, post_object_to_test_endpoint,

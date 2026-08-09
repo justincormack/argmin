@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_tests::{
     raw_anonymous, raw_anonymous_put,
     shape::{assert_shape, error_response_headers, expected_error, shape},

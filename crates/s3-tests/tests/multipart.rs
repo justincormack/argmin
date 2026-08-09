@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Multipart upload integration tests.
 //!
 //! Tests the full multipart upload lifecycle through the S3 HTTP API:

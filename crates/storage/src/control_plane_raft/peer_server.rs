@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 
 const CONTROL_PLANE_RAFT_PEER_SERVER_DEADLINE_EXPIRED: &str =

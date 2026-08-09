@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::codec::Backend;
 use crate::gf::{apply_matrix_rows, gf_mul, invert_matrix};
 use crate::{EcError, MAX_TOTAL_SHARDS};

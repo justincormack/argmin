@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Multipart form-data parser for S3 POST Object.
 use crate::error::ServerError;
 use storage::ObjectKey;

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;

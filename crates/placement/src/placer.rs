@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::cluster::{ClusterMap, NodeId, NodeInfo};
 use crate::config::{PlacementConfig, PlacementError};
 use crate::constraint::{Admission, AdmitFn, PlacementConstraint};

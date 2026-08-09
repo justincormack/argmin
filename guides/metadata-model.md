@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Metadata Model And Integrity
 
 This guide defines the target model for replicated metadata. It is intentionally

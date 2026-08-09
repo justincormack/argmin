@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Canonical request construction per AWS SigV4 spec.
 use crate::encoding::{hex_encode_lower, hex_val, percent_decode_lossy};
 

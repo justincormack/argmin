@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::cluster::NodeId;
 use crate::deterministic_log::{deterministic_log_u53, Unit53};
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};

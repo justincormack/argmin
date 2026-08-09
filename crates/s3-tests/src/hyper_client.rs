@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::HashMap;
 use std::error::Error as _;
 use std::fmt;

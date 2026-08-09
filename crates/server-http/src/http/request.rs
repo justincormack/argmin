@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Parse HTTP requests into structured S3 request data.
 use std::{borrow::Cow, net::IpAddr};
 

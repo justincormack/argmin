@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bucket ACL integration tests.
 //!
 //! Covers canned bucket ACLs, default ACL verification, grant revocation,

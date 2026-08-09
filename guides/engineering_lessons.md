@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Engineering Lessons
 
 *Lessons learned building the EC engine. Generalise before adding new entries.*

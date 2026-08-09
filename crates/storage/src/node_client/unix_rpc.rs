@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::metadata_command::validate_metadata_command_recovery_certificate;
 use crate::BucketAclSummary;

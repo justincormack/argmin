@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 struct StorageRpcDecoder<'a> {
     bytes: &'a [u8],
     cursor: usize,

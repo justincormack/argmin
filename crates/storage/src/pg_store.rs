@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// PgStore — per-PG shard I/O and object metadata, backed by filesystem + SQLite.
 ///
 /// Owns a single `rusqlite::Connection` to the per-PG `metadata.db` and manages

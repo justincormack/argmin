@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::Duration;
 
 use s3_tests::{assert_s3_err_code, err_status, CTX};

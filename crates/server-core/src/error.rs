@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Unified error type for the server crate.
 use s3_types::VersionId;
 use storage::{

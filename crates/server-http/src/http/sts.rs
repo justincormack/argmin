@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use auth::{
     authenticate_request, generate_session_credential_material, IamRoleArn, PolicyEvaluation,
     ResolvedPrincipalAuthorization, RoleSessionName, RoleSessionNameError, SessionLifetime,

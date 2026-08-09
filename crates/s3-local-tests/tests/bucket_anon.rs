@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_tests::{build_test_agent, TestServer, RT};
 
 fn run_local<F: std::future::Future>(f: F) -> F::Output {

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::types::{GenerationId, SessionId, UploadId};
 
 fn sha256_truncated_16(input: &[u8]) -> [u8; 16] {

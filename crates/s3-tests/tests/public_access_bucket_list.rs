@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_tests::{delete_all_and_bucket, CTX};
 
 const SET_B: &[&str] = &["bar", "baz", "cab", "dog", "foo/bar", "foo/baz", "quux"];

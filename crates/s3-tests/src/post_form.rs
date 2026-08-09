@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

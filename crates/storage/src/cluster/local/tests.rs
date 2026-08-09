@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::cluster::{MetadataCommandRecoveryWaiterOutcome, PendingMetadataCommandOutcome};
 use crate::metadata_command::{

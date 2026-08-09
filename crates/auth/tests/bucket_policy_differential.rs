@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use auth::bucket_policy::{
     clause_supported_for_action_for_tests, parse_bucket_policy, BucketPolicy, ExistingObjectTags,
     PolicyAction, PolicyEvaluation, PolicyRequest, PolicyRequester, PolicyTag,

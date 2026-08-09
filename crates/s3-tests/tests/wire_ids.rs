@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_tests::{
     aws_sdk_s3::primitives::ByteStream,
     build_client_with_ca, object_url, send_signed_request_with_credentials,

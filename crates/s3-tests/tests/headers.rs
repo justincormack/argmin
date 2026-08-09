@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use auth::canonical::{canonical_query_string, uri_encode};

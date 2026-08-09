@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use auth::SecretKey;
 use ec::EcConfig;
 use rustls::sign::CertifiedKey;

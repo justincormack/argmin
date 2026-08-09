@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

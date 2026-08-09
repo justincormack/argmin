@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Integration tests for the placement crate.
 //!
 //! Tests the full pipeline: ClusterMap → PlacementConfig → Placer → place().

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// SigV4 signature verification.
 use argmin_crypto::hmac;
 

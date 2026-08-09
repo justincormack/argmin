@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Condition operator table.
 //!
 //! This module hosts one definition per supported AWS IAM condition operator

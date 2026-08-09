@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! SQLite codecs for storage domain types.
 //!
 //! These implementations are deliberately owned by PgStore so the general

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Authoritative mutable IAM authorization records.
 //!
 //! These records are deliberately separate from the immutable role-incarnation

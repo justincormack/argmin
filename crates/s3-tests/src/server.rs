@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

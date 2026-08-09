@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 const INTERNAL_LIST_PAGE_SIZE: u32 = 1_000;
 const ORPHAN_OBJECT_PAYLOAD_RECLAIM_BUCKET_INCARNATION: u64 = 0;
 #[cfg(any(test, feature = "test-hooks"))]

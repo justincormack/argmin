@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

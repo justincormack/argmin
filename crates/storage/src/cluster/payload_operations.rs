@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl StorageCluster {
     pub(crate) fn place_payload_shards(
         &self,

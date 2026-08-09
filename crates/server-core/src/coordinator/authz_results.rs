@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #![cfg_attr(test, allow(dead_code))]
 
 use std::sync::Arc;

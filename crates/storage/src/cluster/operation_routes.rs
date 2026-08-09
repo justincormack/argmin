@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Request-scoped, subject-bound authority for removing one abandoned stream
 /// upload, including a prompt attempt after the active route deadline elapses.
 ///

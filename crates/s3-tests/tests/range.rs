@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use s3_tests::{
     cleanup_versioned_bucket, err_status, raw_object_query, raw_object_with,

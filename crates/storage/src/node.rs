@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// LocalStorageNode and SharedStorageNode — manage multiple PgStores on a single node.
 use ec::{EcConfig, ErasureCodec};
 use std::collections::{HashMap, HashSet, VecDeque};

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Build HTTP responses for S3 operations.
 
 use std::sync::Arc;

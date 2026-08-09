@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_types::VersionId;
 #[cfg(test)]
 use storage::ObjectLayout;

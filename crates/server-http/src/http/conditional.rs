@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// HTTP header parsing for conditional request types.
 ///
 /// Extracts `ReadCondition`, `WriteCondition`, and `DeleteCondition` from

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Authentication error types.
 #[derive(thiserror::Error)]
 pub enum AuthError {

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[test]
 fn control_plane_openraft_single_node_initialize_uses_bootstrap_membership() {
     ControlPlaneRaftTypeConfig::run(async {

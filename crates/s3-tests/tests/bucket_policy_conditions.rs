@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bucket-policy condition scenario matrices, migrated from the standalone
 //! AWS-vs-local diff suite (see plans/completed/diff-test-consolidation-plan.md).
 //!

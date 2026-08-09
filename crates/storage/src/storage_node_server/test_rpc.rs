@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
     #[test]
     fn storage_node_server_rejects_unknown_data_pg_for_every_shard_ack_operation() {
         let tmp = test_util::tempdir();

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #![forbid(unsafe_code)]
 
 //! Shared S3/domain value types used across storage and server layers.

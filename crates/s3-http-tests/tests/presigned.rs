@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::Duration;
 
 use s3_http_tests::{create_bucket, run, test_agent, unique_bucket, CTX};

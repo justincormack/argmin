@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl super::StorageCluster {
     pub(crate) fn payload_reclaim_exists(
         &self,

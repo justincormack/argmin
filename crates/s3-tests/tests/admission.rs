@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tests for connection and request admission control.
 //!
 //! These tests start dedicated servers with constrained pool sizes to exercise

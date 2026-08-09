@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 
 const PENDING_PLACED_SEGMENT_REFERENCE_RECORD_LEN: usize = 54;

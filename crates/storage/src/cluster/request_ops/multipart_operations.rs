@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_put_object_stream_session<T, E>(

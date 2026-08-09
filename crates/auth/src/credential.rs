@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Credential storage for SigV4 authentication.
 use std::collections::HashMap;
 use std::sync::Arc;

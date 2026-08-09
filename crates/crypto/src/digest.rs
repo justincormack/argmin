@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Incremental message digests.
 
 #[cfg(feature = "openssl")]

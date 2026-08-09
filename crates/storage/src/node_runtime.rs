@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Private storage-node runtime implementation.
 //!
 //! Raw node state, concrete node clients, and the storage-node server share

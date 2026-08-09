@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Security Findings Inventory
 
 This is the checked-in one-row-per-finding map for every file under

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::control_plane::ControlPlaneError;
 use argmin_crypto::hmac::Sha256Key;
 use placement::NodeId;

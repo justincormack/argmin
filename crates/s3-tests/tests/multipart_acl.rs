@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Multipart upload tests that intentionally exercise legacy ACL authorization.
 
 use std::collections::BTreeMap;

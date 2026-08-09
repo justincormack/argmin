@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Opaque mutable wall-clock override for deterministic cross-crate tests.
 ///
 /// The process-local clock slot and its reset guard remain owned by storage.

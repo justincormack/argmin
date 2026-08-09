@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! SHA-256 hashing.
 
 const DIGEST_LEN: usize = 32;

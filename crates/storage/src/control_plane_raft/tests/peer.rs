@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[test]
 fn control_plane_raft_peer_rpc_append_entries_request_frame_round_trips() {
     let request = AppendEntriesRequest {

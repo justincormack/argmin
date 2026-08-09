@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared value types and validation for AWS resource tags.
 //!
 //! Resource-tag keys and values use UTF-16 length limits and the AWS

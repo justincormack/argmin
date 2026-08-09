@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_tests::shape::{assert_shape, error_response_headers, shape, xml_tag_text, ShapeSpec};
 use s3_tests::{
     build_configured_test_agent, build_test_agent, create_account_regional_bucket_with_credentials,

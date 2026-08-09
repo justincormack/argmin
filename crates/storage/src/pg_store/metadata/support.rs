@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[cfg(any(test, feature = "test-hooks"))]
 fn require_one_test_mutation(changed: usize) -> Result<(), StoreError> {
     if changed == 1 {

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Stateless temporary-credential session-token sealing.
 
 use std::collections::HashMap;

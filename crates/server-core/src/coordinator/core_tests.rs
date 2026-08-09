@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::test_helpers::{self, UploadPartRequest};
 use super::test_panic::SuppressExpectedTestPanic;
 use super::test_support::*;

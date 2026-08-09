@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// Integration tests for malformed XML request bodies.
 ///
 /// These cover the error paths in XML parsers (parse_delete_objects_xml,

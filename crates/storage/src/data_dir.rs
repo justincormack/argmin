@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

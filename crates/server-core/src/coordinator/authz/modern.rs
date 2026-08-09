@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::policy::{object_policy_request, policy_tags_from_pairs, ObjectPolicyRequestInput};
 use super::*;
 use std::ops::Deref;

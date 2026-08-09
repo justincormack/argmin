@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use checksum::{ChecksumAlgorithm, ChecksumType};
 use s3_types::{
     CacheControl, ContentDisposition, ContentEncoding, ContentLanguage, ContentType, Expires,

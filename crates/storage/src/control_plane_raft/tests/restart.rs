@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[test]
 fn control_plane_raft_log_store_rejects_append_holes() {
     ControlPlaneRaftTypeConfig::run(async {

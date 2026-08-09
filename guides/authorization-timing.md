@@ -1,3 +1,6 @@
+<!-- Copyright The Argmin Authors. -->
+<!-- SPDX-License-Identifier: CC-BY-4.0 -->
+
 # Authorization Timing Guide
 
 This guide defines the repository policy for when authentication-derived

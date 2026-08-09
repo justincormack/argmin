@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use s3_tests::server::{TEST_ACCESS_KEY, TEST_REGION, TEST_SECRET_KEY};

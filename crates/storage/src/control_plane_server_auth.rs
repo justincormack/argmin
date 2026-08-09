@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::fmt;
 use std::fmt::Write as _;
 use std::sync::Arc;

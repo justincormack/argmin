@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::authz::modern::{
     self, BoeBucketSummary, ModernObjectReadAuthorization, ModernObjectWriteAuthorization,
     ModernReadAction, ModernWriteAction, PreloadedBucketTags,

@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use s3_tests::{
     content_md5_header, raw_bucket, send_signed_request,
     shape::{assert_shape, error_response_headers, expected_error, id_headers, shape},

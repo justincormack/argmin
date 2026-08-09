@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 /// ETag formatting: CRC64-NVME value to/from quoted hex string.
 /// Format a CRC64-NVME value as a quoted hex ETag string.
 ///

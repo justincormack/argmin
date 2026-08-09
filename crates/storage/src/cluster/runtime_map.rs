@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StorageClusterRuntimeMapRefreshLoopSuccess {
     pub cluster_epoch: ClusterEpoch,

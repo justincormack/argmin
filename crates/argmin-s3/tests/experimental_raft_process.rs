@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::fmt::Write as _;

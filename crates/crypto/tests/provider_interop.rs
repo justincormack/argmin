@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #![cfg(feature = "openssl")]
 
 use md5_legacy::Digest as _;

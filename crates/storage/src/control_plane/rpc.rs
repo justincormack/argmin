@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #[derive(Clone)]
 pub struct UnixControlPlaneClient {
     endpoints: Arc<[ControlPlaneRpcClientEndpoint]>,

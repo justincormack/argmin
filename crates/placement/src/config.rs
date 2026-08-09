@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use thiserror::Error;
 
 /// Parameters for one placement scheme. Cheap to copy.

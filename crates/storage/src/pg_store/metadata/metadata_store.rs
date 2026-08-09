@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 impl PgMetadataStore for PgStore {
     #[cfg(test)]
     fn create_bucket(

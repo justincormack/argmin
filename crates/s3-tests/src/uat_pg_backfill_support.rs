@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use storage::{BucketName, ObjectKey, PgTopology};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

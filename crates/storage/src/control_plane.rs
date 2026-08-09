@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{ErrorKind, Read as _, Write as _};

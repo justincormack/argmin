@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::gf::{build_mul_tables, encode_rows, gen_cauchy1_matrix};
 use crate::reconstruct::reconstruct_shards;
 use std::sync::OnceLock;

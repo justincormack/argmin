@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
     #[test]
     fn active_object_routes_keep_their_captured_deadline_after_validity_extension() {
         let tmp = test_util::tempdir();

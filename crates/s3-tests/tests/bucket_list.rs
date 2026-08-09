@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use aws_sdk_s3::types::EncodingType;
 use s3_tests::{
     assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,

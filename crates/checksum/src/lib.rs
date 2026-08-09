@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,

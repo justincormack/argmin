@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared test utilities for argmin.
 //!
 //! Provides a temp directory helper that prevents `/tmp` from filling up

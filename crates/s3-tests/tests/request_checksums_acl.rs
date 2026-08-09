@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Request checksum tests for legacy ACL subresources.
 
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration, ObjectOwnership};

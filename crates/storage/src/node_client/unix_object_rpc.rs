@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use crate::metadata_command::{
     CREATE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,

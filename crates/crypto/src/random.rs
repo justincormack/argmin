@@ -1,3 +1,6 @@
+// Copyright The Argmin Authors.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Cryptographically secure random bytes.
 
 #[cfg(all(feature = "ring", not(feature = "openssl")))]
