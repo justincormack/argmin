@@ -100,6 +100,130 @@ fn metadata_command_log_bytes_mismatch_prevents_ack() {
 }
 
 #[test]
+fn witnessed_primary_divergence_preserves_definitive_log_conflict() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let desired_bucket = bucket_for_pg(topology, 1, "witnessed-desired-");
+    let divergent_bucket = bucket_for_pg(topology, 1, "witnessed-divergent-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let desired = create_bucket_metadata_command(PgId::new(1), 1, desired_bucket.clone());
+    let divergent = create_bucket_metadata_command(PgId::new(1), 1, divergent_bucket.clone());
+    let hook_map = Arc::clone(&map);
+    let installed = Arc::new(AtomicBool::new(false));
+    let installed_hook = Arc::clone(&installed);
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, _command| {
+            if node_id == NodeId::new(0) && !installed_hook.swap(true, Ordering::SeqCst) {
+                hook_map
+                    .node(NodeId::new(1))
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(1)
+                    .unwrap()
+                    .apply_metadata_command_and_record(1, &divergent)
+                    .unwrap();
+            }
+            Ok(())
+        },
+    ));
+
+    let error = cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &desired)
+        .unwrap_err();
+    drop(hook);
+
+    assert!(installed.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+            node_id: 1,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            log_index: 1,
+        })
+    ));
+    let witness_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    crate::PgMetadataStore::head_bucket(&*witness_pg, &desired_bucket).unwrap();
+}
+
+#[test]
+fn witnessed_confirmation_deadline_does_not_start_primary_apply_after_oversleep() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "witness-deadline-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let command = create_bucket_metadata_command(PgId::new(1), 1, bucket.clone());
+    let overslept = Arc::new(AtomicBool::new(false));
+    let overslept_hook = Arc::clone(&overslept);
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook = cluster.test_install_after_metadata_command_apply_hook(Arc::new(
+        move |node_id, _command| {
+            if node_id == NodeId::new(0) && !overslept_hook.swap(true, Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1_050));
+            }
+            Ok(())
+        },
+    ));
+
+    let error = cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
+        .unwrap_err();
+    drop(hook);
+
+    assert!(overslept.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::BucketSnapshotLoadError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+            }
+        )
+    ));
+    let witness_pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    crate::PgMetadataStore::head_bucket(&*witness_pg, &bucket).unwrap();
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::head_bucket(&*pg, &bucket),
+            Err(crate::MetadataError::BucketNotFound { .. })
+        ));
+    }
+}
+
+#[test]
 fn metadata_state_digest_mismatch_prevents_ack() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -142,26 +266,25 @@ fn metadata_state_digest_mismatch_prevents_ack() {
     let err = cluster
         .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &second_command)
         .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::BucketSnapshotLoadError::Store(StoreError::MetadataStateDigestMismatch {
-            node_id: 0,
-            pg_id: 1,
-            cluster_epoch: ClusterEpoch::INITIAL,
-            expected_digest: digest,
-            actual_digest: _,
-        }) if digest == expected_digest.value()
-    ));
+    assert!(
+        matches!(
+            &err,
+            crate::BucketSnapshotLoadError::Store(StoreError::MetadataStateDigestMismatch {
+                node_id: 0,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                expected_digest: digest,
+                actual_digest: _,
+            }) if *digest == expected_digest.value()
+        ),
+        "unexpected digest mismatch result: {err:?}"
+    );
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
-        if node_id == NodeId::new(1) {
-            assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_ok());
-        } else {
-            assert!(matches!(
-                crate::PgMetadataStore::head_bucket(&*pg, &second_bucket),
-                Err(crate::MetadataError::BucketNotFound { .. })
-            ));
-        }
+        assert!(matches!(
+            crate::PgMetadataStore::head_bucket(&*pg, &second_bucket),
+            Err(crate::MetadataError::BucketNotFound { .. })
+        ));
     }
 }
 
@@ -433,18 +556,14 @@ fn partially_applied_stream_create_converges_after_bucket_reservation_expires() 
         }));
 
     let session_id = crate::SessionId::try_from("c0".repeat(16)).unwrap();
-    let err = cluster
+    cluster
         .create_put_object_stream_session_record(
             &bucket,
             &key,
             &session_id,
             crate::ObjectEncryption::None,
         )
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::ObjectPgActionError::Store(StoreError::Io { .. })
-    ));
+        .unwrap();
 
     let primary_pg = map
         .node(NodeId::new(1))
@@ -706,7 +825,7 @@ fn stream_put_create_keeps_reservation_until_pending_converges() {
         }));
 
     let session_id = crate::SessionId::try_from("d0".repeat(16)).unwrap();
-    let err = cluster
+    cluster
         .create_put_object_stream_session_raw(
             &bucket,
             &key,
@@ -724,11 +843,8 @@ fn stream_put_create_keeps_reservation_until_pending_converges() {
                 ))
             },
         )
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::BucketSnapshotLoadError::Store(StoreError::Io { .. })
-    ));
+        .unwrap()
+        .unwrap();
 
     let primary_pg = map
         .node(NodeId::new(1))
@@ -1013,18 +1129,14 @@ fn put_object_stream_create_open_time_convergence_preserves_bucket_write_reserva
         }));
 
     let session_id = crate::SessionId::try_from("c2".repeat(16)).unwrap();
-    let err = cluster
+    cluster
         .create_put_object_stream_session_record(
             &bucket,
             &key,
             &session_id,
             crate::ObjectEncryption::None,
         )
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::ObjectPgActionError::Store(StoreError::Io { .. })
-    ));
+        .unwrap();
     drop(hook_guard);
 
     let primary_pg = map
@@ -2343,24 +2455,14 @@ fn required_reservation_release_keeps_durable_slot_until_partial_apply_retry() {
         },
     ));
 
-    let err = cluster
+    cluster
         .release_object_generation_reservation_command_required(
             pg_id,
             &bucket,
             &key,
             &reservation_id,
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected required release apply failure",
-                ..
-            })
-        ),
-        "expected injected release failure, got {err:?}"
-    );
+        .unwrap();
     assert!(!fail_once.load(Ordering::SeqCst));
     {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();

@@ -517,6 +517,33 @@ pub(crate) enum StoreError {
     MetadataCommandContention { context: &'static str },
 
     #[error(
+        "metadata command outcome is unconfirmed for PG {pg_id} epoch {cluster_epoch} log index {log_index}"
+    )]
+    MetadataCommandOutcomeUnconfirmed {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+
+    #[error(
+        "metadata command is irrevocable but awaiting convergence for PG {pg_id} epoch {cluster_epoch} log index {log_index}"
+    )]
+    MetadataCommandIrrevocableConvergencePending {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+
+    #[error(
+        "metadata command dependency is published but not converged for PG {pg_id} epoch {cluster_epoch} log index {log_index}"
+    )]
+    MetadataCommandDependencyConvergencePending {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+
+    #[error(
         "metadata transfer adoption for PG {pg_id} epoch {cluster_epoch} requires at least one retained command"
     )]
     MetadataTransferEmpty {
@@ -816,6 +843,9 @@ impl StoreError {
             | Self::MetadataCommandFromNonPrimary { .. }
             | Self::MetadataTransferEmpty { .. }
             | Self::MetadataCommandPendingOnNonPrimary { .. }
+            | Self::MetadataCommandOutcomeUnconfirmed { .. }
+            | Self::MetadataCommandIrrevocableConvergencePending { .. }
+            | Self::MetadataCommandDependencyConvergencePending { .. }
             | Self::MetadataCommandLogChecksumMismatch { .. }
             | Self::MetadataCommandLogHashMismatch { .. }
             | Self::MetadataCommandReplicaStateEncodingVersion { .. }
@@ -898,6 +928,9 @@ impl StoreError {
             }
             Self::ObjectPayloadReclaimFenceAuthorityMismatch
             | Self::MetadataTransferEmpty { .. }
+            | Self::MetadataCommandOutcomeUnconfirmed { .. }
+            | Self::MetadataCommandIrrevocableConvergencePending { .. }
+            | Self::MetadataCommandDependencyConvergencePending { .. }
             | Self::MetadataCommandReplicaStateMissing { .. }
             | Self::MetadataTransferUnsupportedProof { .. }
             | Self::ShardScavengerObservationWrongPg { .. }
@@ -1098,6 +1131,15 @@ impl StoreError {
             Self::StaleShardOperation { .. } => "stale_shard_operation",
             Self::StaleShardLocation { .. } => "stale_shard_location",
             Self::MetadataCommandContention { .. } => "metadata_command_contention",
+            Self::MetadataCommandOutcomeUnconfirmed { .. } => {
+                "metadata_command_outcome_unconfirmed"
+            }
+            Self::MetadataCommandIrrevocableConvergencePending { .. } => {
+                "metadata_command_irrevocable_convergence_pending"
+            }
+            Self::MetadataCommandDependencyConvergencePending { .. } => {
+                "metadata_command_dependency_convergence_pending"
+            }
             Self::MetadataTransferEmpty { .. } => "metadata_transfer_empty",
             Self::MetadataCommandPendingOnNonPrimary { .. } => {
                 "metadata_command_pending_on_non_primary"
@@ -3970,6 +4012,36 @@ mod tests {
                 "unexpected request classification for {code:?}"
             );
         }
+        assert_eq!(
+            StoreError::MetadataCommandOutcomeUnconfirmed {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            }
+            .operation_failure_class(),
+            StoreOperationFailureClass::Other,
+            "an irrevocable but unconfirmed command must not become retryable contention"
+        );
+        assert_eq!(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            }
+            .operation_failure_class(),
+            StoreOperationFailureClass::Other,
+            "an irrevocable command awaiting convergence must not become retryable contention"
+        );
+        assert_eq!(
+            StoreError::MetadataCommandDependencyConvergencePending {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            }
+            .operation_failure_class(),
+            StoreOperationFailureClass::Other,
+            "a published dependency awaiting convergence must not become retryable contention"
+        );
 
         for class in [
             StoreOperationFailureClass::ResourceExhausted,
@@ -4796,6 +4868,37 @@ mod tests {
             );
             assert_eq!(DirectPutFailure::for_test(expected).kind(), expected);
         }
+
+        assert_eq!(
+            convert(ObjectPgActionError::Store(
+                StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: 2,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 3,
+                },
+            )),
+            DirectPutFailureKind::InternalError
+        );
+        assert_eq!(
+            convert(ObjectPgActionError::Store(
+                StoreError::MetadataCommandIrrevocableConvergencePending {
+                    pg_id: 2,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 3,
+                },
+            )),
+            DirectPutFailureKind::InternalError
+        );
+        assert_eq!(
+            convert(ObjectPgActionError::Store(
+                StoreError::MetadataCommandDependencyConvergencePending {
+                    pg_id: 2,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 3,
+                },
+            )),
+            DirectPutFailureKind::InternalError
+        );
 
         assert_eq!(
             convert(ObjectPgActionError::Metadata(

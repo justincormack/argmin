@@ -363,7 +363,7 @@ fn stream_put_create_partial_apply_retry_reuses_existing_session() {
         },
     ));
 
-    let err = cluster
+    cluster
         .create_put_object_stream_session_raw(
             &bucket,
             &key,
@@ -373,17 +373,8 @@ fn stream_put_create_partial_apply_retry_reuses_existing_session() {
                 Ok::<_, ()>(((), create.clone()))
             },
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected stream create metadata command replica apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap()
+        .unwrap();
     drop(hook_guard);
 
     assert!(
@@ -633,13 +624,15 @@ fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
             match command.payload() {
                 MetadataCommandPayload::CreateStreamUpload(create)
                     if create.session.session_id == hook_session_id
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected stream create metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected stream create metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected stream create metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -659,7 +652,8 @@ fn stream_put_create_drains_unrelated_pending_create_before_new_session() {
                 Ok::<_, ()>(((), first_create.clone()))
             },
         )
-        .unwrap_err();
+        .expect("published stream create must hand trailing convergence to recovery")
+        .expect("stream-create preparation should produce an outcome");
     drop(hook_guard);
 
     assert!(
@@ -1031,7 +1025,7 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
         },
     ));
 
-    let err = cluster
+    cluster
         .commit_stream_segment_append(
             &bucket,
             &key,
@@ -1040,17 +1034,7 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
             &segment,
             &shard_batch,
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected stream append metadata command replica apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -1898,7 +1882,7 @@ fn stream_append_log_conflict_drain_failure_cleans_unreferenced_payload() {
                         &failure_key,
                         &failure_reservation_id,
                     )
-            ) && node_id == NodeId::new(2)
+            ) && node_id == NodeId::new(0)
                 && fail_once_for_hook.swap(false, Ordering::SeqCst)
             {
                 return Err(StoreError::Io {
@@ -2391,19 +2375,9 @@ fn stream_abort_pending_drain_cleans_terminal_stream_session() {
         },
     ));
 
-    let err = cluster
+    cluster
         .abort_stream_upload_session(&bucket, &key, &session_id)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected stream abort metadata command replica apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -2800,7 +2774,7 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
             Ok::<_, ()>(crate::PreparedStreamPutCommit {
                 value: (),
@@ -2816,17 +2790,9 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
                 encryption: crate::ObjectEncryption::None,
             })
         })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected stream put finalize metadata command replica apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.live_size, payload.len() as u64);
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -4606,7 +4572,7 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
         ec_k: segment.ec_k,
         ec_m: segment.ec_m,
     }];
-    let err = cluster
+    let published = cluster
         .finalize_upload_part_stream(
             &bucket,
             &key,
@@ -4619,17 +4585,9 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
             ),
             |_| Ok::<_, ()>(prepared_stream_part((), &expected_part)),
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected stream part metadata command replica apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap()
+        .unwrap();
+    assert_eq!(published.last_modified, expected_part.last_modified);
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -5003,12 +4961,16 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
             match command.payload() {
                 MetadataCommandPayload::CommitStreamPart(commit)
                     if commit.session_id == hook_session_id
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected stream part reopen apply failure",
-                        source: std::io::Error::other("injected stream part reopen apply failure"),
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected stream part reopen apply failure".to_owned(),
+                        ),
                     });
                 }
                 _ => {}
@@ -5016,7 +4978,7 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
             Ok(())
         },
     ));
-    let err = cluster
+    cluster
         .finalize_upload_part_stream(
             &bucket,
             &key,
@@ -5029,17 +4991,8 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
             ),
             |_| Ok::<_, ()>(prepared_stream_part((), &expected_part)),
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected stream part reopen apply failure",
-                ..
-            })
-        ),
-        "expected injected primary failure, got {err:?}"
-    );
+        .expect("published stream-part finalize must hand trailing convergence to recovery")
+        .expect("stream-part finalize preparation should produce an outcome");
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),

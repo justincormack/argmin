@@ -228,19 +228,10 @@ fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert_eq!(published.versioning, crate::BucketVersioningState::Enabled);
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
@@ -1525,16 +1516,6 @@ fn begin_bucket_delete_retries_after_partial_mark_deleting_conflict() {
         },
     ));
 
-    let err = cluster
-        .begin_bucket_delete_if_current(&bucket, bucket_identity)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
-        ),
-        "partial exact mark deleting conflict should ask the caller to retry, got {err:?}"
-    );
     cluster
         .begin_bucket_delete_if_current(&bucket, bucket_identity)
         .unwrap();
@@ -1545,7 +1526,7 @@ fn begin_bucket_delete_retries_after_partial_mark_deleting_conflict() {
     );
     assert!(
         pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
-        "bucket delete should finish and clear the pending slot after retrying"
+        "bucket delete should converge the exact witnessed command and clear its pending slot"
     );
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
@@ -1652,7 +1633,7 @@ fn begin_bucket_delete_reissues_stale_duplicate_mark_deleting_index() {
 }
 
 #[test]
-fn begin_bucket_delete_reissue_waits_for_primary_last_apply_window() {
+fn begin_bucket_delete_reissue_waits_for_post_primary_replica_apply_window() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1760,7 +1741,7 @@ fn begin_bucket_delete_reissue_waits_for_primary_last_apply_window() {
             .0;
         assert!(
             *guard,
-            "occupant command should pause in the primary-last apply window"
+            "occupant command should pause in the post-primary replica apply window"
         );
     }
 
@@ -4175,7 +4156,7 @@ fn begin_bucket_delete_route_expiry_after_final_visibility_preserves_for_fenced_
 }
 
 #[test]
-fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
+fn begin_bucket_delete_post_publication_route_loss_returns_success_and_retains_recovery_slot() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4201,27 +4182,15 @@ fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
 
     let hook_calls = Arc::new(AtomicUsize::new(0));
     let hook_calls_for_hook = Arc::clone(&hook_calls);
-    let hook_map = Arc::clone(&map);
     let hook_bucket = bucket.clone();
-    let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+    let _hook_guard = cluster.test_install_after_metadata_command_apply_hook(Arc::new(
         move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::MarkBucketDeleting(mark)
                     if mark.bucket_name() == &hook_bucket
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0 =>
                 {
-                    for node_id in [NodeId::new(0), NodeId::new(2)] {
-                        let node = hook_map.node(node_id).unwrap().storage_node();
-                        let pg = node.get_pg(command.id().pg_id().get())?;
-                        pg.apply_metadata_command_and_record(node_id.as_u32(), command)
-                            .map_err(|error| match error {
-                                crate::BucketSnapshotLoadError::Store(error) => error,
-                                crate::BucketSnapshotLoadError::Metadata(error) => {
-                                    panic!("manual mark deleting command apply failed: {error}")
-                                }
-                            })?;
-                    }
                     return Err(StoreError::RouteMapExpired {
                         cluster_epoch: ClusterEpoch::INITIAL,
                         valid_until_ms: 0,
@@ -4234,24 +4203,17 @@ fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
         },
     ));
 
-    let first_err = cluster
+    cluster
         .begin_bucket_delete_if_current(&bucket, bucket_identity)
-        .unwrap_err();
-    assert!(
-        matches!(
-            first_err,
-            crate::BucketWriteDrainError::Store(StoreError::RouteMapExpired { .. })
-        ),
-        "expected injected post-commit route error, got {first_err:?}"
-    );
+        .expect("post-publication route loss must not replace the committed outcome");
     assert_eq!(
         hook_calls.load(Ordering::SeqCst),
         1,
-        "first attempt should inject exactly once after committing MarkBucketDeleting"
+        "first attempt should inject exactly once after publishing MarkBucketDeleting"
     );
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
-        "response loss after committed MarkBucketDeleting may leave a terminal pending command for retry cleanup"
+        "post-publication recovery handoff must retain the exact pending command"
     );
 
     cluster
@@ -4259,8 +4221,8 @@ fn begin_bucket_delete_committed_response_loss_retry_observes_deleting() {
         .expect("retry should observe the committed bucket delete");
     assert_eq!(
         hook_calls.load(Ordering::SeqCst),
-        1,
-        "committed retry should not rerun MarkBucketDeleting apply"
+        2,
+        "committed retry must replay the exact retained MarkBucketDeleting command"
     );
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
@@ -6084,13 +6046,15 @@ fn begin_bucket_delete_drains_pending_lifecycle_current_expiry_marker() {
                 MetadataCommandPayload::InsertDeleteMarker(marker)
                     if marker.bucket == hook_bucket
                         && marker.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(1)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected lifecycle current expiry apply failure",
-                        source: std::io::Error::other(
-                            "injected lifecycle current expiry apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "injected lifecycle current expiry apply failure",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected lifecycle current expiry apply failure".to_owned(),
                         ),
                     });
                 }
@@ -6100,7 +6064,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_current_expiry_marker() {
         },
     ));
 
-    let err = cluster
+    cluster
         .expire_current_object_if_due_raw(
             &bucket,
             &key,
@@ -6108,17 +6072,8 @@ fn begin_bucket_delete_drains_pending_lifecycle_current_expiry_marker() {
             current_bucket_incarnation(&cluster, &bucket),
             |_, _| Ok::<_, ()>(true),
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected lifecycle current expiry apply failure",
-                ..
-            })
-        ),
-        "expected injected lifecycle current expiry failure, got {err:?}"
-    );
+        .expect("published lifecycle expiry should hand trailing convergence to recovery")
+        .expect("lifecycle current-expiry predicate should succeed");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
@@ -6212,13 +6167,15 @@ fn begin_bucket_delete_drains_pending_lifecycle_noncurrent_expiry() {
                     if delete.bucket == hook_bucket
                         && delete.key == hook_key
                         && delete.version_id == older_version
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(1)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected lifecycle noncurrent expiry apply failure",
-                        source: std::io::Error::other(
-                            "injected lifecycle noncurrent expiry apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "injected lifecycle noncurrent expiry apply failure",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected lifecycle noncurrent expiry apply failure".to_owned(),
                         ),
                     });
                 }
@@ -6228,24 +6185,15 @@ fn begin_bucket_delete_drains_pending_lifecycle_noncurrent_expiry() {
         },
     ));
 
-    let err = cluster
+    cluster
         .delete_noncurrent_live_versions_if_due_raw(
             &bucket,
             &key,
             current_bucket_incarnation(&cluster, &bucket),
             |_, _| Ok::<_, ()>(HashSet::from([older.version_id])),
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected lifecycle noncurrent expiry apply failure",
-                ..
-            })
-        ),
-        "expected injected lifecycle noncurrent expiry failure, got {err:?}"
-    );
+        .expect("published lifecycle expiry should hand trailing convergence to recovery")
+        .expect("lifecycle noncurrent-expiry predicate should succeed");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
@@ -6350,13 +6298,15 @@ fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() 
                             delete.target,
                             DeleteObjectVersionTarget::DeleteMarker { .. }
                         )
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(1)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected lifecycle delete-marker cleanup apply failure",
-                        source: std::io::Error::other(
-                            "injected lifecycle delete-marker cleanup apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "injected lifecycle delete-marker cleanup apply failure",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected lifecycle delete-marker cleanup apply failure".to_owned(),
                         ),
                     });
                 }
@@ -6366,7 +6316,7 @@ fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() 
         },
     ));
 
-    let err = cluster
+    cluster
         .delete_expired_delete_marker_if_due_raw(
             &bucket,
             &key,
@@ -6374,17 +6324,8 @@ fn begin_bucket_delete_drains_pending_lifecycle_expired_delete_marker_cleanup() 
             current_bucket_incarnation(&cluster, &bucket),
             |_, _| Ok::<_, ()>(true),
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected lifecycle delete-marker cleanup apply failure",
-                ..
-            })
-        ),
-        "expected injected lifecycle delete-marker cleanup failure, got {err:?}"
-    );
+        .expect("published lifecycle cleanup should hand trailing convergence to recovery")
+        .expect("lifecycle delete-marker predicate should succeed");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(

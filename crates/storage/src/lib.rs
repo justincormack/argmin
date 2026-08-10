@@ -827,6 +827,23 @@ pub mod test_support {
         ) -> TestMetadataCommandApplyHookGuard;
     }
 
+    fn metadata_command_first_publication_node(
+        storage_cluster: &StorageCluster,
+        pg_id: PgId,
+    ) -> NodeId {
+        let route = storage_cluster
+            .local_pg_route(pg_id)
+            .expect("test metadata route must exist");
+        let primary = route.primary_node_id();
+        route
+            .acting_set()
+            .iter()
+            .copied()
+            .filter(|node_id| *node_id != primary)
+            .min()
+            .unwrap_or(primary)
+    }
+
     impl StorageClusterMetadataCommandTestSupport for StorageCluster {
         fn test_capture_object_metadata_command_state(
             &self,
@@ -895,27 +912,24 @@ pub mod test_support {
             kind: MetadataCommandApplyTestKind,
         ) -> TestMetadataCommandApplyHookGuard {
             let pg_id = self.test_bucket_pg_id_for(bucket);
-            let primary_node = self
-                .local_pg_route(PgId::new(pg_id))
-                .expect("test bucket metadata route must exist")
-                .primary_node_id();
+            let publication_node = metadata_command_first_publication_node(self, PgId::new(pg_id));
             let cluster_epoch = self.operation_epoch();
-            self.test_install_before_bucket_metadata_command_primary_apply_hook(
-                bucket,
-                Arc::new(move |observed_kind| {
-                    if observed_kind == kind {
-                        return Err(TestInjectedStorageFailure::new(
-                            StoreError::MetadataCommandLogConflict {
-                                node_id: primary_node.as_u32(),
-                                pg_id,
-                                cluster_epoch,
-                                log_index: 1,
-                            },
-                        ));
-                    }
-                    Ok(())
-                }),
-            )
+            let bucket = bucket.clone();
+            self.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+                if context.node_id == publication_node
+                    && context.bucket.as_ref() == Some(&bucket)
+                    && context.key.is_none()
+                    && context.kind == kind
+                {
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id: publication_node.as_u32(),
+                        pg_id,
+                        cluster_epoch,
+                        log_index: 1,
+                    });
+                }
+                Ok(())
+            }))
         }
 
         fn test_install_object_metadata_command_log_conflict(
@@ -925,28 +939,25 @@ pub mod test_support {
             kind: MetadataCommandApplyTestKind,
         ) -> TestMetadataCommandApplyHookGuard {
             let pg_id = self.test_object_pg_id_for(bucket, key);
-            let primary_node = self
-                .local_pg_route(PgId::new(pg_id))
-                .expect("test object metadata route must exist")
-                .primary_node_id();
+            let publication_node = metadata_command_first_publication_node(self, PgId::new(pg_id));
             let cluster_epoch = self.operation_epoch();
-            self.test_install_before_object_metadata_command_primary_apply_hook(
-                bucket,
-                key,
-                Arc::new(move |observed_kind| {
-                    if observed_kind == kind {
-                        return Err(TestInjectedStorageFailure::new(
-                            StoreError::MetadataCommandLogConflict {
-                                node_id: primary_node.as_u32(),
-                                pg_id,
-                                cluster_epoch,
-                                log_index: 1,
-                            },
-                        ));
-                    }
-                    Ok(())
-                }),
-            )
+            let bucket = bucket.clone();
+            let key = key.clone();
+            self.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+                if context.node_id == publication_node
+                    && context.bucket.as_ref() == Some(&bucket)
+                    && context.key.as_ref() == Some(&key)
+                    && context.kind == kind
+                {
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id: publication_node.as_u32(),
+                        pg_id,
+                        cluster_epoch,
+                        log_index: 1,
+                    });
+                }
+                Ok(())
+            }))
         }
 
         fn test_install_object_metadata_command_log_conflict_once(
@@ -956,29 +967,27 @@ pub mod test_support {
             kind: MetadataCommandApplyTestKind,
         ) -> TestMetadataCommandApplyHookGuard {
             let pg_id = self.test_object_pg_id_for(bucket, key);
-            let primary_node = self
-                .local_pg_route(PgId::new(pg_id))
-                .expect("test object metadata route must exist")
-                .primary_node_id();
+            let publication_node = metadata_command_first_publication_node(self, PgId::new(pg_id));
             let cluster_epoch = self.operation_epoch();
             let pending_failure = AtomicBool::new(true);
-            self.test_install_before_object_metadata_command_primary_apply_hook(
-                bucket,
-                key,
-                Arc::new(move |observed_kind| {
-                    if observed_kind == kind && pending_failure.swap(false, Ordering::SeqCst) {
-                        return Err(TestInjectedStorageFailure::new(
-                            StoreError::MetadataCommandLogConflict {
-                                node_id: primary_node.as_u32(),
-                                pg_id,
-                                cluster_epoch,
-                                log_index: 1,
-                            },
-                        ));
-                    }
-                    Ok(())
-                }),
-            )
+            let bucket = bucket.clone();
+            let key = key.clone();
+            self.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+                if context.node_id == publication_node
+                    && context.bucket.as_ref() == Some(&bucket)
+                    && context.key.as_ref() == Some(&key)
+                    && context.kind == kind
+                    && pending_failure.swap(false, Ordering::SeqCst)
+                {
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id: publication_node.as_u32(),
+                        pg_id,
+                        cluster_epoch,
+                        log_index: 1,
+                    });
+                }
+                Ok(())
+            }))
         }
 
         fn test_install_object_metadata_command_stale_apply_once(
@@ -995,22 +1004,24 @@ pub mod test_support {
                 .and_then(ClusterEpoch::new)
                 .expect("test operation epoch must permit a successor");
             let pending_failure = AtomicBool::new(true);
-            self.test_install_before_object_metadata_command_primary_apply_hook(
-                bucket,
-                key,
-                Arc::new(move |observed_kind| {
-                    if observed_kind == kind && pending_failure.swap(false, Ordering::SeqCst) {
-                        return Err(TestInjectedStorageFailure::new(
-                            StoreError::StaleMetadataOperation {
-                                pg_id,
-                                operation_epoch,
-                                current_epoch,
-                            },
-                        ));
-                    }
-                    Ok(())
-                }),
-            )
+            let publication_node = metadata_command_first_publication_node(self, PgId::new(pg_id));
+            let bucket = bucket.clone();
+            let key = key.clone();
+            self.test_install_before_metadata_command_apply_context_hook(Arc::new(move |context| {
+                if context.node_id == publication_node
+                    && context.bucket.as_ref() == Some(&bucket)
+                    && context.key.as_ref() == Some(&key)
+                    && context.kind == kind
+                    && pending_failure.swap(false, Ordering::SeqCst)
+                {
+                    return Err(StoreError::StaleMetadataOperation {
+                        pg_id,
+                        operation_epoch,
+                        current_epoch,
+                    });
+                }
+                Ok(())
+            }))
         }
     }
 

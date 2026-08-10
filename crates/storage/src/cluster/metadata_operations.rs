@@ -2,6 +2,21 @@
 // SPDX-License-Identifier: Apache-2.0
 
 impl StorageCluster {
+    fn metadata_command_publication_order_key(
+        node_id: NodeId,
+        primary_node_id: NodeId,
+        witness_node_id: Option<NodeId>,
+    ) -> (u8, NodeId) {
+        let publication_rank = if Some(node_id) == witness_node_id {
+            0
+        } else if node_id == primary_node_id {
+            1
+        } else {
+            2
+        };
+        (publication_rank, node_id)
+    }
+
     fn emit_metadata_command_conflict(
         &self,
         node_id: Option<NodeId>,
@@ -250,13 +265,57 @@ impl StorageCluster {
         source: &BucketSnapshotLoadError,
         route_mode: MetadataCommandRouteMode,
     ) -> Result<bool, BucketSnapshotLoadError> {
+        self.partial_exact_metadata_command_conflict_is_retryable_with_route_mode_and_deadline(
+            pg_id,
+            command,
+            applied_nodes,
+            source,
+            route_mode,
+            None,
+        )
+    }
+
+    fn partial_exact_metadata_command_conflict_is_retryable_with_route_mode_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        applied_nodes: usize,
+        source: &BucketSnapshotLoadError,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.partial_exact_metadata_command_conflict_is_retryable_with_route_mode_and_deadline(
+            pg_id,
+            command,
+            applied_nodes,
+            source,
+            route_mode,
+            Some(deadline),
+        )
+    }
+
+    fn partial_exact_metadata_command_conflict_is_retryable_with_route_mode_and_deadline(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        applied_nodes: usize,
+        source: &BucketSnapshotLoadError,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Option<Instant>,
+    ) -> Result<bool, BucketSnapshotLoadError> {
         fn entry_hashes_or_not_retryable(
             metadata_command_client: &dyn MetadataCommandInspectionNodeClient,
             pg_id: PgId,
             command: &MetadataCommandEnvelope,
+            deadline: Option<Instant>,
         ) -> Result<Option<(u64, u64)>, BucketSnapshotLoadError> {
-            match metadata_command_client.applied_metadata_command_log_entry_hashes(pg_id, command)
-            {
+            let result = match deadline {
+                Some(deadline) => metadata_command_client
+                    .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline),
+                None => metadata_command_client
+                    .applied_metadata_command_log_entry_hashes(pg_id, command),
+            };
+            match result {
                 Ok(hashes) => Ok(hashes),
                 Err(StoreError::MetadataCommandLogConflict { .. }) => Ok(None),
                 Err(error) => Err(error.into()),
@@ -279,33 +338,6 @@ impl StorageCluster {
             return Ok(false);
         }
 
-        let primary_node_id = self
-            .local_map
-            .pg_route(pg_id)
-            .expect("validated metadata PG command route must exist")
-            .primary_node_id();
-        let mut nodes = match route_mode {
-            MetadataCommandRouteMode::Normal => self
-                .local_map
-                .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id),
-            MetadataCommandRouteMode::Recovery => self
-                .local_map
-                .metadata_pg_acting_nodes_for_metadata_command_recovery(
-                    command.id().cluster_epoch(),
-                    pg_id,
-                ),
-        }?;
-        nodes.sort_by_key(|node| node.node_id() != primary_node_id);
-        let Some(conflict_index) = nodes
-            .iter()
-            .position(|node| node.node_id().as_u32() == *conflict_node_id)
-        else {
-            return Ok(false);
-        };
-        if conflict_index != applied_nodes {
-            return Ok(false);
-        }
-
         let primary = match route_mode {
             MetadataCommandRouteMode::Normal => self
                 .local_map
@@ -317,9 +349,45 @@ impl StorageCluster {
                     pg_id,
                 ),
         }?;
-        let primary_state = primary
-            .metadata_command_inspection_client()
-            .metadata_command_replica_state(pg_id)?;
+        let primary_node_id = primary.node_id();
+        let mut nodes = match route_mode {
+            MetadataCommandRouteMode::Normal => self
+                .local_map
+                .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id),
+            MetadataCommandRouteMode::Recovery => self
+                .local_map
+                .metadata_pg_acting_nodes_for_metadata_command_recovery(
+                    command.id().cluster_epoch(),
+                    pg_id,
+                ),
+        }?;
+        let witness_node_id = nodes
+            .iter()
+            .map(|node| node.node_id())
+            .filter(|node_id| *node_id != primary_node_id)
+            .min();
+        nodes.sort_by_key(|node| {
+            Self::metadata_command_publication_order_key(
+                node.node_id(),
+                primary_node_id,
+                witness_node_id,
+            )
+        });
+        let Some(conflict_index) = nodes
+            .iter()
+            .position(|node| node.node_id().as_u32() == *conflict_node_id)
+        else {
+            return Ok(false);
+        };
+        if conflict_index != applied_nodes {
+            return Ok(false);
+        }
+
+        let primary_client = primary.metadata_command_inspection_client();
+        let primary_state = match deadline {
+            Some(deadline) => primary_client.metadata_command_replica_state_until(pg_id, deadline),
+            None => primary_client.metadata_command_replica_state(pg_id),
+        }?;
         let command_log_index = command.id().log_index().get();
         let expected_previous_log_hash =
             if command_log_index == primary_state.applied_log_index.saturating_add(1) {
@@ -329,6 +397,7 @@ impl StorageCluster {
                     primary.metadata_command_inspection_client().as_ref(),
                     pg_id,
                     command,
+                    deadline,
                 )?
                 else {
                     return Ok(false);
@@ -347,6 +416,7 @@ impl StorageCluster {
                 node.metadata_command_inspection_client().as_ref(),
                 pg_id,
                 command,
+                deadline,
             )?;
             match (index <= conflict_index, hashes, expected_hashes) {
                 (true, Some(hashes), None) if hashes.0 == expected_previous_log_hash => {
@@ -4210,9 +4280,26 @@ impl StorageCluster {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn validate_metadata_command_bucket_write_reservation(
         &self,
         command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.validate_metadata_command_bucket_write_reservation_inner(command, None)
+    }
+
+    pub(super) fn validate_metadata_command_bucket_write_reservation_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.validate_metadata_command_bucket_write_reservation_inner(command, Some(deadline))
+    }
+
+    fn validate_metadata_command_bucket_write_reservation_inner(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Option<Instant>,
     ) -> Result<(), BucketSnapshotLoadError> {
         let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
             return Ok(());
@@ -4229,13 +4316,17 @@ impl StorageCluster {
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), PgId::new(pg_id))?;
-        node.bucket_write_reservation_client()
+        let route = node
+            .bucket_write_reservation_client()
             .open_bucket_write_reservation_route(
                 self.operation_epoch(),
                 self.validated_bucket_metadata_pg(PgId::new(pg_id)),
                 &proof.bucket,
-            )
-            .and_then(|route| route.validate_bucket_write_reservation_proof(proof))
+            )?;
+        match deadline {
+            Some(deadline) => route.validate_bucket_write_reservation_proof_until(proof, deadline),
+            None => route.validate_bucket_write_reservation_proof(proof),
+        }
     }
 
     fn metadata_command_bucket_write_reservation_subject_matches(

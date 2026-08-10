@@ -369,6 +369,9 @@ use checksum::{ChecksumAlgorithm, ChecksumHasher};
 
 #[cfg(test)]
 type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
+#[cfg(test)]
+type StorageRpcResponseEnvelopeTestHook =
+    Arc<dyn Fn(StorageRpcMessageKind, &mut Vec<u8>) + Send + Sync>;
 
 const STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME: &str = ".argmin-storage-node.lock";
 const STORAGE_NODE_INCARNATION_FILE: &str = "control-plane-node-incarnation";
@@ -454,6 +457,17 @@ impl StorageNodeConnectionHandler {
                     format!("storage RPC response authentication failed: {error}"),
                 ))
             })?;
+        #[cfg(test)]
+        let mut envelope = envelope;
+        #[cfg(test)]
+        if let Some(hook) = self
+            .response_envelope_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            hook(response.kind, &mut envelope);
+        }
         write_storage_rpc_auth_transport_frame_with_limit(
             stream,
             &envelope,
@@ -7157,11 +7171,28 @@ impl StorageNodeConnectionHandler {
         session: &StorageNodeSession,
         request: StorageRpcMetadataCommandStateRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
-        if let Err(error) = self.validate_pg_route_for_metadata_transfer_inspection(
-            request.node_id,
-            request.cluster_epoch,
-            request.pg_id,
-        ) {
+        let route_validation = if request.cluster_epoch < self.config.cluster_epoch {
+            self.validate_metadata_command_recovery_read(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+                false,
+            )
+            .or_else(|_| {
+                self.validate_pg_route_for_metadata_transfer_inspection(
+                    request.node_id,
+                    request.cluster_epoch,
+                    request.pg_id,
+                )
+            })
+        } else {
+            self.validate_pg_route_for_metadata_transfer_inspection(
+                request.node_id,
+                request.cluster_epoch,
+                request.pg_id,
+            )
+        };
+        if let Err(error) = route_validation {
             return encode_storage_rpc_error_response(&error);
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);

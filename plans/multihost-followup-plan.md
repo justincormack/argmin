@@ -474,6 +474,28 @@ boundary for:
 Each point must state whether restart completes, retries, quarantines, or
 requires operator repair.
 
+For metadata-command fanout, the matrix must enforce the publication and retry
+contract in `guides/metadata-command-stream.md`: pre-dispatch rejection remains
+abortable; the deterministic off-primary witness precedes primary publication;
+confirmed or transport-ambiguous dispatch to either enters irrevocable
+convergence; trailing replicas converge that exact command through a bounded,
+deduplicated worker handoff; and no retryable S3 response is emitted after
+witness dispatch. Cover witness and primary apply, every trailing-replica
+position, each response-loss boundary, persistent replica outage, reservation
+expiry during convergence, request-budget expiry before and after publication,
+process restart, route transition, terminal cleanup, and loss of the publishing
+primary plus its coordinator. Assert the request worker is released after
+confirmed publication, the exact epoch/index/checksum survives every replay,
+and the retained slot is not cleaned before all replicas converge. Run the same
+cases through embedded and authenticated Unix/TCP clients so transport
+classification cannot silently change the contract.
+
+At the transport boundary, distinguish authenticated Unix and TLS/TCP
+`NotSent` connection failures from post-commit response loss, malformed
+payloads, and response-authentication rejection (`MayHaveApplied`). Exercise
+one absolute confirmation deadline across admission, connect, write, read, and
+state observation, including scheduler delay immediately before a retry.
+
 ### 5.4 Network And Process Nemesis
 
 Add a bounded proxy/fault transport for asymmetric partition, response loss,

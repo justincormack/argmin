@@ -2724,7 +2724,11 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
     let server_thread = {
         let server = Arc::clone(&server);
-        thread::spawn(move || server.accept_one().unwrap())
+        thread::spawn(move || {
+            for _ in 0..2 {
+                server.accept_one().unwrap();
+            }
+        })
     };
 
     let frontend_data_dir = tmp.path().join("frontend-only-metadata-routing");

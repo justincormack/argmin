@@ -156,6 +156,8 @@ pub struct StorageNodeServer {
     runtime_route_capture_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
     #[cfg(test)]
     runtime_route_before_publish_lock_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
+    #[cfg(test)]
+    response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
 }
 
 #[cfg(test)]
@@ -793,6 +795,8 @@ impl StorageNodeServer {
             runtime_route_capture_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             runtime_route_before_publish_lock_test_hook: Mutex::new(None),
+            #[cfg(test)]
+            response_envelope_test_hook: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -822,7 +826,7 @@ impl StorageNodeServer {
     }
 
     #[cfg(test)]
-    fn tcp_listener_addr_for_test(&self) -> SocketAddr {
+    pub(crate) fn tcp_listener_addr_for_test(&self) -> SocketAddr {
         self.listeners
             .iter()
             .find_map(|listener| match listener {
@@ -1224,7 +1228,20 @@ impl StorageNodeServer {
             rpc_auth: self.rpc_auth.clone(),
             #[cfg(test)]
             runtime_route_capture_test_hook: Arc::clone(&self.runtime_route_capture_test_hook),
+            #[cfg(test)]
+            response_envelope_test_hook: Arc::clone(&self.response_envelope_test_hook),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_response_envelope_test_hook(
+        &self,
+        hook: StorageRpcResponseEnvelopeTestHook,
+    ) {
+        *self
+            .response_envelope_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     fn config_snapshot(&self) -> StorageNodeProcessConfig {

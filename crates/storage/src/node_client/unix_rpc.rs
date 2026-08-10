@@ -1859,6 +1859,58 @@ impl UnixStorageNodeClient {
         payload: Vec<u8>,
         rpc_permit: UnixStorageNodeRpcAdmissionPermit,
     ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        let io_timeout = storage_rpc_io_timeout(self.rpc_auth.as_deref());
+        let deadline = Instant::now()
+            .checked_add(io_timeout)
+            .ok_or_else(|| StoreError::Io {
+                context: "compute storage-node RPC deadline",
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "storage-node RPC deadline overflowed",
+                ),
+            })?;
+        self.rpc_request_result_with_permit_until(kind, payload, rpc_permit, deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)
+    }
+
+    fn rpc_request_until(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, StoreError> {
+        match self
+            .rpc_request_result_until(kind, payload, deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+        {
+            Ok(payload) => Ok(payload),
+            Err(error) => Err(self.rpc_response_error(kind, error)),
+        }
+    }
+
+    fn rpc_request_result_until(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StorageRpcRequestDispatchFailure> {
+        let rpc_permit = self
+            .acquire_rpc_admission_with_class_until(
+                kind,
+                storage_rpc_admission_class(kind),
+                deadline,
+            )
+            .map_err(StorageRpcRequestDispatchFailure::NotSent)?;
+        self.rpc_request_result_with_permit_until(kind, payload, rpc_permit, deadline)
+    }
+
+    fn rpc_request_result_with_permit_until(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        rpc_permit: UnixStorageNodeRpcAdmissionPermit,
+        deadline: Instant,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StorageRpcRequestDispatchFailure> {
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let started = Instant::now();
         let _pending_envelope_guard =
@@ -1885,15 +1937,13 @@ impl UnixStorageNodeClient {
                 ),
             );
         }
-        let io_timeout = storage_rpc_io_timeout(self.rpc_auth.as_deref());
-        let deadline = started
-            .checked_add(io_timeout)
-            .ok_or_else(|| StoreError::Io {
-                context: "compute storage-node RPC deadline",
-                source: io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "storage-node RPC deadline overflowed",
-                ),
+        let io_timeout = deadline
+            .checked_duration_since(started)
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                StorageRpcRequestDispatchFailure::NotSent(storage_rpc_deadline_expired(
+                    "start storage-node RPC request",
+                ))
             })?;
         let max_connections = self
             .rpc_auth
@@ -1937,10 +1987,10 @@ impl UnixStorageNodeClient {
                             ),
                         );
                     }
-                    return Err(StoreError::Io {
+                    return Err(StorageRpcRequestDispatchFailure::NotSent(StoreError::Io {
                         context: "connect storage-node RPC endpoint",
                         source,
-                    });
+                    }));
                 }
             };
         let request = StorageRpcFrame {
@@ -1948,7 +1998,7 @@ impl UnixStorageNodeClient {
             kind,
             payload,
         };
-        let request_proof = match write_unix_storage_rpc_request(
+        let request_proof = match write_unix_storage_rpc_request_classified(
             connection.stream_mut(),
             self.node_id,
             self.rpc_auth.as_deref(),
@@ -1962,7 +2012,7 @@ impl UnixStorageNodeClient {
                         "storage_rpc_client",
                         "storage_rpc_client_write_failed",
                         format!(
-                            "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
+                            "node_id={} rpc_request_id={} kind={} elapsed_us={} error={:?}",
                             self.node_id.as_u32(),
                             request_id,
                             kind.operation_name(),
@@ -2025,22 +2075,26 @@ impl UnixStorageNodeClient {
                         ),
                     );
                 }
-                return Err(error);
+                return Err(StorageRpcRequestDispatchFailure::MayHaveApplied(error));
             }
         };
         if response.request_id != request_id || response.kind != kind {
-            return Err(self.rpc_payload_error(
-                "validate storage RPC response",
-                format!(
-                    "expected request {request_id} kind {kind:?}, got request {} kind {:?}",
-                    response.request_id, response.kind
+            return Err(StorageRpcRequestDispatchFailure::MayHaveApplied(
+                self.rpc_payload_error(
+                    "validate storage RPC response",
+                    format!(
+                        "expected request {request_id} kind {kind:?}, got request {} kind {:?}",
+                        response.request_id, response.kind
+                    ),
                 ),
             ));
         }
         let response =
             decode_storage_rpc_response_payload_with_connection_disposition(&response.payload)
                 .map_err(|error| {
-                    self.rpc_payload_error("decode storage RPC response", error.to_string())
+                    StorageRpcRequestDispatchFailure::MayHaveApplied(
+                        self.rpc_payload_error("decode storage RPC response", error.to_string()),
+                    )
                 })?;
         if response.connection_reusable {
             connection.mark_reusable();
@@ -2060,9 +2114,22 @@ impl UnixStorageNodeClient {
         kind: StorageRpcMessageKind,
         class: UnixStorageNodeRpcAdmissionClass,
     ) -> Result<UnixStorageNodeRpcAdmissionPermit, StoreError> {
+        let deadline = Instant::now() + self.rpc_admission.wait_timeout_for_class(class);
+        self.acquire_rpc_admission_with_class_until(kind, class, deadline)
+    }
+
+    pub(crate) fn acquire_rpc_admission_with_class_until(
+        &self,
+        kind: StorageRpcMessageKind,
+        class: UnixStorageNodeRpcAdmissionClass,
+        deadline: Instant,
+    ) -> Result<UnixStorageNodeRpcAdmissionPermit, StoreError> {
         observability::emit_storage_rpc_admission_attempt();
-        let wait_timeout = self.rpc_admission.wait_timeout_for_class(class);
-        match self.rpc_admission.acquire_with_kind(class, kind) {
+        let wait_timeout = deadline.saturating_duration_since(Instant::now());
+        match self
+            .rpc_admission
+            .acquire_with_kind_until(class, kind, deadline)
+        {
             UnixStorageNodeRpcAdmissionAcquire::Acquired { permit, wait_us } => {
                 if wait_us > 0 {
                     let _ = observability::emit_storage_rpc_admission_wait(
@@ -2153,6 +2220,22 @@ impl UnixStorageNodeClient {
         }
     }
 
+    pub(crate) fn rpc_request_bucket_snapshot_until(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, BucketSnapshotLoadError> {
+        match self
+            .rpc_request_result_until(kind, payload, deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)
+            .map_err(BucketSnapshotLoadError::Store)?
+        {
+            Ok(response) => Ok(response),
+            Err(error) => Err(self.bucket_snapshot_rpc_response_error(kind, error)),
+        }
+    }
+
     pub(crate) fn rpc_payload_error(&self, operation: &'static str, message: String) -> StoreError {
         StoreError::StorageRpc {
             node_id: self.node_id.as_u32(),
@@ -2168,14 +2251,26 @@ impl UnixStorageNodeClient {
         &self,
         pg_id: PgId,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let deadline = Instant::now() + storage_rpc_io_timeout(self.rpc_auth.as_deref());
+        self.metadata_command_replica_state_until(pg_id, deadline)
+    }
+
+    fn metadata_command_replica_state_until(
+        &self,
+        pg_id: PgId,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
         let request = StorageRpcMetadataCommandStateRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
             pg_id,
         };
         let payload = encode_metadata_command_state_request(&request);
-        let response =
-            self.rpc_request(StorageRpcMessageKind::MetadataCommandReplicaState, payload)?;
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandReplicaState,
+            payload,
+            deadline,
+        )?;
         decode_metadata_command_state_response(&response)
             .map(|response| response.state)
             .map_err(|error| {
@@ -2538,6 +2633,20 @@ impl UnixStorageNodeClient {
         )
     }
 
+    fn metadata_command_acceptance_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.metadata_command_acceptance_request_until(
+            StorageRpcMessageKind::MetadataCommandAcceptance,
+            pg_id,
+            command,
+            deadline,
+        )
+    }
+
     pub(crate) fn metadata_command_abandon_acceptance(
         &self,
         pg_id: PgId,
@@ -2726,10 +2835,21 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<(u64, u64)>, StoreError> {
+        let deadline = Instant::now() + storage_rpc_io_timeout(self.rpc_auth.as_deref());
+        self.applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline)
+    }
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
         let payload = self.encode_metadata_command_request(pg_id, command)?;
-        let response = self.rpc_request(
+        let response = self.rpc_request_until(
             StorageRpcMessageKind::MetadataCommandAppliedLogHashes,
             payload,
+            deadline,
         )?;
         let response =
             decode_metadata_command_applied_hashes_response(&response).map_err(|error| {
@@ -2914,6 +3034,25 @@ impl UnixStorageNodeClient {
         )
     }
 
+    fn apply_metadata_command_and_record_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        let payload = self
+            .encode_metadata_command_request(pg_id, command)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        self.metadata_command_apply_and_record_with_payload_until(
+            pg_id,
+            command,
+            StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            payload,
+            "decode metadata command apply and record response",
+            deadline,
+        )
+    }
+
     #[allow(dead_code)]
     fn replay_metadata_command_for_peering(
         &self,
@@ -2955,12 +3094,49 @@ impl UnixStorageNodeClient {
         payload: Vec<u8>,
         decode_context: &'static str,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
-        let response = self
-            .rpc_request(kind, payload)
-            .map_err(BucketSnapshotLoadError::Store)?;
+        let deadline = Instant::now()
+            .checked_add(storage_rpc_io_timeout(self.rpc_auth.as_deref()))
+            .ok_or_else(|| {
+                BucketSnapshotLoadError::Store(StoreError::Io {
+                    context: "compute metadata command apply RPC deadline",
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "metadata command apply RPC deadline overflowed",
+                    ),
+                })
+            })?;
+        self.metadata_command_apply_and_record_with_payload_until(
+            pg_id,
+            command,
+            kind,
+            payload,
+            decode_context,
+            deadline,
+        )
+        .map_err(MetadataCommandApplyError::into_source)
+    }
+
+    fn metadata_command_apply_and_record_with_payload_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+        decode_context: &'static str,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        let response = match self.rpc_request_result_until(kind, payload, deadline) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(MetadataCommandApplyError::definitive(
+                    self.bucket_snapshot_rpc_response_error(kind, error),
+                ));
+            }
+            Err(error) => return Err(error.into_metadata_command_apply_error()),
+        };
         let response = decode_metadata_command_state_outcome_response(&response)
             .map_err(|error| self.rpc_payload_error(decode_context, error.to_string()))
-            .map_err(BucketSnapshotLoadError::Store)?;
+            .map_err(MetadataCommandApplyError::may_have_applied)?;
         match response.outcome {
             StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
             StorageRpcMetadataCommandStateOutcome::LogConflict {
@@ -2968,8 +3144,8 @@ impl UnixStorageNodeClient {
                 pg_id: conflict_pg_id,
                 cluster_epoch,
                 log_index,
-            } => Err(BucketSnapshotLoadError::Store(
-                metadata_command_log_conflict_error(
+            } => Err(MetadataCommandApplyError::definitive(
+                BucketSnapshotLoadError::Store(metadata_command_log_conflict_error(
                     self.cluster_epoch,
                     pg_id,
                     "decode metadata command apply and record response",
@@ -2980,21 +3156,25 @@ impl UnixStorageNodeClient {
                         cluster_epoch,
                         log_index,
                     },
-                ),
+                )),
             )),
             StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
                 reservation_id,
                 generation_id,
-            } => Err(BucketSnapshotLoadError::Metadata(
-                MetadataError::ObjectGenerationReservationConflict {
-                    reservation_id: reservation_id.into_string(),
-                    generation_id: generation_id.get(),
-                },
+            } => Err(MetadataCommandApplyError::definitive(
+                BucketSnapshotLoadError::Metadata(
+                    MetadataError::ObjectGenerationReservationConflict {
+                        reservation_id: reservation_id.into_string(),
+                        generation_id: generation_id.get(),
+                    },
+                ),
             )),
             StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
                 version_id,
-            } => Err(BucketSnapshotLoadError::Metadata(
-                MetadataError::ObjectVersionReservationConflict { version_id },
+            } => Err(MetadataCommandApplyError::definitive(
+                BucketSnapshotLoadError::Metadata(
+                    MetadataError::ObjectVersionReservationConflict { version_id },
+                ),
             )),
             StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
                 name,
@@ -3006,8 +3186,12 @@ impl UnixStorageNodeClient {
                 "decode metadata command apply and record response",
                 |operation, message| self.rpc_payload_error(operation, message),
             ) {
-                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
-                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+                Ok(error) => Err(MetadataCommandApplyError::definitive(
+                    BucketSnapshotLoadError::Metadata(error),
+                )),
+                Err(error) => Err(MetadataCommandApplyError::definitive(
+                    BucketSnapshotLoadError::Store(error),
+                )),
             },
             StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
                 bucket,
@@ -3023,14 +3207,18 @@ impl UnixStorageNodeClient {
                 "decode metadata command apply and record response",
                 |operation, message| self.rpc_payload_error(operation, message),
             ) {
-                Ok(error) => Err(BucketSnapshotLoadError::Metadata(error)),
-                Err(error) => Err(BucketSnapshotLoadError::Store(error)),
+                Ok(error) => Err(MetadataCommandApplyError::definitive(
+                    BucketSnapshotLoadError::Metadata(error),
+                )),
+                Err(error) => Err(MetadataCommandApplyError::definitive(
+                    BucketSnapshotLoadError::Store(error),
+                )),
             },
-            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index } => {
-                Err(BucketSnapshotLoadError::Metadata(
+            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index } => Err(
+                MetadataCommandApplyError::definitive(BucketSnapshotLoadError::Metadata(
                     MetadataError::StreamSegmentConflict { segment_index },
-                ))
-            }
+                )),
+            ),
         }
     }
 
@@ -3238,7 +3426,41 @@ impl UnixStorageNodeClient {
             self.rpc_payload_error("encode metadata command request", error.to_string())
         })?;
         let response = self.rpc_request(kind, payload)?;
-        let response = decode_metadata_command_acceptance_response(&response).map_err(|error| {
+        self.decode_metadata_command_acceptance_response(pg_id, &response)
+    }
+
+    fn metadata_command_acceptance_request_until(
+        &self,
+        kind: StorageRpcMessageKind,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            command: command.clone(),
+        };
+        let payload = encode_metadata_command_request(&request).map_err(|error| {
+            self.rpc_payload_error("encode metadata command request", error.to_string())
+        })?;
+        let response = match self
+            .rpc_request_result_until(kind, payload, deadline)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)?
+        {
+            Ok(response) => response,
+            Err(error) => return Err(self.rpc_response_error(kind, error)),
+        };
+        self.decode_metadata_command_acceptance_response(pg_id, &response)
+    }
+
+    fn decode_metadata_command_acceptance_response(
+        &self,
+        pg_id: PgId,
+        response: &[u8],
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        let response = decode_metadata_command_acceptance_response(response).map_err(|error| {
             self.rpc_payload_error(
                 "decode metadata command acceptance response",
                 error.to_string(),
@@ -3361,6 +3583,14 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         MetadataCommandNodeClient::metadata_command_replica_state(self, pg_id)
     }
 
+    fn metadata_command_replica_state_until(
+        &self,
+        pg_id: PgId,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        UnixStorageNodeClient::metadata_command_replica_state_until(self, pg_id, deadline)
+    }
+
     fn metadata_command_checkpoint(
         &self,
         pg_id: PgId,
@@ -3408,6 +3638,15 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         MetadataCommandNodeClient::metadata_command_acceptance(self, pg_id, command)
     }
 
+    fn metadata_command_acceptance_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        UnixStorageNodeClient::metadata_command_acceptance_until(self, pg_id, command, deadline)
+    }
+
     fn metadata_command_abandon_acceptance(
         &self,
         pg_id: PgId,
@@ -3422,6 +3661,17 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<(u64, u64)>, StoreError> {
         MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(self, pg_id, command)
+    }
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        UnixStorageNodeClient::applied_metadata_command_log_entry_hashes_until(
+            self, pg_id, command, deadline,
+        )
     }
 
     fn retained_metadata_command_log_hashes(
@@ -3754,6 +4004,26 @@ impl MetadataCommandRecoveryNodeClient for UnixStorageNodeClient {
         ))
     }
 
+    fn open_metadata_command_recovery_critical_section_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<Box<dyn MetadataCommandRecoveryCriticalSection>, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(Box::new(
+            UnixStorageNodeClient::open_metadata_command_critical_section_until(
+                self, pg_id, deadline,
+            )?,
+        ))
+    }
+
     fn open_metadata_command_recovery_replica_apply_route<'a>(
         &'a self,
         pg_id: PgId,
@@ -3809,6 +4079,29 @@ impl MetadataCommandRecoveryReplicaApplyRoute for UnixMetadataCommandRecoveryRep
             "decode metadata command recovery replica apply response",
         )
     }
+
+    fn apply_until(
+        self: Box<Self>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        let payload = encode_metadata_command_recovery_request(&self.request())
+            .map_err(|error| {
+                self.client.rpc_payload_error(
+                    "encode metadata command recovery replica apply request",
+                    error.to_string(),
+                )
+            })
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        self.client
+            .metadata_command_apply_and_record_with_payload_until(
+                self.pg_id,
+                self.command,
+                StorageRpcMessageKind::MetadataCommandRecoveryApplyAndRecord,
+                payload,
+                "decode metadata command recovery replica apply response",
+                deadline,
+            )
+    }
 }
 
 impl MetadataCommandRecoveryReplicaAbandonRoute for UnixMetadataCommandRecoveryReplicaRoute<'_> {
@@ -3847,6 +4140,26 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         }
         Ok(Box::new(
             UnixStorageNodeClient::open_metadata_command_critical_section(self, pg_id)?,
+        ))
+    }
+
+    fn open_metadata_command_critical_section_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<Box<dyn MetadataCommandCriticalSection>, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        Ok(Box::new(
+            UnixStorageNodeClient::open_metadata_command_critical_section_until(
+                self, pg_id, deadline,
+            )?,
         ))
     }
 
@@ -4112,6 +4425,17 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError> {
         UnixStorageNodeClient::apply_metadata_command_and_record(self, pg_id, command)
+    }
+
+    fn apply_metadata_command_and_record_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        UnixStorageNodeClient::apply_metadata_command_and_record_until(
+            self, pg_id, command, deadline,
+        )
     }
 
     fn record_metadata_command_abandoned_on_replica(

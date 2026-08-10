@@ -257,6 +257,15 @@ pub(crate) trait BucketWriteReservationRoute: Send {
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
 
+    fn validate_bucket_write_reservation_proof_until(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.validate_bucket_write_reservation_proof(proof)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn begin_durable_bucket_write_drain(
         &self,
@@ -1492,6 +1501,15 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         pg_id: PgId,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
+    fn metadata_command_replica_state_until(
+        &self,
+        pg_id: PgId,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.metadata_command_replica_state(pg_id)
+    }
+
     fn metadata_command_checkpoint(
         &self,
         pg_id: PgId,
@@ -1518,6 +1536,16 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError>;
 
+    fn metadata_command_acceptance_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.metadata_command_acceptance(pg_id, command)
+    }
+
     fn metadata_command_abandon_acceptance(
         &self,
         pg_id: PgId,
@@ -1529,6 +1557,16 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<(u64, u64)>, StoreError>;
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.applied_metadata_command_log_entry_hashes(pg_id, command)
+    }
 
     #[allow(dead_code)]
     fn retained_metadata_command_log_hashes(
@@ -1631,6 +1669,16 @@ pub(crate) trait MetadataCommandRecoveryNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<Box<dyn MetadataCommandRecoveryCriticalSection>, StoreError>;
 
+    fn open_metadata_command_recovery_critical_section_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<Box<dyn MetadataCommandRecoveryCriticalSection>, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.open_metadata_command_recovery_critical_section(pg_id, cluster_epoch)
+    }
+
     /// Bind one historical-replica mutation to its exact recovery certificate
     /// and command. The returned single-use capability cannot inspect or
     /// replace the replica's pending slot.
@@ -1655,6 +1703,11 @@ pub(crate) trait MetadataCommandRecoveryNodeClient: Send + Sync {
 
 pub(crate) trait MetadataCommandRecoveryReplicaApplyRoute: Send {
     fn apply(self: Box<Self>) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    fn apply_until(
+        self: Box<Self>,
+        _deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError>;
 }
 
 pub(crate) trait MetadataCommandRecoveryReplicaAbandonRoute: Send {
@@ -1676,6 +1729,15 @@ pub(crate) trait MetadataCommandRecoveryCriticalSection: Send {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn metadata_command_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.metadata_command_acceptance(command)
+    }
 
     fn metadata_command_abandon_acceptance(
         &self,
@@ -1705,6 +1767,23 @@ pub(crate) trait MetadataCommandRecoveryCriticalSection: Send {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 
+    fn apply_metadata_command_and_record_for_recovery_until(
+        &self,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        self.apply_metadata_command_and_record_for_recovery(
+            authorized_source,
+            abandoned_source,
+            command,
+        )
+        .map_err(MetadataCommandApplyError::definitive)
+    }
+
     fn record_metadata_command_abandoned(
         &self,
         command: &MetadataCommandEnvelope,
@@ -1717,6 +1796,16 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
     ) -> Result<Box<dyn MetadataCommandCriticalSection>, StoreError>;
+
+    fn open_metadata_command_critical_section_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<Box<dyn MetadataCommandCriticalSection>, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.open_metadata_command_critical_section(pg_id, cluster_epoch)
+    }
 
     fn max_metadata_command_log_index(
         &self,
@@ -1862,6 +1951,18 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
 
+    fn apply_metadata_command_and_record_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        self.apply_metadata_command_and_record(pg_id, command)
+            .map_err(MetadataCommandApplyError::definitive)
+    }
+
     /// Record one tombstone on a current-route replica without granting the
     /// primary-only metadata-command critical-section capability.
     fn record_metadata_command_abandoned_on_replica(
@@ -1882,8 +1983,84 @@ pub(crate) trait MetadataCommandCriticalSection: Send {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError>;
 
+    fn metadata_command_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.metadata_command_acceptance(command)
+    }
+
     fn apply_metadata_command_and_record(
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, BucketSnapshotLoadError>;
+
+    fn apply_metadata_command_and_record_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        self.apply_metadata_command_and_record(command)
+            .map_err(MetadataCommandApplyError::definitive)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataCommandApplyErrorKind {
+    NotSent,
+    Definitive,
+    MayHaveApplied,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataCommandApplyError {
+    kind: MetadataCommandApplyErrorKind,
+    source: BucketSnapshotLoadError,
+}
+
+impl MetadataCommandApplyError {
+    pub(crate) fn not_sent(source: impl Into<BucketSnapshotLoadError>) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::NotSent,
+            source: source.into(),
+        }
+    }
+
+    pub(crate) fn definitive(source: impl Into<BucketSnapshotLoadError>) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::Definitive,
+            source: source.into(),
+        }
+    }
+
+    pub(crate) fn may_have_applied(source: impl Into<BucketSnapshotLoadError>) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::MayHaveApplied,
+            source: source.into(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> MetadataCommandApplyErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_source(self) -> BucketSnapshotLoadError {
+        self.source
+    }
+}
+
+pub(crate) fn require_metadata_command_operation_deadline(
+    deadline: Instant,
+) -> Result<(), StoreError> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(storage_rpc_deadline_expired(
+            "start metadata command confirmation operation",
+        ))
+    }
 }

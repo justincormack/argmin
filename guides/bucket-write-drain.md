@@ -191,8 +191,9 @@ The implemented recovery rule is conservative: a durable drain without terminal
 `MarkBucketDeleting` is rolled back only when it has an explicit expired lease.
 Different owner tokens alone are not proof of a dead owner. Terminal
 `MarkBucketDeleting` with a surviving durable drain is idempotent; reopen
-converges primary-last partial apply and keeps the terminal drain until
-finalization removes the bucket row.
+converges the off-primary witness before primary publication and keeps the
+terminal drain until every replica converges and finalization removes the bucket
+row.
 
 ## DeleteBucket Finalization
 

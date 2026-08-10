@@ -724,12 +724,16 @@ fn object_payload_reclaim_retry_releases_surviving_terminal_claim() {
             match command.payload() {
                 MetadataCommandPayload::DeleteObjectPayloadReclaim(reclaim)
                     if reclaim.matches_request(&hook_bucket, &hook_key, generation_id)
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected reclaim apply failure",
-                        source: std::io::Error::other("injected reclaim apply failure"),
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected reclaim apply failure".to_owned(),
+                        ),
                     });
                 }
                 _ => {}
@@ -738,16 +742,9 @@ fn object_payload_reclaim_retry_releases_surviving_terminal_claim() {
         },
     ));
 
-    let err = cluster
+    assert!(cluster
         .reclaim_object_payload_if_unleased(&bucket, &key, generation_id)
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::ObjectPgActionError::Store(StoreError::Io {
-            context: "injected reclaim apply failure",
-            ..
-        })
-    ));
+        .expect("published reclaim must hand trailing convergence to recovery"));
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -1763,16 +1760,9 @@ fn reclaim_payload_metadata_delete_retry_reuses_pending_partial_command() {
             }
             Ok(())
         }));
-    let err = cluster
+    assert!(cluster
         .reclaim_object_payload_if_unleased(&bucket, &key, committed.generation_id)
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::ObjectPgActionError::Store(crate::StoreError::Io {
-            context: "injected reclaim metadata command apply failure",
-            ..
-        })
-    ));
+        .unwrap());
     let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
         .expect("partial reclaim metadata delete must keep pending command");
     assert!(matches!(

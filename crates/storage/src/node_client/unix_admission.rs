@@ -251,29 +251,64 @@ impl UnixStorageNodeRpcAdmission {
         self.acquire_with_pending_envelope(class, false)
     }
 
+    #[cfg(test)]
     pub(crate) fn acquire_with_kind(
         self: &Arc<Self>,
         class: UnixStorageNodeRpcAdmissionClass,
         kind: StorageRpcMessageKind,
     ) -> UnixStorageNodeRpcAdmissionAcquire {
-        self.acquire_with_pending_envelope(
+        let deadline = Instant::now() + self.wait_timeout_for_class(class);
+        self.acquire_with_pending_envelope_until(
             class,
             kind == StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            deadline,
         )
     }
 
+    pub(crate) fn acquire_with_kind_until(
+        self: &Arc<Self>,
+        class: UnixStorageNodeRpcAdmissionClass,
+        kind: StorageRpcMessageKind,
+        deadline: Instant,
+    ) -> UnixStorageNodeRpcAdmissionAcquire {
+        self.acquire_with_pending_envelope_until(
+            class,
+            kind == StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            deadline,
+        )
+    }
+
+    #[cfg(test)]
     fn acquire_with_pending_envelope(
         self: &Arc<Self>,
         class: UnixStorageNodeRpcAdmissionClass,
         pending_envelope: bool,
     ) -> UnixStorageNodeRpcAdmissionAcquire {
+        let deadline = Instant::now() + self.wait_timeout_for_class(class);
+        self.acquire_with_pending_envelope_until(class, pending_envelope, deadline)
+    }
+
+    fn acquire_with_pending_envelope_until(
+        self: &Arc<Self>,
+        class: UnixStorageNodeRpcAdmissionClass,
+        pending_envelope: bool,
+        deadline: Instant,
+    ) -> UnixStorageNodeRpcAdmissionAcquire {
         let started_at = Instant::now();
-        let wait_timeout = self.wait_timeout_for_class(class);
-        let deadline = started_at + wait_timeout;
         let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         let mut waited = false;
         loop {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return UnixStorageNodeRpcAdmissionAcquire::TimedOut {
+                    wait_us: started_at.elapsed().as_micros(),
+                };
+            };
             if self.can_admit(&active, class, pending_envelope) {
+                if Instant::now() >= deadline {
+                    return UnixStorageNodeRpcAdmissionAcquire::TimedOut {
+                        wait_us: started_at.elapsed().as_micros(),
+                    };
+                }
                 active.acquire(class, pending_envelope);
                 observability::storage_rpc_admission_class_acquired(class);
                 return UnixStorageNodeRpcAdmissionAcquire::Acquired {
@@ -290,11 +325,6 @@ impl UnixStorageNodeRpcAdmission {
                     },
                 };
             }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return UnixStorageNodeRpcAdmissionAcquire::TimedOut {
-                    wait_us: started_at.elapsed().as_micros(),
-                };
-            };
             waited = true;
             let (next_active, wait_result) = self
                 .capacity_available
@@ -742,6 +772,32 @@ mod tests {
             admission.acquire(UnixStorageNodeRpcAdmissionClass::Control),
             UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
         ));
+    }
+
+    #[test]
+    fn unix_storage_node_rpc_admission_rejects_expired_available_capacity() {
+        let admission = Arc::new(test_admission(
+            1,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        ));
+
+        assert!(matches!(
+            admission.acquire_with_kind_until(
+                UnixStorageNodeRpcAdmissionClass::Control,
+                StorageRpcMessageKind::Health,
+                Instant::now(),
+            ),
+            UnixStorageNodeRpcAdmissionAcquire::TimedOut { .. }
+        ));
+        assert_eq!(
+            admission
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .total_sessions,
+            0
+        );
     }
 
     #[test]

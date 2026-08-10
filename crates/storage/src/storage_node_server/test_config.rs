@@ -7,15 +7,19 @@
         ControlPlaneScopedCredentialStore,
     };
     use crate::node_client::{
-        LocalUnixStorageNodeClientAdmissionSettings, PlacedShardNodeClient, UnixStorageNodeClient,
+        LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
+        PlacedShardNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
-    use crate::{BucketAclSummary, StorageRpcClientAuthConfig};
+    use crate::{
+        BucketAclSummary, LocalClusterMap, LocalUnixStorageNodeClientConfig, StorageCluster,
+        StorageRpcClientAuthConfig,
+    };
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::io::Write;
     use std::os::unix::net::UnixStream;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -4540,6 +4544,685 @@
         }
         drop(client);
         assert!(join.join().unwrap().is_ok());
+    }
+
+    fn authenticated_metadata_apply_preconnect_failure_is_not_sent(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let endpoint = if tcp {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let error = MetadataCommandNodeClient::apply_metadata_command_and_record_until(
+            &client,
+            PgId::new(0),
+            &test_metadata_command(0, 1),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), MetadataCommandApplyErrorKind::NotSent);
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_apply_preconnect_failure_is_not_sent() {
+        authenticated_metadata_apply_preconnect_failure_is_not_sent(false);
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_metadata_apply_preconnect_failure_is_not_sent() {
+        authenticated_metadata_apply_preconnect_failure_is_not_sent(true);
+    }
+
+    fn authenticated_metadata_apply_response_auth_failure_is_may_have_applied(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let node = Arc::clone(&server._node);
+        server.set_response_envelope_test_hook(Arc::new(|kind, envelope| {
+            if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord {
+                let last = envelope
+                    .last_mut()
+                    .expect("authenticated response envelope must not be empty");
+                *last ^= 1;
+            }
+        }));
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let command = test_metadata_command(0, 1);
+        let error = MetadataCommandNodeClient::apply_metadata_command_and_record_until(
+            &client,
+            PgId::new(0),
+            &command,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), MetadataCommandApplyErrorKind::MayHaveApplied);
+        assert_eq!(
+            node.get_pg(0)
+                .unwrap()
+                .metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index,
+            command.id().log_index().get(),
+            "server must commit before the authenticated response is corrupted"
+        );
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_apply_response_auth_failure_is_may_have_applied() {
+        authenticated_metadata_apply_response_auth_failure_is_may_have_applied(false);
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_metadata_apply_response_auth_failure_is_may_have_applied() {
+        authenticated_metadata_apply_response_auth_failure_is_may_have_applied(true);
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthenticatedMetadataSessionFailure {
+        PreSendDeadline,
+        ResponseAuthentication,
+        DefinitiveConflict,
+    }
+
+    fn authenticated_metadata_session_classifies_apply_failure(
+        tcp: bool,
+        failure: AuthenticatedMetadataSessionFailure,
+    ) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let node = Arc::clone(&server._node);
+        let applied = test_metadata_command(0, 1);
+        let command = if matches!(failure, AuthenticatedMetadataSessionFailure::DefinitiveConflict)
+        {
+            node.get_pg(0)
+                .unwrap()
+                .apply_metadata_command_and_record(config.node_id.as_u32(), &applied)
+                .unwrap();
+            MetadataCommandEnvelope::new(
+                applied.id(),
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        crate::tests::bucket_name("metadata-rpc-bucket"),
+                        crate::tests::object_key("conflicting-object"),
+                        crate::tests::stream_session_id("meta-conflict"),
+                        GenerationId::new(1).unwrap(),
+                        123,
+                    ),
+                ),
+            )
+        } else {
+            applied
+        };
+        if matches!(
+            failure,
+            AuthenticatedMetadataSessionFailure::ResponseAuthentication
+        ) {
+            server.set_response_envelope_test_hook(Arc::new(|kind, envelope| {
+                if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord {
+                    let last = envelope
+                        .last_mut()
+                        .expect("authenticated response envelope must not be empty");
+                    *last ^= 1;
+                }
+            }));
+        }
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let section = MetadataCommandNodeClient::open_metadata_command_critical_section_until(
+            &client,
+            PgId::new(0),
+            config.cluster_epoch,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap();
+        let deadline = match failure {
+            AuthenticatedMetadataSessionFailure::PreSendDeadline => Instant::now(),
+            AuthenticatedMetadataSessionFailure::ResponseAuthentication
+            | AuthenticatedMetadataSessionFailure::DefinitiveConflict => {
+                Instant::now() + Duration::from_secs(2)
+            }
+        };
+        let error = section
+            .apply_metadata_command_and_record_until(&command, deadline)
+            .unwrap_err();
+
+        let expected_kind = match failure {
+            AuthenticatedMetadataSessionFailure::PreSendDeadline => {
+                MetadataCommandApplyErrorKind::NotSent
+            }
+            AuthenticatedMetadataSessionFailure::ResponseAuthentication => {
+                MetadataCommandApplyErrorKind::MayHaveApplied
+            }
+            AuthenticatedMetadataSessionFailure::DefinitiveConflict => {
+                MetadataCommandApplyErrorKind::Definitive
+            }
+        };
+        assert_eq!(error.kind(), expected_kind);
+        if matches!(failure, AuthenticatedMetadataSessionFailure::DefinitiveConflict) {
+            assert!(matches!(
+                error.into_source(),
+                BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 1,
+                }) if node_id == config.node_id.as_u32()
+            ));
+        }
+        let applied_log_index = node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap()
+            .applied_log_index;
+        assert_eq!(
+            applied_log_index,
+            if matches!(failure, AuthenticatedMetadataSessionFailure::PreSendDeadline) {
+                0
+            } else {
+                1
+            }
+        );
+        drop(section);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_session_pre_send_failure_is_not_sent() {
+        authenticated_metadata_session_classifies_apply_failure(
+            false,
+            AuthenticatedMetadataSessionFailure::PreSendDeadline,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_metadata_session_pre_send_failure_is_not_sent() {
+        authenticated_metadata_session_classifies_apply_failure(
+            true,
+            AuthenticatedMetadataSessionFailure::PreSendDeadline,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_session_response_auth_failure_may_have_applied() {
+        authenticated_metadata_session_classifies_apply_failure(
+            false,
+            AuthenticatedMetadataSessionFailure::ResponseAuthentication,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_metadata_session_response_auth_failure_may_have_applied() {
+        authenticated_metadata_session_classifies_apply_failure(
+            true,
+            AuthenticatedMetadataSessionFailure::ResponseAuthentication,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_session_signed_conflict_is_definitive() {
+        authenticated_metadata_session_classifies_apply_failure(
+            false,
+            AuthenticatedMetadataSessionFailure::DefinitiveConflict,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_metadata_session_signed_conflict_is_definitive() {
+        authenticated_metadata_session_classifies_apply_failure(
+            true,
+            AuthenticatedMetadataSessionFailure::DefinitiveConflict,
+        );
+    }
+
+    struct AuthenticatedFanoutServerSet {
+        stop: Arc<AtomicBool>,
+        servers: Vec<Arc<StorageNodeServer>>,
+        joins: Vec<thread::JoinHandle<()>>,
+    }
+
+    impl Drop for AuthenticatedFanoutServerSet {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            for server in &self.servers {
+                let _ = UnixStream::connect(server.socket_path_for_test());
+            }
+            for join in self.joins.drain(..) {
+                if let Err(panic) = join.join() {
+                    if thread::panicking() {
+                        return;
+                    }
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthenticatedFanoutFailurePoint {
+        Witness,
+        Primary,
+        TrailingRetryable,
+    }
+
+    fn authenticated_metadata_fanout_handles_apply_failure(
+        tcp: bool,
+        failure_point: AuthenticatedFanoutFailurePoint,
+    ) {
+        let tmp = test_util::tempdir();
+        let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+        let primary_node_id = NodeId::new(1);
+        let witness_node_id = NodeId::new(0);
+        let corrupt_node_id = match failure_point {
+            AuthenticatedFanoutFailurePoint::Witness => Some(witness_node_id),
+            AuthenticatedFanoutFailurePoint::Primary => Some(primary_node_id),
+            AuthenticatedFanoutFailurePoint::TrailingRetryable => None,
+        };
+        let ec_shape = EcShape { k: 2, m: 1 };
+        let route_map_validity = RouteMapValidity::until_ms_saturating(
+            crate::clock::current_time_millis().saturating_add(60_000),
+        );
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "fanout-frontend".to_owned(),
+        });
+        let corrupted = Arc::new(AtomicBool::new(false));
+        let signed_retryable_response_observed = Arc::new(AtomicBool::new(false));
+        let mut servers = Vec::new();
+        let mut client_configs = Vec::new();
+
+        for node_id in node_ids {
+            let socket_path = tmp
+                .path()
+                .join("fanout-sockets")
+                .join(format!("node-{}.sock", node_id.as_u32()));
+            private_socket_dir(socket_path.parent().unwrap());
+            let config = StorageNodeProcessConfig {
+                node_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                route_map_validity,
+                data_dir: tmp
+                    .path()
+                    .join(format!("fanout-node-{}", node_id.as_u32())),
+                default_ec_shape: ec_shape,
+                pg_ids: vec![0],
+                socket_path: socket_path.clone(),
+                pg_routes: vec![StorageNodePgRoute {
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    state: PgState::Active,
+                    primary_node_id,
+                    metadata_transfer_destination_epoch: None,
+                    metadata_read_route: None,
+                    acting_set: node_ids.to_vec(),
+                }],
+                historical_pg_routes: Vec::new(),
+                pending_metadata_command_recoveries: Vec::new(),
+            };
+            let mut prepared = PreparedStorageNodeServer::new(config)
+                .with_rpc_auth(storage_rpc_server_auth(&credential));
+            if tcp {
+                prepared = prepared.with_rpc_listeners(vec![
+                    StorageNodeRpcListenerConfig::unix(socket_path.clone()),
+                    StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                        "127.0.0.1:0".parse().unwrap(),
+                        storage_rpc_tls_server_config(),
+                    ),
+                ]);
+            }
+            let server = Arc::new(prepared.bind().unwrap());
+            if Some(node_id) == corrupt_node_id {
+                let corrupted_hook = Arc::clone(&corrupted);
+                server.set_response_envelope_test_hook(Arc::new(move |kind, envelope| {
+                    if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord
+                        && !corrupted_hook.swap(true, Ordering::AcqRel)
+                    {
+                        *envelope
+                            .last_mut()
+                            .expect("authenticated response envelope must not be empty") ^= 1;
+                    }
+                }));
+            } else if node_id == NodeId::new(2)
+                && matches!(
+                    failure_point,
+                    AuthenticatedFanoutFailurePoint::TrailingRetryable
+                )
+            {
+                let response_observed = Arc::clone(&signed_retryable_response_observed);
+                server.set_response_envelope_test_hook(Arc::new(move |kind, _envelope| {
+                    if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord {
+                        response_observed.store(true, Ordering::Release);
+                    }
+                }));
+            }
+            let endpoint = if tcp {
+                let address = server.tcp_listener_addr_for_test();
+                StorageRpcClientEndpoint::tcp_with_config(
+                    format!("tcp://localhost:{}", address.port()),
+                    vec![address],
+                    "localhost",
+                    storage_rpc_tls_client_config(),
+                )
+                .unwrap()
+            } else {
+                StorageRpcClientEndpoint::unix(socket_path)
+            };
+            client_configs.push(
+                LocalUnixStorageNodeClientConfig::with_rpc_endpoint_and_admission_settings(
+                    node_id,
+                    endpoint,
+                    LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                )
+                .with_frontend_rpc_auth(
+                    crate::FrontendStorageRpcClientCapability::new(
+                        credential.clone(),
+                        9,
+                        STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                    )
+                    .unwrap(),
+                ),
+            );
+            servers.push(server);
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let joins = servers
+            .iter()
+            .map(|server| {
+                let server = Arc::clone(server);
+                let stop = Arc::clone(&stop);
+                thread::spawn(move || server.serve_until_stop_for_test(&stop).unwrap())
+            })
+            .collect();
+        let server_set = AuthenticatedFanoutServerSet {
+            stop,
+            servers,
+            joins,
+        };
+
+        let mut map = LocalClusterMap::open_frontend_topology_only_with_epoch(
+            primary_node_id,
+            node_ids,
+            &[0],
+            ec_shape,
+            ClusterEpoch::INITIAL,
+        )
+        .unwrap();
+        map.install_unix_storage_node_clients(client_configs)
+            .unwrap();
+        let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+        let retryable_error_injected = Arc::new(AtomicBool::new(false));
+        let apply_hook = if matches!(
+            failure_point,
+            AuthenticatedFanoutFailurePoint::TrailingRetryable
+        ) {
+            let trailing_server = Arc::clone(
+                server_set
+                    .servers
+                    .iter()
+                    .find(|server| server.config_snapshot().node_id == NodeId::new(2))
+                    .unwrap(),
+            );
+            let retryable_error_injected = Arc::clone(&retryable_error_injected);
+            Some(cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+                move |node_id, _command| {
+                    if node_id == NodeId::new(2)
+                        && !retryable_error_injected.swap(true, Ordering::AcqRel)
+                    {
+                        let mut next = trailing_server.config_snapshot();
+                        let previous_routes = next.pg_routes.clone();
+                        let next_epoch = ClusterEpoch::new(2).unwrap();
+                        next.cluster_epoch = next_epoch;
+                        for route in &mut next.pg_routes {
+                            route.cluster_epoch = next_epoch;
+                        }
+                        next.historical_pg_routes = previous_routes;
+                        trailing_server
+                            .install_control_plane_runtime_config(next)
+                            .unwrap();
+                    }
+                    Ok(())
+                },
+            )))
+        } else {
+            None
+        };
+        let attempt_count = Arc::new(AtomicUsize::new(0));
+        let attempt_hook = if matches!(failure_point, AuthenticatedFanoutFailurePoint::Witness) {
+            let attempt_count = Arc::clone(&attempt_count);
+            Some(cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(
+                move |_command| {
+                    if attempt_count.fetch_add(1, Ordering::AcqRel) == 1 {
+                        return Err(StoreError::StorageRpc {
+                            node_id: primary_node_id.as_u32(),
+                            operation: "test post-witness pre-dispatch failure",
+                            failure: StorageRpcErrorCode::PayloadDecode,
+                            detail: crate::StorageNodeFailureDetail::new(
+                                "synthetic definitive pre-dispatch protocol failure",
+                            ),
+                        });
+                    }
+                    Ok(())
+                },
+            )))
+        } else {
+            None
+        };
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        let bucket = crate::tests::bucket_name("authenticated-fanout-bucket");
+        let create_config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config_for_test(&create_config, 1_234, 1).unwrap(),
+            ),
+        );
+
+        cluster
+            .test_apply_metadata_command_to_acting_set_from_origin(primary_node_id, &command)
+            .unwrap();
+        drop(apply_hook);
+        drop(attempt_hook);
+
+        if matches!(
+            failure_point,
+            AuthenticatedFanoutFailurePoint::TrailingRetryable
+        ) {
+            assert!(retryable_error_injected.load(Ordering::Acquire));
+            assert!(signed_retryable_response_observed.load(Ordering::Acquire));
+        } else {
+            assert!(corrupted.load(Ordering::Acquire));
+        }
+        if matches!(failure_point, AuthenticatedFanoutFailurePoint::Witness) {
+            assert!(
+                attempt_count.load(Ordering::Acquire) >= 3,
+                "witness ambiguity must survive the later definitive pre-dispatch failure"
+            );
+        }
+        for server in &server_set.servers {
+            let applied_log_index = server
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index;
+            let expected = if matches!(
+                failure_point,
+                AuthenticatedFanoutFailurePoint::Primary
+                    | AuthenticatedFanoutFailurePoint::TrailingRetryable
+            )
+                && server.config_snapshot().node_id == NodeId::new(2)
+            {
+                0
+            } else {
+                1
+            };
+            assert_eq!(
+                applied_log_index,
+                expected,
+                "unexpected applied index on node {}",
+                server.config_snapshot().node_id.as_u32()
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_unix_fanout_confirms_witness_after_response_auth_failure() {
+        authenticated_metadata_fanout_handles_apply_failure(
+            false,
+            AuthenticatedFanoutFailurePoint::Witness,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_fanout_confirms_witness_after_response_auth_failure() {
+        authenticated_metadata_fanout_handles_apply_failure(
+            true,
+            AuthenticatedFanoutFailurePoint::Witness,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_fanout_confirms_primary_after_response_auth_failure() {
+        authenticated_metadata_fanout_handles_apply_failure(
+            false,
+            AuthenticatedFanoutFailurePoint::Primary,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_fanout_confirms_primary_after_response_auth_failure() {
+        authenticated_metadata_fanout_handles_apply_failure(
+            true,
+            AuthenticatedFanoutFailurePoint::Primary,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_fanout_hands_off_signed_retryable_trailing_failure() {
+        authenticated_metadata_fanout_handles_apply_failure(
+            false,
+            AuthenticatedFanoutFailurePoint::TrailingRetryable,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_fanout_hands_off_signed_retryable_trailing_failure() {
+        authenticated_metadata_fanout_handles_apply_failure(
+            true,
+            AuthenticatedFanoutFailurePoint::TrailingRetryable,
+        );
     }
 
     #[test]

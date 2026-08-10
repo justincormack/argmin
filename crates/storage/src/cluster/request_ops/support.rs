@@ -131,6 +131,28 @@ pub(super) fn metadata_command_apply_transport_error_is_retryable(
     )
 }
 
+fn metadata_command_apply_error_can_handoff_to_recovery(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    if metadata_command_apply_transport_error_is_retryable(error) {
+        return true;
+    }
+    match error {
+        BucketSnapshotLoadError::Store(error) => {
+            matches!(
+                error,
+                StoreError::Io { .. } | StoreError::MetadataCommandContention { .. }
+            )
+                || matches!(
+                    error.operation_failure_class(),
+                    StoreOperationFailureClass::ResourceExhausted
+                        | StoreOperationFailureClass::RetryableConvergence
+                )
+        }
+        BucketSnapshotLoadError::Metadata(_) => false,
+    }
+}
+
 pub(super) fn applied_metadata_command_cleanup_error_is_retryable(
     error: &BucketSnapshotLoadError,
 ) -> bool {
@@ -412,6 +434,14 @@ type MetadataCommandApplyTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(test)]
+type MetadataCommandAfterApplyTestHook =
+    Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(test)]
+type MetadataCommandApplyAttemptTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(test)]
 type AbortMultipartPendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -480,6 +510,16 @@ type MultipartCompletionStaleRetryTestHook =
 #[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static AFTER_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MetadataCommandAfterApplyTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static METADATA_COMMAND_APPLY_ATTEMPT_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MetadataCommandApplyAttemptTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -568,6 +608,16 @@ pub(crate) struct MetadataCommandApplyTestHookGuard {
 }
 
 #[cfg(test)]
+pub(crate) struct MetadataCommandAfterApplyTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MetadataCommandApplyAttemptTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
 pub(crate) struct AbortMultipartPendingInstallTestHookGuard {
     scope_id: usize,
 }
@@ -646,6 +696,29 @@ pub(crate) struct MultipartCompletionStaleRetryTestHookGuard {
 impl Drop for MetadataCommandApplyTestHookGuard {
     fn drop(&mut self) {
         let hooks = BEFORE_METADATA_COMMAND_APPLY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCommandAfterApplyTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = AFTER_METADATA_COMMAND_APPLY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCommandApplyAttemptTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            METADATA_COMMAND_APPLY_ATTEMPT_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -872,6 +945,45 @@ fn maybe_run_before_metadata_command_apply_hook(
             .cloned();
         if let Some(hook) = hook {
             hook(_node_id, _command)?;
+        }
+    }
+    Ok(())
+}
+
+fn maybe_run_after_metadata_command_apply_hook(
+    _scope_id: usize,
+    _node_id: NodeId,
+    _command: &MetadataCommandEnvelope,
+) -> Result<(), StoreError> {
+    #[cfg(test)]
+    {
+        let hook = AFTER_METADATA_COMMAND_APPLY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&_scope_id)
+            .cloned();
+        if let Some(hook) = hook {
+            hook(_node_id, _command)?;
+        }
+    }
+    Ok(())
+}
+
+fn maybe_run_metadata_command_apply_attempt_hook(
+    _scope_id: usize,
+    _command: &MetadataCommandEnvelope,
+) -> Result<(), StoreError> {
+    #[cfg(test)]
+    {
+        let hook = METADATA_COMMAND_APPLY_ATTEMPT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&_scope_id)
+            .cloned();
+        if let Some(hook) = hook {
+            hook(_command)?;
         }
     }
     Ok(())
@@ -1408,7 +1520,145 @@ fn bucket_snapshot_error_to_bucket_write_drain_error(
 #[derive(Debug)]
 pub(super) struct MetadataCommandApplyFailure {
     pub(super) applied_nodes: usize,
+    pub(super) progress: MetadataCommandApplyProgress,
     pub(super) source: BucketSnapshotLoadError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetadataCommandApplyProgress {
+    Abortable,
+    Witnessed,
+    PublicationUnconfirmed,
+    Published,
+}
+
+impl MetadataCommandApplyProgress {
+    fn after_dispatch(self, is_primary: bool) -> Self {
+        if is_primary {
+            self.merge(Self::PublicationUnconfirmed)
+        } else {
+            self.merge(Self::Witnessed)
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        fn rank(progress: MetadataCommandApplyProgress) -> u8 {
+            match progress {
+                MetadataCommandApplyProgress::Abortable => 0,
+                MetadataCommandApplyProgress::Witnessed => 1,
+                MetadataCommandApplyProgress::PublicationUnconfirmed => 2,
+                MetadataCommandApplyProgress::Published => 3,
+            }
+        }
+        if rank(self) >= rank(other) {
+            self
+        } else {
+            other
+        }
+    }
+
+    pub(super) fn is_abortable(self) -> bool {
+        self == Self::Abortable
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetadataCommandApplyOutcome {
+    Converged,
+    PublishedPendingRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetadataCommandConvergenceRequirement {
+    AllowRecoveryHandoff,
+    RequireAllReplicas,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MetadataCommandFinishPolicy {
+    pub(super) clear_pending_on_zero_apply: bool,
+    pub(super) retry_partial_exact_conflict: bool,
+    pub(super) convergence_requirement: MetadataCommandConvergenceRequirement,
+}
+
+#[derive(Debug)]
+struct MetadataCommandApplyAttemptFailure {
+    failure: MetadataCommandApplyFailure,
+    may_have_applied: bool,
+    apply_error_kind: Option<MetadataCommandApplyErrorKind>,
+}
+
+impl MetadataCommandApplyAttemptFailure {
+    fn before_apply(
+        applied_nodes: usize,
+        source: impl Into<BucketSnapshotLoadError>,
+    ) -> Self {
+        Self {
+            failure: MetadataCommandApplyFailure {
+                applied_nodes,
+                progress: MetadataCommandApplyProgress::Abortable,
+                source: source.into(),
+            },
+            may_have_applied: false,
+            apply_error_kind: None,
+        }
+    }
+
+    fn before_apply_with_progress(
+        applied_nodes: usize,
+        progress: MetadataCommandApplyProgress,
+        source: impl Into<BucketSnapshotLoadError>,
+    ) -> Self {
+        Self {
+            failure: MetadataCommandApplyFailure {
+                applied_nodes,
+                progress,
+                source: source.into(),
+            },
+            may_have_applied: false,
+            apply_error_kind: None,
+        }
+    }
+
+    fn after_apply_dispatch_with_progress(
+        applied_nodes: usize,
+        progress: MetadataCommandApplyProgress,
+        is_primary: bool,
+        source: impl Into<BucketSnapshotLoadError>,
+    ) -> Self {
+        Self {
+            failure: MetadataCommandApplyFailure {
+                applied_nodes,
+                progress: progress.after_dispatch(is_primary),
+                source: source.into(),
+            },
+            may_have_applied: true,
+            apply_error_kind: Some(MetadataCommandApplyErrorKind::MayHaveApplied),
+        }
+    }
+
+    fn from_apply_call_error_with_progress(
+        applied_nodes: usize,
+        progress: MetadataCommandApplyProgress,
+        is_primary: bool,
+        source: MetadataCommandApplyError,
+    ) -> Self {
+        let kind = source.kind();
+        let source = source.into_source();
+        let mut failure = if kind == MetadataCommandApplyErrorKind::MayHaveApplied {
+            Self::after_apply_dispatch_with_progress(
+                applied_nodes,
+                progress,
+                is_primary,
+                source,
+            )
+        } else {
+            Self::before_apply_with_progress(applied_nodes, progress, source)
+        };
+        failure.apply_error_kind = Some(kind);
+        failure
+    }
+
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

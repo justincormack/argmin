@@ -13392,7 +13392,7 @@ fn lifecycle_abort_multipart_maps_command_log_conflict_to_slow_down() {
 }
 
 #[test]
-fn direct_put_retry_converges_pending_partial_metadata_command() {
+fn direct_put_primary_preapply_io_after_witness_converges_before_success() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13423,7 +13423,7 @@ fn direct_put_retry_converges_pending_partial_metadata_command() {
         );
 
     let metadata = MetadataBlob::new();
-    let first_err = test_helpers::put_object(
+    let first = test_helpers::put_object(
         &coord,
         &PutObjectRequest {
             encryption: WriteEncryptionRequest::none(),
@@ -13438,35 +13438,10 @@ fn direct_put_retry_converges_pending_partial_metadata_command() {
             acl: NO_PUT_OBJECT_ACL.into(),
         },
     )
-    .unwrap_err();
-    assert!(
-        matches!(
-            first_err,
-            ServerError::DirectPut(ref failure)
-                if failure.kind() == storage::DirectPutFailureKind::InternalError
-                    && failure.diagnostic_cause_label() == "store_io_failure"
-        ),
-        "expected injected direct PUT command failure, got {first_err:?}"
-    );
+    .unwrap();
+    assert_eq!(first.version_id, VersionId::Null);
     assert!(!fail_once.load(Ordering::SeqCst));
     drop(hook_guard);
-
-    test_helpers::put_object(
-        &coord,
-        &PutObjectRequest {
-            encryption: WriteEncryptionRequest::none(),
-            policy_context: PutObjectPolicyContext::default(),
-            object_lock: ObjectLockState::default(),
-            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
-            data: b"retry-write",
-            metadata: &metadata,
-            system_metadata: &SystemMetadata::EMPTY,
-            tags: None,
-            cond: NO_WRITE,
-            acl: NO_PUT_OBJECT_ACL.into(),
-        },
-    )
-    .unwrap();
 
     let get = coord
         .get_object(&GetObjectRequest {
@@ -13481,7 +13456,7 @@ fn direct_put_retry_converges_pending_partial_metadata_command() {
             cond: NO_READ,
         })
         .unwrap();
-    assert_eq!(get.body.read_all().unwrap(), b"retry-write");
+    assert_eq!(get.body.read_all().unwrap(), b"first-write");
 }
 
 #[test]

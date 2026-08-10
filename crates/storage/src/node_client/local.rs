@@ -6295,6 +6295,15 @@ impl MetadataCommandRecoveryReplicaApplyRoute for LocalMetadataCommandRecoveryRe
             self.command,
         )
     }
+
+    fn apply_until(
+        self: Box<Self>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        self.apply().map_err(MetadataCommandApplyError::definitive)
+    }
 }
 
 impl MetadataCommandRecoveryReplicaAbandonRoute for LocalMetadataCommandRecoveryReplicaRoute<'_> {

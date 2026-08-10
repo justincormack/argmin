@@ -318,13 +318,15 @@ fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected direct put metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected direct put metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected direct put metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -334,21 +336,12 @@ fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
         },
     ));
 
-    let err = cluster
+    cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<(), ()>(())
         })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected direct put metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published direct PUT must hand trailing convergence to recovery")
+        .expect("direct PUT preparation should produce an outcome");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
@@ -364,7 +357,8 @@ fn direct_put_metadata_command_retry_reuses_pending_partial_replica_command() {
             .expect("partial direct PUT should leave durable primary pending slot");
         assert_eq!(slot.scope_bucket.as_ref(), Some(&bucket));
     }
-    for node_id in [NodeId::new(0), NodeId::new(2)] {
+    {
+        let node_id = NodeId::new(2);
         let node = map.node(node_id).unwrap().storage_node();
         let pg = node.get_pg(object_pg).unwrap();
         assert!(matches!(
@@ -540,12 +534,16 @@ fn direct_put_open_time_convergence_releases_bucket_write_reservation() {
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(2)
                         && !hook_failed.swap(true, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected direct put reopen apply failure",
-                        source: std::io::Error::other("injected direct put reopen apply failure"),
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected direct put reopen apply failure".to_owned(),
+                        ),
                     });
                 }
                 _ => {}
@@ -554,15 +552,12 @@ fn direct_put_open_time_convergence_releases_bucket_write_reservation() {
         },
     ));
 
-    let err = cluster
+    cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<(), ()>(())
         })
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        crate::ObjectPgActionError::Store(StoreError::Io { .. })
-    ));
+        .expect("published direct PUT must hand trailing convergence to recovery")
+        .expect("direct PUT preparation should produce an outcome");
     drop(hook_guard);
     assert!(failed.load(Ordering::SeqCst));
     assert!(
@@ -678,13 +673,15 @@ fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected direct put metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected direct put metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected direct put metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -694,21 +691,12 @@ fn object_generation_reservation_entry_drains_pending_direct_put_commit() {
         },
     ));
 
-    let err = cluster
+    cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<(), ()>(())
         })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected direct put metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published direct PUT must hand trailing convergence to recovery")
+        .expect("direct PUT preparation should produce an outcome");
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -805,13 +793,15 @@ fn object_delete_drains_pending_direct_put_commit_before_delete() {
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected direct put metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected direct put metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected direct put metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -821,21 +811,12 @@ fn object_delete_drains_pending_direct_put_commit_before_delete() {
         },
     ));
 
-    let err = cluster
+    cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<(), ()>(())
         })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected direct put metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published direct PUT must hand trailing convergence to recovery")
+        .expect("direct PUT preparation should produce an outcome");
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -2451,7 +2432,7 @@ fn multipart_completion_zero_apply_failure_retains_pending_command_for_retry() {
                 MetadataCommandPayload::CommitMultipartObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(0)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
                     return Err(StoreError::Io {
@@ -2568,19 +2549,10 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
         },
     ));
 
-    let err = cluster
+    let published_outcome = cluster
         .complete_multipart_upload_commit_serialized(req.clone())
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected multipart completion reopen failure",
-                ..
-            })
-        ),
-        "expected injected partial completion failure, got {err:?}"
-    );
+        .unwrap();
+    assert_eq!(published_outcome.live_size, 19);
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
@@ -2606,14 +2578,20 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
         .unwrap();
     let stored = crate::PgMetadataStore::get_object_meta(&*first_pg, &bucket, &key).unwrap();
     let live = stored.as_live().unwrap();
-    let outcome = crate::CompleteMultipartCommitOutcome {
+    let recovered_outcome = crate::CompleteMultipartCommitOutcome {
         version_id: live.version_id,
         stale_payload_generation_id: None,
         live_tags: live.tags.clone(),
         live_size: live.size,
         live_last_modified: live.last_modified,
     };
-    expected_segment.version_id = outcome.version_id.to_u64();
+    assert_eq!(recovered_outcome.version_id, published_outcome.version_id);
+    assert_eq!(recovered_outcome.live_size, published_outcome.live_size);
+    assert_eq!(
+        recovered_outcome.live_last_modified,
+        published_outcome.live_last_modified
+    );
+    expected_segment.version_id = published_outcome.version_id.to_u64();
     drop(first_pg);
 
     assert_streamed_multipart_completion_on_acting_nodes(
@@ -2622,7 +2600,7 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
         object_pg,
         &req,
         &expected_segment,
-        &outcome,
+        &published_outcome,
     );
     assert_terminal_multipart_upload_invariants(
         &reopened,
@@ -2825,12 +2803,11 @@ fn multipart_completion_retries_partial_bucket_barrier_command() {
     assert!(
         matches!(
             err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected completed MPU order apply failure",
-                ..
-            })
+            crate::ObjectPgActionError::Store(
+                StoreError::MetadataCommandDependencyConvergencePending { pg_id: 1, .. }
+            )
         ),
-        "expected injected bucket-PG order failure, got {err:?}"
+        "expected published but unconverged bucket-PG dependency, got {err:?}"
     );
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
@@ -3285,13 +3262,15 @@ fn multipart_completion_drains_pending_abort_before_completing() {
             match command.payload() {
                 MetadataCommandPayload::AbortMultipartUpload(abort)
                     if abort.upload_id == hook_upload_id
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected multipart abort before completion failure",
-                        source: std::io::Error::other(
-                            "injected multipart abort before completion failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected multipart abort before completion failure".to_owned(),
                         ),
                     });
                 }
@@ -3301,19 +3280,9 @@ fn multipart_completion_drains_pending_abort_before_completing() {
         },
     ));
 
-    let err = cluster
+    assert!(cluster
         .abort_multipart_upload(&bucket, &key, &req.upload_id)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected multipart abort before completion failure",
-                ..
-            })
-        ),
-        "expected injected abort failure, got {err:?}"
-    );
+        .expect("published multipart abort must hand trailing convergence to recovery"));
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(

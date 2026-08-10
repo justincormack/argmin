@@ -456,6 +456,28 @@ pub(super) fn sleep_after_metadata_contention_retry_for(
     emit_metadata_contention_backoff(operation, pg_id, context, delay);
 }
 
+pub(super) fn sleep_after_metadata_contention_retry_until(
+    operation: &'static str,
+    pg_id: Option<PgId>,
+    context: &'static str,
+    contention_retries: &mut usize,
+    deadline: Instant,
+) -> bool {
+    *contention_retries = (*contention_retries).saturating_add(1);
+    let cap = metadata_contention_backoff_cap(*contention_retries);
+    let requested_delay = jittered_metadata_contention_backoff_delay(cap);
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        emit_metadata_contention_backoff(operation, pg_id, context, Duration::ZERO);
+        return false;
+    };
+    let delay = requested_delay.min(remaining);
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+    emit_metadata_contention_backoff(operation, pg_id, context, delay);
+    Instant::now() < deadline
+}
+
 fn sleep_for_metadata_contention_cap(cap: Duration) -> Duration {
     let delay = jittered_metadata_contention_backoff_delay(cap);
     if delay > Duration::ZERO {

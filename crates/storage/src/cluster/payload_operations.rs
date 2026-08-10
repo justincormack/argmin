@@ -529,9 +529,13 @@ impl StorageCluster {
             let mut command = command;
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
-                    Ok(()) => {
-                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    Ok(outcome) => {
+                        if outcome == request_ops::MetadataCommandApplyOutcome::Converged {
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
                             .map_err(ObjectPgActionError::from)?;
+                        }
                         match command.payload() {
                             MetadataCommandPayload::ReserveObjectGeneration(reservation) => {
                                 return Ok(reservation.generation_id);
@@ -585,7 +589,8 @@ impl StorageCluster {
                         ));
                     }
                     Err(error)
-                        if error.applied_nodes == 0
+                        if error.progress.is_abortable()
+                            && error.applied_nodes == 0
                             && Self::reserve_object_generation_conflict_matches(
                                 &command,
                                 &error.source,
@@ -613,7 +618,8 @@ impl StorageCluster {
                         continue;
                     }
                     Err(error)
-                        if error.applied_nodes == 0
+                        if error.progress.is_abortable()
+                            && error.applied_nodes == 0
                             && Self::metadata_command_log_conflict_matches(
                                 &command,
                                 &error.source,
@@ -642,7 +648,7 @@ impl StorageCluster {
                         command = reissued;
                     }
                     Err(error) => {
-                        if error.applied_nodes == 0 {
+                        if error.progress.is_abortable() && error.applied_nodes == 0 {
                             self.record_abandoned_metadata_command_to_acting_set(&command)
                                 .map_err(|error| {
                                     bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -1363,37 +1369,40 @@ impl StorageCluster {
                 },
             };
             match apply_result {
-                Ok(()) => {
-                    if reservation_authority
-                        .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                            pg_id, &command,
-                        )
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
-                    {
-                        match route_mode {
-                            MetadataCommandRouteMode::Normal => self
-                                .remove_pending_metadata_command_for_bucket_with_work_budget(
-                                    pg_id,
-                                    command_bucket,
-                                    &command,
-                                    work_budget,
-                                ),
-                            MetadataCommandRouteMode::Recovery => self
-                                .remove_pending_metadata_command_for_bucket_recovery(
-                                    execution_route,
-                                    pg_id,
-                                    command_bucket,
-                                    &command,
-                                    work_budget,
-                                ),
+                Ok(outcome) => {
+                    if outcome == request_ops::MetadataCommandApplyOutcome::Converged {
+                        if reservation_authority
+                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                                pg_id, &command,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                        {
+                            match route_mode {
+                                MetadataCommandRouteMode::Normal => self
+                                    .remove_pending_metadata_command_for_bucket_with_work_budget(
+                                        pg_id,
+                                        command_bucket,
+                                        &command,
+                                        work_budget,
+                                    ),
+                                MetadataCommandRouteMode::Recovery => self
+                                    .remove_pending_metadata_command_for_bucket_recovery(
+                                        execution_route,
+                                        pg_id,
+                                        command_bucket,
+                                        &command,
+                                        work_budget,
+                                    ),
+                            }
+                            .map_err(ObjectPgActionError::from)?;
                         }
-                        .map_err(ObjectPgActionError::from)?;
+                        self.after_object_metadata_command_applied(&command);
                     }
-                    self.after_object_metadata_command_applied(&command);
                     return Ok(PendingMetadataCommandOutcome::Applied);
                 }
                 Err(error)
-                    if request_ops::metadata_command_apply_transport_error_is_retryable(
+                    if error.progress.is_abortable()
+                        && request_ops::metadata_command_apply_transport_error_is_retryable(
                         &error.source,
                     ) =>
                 {
@@ -1406,13 +1415,12 @@ impl StorageCluster {
                 }
                 Err(error)
                     if Self::metadata_command_log_conflict_matches(&command, &error.source)
-                        && ((error.applied_nodes == 0
-                            && self
+                        && (self
                                 .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
                                     pg_id, &command, route_mode,
                                 )
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?)
-                            || (error.applied_nodes > 0
+                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                            || (!error.progress.is_abortable()
                                 && self
                                     .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(
                                 pg_id,
@@ -1420,7 +1428,7 @@ impl StorageCluster {
                                 error.applied_nodes,
                                 &error.source,
                                 route_mode,
-                            )
+                                    )
                                     .map_err(bucket_snapshot_error_to_object_pg_action_error)?)) =>
                 {
                     if self
@@ -1460,7 +1468,8 @@ impl StorageCluster {
                     return Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict);
                 }
                 Err(error)
-                    if error.applied_nodes == 0
+                    if error.progress.is_abortable()
+                        && error.applied_nodes == 0
                         && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
                 {
                     let reissued = match self.reissue_pending_metadata_command_with_route_mode(
@@ -1487,6 +1496,7 @@ impl StorageCluster {
                 }
                 Err(error)
                     if abandon_zero_apply_stale_reservation
+                        && error.progress.is_abortable()
                         && error.applied_nodes == 0
                         && (Self::reserve_object_generation_conflict_matches(
                             &command,
@@ -1769,9 +1779,13 @@ impl StorageCluster {
             let mut command = command;
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
-                    Ok(()) => {
-                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    Ok(outcome) => {
+                        if outcome == request_ops::MetadataCommandApplyOutcome::Converged {
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
                             .map_err(ObjectPgActionError::from)?;
+                        }
                         return Ok(());
                     }
                     Err(error)
@@ -1807,7 +1821,8 @@ impl StorageCluster {
                         ));
                     }
                     Err(error)
-                        if error.applied_nodes == 0
+                        if error.progress.is_abortable()
+                            && error.applied_nodes == 0
                             && Self::metadata_command_log_conflict_matches(
                                 &command,
                                 &error.source,
@@ -1822,7 +1837,7 @@ impl StorageCluster {
                         command = reissued;
                     }
                     Err(error) => {
-                        if error.applied_nodes == 0 {
+                        if error.progress.is_abortable() && error.applied_nodes == 0 {
                             self.record_abandoned_metadata_command_to_acting_set(&command)
                                 .map_err(|error| {
                                     bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -2133,13 +2148,15 @@ impl StorageCluster {
         let mut command = command.clone();
         loop {
             match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => {
-                    self.remove_pending_metadata_command_for_bucket(
-                        pg_id,
-                        command.bucket_name(),
-                        &command,
-                    )
-                    .map_err(ObjectPgActionError::from)?;
+                Ok(outcome) => {
+                    if outcome == request_ops::MetadataCommandApplyOutcome::Converged {
+                        self.remove_pending_metadata_command_for_bucket(
+                            pg_id,
+                            command.bucket_name(),
+                            &command,
+                        )
+                        .map_err(ObjectPgActionError::from)?;
+                    }
                     return Ok(StreamAppendCommandApplyOutcome::Applied);
                 }
                 Err(error)
@@ -2179,7 +2196,8 @@ impl StorageCluster {
                     ));
                 }
                 Err(error)
-                    if error.applied_nodes == 0
+                    if error.progress.is_abortable()
+                        && error.applied_nodes == 0
                         && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
                 {
                     let Some(reissued) = self
@@ -2191,7 +2209,7 @@ impl StorageCluster {
                     command = reissued;
                 }
                 Err(error) => {
-                    if error.applied_nodes == 0 {
+                    if error.progress.is_abortable() && error.applied_nodes == 0 {
                         self.record_abandoned_metadata_command_to_acting_set(&command)
                             .map_err(|error| {
                                 bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -2386,9 +2404,13 @@ impl StorageCluster {
             let mut command = command;
             loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
-                    Ok(()) => {
-                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                    Ok(outcome) => {
+                        if outcome == request_ops::MetadataCommandApplyOutcome::Converged {
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
                             .map_err(ObjectPgActionError::from)?;
+                        }
                         return Ok(());
                     }
                     Err(error)
@@ -2424,7 +2446,8 @@ impl StorageCluster {
                         ));
                     }
                     Err(error)
-                        if error.applied_nodes == 0
+                        if error.progress.is_abortable()
+                            && error.applied_nodes == 0
                             && Self::metadata_command_log_conflict_matches(
                                 &command,
                                 &error.source,
@@ -2444,7 +2467,7 @@ impl StorageCluster {
                         command = reissued;
                     }
                     Err(error) => {
-                        if error.applied_nodes == 0 {
+                        if error.progress.is_abortable() && error.applied_nodes == 0 {
                             self.record_abandoned_metadata_command_to_acting_set(&command)
                                 .map_err(|error| {
                                     bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -3027,11 +3050,14 @@ impl StorageCluster {
             };
 
             let mut command = command;
-            loop {
+            let converged = loop {
                 match self.apply_metadata_command_to_acting_set(&command) {
-                    Ok(()) => break,
+                    Ok(outcome) => {
+                        break outcome == request_ops::MetadataCommandApplyOutcome::Converged;
+                    }
                     Err(error)
-                        if request_ops::metadata_command_apply_transport_error_is_retryable(
+                        if error.progress.is_abortable()
+                            && request_ops::metadata_command_apply_transport_error_is_retryable(
                             &error.source,
                         ) =>
                     {
@@ -3054,7 +3080,7 @@ impl StorageCluster {
                             Some(true)
                         ) =>
                     {
-                        break;
+                        break true;
                     }
                     Err(error)
                         if matches!(
@@ -3073,7 +3099,8 @@ impl StorageCluster {
                         ));
                     }
                     Err(error)
-                        if error.applied_nodes == 0
+                        if error.progress.is_abortable()
+                            && error.applied_nodes == 0
                             && Self::metadata_command_log_conflict_matches(
                                 &command,
                                 &error.source,
@@ -3121,7 +3148,10 @@ impl StorageCluster {
                         command = reissued;
                     }
                     Err(error) => {
-                        if new_pending_command && error.applied_nodes == 0 {
+                        if new_pending_command
+                            && error.progress.is_abortable()
+                            && error.applied_nodes == 0
+                        {
                             self.record_abandoned_metadata_command_to_acting_set(&command)
                                 .map_err(|error| {
                                     bucket_snapshot_error_to_object_pg_action_error(error.source)
@@ -3152,9 +3182,10 @@ impl StorageCluster {
                         ));
                     }
                 }
-            }
+            };
 
-            if self
+            if converged
+                && self
                 .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
                     pg_id, &command,
                 )
@@ -3167,7 +3198,11 @@ impl StorageCluster {
                 )
                 .map_err(ObjectPgActionError::from)?;
             }
-            self.emit_metadata_command_recovery_outcome_for_command(pg_id, &command, "applied");
+            if converged {
+                self.emit_metadata_command_recovery_outcome_for_command(
+                    pg_id, &command, "applied",
+                );
+            }
             break command;
         };
 

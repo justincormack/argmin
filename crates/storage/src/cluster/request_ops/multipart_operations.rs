@@ -1518,7 +1518,7 @@ impl super::StorageCluster {
                     command.payload()
                 {
                     match self
-                        .drain_bucket_pg_pending_metadata_command_with_work_budget(
+                        .drain_bucket_pg_pending_metadata_command_requiring_convergence_with_work_budget(
                             pg_id,
                             &command,
                             false,
@@ -1586,7 +1586,8 @@ impl super::StorageCluster {
                 super::AllocatorCleanupPendingInstallOutcome::Installed => {}
                 super::AllocatorCleanupPendingInstallOutcome::RetryAfterContention => continue,
             }
-            match self.finish_pending_metadata_command_to_acting_set_with_work_budget(
+            match self
+                .finish_pending_metadata_command_to_acting_set_requiring_convergence_with_work_budget(
                 pg_id,
                 &command,
                 true,
@@ -1651,12 +1652,14 @@ impl super::StorageCluster {
         let mut command = command.clone();
         loop {
             match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => {
-                    self.release_metadata_command_bucket_write_reservation(&command)
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                    self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                        .map_err(ObjectPgActionError::from)?;
-                    self.after_object_metadata_command_applied(&command);
+                Ok(outcome) => {
+                    if outcome == MetadataCommandApplyOutcome::Converged {
+                        self.release_metadata_command_bucket_write_reservation(&command)
+                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
+                            .map_err(ObjectPgActionError::from)?;
+                        self.after_object_metadata_command_applied(&command);
+                    }
                     return Ok(());
                 }
                 Err(error)
@@ -1695,7 +1698,8 @@ impl super::StorageCluster {
                     ));
                 }
                 Err(error)
-                    if error.applied_nodes == 0
+                    if error.progress.is_abortable()
+                        && error.applied_nodes == 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command,
                             &error.source,

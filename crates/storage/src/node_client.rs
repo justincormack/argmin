@@ -1362,6 +1362,37 @@ pub(crate) struct UnixStorageNodeClient {
     rpc_auth: Option<Arc<StorageRpcClientAuthConfig>>,
 }
 
+#[derive(Debug)]
+enum StorageRpcRequestDispatchFailure {
+    NotSent(StoreError),
+    MayHaveApplied(StoreError),
+}
+
+impl StorageRpcRequestDispatchFailure {
+    fn into_source(self) -> StoreError {
+        match self {
+            Self::NotSent(source) | Self::MayHaveApplied(source) => source,
+        }
+    }
+
+    fn into_metadata_command_apply_error(self) -> MetadataCommandApplyError {
+        match self {
+            Self::NotSent(source) => MetadataCommandApplyError::not_sent(source),
+            Self::MayHaveApplied(source) => MetadataCommandApplyError::may_have_applied(source),
+        }
+    }
+}
+
+fn storage_rpc_deadline_expired(context: &'static str) -> StoreError {
+    StoreError::Io {
+        context,
+        source: io::Error::new(
+            io::ErrorKind::TimedOut,
+            "storage-node RPC absolute operation deadline expired",
+        ),
+    }
+}
+
 fn write_unix_storage_rpc_request<W: Write>(
     writer: &mut W,
     node_id: NodeId,
@@ -1385,6 +1416,45 @@ fn write_unix_storage_rpc_request<W: Write>(
     )
     .map_err(|error| {
         storage_rpc_stream_error(node_id, operation, StorageRpcStreamError::Io(error))
+    })?;
+    Ok(Some(request_proof))
+}
+
+fn write_unix_storage_rpc_request_classified<W: Write>(
+    writer: &mut W,
+    node_id: NodeId,
+    auth: Option<&StorageRpcClientAuthConfig>,
+    frame: &StorageRpcFrame,
+    operation: &'static str,
+) -> Result<Option<StorageRpcRequestProof>, StorageRpcRequestDispatchFailure> {
+    let Some(auth) = auth else {
+        return write_storage_rpc_frame_to(writer, frame)
+            .map(|()| None)
+            .map_err(|error| {
+                StorageRpcRequestDispatchFailure::MayHaveApplied(storage_rpc_stream_error(
+                    node_id, operation, error,
+                ))
+            });
+    };
+    let signed_request = auth
+        .sign_request(node_id, crate::clock::current_time_millis(), frame)
+        .map_err(|error| {
+            StorageRpcRequestDispatchFailure::NotSent(storage_rpc_auth_store_error(
+                node_id, operation, error,
+            ))
+        })?;
+    let (envelope, request_proof) = signed_request.into_parts();
+    write_storage_rpc_auth_transport_frame_with_limit(
+        writer,
+        &envelope,
+        auth.transport_limits().max_frame_bytes(),
+    )
+    .map_err(|error| {
+        StorageRpcRequestDispatchFailure::MayHaveApplied(storage_rpc_stream_error(
+            node_id,
+            operation,
+            StorageRpcStreamError::Io(error),
+        ))
     })?;
     Ok(Some(request_proof))
 }

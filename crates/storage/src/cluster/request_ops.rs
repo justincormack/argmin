@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::sync::MutexGuard;
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use placement::NodeId;
 
@@ -52,7 +53,8 @@ use crate::node_client::{
     BuildDeleteSpecificObjectVersionCommandReq, BuildInsertDeleteMarkerCommandReq,
     BuildPutObjectMetadataCommandReq, BuildStreamPartCommitCommandReq,
     BuildStreamPutCommitCommandReq, CreateBucketCommandBuild, CreateStreamUploadPrecondition,
-    InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild, MetadataReadAuthorization,
+    InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild, MetadataCommandApplyError,
+    MetadataCommandApplyErrorKind, MetadataReadAuthorization,
 };
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::traits::DurableBucketWriteReservationAcquire;

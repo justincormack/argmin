@@ -1265,7 +1265,7 @@ fn direct_put_committed_response_loss_retry_returns_existing_commit() {
 }
 
 #[test]
-fn versioned_direct_put_retries_replica_timeout_after_primary_commit() {
+fn versioned_direct_put_hands_persistent_trailing_replica_failure_to_recovery() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1313,10 +1313,10 @@ fn versioned_direct_put_retries_replica_timeout_after_primary_commit() {
     };
 
     let _serial = lock_metadata_command_apply_hook_test();
-    let fail_replica_once = Arc::new(AtomicBool::new(true));
+    let trailing_replica_attempts = Arc::new(AtomicUsize::new(0));
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
-    let fail_replica_once_hook = Arc::clone(&fail_replica_once);
+    let trailing_replica_attempts_hook = Arc::clone(&trailing_replica_attempts);
     let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
         move |node_id, command| {
             if matches!(
@@ -1324,32 +1324,296 @@ fn versioned_direct_put_retries_replica_timeout_after_primary_commit() {
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && node_id == NodeId::new(0)
-                        && fail_replica_once_hook.swap(false, Ordering::SeqCst)
+                        && node_id == NodeId::new(2)
             ) {
+                trailing_replica_attempts_hook.fetch_add(1, Ordering::SeqCst);
                 return Err(StoreError::StorageRpc {
                     node_id: node_id.as_u32(),
                     operation: "apply metadata command",
                     failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
                     detail: crate::error::StorageNodeFailureDetail::new(
-                        "injected direct PUT replica timeout after primary apply",
+                        "injected persistent direct PUT trailing-replica timeout",
                     ),
                 });
             }
             Ok(())
         },
     ));
-
     let outcome = route
         .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
         .unwrap()
         .unwrap();
     drop(hook_guard);
-    assert!(
-        !fail_replica_once.load(Ordering::SeqCst),
-        "direct PUT must exercise the post-primary transport retry"
+    assert_eq!(
+        trailing_replica_attempts.load(Ordering::SeqCst),
+        1,
+        "published direct PUT must hand the first failed trailing apply to recovery"
     );
     assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
+    let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("published command must retain its exact recovery slot");
+    let expected_identity = (
+        pending.id().cluster_epoch(),
+        pending.id().log_index(),
+        pending.checksum_crc64(),
+    );
+
+    for node_id in [NodeId::new(0), NodeId::new(1)] {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        let live = stored.as_live().expect("direct PUT object should be live");
+        assert_eq!(live.version_id, outcome.version_id);
+        assert_eq!(live.generation_id, generation_id);
+        assert_eq!(live.size, data.len() as u64);
+    }
+    let trailing_pg = map
+        .node(NodeId::new(2))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*trailing_pg, &bucket, &key),
+        Err(crate::MetadataError::ObjectNotFound)
+    ));
+    drop(trailing_pg);
+
+    let recovered_identities = Arc::new(Mutex::new(Vec::new()));
+    let recovered_identities_hook = Arc::clone(&recovered_identities);
+    let recovery_bucket = bucket.clone();
+    let recovery_key = key.clone();
+    let recovery_hook = cluster.test_install_after_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if node_id == NodeId::new(2)
+                        && commit.object.bucket == recovery_bucket
+                        && commit.object.key == recovery_key
+            ) {
+                recovered_identities_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push((
+                        command.id().cluster_epoch(),
+                        command.id().log_index(),
+                        command.checksum_crc64(),
+                    ));
+            }
+            Ok(())
+        },
+    ));
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_recovery_gate(PgId::new(object_pg), &pending,)
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    drop(recovery_hook);
+    let recovered_identities = recovered_identities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert_eq!(
+        recovered_identities.as_slice(),
+        &[expected_identity],
+        "recovery must replay the exact published command"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
+fn versioned_direct_put_converges_primary_apply_response_loss_before_success() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("response-loss");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let data = b"versioned direct PUT apply response loss";
+    let payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Enabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(data),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let primary_response_lost = Arc::new(AtomicBool::new(false));
+    let witness_response_lost = Arc::new(AtomicBool::new(false));
+    let observed_command_identities = Arc::new(Mutex::new(Vec::new()));
+    let attempted_command_identities = Arc::new(Mutex::new(Vec::new()));
+    let attempt_count = Arc::new(AtomicUsize::new(0));
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let primary_response_lost_hook = Arc::clone(&primary_response_lost);
+    let witness_response_lost_hook = Arc::clone(&witness_response_lost);
+    let observed_command_identities_hook = Arc::clone(&observed_command_identities);
+    let attempted_command_identities_hook = Arc::clone(&attempted_command_identities);
+    let attempt_count_hook = Arc::clone(&attempt_count);
+    let attempt_hook_bucket = bucket.clone();
+    let attempt_hook_key = key.clone();
+    let attempt_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.bucket == attempt_hook_bucket
+                        && commit.object.key == attempt_hook_key
+            ) {
+                attempted_command_identities_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push((
+                        command.id().cluster_epoch(),
+                        command.id().log_index(),
+                        command.checksum_crc64(),
+                    ));
+                if attempt_count_hook.fetch_add(1, Ordering::SeqCst) == 1 {
+                    return Err(StoreError::RouteMapExpired {
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        valid_until_ms: 0,
+                        now_ms: 1,
+                    });
+                }
+            }
+            Ok(())
+        }));
+    let hook_guard = cluster.test_install_after_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() {
+                if commit.object.bucket == hook_bucket && commit.object.key == hook_key {
+                    observed_command_identities_hook
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .push((
+                            command.id().cluster_epoch(),
+                            command.id().log_index(),
+                            command.checksum_crc64(),
+                        ));
+                    if node_id == NodeId::new(1)
+                        && !primary_response_lost_hook.swap(true, Ordering::SeqCst)
+                    {
+                        return Err(StoreError::StorageRpc {
+                            node_id: node_id.as_u32(),
+                            operation: "apply metadata command",
+                            failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                            detail: crate::error::StorageNodeFailureDetail::new(
+                                "injected response loss after durable primary apply",
+                            ),
+                        });
+                    }
+                    if node_id == NodeId::new(0)
+                        && !witness_response_lost_hook.swap(true, Ordering::SeqCst)
+                    {
+                        return Err(StoreError::StorageRpc {
+                            node_id: node_id.as_u32(),
+                            operation: "apply metadata command",
+                            failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                            detail: crate::error::StorageNodeFailureDetail::new(
+                                "injected response loss after durable replica apply",
+                            ),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        },
+    ));
+    let outcome = route
+        .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+    drop(hook_guard);
+    drop(attempt_hook);
+    assert!(
+        primary_response_lost.load(Ordering::SeqCst),
+        "direct PUT must cross the durable primary response-loss boundary"
+    );
+    assert!(
+        witness_response_lost.load(Ordering::SeqCst),
+        "direct PUT must cross the durable witness response-loss boundary"
+    );
+    let observed_command_identities = observed_command_identities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let expected_identity = observed_command_identities[0];
+    assert!(
+        observed_command_identities
+            .iter()
+            .all(|identity| *identity == expected_identity),
+        "every publication-confirmation replay must retain epoch, index, and checksum"
+    );
+    drop(observed_command_identities);
+    let attempted_command_identities = attempted_command_identities
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        attempted_command_identities.len() >= 3,
+        "witness loss, an unrelated route expiry, and primary loss must all preserve exact-command confirmation"
+    );
+    assert!(
+        attempted_command_identities
+            .iter()
+            .all(|identity| *identity == expected_identity),
+        "every apply attempt must retain the exact epoch, index, and checksum"
+    );
+    assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
+    let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("primary response loss must retain the exact recovery slot");
+    assert_eq!(
+        (
+            pending.id().cluster_epoch(),
+            pending.id().log_index(),
+            pending.checksum_crc64(),
+        ),
+        expected_identity,
+        "recovery handoff must retain the published command identity"
+    );
+    assert_eq!(
+        cluster
+            .drain_pending_metadata_command_with_recovery_gate(PgId::new(object_pg), &pending,)
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     assert_bucket_write_reservations_released(&map, &bucket);
     for node_id in node_ids {

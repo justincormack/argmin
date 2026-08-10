@@ -159,6 +159,115 @@ mod pending_command_terminal_cleanup_tests {
     }
 
     #[test]
+    fn published_command_handoff_excludes_divergent_and_semantic_conflicts() {
+        assert!(metadata_command_apply_error_can_handoff_to_recovery(
+            &remote_failure(StorageRpcErrorCode::TransportTimeout)
+        ));
+        assert!(metadata_command_apply_error_can_handoff_to_recovery(
+            &StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            }
+            .into()
+        ));
+        assert!(metadata_command_apply_error_can_handoff_to_recovery(
+            &StoreError::Io {
+                context: "test trailing replica storage failure",
+                source: std::io::Error::other("test trailing replica storage failure"),
+            }
+            .into()
+        ));
+        assert!(!metadata_command_apply_error_can_handoff_to_recovery(
+            &StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            }
+            .into()
+        ));
+        assert!(!metadata_command_apply_error_can_handoff_to_recovery(
+            &BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationConflict {
+                    reservation_id: "reservation".to_string(),
+                },
+            )
+        ));
+    }
+
+    #[test]
+    fn metadata_command_publication_progress_is_monotonic() {
+        let states = [
+            MetadataCommandApplyProgress::Abortable,
+            MetadataCommandApplyProgress::Witnessed,
+            MetadataCommandApplyProgress::PublicationUnconfirmed,
+            MetadataCommandApplyProgress::Published,
+        ];
+
+        for (left_rank, left) in states.into_iter().enumerate() {
+            for (right_rank, right) in states.into_iter().enumerate() {
+                assert_eq!(
+                    left.merge(right),
+                    states[left_rank.max(right_rank)],
+                    "merging publication progress must retain the furthest observed state"
+                );
+            }
+        }
+
+        assert_eq!(
+            MetadataCommandApplyProgress::Abortable.after_dispatch(false),
+            MetadataCommandApplyProgress::Witnessed
+        );
+        assert_eq!(
+            MetadataCommandApplyProgress::Witnessed.after_dispatch(true),
+            MetadataCommandApplyProgress::PublicationUnconfirmed
+        );
+        assert_eq!(
+            MetadataCommandApplyProgress::Published.after_dispatch(false),
+            MetadataCommandApplyProgress::Published
+        );
+        assert_eq!(
+            MetadataCommandApplyProgress::Published.after_dispatch(true),
+            MetadataCommandApplyProgress::Published
+        );
+
+        let failure = MetadataCommandApplyAttemptFailure::before_apply(
+            2,
+            StoreError::MetadataCommandContention {
+                context: "test pre-dispatch failure",
+            },
+        );
+        assert_eq!(
+            failure.failure.progress,
+            MetadataCommandApplyProgress::Abortable,
+            "a node position alone must not imply that any dispatch occurred"
+        );
+    }
+
+    #[test]
+    fn metadata_command_publication_order_is_witness_then_primary_then_replicas() {
+        let primary = NodeId::new(7);
+        let witness = NodeId::new(2);
+        let mut nodes = [NodeId::new(9), primary, NodeId::new(4), witness];
+
+        nodes.sort_by_key(|node_id| {
+            StorageCluster::metadata_command_publication_order_key(
+                *node_id,
+                primary,
+                Some(witness),
+            )
+        });
+
+        assert_eq!(nodes, [witness, primary, NodeId::new(4), NodeId::new(9)]);
+        assert_eq!(
+            StorageCluster::metadata_command_publication_order_key(primary, primary, None),
+            (1, primary),
+            "single-replica mode has no off-primary witness"
+        );
+    }
+
+    #[test]
     fn applied_command_release_defers_metadata_contention_but_not_invariants() {
         assert!(applied_metadata_command_cleanup_error_is_retryable(
             &BucketSnapshotLoadError::Metadata(

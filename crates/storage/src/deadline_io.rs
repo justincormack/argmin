@@ -16,8 +16,10 @@
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// A connected stream that can wait for read and write readiness until an
@@ -115,6 +117,173 @@ fn wait_for_fd_until(
         }
         return Ok(());
     }
+}
+
+/// Connects a filesystem Unix socket without allowing listen-backlog pressure
+/// to escape the caller's absolute deadline.
+pub(crate) fn connect_unix_stream_until(
+    path: &Path,
+    deadline: Instant,
+    timeout_message: &'static str,
+) -> io::Result<UnixStream> {
+    remaining_poll_timeout_ms(deadline, timeout_message)?;
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&0) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "Unix socket path contains NUL",
+        ));
+    }
+
+    // SAFETY: sockaddr_un is a plain C address structure and zero is a valid
+    // initialization before its family and path fields are populated.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path_bytes.len() >= address.sun_path.len() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "Unix socket path is too long",
+        ));
+    }
+    address.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX)
+        .expect("AF_UNIX fits the platform socket-family field");
+    // SAFETY: the length check above proves the source plus its zero terminator
+    // fits sun_path, which was zero-initialized.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            path_bytes.as_ptr(),
+            address.sun_path.as_mut_ptr().cast::<u8>(),
+            path_bytes.len(),
+        );
+    }
+    let address_len = std::mem::offset_of!(libc::sockaddr_un, sun_path)
+        .checked_add(path_bytes.len())
+        .and_then(|len| len.checked_add(1))
+        .and_then(|len| libc::socklen_t::try_from(len).ok())
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Unix socket path overflowed"))?;
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    {
+        address.sun_len = u8::try_from(address_len)
+            .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "Unix socket path is too long"))?;
+    }
+
+    // SAFETY: AF_UNIX/SOCK_STREAM has no additional pointer arguments.
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw_fd was returned as a new owned descriptor above.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    set_unix_connect_descriptor_flags(&fd)?;
+
+    // SAFETY: address points to an initialized sockaddr_un and address_len
+    // covers exactly its family, path bytes, and zero terminator.
+    let connect_result = unsafe {
+        libc::connect(
+            fd.as_raw_fd(),
+            (&raw const address).cast::<libc::sockaddr>(),
+            address_len,
+        )
+    };
+    if connect_result != 0 {
+        let error = io::Error::last_os_error();
+        let raw_error = error.raw_os_error();
+        if raw_error != Some(libc::EINPROGRESS)
+            && raw_error != Some(libc::EAGAIN)
+            && raw_error != Some(libc::EWOULDBLOCK)
+            && raw_error != Some(libc::EINTR)
+        {
+            return Err(error);
+        }
+        wait_for_fd_until(fd.as_raw_fd(), libc::POLLOUT, deadline, timeout_message)?;
+
+        let mut socket_error = 0;
+        let mut socket_error_len = libc::socklen_t::try_from(std::mem::size_of_val(&socket_error))
+            .expect("socket error length fits socklen_t");
+        // SAFETY: both output pointers reference initialized writable values
+        // of the lengths passed to getsockopt.
+        if unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                (&raw mut socket_error).cast(),
+                &raw mut socket_error_len,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if socket_error != 0 {
+            return Err(io::Error::from_raw_os_error(socket_error));
+        }
+    }
+    if Instant::now() >= deadline {
+        return Err(timeout_error(timeout_message));
+    }
+    clear_unix_connect_nonblocking(&fd)?;
+    Ok(UnixStream::from(fd))
+}
+
+fn set_unix_connect_descriptor_flags(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: fcntl operates on the live descriptor owned by fd.
+    let descriptor_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFD consumes an integer flag value, not a pointer.
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFD,
+            descriptor_flags | libc::FD_CLOEXEC,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fcntl operates on the live descriptor owned by fd.
+    let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL consumes an integer flag value, not a pointer.
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFL,
+            status_flags | libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn clear_unix_connect_nonblocking(fd: &OwnedFd) -> io::Result<()> {
+    // SAFETY: fcntl operates on the live descriptor owned by fd.
+    let status_flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL consumes an integer flag value, not a pointer.
+    if unsafe {
+        libc::fcntl(
+            fd.as_raw_fd(),
+            libc::F_SETFL,
+            status_flags & !libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 macro_rules! impl_deadline_transport_for_socket {

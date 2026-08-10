@@ -687,19 +687,13 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
         },
     };
 
-    let err = cluster
+    let published = cluster
         .create_bucket_with_config_and_load_info_raw(&create_config())
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert!(matches!(
+        published,
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name == bucket
+    ));
     assert!(!fail_once.load(Ordering::SeqCst));
     {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -979,7 +973,7 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
             name: first_bucket.as_str(),
             owner_principal: "owner",
@@ -993,17 +987,11 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
                 object_ownership: crate::BucketObjectOwnership::ObjectWriter,
             },
         })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected partial create bucket failure",
-                ..
-            })
-        ),
-        "expected injected partial create failure, got {err:?}"
-    );
+        .unwrap();
+    assert!(matches!(
+        published,
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name == first_bucket
+    ));
     assert!(pending_metadata_command_for_test(&map, PgId::new(1), &first_bucket).is_some());
     drop(hook_guard);
 
@@ -1123,19 +1111,10 @@ fn put_bucket_versioning_command_retry_reuses_pending_partial_replica_command() 
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert_eq!(published.versioning, crate::BucketVersioningState::Enabled);
     assert!(!fail_once.load(Ordering::SeqCst));
     {
         let primary = map.node(NodeId::new(1)).unwrap().storage_node();
@@ -1253,19 +1232,10 @@ fn same_bucket_pending_metadata_command_drains_before_later_acl() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert_eq!(published.versioning, crate::BucketVersioningState::Enabled);
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
 
@@ -1476,7 +1446,7 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
@@ -1485,17 +1455,9 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
                 public_write: false,
             },
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert!(published.public_read);
+    assert!(!published.public_write);
     assert!(!fail_once.load(Ordering::SeqCst));
 
     let partial_info = {
@@ -1596,20 +1558,20 @@ fn bucket_acl_drains_pending_multipart_completion_barrier_command() {
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
     let _serial = lock_metadata_command_apply_hook_test();
-    let apply_count = Arc::new(AtomicUsize::new(0));
     let hook_bucket = bucket.clone();
-    let apply_count_hook = Arc::clone(&apply_count);
     let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
-        move |_node_id, command| {
+        move |node_id, command| {
             match command.payload() {
                 MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance)
-                    if advance.bucket == hook_bucket
-                        && apply_count_hook.fetch_add(1, Ordering::SeqCst) == 1 =>
+                    if advance.bucket == hook_bucket && node_id == NodeId::new(2) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected multipart completion barrier sequence apply failure",
-                        source: std::io::Error::other(
-                            "injected multipart completion barrier sequence apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "injected multipart completion barrier sequence apply failure",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected multipart completion barrier sequence apply failure"
+                                .to_owned(),
                         ),
                     });
                 }
@@ -1619,18 +1581,23 @@ fn bucket_acl_drains_pending_multipart_completion_barrier_command() {
         },
     ));
 
-    let err = cluster
+    cluster
         .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &command)
-        .unwrap_err();
+        .expect("witness and primary publication should hand trailing convergence to recovery");
     assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected multipart completion barrier sequence apply failure",
-                ..
-            })
-        ),
-        "expected injected sequence apply failure, got {err:?}"
+        pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
+        "published command must retain its exact recovery slot"
+    );
+    let trailing = map.node(NodeId::new(2)).unwrap().storage_node();
+    assert_eq!(
+        crate::traits::PgMetadataStore::head_bucket_record_raw(
+            &*trailing.get_pg(pg_id.get()).unwrap(),
+            &bucket,
+        )
+        .unwrap()
+        .multipart_completion_barrier_sequence,
+        0,
+        "the injected trailing failure must leave replica convergence pending"
     );
     drop(hook_guard);
 
@@ -1703,7 +1670,7 @@ fn existing_create_bucket_preserves_pending_acl_command_for_retry() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .put_bucket_acl_and_load_info_raw(
             &bucket,
             &acl_grants,
@@ -1712,17 +1679,9 @@ fn existing_create_bucket_preserves_pending_acl_command_for_retry() {
                 public_write: false,
             },
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert!(published.public_read);
+    assert!(!published.public_write);
     assert!(!fail_once.load(Ordering::SeqCst));
 
     let pending_before = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
@@ -2056,19 +2015,10 @@ fn bucket_property_command_retry_reuses_pending_partial_replica_command() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .put_bucket_public_access_block_and_load_info_raw(&bucket, public_access_block)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert_eq!(published.public_access_block, Some(public_access_block));
     assert!(!fail_once.load(Ordering::SeqCst));
 
     let partial_info = {
@@ -2485,7 +2435,7 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .put_bucket_subresource_and_load_info_raw(
             &bucket,
             crate::PutBucketSubresource {
@@ -2494,17 +2444,8 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
                 aux: crate::BucketSubresourceAux::policy(false),
             },
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert!(published.bucket_policy_present);
     assert!(!fail_once.load(Ordering::SeqCst));
 
     let partial_info = {

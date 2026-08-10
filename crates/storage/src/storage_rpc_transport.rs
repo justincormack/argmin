@@ -13,7 +13,7 @@ use rustls::pki_types::ServerName;
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
-use crate::deadline_io::DeadlineStream;
+use crate::deadline_io::{connect_unix_stream_until, DeadlineStream};
 
 pub(crate) const STORAGE_RPC_TLS_ALPN: &[u8] = b"argmin-storage-rpc/1";
 const STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT: usize = 8;
@@ -203,7 +203,11 @@ impl StorageRpcClientEndpoint {
     pub(crate) fn connect(&self, deadline: Instant) -> io::Result<BoxStorageRpcStream> {
         match &self.inner {
             StorageRpcClientEndpointInner::Unix { socket_path, .. } => {
-                let stream = UnixStream::connect(socket_path)?;
+                let stream = connect_unix_stream_until(
+                    socket_path,
+                    deadline,
+                    "storage RPC absolute operation deadline expired",
+                )?;
                 let stream = DeadlineStream::new(
                     stream,
                     deadline,
@@ -213,7 +217,11 @@ impl StorageRpcClientEndpoint {
             }
             #[cfg(test)]
             StorageRpcClientEndpointInner::TestUnpooledUnix { socket_path } => {
-                let stream = UnixStream::connect(socket_path)?;
+                let stream = connect_unix_stream_until(
+                    socket_path,
+                    deadline,
+                    "storage RPC absolute operation deadline expired",
+                )?;
                 let stream = DeadlineStream::new(
                     stream,
                     deadline,
@@ -241,7 +249,11 @@ impl StorageRpcClientEndpoint {
                 socket_path,
                 request_pool,
             } => request_pool.checkout(deadline, io_timeout, max_connections, || {
-                let stream = UnixStream::connect(socket_path)?;
+                let stream = connect_unix_stream_until(
+                    socket_path,
+                    deadline,
+                    "storage RPC absolute operation deadline expired",
+                )?;
                 let stream = DeadlineStream::new(
                     stream,
                     deadline,
@@ -695,6 +707,7 @@ mod tests {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     use std::net::TcpListener;
+    use std::os::unix::net::UnixListener;
     use std::thread;
 
     fn test_certificates() -> Vec<CertificateDer<'static>> {
@@ -973,6 +986,21 @@ mod tests {
 
         assert_eq!(observer.read_timeout().unwrap(), None);
         assert_eq!(observer.write_timeout().unwrap(), None);
+    }
+
+    #[test]
+    fn unix_endpoint_does_not_connect_after_absolute_deadline() {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("storage.sock");
+        let _listener = UnixListener::bind(&socket_path).unwrap();
+        let endpoint = StorageRpcClientEndpoint::unix(socket_path);
+
+        let error = endpoint
+            .connect(Instant::now())
+            .err()
+            .expect("expired Unix connect must fail");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

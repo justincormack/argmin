@@ -1850,11 +1850,7 @@ fn stale_duplicate_metadata_command_index_on_non_primary_fails_closed_without_dr
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         crate::PgMetadataStore::head_bucket(&*pg, &first_bucket).unwrap();
-        if node_id == NodeId::new(1) {
-            crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).unwrap();
-        } else {
-            assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
-        }
+        assert!(crate::PgMetadataStore::head_bucket(&*pg, &second_bucket).is_err());
         if node_id == NodeId::new(0) {
             crate::PgMetadataStore::head_bucket(&*pg, &occupant_bucket).unwrap();
         } else {
@@ -1863,11 +1859,7 @@ fn stale_duplicate_metadata_command_index_on_non_primary_fails_closed_without_dr
         assert_eq!(
             pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
                 .unwrap(),
-            if node_id == NodeId::new(0) || node_id == NodeId::new(1) {
-                2
-            } else {
-                1
-            }
+            if node_id == NodeId::new(0) { 2 } else { 1 }
         );
     }
 }
@@ -2485,7 +2477,7 @@ fn zero_apply_command_failure_records_tombstone_for_later_hash_chain_convergence
             match command.payload() {
                 MetadataCommandPayload::CreateBucket(create)
                     if create.bucket().name == first_bucket_for_hook
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(0)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
                     return Err(StoreError::Io {
@@ -7201,24 +7193,11 @@ fn abandoned_put_object_stream_create_release_failure_retries_to_terminal_cleanu
         },
     ));
 
-    let err = cluster
-        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected abandoned stream create release failure",
-                ..
-            })
-        ),
-        "expected injected abandoned release failure, got {err:?}"
-    );
-    drop(hook_guard);
-    assert!(!fail_once.load(Ordering::SeqCst));
     cluster
         .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
-        .unwrap();
+        .expect("pre-witness cleanup failure should retry the exact derivative");
+    drop(hook_guard);
+    assert!(!fail_once.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
     for node_id in node_ids {
         let pg = map
@@ -7342,7 +7321,7 @@ fn abandoned_stream_create_cleanup_derivative_reissues_and_converges() {
             match candidate.payload() {
                 MetadataCommandPayload::ReleaseObjectGeneration(release)
                     if release.matches_request(&hook_bucket, &hook_key, &hook_session)
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(0)
                         && conflict_once_hook.swap(false, Ordering::SeqCst) =>
                 {
                     first_cleanup_log_index_hook
@@ -7444,7 +7423,7 @@ fn zero_apply_generation_reservation_records_tombstone_and_later_reserves() {
                 MetadataCommandPayload::ReserveObjectGeneration(reservation)
                     if reservation.bucket == hook_bucket
                         && reservation.key == hook_key
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(0)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
                     return Err(StoreError::Io {
@@ -7590,7 +7569,7 @@ fn zero_apply_direct_put_commit_records_tombstone_and_cleans_new_payload() {
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(0)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
                     return Err(StoreError::Io {
@@ -7915,13 +7894,15 @@ fn direct_put_commit_drains_unrelated_pending_command_before_publish() {
                 MetadataCommandPayload::PutObjectMetadata(update)
                     if update.object.bucket == hook_bucket
                         && update.object.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected unrelated metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected unrelated metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected unrelated metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -7933,21 +7914,12 @@ fn direct_put_commit_drains_unrelated_pending_command_before_publish() {
 
     let tags =
         "<Tagging><TagSet><Tag><Key>phase</Key><Value>pending</Value></Tag></TagSet></Tagging>";
-    let err = cluster
+    cluster
         .put_object_tags_if(&bucket, &pending_key, None, tags, |stored| {
             Ok::<_, ()>(stored.version_id())
         })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected unrelated metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected unrelated pending command failure, got {err:?}"
-    );
+        .expect("published metadata update must hand trailing convergence to recovery")
+        .expect("object tag precondition should succeed");
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -8322,13 +8294,15 @@ fn reserve_object_version_retry_converges_pending_then_allocates_fresh_version()
                 MetadataCommandPayload::ReserveObjectVersion(reservation)
                     if reservation.bucket == hook_bucket
                         && reservation.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected reserve object version apply failure",
-                        source: std::io::Error::other(
-                            "injected reserve object version apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected reserve object version apply failure".to_owned(),
                         ),
                     });
                 }
@@ -8338,19 +8312,10 @@ fn reserve_object_version_retry_converges_pending_then_allocates_fresh_version()
         },
     ));
 
-    let err = cluster
+    let first_reserved = cluster
         .reserve_next_object_version(pg_id, &bucket, &key)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected reserve object version apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published version reservation must hand trailing convergence to recovery");
+    assert_eq!(first_reserved, crate::VersionId::from_u64(1));
     drop(hook_guard);
 
     let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
@@ -8367,16 +8332,22 @@ fn reserve_object_version_retry_converges_pending_then_allocates_fresh_version()
         &key,
         2,
     );
-    for node_id in [NodeId::new(0), NodeId::new(2)] {
-        assert_object_version_counter_on_acting_nodes(
-            &map,
-            &[node_id],
-            object_pg,
-            &bucket,
-            &key,
-            0,
-        );
-    }
+    assert_object_version_counter_on_acting_nodes(
+        &map,
+        &[NodeId::new(0)],
+        object_pg,
+        &bucket,
+        &key,
+        2,
+    );
+    assert_object_version_counter_on_acting_nodes(
+        &map,
+        &[NodeId::new(2)],
+        object_pg,
+        &bucket,
+        &key,
+        0,
+    );
 
     let reserved = cluster
         .reserve_next_object_version(pg_id, &bucket, &key)
@@ -8546,19 +8517,10 @@ fn reserve_object_version_partial_apply_after_reopen_converges() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .reserve_next_object_version(pg_id, &bucket, &key)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected lost reserve object version replica apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .unwrap();
+    assert_eq!(published, crate::VersionId::from_u64(1));
     drop(hook_guard);
 
     assert_object_version_counter_on_acting_nodes(

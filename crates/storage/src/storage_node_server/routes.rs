@@ -13,6 +13,8 @@ struct StorageNodeConnectionHandler {
     rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,
     #[cfg(test)]
     runtime_route_capture_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
+    #[cfg(test)]
+    response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
 }
 #[derive(Debug)]
 enum StorageNodeBucketRouteError {

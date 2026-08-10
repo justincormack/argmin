@@ -1708,13 +1708,15 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
                         &create.upload().upload_id,
                     )
                     .is_some_and(|position| position != (0, 0))
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected multipart create metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected multipart create metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected multipart create metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -1724,7 +1726,7 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
         },
     ));
 
-    let err = cluster
+    cluster
         .create_multipart_upload_with_ordered_id(
             &bucket,
             &key,
@@ -1734,17 +1736,8 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
                 Ok::<_, ()>(((), create.clone(), upload_id_key.clone()))
             },
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected multipart create metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published multipart create must hand trailing convergence to recovery")
+        .expect("multipart create preparation should produce an outcome");
     drop(hook_guard);
 
     let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
@@ -1769,7 +1762,7 @@ fn multipart_create_partial_apply_retry_reuses_pending_command() {
         crate::PgMetadataStore::get_multipart_upload(&*pg, &ordered_upload_id).unwrap()
     };
     {
-        let failed_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+        let failed_replica = map.node(NodeId::new(2)).unwrap().storage_node();
         let pg = failed_replica.get_pg(object_pg).unwrap();
         assert!(matches!(
             crate::PgMetadataStore::get_multipart_upload(&*pg, &ordered_upload_id),
@@ -1858,12 +1851,16 @@ fn multipart_create_partial_apply_reopens_and_converges() {
             match command.payload() {
                 MetadataCommandPayload::CreateMultipartUpload(create)
                     if create.upload().upload_id == hook_upload_id
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected multipart create reopen failure",
-                        source: std::io::Error::other("injected multipart create reopen failure"),
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected multipart create reopen failure".to_owned(),
+                        ),
                     });
                 }
                 _ => {}
@@ -1872,7 +1869,7 @@ fn multipart_create_partial_apply_reopens_and_converges() {
         },
     ));
 
-    let err = cluster
+    cluster
         .create_multipart_upload(
             &bucket,
             &key,
@@ -1882,17 +1879,8 @@ fn multipart_create_partial_apply_reopens_and_converges() {
                 Ok::<_, ()>(((), create.clone()))
             },
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::BucketSnapshotLoadError::Store(StoreError::Io {
-                context: "injected multipart create reopen failure",
-                ..
-            })
-        ),
-        "expected injected partial create failure, got {err:?}"
-    );
+        .expect("published multipart create must hand trailing convergence to recovery")
+        .expect("multipart create preparation should produce an outcome");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket);
@@ -2230,13 +2218,15 @@ fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
             match command.payload() {
                 MetadataCommandPayload::AbortMultipartUpload(abort)
                     if abort.upload_id == hook_upload_id
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected multipart abort metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected multipart abort metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected multipart abort metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -2246,19 +2236,9 @@ fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
         },
     ));
 
-    let err = cluster
+    assert!(cluster
         .abort_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected multipart abort metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published multipart abort must hand trailing convergence to recovery"));
     drop(hook_guard);
 
     assert!(
@@ -2267,7 +2247,7 @@ fn multipart_abort_partial_apply_retry_cleans_uploaded_part_payload() {
     );
     {
         let replica_pg = map
-            .node(NodeId::new(0))
+            .node(NodeId::new(2))
             .unwrap()
             .storage_node()
             .get_pg(object_pg)
@@ -2534,19 +2514,9 @@ fn multipart_abort_partial_apply_reopens_and_converges() {
         },
     ));
 
-    let err = cluster
+    assert!(cluster
         .abort_multipart_upload(&bucket, &key, &upload_id)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected multipart abort reopen failure",
-                ..
-            })
-        ),
-        "expected injected partial abort failure, got {err:?}"
-    );
+        .unwrap());
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -4640,7 +4610,7 @@ fn multipart_abort_zero_apply_leaves_upload_in_progress_before_retry() {
             match command.payload() {
                 MetadataCommandPayload::AbortMultipartUpload(abort)
                     if abort.upload_id == hook_upload_id
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(0)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
                     return Err(StoreError::Io {

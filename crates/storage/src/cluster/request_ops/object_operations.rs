@@ -419,22 +419,24 @@ impl super::StorageCluster {
         loop {
             work_budget.check("object metadata command apply retry budget exhausted")?;
             match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(()) => {
-                    if self
-                        .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                            pg_id, &command,
-                        )
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
-                    {
-                        self.remove_pending_metadata_command_for_bucket_with_work_budget(
-                            pg_id,
-                            command.bucket_name(),
-                            &command,
-                            &mut work_budget,
-                        )
-                        .map_err(ObjectPgActionError::from)?;
+                Ok(outcome) => {
+                    if outcome == MetadataCommandApplyOutcome::Converged {
+                        if self
+                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                                pg_id, &command,
+                            )
+                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+                        {
+                            self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                                pg_id,
+                                command.bucket_name(),
+                                &command,
+                                &mut work_budget,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
+                        }
+                        self.after_object_metadata_command_applied(&command);
                     }
-                    self.after_object_metadata_command_applied(&command);
                     #[cfg(test)]
                     crate::node::maybe_run_after_object_metadata_command_publish_hook(
                         self.metadata_primary_test_hook_node().test_hook_scope_id(),
@@ -444,9 +446,12 @@ impl super::StorageCluster {
                 Err(error) => {
                     let MetadataCommandApplyFailure {
                         applied_nodes,
+                        progress,
                         source,
                     } = error;
-                    if metadata_command_apply_transport_error_is_retryable(&source) {
+                    if progress.is_abortable()
+                        && metadata_command_apply_transport_error_is_retryable(&source)
+                    {
                         work_budget
                             .sleep_after_contention(
                                 "object metadata command transport retry budget exhausted",
@@ -488,7 +493,8 @@ impl super::StorageCluster {
                         }
                         None => {}
                     }
-                    if applied_nodes == 0
+                    if progress.is_abortable()
+                        && applied_nodes == 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command, &source,
                         )
@@ -504,7 +510,8 @@ impl super::StorageCluster {
                         command = reissued;
                         continue;
                     }
-                    if applied_nodes == 0
+                    if progress.is_abortable()
+                        && applied_nodes == 0
                         && super::StorageCluster::reserve_object_version_conflict_matches(
                             &command, &source,
                         )
@@ -532,7 +539,7 @@ impl super::StorageCluster {
                             source,
                         ));
                     }
-                    if applied_nodes == 0 {
+                    if progress.is_abortable() && applied_nodes == 0 {
                         self.record_abandoned_metadata_command_to_acting_set(&command)
                             .map_err(|error| {
                                 super::bucket_snapshot_error_to_object_pg_action_error(error.source)

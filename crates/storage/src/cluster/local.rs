@@ -4643,6 +4643,7 @@ impl LocalClusterMap {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_metadata_command_for_replica(
         &self,
         origin_node_id: NodeId,
@@ -4656,15 +4657,35 @@ impl LocalClusterMap {
             target_pg_id,
             command,
             true,
+            None,
         )
     }
 
-    pub(crate) fn validate_metadata_command_for_replica_for_metadata_command_recovery(
+    pub(crate) fn validate_metadata_command_for_replica_until(
         &self,
         origin_node_id: NodeId,
         target_node_id: NodeId,
         target_pg_id: PgId,
         command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_metadata_command_for_replica_with_route_validity(
+            origin_node_id,
+            target_node_id,
+            target_pg_id,
+            command,
+            true,
+            Some(deadline),
+        )
+    }
+
+    pub(crate) fn validate_metadata_command_for_replica_for_metadata_command_recovery_until(
+        &self,
+        origin_node_id: NodeId,
+        target_node_id: NodeId,
+        target_pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
         self.validate_metadata_command_for_replica_with_route_validity(
             origin_node_id,
@@ -4672,6 +4693,7 @@ impl LocalClusterMap {
             target_pg_id,
             command,
             false,
+            Some(deadline),
         )
     }
 
@@ -4682,6 +4704,7 @@ impl LocalClusterMap {
         target_pg_id: PgId,
         command: &MetadataCommandEnvelope,
         require_validity: bool,
+        deadline: Option<Instant>,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
         let command_pg_id = command.id().pg_id();
         if command_pg_id != target_pg_id {
@@ -4760,9 +4783,14 @@ impl LocalClusterMap {
                 cluster_epoch: self.epoch,
             })?;
 
-        target_node
-            .metadata_command_inspection_client()
-            .metadata_command_acceptance(target_pg_id, command)
+        match deadline {
+            Some(deadline) => target_node
+                .metadata_command_inspection_client()
+                .metadata_command_acceptance_until(target_pg_id, command, deadline),
+            None => target_node
+                .metadata_command_inspection_client()
+                .metadata_command_acceptance(target_pg_id, command),
+        }
     }
 
     pub(crate) fn validate_metadata_command_abandon_for_replica(

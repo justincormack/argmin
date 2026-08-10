@@ -600,13 +600,15 @@ fn object_delete_metadata_command_retry_reuses_pending_partial_replica_command()
                 MetadataCommandPayload::DeleteObjectVersion(delete)
                     if delete.bucket == hook_bucket
                         && delete.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected object delete metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected object delete metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected object delete metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -616,19 +618,10 @@ fn object_delete_metadata_command_retry_reuses_pending_partial_replica_command()
         },
     ));
 
-    let err = cluster
+    cluster
         .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected object delete metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published object delete must hand trailing convergence to recovery")
+        .expect("object delete precondition should succeed");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
@@ -644,7 +637,7 @@ fn object_delete_metadata_command_retry_reuses_pending_partial_replica_command()
         ));
     }
     {
-        let failed_replica = map.node(NodeId::new(0)).unwrap().storage_node();
+        let failed_replica = map.node(NodeId::new(2)).unwrap().storage_node();
         let pg = failed_replica.get_pg(object_pg).unwrap();
         let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
         assert_eq!(
@@ -829,19 +822,14 @@ fn object_delete_exact_pending_retry_converges_partial_exact_conflict() {
         },
     ));
 
-    let err = cluster
+    let published = cluster
         .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected exact pending delete apply failure",
-                ..
-            })
-        ),
-        "expected injected node-2 failure, got {err:?}"
-    );
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        published.deleted,
+        crate::DeletedCurrentObject::Live { .. }
+    ));
     drop(fail_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some());
@@ -1027,13 +1015,15 @@ fn object_delete_metadata_command_partial_apply_reopens_and_releases_bucket_writ
                 MetadataCommandPayload::DeleteObjectVersion(delete)
                     if delete.bucket == hook_bucket
                         && delete.key == hook_key
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected object delete reopen apply failure",
-                        source: std::io::Error::other(
-                            "injected object delete reopen apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected object delete reopen apply failure".to_owned(),
                         ),
                     });
                 }
@@ -1043,26 +1033,18 @@ fn object_delete_metadata_command_partial_apply_reopens_and_releases_bucket_writ
         },
     ));
 
-    let err = cluster
+    cluster
         .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected object delete reopen apply failure",
-                ..
-            })
-        ),
-        "expected injected primary failure, got {err:?}"
-    );
+        .expect("published object delete must hand trailing convergence to recovery")
+        .expect("object delete precondition should succeed");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
         "partial object delete command must remain durable before reopen"
     );
-    for node_id in [NodeId::new(1), NodeId::new(2)] {
+    {
+        let node_id = NodeId::new(2);
         let pg = map
             .node(node_id)
             .unwrap()
@@ -1165,13 +1147,15 @@ fn multipart_completion_barrier_drains_same_pg_object_command_with_cleanup_hooks
                 MetadataCommandPayload::DeleteObjectVersion(delete)
                     if delete.bucket == hook_bucket
                         && delete.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected same-pg object delete apply failure",
-                        source: std::io::Error::other(
-                            "injected same-pg object delete apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected same-pg object delete apply failure".to_owned(),
                         ),
                     });
                 }
@@ -1181,19 +1165,10 @@ fn multipart_completion_barrier_drains_same_pg_object_command_with_cleanup_hooks
         },
     ));
 
-    let err = cluster
+    cluster
         .delete_current_object_if(&bucket, &key, |_| Ok::<(), ()>(()))
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected same-pg object delete apply failure",
-                ..
-            })
-        ),
-        "expected injected delete failure, got {err:?}"
-    );
+        .expect("published object delete must hand trailing convergence to recovery")
+        .expect("object delete precondition should succeed");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&map, PgId::new(pg_id), &bucket).is_some());
@@ -1736,13 +1711,15 @@ fn object_metadata_update_retry_converges_pending_partial_replica_command() {
                 MetadataCommandPayload::PutObjectMetadata(update)
                     if update.object.bucket == hook_bucket
                         && update.object.key == hook_key
-                        && node_id == NodeId::new(0)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected object metadata command apply failure",
-                        source: std::io::Error::other(
-                            "injected object metadata command apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected object metadata command apply failure".to_owned(),
                         ),
                     });
                 }
@@ -1752,25 +1729,17 @@ fn object_metadata_update_retry_converges_pending_partial_replica_command() {
         },
     ));
 
-    let err = cluster
+    cluster
         .put_object_tags_if(&bucket, &key, None, tags, require_tags_absent)
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected object metadata command apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published metadata update must hand trailing convergence to recovery")
+        .expect("object metadata precondition should succeed");
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
         "partial object metadata command must remain pending"
     );
-    for node_id in [NodeId::new(0), NodeId::new(2)] {
+    {
+        let node_id = NodeId::new(2);
         let node = map.node(node_id).unwrap().storage_node();
         let pg = node.get_pg(object_pg).unwrap();
         assert_eq!(
@@ -1848,13 +1817,15 @@ fn object_metadata_partial_apply_reopens_and_converges() {
                 MetadataCommandPayload::PutObjectMetadata(update)
                     if update.object.bucket == hook_bucket
                         && update.object.key == hook_key
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected object metadata reopen apply failure",
-                        source: std::io::Error::other(
-                            "injected object metadata reopen apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected object metadata reopen apply failure".to_owned(),
                         ),
                     });
                 }
@@ -1863,21 +1834,12 @@ fn object_metadata_partial_apply_reopens_and_converges() {
             Ok(())
         },
     ));
-    let err = cluster
+    cluster
         .put_object_tags_if(&bucket, &key, None, tags, |stored| {
             Ok::<_, ()>(stored.version_id())
         })
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected object metadata reopen apply failure",
-                ..
-            })
-        ),
-        "expected injected primary failure, got {err:?}"
-    );
+        .expect("published metadata update must hand trailing convergence to recovery")
+        .expect("object metadata precondition should succeed");
     drop(hook_guard);
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
@@ -3623,13 +3585,15 @@ fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservat
                 MetadataCommandPayload::InsertDeleteMarker(marker)
                     if marker.bucket == hook_bucket
                         && marker.key == hook_key
-                        && node_id == NodeId::new(1)
+                        && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected delete marker reopen apply failure",
-                        source: std::io::Error::other(
-                            "injected delete marker reopen apply failure",
+                    return Err(StoreError::StorageRpc {
+                        node_id: node_id.as_u32(),
+                        operation: "apply metadata command",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "injected delete marker reopen apply failure".to_owned(),
                         ),
                     });
                 }
@@ -3639,7 +3603,7 @@ fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservat
         },
     ));
 
-    let err = cluster
+    cluster
         .insert_current_delete_marker_if(
             &bucket,
             &key,
@@ -3647,17 +3611,8 @@ fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservat
             owner.clone(),
             |_| Ok::<(), ()>(()),
         )
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(StoreError::Io {
-                context: "injected delete marker reopen apply failure",
-                ..
-            })
-        ),
-        "expected injected replica failure, got {err:?}"
-    );
+        .expect("published delete marker must hand trailing convergence to recovery")
+        .expect("delete marker precondition should succeed");
     drop(hook_guard);
     assert!(!fail_once.load(Ordering::SeqCst));
     assert!(
@@ -3674,7 +3629,8 @@ fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservat
         let stored = crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key).unwrap();
         assert!(matches!(stored, crate::StoredObject::DeleteMarker(_)));
     }
-    for node_id in [NodeId::new(1), NodeId::new(2)] {
+    {
+        let node_id = NodeId::new(2);
         let pg = map
             .node(node_id)
             .unwrap()
