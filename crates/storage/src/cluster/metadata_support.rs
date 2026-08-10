@@ -216,26 +216,26 @@ fn metadata_transfer_destination_proof(
 fn metadata_transfer_destination_proof_for_commands(
     pg_id: PgId,
     applied_log_index: u64,
-    state_digest: u64,
+    state_digest: CanonicalStateDigest,
     commands: &[MetadataTransferCommand],
     destination_cluster_epoch: ClusterEpoch,
 ) -> PgMetadataProof {
-    let mut applied_log_hash = 0;
+    let mut applied_log_hash = MetadataCommandLogHash::genesis();
     for transfer_command in commands {
         let command = &transfer_command.command;
         applied_log_hash = metadata_command_log_hash(
             destination_cluster_epoch,
             pg_id,
             command.id().log_index(),
-            applied_log_hash,
+            applied_log_hash.value(),
             command.checksum_crc64(),
         );
     }
-    PgMetadataProof {
+    PgMetadataProof::from_carriers(
         applied_log_index,
         applied_log_hash,
         state_digest,
-    }
+    )
 }
 
 fn retained_log_export_failure_allows_checkpoint_fallback(
@@ -253,11 +253,11 @@ fn retained_log_export_failure_allows_checkpoint_fallback(
 
 fn metadata_transfer_prefix_proof_at_epoch(
     pg_id: PgId,
-    state_digest: u64,
+    state_digest: CanonicalStateDigest,
     commands: &[MetadataTransferCommand],
     destination_cluster_epoch: ClusterEpoch,
 ) -> PgMetadataProof {
-    let mut applied_log_hash = 0;
+    let mut applied_log_hash = MetadataCommandLogHash::genesis();
     for (index, transfer_command) in commands.iter().enumerate() {
         let log_index = MetadataCommandLogIndex::new((index + 1) as u64)
             .expect("metadata transfer prefix log indexes are non-zero");
@@ -269,15 +269,15 @@ fn metadata_transfer_prefix_proof_at_epoch(
             destination_cluster_epoch,
             pg_id,
             log_index,
-            applied_log_hash,
+            applied_log_hash.value(),
             command.checksum_crc64(),
         );
     }
-    PgMetadataProof {
-        applied_log_index: commands.len() as u64,
+    PgMetadataProof::from_carriers(
+        commands.len() as u64,
         applied_log_hash,
         state_digest,
-    }
+    )
 }
 
 impl StorageCluster {
@@ -389,7 +389,7 @@ fn classify_metadata_transfer_import_destination(
     }
 
     if state.applied_log_index == 0
-        && state.applied_log_hash == 0
+        && state.applied_log_hash.value() == 0
         && metadata_client.metadata_command_replica_state_can_initialize(pg_id, cluster_epoch)?
     {
         let actual_proof = PgMetadataProof {
@@ -406,8 +406,8 @@ fn classify_metadata_transfer_import_destination(
                 pg_id,
                 cluster_epoch,
                 applied_log_index: state.applied_log_index,
-                applied_log_hash: state.applied_log_hash,
-                state_digest: state.state_digest,
+                applied_log_hash: state.applied_log_hash.value(),
+                state_digest: state.state_digest.value(),
                 expected: base_import_proof,
             }
             .into(),
@@ -423,7 +423,7 @@ fn classify_metadata_transfer_import_destination(
                     state_digest: state.state_digest,
                 };
                 if base_import_proof.applied_log_index == 0
-                    && base_import_proof.applied_log_hash == 0
+                    && base_import_proof.applied_log_hash.value() == 0
                     && base_import_proof.state_digest == first_command.pre_state_digest
                 {
                     let peering_route = metadata_client
@@ -458,8 +458,8 @@ fn classify_metadata_transfer_import_destination(
                         pg_id,
                         cluster_epoch,
                         applied_log_index: state.applied_log_index,
-                        applied_log_hash: state.applied_log_hash,
-                        state_digest: state.state_digest,
+                        applied_log_hash: state.applied_log_hash.value(),
+                        state_digest: state.state_digest.value(),
                         expected: base_import_proof,
                     }
                     .into(),
@@ -493,8 +493,8 @@ fn classify_metadata_transfer_import_destination(
                         pg_id,
                         cluster_epoch,
                         applied_log_index: state.applied_log_index,
-                        applied_log_hash: state.applied_log_hash,
-                        state_digest: state.state_digest,
+                        applied_log_hash: state.applied_log_hash.value(),
+                        state_digest: state.state_digest.value(),
                         expected: prefix_proof,
                     }
                     .into(),
@@ -526,8 +526,8 @@ fn classify_metadata_transfer_import_destination(
                     pg_id,
                     cluster_epoch,
                     applied_log_index: state.applied_log_index,
-                    applied_log_hash: state.applied_log_hash,
-                    state_digest: state.state_digest,
+                    applied_log_hash: state.applied_log_hash.value(),
+                    state_digest: state.state_digest.value(),
                     expected: historical_prefix_proof,
                 }
                 .into(),
@@ -539,8 +539,8 @@ fn classify_metadata_transfer_import_destination(
                 pg_id,
                 cluster_epoch,
                 applied_log_index: state.applied_log_index,
-                applied_log_hash: state.applied_log_hash,
-                state_digest: state.state_digest,
+                applied_log_hash: state.applied_log_hash.value(),
+                state_digest: state.state_digest.value(),
                 expected: expected_import_proof,
             }
             .into(),

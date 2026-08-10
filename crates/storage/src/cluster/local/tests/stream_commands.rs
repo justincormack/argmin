@@ -3176,11 +3176,11 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
             .get_pg(object_pg)
             .unwrap();
         let state = pg.metadata_command_replica_state().unwrap();
-        let proof = crate::control_plane::PgMetadataProof {
-            applied_log_index: state.applied_log_index,
-            applied_log_hash: state.applied_log_hash,
-            state_digest: state.state_digest,
-        };
+        let proof = crate::control_plane::PgMetadataProof::current(
+            state.applied_log_index,
+            state.applied_log_hash,
+            state.state_digest,
+        );
         assert_eq!(
             proof, before_object_pg_proof,
             "old-primary stream PUT finalize must not append an object-PG command on node {node_id:?}"

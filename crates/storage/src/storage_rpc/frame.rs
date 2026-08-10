@@ -349,10 +349,10 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 4
         }
         StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize => {
-            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8
+            STORAGE_RPC_MAX_METADATA_COMMAND_TRANSFER_EMPTY_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize => {
-            STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN + 8 + 8 + 8
+            STORAGE_RPC_MAX_METADATA_COMMAND_TRANSFER_MATCHING_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall => {
             STORAGE_RPC_MAX_PAYLOAD_LEN

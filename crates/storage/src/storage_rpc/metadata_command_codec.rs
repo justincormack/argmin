@@ -1,6 +1,30 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+fn put_metadata_command_log_hash(out: &mut Vec<u8>, hash: MetadataCommandLogHash) {
+    put_u8(out, hash.encoding_version());
+    put_u64(out, hash.value());
+}
+
+fn read_metadata_command_log_hash(
+    decoder: &mut StorageRpcDecoder<'_>,
+) -> Result<MetadataCommandLogHash, StorageRpcPayloadError> {
+    MetadataCommandLogHash::from_encoded_parts(decoder.read_u8()?, decoder.read_u64()?)
+        .map_err(|_| StorageRpcPayloadError::UnsupportedMetadataProofCarrier("log-hash"))
+}
+
+fn put_canonical_state_digest(out: &mut Vec<u8>, digest: CanonicalStateDigest) {
+    put_u8(out, digest.encoding_version());
+    put_u64(out, digest.value());
+}
+
+fn read_canonical_state_digest(
+    decoder: &mut StorageRpcDecoder<'_>,
+) -> Result<CanonicalStateDigest, StorageRpcPayloadError> {
+    CanonicalStateDigest::from_encoded_parts(decoder.read_u8()?, decoder.read_u64()?)
+        .map_err(|_| StorageRpcPayloadError::UnsupportedMetadataProofCarrier("state-digest"))
+}
+
 pub(crate) fn encode_metadata_command_pending_slot_request(
     request: &StorageRpcMetadataCommandPendingSlotRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
@@ -500,8 +524,8 @@ pub(crate) fn encode_metadata_command_log_hash_range_response(
     );
     for entry in &response.entries {
         put_u64(&mut out, entry.log_index);
-        put_u64(&mut out, entry.previous_log_hash);
-        put_u64(&mut out, entry.log_hash);
+        put_metadata_command_log_hash(&mut out, entry.previous_log_hash);
+        put_metadata_command_log_hash(&mut out, entry.log_hash);
     }
     Ok(out)
 }
@@ -526,8 +550,8 @@ pub(crate) fn decode_metadata_command_log_hash_range_response(
         }
         entries.push(MetadataCommandLogHashRangeEntry {
             log_index,
-            previous_log_hash: decoder.read_u64()?,
-            log_hash: decoder.read_u64()?,
+            previous_log_hash: read_metadata_command_log_hash(&mut decoder)?,
+            log_hash: read_metadata_command_log_hash(&mut decoder)?,
         });
     }
     decoder.finish()?;
@@ -554,19 +578,19 @@ pub(crate) fn encode_metadata_command_log_entry_range_response(
             ));
         }
         put_u64(&mut out, entry.log_index);
-        put_u64(&mut out, entry.previous_log_hash);
-        put_u64(&mut out, entry.log_hash);
+        put_metadata_command_log_hash(&mut out, entry.previous_log_hash);
+        put_metadata_command_log_hash(&mut out, entry.log_hash);
         match entry.pre_state_digest {
             Some(pre_state_digest) => {
                 put_u8(&mut out, 1);
-                put_u64(&mut out, pre_state_digest);
+                put_canonical_state_digest(&mut out, pre_state_digest);
             }
             None => put_u8(&mut out, 0),
         }
         match entry.post_state_digest {
             Some(post_state_digest) => {
                 put_u8(&mut out, 1);
-                put_u64(&mut out, post_state_digest);
+                put_canonical_state_digest(&mut out, post_state_digest);
             }
             None => put_u8(&mut out, 0),
         }
@@ -614,11 +638,11 @@ pub(crate) fn decode_metadata_command_log_entry_range_response(
                 "metadata command entry range response log index must not be zero",
             ));
         }
-        let previous_log_hash = decoder.read_u64()?;
-        let log_hash = decoder.read_u64()?;
+        let previous_log_hash = read_metadata_command_log_hash(&mut decoder)?;
+        let log_hash = read_metadata_command_log_hash(&mut decoder)?;
         let pre_state_digest = match decoder.read_u8()? {
             0 => None,
-            1 => Some(decoder.read_u64()?),
+            1 => Some(read_canonical_state_digest(&mut decoder)?),
             _ => {
                 return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                     "metadata command entry range pre-state digest flag is invalid",
@@ -627,7 +651,7 @@ pub(crate) fn decode_metadata_command_log_entry_range_response(
         };
         let post_state_digest = match decoder.read_u8()? {
             0 => None,
-            1 => Some(decoder.read_u64()?),
+            1 => Some(read_canonical_state_digest(&mut decoder)?),
             _ => {
                 return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                     "metadata command entry range post-state digest flag is invalid",
@@ -944,8 +968,10 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
             put_u8(&mut out, 0);
             put_u64(&mut out, state.cluster_epoch.get());
             put_u64(&mut out, state.applied_log_index);
-            put_u64(&mut out, state.applied_log_hash);
-            put_u64(&mut out, state.state_digest);
+            put_u8(&mut out, state.applied_log_hash.encoding_version());
+            put_u64(&mut out, state.applied_log_hash.value());
+            put_u8(&mut out, state.state_digest.encoding_version());
+            put_u64(&mut out, state.state_digest.value());
         }
         StorageRpcMetadataCommandStateOutcome::LogConflict {
             node_id,
@@ -1010,12 +1036,30 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
 ) -> Result<StorageRpcMetadataCommandStateOutcomeResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
     let outcome = match decoder.read_u8()? {
-        0 => StorageRpcMetadataCommandStateOutcome::State(MetadataCommandReplicaState {
-            cluster_epoch: decoder.read_cluster_epoch()?,
-            applied_log_index: decoder.read_u64()?,
-            applied_log_hash: decoder.read_u64()?,
-            state_digest: decoder.read_u64()?,
-        }),
+        0 => {
+            let cluster_epoch = decoder.read_cluster_epoch()?;
+            let applied_log_index = decoder.read_u64()?;
+            let applied_log_hash = MetadataCommandLogHash::from_encoded_parts(
+                decoder.read_u8()?,
+                decoder.read_u64()?,
+            )
+            .map_err(|_| {
+                StorageRpcPayloadError::UnsupportedMetadataProofCarrier("log-hash")
+            })?;
+            let state_digest = CanonicalStateDigest::from_encoded_parts(
+                decoder.read_u8()?,
+                decoder.read_u64()?,
+            )
+            .map_err(|_| {
+                StorageRpcPayloadError::UnsupportedMetadataProofCarrier("state-digest")
+            })?;
+            StorageRpcMetadataCommandStateOutcome::State(MetadataCommandReplicaState {
+                cluster_epoch,
+                applied_log_index,
+                applied_log_hash,
+                state_digest,
+            })
+        }
         1 => StorageRpcMetadataCommandStateOutcome::LogConflict {
             node_id: decoder.read_u32()?,
             pg_id: decoder.read_u32()?,
@@ -1099,7 +1143,7 @@ pub(crate) fn encode_metadata_command_transfer_adopt_request(
         cluster_epoch: request.cluster_epoch,
         pg_id: request.pg_id,
     });
-    put_u64(&mut out, request.expected_state_digest);
+    put_canonical_state_digest(&mut out, request.expected_state_digest);
     put_u32(
         &mut out,
         u32::try_from(request.commands.len()).map_err(|_| {
@@ -1111,8 +1155,8 @@ pub(crate) fn encode_metadata_command_transfer_adopt_request(
     for transfer_command in &request.commands {
         let command = &transfer_command.command;
         validate_metadata_command_route(request.cluster_epoch, request.pg_id, command.id())?;
-        put_u64(&mut out, transfer_command.pre_state_digest);
-        put_u64(&mut out, transfer_command.post_state_digest);
+        put_canonical_state_digest(&mut out, transfer_command.pre_state_digest);
+        put_canonical_state_digest(&mut out, transfer_command.post_state_digest);
         let item = StorageRpcMetadataCommandItem {
             command_checksum: command.checksum_crc64(),
             command_bytes: command.command_bytes(),
@@ -1130,12 +1174,12 @@ pub(crate) fn decode_metadata_command_transfer_adopt_request(
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
-    let expected_state_digest = decoder.read_u64()?;
+    let expected_state_digest = read_canonical_state_digest(&mut decoder)?;
     let count = decoder.read_u32()?;
     let mut commands = Vec::new();
     for _ in 0..count {
-        let pre_state_digest = decoder.read_u64()?;
-        let post_state_digest = decoder.read_u64()?;
+        let pre_state_digest = read_canonical_state_digest(&mut decoder)?;
+        let post_state_digest = read_canonical_state_digest(&mut decoder)?;
         let item = decoder.read_metadata_command_item()?;
         let command = metadata_command_envelope_from_item(&item, authority)?;
         validate_metadata_command_route(cluster_epoch, pg_id, command.id())?;
@@ -1163,7 +1207,7 @@ pub(crate) fn encode_metadata_command_transfer_empty_state_request(
         cluster_epoch: request.cluster_epoch,
         pg_id: request.pg_id,
     });
-    put_u64(&mut out, request.expected_state_digest);
+    put_canonical_state_digest(&mut out, request.expected_state_digest);
     out
 }
 
@@ -1174,7 +1218,7 @@ pub(crate) fn decode_metadata_command_transfer_empty_state_request(
     let node_id = NodeId::new(decoder.read_u32()?);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
-    let expected_state_digest = decoder.read_u64()?;
+    let expected_state_digest = read_canonical_state_digest(&mut decoder)?;
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandTransferEmptyStateRequest {
         node_id,
@@ -1193,8 +1237,8 @@ pub(crate) fn encode_metadata_command_transfer_matching_state_request(
         pg_id: request.pg_id,
     });
     put_u64(&mut out, request.applied_log_index);
-    put_u64(&mut out, request.applied_log_hash);
-    put_u64(&mut out, request.expected_state_digest);
+    put_metadata_command_log_hash(&mut out, request.applied_log_hash);
+    put_canonical_state_digest(&mut out, request.expected_state_digest);
     out
 }
 
@@ -1206,8 +1250,8 @@ pub(crate) fn decode_metadata_command_transfer_matching_state_request(
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let applied_log_index = decoder.read_u64()?;
-    let applied_log_hash = decoder.read_u64()?;
-    let expected_state_digest = decoder.read_u64()?;
+    let applied_log_hash = read_metadata_command_log_hash(&mut decoder)?;
+    let expected_state_digest = read_canonical_state_digest(&mut decoder)?;
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandTransferMatchingStateRequest {
         node_id,
@@ -1532,12 +1576,15 @@ fn encode_metadata_command_checkpoint(
     out: &mut Vec<u8>,
     checkpoint: &MetadataCommandCheckpoint,
 ) -> Result<(), StorageRpcPayloadError> {
+    out.extend_from_slice(METADATA_COMMAND_CHECKPOINT_MAGIC);
+    out.extend_from_slice(&METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION.to_be_bytes());
     put_u64(out, checkpoint.cluster_epoch.get());
     put_u32(out, checkpoint.pg_id.get());
     put_u64(out, checkpoint.applied_log_index);
-    put_u64(out, checkpoint.applied_log_hash);
-    put_u64(out, checkpoint.state_digest);
-    put_u8(out, checkpoint.canonical_state_encoding_version);
+    put_u8(out, checkpoint.applied_log_hash.encoding_version());
+    put_u64(out, checkpoint.applied_log_hash.value());
+    put_u8(out, checkpoint.state_digest.encoding_version());
+    put_u64(out, checkpoint.state_digest.value());
     put_u32(out, checked_u32_len(checkpoint.table_digests.len())?);
     for digest in &checkpoint.table_digests {
         put_string(out, &digest.table_name);
@@ -1557,19 +1604,37 @@ fn encode_metadata_command_checkpoint(
 fn decode_metadata_command_checkpoint(
     decoder: &mut StorageRpcDecoder<'_>,
 ) -> Result<MetadataCommandCheckpoint, StorageRpcPayloadError> {
-    let cluster_epoch = decoder.read_cluster_epoch()?;
-    let pg_id = PgId::new(decoder.read_u32()?);
-    let applied_log_index = decoder.read_u64()?;
-    let applied_log_hash = decoder.read_u64()?;
-    let state_digest = decoder.read_u64()?;
-    let canonical_state_encoding_version = decoder.read_u8()?;
-    if canonical_state_encoding_version != METADATA_CANONICAL_STATE_ENCODING_VERSION {
+    if decoder.read_exact(METADATA_COMMAND_CHECKPOINT_MAGIC.len())?
+        != METADATA_COMMAND_CHECKPOINT_MAGIC
+    {
+        return Err(StorageRpcPayloadError::UnknownMetadataCheckpointMagic);
+    }
+    let checkpoint_version = u16::from_be_bytes(
+        decoder
+            .read_exact(2)?
+            .try_into()
+            .expect("two checkpoint-version bytes were read"),
+    );
+    if checkpoint_version != METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION {
         return Err(
-            StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                actual: canonical_state_encoding_version,
+            StorageRpcPayloadError::UnsupportedMetadataCheckpointEncodingVersion {
+                actual: checkpoint_version,
             },
         );
     }
+    let cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let applied_log_index = decoder.read_u64()?;
+    let applied_log_hash = MetadataCommandLogHash::from_encoded_parts(
+        decoder.read_u8()?,
+        decoder.read_u64()?,
+    )
+    .map_err(|_| StorageRpcPayloadError::UnsupportedMetadataProofCarrier("log-hash"))?;
+    let state_digest =
+        CanonicalStateDigest::from_encoded_parts(decoder.read_u8()?, decoder.read_u64()?)
+            .map_err(|_| {
+                StorageRpcPayloadError::UnsupportedMetadataProofCarrier("state-digest")
+            })?;
     let table_digest_count =
         decoder.read_count_with_limit(STORAGE_RPC_MAX_METADATA_CHECKPOINT_TABLES)?;
     let mut table_digests = Vec::with_capacity(table_digest_count);
@@ -1595,7 +1660,6 @@ fn decode_metadata_command_checkpoint(
         applied_log_index,
         applied_log_hash,
         state_digest,
-        canonical_state_encoding_version,
         table_digests,
         table_blocks,
         checkpoint_crc64,
@@ -1742,8 +1806,13 @@ pub(crate) fn encode_metadata_command_state_response(
     let mut out = Vec::new();
     put_u64(&mut out, response.state.cluster_epoch.get());
     put_u64(&mut out, response.state.applied_log_index);
-    put_u64(&mut out, response.state.applied_log_hash);
-    put_u64(&mut out, response.state.state_digest);
+    put_u8(
+        &mut out,
+        response.state.applied_log_hash.encoding_version(),
+    );
+    put_u64(&mut out, response.state.applied_log_hash.value());
+    put_u8(&mut out, response.state.state_digest.encoding_version());
+    put_u64(&mut out, response.state.state_digest.value());
     out
 }
 
@@ -1753,8 +1822,16 @@ pub(crate) fn decode_metadata_command_state_response(
     let mut decoder = StorageRpcDecoder::new(bytes);
     let cluster_epoch = decoder.read_cluster_epoch()?;
     let applied_log_index = decoder.read_u64()?;
-    let applied_log_hash = decoder.read_u64()?;
-    let state_digest = decoder.read_u64()?;
+    let applied_log_hash = MetadataCommandLogHash::from_encoded_parts(
+        decoder.read_u8()?,
+        decoder.read_u64()?,
+    )
+    .map_err(|_| StorageRpcPayloadError::UnsupportedMetadataProofCarrier("log-hash"))?;
+    let state_digest =
+        CanonicalStateDigest::from_encoded_parts(decoder.read_u8()?, decoder.read_u64()?)
+            .map_err(|_| {
+                StorageRpcPayloadError::UnsupportedMetadataProofCarrier("state-digest")
+            })?;
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandStateResponse {
         state: MetadataCommandReplicaState {

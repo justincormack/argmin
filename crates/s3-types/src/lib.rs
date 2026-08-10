@@ -896,6 +896,75 @@ pub enum AclGrantsParseError {
     NonCanonical,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StoredAclGrantsParseError {
+    #[error(transparent)]
+    Frame(#[from] StoredTextFrameParseError),
+    #[error("stored ACL-grants payload is invalid: {0}")]
+    Payload(#[from] AclGrantsParseError),
+}
+
+const STORED_ACL_GRANTS_MAGIC: &str = "ARGMIN-ACL-GRANTS/";
+const STORED_ACL_GRANTS_VERSION: u64 = 1;
+
+/// Opaque current durable representation of logical ACL grants.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredAclGrants {
+    serialized: String,
+    grants: AclGrants,
+}
+
+impl StoredAclGrants {
+    #[must_use]
+    pub fn from_grants(grants: &AclGrants) -> Self {
+        let payload = grants.to_canonical_storage_payload();
+        let mut serialized =
+            String::with_capacity(STORED_ACL_GRANTS_MAGIC.len() + 2 + payload.len());
+        serialized.push_str(STORED_ACL_GRANTS_MAGIC);
+        serialized.push_str(&STORED_ACL_GRANTS_VERSION.to_string());
+        serialized.push('\n');
+        serialized.push_str(&payload);
+        Self {
+            serialized,
+            grants: grants.clone(),
+        }
+    }
+
+    pub fn parse_current(serialized: String) -> Result<Self, StoredAclGrantsParseError> {
+        let payload = tag::parse_stored_text_frame(
+            &serialized,
+            STORED_ACL_GRANTS_MAGIC,
+            STORED_ACL_GRANTS_VERSION,
+        )?;
+        let grants = AclGrants::parse_canonical_storage_payload(payload)?;
+        Ok(Self { serialized, grants })
+    }
+
+    #[must_use]
+    pub fn grants(&self) -> &AclGrants {
+        &self.grants
+    }
+
+    #[must_use]
+    pub fn into_grants(self) -> AclGrants {
+        self.grants
+    }
+
+    #[must_use]
+    pub fn as_storage_str(&self) -> &str {
+        &self.serialized
+    }
+}
+
+impl std::fmt::Debug for StoredAclGrants {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StoredAclGrants")
+            .field("grant_count", &self.grants.0.len())
+            .finish()
+    }
+}
+
 impl AclGrants {
     #[must_use]
     pub fn new(mut grants: Vec<AclGrant>) -> Self {
@@ -946,9 +1015,7 @@ impl AclGrants {
         self.allows_all_users(permission) || self.allows_authenticated_users(permission)
     }
 
-    /// Encode the exact current durable ACL representation.
-    #[must_use]
-    pub fn to_current_storage_string(&self) -> String {
+    fn to_canonical_storage_payload(&self) -> String {
         let mut out = String::new();
         for grant in &self.0 {
             let (kind, value) = grant.grantee().serialize_tag();
@@ -957,10 +1024,9 @@ impl AclGrants {
         out
     }
 
-    /// Decode only the exact current durable ACL representation.
-    pub fn parse_current_storage(serialized: &str) -> Result<Self, AclGrantsParseError> {
+    fn parse_canonical_storage_payload(serialized: &str) -> Result<Self, AclGrantsParseError> {
         let grants = Self::parse_storage(serialized)?;
-        if grants.to_current_storage_string() == serialized {
+        if grants.to_canonical_storage_payload() == serialized {
             Ok(grants)
         } else {
             Err(AclGrantsParseError::NonCanonical)
@@ -1015,9 +1081,9 @@ mod tests {
         AclGrantsParseError, AclPermission, BucketNamespace, BucketObjectLockConfig,
         BucketVersioningState, CacheControl, CanonicalUserId, ContentEncoding, ContentType,
         Expires, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState,
-        ObjectRetention, RetentionPeriod, StoredLegalHoldStatus, VersionId,
-        WebsiteRedirectLocation, WebsiteRedirectLocationError, ANONYMOUS_UPLOAD_CANONICAL_USER_ID,
-        CANONICAL_USER_ID_LEN,
+        ObjectRetention, RetentionPeriod, StoredAclGrants, StoredAclGrantsParseError,
+        StoredLegalHoldStatus, StoredTextFrameParseError, VersionId, WebsiteRedirectLocation,
+        WebsiteRedirectLocationError, ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -1430,8 +1496,10 @@ mod tests {
             ),
             AclGrant::new(AclGrantee::AllUsers, AclPermission::Read),
         ]);
-        let serialized = grants.to_current_storage_string();
-        let parsed = AclGrants::parse_current_storage(&serialized).unwrap();
+        let serialized = StoredAclGrants::from_grants(&grants);
+        let parsed = StoredAclGrants::parse_current(serialized.as_storage_str().to_string())
+            .unwrap()
+            .into_grants();
         assert_eq!(parsed, grants);
         assert!(parsed.allows_all_users(AclPermission::Read));
         assert!(parsed.allows_canonical_user(&alt, AclPermission::WriteAcp));
@@ -1444,29 +1512,39 @@ mod tests {
     #[test]
     fn acl_grants_parse_reports_typed_errors() {
         assert_eq!(
-            AclGrants::parse_current_storage("group").unwrap_err(),
-            AclGrantsParseError::MissingValue { line: 1 }
+            StoredAclGrants::parse_current("ARGMIN-ACL-GRANTS/1\ngroup".to_string()).unwrap_err(),
+            StoredAclGrantsParseError::Payload(AclGrantsParseError::MissingValue { line: 1 })
         );
         assert_eq!(
-            AclGrants::parse_current_storage("group:all_users").unwrap_err(),
-            AclGrantsParseError::MissingPermission { line: 1 }
-        );
-        assert_eq!(
-            AclGrants::parse_current_storage("cu:not-a-canonical-id:READ").unwrap_err(),
-            AclGrantsParseError::InvalidCanonicalUserId { line: 1 }
-        );
-        assert_eq!(
-            AclGrants::parse_current_storage("group:unknown:READ").unwrap_err(),
-            AclGrantsParseError::InvalidGrantee { line: 1 }
-        );
-        assert_eq!(
-            AclGrants::parse_current_storage("group:all_users:BAD").unwrap_err(),
-            AclGrantsParseError::InvalidPermission { line: 1 }
-        );
-        assert_eq!(
-            AclGrants::parse_current_storage("group:all_users:READ\ngroup:unknown:READ")
+            StoredAclGrants::parse_current("ARGMIN-ACL-GRANTS/1\ngroup:all_users".to_string())
                 .unwrap_err(),
-            AclGrantsParseError::InvalidGrantee { line: 2 }
+            StoredAclGrantsParseError::Payload(AclGrantsParseError::MissingPermission { line: 1 })
+        );
+        assert_eq!(
+            StoredAclGrants::parse_current(
+                "ARGMIN-ACL-GRANTS/1\ncu:not-a-canonical-id:READ".to_string()
+            )
+            .unwrap_err(),
+            StoredAclGrantsParseError::Payload(AclGrantsParseError::InvalidCanonicalUserId {
+                line: 1
+            })
+        );
+        assert_eq!(
+            StoredAclGrants::parse_current("ARGMIN-ACL-GRANTS/1\ngroup:unknown:READ".to_string())
+                .unwrap_err(),
+            StoredAclGrantsParseError::Payload(AclGrantsParseError::InvalidGrantee { line: 1 })
+        );
+        assert_eq!(
+            StoredAclGrants::parse_current("ARGMIN-ACL-GRANTS/1\ngroup:all_users:BAD".to_string())
+                .unwrap_err(),
+            StoredAclGrantsParseError::Payload(AclGrantsParseError::InvalidPermission { line: 1 })
+        );
+        assert_eq!(
+            StoredAclGrants::parse_current(
+                "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ\ngroup:unknown:READ".to_string()
+            )
+            .unwrap_err(),
+            StoredAclGrantsParseError::Payload(AclGrantsParseError::InvalidGrantee { line: 2 })
         );
     }
 
@@ -1489,9 +1567,21 @@ mod tests {
             "group:all_users:READ\n",
             "group:authenticated_users:READ_ACP\n",
         );
-        assert_eq!(AclGrants::default().to_current_storage_string(), "");
-        assert_eq!(grants.to_current_storage_string(), expected);
-        assert_eq!(AclGrants::parse_current_storage(expected).unwrap(), grants);
+        assert_eq!(
+            StoredAclGrants::from_grants(&AclGrants::default()).as_storage_str(),
+            "ARGMIN-ACL-GRANTS/1\n"
+        );
+        let framed_expected = format!("ARGMIN-ACL-GRANTS/1\n{expected}");
+        assert_eq!(
+            StoredAclGrants::from_grants(&grants).as_storage_str(),
+            framed_expected
+        );
+        assert_eq!(
+            StoredAclGrants::parse_current(framed_expected)
+                .unwrap()
+                .into_grants(),
+            grants
+        );
 
         let all_permissions = AclGrants::new(vec![
             AclGrant::new(AclGrantee::AllUsers, AclPermission::FullControl),
@@ -1508,11 +1598,15 @@ mod tests {
             "group:all_users:FULL_CONTROL\n",
         );
         assert_eq!(
-            all_permissions.to_current_storage_string(),
-            all_permissions_expected
+            StoredAclGrants::from_grants(&all_permissions).as_storage_str(),
+            format!("ARGMIN-ACL-GRANTS/1\n{all_permissions_expected}")
         );
         assert_eq!(
-            AclGrants::parse_current_storage(all_permissions_expected).unwrap(),
+            StoredAclGrants::parse_current(format!(
+                "ARGMIN-ACL-GRANTS/1\n{all_permissions_expected}"
+            ))
+            .unwrap()
+            .into_grants(),
             all_permissions
         );
 
@@ -1524,8 +1618,45 @@ mod tests {
             "cu:A111111111111111111111111111111111111111111111111111111111111111:FULL_CONTROL\n",
         ] {
             assert_eq!(
-                AclGrants::parse_current_storage(noncanonical),
-                Err(AclGrantsParseError::NonCanonical)
+                StoredAclGrants::parse_current(format!("ARGMIN-ACL-GRANTS/1\n{noncanonical}")),
+                Err(StoredAclGrantsParseError::Payload(
+                    AclGrantsParseError::NonCanonical
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn acl_grants_storage_frame_rejects_version_before_payload() {
+        for malformed in [
+            "",
+            "ARGMIN-ACL",
+            "not-acl-grants",
+            "ARGMIN-ACL-GRANTS/",
+            "ARGMIN-ACL-GRANTS/\n",
+            "ARGMIN-ACL-GRANTS/x\n",
+            "ARGMIN-ACL-GRANTS/01\n",
+            "ARGMIN-ACL-GRANTS/18446744073709551616\n",
+            "ARGMIN-ACL-GRANTS/1\r\n",
+        ] {
+            let expected = if malformed.starts_with("ARGMIN-ACL-GRANTS/") {
+                StoredTextFrameParseError::MalformedVersion
+            } else {
+                StoredTextFrameParseError::UnknownMagic
+            };
+            assert_eq!(
+                StoredAclGrants::parse_current(malformed.to_string()),
+                Err(StoredAclGrantsParseError::Frame(expected))
+            );
+        }
+        for version in [0, 2] {
+            assert_eq!(
+                StoredAclGrants::parse_current(format!(
+                    "ARGMIN-ACL-GRANTS/{version}\ngroup:invalid:BAD"
+                )),
+                Err(StoredAclGrantsParseError::Frame(
+                    StoredTextFrameParseError::UnsupportedVersion { actual: version }
+                ))
             );
         }
     }

@@ -4,10 +4,11 @@
 use crate::control_plane::{
     format_snapshot, initial_cluster_bootstrap_map_digest, parse_snapshot,
     parse_snapshot_without_publication_validation, validate_control_plane_snapshot,
-    ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneError,
-    InitialClusterTopologyCertificate, NodeAvailabilityState, NodeHeartbeat, NodeMembershipState,
-    NodePgHeartbeatObservation, PendingMetadataCommandObservation, PgMetadataProof,
-    PgMetadataTransferProof, RuntimeMapFreshnessProof,
+    CanonicalStateDigest, ClusterControlSnapshot, ClusterRuntimeMapSnapshot, ControlPlaneError,
+    InitialClusterTopologyCertificate, MetadataCommandLogHash, NodeAvailabilityState,
+    NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation,
+    PendingMetadataCommandObservation, PgMetadataProof, PgMetadataTransferProof,
+    RuntimeMapFreshnessProof,
 };
 pub use crate::control_plane_lease::LeaseHorizonAuthorityBinding;
 use crate::types::{PgId, PgState};
@@ -20,7 +21,7 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 
 const CONTROL_PLANE_COMMAND_MAGIC: &[u8; 8] = b"ARGCPCMD";
-const CONTROL_PLANE_COMMAND_VERSION: u16 = 14;
+const CONTROL_PLANE_COMMAND_VERSION: u16 = 15;
 const CONTROL_PLANE_COMMAND_CHECKSUM_LEN: usize = 8;
 const CONTROL_PLANE_SNAPSHOT_MAGIC: &[u8; 8] = b"ARGCPSNP";
 const CONTROL_PLANE_SNAPSHOT_VERSION: u16 = 1;
@@ -1684,8 +1685,10 @@ fn read_node_availability(
 
 fn write_pg_metadata_proof(out: &mut Vec<u8>, proof: PgMetadataProof) {
     write_u64(out, proof.applied_log_index);
-    write_u64(out, proof.applied_log_hash);
-    write_u64(out, proof.state_digest);
+    write_u8(out, proof.applied_log_hash.encoding_version());
+    write_u64(out, proof.applied_log_hash.value());
+    write_u8(out, proof.state_digest.encoding_version());
+    write_u64(out, proof.state_digest.value());
 }
 
 fn write_pending_metadata_command_observation(
@@ -1730,10 +1733,19 @@ fn read_pending_metadata_command_observation(
 fn read_pg_metadata_proof(
     reader: &mut PayloadReader<'_>,
 ) -> Result<PgMetadataProof, ControlPlaneError> {
+    let applied_log_index = reader.read_u64()?;
+    let applied_log_hash_version = reader.read_u8()?;
+    let applied_log_hash =
+        MetadataCommandLogHash::from_encoded_parts(applied_log_hash_version, reader.read_u64()?)
+            .map_err(|error| command_protocol_error(error.to_string()))?;
+    let state_digest_version = reader.read_u8()?;
+    let state_digest =
+        CanonicalStateDigest::from_encoded_parts(state_digest_version, reader.read_u64()?)
+            .map_err(|error| command_protocol_error(error.to_string()))?;
     Ok(PgMetadataProof {
-        applied_log_index: reader.read_u64()?,
-        applied_log_hash: reader.read_u64()?,
-        state_digest: reader.read_u64()?,
+        applied_log_index,
+        applied_log_hash,
+        state_digest,
     })
 }
 
@@ -1925,19 +1937,19 @@ mod tests {
 
     #[test]
     fn pg_metadata_proof_command_encoding_is_stable() {
-        let proof = PgMetadataProof {
-            applied_log_index: 0x0102_0304_0506_0708,
-            applied_log_hash: 0x1112_1314_1516_1718,
-            state_digest: 0x2122_2324_2526_2728,
-        };
+        let proof = PgMetadataProof::current(
+            0x0102_0304_0506_0708,
+            0x1112_1314_1516_1718,
+            0x2122_2324_2526_2728,
+        );
         let mut bytes = Vec::new();
         write_pg_metadata_proof(&mut bytes, proof);
 
         assert_eq!(
             bytes,
             [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
-                0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x11, 0x12, 0x13, 0x14, 0x15,
+                0x16, 0x17, 0x18, 0x05, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
             ]
         );
         let mut reader = PayloadReader::new(&bytes);
@@ -1945,24 +1957,39 @@ mod tests {
         assert_eq!(reader.remaining_len(), 0);
     }
 
+    #[test]
+    fn pg_metadata_proof_command_rejects_each_unsupported_carrier_version() {
+        let proof = PgMetadataProof::current(1, 2, 3);
+        let mut bytes = Vec::new();
+        write_pg_metadata_proof(&mut bytes, proof);
+
+        for (offset, version, expected) in [
+            (
+                8,
+                2,
+                "unsupported metadata-command log-hash encoding version 2",
+            ),
+            (
+                17,
+                6,
+                "unsupported canonical-state digest encoding version 6",
+            ),
+        ] {
+            let mut malformed = bytes.clone();
+            malformed[offset] = version;
+            assert!(matches!(
+                read_pg_metadata_proof(&mut PayloadReader::new(&malformed)),
+                Err(ControlPlaneError::CommandDecode { message }) if message == expected
+            ));
+        }
+    }
+
     fn sample_commands() -> Vec<ControlPlaneCommand> {
-        let proof = PgMetadataProof {
-            applied_log_index: 7,
-            applied_log_hash: 8,
-            state_digest: 9,
-        };
+        let proof = PgMetadataProof::current(7, 8, 9);
         let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
             ClusterEpoch::new(11).unwrap(),
-            PgMetadataProof {
-                applied_log_index: 1,
-                applied_log_hash: 2,
-                state_digest: 3,
-            },
-            PgMetadataProof {
-                applied_log_index: 4,
-                applied_log_hash: 5,
-                state_digest: 6,
-            },
+            PgMetadataProof::current(1, 2, 3),
+            PgMetadataProof::current(4, 5, 6),
         );
         let certified_nodes = vec![
             (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
@@ -2128,11 +2155,7 @@ mod tests {
     }
 
     fn degenerate_commands() -> Vec<ControlPlaneCommand> {
-        let max_proof = PgMetadataProof {
-            applied_log_index: u64::MAX,
-            applied_log_hash: u64::MAX,
-            state_digest: u64::MAX,
-        };
+        let max_proof = PgMetadataProof::current(u64::MAX, u64::MAX, u64::MAX);
         vec![
             ControlPlaneCommand::BootstrapInitialClusterMap {
                 nodes: Vec::new(),
@@ -2323,6 +2346,35 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_command_v15_aggregate_encoding_is_stable() {
+        let mut aggregate = Vec::new();
+        for command in sample_commands().into_iter().chain(degenerate_commands()) {
+            let encoded = encode_control_plane_command(&command).unwrap();
+            write_u32(
+                &mut aggregate,
+                u32::try_from(encoded.len()).expect("test command length fits u32"),
+            );
+            aggregate.extend_from_slice(&encoded);
+        }
+        let digest: [u8; 32] =
+            checksum::compute_checksum(checksum::ChecksumAlgorithm::Sha256, &aggregate)
+                .bytes()
+                .try_into()
+                .unwrap();
+
+        assert_eq!(
+            (aggregate.len(), digest),
+            (
+                1_715,
+                [
+                    46, 63, 47, 65, 54, 10, 5, 92, 33, 210, 45, 201, 2, 193, 190, 143, 88, 127, 9,
+                    254, 58, 161, 137, 28, 138, 43, 167, 51, 164, 1, 182, 163,
+                ],
+            )
+        );
+    }
+
+    #[test]
     fn control_plane_command_codec_round_trips_degenerate_values() {
         for command in degenerate_commands() {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -2335,8 +2387,13 @@ mod tests {
     fn control_plane_command_codec_rejects_incompatible_or_malformed_payloads() {
         assert_decode_error_contains(b"not a command", "truncated");
 
-        let encoded = command_frame_with_version(12, 5, |body| write_u64(body, 1_000));
-        assert_decode_error_contains(&encoded, "unsupported control-plane command version 12");
+        for version in [14, 16] {
+            let encoded = command_frame_with_version(version, 5, |body| write_u64(body, 1_000));
+            assert_decode_error_contains(
+                &encoded,
+                &format!("unsupported control-plane command version {version}"),
+            );
+        }
 
         let mut encoded = encode_control_plane_command(&ControlPlaneCommand::SetPgState {
             pg_id: PgId::new(7),
@@ -2558,14 +2615,7 @@ mod tests {
             write_u32(body, 1);
             write_u32(body, 7);
             write_pg_state(body, PgState::Peering);
-            write_pg_metadata_proof(
-                body,
-                PgMetadataProof {
-                    applied_log_index: 1,
-                    applied_log_hash: 2,
-                    state_digest: 3,
-                },
-            );
+            write_pg_metadata_proof(body, PgMetadataProof::current(1, 2, 3));
             write_u8(body, 2);
         });
         assert_decode_error_contains(

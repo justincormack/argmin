@@ -749,7 +749,8 @@ fn force_insert_terminal_pending_metadata_command_for_test(
             command,
             pg.metadata_command_replica_state()
                 .unwrap()
-                .applied_log_hash,
+                .applied_log_hash
+                .value(),
         )
         .unwrap_or(false)
         || matches!(

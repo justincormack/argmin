@@ -58,6 +58,103 @@ pub enum CanonicalTagSetParseError {
     Invalid(#[from] TagSetValidationError),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StoredTextFrameParseError {
+    #[error("stored value has unknown magic")]
+    UnknownMagic,
+    #[error("stored value has a malformed or noncanonical version")]
+    MalformedVersion,
+    #[error("stored value has unsupported version {actual}")]
+    UnsupportedVersion { actual: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StoredTagSetParseError {
+    #[error(transparent)]
+    Frame(#[from] StoredTextFrameParseError),
+    #[error("stored tag-set payload is invalid: {0}")]
+    Payload(#[from] CanonicalTagSetParseError),
+}
+
+const STORED_TAG_SET_MAGIC: &str = "ARGMIN-TAGSET/";
+const STORED_TAG_SET_VERSION: u64 = 1;
+
+/// Opaque current durable representation of an AWS tag set.
+///
+/// The frame bytes are distinct from the AWS response XML produced by
+/// [`TagSet::to_xml`]. Callers use the logical projection for S3 behavior and
+/// storage boundaries use the framed string for persistence and internal
+/// transport.
+#[derive(Clone, PartialEq, Eq)]
+pub struct StoredTagSet {
+    serialized: String,
+    tags: TagSet,
+}
+
+impl StoredTagSet {
+    #[must_use]
+    pub fn from_tag_set(tags: TagSet) -> Self {
+        let payload = tags.to_xml();
+        let mut serialized = String::with_capacity(STORED_TAG_SET_MAGIC.len() + 2 + payload.len());
+        serialized.push_str(STORED_TAG_SET_MAGIC);
+        serialized.push_str(&STORED_TAG_SET_VERSION.to_string());
+        serialized.push('\n');
+        serialized.push_str(&payload);
+        Self { serialized, tags }
+    }
+
+    pub fn parse_current(
+        serialized: String,
+        maximum: usize,
+    ) -> Result<Self, StoredTagSetParseError> {
+        let payload =
+            parse_stored_text_frame(&serialized, STORED_TAG_SET_MAGIC, STORED_TAG_SET_VERSION)?;
+        let tags = TagSet::parse_current_xml(payload, maximum)?;
+        Ok(Self { serialized, tags })
+    }
+
+    #[must_use]
+    pub fn tag_set(&self) -> &TagSet {
+        &self.tags
+    }
+
+    #[must_use]
+    pub fn as_storage_str(&self) -> &str {
+        &self.serialized
+    }
+}
+
+impl fmt::Debug for StoredTagSet {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StoredTagSet")
+            .field("tag_count", &self.tags.len())
+            .finish()
+    }
+}
+
+pub(crate) fn parse_stored_text_frame<'a>(
+    serialized: &'a str,
+    magic: &str,
+    current_version: u64,
+) -> Result<&'a str, StoredTextFrameParseError> {
+    let version_and_payload = serialized
+        .strip_prefix(magic)
+        .ok_or(StoredTextFrameParseError::UnknownMagic)?;
+    let (version_text, payload) = version_and_payload
+        .split_once('\n')
+        .ok_or(StoredTextFrameParseError::MalformedVersion)?;
+    let version = version_text
+        .parse::<u64>()
+        .ok()
+        .filter(|version| version.to_string() == version_text)
+        .ok_or(StoredTextFrameParseError::MalformedVersion)?;
+    if version != current_version {
+        return Err(StoredTextFrameParseError::UnsupportedVersion { actual: version });
+    }
+    Ok(payload)
+}
+
 #[must_use]
 pub fn tag_utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
@@ -614,6 +711,179 @@ mod tests {
                         </TagSet></Tagging>";
         assert_eq!(tags.to_xml(), expected);
         assert_eq!(TagSet::parse_current_xml(expected, 10).unwrap(), tags);
+    }
+
+    #[test]
+    fn stored_tag_set_frames_empty_and_unicode_values_exactly() {
+        let empty = StoredTagSet::from_tag_set(TagSet::empty(MAX_OBJECT_TAGS));
+        assert_eq!(
+            empty.as_storage_str(),
+            concat!(
+                "ARGMIN-TAGSET/1\n",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+                "<TagSet></TagSet></Tagging>"
+            )
+        );
+        assert_eq!(
+            StoredTagSet::parse_current(empty.as_storage_str().to_string(), MAX_OBJECT_TAGS)
+                .unwrap()
+                .tag_set(),
+            empty.tag_set()
+        );
+
+        let tags = TagSet::from_pairs(
+            vec![
+                ("first/環境".to_string(), "plus+value".to_string()),
+                ("second".to_string(), "space\u{00a0}value".to_string()),
+            ],
+            MAX_BUCKET_TAGS,
+        )
+        .unwrap();
+        let stored = StoredTagSet::from_tag_set(tags.clone());
+        assert_eq!(
+            stored.as_storage_str(),
+            concat!(
+                "ARGMIN-TAGSET/1\n",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet>",
+                "<Tag><Key>first/環境</Key><Value>plus+value</Value></Tag>",
+                "<Tag><Key>second</Key><Value>space\u{00a0}value</Value></Tag>",
+                "</TagSet></Tagging>"
+            )
+        );
+        assert_eq!(
+            StoredTagSet::parse_current(stored.as_storage_str().to_string(), MAX_BUCKET_TAGS)
+                .unwrap()
+                .tag_set(),
+            &tags
+        );
+        assert_eq!(
+            StoredTagSet::parse_current(stored.as_storage_str().to_string(), MAX_OBJECT_TAGS)
+                .unwrap()
+                .tag_set()
+                .as_slice(),
+            tags.as_slice(),
+            "object and bucket frames must share bytes below both cardinality limits"
+        );
+    }
+
+    #[test]
+    fn stored_tag_set_enforces_object_and_bucket_cardinality_profiles() {
+        let pairs = (0..MAX_BUCKET_TAGS)
+            .map(|index| (format!("key-{index:02}"), format!("value-{index:02}")))
+            .collect::<Vec<_>>();
+        let bucket_tags = TagSet::from_pairs(pairs.clone(), MAX_BUCKET_TAGS).unwrap();
+        let stored = StoredTagSet::from_tag_set(bucket_tags.clone());
+
+        assert_eq!(
+            StoredTagSet::parse_current(
+                StoredTagSet::from_tag_set(
+                    TagSet::from_pairs(pairs[..MAX_OBJECT_TAGS].to_vec(), MAX_OBJECT_TAGS).unwrap(),
+                )
+                .as_storage_str()
+                .to_string(),
+                MAX_OBJECT_TAGS,
+            )
+            .unwrap()
+            .tag_set()
+            .len(),
+            MAX_OBJECT_TAGS
+        );
+        assert!(matches!(
+            StoredTagSet::parse_current(stored.as_storage_str().to_string(), MAX_OBJECT_TAGS),
+            Err(StoredTagSetParseError::Payload(
+                CanonicalTagSetParseError::Invalid(TagSetValidationError::TooMany {
+                    actual: MAX_BUCKET_TAGS,
+                    maximum: MAX_OBJECT_TAGS,
+                })
+            ))
+        ));
+        assert_eq!(
+            StoredTagSet::parse_current(stored.as_storage_str().to_string(), MAX_BUCKET_TAGS)
+                .unwrap()
+                .tag_set(),
+            &bucket_tags
+        );
+
+        let oversized_xml = TagSet::from_pairs(pairs, MAX_BUCKET_TAGS)
+            .unwrap()
+            .to_xml()
+            .replacen(
+                "</TagSet>",
+                "<Tag><Key>key-50</Key><Value>value-50</Value></Tag></TagSet>",
+                1,
+            );
+        assert!(matches!(
+            StoredTagSet::parse_current(
+                format!("ARGMIN-TAGSET/1\n{oversized_xml}"),
+                MAX_BUCKET_TAGS,
+            ),
+            Err(StoredTagSetParseError::Payload(
+                CanonicalTagSetParseError::Invalid(TagSetValidationError::TooMany {
+                    actual: 51,
+                    maximum: MAX_BUCKET_TAGS,
+                })
+            ))
+        ));
+    }
+
+    #[test]
+    fn stored_tag_set_rejects_version_before_payload() {
+        for malformed in [
+            "",
+            "ARGMIN-TAG",
+            "not-a-tag-set",
+            "ARGMIN-TAGSET/",
+            "ARGMIN-TAGSET/\n",
+            "ARGMIN-TAGSET/x\n",
+            "ARGMIN-TAGSET/01\n",
+            "ARGMIN-TAGSET/18446744073709551616\n",
+            "ARGMIN-TAGSET/1\r\n",
+        ] {
+            let expected = if malformed.starts_with("ARGMIN-TAGSET/") {
+                StoredTextFrameParseError::MalformedVersion
+            } else {
+                StoredTextFrameParseError::UnknownMagic
+            };
+            assert_eq!(
+                StoredTagSet::parse_current(malformed.to_string(), MAX_OBJECT_TAGS),
+                Err(StoredTagSetParseError::Frame(expected))
+            );
+        }
+        for version in [0, 2] {
+            assert_eq!(
+                StoredTagSet::parse_current(
+                    format!("ARGMIN-TAGSET/{version}\n<not-valid-xml>"),
+                    MAX_OBJECT_TAGS,
+                ),
+                Err(StoredTagSetParseError::Frame(
+                    StoredTextFrameParseError::UnsupportedVersion { actual: version }
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn stored_tag_set_reports_payload_errors_after_accepting_the_frame() {
+        assert!(matches!(
+            StoredTagSet::parse_current(
+                "ARGMIN-TAGSET/1\n<not-valid-xml>".to_string(),
+                MAX_OBJECT_TAGS,
+            ),
+            Err(StoredTagSetParseError::Payload(
+                CanonicalTagSetParseError::Malformed { .. }
+            ))
+        ));
+        assert_eq!(
+            StoredTagSet::parse_current(
+                "ARGMIN-TAGSET/1\n<Tagging><TagSet></TagSet></Tagging>".to_string(),
+                MAX_OBJECT_TAGS,
+            ),
+            Err(StoredTagSetParseError::Payload(
+                CanonicalTagSetParseError::NonCanonical
+            ))
+        );
     }
 
     #[test]

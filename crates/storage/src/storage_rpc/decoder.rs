@@ -923,7 +923,7 @@ impl<'a> StorageRpcDecoder<'a> {
         match self.read_u8()? {
             0 => Ok(LoadedBucketSubresource::NotRequested),
             1 => Ok(LoadedBucketSubresource::Missing),
-            2 => SerializedBucketTagSet::from_current_xml(self.read_string()?)
+            2 => SerializedBucketTagSet::from_current_storage(self.read_string()?)
                 .map(LoadedBucketSubresource::Loaded)
                 .map_err(|_| {
                     StorageRpcPayloadError::InvalidResponseEnvelope("invalid bucket tags")
@@ -1266,7 +1266,7 @@ impl<'a> StorageRpcDecoder<'a> {
         match self.read_u8()? {
             0 => {
                 let tags =
-                    SerializedTagSet::from_current_xml(self.read_string()?).map_err(|_| {
+                    SerializedTagSet::from_current_storage(self.read_string()?).map_err(|_| {
                         StorageRpcPayloadError::InvalidObjectMetadataRequest(
                             "invalid canonical object tags",
                         )
@@ -2263,7 +2263,8 @@ impl<'a> StorageRpcDecoder<'a> {
             STORAGE_RPC_MAX_BUCKET_ACL_GRANTS_LEN,
             StorageRpcPayloadError::InvalidBucketMetadataRequest("ACL grants are too large"),
         )?;
-        AclGrants::parse_current_storage(&value)
+        StoredAclGrants::parse_current(value)
+            .map(StoredAclGrants::into_grants)
             .map_err(|_| StorageRpcPayloadError::InvalidBucketMetadataRequest("invalid ACL grants"))
     }
 
@@ -2393,7 +2394,7 @@ impl<'a> StorageRpcDecoder<'a> {
                         Ok(BucketSubresourceMutation::PutCors(body))
                     }
                     (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
-                        SerializedBucketTagSet::from_current_xml(body)
+                        SerializedBucketTagSet::from_current_storage(body)
                             .map(BucketSubresourceMutation::PutTagging)
                             .map_err(|_| {
                                 StorageRpcPayloadError::InvalidBucketMetadataRequest(
@@ -2892,7 +2893,7 @@ impl<'a> StorageRpcDecoder<'a> {
         &mut self,
     ) -> Result<Option<SerializedTagSet>, StorageRpcPayloadError> {
         self.read_optional_string()?
-            .map(SerializedTagSet::from_current_xml)
+            .map(SerializedTagSet::from_current_storage)
             .transpose()
             .map_err(|_| {
                 StorageRpcPayloadError::InvalidObjectMetadataRequest(

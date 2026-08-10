@@ -1164,34 +1164,32 @@ impl std::fmt::Debug for SerializedSystemMetadataBlob {
 /// values, but cannot inject an arbitrary persisted representation.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SerializedTagSet {
-    xml: String,
-    tags: s3_types::TagSet,
+    stored: s3_types::StoredTagSet,
 }
 
 impl SerializedTagSet {
     pub fn from_tag_set(tags: s3_types::TagSet) -> Result<Self, s3_types::TagSetValidationError> {
         let tags = s3_types::TagSet::new(tags.as_slice().to_vec(), s3_types::MAX_OBJECT_TAGS)?;
         Ok(Self {
-            xml: tags.to_xml(),
-            tags,
+            stored: s3_types::StoredTagSet::from_tag_set(tags),
         })
     }
 
     #[must_use]
     pub fn tag_set(&self) -> &s3_types::TagSet {
-        &self.tags
+        self.stored.tag_set()
     }
 
-    pub(crate) fn from_current_xml(
-        xml: String,
-    ) -> Result<Self, s3_types::CanonicalTagSetParseError> {
-        let tags = s3_types::TagSet::parse_current_xml(&xml, s3_types::MAX_OBJECT_TAGS)?;
-        Ok(Self { xml, tags })
+    pub(crate) fn from_current_storage(
+        serialized: String,
+    ) -> Result<Self, s3_types::StoredTagSetParseError> {
+        let stored = s3_types::StoredTagSet::parse_current(serialized, s3_types::MAX_OBJECT_TAGS)?;
+        Ok(Self { stored })
     }
 
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
-        &self.xml
+        self.stored.as_storage_str()
     }
 
     #[cfg(test)]
@@ -1234,7 +1232,7 @@ impl From<String> for SerializedTagSet {
 impl std::fmt::Debug for SerializedTagSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SerializedTagSet")
-            .field("tag_count", &self.tags.len())
+            .field("tag_count", &self.stored.tag_set().len())
             .finish()
     }
 }
@@ -1247,34 +1245,32 @@ impl std::fmt::Debug for SerializedTagSet {
 /// spelling.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SerializedBucketTagSet {
-    xml: String,
-    tags: s3_types::TagSet,
+    stored: s3_types::StoredTagSet,
 }
 
 impl SerializedBucketTagSet {
     pub fn from_tag_set(tags: s3_types::TagSet) -> Result<Self, s3_types::TagSetValidationError> {
         let tags = s3_types::TagSet::new(tags.as_slice().to_vec(), s3_types::MAX_BUCKET_TAGS)?;
         Ok(Self {
-            xml: tags.to_xml(),
-            tags,
+            stored: s3_types::StoredTagSet::from_tag_set(tags),
         })
     }
 
     #[must_use]
     pub fn tag_set(&self) -> &s3_types::TagSet {
-        &self.tags
+        self.stored.tag_set()
     }
 
-    pub(crate) fn from_current_xml(
-        xml: String,
-    ) -> Result<Self, s3_types::CanonicalTagSetParseError> {
-        let tags = s3_types::TagSet::parse_current_xml(&xml, s3_types::MAX_BUCKET_TAGS)?;
-        Ok(Self { xml, tags })
+    pub(crate) fn from_current_storage(
+        serialized: String,
+    ) -> Result<Self, s3_types::StoredTagSetParseError> {
+        let stored = s3_types::StoredTagSet::parse_current(serialized, s3_types::MAX_BUCKET_TAGS)?;
+        Ok(Self { stored })
     }
 
     #[must_use]
     pub(crate) fn as_str(&self) -> &str {
-        &self.xml
+        self.stored.as_storage_str()
     }
 
     #[cfg(test)]
@@ -1296,7 +1292,7 @@ impl std::ops::Deref for SerializedBucketTagSet {
 impl std::fmt::Debug for SerializedBucketTagSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SerializedBucketTagSet")
-            .field("tag_count", &self.tags.len())
+            .field("tag_count", &self.stored.tag_set().len())
             .finish()
     }
 }
@@ -7711,15 +7707,17 @@ mod tests {
         let stored = SerializedTagSet::from_tag_set(tags.clone()).unwrap();
         assert_eq!(stored.tag_set(), &tags);
         assert_eq!(
-            SerializedTagSet::from_current_xml(stored.as_str().to_string()).unwrap(),
+            SerializedTagSet::from_current_storage(stored.as_str().to_string()).unwrap(),
             stored
         );
         assert!(matches!(
-            SerializedTagSet::from_current_xml(
+            SerializedTagSet::from_current_storage(
                 "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
                     .to_string()
             ),
-            Err(s3_types::CanonicalTagSetParseError::NonCanonical)
+            Err(s3_types::StoredTagSetParseError::Frame(
+                s3_types::StoredTextFrameParseError::UnknownMagic
+            ))
         ));
 
         let too_many = s3_types::TagSet::from_pairs(
@@ -7749,18 +7747,20 @@ mod tests {
         assert_eq!(stored.tag_set(), &tags);
         assert_eq!(
             stored.as_str(),
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+            "ARGMIN-TAGSET/1\n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Tagging xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
         );
         assert_eq!(
-            SerializedBucketTagSet::from_current_xml(stored.as_str().to_string()).unwrap(),
+            SerializedBucketTagSet::from_current_storage(stored.as_str().to_string()).unwrap(),
             stored
         );
         assert!(matches!(
-            SerializedBucketTagSet::from_current_xml(
+            SerializedBucketTagSet::from_current_storage(
                 "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
                     .to_string()
             ),
-            Err(s3_types::CanonicalTagSetParseError::NonCanonical)
+            Err(s3_types::StoredTagSetParseError::Frame(
+                s3_types::StoredTextFrameParseError::UnknownMagic
+            ))
         ));
 
         let too_many = s3_types::TagSet::from_pairs(

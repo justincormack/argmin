@@ -2176,11 +2176,11 @@ fn local_cluster_reopen_rejects_same_state_with_different_history() {
                 1,
                 &alternate_command,
                 0,
-                alternate_hash,
+                alternate_hash.value(),
             )
             .unwrap();
         replica_pg
-            .test_set_metadata_command_replica_applied_log_hash(alternate_hash)
+            .test_set_metadata_command_replica_applied_log_hash(alternate_hash.value())
             .unwrap();
     }
 

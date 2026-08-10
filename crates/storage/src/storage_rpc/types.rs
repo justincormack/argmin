@@ -778,8 +778,12 @@ pub(crate) enum StorageRpcPayloadError {
     InvalidMetadataCommandPendingSlotRequest(&'static str),
     #[error("invalid metadata command log compaction status {0}")]
     InvalidMetadataCommandLogCompactionStatus(u8),
-    #[error("unsupported metadata canonical-state encoding version {actual}")]
-    UnsupportedMetadataCanonicalStateEncodingVersion { actual: u8 },
+    #[error("unknown metadata checkpoint magic")]
+    UnknownMetadataCheckpointMagic,
+    #[error("unsupported metadata checkpoint encoding version {actual}")]
+    UnsupportedMetadataCheckpointEncodingVersion { actual: u16 },
+    #[error("unsupported metadata proof carrier: {0}")]
+    UnsupportedMetadataProofCarrier(&'static str),
     #[error("invalid bucket metadata request: {0}")]
     InvalidBucketMetadataRequest(&'static str),
     #[error("invalid object metadata request: {0}")]
@@ -2414,7 +2418,7 @@ pub(crate) struct StorageRpcMetadataCommandTransferAdoptRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
-    pub(crate) expected_state_digest: u64,
+    pub(crate) expected_state_digest: CanonicalStateDigest,
     pub(crate) commands: Vec<MetadataTransferCommand>,
 }
 
@@ -2423,7 +2427,7 @@ pub(crate) struct StorageRpcMetadataCommandTransferEmptyStateRequest {
     pub(crate) node_id: NodeId,
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
-    pub(crate) expected_state_digest: u64,
+    pub(crate) expected_state_digest: CanonicalStateDigest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2432,8 +2436,8 @@ pub(crate) struct StorageRpcMetadataCommandTransferMatchingStateRequest {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) applied_log_index: u64,
-    pub(crate) applied_log_hash: u64,
-    pub(crate) expected_state_digest: u64,
+    pub(crate) applied_log_hash: MetadataCommandLogHash,
+    pub(crate) expected_state_digest: CanonicalStateDigest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

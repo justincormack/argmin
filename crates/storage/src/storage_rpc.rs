@@ -3,6 +3,7 @@
 
 use crate::{
     cluster::ShardLocation,
+    control_plane::{CanonicalStateDigest, MetadataCommandLogHash},
     metadata_command::{
         decode_metadata_command_envelope, validate_metadata_command_envelope_bytes,
         BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,
@@ -20,7 +21,7 @@ use crate::{
         PgClusterMapHistoryRouteReference, PgClusterMapHistoryRouteReferenceKind,
         PgClusterMapHistoryRouteReferences, ScavengerShardFile, ScavengerShardFileScan,
         ScavengerShardRow, MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES,
-        METADATA_CANONICAL_STATE_ENCODING_VERSION,
+        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
     },
     types::{
         AbortMultipartUploadCleanup, AbortingMultipartUploadBucketWitness, BucketAclSummary,
@@ -76,7 +77,7 @@ use crate::{
 };
 use s3_types::{
     AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
-    ObjectLockDefaultRetention, ObjectLockMode, RetentionPeriod,
+    ObjectLockDefaultRetention, ObjectLockMode, RetentionPeriod, StoredAclGrants,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};

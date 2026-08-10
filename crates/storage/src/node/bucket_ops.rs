@@ -427,7 +427,7 @@ impl SharedStorageNode {
             bucket,
             BucketSubresourceKind::Tagging,
         )? {
-            Some(stored) => crate::SerializedBucketTagSet::from_current_xml(stored.body)
+            Some(stored) => crate::SerializedBucketTagSet::from_current_storage(stored.body)
                 .map(LoadedBucketSubresource::Loaded)
                 .map_err(|error| {
                     crate::MetadataError::InvariantViolation {

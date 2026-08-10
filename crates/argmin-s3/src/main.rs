@@ -1070,10 +1070,14 @@ fn parse_control_plane_pg_acting_set_with_metadata_transfer_args(
     let source_epoch = parse_next_u64(&mut args)?;
     let expected_destination_epoch = parse_next_u64(&mut args)?;
     let source_applied_log_index = parse_next_u64(&mut args)?;
+    let source_applied_log_hash_version = parse_next_u8(&mut args)?;
     let source_applied_log_hash = parse_next_u64(&mut args)?;
+    let source_state_digest_version = parse_next_u8(&mut args)?;
     let source_state_digest = parse_next_u64(&mut args)?;
     let imported_applied_log_index = parse_next_u64(&mut args)?;
+    let imported_applied_log_hash_version = parse_next_u8(&mut args)?;
     let imported_applied_log_hash = parse_next_u64(&mut args)?;
+    let imported_state_digest_version = parse_next_u8(&mut args)?;
     let imported_state_digest = parse_next_u64(&mut args)?;
     let mut acting_set = Vec::new();
     for node_id in args {
@@ -1092,10 +1096,14 @@ fn parse_control_plane_pg_acting_set_with_metadata_transfer_args(
         source_epoch,
         expected_destination_epoch,
         source_applied_log_index,
+        source_applied_log_hash_version,
         source_applied_log_hash,
+        source_state_digest_version,
         source_state_digest,
         imported_applied_log_index,
+        imported_applied_log_hash_version,
         imported_applied_log_hash,
+        imported_state_digest_version,
         imported_state_digest,
     )
     .ok()?;
@@ -1103,6 +1111,10 @@ fn parse_control_plane_pg_acting_set_with_metadata_transfer_args(
 }
 
 fn parse_next_u32(args: &mut impl Iterator<Item = OsString>) -> Option<u32> {
+    args.next()?.into_string().ok()?.parse().ok()
+}
+
+fn parse_next_u8(args: &mut impl Iterator<Item = OsString>) -> Option<u8> {
     args.next()?.into_string().ok()?.parse().ok()
 }
 

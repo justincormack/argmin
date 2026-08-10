@@ -309,12 +309,12 @@ impl LivePgMetadataTransferSummary {
 
     #[must_use]
     pub fn imported_log_hash(&self) -> u64 {
-        self.imported_proof.applied_log_hash
+        self.imported_proof.applied_log_hash.value()
     }
 
     #[must_use]
     pub fn imported_state_digest(&self) -> u64 {
-        self.imported_proof.state_digest
+        self.imported_proof.state_digest.value()
     }
 
     #[must_use]
@@ -2152,11 +2152,11 @@ mod tests {
         assert_eq!(route.acting_set(), &[destination_node_id]);
         assert_eq!(
             route.active_metadata_proof(),
-            Some(PgMetadataProof {
-                applied_log_index: summary.imported_log_index(),
-                applied_log_hash: summary.imported_log_hash(),
-                state_digest: summary.imported_state_digest(),
-            })
+            Some(PgMetadataProof::current(
+                summary.imported_log_index(),
+                summary.imported_log_hash(),
+                summary.imported_state_digest(),
+            ))
         );
     }
 
@@ -2183,11 +2183,7 @@ mod tests {
             vec![now_ms.saturating_add(11)],
         );
         let _time = crate::clock::test_time_override_guard(now_ms.saturating_add(20));
-        let imported_proof = PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
-        };
+        let imported_proof = PgMetadataProof::current(1, 2, 3);
         let acting_set = [source_node_id];
         let admin = live_transfer_admin(tmp.path(), &socket_path);
 

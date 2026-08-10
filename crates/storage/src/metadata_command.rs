@@ -6,9 +6,10 @@ use std::num::{NonZeroU32, NonZeroU64};
 use s3_types::{
     AclGrants, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
     ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod,
-    StoredLegalHoldStatus,
+    StoredAclGrants, StoredLegalHoldStatus,
 };
 
+use crate::control_plane::{CanonicalStateDigest, MetadataCommandLogHash};
 use crate::types::{
     AbortMultipartUploadCleanup, BucketAclSummary, BucketEncryptionConfig, BucketName,
     BucketObjectOwnership, BucketOwnershipControls, BucketState, BucketSubresourceAux,
@@ -28,8 +29,18 @@ use crate::types::{
     VersionId, MULTIPART_UPLOAD_ID_KEY_LEN,
 };
 
+/// Unforgeable authority for hash values produced by the metadata-command
+/// hash-chain algorithm.
+pub(crate) struct MetadataCommandLogHashIssuer(());
+
+impl MetadataCommandLogHashIssuer {
+    const fn new() -> Self {
+        Self(())
+    }
+}
+
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 6;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 7;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
@@ -517,24 +528,24 @@ impl MetadataCommandLogEntryHeader {
 pub(crate) struct MetadataCommandReplicaState {
     pub(crate) cluster_epoch: ClusterEpoch,
     pub(crate) applied_log_index: u64,
-    pub(crate) applied_log_hash: u64,
-    pub(crate) state_digest: u64,
+    pub(crate) applied_log_hash: MetadataCommandLogHash,
+    pub(crate) state_digest: CanonicalStateDigest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataCommandLogHashRangeEntry {
     pub(crate) log_index: u64,
-    pub(crate) previous_log_hash: u64,
-    pub(crate) log_hash: u64,
+    pub(crate) previous_log_hash: MetadataCommandLogHash,
+    pub(crate) log_hash: MetadataCommandLogHash,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataCommandLogRangeEntry {
     pub(crate) log_index: u64,
-    pub(crate) previous_log_hash: u64,
-    pub(crate) log_hash: u64,
-    pub(crate) pre_state_digest: Option<u64>,
-    pub(crate) post_state_digest: Option<u64>,
+    pub(crate) previous_log_hash: MetadataCommandLogHash,
+    pub(crate) log_hash: MetadataCommandLogHash,
+    pub(crate) pre_state_digest: Option<CanonicalStateDigest>,
+    pub(crate) post_state_digest: Option<CanonicalStateDigest>,
     pub(crate) kind: MetadataCommandLogRangeEntryKind,
 }
 
@@ -547,8 +558,8 @@ pub(crate) enum MetadataCommandLogRangeEntryKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MetadataTransferCommand {
     pub(crate) command: MetadataCommandEnvelope,
-    pub(crate) pre_state_digest: u64,
-    pub(crate) post_state_digest: u64,
+    pub(crate) pre_state_digest: CanonicalStateDigest,
+    pub(crate) post_state_digest: CanonicalStateDigest,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1064,7 +1075,7 @@ impl BucketSubresourceMutation {
                 Ok(Self::PutCors(request.body().to_owned()))
             }
             (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
-                SerializedBucketTagSet::from_current_xml(request.body().to_owned())
+                SerializedBucketTagSet::from_current_storage(request.body().to_owned())
                     .map(Self::PutTagging)
                     .map_err(|error| error.to_string())
             }
@@ -1986,7 +1997,7 @@ pub(crate) fn metadata_command_log_hash(
     log_index: MetadataCommandLogIndex,
     previous_log_hash: u64,
     command_checksum: u64,
-) -> u64 {
+) -> MetadataCommandLogHash {
     let mut out = Vec::new();
     put_bytes(&mut out, b"ARGMIN-METADATA-COMMAND-LOG-V1");
     put_u64(&mut out, cluster_epoch.get());
@@ -1994,7 +2005,10 @@ pub(crate) fn metadata_command_log_hash(
     put_u64(&mut out, log_index.get());
     put_u64(&mut out, previous_log_hash);
     put_u64(&mut out, command_checksum);
-    checksum::crc64::checksum(&out)
+    MetadataCommandLogHash::from_hash_owner(
+        checksum::crc64::checksum(&out),
+        MetadataCommandLogHashIssuer::new(),
+    )
 }
 
 pub(crate) fn abandoned_command_log_bytes(id: MetadataCommandId, command_checksum: u64) -> Vec<u8> {
@@ -2720,7 +2734,8 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
     }
 
     fn read_acl_grants(&mut self) -> Result<AclGrants, String> {
-        AclGrants::parse_current_storage(&self.read_string("ACL grants")?)
+        StoredAclGrants::parse_current(self.read_string("ACL grants")?)
+            .map(StoredAclGrants::into_grants)
             .map_err(|reason| format!("invalid ACL grants in metadata command: {reason}"))
     }
 
@@ -2741,7 +2756,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
         field: &'static str,
     ) -> Result<Option<SerializedTagSet>, String> {
         self.read_optional_string(field)?
-            .map(SerializedTagSet::from_current_xml)
+            .map(SerializedTagSet::from_current_storage)
             .transpose()
             .map_err(|error| format!("invalid {field} in metadata command: {error}"))
     }
@@ -3728,7 +3743,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                         Ok(BucketSubresourceMutation::PutCors(body))
                     }
                     (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
-                        SerializedBucketTagSet::from_current_xml(body)
+                        SerializedBucketTagSet::from_current_storage(body)
                             .map(BucketSubresourceMutation::PutTagging)
                             .map_err(|error| format!("invalid bucket tags: {error}"))
                     }
@@ -4245,7 +4260,7 @@ fn encode_multipart_upload(out: &mut Vec<u8>, upload: &MultipartUploadRecord) {
     put_bytes(out, upload.system_metadata_blob.as_slice());
     encode_owner_identity(out, &upload.initiator);
     encode_owner_identity(out, &upload.owner);
-    put_str(out, &upload.acl_grants.to_current_storage_string());
+    encode_acl_grants(out, &upload.acl_grants);
     put_bool(out, upload.public_read);
     put_u64(out, upload.object_generation_id.get());
     encode_multipart_object_identity(out, upload.initiated_object_identity);
@@ -4285,7 +4300,7 @@ fn encode_put_live_object(out: &mut Vec<u8>, object: &PutLiveObjectReq) {
     encode_version_id(out, object.version_id);
     put_str(out, &object.owner.principal);
     put_str(out, object.owner.canonical_id.as_str());
-    put_str(out, &object.acl_grants.to_current_storage_string());
+    encode_acl_grants(out, &object.acl_grants);
     put_bool(out, object.public_read);
     put_u64(out, object.generation_id.get());
     put_u64(out, object.size);
@@ -4314,7 +4329,7 @@ fn encode_live_object_record(out: &mut Vec<u8>, object: &LiveObjectRecord) {
     put_str(out, object.key.as_str());
     encode_version_id(out, object.version_id);
     encode_owner_identity(out, &object.owner);
-    put_str(out, &object.acl_grants.to_current_storage_string());
+    encode_acl_grants(out, &object.acl_grants);
     put_bool(out, object.public_read);
     put_u64(out, object.generation_id.get());
     put_u64(out, object.size);
@@ -4350,7 +4365,7 @@ fn encode_bucket_record(out: &mut Vec<u8>, bucket: &BucketRecord) {
     put_u8(out, bucket.state as u8);
     put_u8(out, bucket.versioning as u8);
     encode_object_lock(out, bucket.object_lock);
-    put_str(out, &bucket.acl_grants.to_current_storage_string());
+    encode_acl_grants(out, &bucket.acl_grants);
     put_bool(out, bucket.public_read);
     put_bool(out, bucket.public_write);
     encode_public_access_block(out, bucket.public_access_block);
@@ -4773,6 +4788,11 @@ fn put_str(out: &mut Vec<u8>, value: &str) {
     put_bytes(out, value.as_bytes());
 }
 
+fn encode_acl_grants(out: &mut Vec<u8>, grants: &AclGrants) {
+    let stored = StoredAclGrants::from_grants(grants);
+    put_str(out, stored.as_storage_str());
+}
+
 fn put_bool(out: &mut Vec<u8>, value: bool) {
     put_u8(out, u8::from(value));
 }
@@ -4992,16 +5012,19 @@ mod tests {
         let error = MetadataCommandLogEntryDecoder::new(&encoded)
             .read_optional_object_tags("object tags")
             .unwrap_err();
-        assert!(error.contains("not the current canonical representation"));
+        assert_eq!(
+            error,
+            "invalid object tags in metadata command: stored value has unknown magic"
+        );
 
-        let canonical = s3_types::TagSet::from_pairs(
+        let tags = s3_types::TagSet::from_pairs(
             vec![("key".to_string(), "value".to_string())],
             s3_types::MAX_OBJECT_TAGS,
         )
-        .unwrap()
-        .to_xml();
+        .unwrap();
+        let canonical = s3_types::StoredTagSet::from_tag_set(tags);
         let mut encoded = Vec::new();
-        encode_optional_str(&mut encoded, Some(&canonical));
+        encode_optional_str(&mut encoded, Some(canonical.as_storage_str()));
         let decoded = MetadataCommandLogEntryDecoder::new(&encoded)
             .read_optional_object_tags("object tags")
             .unwrap()
@@ -5024,18 +5047,18 @@ mod tests {
         let error = MetadataCommandLogEntryDecoder::new(&encoded)
             .read_bucket_subresource_mutation()
             .unwrap_err();
-        assert!(error.contains("not the current canonical representation"));
+        assert_eq!(error, "invalid bucket tags: stored value has unknown magic");
 
-        let canonical = s3_types::TagSet::from_pairs(
+        let tags = s3_types::TagSet::from_pairs(
             vec![("key".to_string(), "value".to_string())],
             s3_types::MAX_BUCKET_TAGS,
         )
-        .unwrap()
-        .to_xml();
+        .unwrap();
+        let canonical = s3_types::StoredTagSet::from_tag_set(tags);
         let mut encoded = Vec::new();
         put_u8(&mut encoded, 1);
         encode_bucket_subresource_kind(&mut encoded, BucketSubresourceKind::Tagging);
-        put_str(&mut encoded, &canonical);
+        put_str(&mut encoded, canonical.as_storage_str());
         encode_bucket_subresource_aux(&mut encoded, BucketSubresourceAux::None);
         let decoded = MetadataCommandLogEntryDecoder::new(&encoded)
             .read_bucket_subresource_mutation()
@@ -5048,24 +5071,28 @@ mod tests {
     #[test]
     fn metadata_command_acl_grants_require_current_canonical_representation() {
         for noncanonical in [
-            "group:all_users:READ",
-            "group:all_users:READ\ngroup:all_users:READ\n",
+            "group:all_users:READ\n",
+            "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ",
+            "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ\ngroup:all_users:READ\n",
         ] {
             let mut encoded = Vec::new();
             put_str(&mut encoded, noncanonical);
             let error = MetadataCommandLogEntryDecoder::new(&encoded)
                 .read_acl_grants()
                 .unwrap_err();
-            assert!(error.contains("not the current canonical representation"));
+            assert!(error.contains("invalid ACL grants in metadata command"));
         }
 
-        let canonical = "group:all_users:READ\n";
+        let canonical = "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ\n";
         let mut encoded = Vec::new();
         put_str(&mut encoded, canonical);
         let decoded = MetadataCommandLogEntryDecoder::new(&encoded)
             .read_acl_grants()
             .unwrap();
-        assert_eq!(decoded.to_current_storage_string(), canonical);
+        assert_eq!(
+            StoredAclGrants::from_grants(&decoded).as_storage_str(),
+            canonical
+        );
     }
 
     #[test]
@@ -5517,7 +5544,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0xfe0ef0954a8ee51c);
+        assert_eq!(envelope.checksum_crc64(), 0x033ce07ca9fccc9c);
     }
 
     #[test]
@@ -5569,17 +5596,21 @@ mod tests {
         assert_eq!(applied_header.kind(), MetadataCommandLogEntryKind::Applied);
         assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
 
-        let mut old_version = envelope.command_bytes();
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        old_version[version_offset..version_offset + 2].copy_from_slice(&5_u16.to_le_bytes());
-        assert_eq!(
-            decode_metadata_command_envelope_for_test(&old_version),
-            Err("unsupported metadata command encoding version 5".to_string())
-        );
-        assert_eq!(
-            decode_metadata_command_log_entry_header(&old_version),
-            Err("unsupported metadata command encoding version 5".to_string())
-        );
+        for version in [6_u16, 8_u16] {
+            let mut unsupported_version = envelope.command_bytes();
+            unsupported_version[version_offset..version_offset + 2]
+                .copy_from_slice(&version.to_le_bytes());
+            let expected = format!("unsupported metadata command encoding version {version}");
+            assert_eq!(
+                decode_metadata_command_envelope_for_test(&unsupported_version),
+                Err(expected.clone())
+            );
+            assert_eq!(
+                decode_metadata_command_log_entry_header(&unsupported_version),
+                Err(expected)
+            );
+        }
 
         let mut applied_with_trailing_bytes = envelope.command_bytes();
         applied_with_trailing_bytes.push(0);
@@ -5642,7 +5673,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x56a519557ee5c30f);
+        assert_eq!(envelope.checksum_crc64(), 0x549508689aa0cd6b);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5670,7 +5701,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x8eb3f800c9cd0c3f);
+        assert_eq!(envelope.checksum_crc64(), 0xd98216712f651f07);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5735,7 +5766,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xa8ca6e171342fba3);
+        assert_eq!(envelope.checksum_crc64(), 0x81f66585cb9ca27c);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5816,13 +5847,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x7b062c779cc35006,
-                0x7cbada465b96619a,
-                0x0f9863d317573696,
-                0xda4b165857559529,
-                0xfd142c09a2da3d5a,
-                0x12ca55b8ae7b9fca,
-                0x96402c8d3cac24a1,
+                0x578f54ecc63f42f5,
+                0x252a29cab39aec56,
+                0x0e3466a491f5a39e,
+                0x7f7d249a9a5e1792,
+                0xabb78f6479e90df6,
+                0x326ac53b91d5b0a7,
+                0x00f2339101624ed7,
             ]
         );
     }
@@ -5893,14 +5924,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x62e99f04c21227c6,
-                0xee6c3baef0be36fd,
-                0x98c3039f248eaf5e,
-                0xb2f7474e49731332,
-                0xd1012688be94cc22,
-                0x2130e6008dbfdaac,
-                0x793e49fd7d524341,
-                0xdf567b8f60032552,
+                0xb53cd25cecbd0570,
+                0xdfc60af5d1267105,
+                0xca63cc08bab0036d,
+                0x835d761568eb54ca,
+                0x2c8b54e64b5aad86,
+                0x109ad75bac279d54,
+                0x80926a83504a1143,
+                0xeefc4ad4419b62aa,
             ]
         );
     }
@@ -6486,36 +6517,36 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xa9ad2267ab106845,
-                0xf557f5fad3772da5,
-                0x0c28d93443a864ed,
-                0x1e529dc6f2849cd5,
-                0x8726cbf64412d9b0,
-                0xf934064d0e28cf04,
-                0x0739d9358bbfa51c,
-                0x11d6384fe1b6fb5b,
-                0xc984ee7376ebc2ba,
-                0x2668392d5914ebcb,
-                0xdf2d9709f7b824cc,
-                0x1e0d69f0803f0304,
-                0x4ceeaf61cf5f8308,
-                0xcb7c051935b04c6e,
-                0x09048c1a4f862142,
-                0xd37e1fbeed917693,
-                0x86318d9954d73218,
-                0x57c60c2995960be9,
-                0x4a518d5cc4bb44e4,
-                0xf2bcb33ca42cba80,
-                0xbe50551dcdba58e6,
-                0x18bb5e7ceb4530b4,
-                0xb0ba98114681206b,
-                0x33e434dd8f9c1503,
-                0xe4061706386224ac,
-                0x7415b5f6ceaa27e5,
-                0x7870aa3ee97ee59e,
-                0xf74f4fbac0167b0e,
-                0x500134929cac8fb6,
-                0xa3647bea1d301760,
+                0x8e0f0b43425a408c,
+                0x0033051f779c165c,
+                0xc882464002ae9414,
+                0x251ac3992a5ab6dd,
+                0x28fb52f032859fef,
+                0xcfeeea7e6e5a62c1,
+                0xe6f2c6d933674b79,
+                0x5c47f9ad25245c90,
+                0x7db813712dbfefd7,
+                0x5a6c6e5c7d88b3cd,
+                0xaa157ce251b36369,
+                0xee31cdc6bae8727c,
+                0xa1d35543551884dc,
+                0x74cd663b34668700,
+                0x89f297cfe13726c1,
+                0xc9f3aeaa7bccfa6d,
+                0xb511399ff42fff6f,
+                0xbf453478b5248910,
+                0xec3aa3091d8de6c0,
+                0x220e9f497896da04,
+                0xab06995d986c8153,
+                0x204d07d53958d1fe,
+                0x90918496a8aa4bc2,
+                0x01c97d43c8255c55,
+                0x1e49d34d6ec643a6,
+                0x16e92b0591fa5617,
+                0xc51f41563754fd0a,
+                0x9151f963011e62b8,
+                0x4da0caa9ff2baa13,
+                0xfa2ccf795f9c8530,
             ]
         );
     }

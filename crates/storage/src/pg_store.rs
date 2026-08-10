@@ -57,6 +57,16 @@ use crate::node_runtime::MetadataCommandDecodeAuthority;
 use crate::types::*;
 use placement::NodeId;
 
+/// Unforgeable authority for restoring or producing PG-owned metadata proof
+/// carriers from the durable implementation representation.
+pub(crate) struct MetadataProofStorageIssuer(());
+
+impl MetadataProofStorageIssuer {
+    const fn new() -> Self {
+        Self(())
+    }
+}
+
 const TRACE_TARGET: &str = "storage";
 
 impl From<rusqlite::Error> for crate::error::DatabaseError {
@@ -98,7 +108,8 @@ mod sql_types;
 
 use schema::{init_pg_schema, require_current_pg_schema};
 
-pub(crate) use command_log::METADATA_CANONICAL_STATE_ENCODING_VERSION;
+#[cfg(test)]
+pub(crate) use crate::control_plane::METADATA_CANONICAL_STATE_ENCODING_VERSION;
 #[cfg(test)]
 use command_log::{digest_len_prefixed_bytes, MetadataDigestFilter, METADATA_DIGEST_TABLES};
 pub use command_log::{
@@ -110,6 +121,8 @@ use command_log::{ObjectGenerationReservationConstraint, ObjectGenerationReserva
 pub(crate) use scavenger::{ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow};
 
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
+pub(crate) const METADATA_COMMAND_CHECKPOINT_MAGIC: &[u8; 8] = b"ARGMCPKT";
+pub(crate) const METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION: u16 = 2;
 const BUCKET_INFO_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, \
        public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \

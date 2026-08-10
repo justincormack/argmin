@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 1;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 2;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -134,7 +134,8 @@ CREATE TABLE objects (
     encryption_state BLOB,
     owner_principal TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
-    acl_grants TEXT NOT NULL DEFAULT '',
+    acl_grants TEXT NOT NULL DEFAULT 'ARGMIN-ACL-GRANTS/1
+',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     object_lock_retention_mode INTEGER CHECK (
         object_lock_retention_mode IS NULL OR object_lock_retention_mode IN (0, 1)
@@ -210,7 +211,8 @@ CREATE TABLE multipart_uploads (
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
     initiator_principal TEXT NOT NULL CHECK (length(initiator_principal) BETWEEN 1 AND 256),
     initiator_canonical_id TEXT NOT NULL CHECK (length(initiator_canonical_id) IN (32, 64)),
-    acl_grants TEXT NOT NULL DEFAULT '',
+    acl_grants TEXT NOT NULL DEFAULT 'ARGMIN-ACL-GRANTS/1
+',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     object_generation_id INTEGER NOT NULL CHECK (object_generation_id > 0),
     initiated_object_kind INTEGER NOT NULL DEFAULT 0 CHECK (initiated_object_kind IN (0, 1, 2)),
@@ -561,7 +563,8 @@ CREATE TABLE buckets (
     region           INTEGER NOT NULL DEFAULT 0,
     state            INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),
     versioning       INTEGER NOT NULL DEFAULT 0 CHECK (versioning IN (0, 1, 2)),
-    acl_grants       TEXT NOT NULL DEFAULT '',
+    acl_grants       TEXT NOT NULL DEFAULT 'ARGMIN-ACL-GRANTS/1
+',
     public_read      INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     public_write     INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1)),
     public_access_block_present INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_present IN (0, 1)),
@@ -734,7 +737,11 @@ CREATE TABLE metadata_command_replica_state (
     singleton         INTEGER PRIMARY KEY CHECK (singleton = 0),
     cluster_epoch     INTEGER NOT NULL CHECK (cluster_epoch > 0),
     applied_log_index INTEGER NOT NULL DEFAULT 0 CHECK (applied_log_index >= 0),
+    applied_log_hash_encoding_version INTEGER NOT NULL DEFAULT 1 \
+        CHECK (applied_log_hash_encoding_version = 1),
     applied_log_hash  INTEGER NOT NULL DEFAULT 0,
+    state_digest_encoding_version INTEGER NOT NULL DEFAULT 5 \
+        CHECK (state_digest_encoding_version = 5),
     state_digest      INTEGER NOT NULL DEFAULT 0
 ) STRICT";
 
@@ -1231,14 +1238,16 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.pragma_update(None, "user_version", 2).unwrap();
+        for version in [1, 3] {
+            let conn = Connection::open_in_memory().unwrap();
+            conn.pragma_update(None, "user_version", version).unwrap();
 
-        let error = init_pg_schema(&conn).unwrap_err();
-        assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
-        assert!(error
-            .to_string()
-            .contains("unsupported version 2; expected 1"));
+            let error = init_pg_schema(&conn).unwrap_err();
+            assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
+            assert!(error
+                .to_string()
+                .contains(&format!("unsupported version {version}; expected 2")));
+        }
     }
 
     #[test]

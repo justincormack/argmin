@@ -6,8 +6,9 @@ use std::path::Path;
 
 use crate::control_plane::ControlPlaneRuntimeMapSource as _;
 use crate::control_plane::{
-    AuthenticatedUnixControlPlaneClient, ControlPlaneError, FileControlPlaneStore, PgMetadataProof,
-    PgMetadataTransferProof, SingleAuthorityControlPlane, UnixControlPlaneClient,
+    AuthenticatedUnixControlPlaneClient, CanonicalStateDigest, ControlPlaneError,
+    FileControlPlaneStore, MetadataCommandLogHash, PgMetadataProof, PgMetadataTransferProof,
+    SingleAuthorityControlPlane, UnixControlPlaneClient,
 };
 use crate::control_plane_auth::ControlPlaneScopedCredential;
 use crate::control_plane_client_bootstrap::ControlPlaneAdminClientBootstrap;
@@ -104,8 +105,9 @@ impl fmt::Debug for ControlPlanePgStatusClient {
 /// Opaque, authority-bound client for manual PG administration.
 ///
 /// The process layer supplies only operator-visible integer identifiers and
-/// proof values. Storage owns PG identities, route commands, authentication
-/// dispatch, retry classification, and runtime-map response validation.
+/// explicitly version-qualified proof values. Storage owns PG identities,
+/// proof decoding, route commands, authentication dispatch, retry
+/// classification, and runtime-map response validation.
 pub struct ControlPlanePgAdminClient {
     dispatch: ControlPlanePgAdminDispatch,
 }
@@ -229,10 +231,14 @@ impl ControlPlanePgMetadataTransferInstall {
         source_epoch: u64,
         expected_destination_epoch: u64,
         source_applied_log_index: u64,
+        source_applied_log_hash_version: u8,
         source_applied_log_hash: u64,
+        source_state_digest_version: u8,
         source_state_digest: u64,
         imported_applied_log_index: u64,
+        imported_applied_log_hash_version: u8,
         imported_applied_log_hash: u64,
+        imported_state_digest_version: u8,
         imported_state_digest: u64,
     ) -> Result<Self, ControlPlanePgAdminInputError> {
         if acting_set.is_empty() {
@@ -246,21 +252,57 @@ impl ControlPlanePgMetadataTransferInstall {
             ClusterEpoch::new(expected_destination_epoch).ok_or_else(|| {
                 ControlPlanePgAdminInputError::new("expected destination epoch must be nonzero")
             })?;
+        let source_applied_log_hash = MetadataCommandLogHash::from_encoded_parts(
+            source_applied_log_hash_version,
+            source_applied_log_hash,
+        )
+        .map_err(|_| {
+            ControlPlanePgAdminInputError::new(
+                "source metadata-command log-hash version is unsupported",
+            )
+        })?;
+        let source_state_digest = CanonicalStateDigest::from_encoded_parts(
+            source_state_digest_version,
+            source_state_digest,
+        )
+        .map_err(|_| {
+            ControlPlanePgAdminInputError::new(
+                "source canonical-state digest version is unsupported",
+            )
+        })?;
+        let imported_applied_log_hash = MetadataCommandLogHash::from_encoded_parts(
+            imported_applied_log_hash_version,
+            imported_applied_log_hash,
+        )
+        .map_err(|_| {
+            ControlPlanePgAdminInputError::new(
+                "imported metadata-command log-hash version is unsupported",
+            )
+        })?;
+        let imported_state_digest = CanonicalStateDigest::from_encoded_parts(
+            imported_state_digest_version,
+            imported_state_digest,
+        )
+        .map_err(|_| {
+            ControlPlanePgAdminInputError::new(
+                "imported canonical-state digest version is unsupported",
+            )
+        })?;
         Ok(Self {
             pg_id: PgId::new(pg_id),
             acting_set: acting_set.into_iter().map(NodeId::new).collect(),
             transfer: PgMetadataTransferProof::new_with_imported_metadata_proof(
                 source_epoch,
-                PgMetadataProof {
-                    applied_log_index: source_applied_log_index,
-                    applied_log_hash: source_applied_log_hash,
-                    state_digest: source_state_digest,
-                },
-                PgMetadataProof {
-                    applied_log_index: imported_applied_log_index,
-                    applied_log_hash: imported_applied_log_hash,
-                    state_digest: imported_state_digest,
-                },
+                PgMetadataProof::from_carriers(
+                    source_applied_log_index,
+                    source_applied_log_hash,
+                    source_state_digest,
+                ),
+                PgMetadataProof::from_carriers(
+                    imported_applied_log_index,
+                    imported_applied_log_hash,
+                    imported_state_digest,
+                ),
             ),
             expected_destination_epoch,
         })
@@ -387,9 +429,23 @@ mod tests {
 
     #[test]
     fn metadata_transfer_install_rejects_invalid_logical_inputs_and_redacts_debug() {
-        let empty =
-            ControlPlanePgMetadataTransferInstall::new(7, Vec::new(), 1, 2, 3, 4, 5, 6, 7, 8)
-                .unwrap_err();
+        let empty = ControlPlanePgMetadataTransferInstall::new(
+            7,
+            Vec::new(),
+            1,
+            2,
+            3,
+            1,
+            4,
+            CanonicalStateDigest::CURRENT_ENCODING_VERSION,
+            5,
+            6,
+            1,
+            7,
+            CanonicalStateDigest::CURRENT_ENCODING_VERSION,
+            8,
+        )
+        .unwrap_err();
         assert_eq!(
             empty.to_string(),
             "acting set must contain at least one node"
@@ -409,10 +465,70 @@ mod tests {
                 source_epoch,
                 destination_epoch,
                 3,
+                1,
                 4,
+                CanonicalStateDigest::CURRENT_ENCODING_VERSION,
                 5,
                 6,
+                1,
                 7,
+                CanonicalStateDigest::CURRENT_ENCODING_VERSION,
+                8,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected);
+        }
+
+        for (
+            source_hash_version,
+            source_digest_version,
+            imported_hash_version,
+            imported_digest_version,
+            expected,
+        ) in [
+            (
+                2,
+                5,
+                1,
+                5,
+                "source metadata-command log-hash version is unsupported",
+            ),
+            (
+                1,
+                6,
+                1,
+                5,
+                "source canonical-state digest version is unsupported",
+            ),
+            (
+                1,
+                5,
+                2,
+                5,
+                "imported metadata-command log-hash version is unsupported",
+            ),
+            (
+                1,
+                5,
+                1,
+                6,
+                "imported canonical-state digest version is unsupported",
+            ),
+        ] {
+            let error = ControlPlanePgMetadataTransferInstall::new(
+                7,
+                vec![1],
+                1,
+                2,
+                3,
+                source_hash_version,
+                4,
+                source_digest_version,
+                5,
+                6,
+                imported_hash_version,
+                7,
+                imported_digest_version,
                 8,
             )
             .unwrap_err();
@@ -425,10 +541,14 @@ mod tests {
             12,
             13,
             20,
+            1,
             30,
+            CanonicalStateDigest::CURRENT_ENCODING_VERSION,
             40,
             20,
+            1,
             31,
+            CanonicalStateDigest::CURRENT_ENCODING_VERSION,
             40,
         )
         .unwrap();
@@ -438,19 +558,11 @@ mod tests {
         assert_eq!(input.transfer.source_epoch().get(), 12);
         assert_eq!(
             input.transfer.source_metadata_proof(),
-            PgMetadataProof {
-                applied_log_index: 20,
-                applied_log_hash: 30,
-                state_digest: 40,
-            }
+            PgMetadataProof::current(20, 30, 40)
         );
         assert_eq!(
             input.transfer.metadata_proof(),
-            PgMetadataProof {
-                applied_log_index: 20,
-                applied_log_hash: 31,
-                state_digest: 40,
-            }
+            PgMetadataProof::current(20, 31, 40)
         );
         assert_eq!(
             format!("{input:?}"),

@@ -30,9 +30,10 @@ pub use request_ops::BucketIdentityGenerations;
 pub(crate) use request_ops::{DurableReclaimScanBatch, DurableReclaimScanOutcome};
 
 use crate::control_plane::{
-    ClusterRuntimeMapSnapshot, ControlPlaneError, ControlPlaneRuntimeMapSource,
-    ControlPlaneRuntimeMapStatus, PendingMetadataCommandObservation, PgMetadataProof,
-    PgRouteSnapshot, RuntimeMapContentDigest, RuntimeMapFreshnessProof,
+    CanonicalStateDigest, ClusterRuntimeMapSnapshot, ControlPlaneError,
+    ControlPlaneRuntimeMapSource, ControlPlaneRuntimeMapStatus, MetadataCommandLogHash,
+    PendingMetadataCommandObservation, PgMetadataProof, PgRouteSnapshot, RuntimeMapContentDigest,
+    RuntimeMapFreshnessProof,
 };
 use crate::control_plane_lease::BoundRouteMapLease;
 use crate::error::{

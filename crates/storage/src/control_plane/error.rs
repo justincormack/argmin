@@ -389,8 +389,8 @@ pub enum ControlPlaneError {
     )]
     PgMetadataTransferProofMismatch {
         pg_id: u32,
-        expected: PgMetadataTransferProof,
-        actual: PgMetadataTransferProof,
+        expected: Box<PgMetadataTransferProof>,
+        actual: Box<PgMetadataTransferProof>,
     },
 
     #[error(

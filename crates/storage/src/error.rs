@@ -564,6 +564,15 @@ pub(crate) enum StoreError {
     MetadataCommandReplicaStateMissing { pg_id: u32 },
 
     #[error(
+        "metadata command replica state for PG {pg_id} has unsupported {carrier} encoding version {actual}"
+    )]
+    MetadataCommandReplicaStateEncodingVersion {
+        pg_id: u32,
+        carrier: &'static str,
+        actual: u64,
+    },
+
+    #[error(
         "metadata command replica state diverged for PG {pg_id}: local node {node_id} has epoch {cluster_epoch}, log index {applied_log_index}, log hash {applied_log_hash:#018X}, digest {state_digest:#018X}; reference local node {reference_node_id} has epoch {reference_cluster_epoch}, log index {reference_applied_log_index}, log hash {reference_applied_log_hash:#018X}, digest {reference_state_digest:#018X}"
     )]
     MetadataCommandReplicaStateDiverged {
@@ -809,6 +818,7 @@ impl StoreError {
             | Self::MetadataCommandPendingOnNonPrimary { .. }
             | Self::MetadataCommandLogChecksumMismatch { .. }
             | Self::MetadataCommandLogHashMismatch { .. }
+            | Self::MetadataCommandReplicaStateEncodingVersion { .. }
             | Self::MetadataCommandReplicaStateMissing { .. }
             | Self::MetadataCommandReplicaStateDiverged { .. }
             | Self::MetadataStateDigestMismatch { .. }
@@ -852,6 +862,7 @@ impl StoreError {
             | Self::PgDurableIdentityInvalid { .. }
             | Self::MetadataCommandLogChecksumMismatch { .. }
             | Self::MetadataCommandLogHashMismatch { .. }
+            | Self::MetadataCommandReplicaStateEncodingVersion { .. }
             | Self::MetadataCommandReplicaStateDiverged { .. }
             | Self::MetadataStateDigestMismatch { .. }
             | Self::MetadataCheckpointInvalid { .. } => StoreFailureDiagnosticCategory::Integrity,
@@ -1095,6 +1106,9 @@ impl StoreError {
                 "metadata_command_log_checksum_mismatch"
             }
             Self::MetadataCommandLogHashMismatch { .. } => "metadata_command_log_hash_mismatch",
+            Self::MetadataCommandReplicaStateEncodingVersion { .. } => {
+                "metadata_command_replica_state_encoding_version"
+            }
             Self::MetadataCommandReplicaStateMissing { .. } => {
                 "metadata_command_replica_state_missing"
             }

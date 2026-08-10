@@ -1774,11 +1774,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let proof = PgMetadataProof {
-            applied_log_index: 42,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
-        };
+        let proof = PgMetadataProof::for_test(42, 0xabc, 0xdef);
         let peering_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
@@ -2185,17 +2181,17 @@ mod tests {
                     .saturating_mul(SUSTAINED_PEERING_ROUNDS)
                     .saturating_add(interval_round);
                 for node_id in 0..STORAGE_NODE_COUNT {
-                    let node_proof = PgMetadataProof {
-                        applied_log_index: round + 2,
-                        applied_log_hash: round
+                    let node_proof = PgMetadataProof::for_test(
+                        round + 2,
+                        round
                             .saturating_mul(u64::from(STORAGE_NODE_COUNT))
                             .saturating_add(u64::from(node_id))
                             .saturating_add(3),
-                        state_digest: round
+                        round
                             .saturating_mul(u64::from(STORAGE_NODE_COUNT))
                             .saturating_add(u64::from(node_id))
                             .saturating_add(4),
-                    };
+                    );
                     let snapshot = harness
                         .control_plane
                         .current_snapshot()
@@ -2304,13 +2300,13 @@ mod tests {
             "sustained Peering checkpoint must advance the WAL base"
         );
 
-        let metadata_proof = PgMetadataProof {
-            applied_log_index: SUSTAINED_PEERING_INTERVALS
+        let metadata_proof = PgMetadataProof::for_test(
+            SUSTAINED_PEERING_INTERVALS
                 .saturating_mul(SUSTAINED_PEERING_ROUNDS)
                 .saturating_add(2),
-            applied_log_hash: 0xfeed,
-            state_digest: 0xbeef,
-        };
+            0xfeed,
+            0xbeef,
+        );
         for node_id in [0_u32, 2, 1] {
             let snapshot = harness
                 .control_plane
@@ -2933,11 +2929,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read before peering heartbeats")
             .cluster_epoch();
-        let proof = PgMetadataProof {
-            applied_log_index: 42,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
-        };
+        let proof = PgMetadataProof::for_test(42, 0xabc, 0xdef);
         let applied_before_peering = harness
             .control_plane
             .block_on(harness.authority.status())
@@ -3901,11 +3893,7 @@ mod tests {
             .current_snapshot()
             .expect("durable experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let proof = PgMetadataProof {
-            applied_log_index: 42,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
-        };
+        let proof = PgMetadataProof::for_test(42, 0xabc, 0xdef);
         let peering_refresh = harness
             .control_plane
             .refresh_node_heartbeat(
@@ -4284,11 +4272,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let proof = PgMetadataProof {
-            applied_log_index: 92,
-            applied_log_hash: 0x1234,
-            state_digest: 0x5678,
-        };
+        let proof = PgMetadataProof::for_test(92, 0x1234, 0x5678);
         harness
             .control_plane
             .refresh_node_heartbeat(
@@ -4681,11 +4665,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let proof = PgMetadataProof {
-            applied_log_index: 92,
-            applied_log_hash: 0x1234,
-            state_digest: 0x5678,
-        };
+        let proof = PgMetadataProof::for_test(92, 0x1234, 0x5678);
         harness
             .control_plane
             .refresh_node_heartbeat(
@@ -4833,11 +4813,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let proof = PgMetadataProof {
-            applied_log_index: 92,
-            applied_log_hash: 0x1234,
-            state_digest: 0x5678,
-        };
+        let proof = PgMetadataProof::for_test(92, 0x1234, 0x5678);
         harness
             .control_plane
             .refresh_node_heartbeat(
@@ -4951,11 +4927,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let proof = PgMetadataProof {
-            applied_log_index: 77,
-            applied_log_hash: 0x123,
-            state_digest: 0x456,
-        };
+        let proof = PgMetadataProof::for_test(77, 0x123, 0x456);
         let peering_server =
             spawn_experimental_raft_unix_rpc_server(&harness, &socket_path, 30_100);
         let mut client = UnixControlPlaneClient::new(&socket_path);
@@ -5466,11 +5438,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let active_proof = PgMetadataProof {
-            applied_log_index: 91,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
-        };
+        let active_proof = PgMetadataProof::for_test(91, 0xabc, 0xdef);
         harness
             .control_plane
             .refresh_node_heartbeat(
@@ -5611,12 +5579,16 @@ mod tests {
             vec![2],
             active_epoch.get(),
             expected_destination_epoch.get(),
-            active_proof.applied_log_index,
-            active_proof.applied_log_hash,
-            active_proof.state_digest,
-            active_proof.applied_log_index,
-            active_proof.applied_log_hash,
-            active_proof.state_digest,
+            active_proof.test_applied_log_index(),
+            1,
+            active_proof.test_applied_log_hash(),
+            5,
+            active_proof.test_state_digest(),
+            active_proof.test_applied_log_index(),
+            1,
+            active_proof.test_applied_log_hash(),
+            5,
+            active_proof.test_state_digest(),
         )
         .unwrap();
         let installed_epoch = ClusterEpoch::new(
@@ -5715,11 +5687,7 @@ mod tests {
             .current_snapshot()
             .expect("durable experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let active_proof = PgMetadataProof {
-            applied_log_index: 91,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
-        };
+        let active_proof = PgMetadataProof::for_test(91, 0xabc, 0xdef);
         harness
             .control_plane
             .refresh_node_heartbeat(
@@ -5902,11 +5870,7 @@ mod tests {
             .current_snapshot()
             .expect("experimental snapshot should read after startup heartbeat")
             .cluster_epoch();
-        let active_proof = PgMetadataProof {
-            applied_log_index: 101,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
-        };
+        let active_proof = PgMetadataProof::for_test(101, 0xabc, 0xdef);
         harness
             .control_plane
             .refresh_node_heartbeat(
@@ -5969,12 +5933,16 @@ mod tests {
             vec![2],
             active_epoch.get(),
             fenced_epoch.checked_add(1).unwrap(),
-            active_proof.applied_log_index,
-            active_proof.applied_log_hash,
-            active_proof.state_digest,
-            active_proof.applied_log_index,
-            active_proof.applied_log_hash,
-            active_proof.state_digest,
+            active_proof.test_applied_log_index(),
+            1,
+            active_proof.test_applied_log_hash(),
+            5,
+            active_proof.test_state_digest(),
+            active_proof.test_applied_log_index(),
+            1,
+            active_proof.test_applied_log_hash(),
+            5,
+            active_proof.test_state_digest(),
         )
         .unwrap();
         let install_server =
@@ -6011,7 +5979,8 @@ mod tests {
     #[test]
     fn metadata_transfer_admin_args_parse_source_and_imported_proofs() {
         let args = [
-            "7", "12", "13", "20", "30", "40", "20", "31", "40", "2", "3",
+            "7", "12", "13", "20", "1", "30", "5", "40", "20", "1", "31", "5", "40",
+            "2", "3",
         ]
         .into_iter()
         .map(OsString::from);
@@ -6143,11 +6112,7 @@ mod tests {
             )
             .unwrap();
         let peering_epoch = authority.snapshot().cluster_epoch();
-        let metadata_proof = PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
-        };
+        let metadata_proof = PgMetadataProof::for_test(1, 2, 3);
         authority
             .submit_node_heartbeat(
                 NodeHeartbeat {

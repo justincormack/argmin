@@ -59,7 +59,7 @@ pub(crate) const MAX_LEASE_GRANT_HORIZON_MS: u64 = 60_000;
 pub(crate) const CONTROL_PLANE_LEASE_GRANT_HORIZON_DURATION_MS: u64 = 2 * MAX_HEARTBEAT_LEASE_MS;
 pub const CONTROL_PLANE_AUTHORITY_CLOCK_SKEW_BUDGET_MS: u64 = CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
 const CONTROL_PLANE_RPC_MAGIC: &[u8] = b"argmin-control-plane-rpc";
-const CONTROL_PLANE_RPC_VERSION: u16 = 13;
+const CONTROL_PLANE_RPC_VERSION: u16 = 14;
 const CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 pub const CONTROL_PLANE_RPC_MAX_FRAME_BYTES: usize =
     CONTROL_PLANE_RPC_MAGIC.len() + 16 + CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN;
@@ -71,7 +71,7 @@ const CONTROL_PLANE_RPC_SNAPSHOT_PURGE_TIMEOUT: Duration = Duration::from_secs(1
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ADMIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 const CONTROL_PLANE_RPC_AUTHORITY_CLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(50);
-const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 27;
+const CURRENT_CONTROL_PLANE_STATE_VERSION: u64 = 28;
 pub const CONTROL_PLANE_TOPOLOGY_DIGEST_LEN: usize = 32;
 pub const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_LEN: usize = 32;
 const CONTROL_PLANE_BOOTSTRAP_MAP_DIGEST_DOMAIN: &[u8] =
@@ -3234,8 +3234,8 @@ impl ControlPlaneCommandStateMachine for ClusterControlSnapshot {
                     if existing_transfer != transfer {
                         return Err(ControlPlaneError::PgMetadataTransferProofMismatch {
                             pg_id: pg_id.get(),
-                            expected: existing_transfer,
-                            actual: transfer,
+                            expected: Box::new(existing_transfer),
+                            actual: Box::new(transfer),
                         });
                     }
                     let actual_destination_epoch =
@@ -4365,8 +4365,8 @@ pub struct ClusterRuntimeMapSnapshot {
 }
 
 const RUNTIME_MAP_CONTENT_DIGEST_LEN: usize = 32;
-const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v2";
-const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v2";
+const RUNTIME_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-content/v3";
+const RUNTIME_MAP_CURRENT_STATE_DIGEST_DOMAIN: &[u8] = b"argmin/runtime-map-current-state/v3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuntimeMapContentDigest([u8; RUNTIME_MAP_CONTENT_DIGEST_LEN]);
@@ -4856,8 +4856,10 @@ pub(crate) fn digest_pg_routes(hasher: &mut ChecksumHasher, routes: &[PgRouteSna
 
 fn digest_pg_metadata_proof(hasher: &mut ChecksumHasher, proof: PgMetadataProof) {
     digest_u64(hasher, proof.applied_log_index);
-    digest_u64(hasher, proof.applied_log_hash);
-    digest_u64(hasher, proof.state_digest);
+    digest_u8(hasher, proof.applied_log_hash.encoding_version());
+    digest_u64(hasher, proof.applied_log_hash.value());
+    digest_u8(hasher, proof.state_digest.encoding_version());
+    digest_u64(hasher, proof.state_digest.value());
 }
 
 fn digest_len(hasher: &mut ChecksumHasher, len: usize) {
@@ -5752,9 +5754,251 @@ impl NodePgHeartbeatObservation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PgMetadataProof {
-    pub applied_log_index: u64,
-    pub applied_log_hash: u64,
-    pub state_digest: u64,
+    pub(crate) applied_log_index: u64,
+    pub(crate) applied_log_hash: MetadataCommandLogHash,
+    pub(crate) state_digest: CanonicalStateDigest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MetadataCommandLogHash {
+    encoding_version: u8,
+    value: u64,
+}
+
+impl MetadataCommandLogHash {
+    const CURRENT_ENCODING_VERSION: u8 = 1;
+
+    pub(crate) const fn from_hash_owner(
+        value: u64,
+        _issuer: crate::metadata_command::MetadataCommandLogHashIssuer,
+    ) -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value,
+        }
+    }
+
+    pub(crate) const fn from_storage(
+        value: u64,
+        _issuer: crate::pg_store::MetadataProofStorageIssuer,
+    ) -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value,
+        }
+    }
+
+    pub(crate) const fn genesis() -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value: 0,
+        }
+    }
+
+    pub(crate) const fn from_encoded_parts(
+        encoding_version: u8,
+        value: u64,
+    ) -> Result<Self, MetadataProofCarrierVersionError> {
+        if encoding_version == Self::CURRENT_ENCODING_VERSION {
+            Ok(Self {
+                encoding_version,
+                value,
+            })
+        } else {
+            Err(MetadataProofCarrierVersionError::UnsupportedLogHash {
+                actual: encoding_version,
+            })
+        }
+    }
+
+    pub(crate) const fn encoding_version(self) -> u8 {
+        self.encoding_version
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.value
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value,
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Add<u64> for MetadataCommandLogHash {
+    type Output = Self;
+
+    fn add(self, rhs: u64) -> Self::Output {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value: self.value + rhs,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<u64> for MetadataCommandLogHash {
+    fn eq(&self, other: &u64) -> bool {
+        self.value == *other
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<MetadataCommandLogHash> for u64 {
+    fn eq(&self, other: &MetadataCommandLogHash) -> bool {
+        *self == other.value
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait IntoTestMetadataCommandLogHash {
+    fn into_test_metadata_command_log_hash(self) -> MetadataCommandLogHash;
+}
+
+#[cfg(test)]
+impl IntoTestMetadataCommandLogHash for u64 {
+    fn into_test_metadata_command_log_hash(self) -> MetadataCommandLogHash {
+        MetadataCommandLogHash {
+            encoding_version: MetadataCommandLogHash::CURRENT_ENCODING_VERSION,
+            value: self,
+        }
+    }
+}
+
+#[cfg(test)]
+impl IntoTestMetadataCommandLogHash for MetadataCommandLogHash {
+    fn into_test_metadata_command_log_hash(self) -> MetadataCommandLogHash {
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct CanonicalStateDigest {
+    encoding_version: u8,
+    value: u64,
+}
+
+impl CanonicalStateDigest {
+    pub(crate) const CURRENT_ENCODING_VERSION: u8 = METADATA_CANONICAL_STATE_ENCODING_VERSION;
+
+    pub(crate) const fn from_storage(
+        value: u64,
+        _issuer: crate::pg_store::MetadataProofStorageIssuer,
+    ) -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value,
+        }
+    }
+
+    pub(crate) const fn genesis() -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value: 0,
+        }
+    }
+
+    pub(crate) const fn from_encoded_parts(
+        encoding_version: u8,
+        value: u64,
+    ) -> Result<Self, MetadataProofCarrierVersionError> {
+        if encoding_version == Self::CURRENT_ENCODING_VERSION {
+            Ok(Self {
+                encoding_version,
+                value,
+            })
+        } else {
+            Err(MetadataProofCarrierVersionError::UnsupportedStateDigest {
+                actual: encoding_version,
+            })
+        }
+    }
+
+    pub(crate) const fn encoding_version(self) -> u8 {
+        self.encoding_version
+    }
+
+    pub(crate) const fn value(self) -> u64 {
+        self.value
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(value: u64) -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn wrapping_add(self, value: u64) -> Self {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value: self.value.wrapping_add(value),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Add<u64> for CanonicalStateDigest {
+    type Output = Self;
+
+    fn add(self, rhs: u64) -> Self::Output {
+        Self {
+            encoding_version: Self::CURRENT_ENCODING_VERSION,
+            value: self.value + rhs,
+        }
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<u64> for CanonicalStateDigest {
+    fn eq(&self, other: &u64) -> bool {
+        self.value == *other
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<CanonicalStateDigest> for u64 {
+    fn eq(&self, other: &CanonicalStateDigest) -> bool {
+        *self == other.value
+    }
+}
+
+#[cfg(test)]
+pub(crate) trait IntoTestCanonicalStateDigest {
+    fn into_test_canonical_state_digest(self) -> CanonicalStateDigest;
+}
+
+#[cfg(test)]
+impl IntoTestCanonicalStateDigest for u64 {
+    fn into_test_canonical_state_digest(self) -> CanonicalStateDigest {
+        CanonicalStateDigest {
+            encoding_version: CanonicalStateDigest::CURRENT_ENCODING_VERSION,
+            value: self,
+        }
+    }
+}
+
+#[cfg(test)]
+impl IntoTestCanonicalStateDigest for CanonicalStateDigest {
+    fn into_test_canonical_state_digest(self) -> CanonicalStateDigest {
+        self
+    }
+}
+
+pub(crate) const METADATA_CANONICAL_STATE_ENCODING_VERSION: u8 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum MetadataProofCarrierVersionError {
+    #[error("unsupported metadata-command log-hash encoding version {actual}")]
+    UnsupportedLogHash { actual: u8 },
+    #[error("unsupported canonical-state digest encoding version {actual}")]
+    UnsupportedStateDigest { actual: u8 },
 }
 
 /// Read-only metadata authority for one node whose durable replica state is
@@ -5783,13 +6027,72 @@ impl PgMetadataReadRoute {
 }
 
 impl PgMetadataProof {
-    #[must_use]
-    pub const fn empty() -> Self {
+    pub(crate) const fn from_carriers(
+        applied_log_index: u64,
+        applied_log_hash: MetadataCommandLogHash,
+        state_digest: CanonicalStateDigest,
+    ) -> Self {
         Self {
-            applied_log_index: 0,
-            applied_log_hash: 0,
-            state_digest: 0,
+            applied_log_index,
+            applied_log_hash,
+            state_digest,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current(
+        applied_log_index: u64,
+        applied_log_hash: impl IntoTestMetadataCommandLogHash,
+        state_digest: impl IntoTestCanonicalStateDigest,
+    ) -> Self {
+        Self::from_carriers(
+            applied_log_index,
+            applied_log_hash.into_test_metadata_command_log_hash(),
+            state_digest.into_test_canonical_state_digest(),
+        )
+    }
+
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::from_carriers(
+            0,
+            MetadataCommandLogHash::genesis(),
+            CanonicalStateDigest::genesis(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn for_test(applied_log_index: u64, applied_log_hash: u64, state_digest: u64) -> Self {
+        Self::from_carriers(
+            applied_log_index,
+            MetadataCommandLogHash {
+                encoding_version: MetadataCommandLogHash::CURRENT_ENCODING_VERSION,
+                value: applied_log_hash,
+            },
+            CanonicalStateDigest {
+                encoding_version: CanonicalStateDigest::CURRENT_ENCODING_VERSION,
+                value: state_digest,
+            },
+        )
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub const fn test_applied_log_index(self) -> u64 {
+        self.applied_log_index
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub const fn test_applied_log_hash(self) -> u64 {
+        self.applied_log_hash.value()
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub const fn test_state_digest(self) -> u64 {
+        self.state_digest.value()
     }
 }
 
@@ -6831,10 +7134,14 @@ fn format_historical_pg_route_record(record: &HistoricalPgRouteRecord) -> String
     let (
         transfer_source_epoch,
         transfer_source_log_index,
+        transfer_source_log_hash_version,
         transfer_source_log_hash,
+        transfer_source_state_digest_version,
         transfer_source_state_digest,
         transfer_imported_log_index,
+        transfer_imported_log_hash_version,
         transfer_imported_log_hash,
+        transfer_imported_state_digest_version,
         transfer_imported_state_digest,
     ) = match record.peering_metadata_transfer {
         Some(transfer) => {
@@ -6843,11 +7150,15 @@ fn format_historical_pg_route_record(record: &HistoricalPgRouteRecord) -> String
             (
                 transfer.source_epoch().get().to_string(),
                 source.applied_log_index.to_string(),
-                source.applied_log_hash.to_string(),
-                source.state_digest.to_string(),
+                source.applied_log_hash.encoding_version().to_string(),
+                source.applied_log_hash.value().to_string(),
+                source.state_digest.encoding_version().to_string(),
+                source.state_digest.value().to_string(),
                 imported.applied_log_index.to_string(),
-                imported.applied_log_hash.to_string(),
-                imported.state_digest.to_string(),
+                imported.applied_log_hash.encoding_version().to_string(),
+                imported.applied_log_hash.value().to_string(),
+                imported.state_digest.encoding_version().to_string(),
+                imported.state_digest.value().to_string(),
             )
         }
         None => (
@@ -6858,20 +7169,28 @@ fn format_historical_pg_route_record(record: &HistoricalPgRouteRecord) -> String
             "-".to_owned(),
             "-".to_owned(),
             "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
+            "-".to_owned(),
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
         option_u32(record.active_primary.map(NodeId::as_u32)),
         transfer_source_epoch,
         transfer_source_log_index,
+        transfer_source_log_hash_version,
         transfer_source_log_hash,
+        transfer_source_state_digest_version,
         transfer_source_state_digest,
         transfer_imported_log_index,
+        transfer_imported_log_hash_version,
         transfer_imported_log_hash,
+        transfer_imported_state_digest_version,
         transfer_imported_state_digest,
         option_u64(
             record
@@ -6916,31 +7235,61 @@ const fn cluster_map_history_route_reference_kind_as_str(
 }
 
 fn format_pg_record(record: &PgControlRecord) -> String {
-    let (active_log_index, active_log_hash, active_state_digest) =
-        match record.active_metadata_proof {
-            Some(proof) => (
-                option_u64(Some(proof.applied_log_index)),
-                option_u64(Some(proof.applied_log_hash)),
-                option_u64(Some(proof.state_digest)),
-            ),
-            None => (option_u64(None), option_u64(None), option_u64(None)),
-        };
-    let (peering_floor_log_index, peering_floor_log_hash, peering_floor_state_digest) =
-        match record.peering_metadata_proof_floor {
-            Some(proof) => (
-                option_u64(Some(proof.applied_log_index)),
-                option_u64(Some(proof.applied_log_hash)),
-                option_u64(Some(proof.state_digest)),
-            ),
-            None => (option_u64(None), option_u64(None), option_u64(None)),
-        };
+    let (
+        active_log_index,
+        active_log_hash_version,
+        active_log_hash,
+        active_state_digest_version,
+        active_state_digest,
+    ) = match record.active_metadata_proof {
+        Some(proof) => (
+            option_u64(Some(proof.applied_log_index)),
+            option_u64(Some(proof.applied_log_hash.encoding_version().into())),
+            option_u64(Some(proof.applied_log_hash.value())),
+            option_u64(Some(proof.state_digest.encoding_version().into())),
+            option_u64(Some(proof.state_digest.value())),
+        ),
+        None => (
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+        ),
+    };
+    let (
+        peering_floor_log_index,
+        peering_floor_log_hash_version,
+        peering_floor_log_hash,
+        peering_floor_state_digest_version,
+        peering_floor_state_digest,
+    ) = match record.peering_metadata_proof_floor {
+        Some(proof) => (
+            option_u64(Some(proof.applied_log_index)),
+            option_u64(Some(proof.applied_log_hash.encoding_version().into())),
+            option_u64(Some(proof.applied_log_hash.value())),
+            option_u64(Some(proof.state_digest.encoding_version().into())),
+            option_u64(Some(proof.state_digest.value())),
+        ),
+        None => (
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+        ),
+    };
     let (
         transfer_source_epoch,
         transfer_source_log_index,
+        transfer_source_log_hash_version,
         transfer_source_log_hash,
+        transfer_source_state_digest_version,
         transfer_source_state_digest,
         transfer_imported_log_index,
+        transfer_imported_log_hash_version,
         transfer_imported_log_hash,
+        transfer_imported_state_digest_version,
         transfer_imported_state_digest,
         transfer_source_route_epoch,
         transfer_source_node_id,
@@ -6948,11 +7297,41 @@ fn format_pg_record(record: &PgControlRecord) -> String {
         Some(transfer) => (
             option_u64(Some(transfer.source_epoch().get())),
             option_u64(Some(transfer.source_metadata_proof().applied_log_index)),
-            option_u64(Some(transfer.source_metadata_proof().applied_log_hash)),
-            option_u64(Some(transfer.source_metadata_proof().state_digest)),
+            option_u64(Some(
+                transfer
+                    .source_metadata_proof()
+                    .applied_log_hash
+                    .encoding_version()
+                    .into(),
+            )),
+            option_u64(Some(
+                transfer.source_metadata_proof().applied_log_hash.value(),
+            )),
+            option_u64(Some(
+                transfer
+                    .source_metadata_proof()
+                    .state_digest
+                    .encoding_version()
+                    .into(),
+            )),
+            option_u64(Some(transfer.source_metadata_proof().state_digest.value())),
             option_u64(Some(transfer.metadata_proof().applied_log_index)),
-            option_u64(Some(transfer.metadata_proof().applied_log_hash)),
-            option_u64(Some(transfer.metadata_proof().state_digest)),
+            option_u64(Some(
+                transfer
+                    .metadata_proof()
+                    .applied_log_hash
+                    .encoding_version()
+                    .into(),
+            )),
+            option_u64(Some(transfer.metadata_proof().applied_log_hash.value())),
+            option_u64(Some(
+                transfer
+                    .metadata_proof()
+                    .state_digest
+                    .encoding_version()
+                    .into(),
+            )),
+            option_u64(Some(transfer.metadata_proof().state_digest.value())),
             option_u64(
                 record
                     .peering_metadata_transfer_source_route_epoch
@@ -6973,27 +7352,39 @@ fn format_pg_record(record: &PgControlRecord) -> String {
             option_u64(None),
             option_u64(None),
             option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
+            option_u64(None),
             option_u32(None),
         ),
     };
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
         record.pg_id.get(),
         pg_state_as_str(record.state),
         format_node_list(&record.acting_set),
         option_u32(record.active_primary.map(NodeId::as_u32)),
         active_log_index,
+        active_log_hash_version,
         active_log_hash,
+        active_state_digest_version,
         active_state_digest,
         peering_floor_log_index,
+        peering_floor_log_hash_version,
         peering_floor_log_hash,
+        peering_floor_state_digest_version,
         peering_floor_state_digest,
         transfer_source_epoch,
         transfer_source_log_index,
+        transfer_source_log_hash_version,
         transfer_source_log_hash,
+        transfer_source_state_digest_version,
         transfer_source_state_digest,
         transfer_imported_log_index,
+        transfer_imported_log_hash_version,
         transfer_imported_log_hash,
+        transfer_imported_state_digest_version,
         transfer_imported_state_digest,
         transfer_source_route_epoch,
         transfer_source_node_id,
@@ -7042,15 +7433,17 @@ fn format_pg_record(record: &PgControlRecord) -> String {
 
 fn format_node_pg_record(node_id: NodeId, record: &NodePgObservationRecord) -> String {
     format!(
-        "{},{},{},{},{},{},{},{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{},{},{},{},{}",
         node_id.as_u32(),
         record.pg_id.get(),
         pg_state_as_str(record.state),
         record.observed_epoch.get(),
         record.observed_at_ms,
         record.metadata_proof.applied_log_index,
-        record.metadata_proof.applied_log_hash,
-        record.metadata_proof.state_digest,
+        record.metadata_proof.applied_log_hash.encoding_version(),
+        record.metadata_proof.applied_log_hash.value(),
+        record.metadata_proof.state_digest.encoding_version(),
+        record.metadata_proof.state_digest.value(),
         option_u64(
             record
                 .pending_metadata_command
@@ -7700,10 +8093,10 @@ fn parse_historical_pg_route_record(
     value: &str,
 ) -> Result<HistoricalPgRouteRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 13 {
+    if fields.len() != 17 {
         return Err(parse_error(
             line,
-            "historical PG route record must have thirteen fields",
+            "historical PG route record must have seventeen fields",
         ));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "historical PG id")?);
@@ -7715,49 +8108,93 @@ fn parse_historical_pg_route_record(
         parse_option_cluster_epoch(line, fields[4], "historical transfer source epoch")?;
     let source_log_index =
         parse_option_u64(line, fields[5], "historical transfer source log index")?;
-    let source_log_hash = parse_option_u64(line, fields[6], "historical transfer source log hash")?;
+    let source_log_hash_version = parse_option_u64(
+        line,
+        fields[6],
+        "historical transfer source log hash version",
+    )?;
+    let source_log_hash = parse_option_u64(line, fields[7], "historical transfer source log hash")?;
+    let source_state_digest_version = parse_option_u64(
+        line,
+        fields[8],
+        "historical transfer source state digest version",
+    )?;
     let source_state_digest =
-        parse_option_u64(line, fields[7], "historical transfer source state digest")?;
+        parse_option_u64(line, fields[9], "historical transfer source state digest")?;
     let imported_log_index =
-        parse_option_u64(line, fields[8], "historical transfer imported log index")?;
+        parse_option_u64(line, fields[10], "historical transfer imported log index")?;
+    let imported_log_hash_version = parse_option_u64(
+        line,
+        fields[11],
+        "historical transfer imported log hash version",
+    )?;
     let imported_log_hash =
-        parse_option_u64(line, fields[9], "historical transfer imported log hash")?;
+        parse_option_u64(line, fields[12], "historical transfer imported log hash")?;
+    let imported_state_digest_version = parse_option_u64(
+        line,
+        fields[13],
+        "historical transfer imported state digest version",
+    )?;
     let imported_state_digest = parse_option_u64(
         line,
-        fields[10],
+        fields[14],
         "historical transfer imported state digest",
     )?;
     let peering_metadata_transfer = match (
         source_epoch,
         source_log_index,
+        source_log_hash_version,
         source_log_hash,
+        source_state_digest_version,
         source_state_digest,
         imported_log_index,
+        imported_log_hash_version,
         imported_log_hash,
+        imported_state_digest_version,
         imported_state_digest,
     ) {
         (
             Some(source_epoch),
             Some(source_log_index),
+            Some(source_log_hash_version),
             Some(source_log_hash),
+            Some(source_state_digest_version),
             Some(source_state_digest),
             Some(imported_log_index),
+            Some(imported_log_hash_version),
             Some(imported_log_hash),
+            Some(imported_state_digest_version),
             Some(imported_state_digest),
         ) => Some(PgMetadataTransferProof::new_with_imported_metadata_proof(
             source_epoch,
             PgMetadataProof {
                 applied_log_index: source_log_index,
-                applied_log_hash: source_log_hash,
-                state_digest: source_state_digest,
+                applied_log_hash: parse_metadata_log_hash(
+                    line,
+                    source_log_hash_version,
+                    source_log_hash,
+                )?,
+                state_digest: parse_canonical_state_digest(
+                    line,
+                    source_state_digest_version,
+                    source_state_digest,
+                )?,
             },
             PgMetadataProof {
                 applied_log_index: imported_log_index,
-                applied_log_hash: imported_log_hash,
-                state_digest: imported_state_digest,
+                applied_log_hash: parse_metadata_log_hash(
+                    line,
+                    imported_log_hash_version,
+                    imported_log_hash,
+                )?,
+                state_digest: parse_canonical_state_digest(
+                    line,
+                    imported_state_digest_version,
+                    imported_state_digest,
+                )?,
             },
         )),
-        (None, None, None, None, None, None, None) => None,
+        (None, None, None, None, None, None, None, None, None, None, None) => None,
         _ => {
             return Err(parse_error(
                 line,
@@ -7773,12 +8210,12 @@ fn parse_historical_pg_route_record(
         peering_metadata_transfer,
         peering_metadata_transfer_source_route_epoch: parse_option_cluster_epoch(
             line,
-            fields[11],
+            fields[15],
             "historical transfer source route epoch",
         )?,
         peering_metadata_transfer_source_node_id: parse_option_u32(
             line,
-            fields[12],
+            fields[16],
             "historical transfer source node",
         )?
         .map(NodeId::new),
@@ -7790,10 +8227,10 @@ fn parse_node_pg_record(
     value: &str,
 ) -> Result<(NodeId, NodePgObservationRecord), ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 11 {
+    if fields.len() != 13 {
         return Err(parse_error(
             line,
-            "node PG observation record must have eleven fields",
+            "node PG observation record must have thirteen fields",
         ));
     }
     let node_id = NodeId::new(parse_u32(line, fields[0], "node id")?);
@@ -7804,13 +8241,21 @@ fn parse_node_pg_record(
     let observed_at_ms = parse_u64(line, fields[4], "observed at")?;
     let metadata_proof = PgMetadataProof {
         applied_log_index: parse_u64(line, fields[5], "applied log index")?,
-        applied_log_hash: parse_u64(line, fields[6], "applied log hash")?,
-        state_digest: parse_u64(line, fields[7], "state digest")?,
+        applied_log_hash: parse_metadata_log_hash(
+            line,
+            parse_u64(line, fields[6], "applied log hash version")?,
+            parse_u64(line, fields[7], "applied log hash")?,
+        )?,
+        state_digest: parse_canonical_state_digest(
+            line,
+            parse_u64(line, fields[8], "state digest version")?,
+            parse_u64(line, fields[9], "state digest")?,
+        )?,
     };
     let pending_cluster_epoch =
-        parse_option_cluster_epoch(line, fields[8], "pending command cluster epoch")?;
-    let pending_log_index = parse_option_u64(line, fields[9], "pending command log index")?;
-    let pending_command_checksum = parse_option_u64(line, fields[10], "pending command checksum")?;
+        parse_option_cluster_epoch(line, fields[10], "pending command cluster epoch")?;
+    let pending_log_index = parse_option_u64(line, fields[11], "pending command log index")?;
+    let pending_command_checksum = parse_option_u64(line, fields[12], "pending command checksum")?;
     let pending_metadata_command = match (
         pending_cluster_epoch,
         pending_log_index,
@@ -7922,245 +8367,87 @@ fn parse_node_history_route_reference(
 
 fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlPlaneError> {
     let fields: Vec<&str> = value.split(',').collect();
-    if fields.len() != 32 {
-        return Err(parse_error(line, "PG record must have thirty-two fields"));
+    if fields.len() != 40 {
+        return Err(parse_error(line, "PG record must have forty fields"));
     }
     let pg_id = PgId::new(parse_u32(line, fields[0], "PG id")?);
     let state = pg_state_from_str(fields[1])?;
     let acting_set = parse_node_list(line, fields[2])?;
     let active_primary = parse_option_u32(line, fields[3], "active primary")?.map(NodeId::new);
-    let active_log_index = parse_option_u64(line, fields[4], "active applied log index")?;
-    let active_log_hash = parse_option_u64(line, fields[5], "active applied log hash")?;
-    let active_state_digest = parse_option_u64(line, fields[6], "active state digest")?;
-    let active_metadata_proof = match (active_log_index, active_log_hash, active_state_digest) {
-        (Some(applied_log_index), Some(applied_log_hash), Some(state_digest)) => {
-            Some(PgMetadataProof {
-                applied_log_index,
-                applied_log_hash,
-                state_digest,
+    let active_metadata_proof =
+        parse_optional_metadata_proof(line, &fields[4..9], "active PG metadata proof")?;
+    let peering_metadata_proof_floor =
+        parse_optional_metadata_proof(line, &fields[9..14], "peering metadata proof floor")?;
+    let transfer_source_epoch =
+        parse_option_cluster_epoch(line, fields[14], "metadata transfer source epoch")?;
+    let transfer_source_proof =
+        parse_optional_metadata_proof(line, &fields[15..20], "metadata transfer source proof")?;
+    let transfer_imported_proof =
+        parse_optional_metadata_proof(line, &fields[20..25], "metadata transfer imported proof")?;
+    let peering_metadata_transfer = match (
+        transfer_source_epoch,
+        transfer_source_proof,
+        transfer_imported_proof,
+    ) {
+        (Some(source_epoch), Some(source_metadata_proof), Some(imported_metadata_proof)) => {
+            Some(PgMetadataTransferProof {
+                source_epoch,
+                source_metadata_proof,
+                imported_metadata_proof,
             })
         }
         (None, None, None) => None,
         _ => {
             return Err(parse_error(
                 line,
-                "active PG metadata proof fields must be all present or all absent",
+                "metadata transfer fields must be all present or all absent",
             ));
         }
     };
-    let peering_metadata_proof_floor = if fields.len() >= 10 {
-        let peering_floor_log_index =
-            parse_option_u64(line, fields[7], "peering floor applied log index")?;
-        let peering_floor_log_hash =
-            parse_option_u64(line, fields[8], "peering floor applied log hash")?;
-        let peering_floor_state_digest =
-            parse_option_u64(line, fields[9], "peering floor state digest")?;
-        match (
-            peering_floor_log_index,
-            peering_floor_log_hash,
-            peering_floor_state_digest,
-        ) {
-            (Some(applied_log_index), Some(applied_log_hash), Some(state_digest)) => {
-                Some(PgMetadataProof {
-                    applied_log_index,
-                    applied_log_hash,
-                    state_digest,
-                })
-            }
-            (None, None, None) => None,
-            _ => {
-                return Err(parse_error(
-                    line,
-                    "peering metadata proof floor fields must be all present or all absent",
-                ));
-            }
-        }
-    } else {
-        None
-    };
-    let peering_metadata_transfer =
-        if fields.len() == 14 || fields.len() == 17 || fields.len() >= 18 {
-            let transfer_source_epoch =
-                parse_option_cluster_epoch(line, fields[10], "metadata transfer source epoch")?;
-            let transfer_source_log_index = parse_option_u64(
-                line,
-                fields[11],
-                "metadata transfer source applied log index",
-            )?;
-            let transfer_source_log_hash = parse_option_u64(
-                line,
-                fields[12],
-                "metadata transfer source applied log hash",
-            )?;
-            let transfer_source_state_digest =
-                parse_option_u64(line, fields[13], "metadata transfer source state digest")?;
-            let transfer_imported = if fields.len() == 17 || fields.len() >= 18 {
-                let transfer_imported_log_index = parse_option_u64(
-                    line,
-                    fields[14],
-                    "metadata transfer imported applied log index",
-                )?;
-                let transfer_imported_log_hash = parse_option_u64(
-                    line,
-                    fields[15],
-                    "metadata transfer imported applied log hash",
-                )?;
-                let transfer_imported_state_digest =
-                    parse_option_u64(line, fields[16], "metadata transfer imported state digest")?;
-                match (
-                    transfer_imported_log_index,
-                    transfer_imported_log_hash,
-                    transfer_imported_state_digest,
-                ) {
-                    (Some(applied_log_index), Some(applied_log_hash), Some(state_digest)) => {
-                        Some(PgMetadataProof {
-                            applied_log_index,
-                            applied_log_hash,
-                            state_digest,
-                        })
-                    }
-                    (None, None, None) => None,
-                    _ => {
-                        return Err(parse_error(
-                        line,
-                        "metadata transfer imported proof fields must be all present or all absent",
-                    ));
-                    }
-                }
-            } else {
-                None
-            };
-            match (
-                transfer_source_epoch,
-                transfer_source_log_index,
-                transfer_source_log_hash,
-                transfer_source_state_digest,
-                transfer_imported,
-            ) {
-                (
-                    Some(source_epoch),
-                    Some(applied_log_index),
-                    Some(applied_log_hash),
-                    Some(state_digest),
-                    imported_metadata_proof,
-                ) => Some(PgMetadataTransferProof {
-                    source_epoch,
-                    source_metadata_proof: PgMetadataProof {
-                        applied_log_index,
-                        applied_log_hash,
-                        state_digest,
-                    },
-                    imported_metadata_proof: imported_metadata_proof.unwrap_or(PgMetadataProof {
-                        applied_log_index,
-                        applied_log_hash,
-                        state_digest,
-                    }),
-                }),
-                (None, None, None, None, None) => None,
-                _ => {
-                    return Err(parse_error(
-                        line,
-                        "metadata transfer source proof fields must be all present or all absent",
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-    let (
-        peering_metadata_transfer_source_route_epoch,
-        peering_metadata_transfer_source_node_id,
-        metadata_transfer_field_offset,
-    ) = if fields.len() >= 23 {
-        (
-            parse_option_cluster_epoch(line, fields[17], "metadata transfer source route epoch")?,
-            parse_option_u32(line, fields[18], "metadata transfer source node")?.map(NodeId::new),
-            19,
-        )
-    } else {
-        (None, None, 17)
-    };
-    let metadata_transfer_fenced = if fields.len() > metadata_transfer_field_offset {
-        parse_bool_u8(
-            line,
-            fields[metadata_transfer_field_offset],
-            "metadata transfer fenced",
-        )?
-    } else {
-        false
-    };
-    let active_metadata_transfer_imported = if fields.len() > metadata_transfer_field_offset + 1 {
-        parse_bool_u8(
-            line,
-            fields[metadata_transfer_field_offset + 1],
-            "active metadata transfer imported provenance",
-        )?
-    } else {
-        false
-    };
-    let metadata_transfer_fence_source_lease_deadline_ms =
-        if fields.len() > metadata_transfer_field_offset + 2 {
-            parse_option_u64(
-                line,
-                fields[metadata_transfer_field_offset + 2],
-                "metadata transfer fence source lease deadline",
-            )?
-        } else {
-            None
-        };
-    let metadata_transfer_fence_source_imported =
-        if fields.len() > metadata_transfer_field_offset + 3 {
-            parse_bool_u8(
-                line,
-                fields[metadata_transfer_field_offset + 3],
-                "metadata transfer fence source imported provenance",
-            )?
-        } else {
-            false
-        };
-    let active_metadata_proof_epoch = if fields.len() > metadata_transfer_field_offset + 4 {
-        parse_option_cluster_epoch(
-            line,
-            fields[metadata_transfer_field_offset + 4],
-            "active metadata proof epoch",
-        )?
-    } else {
-        None
-    };
-    let peering_metadata_proof_floor_epoch = if fields.len() > metadata_transfer_field_offset + 5 {
-        parse_option_cluster_epoch(
-            line,
-            fields[metadata_transfer_field_offset + 5],
-            "peering metadata proof floor epoch",
-        )?
-    } else {
-        None
-    };
-    let peering_metadata_proof_floor_imported = if fields.len() > metadata_transfer_field_offset + 6
-    {
-        parse_bool_u8(
-            line,
-            fields[metadata_transfer_field_offset + 6],
-            "peering metadata proof floor imported provenance",
-        )?
-    } else {
-        false
-    };
+    let peering_metadata_transfer_source_route_epoch =
+        parse_option_cluster_epoch(line, fields[25], "metadata transfer source route epoch")?;
+    let peering_metadata_transfer_source_node_id =
+        parse_option_u32(line, fields[26], "metadata transfer source node")?.map(NodeId::new);
+    let metadata_transfer_fenced = parse_bool_u8(line, fields[27], "metadata transfer fenced")?;
+    let active_metadata_transfer_imported = parse_bool_u8(
+        line,
+        fields[28],
+        "active metadata transfer imported provenance",
+    )?;
+    let metadata_transfer_fence_source_lease_deadline_ms = parse_option_u64(
+        line,
+        fields[29],
+        "metadata transfer fence source lease deadline",
+    )?;
+    let metadata_transfer_fence_source_imported = parse_bool_u8(
+        line,
+        fields[30],
+        "metadata transfer fence source imported provenance",
+    )?;
+    let active_metadata_proof_epoch =
+        parse_option_cluster_epoch(line, fields[31], "active metadata proof epoch")?;
+    let peering_metadata_proof_floor_epoch =
+        parse_option_cluster_epoch(line, fields[32], "peering metadata proof floor epoch")?;
+    let peering_metadata_proof_floor_imported = parse_bool_u8(
+        line,
+        fields[33],
+        "peering metadata proof floor imported provenance",
+    )?;
     let previous_primary_node_id =
-        parse_option_u32(line, fields[26], "previous primary node id")?.map(NodeId::new);
+        parse_option_u32(line, fields[34], "previous primary node id")?.map(NodeId::new);
     let previous_primary_node_incarnation =
-        parse_option_u64(line, fields[27], "previous primary node incarnation")?;
+        parse_option_u64(line, fields[35], "previous primary node incarnation")?;
     if previous_primary_node_incarnation == Some(0) {
         return Err(parse_error(
             line,
             "previous primary node incarnation must be nonzero",
         ));
     }
-    let previous_primary_endpoint = if fields[28] == "-" {
+    let previous_primary_endpoint = if fields[36] == "-" {
         None
     } else {
         Some(
-            String::from_utf8(hex_decode(line, fields[28])?).map_err(|_| {
+            String::from_utf8(hex_decode(line, fields[36])?).map_err(|_| {
                 parse_error(
                     line,
                     "previous primary endpoint must be valid UTF-8 after hex decoding",
@@ -8169,11 +8456,11 @@ fn parse_pg_record(line: usize, value: &str) -> Result<PgControlRecord, ControlP
         )
     };
     let previous_primary_lease_deadline_ms =
-        parse_option_u64(line, fields[29], "previous primary lease deadline")?;
+        parse_option_u64(line, fields[37], "previous primary lease deadline")?;
     let previous_primary_prefer_reactivation =
-        parse_bool_u8(line, fields[30], "previous primary reactivation preference")?;
+        parse_bool_u8(line, fields[38], "previous primary reactivation preference")?;
     let metadata_transfer_fence_epoch =
-        parse_option_cluster_epoch(line, fields[31], "metadata transfer fence epoch")?;
+        parse_option_cluster_epoch(line, fields[39], "metadata transfer fence epoch")?;
     let previous_primary_lease = match (
         previous_primary_node_id,
         previous_primary_node_incarnation,
@@ -8892,7 +9179,7 @@ fn converged_peering_proof_preserves_local_state(
         && !floor.imported
         && floor.epoch.is_some_and(|epoch| epoch < cluster_epoch)
         && actual != floor.proof
-        && actual.applied_log_hash != 0
+        && actual.applied_log_hash.value() != 0
         && actual.applied_log_hash != floor.proof.applied_log_hash
         && actual.state_digest == floor.proof.state_digest
 }
@@ -9051,7 +9338,7 @@ fn metadata_proof_satisfies_active_primary_observation_floor_impl(
     if let Some(progress_provenance) = progress_provenance {
         progress_provenance.floor_epoch < observed_epoch
             && observed != active_floor
-            && observed.applied_log_hash != 0
+            && observed.applied_log_hash.value() != 0
             && observed.applied_log_hash != active_floor.applied_log_hash
             && observed.state_digest != active_floor.state_digest
             && match progress_provenance.kind {
@@ -9081,7 +9368,7 @@ fn metadata_proof_satisfies_imported_transfer_local_progress_floor(
         // ordinary migration source selection uses the strict active floor
         // above.
         || (observed != active_floor
-            && observed.applied_log_hash != 0
+            && observed.applied_log_hash.value() != 0
             && observed.applied_log_hash != active_floor.applied_log_hash
             && observed.state_digest != active_floor.state_digest)
 }
@@ -9735,6 +10022,61 @@ fn parse_u64(line: usize, value: &str, field: &'static str) -> Result<u64, Contr
     value
         .parse::<u64>()
         .map_err(|source| parse_error(line, &format!("invalid {field} {value:?}: {source}")))
+}
+
+fn parse_metadata_log_hash(
+    line: usize,
+    encoding_version: u64,
+    value: u64,
+) -> Result<MetadataCommandLogHash, ControlPlaneError> {
+    let encoding_version = u8::try_from(encoding_version)
+        .map_err(|_| parse_error(line, "metadata log hash version does not fit u8"))?;
+    MetadataCommandLogHash::from_encoded_parts(encoding_version, value)
+        .map_err(|error| parse_error(line, &error.to_string()))
+}
+
+fn parse_canonical_state_digest(
+    line: usize,
+    encoding_version: u64,
+    value: u64,
+) -> Result<CanonicalStateDigest, ControlPlaneError> {
+    let encoding_version = u8::try_from(encoding_version)
+        .map_err(|_| parse_error(line, "canonical state digest version does not fit u8"))?;
+    CanonicalStateDigest::from_encoded_parts(encoding_version, value)
+        .map_err(|error| parse_error(line, &error.to_string()))
+}
+
+fn parse_optional_metadata_proof(
+    line: usize,
+    fields: &[&str],
+    field: &'static str,
+) -> Result<Option<PgMetadataProof>, ControlPlaneError> {
+    debug_assert_eq!(fields.len(), 5);
+    let values = [
+        parse_option_u64(line, fields[0], field)?,
+        parse_option_u64(line, fields[1], field)?,
+        parse_option_u64(line, fields[2], field)?,
+        parse_option_u64(line, fields[3], field)?,
+        parse_option_u64(line, fields[4], field)?,
+    ];
+    match values {
+        [Some(applied_log_index), Some(log_hash_version), Some(log_hash), Some(state_digest_version), Some(state_digest)] => {
+            Ok(Some(PgMetadataProof {
+                applied_log_index,
+                applied_log_hash: parse_metadata_log_hash(line, log_hash_version, log_hash)?,
+                state_digest: parse_canonical_state_digest(
+                    line,
+                    state_digest_version,
+                    state_digest,
+                )?,
+            }))
+        }
+        [None, None, None, None, None] => Ok(None),
+        _ => Err(parse_error(
+            line,
+            &format!("{field} fields must be all present or all absent"),
+        )),
+    }
 }
 
 fn parse_error(line: usize, message: &str) -> ControlPlaneError {

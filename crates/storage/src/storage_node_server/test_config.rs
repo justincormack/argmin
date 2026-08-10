@@ -519,11 +519,7 @@
                 metadata_transfer_destination_epoch: None,
                 metadata_read_route: Some(crate::control_plane::PgMetadataReadRoute::new(
                     NodeId::new(7),
-                    crate::control_plane::PgMetadataProof {
-                        applied_log_index: 101,
-                        applied_log_hash: 202,
-                        state_digest: 303,
-                    },
+                    crate::control_plane::PgMetadataProof::current(101, 202, 303),
                 )),
                 acting_set: vec![NodeId::new(8), NodeId::new(7)],
             },
@@ -537,11 +533,7 @@
                 metadata_transfer_destination_epoch: None,
                 metadata_read_route: Some(crate::control_plane::PgMetadataReadRoute::new(
                     NodeId::new(8),
-                    crate::control_plane::PgMetadataProof {
-                        applied_log_index: 404,
-                        applied_log_hash: 505,
-                        state_digest: 606,
-                    },
+                    crate::control_plane::PgMetadataProof::current(404, 505, 606),
                 )),
                 acting_set: vec![NodeId::new(7), NodeId::new(8)],
             },
@@ -559,7 +551,7 @@
         assert_eq!(
             encode_control_plane_runtime_config(&config),
             concat!(
-                "argmin-storage-node-runtime-config-v4\n",
+                "argmin-storage-node-runtime-config-v5\n",
                 "node_id 7\n",
                 "cluster_epoch 9\n",
                 "route_map_validity until 12345\n",
@@ -569,11 +561,11 @@
                 "0\n",
                 "2\n",
                 "pg_routes 2\n",
-                "0 9 1 7 - - - - - 2 7 8\n",
-                "2 9 2 8 - 7 101 202 303 2 8 7\n",
+                "0 9 1 7 - - - - - - - 2 7 8\n",
+                "2 9 2 8 - 7 101 1 202 5 303 2 8 7\n",
                 "historical_pg_routes 2\n",
-                "0 3 1 7 - 8 404 505 606 2 7 8\n",
-                "2 6 2 8 - - - - - 2 8 7\n",
+                "0 3 1 7 - 8 404 1 505 5 606 2 7 8\n",
+                "2 6 2 8 - - - - - - - 2 8 7\n",
                 "pending_metadata_command_recoveries 0\n",
             )
         );
@@ -602,7 +594,7 @@
             "argmin-storage-node-runtime-config-vx",
         ] {
             let raw = encode_control_plane_runtime_config(&config).replacen(
-                "argmin-storage-node-runtime-config-v4",
+                "argmin-storage-node-runtime-config-v5",
                 magic,
                 1,
             );
@@ -621,14 +613,66 @@
     }
 
     #[test]
+    fn storage_node_runtime_config_rejects_unsupported_or_incomplete_proof_carriers() {
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        config.pg_routes[0].metadata_read_route =
+            Some(crate::control_plane::PgMetadataReadRoute::new(
+                NodeId::new(7),
+                crate::control_plane::PgMetadataProof::current(9, 10, 11),
+            ));
+        let current = encode_control_plane_runtime_config(&config);
+        assert!(current.contains("0 1 1 7 - 7 9 1 10 5 11 1 7\n"));
+        let path = tmp.path().join("runtime-config");
+
+        for (unsupported, expected) in [
+            (
+                current.replacen(" 9 1 10 5 11 ", " 9 2 10 5 11 ", 1),
+                "unsupported metadata-command log-hash encoding version 2",
+            ),
+            (
+                current.replacen(" 9 1 10 5 11 ", " 9 1 10 6 11 ", 1),
+                "unsupported canonical-state digest encoding version 6",
+            ),
+        ] {
+            assert!(matches!(
+                decode_control_plane_runtime_config(
+                    &path,
+                    config.data_dir.clone(),
+                    config.default_ec_shape,
+                    &unsupported,
+                ),
+                Err(StorageNodeServerError::RuntimeConfigInvalid { message, .. })
+                    if message == expected
+            ));
+        }
+
+        let incomplete = current.replacen(" 9 1 10 5 11 ", " 9 - 10 5 11 ", 1);
+        let error = decode_control_plane_runtime_config(
+            &path,
+            config.data_dir,
+            config.default_ec_shape,
+            &incomplete,
+        )
+        .unwrap_err();
+        match error {
+            StorageNodeServerError::RuntimeConfigInvalid { message, .. } => assert_eq!(
+                message,
+                "pg_routes route has an incomplete metadata read route"
+            ),
+            other => panic!("unexpected incomplete proof-carrier error: {other:?}"),
+        }
+    }
+
+    #[test]
     fn storage_node_restart_rejects_unsupported_runtime_config_before_storage_open() {
-        for version in [3_u16, 5] {
+        for version in [4_u16, 6] {
             let tmp = test_util::tempdir();
             let config = test_config(&tmp);
             prepare_private_data_dir(&config.data_dir).unwrap();
             let path = control_plane_runtime_config_path(&config.data_dir);
             let raw = encode_control_plane_runtime_config(&config).replacen(
-                "argmin-storage-node-runtime-config-v4",
+                "argmin-storage-node-runtime-config-v5",
                 &format!("argmin-storage-node-runtime-config-v{version}"),
                 1,
             );
@@ -713,7 +757,7 @@
         let raw = encode_control_plane_runtime_config(&config);
         let mut lines: Vec<_> = raw.lines().map(str::to_owned).collect();
         let route_header = lines.iter().position(|line| line == "pg_routes 1").unwrap();
-        lines[route_header + 1] = format!("0 1 1 7 - - - - - {} 7", usize::MAX);
+        lines[route_header + 1] = format!("0 1 1 7 - - - - - - - {} 7", usize::MAX);
         lines.push(String::new());
         let malformed = lines.join("\n");
 
@@ -3405,11 +3449,7 @@
                 .unwrap();
         }
         authority.set_pg_acting_set(pg_id, vec![node_id]).unwrap();
-        let active_proof = crate::control_plane::PgMetadataProof {
-            applied_log_index: 9,
-            applied_log_hash: 10,
-            state_digest: 11,
-        };
+        let active_proof = crate::control_plane::PgMetadataProof::current(9, 10, 11);
         let peering_epoch = authority.snapshot().cluster_epoch();
         authority
             .heartbeat(
@@ -4367,6 +4407,91 @@
 
             assert_eq!(health.node_id, config.node_id);
             assert_eq!(health.cluster_epoch, config.cluster_epoch);
+        }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_storage_rpc_rejects_resealed_unsupported_checkpoint_before_mutation() {
+        let (_bucket, checkpoint) =
+            test_metadata_checkpoint_with_bucket("authenticated-unsupported-checkpoint");
+        let tmp = test_util::tempdir();
+        let mut config = test_config(&tmp);
+        let destination_epoch = ClusterEpoch::new(2).unwrap();
+        config.cluster_epoch = destination_epoch;
+        config.pg_routes[0].cluster_epoch = destination_epoch;
+        config.pg_routes[0].state = PgState::Peering;
+        config.pg_routes[0].metadata_transfer_destination_epoch = Some(destination_epoch);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .bind()
+            .unwrap();
+        let destination_node = Arc::clone(&server._node);
+        let state_before = destination_node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap();
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            StorageRpcClientEndpoint::unix(socket_path),
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        for unsupported_version in [1_u16, 3] {
+            let mut unsupported = checkpoint.clone();
+            PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
+                &mut unsupported,
+                unsupported_version,
+            );
+            let mut payload =
+                encode_metadata_command_transfer_checkpoint_base_request(
+                    &StorageRpcMetadataCommandTransferCheckpointBaseRequest {
+                        node_id: config.node_id,
+                        cluster_epoch: destination_epoch,
+                        pg_id: PgId::new(0),
+                        checkpoint: unsupported,
+                    },
+                )
+                .unwrap();
+            const REQUEST_PREFIX_LEN: usize = 4 + 8 + 4;
+            let version_offset = REQUEST_PREFIX_LEN
+                + crate::node_runtime::pg_store::METADATA_COMMAND_CHECKPOINT_MAGIC.len();
+            payload[version_offset..version_offset + 2]
+                .copy_from_slice(&unsupported_version.to_be_bytes());
+
+            let error = client
+                .rpc_request_result(
+                    StorageRpcMessageKind::MetadataCommandTransferCheckpointBaseInstall,
+                    payload,
+                )
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+            assert!(
+                error.message.contains(&format!(
+                    "unsupported metadata checkpoint encoding version {unsupported_version}"
+                )),
+                "unexpected error: {error:?}"
+            );
+            assert_eq!(
+                destination_node
+                    .get_pg(0)
+                    .unwrap()
+                    .metadata_command_replica_state()
+                    .unwrap(),
+                state_before,
+                "unsupported checkpoint version {unsupported_version} mutated destination state"
+            );
         }
         drop(client);
         assert!(join.join().unwrap().is_ok());

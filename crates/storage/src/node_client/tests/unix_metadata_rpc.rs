@@ -498,7 +498,7 @@ fn unix_storage_node_client_adopts_metadata_transfer_state() {
         .adopt_metadata_transfer_state_from_rebased_commands(
             &[MetadataTransferCommand {
                 command: rebased,
-                pre_state_digest: 0,
+                pre_state_digest: crate::control_plane::CanonicalStateDigest::for_test(0),
                 post_state_digest: expected_state_digest,
             }],
             expected_state_digest,
@@ -1245,10 +1245,10 @@ fn unix_peering_route_rejects_redirected_commands_before_rpc() {
         .adopt_metadata_transfer_state_from_rebased_commands(
             &[MetadataTransferCommand {
                 command: future_command,
-                pre_state_digest: 0,
-                post_state_digest: 1,
+                pre_state_digest: crate::control_plane::CanonicalStateDigest::for_test(0),
+                post_state_digest: crate::control_plane::CanonicalStateDigest::for_test(1),
             }],
-            1,
+            crate::control_plane::CanonicalStateDigest::for_test(1),
         )
         .unwrap_err();
     assert!(matches!(

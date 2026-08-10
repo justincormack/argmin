@@ -509,11 +509,7 @@ fn record_node_heartbeat_command_records_current_epoch_pg_observation() {
         .unwrap();
 
     let observed_epoch = authority.snapshot().cluster_epoch();
-    let metadata_proof = PgMetadataProof {
-        applied_log_index: 7,
-        applied_log_hash: 8,
-        state_digest: 9,
-    };
+    let metadata_proof = PgMetadataProof::current(7, 8, 9);
     let mut heartbeat = heartbeat_from_record(&authority, 1, observed_epoch, 2_000);
     heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(7),

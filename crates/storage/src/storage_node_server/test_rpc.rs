@@ -1157,7 +1157,7 @@
                     cluster_epoch: destination_epoch,
                     pg_id: PgId::new(0),
                     applied_log_index: 0,
-                    applied_log_hash: 0,
+                    applied_log_hash: crate::control_plane::MetadataCommandLogHash::genesis(),
                     expected_state_digest,
                 },
             ),
@@ -1409,7 +1409,9 @@
                     cluster_epoch: destination_epoch,
                     pg_id: PgId::new(0),
                     applied_log_index: 7,
-                    applied_log_hash: 0x1234,
+                    applied_log_hash: crate::control_plane::MetadataCommandLogHash::for_test(
+                        0x1234,
+                    ),
                     expected_state_digest,
                 },
             ),
@@ -1469,7 +1471,7 @@
                     expected_state_digest,
                     commands: vec![MetadataTransferCommand {
                         command: rebased,
-                        pre_state_digest: 0,
+                pre_state_digest: crate::control_plane::CanonicalStateDigest::for_test(0),
                         post_state_digest: expected_state_digest,
                     }],
                 },
@@ -2365,7 +2367,7 @@
                     expected_state_digest,
                     commands: vec![MetadataTransferCommand {
                         command: rebased,
-                        pre_state_digest: 0,
+                        pre_state_digest: crate::control_plane::CanonicalStateDigest::for_test(0),
                         post_state_digest: expected_state_digest,
                     }],
                 },

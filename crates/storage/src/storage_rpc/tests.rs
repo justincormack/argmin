@@ -62,14 +62,14 @@ mod tests {
             ))
         ));
 
-        let canonical = s3_types::TagSet::from_pairs(
+        let tags = s3_types::TagSet::from_pairs(
             vec![("key".to_string(), "value".to_string())],
             s3_types::MAX_OBJECT_TAGS,
         )
-        .unwrap()
-        .to_xml();
+        .unwrap();
+        let canonical = s3_types::StoredTagSet::from_tag_set(tags);
         let mut encoded = Vec::new();
-        put_optional_string(&mut encoded, Some(&canonical));
+        put_optional_string(&mut encoded, Some(canonical.as_storage_str()));
         let decoded = StorageRpcDecoder::new(&encoded)
             .read_optional_serialized_tag_set()
             .unwrap()
@@ -96,16 +96,16 @@ mod tests {
             ))
         ));
 
-        let canonical = s3_types::TagSet::from_pairs(
+        let tags = s3_types::TagSet::from_pairs(
             vec![("key".to_string(), "value".to_string())],
             s3_types::MAX_BUCKET_TAGS,
         )
-        .unwrap()
-        .to_xml();
+        .unwrap();
+        let canonical = s3_types::StoredTagSet::from_tag_set(tags);
         let mut encoded = Vec::new();
         put_u8(&mut encoded, 1);
         put_bucket_subresource_kind(&mut encoded, BucketSubresourceKind::Tagging);
-        put_string(&mut encoded, &canonical);
+        put_string(&mut encoded, canonical.as_storage_str());
         put_bucket_subresource_aux(&mut encoded, BucketSubresourceAux::None);
         let decoded = StorageRpcDecoder::new(&encoded)
             .read_bucket_subresource_mutation()
@@ -118,8 +118,9 @@ mod tests {
     #[test]
     fn storage_rpc_acl_grants_require_current_canonical_representation() {
         for noncanonical in [
-            "group:all_users:READ",
-            "group:all_users:READ\ngroup:all_users:READ\n",
+            "group:all_users:READ\n",
+            "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ",
+            "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ\ngroup:all_users:READ\n",
         ] {
             let mut encoded = Vec::new();
             put_string(&mut encoded, noncanonical);
@@ -131,11 +132,14 @@ mod tests {
             ));
         }
 
-        let canonical = "group:all_users:READ\n";
+        let canonical = "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ\n";
         let mut encoded = Vec::new();
         put_string(&mut encoded, canonical);
         let decoded = StorageRpcDecoder::new(&encoded).read_acl_grants().unwrap();
-        assert_eq!(decoded.to_current_storage_string(), canonical);
+        assert_eq!(
+            StoredAclGrants::from_grants(&decoded).as_storage_str(),
+            canonical
+        );
     }
 
     #[test]
@@ -170,7 +174,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&24u32.to_le_bytes());
         expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&16u16.to_le_bytes());
+        expected.extend_from_slice(&17u16.to_le_bytes());
         expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
         expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
         expected.extend_from_slice(&3u32.to_le_bytes());
@@ -183,12 +187,12 @@ mod tests {
     #[test]
     fn storage_rpc_frame_rejects_resealed_old_and_new_version_fixtures() {
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(15)),
-            Err(StorageRpcFrameError::UnsupportedVersion(15))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(16)),
+            Err(StorageRpcFrameError::UnsupportedVersion(16))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(17)),
-            Err(StorageRpcFrameError::UnsupportedVersion(17))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(18)),
+            Err(StorageRpcFrameError::UnsupportedVersion(18))
         );
     }
 
@@ -1018,11 +1022,11 @@ mod tests {
             node_id: NodeId::new(7),
             cluster_epoch: command.id().cluster_epoch(),
             pg_id: command.id().pg_id(),
-            expected_state_digest: 1234,
+            expected_state_digest: CanonicalStateDigest::for_test(1234),
             commands: vec![MetadataTransferCommand {
                 command: command.clone(),
-                pre_state_digest: 4321,
-                post_state_digest: 1234,
+                pre_state_digest: CanonicalStateDigest::for_test(4321),
+                post_state_digest: CanonicalStateDigest::for_test(1234),
             }],
         };
 
@@ -1040,6 +1044,20 @@ mod tests {
         );
         assert_eq!(decoded.commands[0].pre_state_digest, 4321);
         assert_eq!(decoded.commands[0].post_state_digest, 1234);
+
+        for offset in [16, 29, 38] {
+            let mut unsupported = bytes.clone();
+            unsupported[offset] = 6;
+            assert_eq!(
+                decode_metadata_command_transfer_adopt_request(
+                    &unsupported,
+                    &metadata_command_decode_authority_for_test(),
+                ),
+                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                    "state-digest"
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1048,13 +1066,22 @@ mod tests {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(3).unwrap(),
             pg_id: PgId::new(11),
-            expected_state_digest: 1234,
+            expected_state_digest: CanonicalStateDigest::for_test(1234),
         };
 
         let bytes = encode_metadata_command_transfer_empty_state_request(&request);
         let decoded = decode_metadata_command_transfer_empty_state_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+
+        let mut unsupported = bytes;
+        unsupported[16] = 6;
+        assert_eq!(
+            decode_metadata_command_transfer_empty_state_request(&unsupported),
+            Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                "state-digest"
+            ))
+        );
     }
 
     #[test]
@@ -1064,18 +1091,30 @@ mod tests {
             cluster_epoch: ClusterEpoch::new(3).unwrap(),
             pg_id: PgId::new(11),
             applied_log_index: 4,
-            applied_log_hash: 5678,
-            expected_state_digest: 1234,
+            applied_log_hash: MetadataCommandLogHash::for_test(5678),
+            expected_state_digest: CanonicalStateDigest::for_test(1234),
         };
 
         let bytes = encode_metadata_command_transfer_matching_state_request(&request);
         assert_eq!(
             hex_bytes(&bytes),
-            "0700000003000000000000000b00000004000000000000002e16000000000000d204000000000000"
+            "0700000003000000000000000b0000000400000000000000012e1600000000000005d204000000000000"
         );
         let decoded = decode_metadata_command_transfer_matching_state_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);
+
+        for (offset, version, carrier) in [(24, 2, "log-hash"), (33, 6, "state-digest")]
+        {
+            let mut unsupported = bytes.clone();
+            unsupported[offset] = version;
+            assert_eq!(
+                decode_metadata_command_transfer_matching_state_request(&unsupported),
+                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                    carrier
+                ))
+            );
+        }
     }
 
     #[test]
@@ -1107,6 +1146,11 @@ mod tests {
         assert_eq!(decoded, response);
 
         let bytes = encode_metadata_command_checkpoint_payload(&request.checkpoint).unwrap();
+        assert_eq!(&bytes[..8], METADATA_COMMAND_CHECKPOINT_MAGIC);
+        assert_eq!(
+            u16::from_be_bytes(bytes[8..10].try_into().unwrap()),
+            METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION
+        );
         let payload_sha256: [u8; 32] = checksum::compute_checksum(
             checksum::ChecksumAlgorithm::Sha256,
             &bytes,
@@ -1121,12 +1165,12 @@ mod tests {
                 payload_sha256,
             ),
             (
-                0xbb86_c2bd_95b1_a72b,
-                6_700,
+                0x79f7_3076_ed02_b41a,
+                6_711,
                 [
-                    196, 136, 121, 248, 27, 80, 19, 40, 205, 18, 144, 248, 93, 254, 104,
-                    52, 62, 85, 25, 37, 232, 236, 209, 106, 65, 213, 101, 85, 191, 100, 68,
-                    162,
+                    28, 202, 18, 92, 22, 241, 115, 179, 114, 18, 138, 165, 80, 182, 53,
+                    81, 246, 215, 121, 166, 10, 125, 201, 3, 78, 217, 127, 21, 159, 33,
+                    174, 174,
                 ],
             )
         );
@@ -1134,58 +1178,37 @@ mod tests {
 
         assert_eq!(decoded, request.checkpoint);
 
-        let mut previous_version_request = request.clone();
-        previous_version_request
-            .checkpoint
-            .canonical_state_encoding_version = 3;
-        let bytes =
-            encode_metadata_command_transfer_checkpoint_base_request(&previous_version_request)
-                .unwrap();
+        for unsupported in [1_u16, 3] {
+            let mut unsupported_checkpoint = request.checkpoint.clone();
+            crate::PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
+                &mut unsupported_checkpoint,
+                unsupported,
+            );
+            let mut unsupported_bytes =
+                encode_metadata_command_checkpoint_payload(&unsupported_checkpoint).unwrap();
+            unsupported_bytes[8..10].copy_from_slice(&unsupported.to_be_bytes());
+            assert_eq!(
+                decode_metadata_command_checkpoint_payload(&unsupported_bytes),
+                Err(
+                    StorageRpcPayloadError::UnsupportedMetadataCheckpointEncodingVersion {
+                        actual: unsupported,
+                    }
+                )
+            );
+        }
+        for (offset, version, carrier) in [(30, 2, "log-hash"), (39, 6, "state-digest")] {
+            let mut unsupported_bytes = bytes.clone();
+            unsupported_bytes[offset] = version;
+            assert_eq!(
+                decode_metadata_command_checkpoint_payload(&unsupported_bytes),
+                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                    carrier
+                ))
+            );
+        }
         assert_eq!(
-            decode_metadata_command_transfer_checkpoint_base_request(&bytes),
-            Err(
-                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 3,
-                }
-            )
-        );
-        let bytes =
-            encode_metadata_command_checkpoint_payload(&previous_version_request.checkpoint)
-                .unwrap();
-        assert_eq!(
-            decode_metadata_command_checkpoint_payload(&bytes),
-            Err(
-                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 3,
-                }
-            )
-        );
-
-        let mut future_version_request = request.clone();
-        future_version_request
-            .checkpoint
-            .canonical_state_encoding_version = 5;
-        let bytes =
-            encode_metadata_command_transfer_checkpoint_base_request(&future_version_request)
-                .unwrap();
-        assert_eq!(
-            decode_metadata_command_transfer_checkpoint_base_request(&bytes),
-            Err(
-                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 5,
-                }
-            )
-        );
-        let bytes =
-            encode_metadata_command_checkpoint_payload(&future_version_request.checkpoint)
-                .unwrap();
-        assert_eq!(
-            decode_metadata_command_checkpoint_payload(&bytes),
-            Err(
-                StorageRpcPayloadError::UnsupportedMetadataCanonicalStateEncodingVersion {
-                    actual: 5,
-                }
-            )
+            decode_metadata_command_checkpoint_payload(&bytes[10..]),
+            Err(StorageRpcPayloadError::UnknownMetadataCheckpointMagic)
         );
 
         let candidates_request = StorageRpcMetadataCommandCheckpointCandidatesRequest {
@@ -1413,13 +1436,13 @@ mod tests {
             entries: vec![
                 MetadataCommandLogHashRangeEntry {
                     log_index: 2,
-                    previous_log_hash: 0x11,
-                    log_hash: 0x22,
+                    previous_log_hash: MetadataCommandLogHash::for_test(0x11),
+                    log_hash: MetadataCommandLogHash::for_test(0x22),
                 },
                 MetadataCommandLogHashRangeEntry {
                     log_index: 4,
-                    previous_log_hash: 0x33,
-                    log_hash: 0x44,
+                    previous_log_hash: MetadataCommandLogHash::for_test(0x33),
+                    log_hash: MetadataCommandLogHash::for_test(0x44),
                 },
             ],
         };
@@ -1459,16 +1482,16 @@ mod tests {
             entries: vec![
                 MetadataCommandLogRangeEntry {
                     log_index: command.id().log_index().get(),
-                    previous_log_hash: 0x11,
-                    log_hash: 0x22,
-                    pre_state_digest: Some(0x21),
-                    post_state_digest: Some(0x23),
+                    previous_log_hash: MetadataCommandLogHash::for_test(0x11),
+                    log_hash: MetadataCommandLogHash::for_test(0x22),
+                    pre_state_digest: Some(CanonicalStateDigest::for_test(0x21)),
+                    post_state_digest: Some(CanonicalStateDigest::for_test(0x23)),
                     kind: MetadataCommandLogRangeEntryKind::Applied(Box::new(command.clone())),
                 },
                 MetadataCommandLogRangeEntry {
                     log_index: 9,
-                    previous_log_hash: 0x33,
-                    log_hash: 0x44,
+                    previous_log_hash: MetadataCommandLogHash::for_test(0x33),
+                    log_hash: MetadataCommandLogHash::for_test(0x44),
                     pre_state_digest: None,
                     post_state_digest: None,
                     kind: MetadataCommandLogRangeEntryKind::Abandoned {
@@ -1491,7 +1514,8 @@ mod tests {
     #[test]
     fn metadata_command_log_entry_range_worst_case_response_fits_frame_cap() {
         let worst_case_applied_entry_len =
-            8 + 8 + 8 + 1 + 8 + 1 + 8 + 4 + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
+            8 + 1 + 8 + 1 + 8 + 1 + 1 + 8 + 1 + 1 + 8 + 4
+                + STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN;
         let response_payload_len =
             4 + usize::try_from(STORAGE_RPC_MAX_METADATA_COMMAND_LOG_ENTRY_RANGE_ENTRIES).unwrap()
                 * worst_case_applied_entry_len;
@@ -1513,7 +1537,9 @@ mod tests {
         let mut bytes = Vec::new();
         put_u32(&mut bytes, 1);
         put_u64(&mut bytes, 1);
+        put_u8(&mut bytes, 1);
         put_u64(&mut bytes, 0x11);
+        put_u8(&mut bytes, 1);
         put_u64(&mut bytes, 0x22);
         put_u8(&mut bytes, 0);
         put_u8(&mut bytes, 0);
@@ -1643,8 +1669,8 @@ mod tests {
                     MetadataCommandReplicaState {
                         cluster_epoch: ClusterEpoch::new(3).unwrap(),
                         applied_log_index: 44,
-                        applied_log_hash: 0x55,
-                        state_digest: 0x66,
+                        applied_log_hash: MetadataCommandLogHash::for_test(0x55),
+                        state_digest: CanonicalStateDigest::for_test(0x66),
                     },
                 ),
             },
@@ -1684,8 +1710,8 @@ mod tests {
             state: MetadataCommandReplicaState {
                 cluster_epoch: ClusterEpoch::new(3).unwrap(),
                 applied_log_index: 44,
-                applied_log_hash: 0x55,
-                state_digest: 0x66,
+                applied_log_hash: MetadataCommandLogHash::for_test(0x55),
+                state_digest: CanonicalStateDigest::for_test(0x66),
             },
         };
 
@@ -1693,6 +1719,17 @@ mod tests {
         let decoded = decode_metadata_command_state_response(&bytes).unwrap();
 
         assert_eq!(decoded, response);
+
+        for (offset, version, carrier) in [(16, 2, "log-hash"), (25, 6, "state-digest")] {
+            let mut unsupported = bytes.clone();
+            unsupported[offset] = version;
+            assert_eq!(
+                decode_metadata_command_state_response(&unsupported),
+                Err(StorageRpcPayloadError::UnsupportedMetadataProofCarrier(
+                    carrier
+                ))
+            );
+        }
     }
 
     #[test]
@@ -2860,6 +2897,16 @@ mod tests {
                 StorageRpcMessageKind::MetadataCommand,
                 STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
                 STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandTransferEmptyStateInitialize,
+                STORAGE_RPC_MAX_METADATA_COMMAND_TRANSFER_EMPTY_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_TRANSFER_EMPTY_STATE_PAYLOAD_LEN,
+            ),
+            (
+                StorageRpcMessageKind::MetadataCommandTransferMatchingStateInitialize,
+                STORAGE_RPC_MAX_METADATA_COMMAND_TRANSFER_MATCHING_STATE_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_TRANSFER_MATCHING_STATE_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::ShardWrite,

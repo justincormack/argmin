@@ -150,7 +150,7 @@ fn metadata_state_digest_mismatch_prevents_ack() {
             cluster_epoch: ClusterEpoch::INITIAL,
             expected_digest: digest,
             actual_digest: _,
-        }) if digest == expected_digest
+        }) if digest == expected_digest.value()
     ));
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
@@ -1627,7 +1627,7 @@ fn local_cluster_reopen_rejects_large_command_stream_materialized_tamper() {
         .unwrap();
     let state = node_zero_pg.metadata_command_replica_state().unwrap();
     assert_eq!(state.applied_log_index, 129);
-    assert_ne!(state.state_digest, 0);
+    assert_ne!(state.state_digest.value(), 0);
     node_zero_pg
         .test_set_bucket_public_read(&first_bucket.unwrap(), true)
         .unwrap();

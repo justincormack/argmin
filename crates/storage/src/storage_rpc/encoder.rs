@@ -26,6 +26,11 @@ fn put_string(out: &mut Vec<u8>, value: &str) {
     put_bytes(out, value.as_bytes());
 }
 
+fn put_acl_grants(out: &mut Vec<u8>, grants: &AclGrants) {
+    let stored = StoredAclGrants::from_grants(grants);
+    put_string(out, stored.as_storage_str());
+}
+
 fn put_shard_location(out: &mut Vec<u8>, location: StorageRpcShardLocation) {
     put_u64(out, location.cluster_epoch.get());
     put_u32(out, location.pg_id.get());
@@ -213,7 +218,7 @@ fn put_create_bucket_config(out: &mut Vec<u8>, config: &StorageRpcCreateBucketCo
     put_string(out, config.name.as_str());
     put_string(out, &config.owner_principal);
     put_string(out, config.owner_canonical_id.as_str());
-    put_string(out, &config.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &config.acl_grants);
     put_bool(out, config.public_read);
     put_bool(out, config.public_write);
     put_u8(out, config.versioning as u8);
@@ -230,7 +235,7 @@ fn put_bucket_info(out: &mut Vec<u8>, info: &BucketInfo) {
     put_u8(out, info.state as u8);
     put_u8(out, info.versioning as u8);
     put_bucket_object_lock_config(out, &info.object_lock);
-    put_string(out, &info.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &info.acl_grants);
     put_bool(out, info.public_read);
     put_bool(out, info.public_write);
     put_optional_public_access_block_config(out, info.public_access_block);
@@ -290,7 +295,7 @@ fn put_bucket_metadata_control_mutation(
             summary,
         } => {
             put_u8(out, 1);
-            put_string(out, &acl_grants.to_current_storage_string());
+            put_acl_grants(out, acl_grants);
             put_bool(out, summary.public_read);
             put_bool(out, summary.public_write);
         }
@@ -532,7 +537,7 @@ fn put_commit_direct_put_object_req(out: &mut Vec<u8>, request: &CommitDirectPut
     put_string(out, request.generation_reservation_id.as_str());
     put_u8(out, request.versioning as u8);
     put_owner_identity(out, &request.owner);
-    put_string(out, &request.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &request.acl_grants);
     put_bool(out, request.public_read);
     put_u64(out, request.generation_id.get());
     put_u64(out, request.size);
@@ -615,7 +620,7 @@ fn put_put_object_metadata_mutation(out: &mut Vec<u8>, mutation: &PutObjectMetad
             public_read,
         } => {
             put_u8(out, 4);
-            put_string(out, &acl_grants.to_current_storage_string());
+            put_acl_grants(out, acl_grants);
             put_bool(out, *public_read);
         }
     }
@@ -803,7 +808,7 @@ fn put_stream_put_commit_input(out: &mut Vec<u8>, commit: &StreamPutCommitInput)
     put_u8(out, commit.versioning as u8);
     put_u64(out, commit.version_id.to_u64());
     put_owner_identity(out, &commit.owner);
-    put_string(out, &commit.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &commit.acl_grants);
     put_bool(out, commit.public_read);
     put_u64(out, commit.etag_crc64);
     put_optional_string(out, commit.tags.as_ref().map(|tags| tags.as_str()));
@@ -823,7 +828,7 @@ fn put_complete_multipart_commit_request(
     put_bytes(out, request.completion_fingerprint.as_bytes());
     put_u8(out, request.versioning as u8);
     put_owner_identity(out, &request.owner);
-    put_string(out, &request.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &request.acl_grants);
     put_bool(out, request.public_read);
     put_u64(out, request.generation_id.get());
     put_u64(out, request.size);
@@ -1018,7 +1023,7 @@ fn put_create_multipart_upload_req(out: &mut Vec<u8>, request: &CreateMultipartU
     put_bytes(out, request.system_metadata_blob.as_slice());
     put_owner_identity(out, &request.initiator);
     put_owner_identity(out, &request.owner);
-    put_string(out, &request.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &request.acl_grants);
     put_bool(out, request.public_read);
     put_object_lock_state(out, request.object_lock);
     put_optional_multipart_checksum_config(out, request.checksum);
@@ -1068,7 +1073,7 @@ fn put_multipart_upload_record(out: &mut Vec<u8>, record: &MultipartUploadRecord
     put_bytes(out, record.system_metadata_blob.as_slice());
     put_owner_identity(out, &record.initiator);
     put_owner_identity(out, &record.owner);
-    put_string(out, &record.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &record.acl_grants);
     put_bool(out, record.public_read);
     put_u64(out, record.object_generation_id.get());
     put_optional_multipart_object_identity(out, record.initiated_object_identity);
@@ -1343,7 +1348,7 @@ fn put_live_object_record(out: &mut Vec<u8>, record: &LiveObjectRecord) {
     put_string(out, record.key.as_str());
     put_u64(out, record.version_id.to_u64());
     put_owner_identity(out, &record.owner);
-    put_string(out, &record.acl_grants.to_current_storage_string());
+    put_acl_grants(out, &record.acl_grants);
     put_bool(out, record.public_read);
     put_u64(out, record.generation_id.get());
     put_u64(out, record.size);

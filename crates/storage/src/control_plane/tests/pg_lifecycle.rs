@@ -794,11 +794,7 @@ fn heartbeat_records_current_epoch_pg_observations() {
     heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(15),
         state: PgState::Peering,
-        metadata_proof: PgMetadataProof {
-            applied_log_index: 9,
-            applied_log_hash: 10,
-            state_digest: 11,
-        },
+        metadata_proof: PgMetadataProof::current(9, 10, 11),
         pending_metadata_command: None,
     }];
     authority.heartbeat(heartbeat, 2_000).unwrap();
@@ -818,11 +814,7 @@ fn heartbeat_records_current_epoch_pg_observations() {
     assert_eq!(observation.observed_at_ms(), 2_000);
     assert_eq!(
         observation.metadata_proof(),
-        PgMetadataProof {
-            applied_log_index: 9,
-            applied_log_hash: 10,
-            state_digest: 11,
-        }
+        PgMetadataProof::current(9, 10, 11)
     );
     let persisted = store.load().unwrap().unwrap();
     let persisted_observation = persisted
@@ -833,11 +825,7 @@ fn heartbeat_records_current_epoch_pg_observations() {
     assert_eq!(persisted_observation.state(), PgState::Peering);
     assert_eq!(
         persisted_observation.metadata_proof(),
-        PgMetadataProof {
-            applied_log_index: 9,
-            applied_log_hash: 10,
-            state_digest: 11,
-        }
+        PgMetadataProof::current(9, 10, 11)
     );
 }
 
@@ -856,16 +844,8 @@ fn complete_pg_peering_requires_matching_metadata_proofs() {
         .set_pg_acting_set(PgId::new(19), vec![NodeId::new(1), NodeId::new(2)])
         .unwrap();
 
-    let matching_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
-    let different_proof = PgMetadataProof {
-        applied_log_index: 41,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let matching_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
+    let different_proof = PgMetadataProof::current(41, 0xabc, 0xdef);
     for (node_id, metadata_proof) in [(1, matching_proof), (2, different_proof)] {
         let mut heartbeat = heartbeat_from_record(
             &authority,
@@ -941,11 +921,7 @@ fn complete_pg_peering_accepts_converged_later_epoch_log_with_unchanged_state() 
         .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
         .unwrap();
 
-    let active_floor = PgMetadataProof {
-        applied_log_index: 90,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let active_floor = PgMetadataProof::current(90, 0xabc, 0xdef);
     for node_id in [1, 2] {
         heartbeat_with_pg_proof(
             &mut authority,
@@ -980,11 +956,7 @@ fn complete_pg_peering_accepts_converged_later_epoch_log_with_unchanged_state() 
     authority
         .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2), NodeId::new(3)])
         .unwrap();
-    let later_epoch_proof = PgMetadataProof {
-        applied_log_index: 2,
-        applied_log_hash: 0x123,
-        state_digest: active_floor.state_digest,
-    };
+    let later_epoch_proof = PgMetadataProof::current(2, 0x123, active_floor.state_digest);
     for node_id in [1, 2, 3] {
         heartbeat_with_pg_proof(
             &mut authority,
@@ -1102,11 +1074,11 @@ fn finalized_bucket_cleanup_proof_progress_requires_logged_command() {
     store.apply_metadata_command_and_record(1, &mark).unwrap();
     let cleanup_floor = pg_metadata_proof_from_store(&store);
 
-    let digest_only_cleanup = PgMetadataProof {
-        applied_log_index: cleanup_floor.applied_log_index,
-        applied_log_hash: cleanup_floor.applied_log_hash,
-        state_digest: cleanup_floor.state_digest.wrapping_add(1),
-    };
+    let digest_only_cleanup = PgMetadataProof::current(
+        cleanup_floor.applied_log_index,
+        cleanup_floor.applied_log_hash,
+        cleanup_floor.state_digest.wrapping_add(1),
+    );
     let cleanup_floor_epoch = ClusterEpoch::new(7).unwrap();
     let cleanup_observed_epoch = ClusterEpoch::new(8).unwrap();
     assert!(!metadata_proof_satisfies_active_primary_observation_floor(
@@ -1160,11 +1132,7 @@ fn pg_peering_reconstruction_fails_closed_until_serving_replicas_converge() {
         .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1), NodeId::new(2)])
         .unwrap();
 
-    let reconstructed_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let reconstructed_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     heartbeat_with_pg_proof(
         &mut authority,
         1,
@@ -1175,11 +1143,7 @@ fn pg_peering_reconstruction_fails_closed_until_serving_replicas_converge() {
         2_001,
     );
 
-    let lagging_proof = PgMetadataProof {
-        applied_log_index: 41,
-        applied_log_hash: 0xaaa,
-        state_digest: 0xddd,
-    };
+    let lagging_proof = PgMetadataProof::current(41, 0xaaa, 0xddd);
     heartbeat_with_pg_proof(
         &mut authority,
         2,
@@ -1205,11 +1169,7 @@ fn pg_peering_reconstruction_fails_closed_until_serving_replicas_converge() {
         }) if expected == reconstructed_proof && actual == lagging_proof
     ));
 
-    let same_index_hash_fork = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabd,
-        state_digest: 0xdef,
-    };
+    let same_index_hash_fork = PgMetadataProof::current(42, 0xabd, 0xdef);
     heartbeat_with_pg_proof(
         &mut authority,
         2,
@@ -1235,11 +1195,7 @@ fn pg_peering_reconstruction_fails_closed_until_serving_replicas_converge() {
         }) if expected == reconstructed_proof && actual == same_index_hash_fork
     ));
 
-    let same_index_state_fork = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdf0,
-    };
+    let same_index_state_fork = PgMetadataProof::current(42, 0xabc, 0xdf0);
     heartbeat_with_pg_proof(
         &mut authority,
         2,
@@ -1300,11 +1256,7 @@ fn complete_pg_peering_rejects_pending_metadata_command_observation() {
         .set_pg_acting_set(PgId::new(29), vec![NodeId::new(1)])
         .unwrap();
 
-    let proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     heartbeat_with_pg_proof(&mut authority, 1, 29, PgState::Peering, proof, false, 2_000);
     authority.complete_ready_pg_peerings(2_010).unwrap();
     let active_epoch = authority.snapshot().cluster_epoch();
@@ -1372,11 +1324,7 @@ fn active_heartbeat_accepts_metadata_progress_after_peering() {
         .set_pg_acting_set(PgId::new(19), vec![NodeId::new(1)])
         .unwrap();
 
-    let accepted_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let accepted_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     let peering_epoch = authority.snapshot().cluster_epoch();
     let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
     peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
@@ -1422,11 +1370,7 @@ fn active_heartbeat_accepts_metadata_progress_after_peering() {
         .lease_deadline_ms()
         .unwrap();
 
-    let progressed_proof = PgMetadataProof {
-        applied_log_index: 1,
-        applied_log_hash: 0x1234,
-        state_digest: 0x5678,
-    };
+    let progressed_proof = PgMetadataProof::current(1, 0x1234, 0x5678);
     let mut progressed_active = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
     progressed_active.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(19),
@@ -1479,16 +1423,8 @@ fn complete_ready_pg_peerings_stamps_active_proofs_with_peering_epoch() {
     }
 
     let peering_epoch = authority.snapshot().cluster_epoch();
-    let proof_21 = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
-    let proof_22 = PgMetadataProof {
-        applied_log_index: 99,
-        applied_log_hash: 0xaabb,
-        state_digest: 0xccdd,
-    };
+    let proof_21 = PgMetadataProof::current(42, 0xabc, 0xdef);
+    let proof_22 = PgMetadataProof::current(99, 0xaabb, 0xccdd);
     let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
     peering_heartbeat.pg_observations = vec![
         NodePgHeartbeatObservation {
@@ -1518,11 +1454,7 @@ fn complete_ready_pg_peerings_stamps_active_proofs_with_peering_epoch() {
         assert_eq!(pg.active_metadata_proof_epoch(), Some(peering_epoch));
     }
 
-    let progressed_proof = PgMetadataProof {
-        applied_log_index: 1,
-        applied_log_hash: 0x1234,
-        state_digest: 0x5678,
-    };
+    let progressed_proof = PgMetadataProof::current(1, 0x1234, 0x5678);
     let mut active_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_020);
     active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(21),
@@ -1550,11 +1482,7 @@ fn complete_ready_pg_peerings_command_rejects_unobserved_metadata_proof() {
         .unwrap();
 
     let peering_epoch = authority.snapshot().cluster_epoch();
-    let observed_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let observed_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
     peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(23),
@@ -1564,11 +1492,7 @@ fn complete_ready_pg_peerings_command_rejects_unobserved_metadata_proof() {
     }];
     authority.heartbeat(peering_heartbeat, 2_000).unwrap();
 
-    let forged_proof = PgMetadataProof {
-        applied_log_index: 43,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let forged_proof = PgMetadataProof::current(43, 0xabc, 0xdef);
     assert!(matches!(
         authority.snapshot().apply_control_plane_command(
             ControlPlaneCommand::CompleteReadyPgPeerings {
@@ -1606,11 +1530,7 @@ fn complete_ready_pg_peerings_command_rejects_wrong_metadata_proof_epoch() {
         .unwrap();
 
     let peering_epoch = authority.snapshot().cluster_epoch();
-    let observed_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let observed_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
     peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(24),
@@ -1656,11 +1576,7 @@ fn complete_ready_pg_peerings_command_replays_with_committed_ready_time() {
         .unwrap();
 
     let peering_epoch = authority.snapshot().cluster_epoch();
-    let observed_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let observed_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
     peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(25),
@@ -1694,11 +1610,7 @@ fn complete_ready_pg_peerings_command_replays_with_committed_ready_time() {
     authority.snapshot = applied.into_snapshot();
     persist_manually_modified_test_snapshot(&mut authority);
     let active_epoch = authority.snapshot().cluster_epoch();
-    let progressed_proof = PgMetadataProof {
-        applied_log_index: 43,
-        applied_log_hash: 0xbc,
-        state_digest: 0xef,
-    };
+    let progressed_proof = PgMetadataProof::current(43, 0xbc, 0xef);
     let mut active_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_010);
     active_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(25),
@@ -1736,11 +1648,7 @@ fn complete_ready_pg_peerings_command_rejects_stale_node_incarnation() {
         .unwrap();
 
     let peering_epoch = authority.snapshot().cluster_epoch();
-    let observed_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let observed_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     let mut peering_heartbeat = heartbeat_from_record(&authority, 1, peering_epoch, 2_000);
     peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(51),
@@ -1818,11 +1726,7 @@ fn complete_ready_pg_peerings_command_rejects_non_deterministic_primary() {
         .unwrap();
 
     let peering_epoch = authority.snapshot().cluster_epoch();
-    let observed_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let observed_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     for node_id in [1, 2] {
         let mut peering_heartbeat =
             heartbeat_from_record(&authority, node_id, peering_epoch, 2_000);
@@ -1934,11 +1838,7 @@ fn active_primary_heartbeat_pending_command_fences_pg_for_recovery() {
         .set_pg_acting_set(PgId::new(32), vec![NodeId::new(1)])
         .unwrap();
 
-    let active_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let active_proof = PgMetadataProof::current(42, 0xabc, 0xdef);
     heartbeat_with_pg_proof(
         &mut authority,
         1,
@@ -2065,16 +1965,8 @@ fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
 
     let affected_pg = PgId::new(34);
     let unaffected_pg = PgId::new(35);
-    let affected_floor = PgMetadataProof {
-        applied_log_index: 90,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
-    let unaffected_proof = PgMetadataProof {
-        applied_log_index: 12,
-        applied_log_hash: 0x123,
-        state_digest: 0x456,
-    };
+    let affected_floor = PgMetadataProof::current(90, 0xabc, 0xdef);
+    let unaffected_proof = PgMetadataProof::current(12, 0x123, 0x456);
 
     authority
         .set_pg_acting_set(affected_pg, vec![NodeId::new(1)])
@@ -2151,11 +2043,7 @@ fn active_primary_pending_reset_fences_only_affected_pg_and_renews_node() {
         .lease_deadline_ms()
         .unwrap();
 
-    let reset_proof = PgMetadataProof {
-        applied_log_index: 2,
-        applied_log_hash: 0x789,
-        state_digest: affected_floor.state_digest,
-    };
+    let reset_proof = PgMetadataProof::current(2, 0x789, affected_floor.state_digest);
     let pending = test_pending_metadata_command(active_epoch);
     let mut pending_heartbeat = heartbeat_from_record(&authority, 1, active_epoch, 2_030);
     pending_heartbeat.requested_lease_duration_ms = 1_000;
@@ -2444,11 +2332,7 @@ fn restart_epoch_bump_drops_reconstructible_pg_observations_from_history() {
         .unwrap();
     let observation_epoch = authority.snapshot().cluster_epoch();
     let mut heartbeat = heartbeat_from_record(&authority, 1, observation_epoch, 2_000);
-    let metadata_proof = PgMetadataProof {
-        applied_log_index: 7,
-        applied_log_hash: 8,
-        state_digest: 9,
-    };
+    let metadata_proof = PgMetadataProof::current(7, 8, 9);
     heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
         pg_id: PgId::new(18),
         state: PgState::Peering,
@@ -2507,11 +2391,7 @@ fn authority_restart_moves_active_pg_back_to_peering_before_service() {
     authority
         .set_pg_acting_set(PgId::new(26), vec![NodeId::new(1)])
         .unwrap();
-    let active_metadata_proof = PgMetadataProof {
-        applied_log_index: 11,
-        applied_log_hash: 12,
-        state_digest: 13,
-    };
+    let active_metadata_proof = PgMetadataProof::current(11, 12, 13);
     let mut peering_heartbeat =
         heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_000);
     peering_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
@@ -2699,11 +2579,7 @@ fn future_observed_epoch_heartbeat_rejected_without_mutation() {
         .set_pg_acting_set(PgId::new(1), vec![NodeId::new(1)])
         .unwrap();
 
-    let proof = PgMetadataProof {
-        applied_log_index: 7,
-        applied_log_hash: 8,
-        state_digest: 9,
-    };
+    let proof = PgMetadataProof::current(7, 8, 9);
     heartbeat_with_pg_proof(&mut authority, 1, 1, PgState::Peering, proof, false, 2_000);
     authority
         .complete_pg_peering(

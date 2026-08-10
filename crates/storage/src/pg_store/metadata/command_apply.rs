@@ -91,7 +91,7 @@ impl PgStore {
                         created_at_millis,
                         BucketState::Active as u8,
                         config.versioning as u8 as i64,
-                        config.acl_grants.to_current_storage_string(),
+                        Self::serialize_acl_grants(config.acl_grants),
                         i32::from(config.public_read),
                         i32::from(config.public_write),
                         Self::ownership_controls_sql_value(Some(config.ownership_controls)),
@@ -182,7 +182,7 @@ impl PgStore {
                         bucket.region as i64,
                         bucket.state as u8 as i64,
                         bucket.versioning as u8 as i64,
-                        bucket.acl_grants.to_current_storage_string(),
+                        Self::serialize_acl_grants(&bucket.acl_grants),
                         i32::from(bucket.public_read),
                         i32::from(bucket.public_write),
                         public_access_block_present,
@@ -333,7 +333,7 @@ impl PgStore {
                                  bucket_execution_generation = ?4 \
                              WHERE name = ?5",
                             params![
-                                target.acl_grants.to_current_storage_string(),
+                                Self::serialize_acl_grants(&target.acl_grants),
                                 i32::from(target.public_read),
                                 i32::from(target.public_write),
                                 target.bucket_execution_generation as i64,
@@ -647,7 +647,7 @@ impl PgStore {
                     self.update_metadata_command_replica_state(
                         record.state.cluster_epoch,
                         record.state.applied_log_index,
-                        record.state.applied_log_hash,
+                        record.state.applied_log_hash.value(),
                     )
                     .map_err(BucketSnapshotLoadError::Store)
                 } else {

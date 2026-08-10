@@ -62,7 +62,7 @@ use crate::{
 };
 
 const PAYLOAD_SHARD_PLACEMENT_KEY_DOMAIN: &[u8] = b"argmin/payload-shard-placement/v1";
-const STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/static-route-map-content/v2";
+const STATIC_ROUTE_MAP_CONTENT_DIGEST_DOMAIN: &[u8] = b"argmin/static-route-map-content/v3";
 const LOCAL_RECLAIM_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -5988,7 +5988,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
                 .has_matching_applied_metadata_command_log_entry(
                     pg_id,
                     command,
-                    unadvanced_state.applied_log_hash,
+                    unadvanced_state.applied_log_hash.value(),
                 )
                 .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
             if !matches_pending {
@@ -6049,7 +6049,7 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
             .has_matching_applied_metadata_command_log_entry(
                 pg_id,
                 command,
-                primary_state.applied_log_hash,
+                primary_state.applied_log_hash.value(),
             )
             .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
         if !matches_pending {
@@ -6110,10 +6110,10 @@ fn metadata_command_replica_state_diverged_error(
             reference_cluster_epoch: reference_state.cluster_epoch,
             applied_log_index: state.applied_log_index,
             reference_applied_log_index: reference_state.applied_log_index,
-            applied_log_hash: state.applied_log_hash,
-            reference_applied_log_hash: reference_state.applied_log_hash,
-            state_digest: state.state_digest,
-            reference_state_digest: reference_state.state_digest,
+            applied_log_hash: state.applied_log_hash.value(),
+            reference_applied_log_hash: reference_state.applied_log_hash.value(),
+            state_digest: state.state_digest.value(),
+            reference_state_digest: reference_state.state_digest.value(),
         },
     )
 }

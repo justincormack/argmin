@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::control_plane::{CanonicalStateDigest, MetadataCommandLogHash};
 use crate::metadata_command::{
     MetadataCommandId, MetadataCommandLogIndex, MetadataTransferCommand,
 };
@@ -189,8 +190,8 @@ fn metadata_transfer_commands(
         .zip(post_state_digests.iter().copied())
         .map(|(command, post_state_digest)| MetadataTransferCommand {
             command,
-            pre_state_digest: 0,
-            post_state_digest,
+            pre_state_digest: CanonicalStateDigest::for_test(0),
+            post_state_digest: CanonicalStateDigest::for_test(post_state_digest),
         })
         .collect()
 }
@@ -3382,7 +3383,7 @@ fn insert_digest_multipart_upload(store: &PgStore, upload_id: &UploadId) {
                 Option::<u8>::None,
                 ObjectEncryption::None.encryption_type() as u8,
                 Option::<&[u8]>::None,
-                "",
+                PgStore::serialize_acl_grants(&AclGrants::default()),
                 0_i64,
                 1_i64,
                 Option::<i64>::None,
@@ -3922,7 +3923,7 @@ fn adopt_metadata_transfer_state_installs_rebased_log_over_matching_materialized
     let mut post_state_digests = Vec::new();
     for command in &commands {
         let state = store.apply_metadata_command_and_record(0, command).unwrap();
-        post_state_digests.push(state.state_digest);
+        post_state_digests.push(state.state_digest.value());
     }
     let source_state = store.metadata_command_replica_state().unwrap();
     assert_eq!(source_state.cluster_epoch, ClusterEpoch::INITIAL);
@@ -3932,14 +3933,14 @@ fn adopt_metadata_transfer_state_installs_rebased_log_over_matching_materialized
         rebase_probe_commands(destination_epoch, PgId::new(1), &commands),
         &post_state_digests,
     );
-    let mut expected_log_hash = 0;
+    let mut expected_log_hash = MetadataCommandLogHash::genesis();
     for transfer_command in &rebased {
         let command = &transfer_command.command;
         expected_log_hash = metadata_command_log_hash(
             destination_epoch,
             PgId::new(1),
             command.id().log_index(),
-            expected_log_hash,
+            expected_log_hash.value(),
             command.checksum_crc64(),
         );
     }
@@ -3999,7 +4000,7 @@ fn adopt_metadata_transfer_state_rejects_dirty_materialized_state() {
             PgId::new(1),
             std::slice::from_ref(&source_command),
         ),
-        &[source_state.state_digest],
+        &[source_state.state_digest.value()],
     );
 
     let err = destination
@@ -4119,7 +4120,7 @@ fn initialize_metadata_transfer_matching_state_moves_matching_nonempty_replica()
             0,
             destination_epoch,
             0,
-            0,
+            MetadataCommandLogHash::genesis(),
             source_state.state_digest,
         )
         .unwrap();
@@ -4154,8 +4155,8 @@ fn initialize_metadata_transfer_matching_state_rejects_dirty_digest() {
             0,
             destination_epoch,
             0,
-            0,
-            before.state_digest.wrapping_add(1),
+            MetadataCommandLogHash::genesis(),
+            CanonicalStateDigest::for_test(before.state_digest.value().wrapping_add(1)),
         )
         .unwrap_err();
     assert!(matches!(
@@ -4186,7 +4187,7 @@ fn initialize_metadata_transfer_matching_state_rejects_unproven_log_tuple() {
             0,
             destination_epoch,
             7,
-            0x1234,
+            MetadataCommandLogHash::for_test(0x1234),
             before.state_digest,
         )
         .unwrap_err();
@@ -4225,25 +4226,13 @@ fn metadata_command_checkpoint_exports_checked_table_digest_summary() {
     assert_eq!(checkpoint.applied_log_hash, state.applied_log_hash);
     assert_eq!(checkpoint.state_digest, state.state_digest);
     assert_eq!(
-        checkpoint.canonical_state_encoding_version,
+        checkpoint.state_digest.encoding_version(),
         METADATA_CANONICAL_STATE_ENCODING_VERSION
     );
     assert_eq!(checkpoint.table_digests.len(), METADATA_DIGEST_TABLES.len());
     assert_eq!(checkpoint.table_blocks.len(), METADATA_DIGEST_TABLES.len());
     assert_ne!(checkpoint.checkpoint_crc64, 0);
     checkpoint.verify().unwrap();
-    let mut previous_version_checkpoint = checkpoint.clone();
-    previous_version_checkpoint.canonical_state_encoding_version = 3;
-    assert_eq!(
-        previous_version_checkpoint.verify(),
-        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 3 })
-    );
-    let mut future_version_checkpoint = checkpoint.clone();
-    future_version_checkpoint.canonical_state_encoding_version = 5;
-    assert_eq!(
-        future_version_checkpoint.verify(),
-        Err(MetadataCommandCheckpointValidationError::UnsupportedStateEncoding { actual: 5 })
-    );
     assert_eq!(
         checkpoint
             .table_digests
@@ -4339,22 +4328,55 @@ fn metadata_command_checkpoint_catalogue_persists_and_lists_newest_valid_candida
         .unwrap();
     assert_eq!(bounded_candidates, vec![first_checkpoint.clone()]);
 
-    store
-        .conn
-        .execute(
-            "UPDATE metadata_command_checkpoints SET checkpoint_bytes = X'00' \
-             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND applied_log_index = ?3",
-            rusqlite::params![
-                ClusterEpoch::INITIAL.get() as i64,
-                1_i64,
-                second_checkpoint.applied_log_index as i64,
-            ],
-        )
-        .unwrap();
-    let candidates = store
-        .metadata_command_checkpoint_candidates(ClusterEpoch::INITIAL, u64::MAX, 8)
-        .unwrap();
-    assert_eq!(candidates, vec![first_checkpoint]);
+    let replica_state_before_rejections = store.metadata_command_replica_state().unwrap();
+    for format in ["corrupt", "unframed-v1", "framed-v1", "framed-v3"] {
+        let (checkpoint_crc64, checkpoint_bytes) = if format == "corrupt" {
+            (second_checkpoint.checkpoint_crc64, vec![0])
+        } else {
+            let encoding_version = if format == "framed-v3" { 3 } else { 1 };
+            let mut unsupported = second_checkpoint.clone();
+            PgStore::test_reseal_metadata_command_checkpoint_for_encoding_version(
+                &mut unsupported,
+                encoding_version,
+            );
+            let mut bytes =
+                crate::storage_rpc::encode_metadata_command_checkpoint_payload(&unsupported)
+                    .unwrap();
+            bytes[8..10].copy_from_slice(&encoding_version.to_be_bytes());
+            if format == "unframed-v1" {
+                bytes.drain(..10);
+            }
+            (unsupported.checkpoint_crc64, bytes)
+        };
+        store
+            .conn
+            .execute(
+                "UPDATE metadata_command_checkpoints \
+                 SET checkpoint_crc64 = ?1, checkpoint_bytes = ?2 \
+                 WHERE cluster_epoch = ?3 AND pg_id = ?4 AND applied_log_index = ?5",
+                rusqlite::params![
+                    checkpoint_crc64 as i64,
+                    checkpoint_bytes,
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    second_checkpoint.applied_log_index as i64,
+                ],
+            )
+            .unwrap();
+        let candidates = store
+            .metadata_command_checkpoint_candidates(ClusterEpoch::INITIAL, u64::MAX, 8)
+            .unwrap();
+        assert_eq!(
+            candidates,
+            vec![first_checkpoint.clone()],
+            "format={format}"
+        );
+        assert_eq!(
+            store.metadata_command_replica_state().unwrap(),
+            replica_state_before_rejections,
+            "format={format} mutated replica state"
+        );
+    }
 }
 
 #[test]
@@ -4368,7 +4390,13 @@ fn metadata_command_checkpoint_catalogue_prunes_old_epochs() {
         let cluster_epoch = ClusterEpoch::new(epoch_value).unwrap();
         if cluster_epoch != initial_state.cluster_epoch {
             store
-                .initialize_metadata_transfer_matching_state(0, cluster_epoch, 0, 0, state_digest)
+                .initialize_metadata_transfer_matching_state(
+                    0,
+                    cluster_epoch,
+                    0,
+                    MetadataCommandLogHash::genesis(),
+                    state_digest,
+                )
                 .unwrap();
         }
         store
@@ -4946,51 +4974,50 @@ fn install_metadata_transfer_checkpoint_base_rejects_tampered_checkpoint_without
 }
 
 #[test]
-fn install_metadata_transfer_checkpoint_base_rejects_future_state_encoding_without_publication() {
-    let source_tmp = test_util::tempdir();
-    let source = PgStore::open(source_tmp.path(), 1).unwrap();
-    let bucket = trusted_bucket_name("metadata-checkpoint-install-future-state");
-    let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
-    source
-        .apply_metadata_command_and_record(0, &command)
-        .unwrap();
-    let mut checkpoint = source
-        .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
-        .unwrap();
-    checkpoint.canonical_state_encoding_version = 5;
-
-    let destination_tmp = test_util::tempdir();
-    let destination = PgStore::open(destination_tmp.path(), 1).unwrap();
-    let before = destination.metadata_command_replica_state().unwrap();
-    let destination_epoch = ClusterEpoch::new(29).unwrap();
-    let err = destination
-        .install_metadata_transfer_checkpoint_base(2, destination_epoch, &checkpoint)
-        .unwrap_err();
-    assert!(matches!(
-        err,
-        StoreError::MetadataCheckpointInvalid {
-            pg_id: 1,
-            cluster_epoch,
-            reason,
-            ..
-        } if cluster_epoch == destination_epoch
-            && reason == "UnsupportedStateEncoding { actual: 5 }"
-    ));
-    assert_eq!(
-        destination.metadata_command_replica_state().unwrap(),
-        before,
-        "unsupported state encoding must not publish replica state"
-    );
-    assert!(
-        destination
-            .metadata_command_replica_state_can_initialize()
-            .unwrap(),
-        "unsupported state encoding must leave the destination empty"
-    );
-    assert!(
-        destination.head_bucket_raw(&bucket).is_err(),
-        "unsupported state encoding must not install materialized rows"
-    );
+fn metadata_command_replica_state_rejects_unsupported_carrier_encodings() {
+    for (column, carrier, versions) in [
+        (
+            "applied_log_hash_encoding_version",
+            "log-hash",
+            [0_u8, 2_u8],
+        ),
+        (
+            "state_digest_encoding_version",
+            "state-digest",
+            [4_u8, 6_u8],
+        ),
+    ] {
+        for version in versions {
+            let tmp = test_util::tempdir();
+            let store = PgStore::open(tmp.path(), 1).unwrap();
+            store
+                .conn
+                .execute_batch("PRAGMA ignore_check_constraints = ON")
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    &format!(
+                        "UPDATE metadata_command_replica_state SET {column} = ?1 WHERE singleton = 0"
+                    ),
+                    params![version],
+                )
+                .unwrap();
+            store
+                .conn
+                .execute_batch("PRAGMA ignore_check_constraints = OFF")
+                .unwrap();
+            let err = store.metadata_command_replica_state().unwrap_err();
+            assert!(matches!(
+                err,
+                StoreError::MetadataCommandReplicaStateEncodingVersion {
+                    pg_id: 1,
+                    carrier: actual_carrier,
+                    actual,
+                } if actual_carrier == carrier && actual == u64::from(version)
+            ));
+        }
+    }
 }
 
 #[test]
@@ -5363,7 +5390,7 @@ fn adopt_metadata_transfer_state_rejects_pending_command() {
             PgId::new(1),
             std::slice::from_ref(&command),
         ),
-        &[source_state.state_digest],
+        &[source_state.state_digest.value()],
     );
     let err = store
         .adopt_metadata_transfer_state_from_rebased_commands(
@@ -5458,7 +5485,7 @@ fn metadata_command_log_contiguous_insert_uses_prefix_fast_path() {
         )
         .unwrap();
     assert_eq!(previous_log_hash, Some(0));
-    assert_eq!(log_hash, Some(expected_log_hash as i64));
+    assert_eq!(log_hash, Some(expected_log_hash.value() as i64));
 }
 
 #[test]
@@ -8870,13 +8897,16 @@ fn row_to_object_record_rejects_negative_parts_count() {
                 NULL AS encryption_state, \
                 'owner' AS owner_principal, \
                 ?1 AS owner_canonical_id, \
-                '' AS acl_grants, \
+                ?2 AS acl_grants, \
                 0 AS public_read, \
                 NULL AS object_lock_retention_mode, \
                 NULL AS object_lock_retain_until, \
                 0 AS object_lock_legal_hold, \
                 NULL AS became_noncurrent_at",
-            params![CanonicalUserId::from_principal("owner").as_str()],
+            params![
+                CanonicalUserId::from_principal("owner").as_str(),
+                PgStore::serialize_acl_grants(&AclGrants::default()),
+            ],
             PgStore::row_to_object_record,
         )
         .unwrap_err();
@@ -8915,13 +8945,16 @@ fn row_to_object_record_rejects_pending_delete_status() {
                 NULL AS encryption_state, \
                 'owner' AS owner_principal, \
                 ?1 AS owner_canonical_id, \
-                '' AS acl_grants, \
+                ?2 AS acl_grants, \
                 0 AS public_read, \
                 NULL AS object_lock_retention_mode, \
                 NULL AS object_lock_retain_until, \
                 0 AS object_lock_legal_hold, \
                 NULL AS became_noncurrent_at",
-            params![CanonicalUserId::from_principal("owner").as_str()],
+            params![
+                CanonicalUserId::from_principal("owner").as_str(),
+                PgStore::serialize_acl_grants(&AclGrants::default()),
+            ],
             PgStore::row_to_object_record,
         )
         .unwrap_err();
@@ -9201,17 +9234,17 @@ fn stored_bucket_tag_rows_reject_aux_for_live_and_tombstone_rows() {
 
 #[test]
 fn stored_acl_grants_require_current_canonical_representation() {
-    let canonical = "group:all_users:READ\n";
+    let canonical = "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ\n";
+    let parsed = PgStore::parse_acl_grants(canonical.to_string(), 0, "ACL grants").unwrap();
     assert_eq!(
-        PgStore::parse_acl_grants(canonical.to_string(), 0, "ACL grants")
-            .unwrap()
-            .to_current_storage_string(),
+        s3_types::StoredAclGrants::from_grants(&parsed).as_storage_str(),
         canonical
     );
 
     for noncanonical in [
-        "group:all_users:READ",
-        "group:all_users:READ\ngroup:all_users:READ\n",
+        "group:all_users:READ\n",
+        "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ",
+        "ARGMIN-ACL-GRANTS/1\ngroup:all_users:READ\ngroup:all_users:READ\n",
     ] {
         assert!(matches!(
             PgStore::parse_acl_grants(noncanonical.to_string(), 0, "ACL grants"),

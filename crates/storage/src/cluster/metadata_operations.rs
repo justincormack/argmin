@@ -323,7 +323,7 @@ impl StorageCluster {
         let command_log_index = command.id().log_index().get();
         let expected_previous_log_hash =
             if command_log_index == primary_state.applied_log_index.saturating_add(1) {
-                primary_state.applied_log_hash
+                primary_state.applied_log_hash.value()
             } else if command_log_index == primary_state.applied_log_index {
                 let Some((previous_log_hash, log_hash)) = entry_hashes_or_not_retryable(
                     primary.metadata_command_inspection_client().as_ref(),
@@ -333,7 +333,7 @@ impl StorageCluster {
                 else {
                     return Ok(false);
                 };
-                if log_hash != primary_state.applied_log_hash {
+                if log_hash != primary_state.applied_log_hash.value() {
                     return Ok(false);
                 }
                 previous_log_hash
@@ -484,7 +484,7 @@ impl StorageCluster {
                     current_log_index,
                 ));
             };
-            if log_hash != primary_state.applied_log_hash {
+            if log_hash != primary_state.applied_log_hash.value() {
                 return Err(self.metadata_command_conflict(
                     primary_node_id,
                     pg_id,
@@ -508,7 +508,7 @@ impl StorageCluster {
             node_id: primary_node_id,
             max_log_index: primary_max_log_index,
             applied_log_index: primary_state.applied_log_index,
-            applied_log_hash: primary_state.applied_log_hash,
+            applied_log_hash: primary_state.applied_log_hash.value(),
         };
         match decide_reissued_pending_command(
             primary_summary,
@@ -566,7 +566,7 @@ impl StorageCluster {
                 .has_matching_applied_metadata_command_log_entry(
                     pg_id,
                     &current,
-                    primary_state.applied_log_hash,
+                    primary_state.applied_log_hash.value(),
                 )?
             {
                 ReissuedPendingCommandReplicaMatch::MatchesHashChain
@@ -577,7 +577,7 @@ impl StorageCluster {
                 node_id: node.node_id(),
                 max_log_index: node_max_log_index,
                 applied_log_index: node_state.applied_log_index,
-                applied_log_hash: node_state.applied_log_hash,
+                applied_log_hash: node_state.applied_log_hash.value(),
                 replacement_match,
             });
         }
@@ -639,7 +639,7 @@ impl StorageCluster {
         else {
             return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
         };
-        if terminal_log_hash != primary_state.applied_log_hash {
+        if terminal_log_hash != primary_state.applied_log_hash.value() {
             return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
         }
 
@@ -678,7 +678,7 @@ impl StorageCluster {
             if node_max_log_index < current_log_index {
                 if node_max_log_index != previous_log_index
                     || node_state.applied_log_index != previous_log_index
-                    || node_state.applied_log_hash != previous_log_hash
+                    || node_state.applied_log_hash.value() != previous_log_hash
                 {
                     return Err(self.metadata_command_conflict(
                         node.node_id(),
@@ -1483,7 +1483,12 @@ impl StorageCluster {
             right
                 .applied_log_index
                 .cmp(&left.applied_log_index)
-                .then_with(|| right.applied_log_hash.cmp(&left.applied_log_hash))
+                .then_with(|| {
+                    right
+                        .applied_log_hash
+                        .value()
+                        .cmp(&left.applied_log_hash.value())
+                })
         });
 
         for checkpoint in candidates {
@@ -1622,7 +1627,7 @@ impl StorageCluster {
             let state = if let Some(checkpoint) = checkpoint_base {
                 let checkpoint_destination_base_proof = PgMetadataProof {
                     applied_log_index: 0,
-                    applied_log_hash: 0,
+                    applied_log_hash: crate::control_plane::MetadataCommandLogHash::genesis(),
                     state_digest: checkpoint.state_digest,
                 };
                 if metadata_client
@@ -1715,8 +1720,8 @@ impl StorageCluster {
                                 pg_id,
                                 cluster_epoch: self.operation_epoch(),
                                 applied_log_index: current.applied_log_index,
-                                applied_log_hash: current.applied_log_hash,
-                                state_digest: current.state_digest,
+                                applied_log_hash: current.applied_log_hash.value(),
+                                state_digest: current.state_digest.value(),
                                 expected: expected_import_proof,
                             }
                             .into(),
@@ -1760,7 +1765,7 @@ impl StorageCluster {
                     MetadataTransferImportDestination::AdoptBase => {
                         peering_route.initialize_metadata_transfer_matching_state(
                             0,
-                            0,
+                            MetadataCommandLogHash::genesis(),
                             base_import_proof.state_digest,
                         )?;
                         let mut state = metadata_client.metadata_command_replica_state(pg_id)?;
@@ -3909,7 +3914,7 @@ impl StorageCluster {
                 current_epoch: route.cluster_epoch(),
             });
         }
-        if state.applied_log_index == 0 && state.applied_log_hash == 0 {
+        if state.applied_log_index == 0 && state.applied_log_hash.value() == 0 {
             summary.skipped_empty += 1;
             return Ok(summary);
         }
@@ -4004,7 +4009,7 @@ impl StorageCluster {
                 summary.skipped_stale_epoch += 1;
                 continue;
             }
-            if state.applied_log_index == 0 && state.applied_log_hash == 0 {
+            if state.applied_log_index == 0 && state.applied_log_hash.value() == 0 {
                 summary.skipped_empty += 1;
                 continue;
             }

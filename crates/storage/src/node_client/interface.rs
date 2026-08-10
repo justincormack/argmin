@@ -138,7 +138,7 @@ pub(crate) trait BucketMetadataRoute: Send {
 
     fn get_bucket_tags(&self) -> Result<Option<SerializedBucketTagSet>, BucketSnapshotLoadError> {
         self.get_bucket_subresource(BucketSubresourceKind::Tagging)?
-            .map(SerializedBucketTagSet::from_current_xml)
+            .map(SerializedBucketTagSet::from_current_storage)
             .transpose()
             .map_err(|error| {
                 MetadataError::InvariantViolation {
@@ -1591,20 +1591,20 @@ pub(crate) trait MetadataCommandPeeringRoute: Send {
 
     fn initialize_metadata_transfer_empty_state(
         &self,
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     fn initialize_metadata_transfer_matching_state(
         &self,
         applied_log_index: u64,
-        applied_log_hash: u64,
-        expected_state_digest: u64,
+        applied_log_hash: MetadataCommandLogHash,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         commands: &[MetadataTransferCommand],
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
 
     #[allow(dead_code)]

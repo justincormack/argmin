@@ -1712,10 +1712,10 @@ fn local_peering_route_rejects_command_for_another_pg_without_mutation() {
         .adopt_metadata_transfer_state_from_rebased_commands(
             &[MetadataTransferCommand {
                 command: wrong_command,
-                pre_state_digest: 0,
-                post_state_digest: 1,
+                pre_state_digest: crate::control_plane::CanonicalStateDigest::for_test(0),
+                post_state_digest: crate::control_plane::CanonicalStateDigest::for_test(1),
             }],
-            1,
+            crate::control_plane::CanonicalStateDigest::for_test(1),
         )
         .unwrap_err();
     assert!(matches!(
@@ -1798,10 +1798,10 @@ fn local_peering_route_rejects_future_epoch_command_without_mutation() {
         .adopt_metadata_transfer_state_from_rebased_commands(
             &[MetadataTransferCommand {
                 command: future_command,
-                pre_state_digest: 0,
-                post_state_digest: 1,
+                pre_state_digest: crate::control_plane::CanonicalStateDigest::for_test(0),
+                post_state_digest: crate::control_plane::CanonicalStateDigest::for_test(1),
             }],
-            1,
+            crate::control_plane::CanonicalStateDigest::for_test(1),
         )
         .unwrap_err();
     assert!(matches!(

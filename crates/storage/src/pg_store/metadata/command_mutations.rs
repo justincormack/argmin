@@ -69,7 +69,7 @@ impl PgStore {
              WHERE bucket = ?7 AND key = ?8 AND version_id = ?9 AND status = ?10",
             params![
                 tags,
-                object.acl_grants.to_current_storage_string(),
+                Self::serialize_acl_grants(&object.acl_grants),
                 i32::from(object.public_read),
                 object_lock_retention_mode,
                 object_lock_retain_until,
@@ -889,7 +889,7 @@ impl PgStore {
                         ctype,
                         encryption_type,
                         encryption_state,
-                        upload.acl_grants.to_current_storage_string(),
+                        Self::serialize_acl_grants(&upload.acl_grants),
                         i32::from(upload.public_read),
                         upload.object_generation_id.get() as i64,
                         listing_cluster_epoch,
@@ -1225,7 +1225,7 @@ impl PgStore {
                 last_modified_millis as i64,
                 owner.principal,
                 owner.canonical_id.as_str(),
-                "",
+                Self::serialize_acl_grants(&AclGrants::default()),
             ],
             "put object meta (delete marker)",
         )?;
@@ -1468,7 +1468,7 @@ impl PgStore {
                          bucket_execution_generation = ?4 \
                     WHERE name = ?5",
                     params![
-                        acl_grants.to_current_storage_string(),
+                        Self::serialize_acl_grants(acl_grants),
                         i32::from(summary.public_read),
                         i32::from(summary.public_write),
                         generation as i64,

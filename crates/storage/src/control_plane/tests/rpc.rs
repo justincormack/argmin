@@ -3083,11 +3083,7 @@ fn authenticated_admin_pg_update_retries_after_source_acknowledges_epoch() {
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
     let target_pg_id = PgId::new(7);
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(target_pg_id, vec![NodeId::new(1)])
         .unwrap();
@@ -3202,11 +3198,7 @@ fn authenticated_admin_pg_update_waits_across_target_pg_lifecycle_progress() {
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
     let target_pg_id = PgId::new(7);
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(target_pg_id, vec![NodeId::new(1)])
         .unwrap();
@@ -3378,11 +3370,7 @@ fn pg_acting_set_command_rejects_removing_pending_reporter_before_mutation() {
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
     let pg_id = PgId::new(7);
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
         .unwrap();
@@ -4413,11 +4401,7 @@ fn authenticated_unix_control_plane_client_signs_metadata_transfer_admin_command
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
         .unwrap();
@@ -4448,11 +4432,7 @@ fn authenticated_unix_control_plane_client_signs_metadata_transfer_admin_command
         2_002,
     );
     let active_epoch = authority.snapshot().cluster_epoch();
-    let imported_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 12,
-        state_digest: 11,
-    };
+    let imported_proof = PgMetadataProof::current(9, 12, 11);
     let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
         active_epoch,
         active_proof,
@@ -4530,11 +4510,7 @@ fn assert_authenticated_metadata_transfer_fence_retries_before_and_after_apply<S
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
         .unwrap();
@@ -4674,11 +4650,7 @@ fn authenticated_admin_metadata_transfer_confirms_after_lost_response() {
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
         .unwrap();
@@ -4710,11 +4682,7 @@ fn authenticated_admin_metadata_transfer_confirms_after_lost_response() {
     );
     let active_epoch = authority.snapshot().cluster_epoch();
     let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
-    let imported_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 12,
-        state_digest: 11,
-    };
+    let imported_proof = PgMetadataProof::current(9, 12, 11);
     let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
         active_epoch,
         active_proof,
@@ -6477,11 +6445,7 @@ fn unix_control_plane_client_confirms_pg_acting_set_with_unrelated_non_serving_p
     authority
         .set_pg_acting_set(PgId::new(8), vec![NodeId::new(1)])
         .unwrap();
-    let unrelated_proof = PgMetadataProof {
-        applied_log_index: 3,
-        applied_log_hash: 4,
-        state_digest: 5,
-    };
+    let unrelated_proof = PgMetadataProof::current(3, 4, 5);
     heartbeat_with_pg_proof(
         &mut authority,
         1,
@@ -6626,11 +6590,7 @@ fn unix_control_plane_client_fences_pg_for_metadata_transfer_live() {
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
         .unwrap();
@@ -6723,11 +6683,7 @@ fn unix_control_plane_client_retries_convergent_fence_before_and_after_apply() {
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
         .unwrap();
@@ -6820,11 +6776,7 @@ fn unix_control_plane_client_uses_longer_timeout_for_fence_confirmation() {
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
         .unwrap();
@@ -6903,11 +6855,7 @@ fn unix_control_plane_client_sets_pg_acting_set_with_metadata_transfer_live() {
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, node_id, 10_000).serving());
     }
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
         .unwrap();
@@ -6938,14 +6886,7 @@ fn unix_control_plane_client_sets_pg_acting_set_with_metadata_transfer_live() {
         10_005,
     );
     let active_epoch = authority.snapshot().cluster_epoch();
-    let transfer = PgMetadataTransferProof::new(
-        active_epoch,
-        PgMetadataProof {
-            applied_log_index: 10,
-            applied_log_hash: 12,
-            state_digest: 13,
-        },
-    );
+    let transfer = PgMetadataTransferProof::new(active_epoch, PgMetadataProof::current(10, 12, 13));
     let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
     let server = std::thread::spawn(move || {
         let (mut stream, _addr) = listener.accept().unwrap();
@@ -6990,11 +6931,7 @@ fn unix_control_plane_client_observes_metadata_transfer_epoch_after_lost_respons
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
         .unwrap();
@@ -7026,11 +6963,7 @@ fn unix_control_plane_client_observes_metadata_transfer_epoch_after_lost_respons
     );
     let active_epoch = authority.snapshot().cluster_epoch();
     let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
-    let imported_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 12,
-        state_digest: 11,
-    };
+    let imported_proof = PgMetadataProof::current(9, 12, 11);
     let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
         active_epoch,
         active_proof,
@@ -7093,11 +7026,7 @@ fn unix_control_plane_client_sets_transfer_and_returns_exact_runtime_map() {
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
         .unwrap();
@@ -7128,11 +7057,7 @@ fn unix_control_plane_client_sets_transfer_and_returns_exact_runtime_map() {
         2_002,
     );
     let active_epoch = authority.snapshot().cluster_epoch();
-    let imported_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 12,
-        state_digest: 11,
-    };
+    let imported_proof = PgMetadataProof::current(9, 12, 11);
     let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
         active_epoch,
         active_proof,
@@ -7197,11 +7122,7 @@ fn unix_control_plane_client_observes_metadata_transfer_install_after_lost_respo
             .unwrap();
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
-    let active_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let active_proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(43), vec![NodeId::new(1)])
         .unwrap();
@@ -7231,11 +7152,7 @@ fn unix_control_plane_client_observes_metadata_transfer_install_after_lost_respo
         false,
         2_002,
     );
-    let unrelated_proof = PgMetadataProof {
-        applied_log_index: 17,
-        applied_log_hash: 18,
-        state_digest: 19,
-    };
+    let unrelated_proof = PgMetadataProof::current(17, 18, 19);
     authority
         .set_pg_acting_set(PgId::new(44), vec![NodeId::new(1)])
         .unwrap();
@@ -7267,11 +7184,7 @@ fn unix_control_plane_client_observes_metadata_transfer_install_after_lost_respo
     );
     let active_epoch = authority.snapshot().cluster_epoch();
     let expected_transfer_epoch = ClusterEpoch::new(active_epoch.get() + 1).unwrap();
-    let imported_proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 12,
-        state_digest: 11,
-    };
+    let imported_proof = PgMetadataProof::current(9, 12, 11);
     let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
         active_epoch,
         active_proof,
@@ -7463,11 +7376,7 @@ fn unix_control_plane_client_runtime_map_status_uses_compact_rpc() {
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
         .unwrap();
@@ -7517,11 +7426,7 @@ fn unix_runtime_map_source_status_uses_check_applied_timeout_for_slow_response()
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
         .unwrap();
@@ -7675,11 +7580,7 @@ fn authenticated_pg_status_facade_uses_check_applied_timeout_for_slow_response()
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
         .unwrap();
@@ -7727,11 +7628,7 @@ fn unix_control_plane_client_runtime_map_snapshot_allows_slow_full_response() {
         .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
-    let proof = PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    };
+    let proof = PgMetadataProof::current(9, 10, 11);
     authority
         .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
         .unwrap();
@@ -8158,22 +8055,22 @@ fn control_plane_rpc_rejects_corrupted_payload_checksum() {
 }
 
 #[test]
-fn control_plane_rpc_rejects_previous_version_fixture() {
-    let (mut writer, mut reader) = UnixStream::pair().unwrap();
-    writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
-    write_u16_to_stream(&mut writer, CONTROL_PLANE_RPC_VERSION - 1);
-    writer.write_all(&[0; 14]).unwrap();
+fn control_plane_rpc_rejects_previous_and_future_version_fixtures() {
+    for version in [CONTROL_PLANE_RPC_VERSION - 1, CONTROL_PLANE_RPC_VERSION + 1] {
+        let (mut writer, mut reader) = UnixStream::pair().unwrap();
+        writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
+        write_u16_to_stream(&mut writer, version);
+        writer.write_all(&[0; 14]).unwrap();
 
-    let error = read_control_plane_unix_request(&mut reader).unwrap_err();
+        let error = read_control_plane_unix_request(&mut reader).unwrap_err();
 
-    assert!(matches!(
-        error,
-        ControlPlaneError::RpcProtocol { diagnostic: message }
-            if message.as_str() == format!(
-                "unsupported control-plane RPC version {}",
-                CONTROL_PLANE_RPC_VERSION - 1
-            )
-    ));
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { diagnostic: message }
+                if message.as_str()
+                    == format!("unsupported control-plane RPC version {version}")
+        ));
+    }
 }
 
 #[test]
@@ -8321,14 +8218,7 @@ fn control_plane_rpc_rejects_malformed_heartbeat_pending_command_presence() {
     write_u32(&mut payload, 1);
     write_u32(&mut payload, 7);
     write_pg_state(&mut payload, PgState::Peering);
-    write_pg_metadata_proof(
-        &mut payload,
-        PgMetadataProof {
-            applied_log_index: 10,
-            applied_log_hash: 11,
-            state_digest: 12,
-        },
-    );
+    write_pg_metadata_proof(&mut payload, PgMetadataProof::current(10, 11, 12));
     write_u8(&mut payload, 2);
 
     let mut reader = PayloadReader::new(&payload);
@@ -8558,11 +8448,7 @@ fn control_plane_rpc_rejects_runtime_map_transfer_without_source_route() {
     route.primary_lease_deadline_ms = None;
     route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
         ClusterEpoch::INITIAL,
-        PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
-        },
+        PgMetadataProof::current(1, 2, 3),
     ));
     route.peering_metadata_transfer_destination_epoch = Some(snapshot.cluster_epoch);
     let error = decode_runtime_map_test_snapshot(snapshot).unwrap_err();
@@ -8617,11 +8503,7 @@ fn control_plane_rpc_rejects_runtime_map_transfer_unknown_source_node() {
     route.primary_lease_deadline_ms = None;
     route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
         ClusterEpoch::INITIAL,
-        PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
-        },
+        PgMetadataProof::current(1, 2, 3),
     ));
     route.peering_metadata_transfer_destination_epoch = Some(snapshot.cluster_epoch);
     route.peering_metadata_transfer_source_route_epoch = Some(ClusterEpoch::INITIAL);
@@ -8872,11 +8754,7 @@ pub(super) fn runtime_map_test_snapshot_with_active_route() -> ClusterRuntimeMap
             primary_node_id: NodeId::new(1),
             acting_set: vec![NodeId::new(1)],
             state: PgState::Active,
-            active_metadata_proof: Some(PgMetadataProof {
-                applied_log_index: 2,
-                applied_log_hash: 3,
-                state_digest: 4,
-            }),
+            active_metadata_proof: Some(PgMetadataProof::current(2, 3, 4)),
             primary_lease_deadline_ms: Some(12_345),
             peering_metadata_transfer: None,
             peering_metadata_transfer_destination_epoch: None,
@@ -8903,11 +8781,7 @@ fn control_plane_rpc_round_trips_active_route_metadata_proof() {
     assert_eq!(decoded, snapshot);
     assert_eq!(
         decoded.pg_routes()[0].active_metadata_proof(),
-        Some(PgMetadataProof {
-            applied_log_index: 2,
-            applied_log_hash: 3,
-            state_digest: 4,
-        })
+        Some(PgMetadataProof::current(2, 3, 4))
     );
 }
 
@@ -8926,11 +8800,7 @@ fn runtime_map_content_digest_excludes_lease_freshness_but_binds_route_content()
 
     assert_eq!(renewed.content_digest(), expected);
 
-    renewed.pg_routes[0].active_metadata_proof = Some(PgMetadataProof {
-        applied_log_index: 3,
-        applied_log_hash: 4,
-        state_digest: 5,
-    });
+    renewed.pg_routes[0].active_metadata_proof = Some(PgMetadataProof::current(3, 4, 5));
     assert_ne!(renewed.content_digest(), expected);
     renewed.pg_routes[0].active_metadata_proof = snapshot.pg_routes[0].active_metadata_proof;
 
@@ -9197,11 +9067,7 @@ fn runtime_map_test_snapshot_with_transfer_route(
         route.primary_lease_deadline_ms = None;
         route.peering_metadata_transfer = Some(PgMetadataTransferProof::new(
             source_epoch,
-            PgMetadataProof {
-                applied_log_index: 1,
-                applied_log_hash: 2,
-                state_digest: 3,
-            },
+            PgMetadataProof::current(1, 2, 3),
         ));
         route.peering_metadata_transfer_destination_epoch = Some(destination_epoch);
         route.peering_metadata_transfer_source_route_epoch = Some(source_epoch);
@@ -9275,11 +9141,7 @@ fn metadata_transfer_source_runtime_map_accepts_fresh_current_fence() {
     let expected_current_route = snapshot.pg_routes[0].clone();
     snapshot.pg_routes[0].metadata_read_route = Some(PgMetadataReadRoute::new(
         NodeId::new(1),
-        PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
-        },
+        PgMetadataProof::current(1, 2, 3),
     ));
 
     let source = snapshot

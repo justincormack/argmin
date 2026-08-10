@@ -8,11 +8,17 @@ pub(super) type BucketObjectLockSqlValues = (i64, Option<u8>, Option<i64>, Optio
 pub(super) type ObjectLockSqlValues = (Option<u8>, Option<i64>, u8);
 
 impl PgStore {
+    pub(super) fn serialize_acl_grants(grants: &AclGrants) -> String {
+        s3_types::StoredAclGrants::from_grants(grants)
+            .as_storage_str()
+            .to_owned()
+    }
+
     pub(super) fn parse_object_tags(
         xml: String,
         column: usize,
     ) -> rusqlite::Result<SerializedTagSet> {
-        SerializedTagSet::from_current_xml(xml).map_err(|error| {
+        SerializedTagSet::from_current_storage(xml).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 column,
                 rusqlite::types::Type::Text,
@@ -25,7 +31,7 @@ impl PgStore {
         xml: String,
         column: usize,
     ) -> rusqlite::Result<SerializedBucketTagSet> {
-        SerializedBucketTagSet::from_current_xml(xml).map_err(|error| {
+        SerializedBucketTagSet::from_current_storage(xml).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
                 column,
                 rusqlite::types::Type::Text,
@@ -1041,7 +1047,7 @@ impl PgStore {
             }
             (BucketSubresourceKind::Tagging, BucketSubresourceAux::None) => {
                 BucketSubresourceMutation::PutTagging(
-                    crate::SerializedBucketTagSet::from_current_xml(body.to_owned()).map_err(
+                    crate::SerializedBucketTagSet::from_current_storage(body.to_owned()).map_err(
                         |error| MetadataError::InvariantViolation {
                             context: "put bucket subresource",
                             reason: format!("invalid bucket tags: {error}"),
@@ -1186,13 +1192,15 @@ impl PgStore {
         col_idx: usize,
         field_name: &'static str,
     ) -> Result<AclGrants, rusqlite::Error> {
-        AclGrants::parse_current_storage(&raw).map_err(|msg| {
-            rusqlite::Error::FromSqlConversionFailure(
-                col_idx,
-                rusqlite::types::Type::Text,
-                Box::from(format!("invalid {field_name}: {msg}")),
-            )
-        })
+        s3_types::StoredAclGrants::parse_current(raw)
+            .map(s3_types::StoredAclGrants::into_grants)
+            .map_err(|msg| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    col_idx,
+                    rusqlite::types::Type::Text,
+                    Box::from(format!("invalid {field_name}: {msg}")),
+                )
+            })
     }
 
     /// Parse a u8-backed enum from a row column.

@@ -67,7 +67,7 @@ impl StorageNodeProcessConfig {
     const CONTROL_PLANE_RUNTIME_CONFIG_FILE: &'static str = "control-plane-runtime-config-v1";
     const CONTROL_PLANE_RUNTIME_CONFIG_MAGIC_PREFIX: &'static str =
         "argmin-storage-node-runtime-config-v";
-    const CONTROL_PLANE_RUNTIME_CONFIG_VERSION: u16 = 4;
+    const CONTROL_PLANE_RUNTIME_CONFIG_VERSION: u16 = 5;
 
     pub fn new(parts: StorageNodeProcessConfigParts) -> Result<Self, StorageNodeServerError> {
         let config = Self {
@@ -826,7 +826,7 @@ fn encode_storage_node_routes(out: &mut String, label: &str, routes: &[StorageNo
     out.push_str(&format!("{label} {}\n", routes.len()));
     for route in routes {
         out.push_str(&format!(
-            "{} {} {} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {} {} {} {}",
             route.pg_id,
             route.cluster_epoch.get(),
             pg_state_code(route.state),
@@ -844,11 +844,19 @@ fn encode_storage_node_routes(out: &mut String, label: &str, routes: &[StorageNo
             ),
             route.metadata_read_route.map_or_else(
                 || "-".to_owned(),
-                |read| read.proof().applied_log_hash.to_string()
+                |read| read.proof().applied_log_hash.encoding_version().to_string()
             ),
             route.metadata_read_route.map_or_else(
                 || "-".to_owned(),
-                |read| read.proof().state_digest.to_string()
+                |read| read.proof().applied_log_hash.value().to_string()
+            ),
+            route.metadata_read_route.map_or_else(
+                || "-".to_owned(),
+                |read| read.proof().state_digest.encoding_version().to_string()
+            ),
+            route.metadata_read_route.map_or_else(
+                || "-".to_owned(),
+                |read| read.proof().state_digest.value().to_string()
             ),
             route.acting_set.len()
         ));
@@ -984,7 +992,11 @@ fn decode_storage_node_routes<'a>(
             next_runtime_config_field(path, &mut fields, &too_few)?;
         let metadata_read_node_id = next_runtime_config_field(path, &mut fields, &too_few)?;
         let metadata_read_log_index = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let metadata_read_log_hash_version =
+            next_runtime_config_field(path, &mut fields, &too_few)?;
         let metadata_read_log_hash = next_runtime_config_field(path, &mut fields, &too_few)?;
+        let metadata_read_state_digest_version =
+            next_runtime_config_field(path, &mut fields, &too_few)?;
         let metadata_read_state_digest = next_runtime_config_field(path, &mut fields, &too_few)?;
         let acting_len = next_runtime_config_field(path, &mut fields, &too_few)?;
         let acting_len = parse_usize_field(path, acting_len, "acting set length")?;
@@ -1026,17 +1038,32 @@ fn decode_storage_node_routes<'a>(
             metadata_read_route: match (
                 metadata_read_node_id,
                 metadata_read_log_index,
+                metadata_read_log_hash_version,
                 metadata_read_log_hash,
+                metadata_read_state_digest_version,
                 metadata_read_state_digest,
             ) {
-                ("-", "-", "-", "-") => None,
-                ("-", _, _, _) | (_, "-", _, _) | (_, _, "-", _) | (_, _, _, "-") => {
+                ("-", "-", "-", "-", "-", "-") => None,
+                fields if fields.0 == "-"
+                    || fields.1 == "-"
+                    || fields.2 == "-"
+                    || fields.3 == "-"
+                    || fields.4 == "-"
+                    || fields.5 == "-" =>
+                {
                     return Err(runtime_config_invalid(
                         path,
                         format!("{label} route has an incomplete metadata read route"),
                     ));
                 }
-                (node_id, log_index, log_hash, state_digest) => Some(PgMetadataReadRoute::new(
+                (
+                    node_id,
+                    log_index,
+                    log_hash_version,
+                    log_hash,
+                    state_digest_version,
+                    state_digest,
+                ) => Some(PgMetadataReadRoute::new(
                     NodeId::new(parse_u32_field(path, node_id, "metadata read node")?),
                     crate::control_plane::PgMetadataProof {
                         applied_log_index: parse_u64_field(
@@ -1044,16 +1071,16 @@ fn decode_storage_node_routes<'a>(
                             log_index,
                             "metadata read log index",
                         )?,
-                        applied_log_hash: parse_u64_field(
-                            path,
-                            log_hash,
-                            "metadata read log hash",
-                        )?,
-                        state_digest: parse_u64_field(
-                            path,
-                            state_digest,
-                            "metadata read state digest",
-                        )?,
+                        applied_log_hash: crate::control_plane::MetadataCommandLogHash::from_encoded_parts(
+                            parse_u8_field(path, log_hash_version, "metadata read log hash version")?,
+                            parse_u64_field(path, log_hash, "metadata read log hash")?,
+                        )
+                        .map_err(|error| runtime_config_invalid(path, error.to_string()))?,
+                        state_digest: crate::control_plane::CanonicalStateDigest::from_encoded_parts(
+                            parse_u8_field(path, state_digest_version, "metadata read state digest version")?,
+                            parse_u64_field(path, state_digest, "metadata read state digest")?,
+                        )
+                        .map_err(|error| runtime_config_invalid(path, error.to_string()))?,
                     },
                 )),
             },

@@ -220,6 +220,22 @@ fn control_plane_rpc_server_pre_auth_budget_rejects_before_payload_read() {
 }
 
 #[test]
+fn control_plane_rpc_v14_frame_encoding_is_exact() {
+    let frame =
+        encode_control_plane_rpc_frame(ControlPlaneRpcKind::RuntimeMapStatus, &[0x01, 0x02, 0x03])
+            .unwrap();
+
+    assert_eq!(
+        frame,
+        [
+            97, 114, 103, 109, 105, 110, 45, 99, 111, 110, 116, 114, 111, 108, 45, 112, 108, 97,
+            110, 101, 45, 114, 112, 99, 0, 14, 0, 12, 0, 0, 0, 3, 75, 136, 143, 73, 152, 40, 182,
+            151, 1, 2, 3,
+        ]
+    );
+}
+
+#[test]
 fn control_plane_rpc_server_response_errors_use_bounded_categories() {
     let classify = |kind| {
         control_plane_rpc_response_write_error_kind(&ControlPlaneError::io(
@@ -1201,14 +1217,24 @@ fn canonical_snapshot_with_node() -> ClusterControlSnapshot {
 }
 
 #[test]
+fn runtime_map_current_state_digest_v3_is_stable() {
+    let control_snapshot = canonical_snapshot_with_node();
+    let runtime_map = rpc::runtime_map_test_snapshot_with_active_route();
+
+    assert_eq!(
+        runtime_map_current_state_digest(&control_snapshot, runtime_map.pg_routes()).as_bytes(),
+        [
+            115, 66, 203, 234, 194, 85, 22, 244, 172, 73, 200, 107, 65, 138, 49, 98, 196, 61, 209,
+            119, 184, 25, 153, 248, 201, 136, 48, 77, 224, 251, 175, 144,
+        ]
+    );
+}
+
+#[test]
 fn volatile_lease_promotion_makes_acting_set_fence_durable() {
     let authority = LeaseHorizonAuthorityBinding::new(7, Some(11));
     let pg_id = PgId::new(9);
-    let proof = PgMetadataProof {
-        applied_log_index: 1,
-        applied_log_hash: 2,
-        state_digest: 3,
-    };
+    let proof = PgMetadataProof::current(1, 2, 3);
     let mut durable = canonical_snapshot_with_node();
     durable.lease_grant_horizon = Some(CommittedLeaseGrantHorizon::from_parts(authority, 900));
     durable.nodes.insert(
@@ -1362,6 +1388,22 @@ fn parse_snapshot_round_trips_canonical_snapshot_bytes() {
 
     assert_eq!(parsed, snapshot);
     assert_eq!(format_snapshot(&parsed), contents);
+}
+
+#[test]
+fn canonical_control_plane_state_v28_text_is_exact() {
+    assert_eq!(
+        format_snapshot(&canonical_snapshot_with_node()),
+        concat!(
+            "version=28\n",
+            "authority_incarnation=1\n",
+            "cluster_epoch=1\n",
+            "initial_topology=-\n",
+            "max_committed_timestamp_ms=123\n",
+            "lease_grant_horizon=-\n",
+            "node=1,active,1,healthy,11,1,100,200,6e6f64652d312e736f636b\n",
+        )
+    );
 }
 
 #[test]
@@ -2057,11 +2099,11 @@ fn logged_delete_finalized_bucket_command(
 
 fn pg_metadata_proof_from_store(store: &PgStore) -> PgMetadataProof {
     let state = store.metadata_command_replica_state().unwrap();
-    PgMetadataProof {
-        applied_log_index: state.applied_log_index,
-        applied_log_hash: state.applied_log_hash,
-        state_digest: state.state_digest,
-    }
+    PgMetadataProof::current(
+        state.applied_log_index,
+        state.applied_log_hash,
+        state.state_digest,
+    )
 }
 
 fn placed_segment_shard_repair_work_item_for_runtime_refresh(
@@ -2420,11 +2462,11 @@ fn heartbeat_model_pg_id() -> PgId {
 }
 
 fn heartbeat_model_proof(seed: u8) -> PgMetadataProof {
-    PgMetadataProof {
-        applied_log_index: u64::from(seed) + 1,
-        applied_log_hash: 0x1000 + u64::from(seed),
-        state_digest: 0x2000 + u64::from(seed),
-    }
+    PgMetadataProof::current(
+        u64::from(seed) + 1,
+        0x1000 + u64::from(seed),
+        0x2000 + u64::from(seed),
+    )
 }
 
 fn test_pending_metadata_command(cluster_epoch: ClusterEpoch) -> PendingMetadataCommandObservation {
@@ -3650,56 +3692,32 @@ proptest! {
 
 #[test]
 fn active_metadata_proof_floor_accepts_only_same_or_later_progress() {
-    let active_floor = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let active_floor = PgMetadataProof::current(42, 0xabc, 0xdef);
     assert!(metadata_proof_satisfies_active_floor(
         active_floor,
         active_floor
     ));
     assert!(metadata_proof_satisfies_active_floor(
         active_floor,
-        PgMetadataProof {
-            applied_log_index: 43,
-            applied_log_hash: 0xabd,
-            state_digest: 0xdf0,
-        },
+        PgMetadataProof::current(43, 0xabd, 0xdf0),
     ));
     assert!(!metadata_proof_satisfies_active_floor(
         active_floor,
-        PgMetadataProof {
-            applied_log_index: 41,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdef,
-        },
+        PgMetadataProof::current(41, 0xabc, 0xdef),
     ));
     assert!(!metadata_proof_satisfies_active_floor(
         active_floor,
-        PgMetadataProof {
-            applied_log_index: 42,
-            applied_log_hash: 0xabd,
-            state_digest: 0xdef,
-        },
+        PgMetadataProof::current(42, 0xabd, 0xdef),
     ));
     assert!(!metadata_proof_satisfies_active_floor(
         active_floor,
-        PgMetadataProof {
-            applied_log_index: 42,
-            applied_log_hash: 0xabc,
-            state_digest: 0xdf0,
-        },
+        PgMetadataProof::current(42, 0xabc, 0xdf0),
     ));
 }
 
 #[test]
 fn active_metadata_observation_rejects_epoch_local_progress_after_activation() {
-    let imported_activation_floor = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let imported_activation_floor = PgMetadataProof::current(42, 0xabc, 0xdef);
 
     assert!(metadata_proof_satisfies_active_observation_floor(
         imported_activation_floor,
@@ -3707,123 +3725,71 @@ fn active_metadata_observation_rejects_epoch_local_progress_after_activation() {
     ));
     assert!(metadata_proof_satisfies_active_observation_floor(
         imported_activation_floor,
-        PgMetadataProof {
-            applied_log_index: 43,
-            applied_log_hash: 0xabd,
-            state_digest: 0xdf0,
-        },
+        PgMetadataProof::current(43, 0xabd, 0xdf0),
     ));
     assert!(!metadata_proof_satisfies_active_observation_floor(
         imported_activation_floor,
-        PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 0x123,
-            state_digest: 0x456,
-        },
+        PgMetadataProof::current(1, 0x123, 0x456),
     ));
     assert!(!metadata_proof_satisfies_active_observation_floor(
         imported_activation_floor,
-        PgMetadataProof {
-            applied_log_index: 42,
-            applied_log_hash: 0xabd,
-            state_digest: 0xdf0,
-        },
+        PgMetadataProof::current(42, 0xabd, 0xdf0),
     ));
     assert!(!metadata_proof_satisfies_active_observation_floor(
         imported_activation_floor,
-        PgMetadataProof {
-            applied_log_index: 41,
-            applied_log_hash: 0,
-            state_digest: 0x456,
-        },
+        PgMetadataProof::current(41, 0, 0x456),
     ));
     assert!(!metadata_proof_satisfies_active_observation_floor(
         imported_activation_floor,
-        PgMetadataProof {
-            applied_log_index: 41,
-            applied_log_hash: 0x123,
-            state_digest: 0xdef,
-        },
+        PgMetadataProof::current(41, 0x123, 0xdef),
     ));
 }
 
 #[test]
 fn imported_transfer_local_progress_floor_requires_new_log_hash_and_digest() {
-    let imported_activation_floor = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let imported_activation_floor = PgMetadataProof::current(42, 0xabc, 0xdef);
 
     assert!(
         metadata_proof_satisfies_imported_transfer_local_progress_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 1,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
+            PgMetadataProof::current(1, 0x123, 0x456),
         )
     );
     assert!(
         metadata_proof_satisfies_imported_transfer_local_progress_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 42,
-                applied_log_hash: 0x123,
-                state_digest: 0x456,
-            },
+            PgMetadataProof::current(42, 0x123, 0x456),
         )
     );
     assert!(
         !metadata_proof_satisfies_imported_transfer_local_progress_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 42,
-                applied_log_hash: 0xabc,
-                state_digest: 0xdf0,
-            },
+            PgMetadataProof::current(42, 0xabc, 0xdf0),
         )
     );
     assert!(
         !metadata_proof_satisfies_imported_transfer_local_progress_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 41,
-                applied_log_hash: 0,
-                state_digest: 0x456,
-            },
+            PgMetadataProof::current(41, 0, 0x456),
         )
     );
     assert!(
         !metadata_proof_satisfies_imported_transfer_local_progress_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 41,
-                applied_log_hash: 0x123,
-                state_digest: 0xdef,
-            },
+            PgMetadataProof::current(41, 0x123, 0xdef),
         )
     );
     assert!(
         !metadata_proof_satisfies_imported_transfer_local_progress_floor(
             imported_activation_floor,
-            PgMetadataProof {
-                applied_log_index: 42,
-                applied_log_hash: 0x123,
-                state_digest: 0xdef,
-            },
+            PgMetadataProof::current(42, 0x123, 0xdef),
         )
     );
 }
 
 #[test]
 fn active_primary_observation_floor_scopes_epoch_local_progress() {
-    let imported_activation_floor = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let imported_activation_floor = PgMetadataProof::current(42, 0xabc, 0xdef);
     let local_epoch_progress = Some(MetadataProofProgressProvenance {
         floor_epoch: ClusterEpoch::new(7).unwrap(),
         kind: MetadataProofProgressKind::LocalEpoch,
@@ -3833,26 +3799,10 @@ fn active_primary_observation_floor_scopes_epoch_local_progress() {
         kind: MetadataProofProgressKind::ImportedTransfer,
     });
 
-    let lower_epoch_local_proof = PgMetadataProof {
-        applied_log_index: 1,
-        applied_log_hash: 0x123,
-        state_digest: 0x456,
-    };
-    let same_index_epoch_local_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0x123,
-        state_digest: 0x456,
-    };
-    let same_log_digest_only_proof = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdf0,
-    };
-    let malformed_epoch_local_proof = PgMetadataProof {
-        applied_log_index: 41,
-        applied_log_hash: 0,
-        state_digest: 0x456,
-    };
+    let lower_epoch_local_proof = PgMetadataProof::current(1, 0x123, 0x456);
+    let same_index_epoch_local_proof = PgMetadataProof::current(42, 0x123, 0x456);
+    let same_log_digest_only_proof = PgMetadataProof::current(42, 0xabc, 0xdf0);
+    let malformed_epoch_local_proof = PgMetadataProof::current(41, 0, 0x456);
 
     assert!(!metadata_proof_satisfies_active_primary_observation_floor(
         imported_activation_floor,
@@ -3918,26 +3868,10 @@ fn active_primary_observation_floor_scopes_epoch_local_progress() {
 
 #[test]
 fn active_primary_observation_floor_rejects_same_epoch_digest_only_progress() {
-    let active_floor = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
-    let digest_only_progress = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdf0,
-    };
-    let divergent_log_hash = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabd,
-        state_digest: 0xdf0,
-    };
-    let zero_hash_digest_only_progress = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0,
-        state_digest: 0xdf0,
-    };
+    let active_floor = PgMetadataProof::current(42, 0xabc, 0xdef);
+    let digest_only_progress = PgMetadataProof::current(42, 0xabc, 0xdf0);
+    let divergent_log_hash = PgMetadataProof::current(42, 0xabd, 0xdf0);
+    let zero_hash_digest_only_progress = PgMetadataProof::current(42, 0, 0xdf0);
 
     assert!(!metadata_proof_satisfies_active_primary_observation_floor(
         active_floor,
@@ -3964,11 +3898,7 @@ fn active_primary_observation_floor_rejects_same_epoch_digest_only_progress() {
         ClusterEpoch::new(7).unwrap(),
     ));
     assert!(!metadata_proof_satisfies_active_primary_observation_floor(
-        PgMetadataProof {
-            applied_log_index: 42,
-            applied_log_hash: 0,
-            state_digest: 0xdef,
-        },
+        PgMetadataProof::current(42, 0, 0xdef),
         zero_hash_digest_only_progress,
         Some(MetadataProofProgressProvenance {
             floor_epoch: ClusterEpoch::new(7).unwrap(),
@@ -3990,11 +3920,7 @@ fn authoritative_migration_source_does_not_invent_missing_active_proof_epoch() {
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
     let pg_id = PgId::new(22);
-    let active_floor = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
+    let active_floor = PgMetadataProof::current(42, 0xabc, 0xdef);
     authority
         .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
         .unwrap();
@@ -4027,11 +3953,11 @@ fn authoritative_migration_source_does_not_invent_missing_active_proof_epoch() {
         2_020,
     );
 
-    let digest_only_progress = PgMetadataProof {
-        applied_log_index: active_floor.applied_log_index,
-        applied_log_hash: active_floor.applied_log_hash,
-        state_digest: active_floor.state_digest + 1,
-    };
+    let digest_only_progress = PgMetadataProof::current(
+        active_floor.applied_log_index,
+        active_floor.applied_log_hash,
+        active_floor.state_digest + 1,
+    );
     let mut snapshot = authority.snapshot().clone();
     snapshot
         .pgs
@@ -4068,11 +3994,7 @@ fn control_snapshot_invariants_reject_active_pg_with_peering_transfer_state() {
         .unwrap();
     assert!(heartbeat_until_serving(&mut authority, 1, 1_000).serving());
     let pg_id = PgId::new(23);
-    let proof = PgMetadataProof {
-        applied_log_index: 7,
-        applied_log_hash: 8,
-        state_digest: 9,
-    };
+    let proof = PgMetadataProof::current(7, 8, 9);
     authority
         .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
         .unwrap();
@@ -4119,11 +4041,7 @@ fn control_snapshot_invariants_reject_transfer_destination_with_source_fence() {
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
     let pg_id = PgId::new(24);
-    let proof = PgMetadataProof {
-        applied_log_index: 7,
-        applied_log_hash: 8,
-        state_digest: 9,
-    };
+    let proof = PgMetadataProof::current(7, 8, 9);
     authority
         .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
         .unwrap();
@@ -4183,11 +4101,7 @@ fn control_snapshot_invariants_reject_transfer_proof_below_floor() {
         assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
     }
     let pg_id = PgId::new(25);
-    let source_proof = PgMetadataProof {
-        applied_log_index: 7,
-        applied_log_hash: 8,
-        state_digest: 9,
-    };
+    let source_proof = PgMetadataProof::current(7, 8, 9);
     authority
         .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
         .unwrap();
@@ -4218,11 +4132,7 @@ fn control_snapshot_invariants_reject_transfer_proof_below_floor() {
         2_020,
     );
 
-    let imported_proof = PgMetadataProof {
-        applied_log_index: 8,
-        applied_log_hash: 9,
-        state_digest: 10,
-    };
+    let imported_proof = PgMetadataProof::current(8, 9, 10);
     let transfer = PgMetadataTransferProof::new_with_imported_metadata_proof(
         authority.snapshot().cluster_epoch(),
         source_proof,
@@ -4233,11 +4143,7 @@ fn control_snapshot_invariants_reject_transfer_proof_below_floor() {
         .unwrap();
     let mut snapshot = authority.snapshot().clone();
     let pg = snapshot.pgs.get_mut(&pg_id).unwrap();
-    pg.peering_metadata_proof_floor = Some(PgMetadataProof {
-        applied_log_index: 9,
-        applied_log_hash: 10,
-        state_digest: 11,
-    });
+    pg.peering_metadata_proof_floor = Some(PgMetadataProof::current(9, 10, 11));
     let error = snapshot.validate_publication_invariants().unwrap_err();
     assert!(
         error.contains("metadata transfer proof is below the proof floor"),
@@ -4439,16 +4345,8 @@ fn replicated_snapshot_install_validates_control_plane_invariants_before_mutatio
 
 #[test]
 fn peering_proof_floor_rejects_uncommitted_digest_only_progress() {
-    let active_floor = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdef,
-    };
-    let digest_only_progress = PgMetadataProof {
-        applied_log_index: 42,
-        applied_log_hash: 0xabc,
-        state_digest: 0xdf0,
-    };
+    let active_floor = PgMetadataProof::current(42, 0xabc, 0xdef);
+    let digest_only_progress = PgMetadataProof::current(42, 0xabc, 0xdf0);
 
     assert!(matches!(
         validate_peering_metadata_proof_floor(

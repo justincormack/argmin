@@ -1037,11 +1037,11 @@ fn heartbeat_authority_with_pending<S: crate::control_plane::ControlPlaneStore>(
                 pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
                     pg_id,
                     state: pg_state,
-                    metadata_proof: crate::control_plane::PgMetadataProof {
-                        applied_log_index: state.applied_log_index,
-                        applied_log_hash: state.applied_log_hash,
-                        state_digest: state.state_digest,
-                    },
+                    metadata_proof: crate::control_plane::PgMetadataProof::current(
+                        state.applied_log_index,
+                        state.applied_log_hash,
+                        state.state_digest,
+                    ),
                     pending_metadata_command,
                 }],
             },
@@ -2589,11 +2589,11 @@ fn peering_reconstruction_gather_accepts_converged_acting_set() {
         .unwrap()
         .metadata_command_replica_state()
         .unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: state.applied_log_index,
-        applied_log_hash: state.applied_log_hash,
-        state_digest: state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        state.applied_log_index,
+        state.applied_log_hash,
+        state.state_digest,
+    );
 
     let decision = cluster
         .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
@@ -2635,11 +2635,11 @@ fn peering_reconstruction_gather_allows_peering_route_state() {
         .unwrap()
         .metadata_command_replica_state()
         .unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: state.applied_log_index,
-        applied_log_hash: state.applied_log_hash,
-        state_digest: state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        state.applied_log_index,
+        state.applied_log_hash,
+        state.state_digest,
+    );
 
     let decision = cluster
         .reconstruct_pg_peering_from_retained_metadata_log(pg_id, NodeId::new(0))
@@ -2693,11 +2693,11 @@ fn peering_reconstruction_gather_uses_primary_retained_suffix_for_lagging_replic
         .apply_metadata_command_and_record(0, &second)
         .unwrap();
     let primary_state = primary_pg.metadata_command_replica_state().unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: primary_state.applied_log_index,
-        applied_log_hash: primary_state.applied_log_hash,
-        state_digest: primary_state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
     drop(primary_pg);
 
     let decision = cluster
@@ -2858,11 +2858,11 @@ fn peering_replay_catches_up_lagging_replicas_from_primary_retained_entries() {
         .apply_metadata_command_and_record(0, &second)
         .unwrap();
     let primary_state = primary_pg.metadata_command_replica_state().unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: primary_state.applied_log_index,
-        applied_log_hash: primary_state.applied_log_hash,
-        state_digest: primary_state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
     drop(primary_pg);
 
     let decision = cluster
@@ -2949,11 +2949,11 @@ fn peering_replay_catches_up_replicas_with_different_lag_distances() {
         .unwrap()
         .metadata_command_replica_state()
         .unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: primary_state.applied_log_index,
-        applied_log_hash: primary_state.applied_log_hash,
-        state_digest: primary_state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
 
     let decision = cluster
         .replay_pg_peering_catchup_from_retained_metadata_log(pg_id, NodeId::new(0))
@@ -3020,11 +3020,11 @@ fn metadata_transfer_export_packages_authoritative_retained_log() {
     assert_eq!(artifact.cluster_epoch, ClusterEpoch::INITIAL);
     assert_eq!(
         artifact.proof,
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: source_state.applied_log_index,
-            applied_log_hash: source_state.applied_log_hash,
-            state_digest: source_state.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest
+        )
     );
     assert_eq!(artifact.retained_log_entries.len(), 2);
     assert_eq!(artifact.retained_log_entries[0].log_index, 1);
@@ -3276,12 +3276,14 @@ fn metadata_transfer_export_packages_retained_suffix_with_base_proof() {
     );
     assert_eq!(artifact.base_proof.applied_log_index, 1);
     assert_eq!(
-        artifact.base_proof.applied_log_hash,
+        artifact.base_proof.applied_log_hash.value(),
         artifact.retained_log_entries[0].previous_log_hash
     );
     assert_eq!(
-        Some(artifact.base_proof.state_digest),
-        artifact.retained_log_entries[0].pre_state_digest
+        Some(artifact.base_proof.state_digest.value()),
+        artifact.retained_log_entries[0]
+            .pre_state_digest
+            .map(crate::control_plane::CanonicalStateDigest::value)
     );
     assert_eq!(artifact.retained_log_entries.len(), 1);
     assert_eq!(artifact.retained_log_entries[0].log_index, 2);
@@ -3716,7 +3718,9 @@ fn metadata_transfer_import_rejects_artifact_with_mismatched_final_state_digest(
         .retained_log_entries
         .last_mut()
         .expect("test artifact should contain retained commands")
-        .post_state_digest = Some(artifact.proof.state_digest.wrapping_add(1));
+        .post_state_digest = Some(crate::control_plane::CanonicalStateDigest::for_test(
+        artifact.proof.state_digest.value().wrapping_add(1),
+    ));
 
     let destination_epoch = ClusterEpoch::new(2).unwrap();
     let map_mut = Arc::get_mut(&mut map).unwrap();
@@ -4033,11 +4037,11 @@ fn metadata_transfer_import_replays_retained_suffix_over_exact_source_base_proof
         .export_pg_metadata_transfer_from_retained_log(pg_id, NodeId::new(0))
         .unwrap();
     artifact.base_kind = crate::peering::PgMetadataTransferBaseKind::RetainedLogPrefix;
-    artifact.base_proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: base_state.applied_log_index,
-        applied_log_hash: base_state.applied_log_hash,
-        state_digest: base_state.state_digest,
-    };
+    artifact.base_proof = crate::control_plane::PgMetadataProof::current(
+        base_state.applied_log_index,
+        base_state.applied_log_hash,
+        base_state.state_digest,
+    );
     artifact
         .retained_log_entries
         .retain(|entry| entry.log_index > base_state.applied_log_index);
@@ -4283,11 +4287,11 @@ fn metadata_transfer_import_replays_retained_suffix_over_checkpoint_base() {
     let checkpoint = source_pg
         .metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
         .unwrap();
-    let checkpoint_proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: checkpoint.applied_log_index,
-        applied_log_hash: checkpoint.applied_log_hash,
-        state_digest: checkpoint.state_digest,
-    };
+    let checkpoint_proof = crate::control_plane::PgMetadataProof::current(
+        checkpoint.applied_log_index,
+        checkpoint.applied_log_hash,
+        checkpoint.state_digest,
+    );
     source_pg
         .apply_metadata_command_and_record(0, &second)
         .unwrap();
@@ -4737,11 +4741,11 @@ fn metadata_transfer_live_export_falls_back_to_checkpoint_without_retained_state
     assert_eq!(checkpoint.applied_log_index, 1);
     assert_eq!(
         artifact.source_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: checkpoint.applied_log_index,
-            applied_log_hash: checkpoint.applied_log_hash,
-            state_digest: checkpoint.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
     );
 }
 
@@ -4809,11 +4813,11 @@ fn metadata_transfer_live_checkpoint_fallback_preserves_source_epoch_under_fence
     assert_eq!(artifact.cluster_epoch, source_state.cluster_epoch);
     assert_eq!(
         artifact.source_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: source_state.applied_log_index,
-            applied_log_hash: source_state.applied_log_hash,
-            state_digest: source_state.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest
+        )
     );
 }
 
@@ -4891,21 +4895,21 @@ fn metadata_transfer_live_export_prefers_checkpoint_suffix_candidate() {
     assert_eq!(artifact.cluster_epoch, checkpoint.cluster_epoch);
     assert_eq!(
         artifact.source_base_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: checkpoint.applied_log_index,
-            applied_log_hash: checkpoint.applied_log_hash,
-            state_digest: checkpoint.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
     );
     assert_eq!(artifact.retained_log_entries.len(), 1);
     assert_eq!(artifact.retained_log_entries[0].log_index, 2);
     assert_eq!(
         artifact.source_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: source_state.applied_log_index,
-            applied_log_hash: source_state.applied_log_hash,
-            state_digest: source_state.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest
+        )
     );
 }
 
@@ -5010,7 +5014,7 @@ proptest! {
         );
         prop_assert_eq!(
             artifact.source_base_metadata_proof(),
-            crate::control_plane::PgMetadataProof { applied_log_index: valid_checkpoint.applied_log_index, applied_log_hash: valid_checkpoint.applied_log_hash, state_digest: valid_checkpoint.state_digest }
+            crate::control_plane::PgMetadataProof::current(valid_checkpoint.applied_log_index, valid_checkpoint.applied_log_hash, valid_checkpoint.state_digest)
         );
         prop_assert_eq!(artifact.retained_log_entries.len(), total_commands - valid_after);
         if let Some(first_retained) = artifact.retained_log_entries.first() {
@@ -5018,7 +5022,7 @@ proptest! {
         }
         prop_assert_eq!(
             artifact.source_metadata_proof(),
-            crate::control_plane::PgMetadataProof { applied_log_index: source_state.applied_log_index, applied_log_hash: source_state.applied_log_hash, state_digest: source_state.state_digest }
+            crate::control_plane::PgMetadataProof::current(source_state.applied_log_index, source_state.applied_log_hash, source_state.state_digest)
         );
     }
 }
@@ -5073,21 +5077,21 @@ fn metadata_transfer_live_export_uses_durable_checkpoint_candidate() {
     );
     assert_eq!(
         artifact.source_base_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: checkpoint.applied_log_index,
-            applied_log_hash: checkpoint.applied_log_hash,
-            state_digest: checkpoint.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
     );
     assert_eq!(artifact.retained_log_entries.len(), 1);
     assert_eq!(artifact.retained_log_entries[0].log_index, 2);
     assert_eq!(
         artifact.source_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: source_state.applied_log_index,
-            applied_log_hash: source_state.applied_log_hash,
-            state_digest: source_state.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest
+        )
     );
 }
 
@@ -5155,20 +5159,20 @@ fn metadata_transfer_live_export_uses_checkpoint_candidate_after_compaction() {
     );
     assert_eq!(
         artifact.source_base_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: checkpoint.applied_log_index,
-            applied_log_hash: checkpoint.applied_log_hash,
-            state_digest: checkpoint.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
     );
     assert!(artifact.retained_log_entries.is_empty());
     assert_eq!(
         artifact.source_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: source_state.applied_log_index,
-            applied_log_hash: source_state.applied_log_hash,
-            state_digest: source_state.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest
+        )
     );
 }
 
@@ -5236,21 +5240,21 @@ fn metadata_transfer_live_export_uses_checkpoint_when_retained_log_has_compacted
     );
     assert_eq!(
         artifact.source_base_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: checkpoint.applied_log_index,
-            applied_log_hash: checkpoint.applied_log_hash,
-            state_digest: checkpoint.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
     );
     assert_eq!(artifact.retained_log_entries.len(), 1);
     assert_eq!(artifact.retained_log_entries[0].log_index, 2);
     assert_eq!(
         artifact.source_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: source_state.applied_log_index,
-            applied_log_hash: source_state.applied_log_hash,
-            state_digest: source_state.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            source_state.applied_log_index,
+            source_state.applied_log_hash,
+            source_state.state_digest
+        )
     );
 }
 
@@ -5561,11 +5565,11 @@ fn metadata_transfer_live_export_falls_back_to_checkpoint_for_abandoned_retained
     assert_eq!(checkpoint.pg_id, pg_id);
     assert_eq!(
         artifact.source_metadata_proof(),
-        crate::control_plane::PgMetadataProof {
-            applied_log_index: checkpoint.applied_log_index,
-            applied_log_hash: checkpoint.applied_log_hash,
-            state_digest: checkpoint.state_digest
-        }
+        crate::control_plane::PgMetadataProof::current(
+            checkpoint.applied_log_index,
+            checkpoint.applied_log_hash,
+            checkpoint.state_digest
+        )
     );
 }
 
@@ -5576,17 +5580,9 @@ fn metadata_transfer_import_rejects_checkpoint_base_without_payload() {
         source_node_id: NodeId::new(0),
         cluster_epoch: ClusterEpoch::INITIAL,
         base_kind: crate::peering::PgMetadataTransferBaseKind::Checkpoint,
-        base_proof: crate::control_plane::PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
-        },
+        base_proof: crate::control_plane::PgMetadataProof::current(1, 2, 3),
         checkpoint_base: None,
-        proof: crate::control_plane::PgMetadataProof {
-            applied_log_index: 1,
-            applied_log_hash: 2,
-            state_digest: 3,
-        },
+        proof: crate::control_plane::PgMetadataProof::current(1, 2, 3),
         retained_log_entries: Vec::new(),
     };
 
@@ -5929,7 +5925,7 @@ fn metadata_transfer_import_bootstraps_matching_old_base_before_suffix_replay() 
             node_id.as_u32(),
             source_epoch,
             0,
-            0,
+            crate::control_plane::MetadataCommandLogHash::genesis(),
             base.state_digest,
         )
         .unwrap();
@@ -6233,11 +6229,11 @@ fn peering_replay_retries_after_partial_replica_catchup() {
         .unwrap()
         .metadata_command_replica_state()
         .unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: primary_state.applied_log_index,
-        applied_log_hash: primary_state.applied_log_hash,
-        state_digest: primary_state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
 
     let decision = cluster
         .replay_pg_peering_catchup_from_retained_metadata_log(pg_id, NodeId::new(0))
@@ -6307,11 +6303,11 @@ fn peering_replay_fetches_primary_retained_entries_across_batches() {
             .unwrap();
     }
     let primary_state = primary_pg.metadata_command_replica_state().unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: primary_state.applied_log_index,
-        applied_log_hash: primary_state.applied_log_hash,
-        state_digest: primary_state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
     drop(primary_pg);
 
     let decision = cluster
@@ -6492,11 +6488,11 @@ fn peering_replay_then_fresh_heartbeats_complete_authority_activation() {
         .apply_metadata_command_and_record(0, &second)
         .unwrap();
     let primary_state = primary_pg.metadata_command_replica_state().unwrap();
-    let proof = crate::control_plane::PgMetadataProof {
-        applied_log_index: primary_state.applied_log_index,
-        applied_log_hash: primary_state.applied_log_hash,
-        state_digest: primary_state.state_digest,
-    };
+    let proof = crate::control_plane::PgMetadataProof::current(
+        primary_state.applied_log_index,
+        primary_state.applied_log_hash,
+        primary_state.state_digest,
+    );
     drop(primary_pg);
 
     let mut authority = crate::control_plane::SingleAuthorityControlPlane::open(
@@ -6594,11 +6590,11 @@ fn heartbeat_authority_with_local_pg_proof<S: crate::control_plane::ControlPlane
         pg_observations: vec![crate::control_plane::NodePgHeartbeatObservation {
             pg_id,
             state: PgState::Peering,
-            metadata_proof: crate::control_plane::PgMetadataProof {
-                applied_log_index: state.applied_log_index,
-                applied_log_hash: state.applied_log_hash,
-                state_digest: state.state_digest,
-            },
+            metadata_proof: crate::control_plane::PgMetadataProof::current(
+                state.applied_log_index,
+                state.applied_log_hash,
+                state.state_digest,
+            ),
             pending_metadata_command: None,
         }],
     };

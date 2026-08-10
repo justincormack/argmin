@@ -507,8 +507,8 @@ pub(super) mod pg_store_facade {
         MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_PG_DURABLE_IDENTITY_BYTES,
     };
     pub(crate) use super::pg_store::{
-        ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
-        METADATA_CANONICAL_STATE_ENCODING_VERSION,
+        MetadataProofStorageIssuer, ScavengerShardFile, ScavengerShardFileScan, ScavengerShardRow,
+        METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION, METADATA_COMMAND_CHECKPOINT_MAGIC,
     };
 }
 

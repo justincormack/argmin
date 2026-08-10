@@ -655,6 +655,23 @@ fail_with_matches \
 tag_codec_leaks=$(
     {
         rg -n --color=never \
+            '\b(StoredTagSet|StoredAclGrants)\b|\.as_storage_str\(' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/s3-types/**' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\.to_xml\(' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
+            'pub[[:space:]]+const[[:space:]]+STORED_(TAG_SET|ACL_GRANTS)_(MAGIC|VERSION)' \
+            crates/s3-types/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
             '\bSerializedTagSet::(as_str|from_current_xml|new|from)\b' \
             . \
             -g 'crates/**/*.rs' \
@@ -685,7 +702,7 @@ tag_codec_leaks=$(
     }
 )
 fail_with_matches \
-    "Canonical object/bucket-tag XML, exact-current decoders, and generic tagging discriminators are private to s3-types/storage; other crates must pass logical or typed tag-set values" \
+    "Durable tag/ACL carriers and canonical tag XML are private to s3-types/storage; other crates must pass logical values and storage must not persist AWS response XML" \
     "$tag_codec_leaks"
 
 acl_codec_leaks=$(
@@ -706,6 +723,117 @@ acl_codec_leaks=$(
 fail_with_matches \
     "Canonical ACL storage strings and exact-current decoding are private to s3-types/storage; other crates must pass logical AclGrants values" \
     "$acl_codec_leaks"
+
+format_carrier_api_leaks=$(
+    awk -f scripts/check-storage-format-carrier-api.awk \
+        crates/s3-types/src/tag.rs \
+        crates/s3-types/src/lib.rs
+)
+fail_with_matches \
+    "Opaque s3-types durable carriers may expose only their reviewed logical constructors, decoders, projections, and storage handoff" \
+    "$format_carrier_api_leaks"
+
+format_carrier_api_fixture=$(
+    awk -f scripts/check-storage-format-carrier-api.awk \
+        scripts/fixtures/storage-format-carriers/violations.rs
+)
+expected_format_carrier_api_fixture='scripts/fixtures/storage-format-carriers/violations.rs:6:public-method:StoredTagSet::raw_bytes
+scripts/fixtures/storage-format-carriers/violations.rs:11:conversion-trait:StoredAclGrants'
+format_carrier_api_fixture_failure=""
+if [[ "$format_carrier_api_fixture" != "$expected_format_carrier_api_fixture" ]]; then
+    format_carrier_api_fixture_failure=$format_carrier_api_fixture
+    if [[ -z "$format_carrier_api_fixture_failure" ]]; then
+        format_carrier_api_fixture_failure="fixture scan returned no matches"
+    fi
+fi
+fail_with_matches \
+    "Durable carrier API scanner must reject multiline inherent-method and conversion-trait bypasses" \
+    "$format_carrier_api_fixture_failure"
+
+metadata_proof_carrier_leaks=$(
+    {
+        rg -n --color=never \
+            'pub[[:space:]]+(struct|enum)[[:space:]]+(MetadataCommandLogHash|CanonicalStateDigest)\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
+            '\bPgMetadataProof::(current|from_carriers|for_test|test_applied_log_index|test_applied_log_hash|test_state_digest)\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            -g '!crates/argmin-s3/src/main_tests.rs' \
+            || true
+        rg -n --color=never \
+            '\b(MetadataCommandLogHash|CanonicalStateDigest)\b' \
+            crates \
+            -g '*.rs' \
+            -g '!crates/storage/**' \
+            || true
+        rg -n --color=never \
+            '\bInto(MetadataCommandLogHash|CanonicalStateDigest)\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            || true
+        rg -n --color=never \
+            '\bMetadataCommandLogHash::from_hash_owner\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            -g '!crates/storage/src/metadata_command.rs' \
+            || true
+        rg -n --color=never \
+            '\b(MetadataCommandLogHash|CanonicalStateDigest)::from_storage\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            -g '!crates/storage/src/pg_store/command_log.rs' \
+            || true
+        rg -n --color=never \
+            '\b(MetadataCommandLogHash|CanonicalStateDigest)::from_encoded_parts\b' \
+            crates/storage/src \
+            -g '*.rs' \
+            -g '!crates/storage/src/control_plane.rs' \
+            -g '!crates/storage/src/control_plane/rpc.rs' \
+            -g '!crates/storage/src/control_plane_command.rs' \
+            -g '!crates/storage/src/control_plane_pg_admin.rs' \
+            -g '!crates/storage/src/pg_store/command_log.rs' \
+            -g '!crates/storage/src/storage_node_server/config.rs' \
+            -g '!crates/storage/src/storage_rpc/metadata_command_codec.rs' \
+            || true
+        awk '
+            function allowed(carrier, method) {
+                if (carrier == "MetadataCommandLogHash") {
+                    return method ~ /^(from_hash_owner|from_storage|genesis|from_encoded_parts|encoding_version|value|for_test)$/
+                }
+                return method ~ /^(from_storage|genesis|from_encoded_parts|encoding_version|value|for_test|wrapping_add)$/
+            }
+            /^impl (MetadataCommandLogHash|CanonicalStateDigest) \{/ {
+                carrier = $2
+                depth = 1
+                next
+            }
+            carrier != "" {
+                if ($0 ~ /pub(\([^)]*\))?[[:space:]]+(const[[:space:]]+)?fn[[:space:]]+/) {
+                    method = $0
+                    sub(/^.*fn[[:space:]]+/, "", method)
+                    sub(/[^A-Za-z0-9_].*$/, "", method)
+                    if (!allowed(carrier, method)) {
+                        print FILENAME ":" FNR ":unexpected-carrier-method:" carrier "::" method
+                    }
+                }
+                line = $0
+                opens = gsub(/\{/, "{", line)
+                closes = gsub(/\}/, "}", line)
+                depth += opens - closes
+                if (depth == 0) {
+                    carrier = ""
+                }
+            }
+        ' crates/storage/src/control_plane.rs
+    }
+)
+fail_with_matches \
+    "Metadata proof carriers are issued only by their hash/digest owners or exact-version decoders; production callers carry typed values and receive only opaque PgMetadataProof capabilities" \
+    "$metadata_proof_carrier_leaks"
 
 route_authority_capability_leaks=$(
     {

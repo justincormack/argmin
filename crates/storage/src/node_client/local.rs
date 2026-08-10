@@ -6078,7 +6078,7 @@ impl MetadataCommandPeeringRoute for LocalMetadataCommandPeeringRoute<'_> {
 
     fn initialize_metadata_transfer_empty_state(
         &self,
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.initialize_metadata_transfer_empty_state(
@@ -6091,8 +6091,8 @@ impl MetadataCommandPeeringRoute for LocalMetadataCommandPeeringRoute<'_> {
     fn initialize_metadata_transfer_matching_state(
         &self,
         applied_log_index: u64,
-        applied_log_hash: u64,
-        expected_state_digest: u64,
+        applied_log_hash: MetadataCommandLogHash,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.initialize_metadata_transfer_matching_state(
@@ -6107,7 +6107,7 @@ impl MetadataCommandPeeringRoute for LocalMetadataCommandPeeringRoute<'_> {
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         commands: &[MetadataTransferCommand],
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         self.validate_transfer_commands(commands)?;
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;

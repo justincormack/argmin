@@ -15,7 +15,7 @@ const INITIALIZING_FILE_NAME: &str = ".argmin-standalone-route.initializing";
 const LOCK_FILE_NAME: &str = ".argmin-standalone-route.lock";
 const IDENTITY_MAGIC: &[u8; 8] = b"ARGSRTID";
 const INITIALIZING_MAGIC: &[u8; 8] = b"ARGSRTIN";
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 const DIGEST_LEN: usize = 32;
 const IDENTITY_LEN: usize = IDENTITY_MAGIC.len() + 2 + DIGEST_LEN + DIGEST_LEN;
 const PRIVATE_FILE_MODE: u32 = 0o600;
@@ -71,7 +71,7 @@ impl StandaloneRouteIdentity {
     #[must_use]
     pub fn combined_with(self, other: Self) -> Self {
         let mut hasher = ChecksumHasher::new(ChecksumAlgorithm::Sha256);
-        hasher.update(b"argmin/standalone-combined-route-identity/v2");
+        hasher.update(b"argmin/standalone-combined-route-identity/v3");
         hasher.update(&self.0);
         hasher.update(&other.0);
         Self(
@@ -927,23 +927,23 @@ mod tests {
         assert_eq!(
             bytes,
             vec![
-                65, 82, 71, 83, 82, 84, 73, 68, 0, 2, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-                7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 88, 85, 185, 143, 36, 139, 121,
-                147, 39, 88, 34, 55, 142, 36, 118, 137, 210, 204, 137, 215, 28, 195, 224, 207, 24,
-                181, 197, 206, 95, 58, 218, 6,
+                65, 82, 71, 83, 82, 84, 73, 68, 0, 3, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+                7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 117, 199, 33, 185, 201, 2, 156,
+                78, 227, 246, 177, 236, 182, 98, 116, 105, 49, 32, 21, 186, 76, 234, 114, 81, 164,
+                108, 29, 171, 38, 178, 239, 78,
             ]
         );
     }
 
     #[test]
-    fn initialization_marker_v2_is_exact() {
+    fn initialization_marker_v3_is_exact() {
         let temp = test_util::tempdir();
         let data_dir = temp.path().join("standalone");
         let preparation = StandaloneRouteIdentityPreparation::acquire(&data_dir).unwrap();
 
         assert_eq!(
             fs::read(data_dir.join(INITIALIZING_FILE_NAME)).unwrap(),
-            vec![65, 82, 71, 83, 82, 84, 73, 78, 0, 2]
+            vec![65, 82, 71, 83, 82, 84, 73, 78, 0, 3]
         );
         drop(preparation);
     }
@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn unsupported_identity_versions_fail_closed_after_valid_checksum() {
-        for version in [1_u16, 3_u16] {
+        for version in [2_u16, 4_u16] {
             let temp = test_util::tempdir();
             let data_dir = temp.path().join(format!("version-{version}"));
             drop(
@@ -1337,7 +1337,7 @@ mod tests {
 
     #[test]
     fn unsupported_initialization_marker_versions_fail_closed() {
-        for version in [1_u16, 3_u16] {
+        for version in [2_u16, 4_u16] {
             let temp = test_util::tempdir();
             let data_dir = temp.path().join(format!("marker-version-{version}"));
             drop(StandaloneRouteIdentityPreparation::acquire(&data_dir).unwrap());
@@ -1418,8 +1418,8 @@ mod tests {
         assert_eq!(
             combined.0,
             [
-                59, 253, 135, 60, 231, 234, 6, 114, 206, 189, 71, 53, 49, 42, 116, 119, 58, 211,
-                198, 113, 201, 123, 178, 95, 244, 180, 252, 14, 31, 196, 73, 144,
+                165, 66, 56, 230, 218, 96, 188, 229, 94, 222, 243, 185, 220, 223, 86, 46, 159, 230,
+                200, 196, 9, 14, 106, 5, 142, 158, 241, 184, 14, 242, 87, 27,
             ]
         );
     }

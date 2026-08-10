@@ -9202,8 +9202,10 @@ fn read_pg_route_snapshots(
 
 fn write_pg_metadata_proof(out: &mut Vec<u8>, proof: PgMetadataProof) {
     write_u64(out, proof.applied_log_index);
-    write_u64(out, proof.applied_log_hash);
-    write_u64(out, proof.state_digest);
+    write_u8(out, proof.applied_log_hash.encoding_version());
+    write_u64(out, proof.applied_log_hash.value());
+    write_u8(out, proof.state_digest.encoding_version());
+    write_u64(out, proof.state_digest.value());
 }
 
 fn write_pending_metadata_command_observation(
@@ -9250,10 +9252,19 @@ fn read_pending_metadata_command_observation(
 fn read_pg_metadata_proof(
     reader: &mut PayloadReader<'_>,
 ) -> Result<PgMetadataProof, ControlPlaneError> {
+    let applied_log_index = reader.read_u64()?;
+    let applied_log_hash = MetadataCommandLogHash::from_encoded_parts(
+        reader.read_u8()?,
+        reader.read_u64()?,
+    )
+    .map_err(|error| ControlPlaneError::rpc_protocol(error.to_string()))?;
+    let state_digest =
+        CanonicalStateDigest::from_encoded_parts(reader.read_u8()?, reader.read_u64()?)
+            .map_err(|error| ControlPlaneError::rpc_protocol(error.to_string()))?;
     Ok(PgMetadataProof {
-        applied_log_index: reader.read_u64()?,
-        applied_log_hash: reader.read_u64()?,
-        state_digest: reader.read_u64()?,
+        applied_log_index,
+        applied_log_hash,
+        state_digest,
     })
 }
 
@@ -9485,23 +9496,38 @@ mod proof_format_baseline_tests {
 
     #[test]
     fn pg_metadata_proof_rpc_encoding_is_stable() {
-        let proof = PgMetadataProof {
-            applied_log_index: 0x0102_0304_0506_0708,
-            applied_log_hash: 0x1112_1314_1516_1718,
-            state_digest: 0x2122_2324_2526_2728,
-        };
+        let proof = PgMetadataProof::current(0x0102_0304_0506_0708, 0x1112_1314_1516_1718, 0x2122_2324_2526_2728);
         let mut bytes = Vec::new();
         write_pg_metadata_proof(&mut bytes, proof);
 
         assert_eq!(
             bytes,
             [
-                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x11, 0x12, 0x13, 0x14,
-                0x15, 0x16, 0x17, 0x18, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28,
+                0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x01, 0x11, 0x12, 0x13,
+                0x14, 0x15, 0x16, 0x17, 0x18, 0x05, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26,
+                0x27, 0x28,
             ]
         );
         let mut reader = PayloadReader::new(&bytes);
         assert_eq!(read_pg_metadata_proof(&mut reader).unwrap(), proof);
         assert_eq!(reader.remaining_len(), 0);
+    }
+
+    #[test]
+    fn pg_metadata_proof_rpc_rejects_each_unsupported_carrier_version() {
+        let proof = PgMetadataProof::current(1, 2, 3);
+        let mut bytes = Vec::new();
+        write_pg_metadata_proof(&mut bytes, proof);
+
+        for (offset, version, expected) in [
+            (8, 2, "unsupported metadata-command log-hash encoding version 2"),
+            (17, 6, "unsupported canonical-state digest encoding version 6"),
+        ] {
+            let mut malformed = bytes.clone();
+            malformed[offset] = version;
+            let error = read_pg_metadata_proof(&mut PayloadReader::new(&malformed)).unwrap_err();
+            assert!(matches!(error, ControlPlaneError::RpcProtocol { .. }));
+            assert!(error.retained_diagnostic_contains(expected));
+        }
     }
 }

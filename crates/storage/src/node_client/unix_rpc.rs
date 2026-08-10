@@ -2600,7 +2600,7 @@ impl UnixStorageNodeClient {
     fn initialize_metadata_transfer_empty_state(
         &self,
         pg_id: PgId,
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let request = StorageRpcMetadataCommandTransferEmptyStateRequest {
             node_id: self.node_id,
@@ -2627,8 +2627,8 @@ impl UnixStorageNodeClient {
         &self,
         pg_id: PgId,
         applied_log_index: u64,
-        applied_log_hash: u64,
-        expected_state_digest: u64,
+        applied_log_hash: MetadataCommandLogHash,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let request = StorageRpcMetadataCommandTransferMatchingStateRequest {
             node_id: self.node_id,
@@ -2657,7 +2657,7 @@ impl UnixStorageNodeClient {
         &self,
         pg_id: PgId,
         commands: &[MetadataTransferCommand],
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let request = StorageRpcMetadataCommandTransferAdoptRequest {
             node_id: self.node_id,
@@ -3591,7 +3591,7 @@ impl MetadataCommandPeeringRoute for UnixMetadataCommandPeeringRoute<'_> {
 
     fn initialize_metadata_transfer_empty_state(
         &self,
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         self.require_current_epoch()?;
         UnixStorageNodeClient::initialize_metadata_transfer_empty_state(
@@ -3604,8 +3604,8 @@ impl MetadataCommandPeeringRoute for UnixMetadataCommandPeeringRoute<'_> {
     fn initialize_metadata_transfer_matching_state(
         &self,
         applied_log_index: u64,
-        applied_log_hash: u64,
-        expected_state_digest: u64,
+        applied_log_hash: MetadataCommandLogHash,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         self.require_current_epoch()?;
         UnixStorageNodeClient::initialize_metadata_transfer_matching_state(
@@ -3620,7 +3620,7 @@ impl MetadataCommandPeeringRoute for UnixMetadataCommandPeeringRoute<'_> {
     fn adopt_metadata_transfer_state_from_rebased_commands(
         &self,
         commands: &[MetadataTransferCommand],
-        expected_state_digest: u64,
+        expected_state_digest: CanonicalStateDigest,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         self.require_current_epoch()?;
         self.validate_transfer_commands(commands)?;
