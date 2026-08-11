@@ -552,6 +552,22 @@ impl Coordinator {
                         // concurrent-operation outcome instead of exposing generic throttling.
                         return Err(ServerError::OperationAborted);
                     }
+                    Err(ServerError::SlowDown)
+                        if stale_snapshot_retry_deadline.is_some_and(|deadline| {
+                            multipart_complete_stale_snapshot_retry_now(
+                                req.upload.bucket_name(),
+                                req.upload.key(),
+                            ) < deadline
+                        }) =>
+                    {
+                        // The operation which invalidated the commit snapshot can still own the
+                        // metadata route while this request begins its fresh pass. Keep the whole
+                        // retry bounded by the original absolute deadline.
+                        continue 'retry_stale_commit_snapshot;
+                    }
+                    Err(ServerError::SlowDown) if stale_snapshot_retry_deadline.is_some() => {
+                        return Err(ServerError::OperationAborted);
+                    }
                     Err(error) => return Err(error),
                 };
             if terminal_reauthorization_only
@@ -941,8 +957,17 @@ impl Coordinator {
             let completion_outcome = match completion_result {
                 Ok(outcome) => outcome,
                 Err(error)
-                    if error.kind() == storage::MultipartCompletionFailureKind::StaleSnapshot =>
+                    if matches!(
+                        error.kind(),
+                        storage::MultipartCompletionFailureKind::StaleSnapshot
+                            | storage::MultipartCompletionFailureKind::MetadataCommandContention
+                    ) =>
                 {
+                    // Both a changed multipart snapshot and commit-time command contention require
+                    // a fresh authorization/snapshot pass. Contention can come from UploadPart,
+                    // not only from another completion. Retry while bounded; once the budget is
+                    // exhausted, terminal authorization distinguishes a completion winner from an
+                    // upload which is still in progress.
                     let deadline = stale_snapshot_retry_deadline.get_or_insert_with(|| {
                         multipart_complete_stale_snapshot_retry_now(bucket.as_str(), key.as_str())
                             + COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET
@@ -989,22 +1014,6 @@ impl Coordinator {
                         key: key.as_str().to_string(),
                         condition,
                     });
-                }
-                Err(error)
-                    if error.kind()
-                        == storage::MultipartCompletionFailureKind::MetadataCommandContention =>
-                {
-                    // Commit-time contention can race a completion which consumes the upload.
-                    // Reauthorize once so a terminal winner resolves as replay/NoSuchUpload;
-                    // ordinary contention against an upload which is still in progress remains
-                    // OperationAborted at the top of the loop.
-                    #[cfg(test)]
-                    maybe_run_multipart_complete_terminal_reauthorization_hook(
-                        bucket.as_str(),
-                        key.as_str(),
-                    );
-                    terminal_reauthorization_only = true;
-                    continue 'retry_stale_commit_snapshot;
                 }
                 Err(error) => {
                     return Err(Coordinator::map_multipart_completion_failure(

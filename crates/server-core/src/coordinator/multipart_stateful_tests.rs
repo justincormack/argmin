@@ -29,6 +29,8 @@ const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0
 const MULTIPART_COMPLETE_RACE_TIMEOUT: Duration = Duration::from_secs(2);
 const MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN: DeterministicFaultToken =
     DeterministicFaultToken::new("multipart-complete-terminal-reauthorization");
+const MULTIPART_COMPLETE_CONTENTION_INJECTION_TOKEN: DeterministicFaultToken =
+    DeterministicFaultToken::new("multipart-complete-contention-injection");
 
 fn test_sse_s3_provider() -> StaticManagedKeyProvider {
     StaticManagedKeyProvider::single(
@@ -414,6 +416,13 @@ struct MultipartCompleteContentionRaceSync {
     _serial_guard: MutexGuard<'static, ()>,
 }
 
+struct MultipartCompleteContentionRetryRaceSync {
+    contention_injection_gate: Arc<DeterministicFaultGate>,
+    contention_injections: Arc<AtomicUsize>,
+    _guard: ReclamationTestHookGuard,
+    _serial_guard: MutexGuard<'static, ()>,
+}
+
 #[derive(Clone)]
 struct MultipartCompleteRetryClock {
     now: Arc<Mutex<Instant>>,
@@ -515,6 +524,8 @@ fn install_multipart_complete_contention_race_hooks(
     let inject_contention_hook = Arc::clone(&inject_contention);
     let contention_injections_hook = Arc::clone(&contention_injections);
     let terminal_reauthorization_gate_hook = Arc::clone(&terminal_reauthorization_gate);
+    let retry_clock_start = Instant::now();
+    let retry_clock_reads = AtomicUsize::new(0);
     let guard = install_reclamation_test_hooks(ReclamationTestHooks {
         target: Some((bucket.to_string(), key.to_string())),
         multipart_complete_commit_failure: Some(Arc::new(move || {
@@ -525,6 +536,13 @@ fn install_multipart_complete_contention_race_hooks(
                     storage::MultipartCompletionFailureKind::MetadataCommandContention
                 })
         })),
+        multipart_complete_stale_snapshot_retry_now: Some(Arc::new(move || {
+            if retry_clock_reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                retry_clock_start
+            } else {
+                retry_clock_start + multipart::COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET
+            }
+        })),
         before_multipart_complete_terminal_reauthorization: Some(Arc::new(move || {
             terminal_reauthorization_gate_hook
                 .wait_at(MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN);
@@ -533,6 +551,40 @@ fn install_multipart_complete_contention_race_hooks(
     });
     MultipartCompleteContentionRaceSync {
         terminal_reauthorization_gate,
+        contention_injections,
+        _guard: guard,
+        _serial_guard: serial,
+    }
+}
+
+fn install_multipart_complete_contention_retry_race_hooks(
+    bucket: &str,
+    key: &str,
+) -> MultipartCompleteContentionRetryRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let contention_injection_gate =
+        DeterministicFaultGate::new(MULTIPART_COMPLETE_CONTENTION_INJECTION_TOKEN);
+    let inject_contention = AtomicBool::new(true);
+    let contention_injections = Arc::new(AtomicUsize::new(0));
+    let contention_injection_gate_hook = Arc::clone(&contention_injection_gate);
+    let contention_injections_hook = Arc::clone(&contention_injections);
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        multipart_complete_commit_failure: Some(Arc::new(move || {
+            inject_contention.swap(false, Ordering::SeqCst).then(|| {
+                contention_injections_hook.fetch_add(1, Ordering::SeqCst);
+                contention_injection_gate_hook
+                    .wait_at(MULTIPART_COMPLETE_CONTENTION_INJECTION_TOKEN);
+                storage::MultipartCompletionFailureKind::MetadataCommandContention
+            })
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    MultipartCompleteContentionRetryRaceSync {
+        contention_injection_gate,
         contention_injections,
         _guard: guard,
         _serial_guard: serial,
@@ -1655,6 +1707,82 @@ fn upload_part_replace_after_complete_snapshot_is_revalidated_before_publish() {
     assert!(
         matches!(err, ServerError::ObjectNotFound { .. }),
         "{invariant}: stale completion must not expose a visible object, got {err:?}"
+    );
+
+    let listed = admin
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert_eq!(listed.parts.len(), 1, "{invariant}");
+    assert_eq!(listed.parts[0].etag, replacement.etag, "{invariant}");
+}
+
+#[test]
+fn upload_part_replace_during_commit_contention_retries_to_invalid_part() {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let completer =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let uploader = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let bucket = "race-complete-part-contention";
+    let key = "race-complete-part-contention-key";
+    let invariant = "commit-time contention racing a changed UploadPart must reload the multipart snapshot and return InvalidPart";
+
+    admin
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, key, &[(1, b"old part")]);
+
+    let sync = install_multipart_complete_contention_retry_race_hooks(bucket, key);
+    let upload_id_for_complete = upload_id.clone();
+    let parts_for_complete = parts.clone();
+    let completion = std::thread::spawn(move || {
+        completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(
+                bucket,
+                key,
+                &upload_id_for_complete,
+                test_requester(),
+            ),
+            parts: &parts_for_complete,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    let _contention_release_guard = sync.contention_injection_gate.release_on_drop();
+    sync.contention_injection_gate
+        .wait_until_arrived(MULTIPART_COMPLETE_RACE_TIMEOUT);
+    let replacement = test_helpers::upload_part(
+        &uploader,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number: 1,
+            data: b"replacement part",
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+    assert_ne!(replacement.etag, parts[0].etag, "{invariant}");
+    sync.contention_injection_gate.release();
+
+    let error = completion.join().unwrap().unwrap_err();
+    assert!(
+        matches!(error, ServerError::InvalidPart { part_number: 1 }),
+        "{invariant}: got {error:?}"
+    );
+    assert_eq!(
+        sync.contention_injections.load(Ordering::SeqCst),
+        1,
+        "{invariant}: the completion must exercise one commit-time contention"
     );
 
     let listed = admin
