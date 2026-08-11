@@ -13,12 +13,14 @@ Run the authenticated static-manifest Raft authority and data-plane soak across
 three real hosts. Each host runs an authority, storage node, and independently
 authenticated frontend. SSH is used only for deployment and process
 supervision; all Argmin traffic uses the configured TLS/TCP endpoints directly.
+Unless explicit binary paths are supplied, the required server and UAT client
+binaries are built locally before any remote setup.
 
 Options:
   --hosts H0,H1,H2       SSH host aliases (or ARGMIN_MULTIHOST_RAFT_HOSTS)
   --addresses A0,A1,A2   Advertised IPv4 addresses (or ARGMIN_MULTIHOST_RAFT_ADDRS)
-  --binary PATH          Deploy an already-built argmin-s3 binary
-  --client-binary PATH   Use an already-built uat_pg_backfill_smoke binary
+  --binary PATH          Deploy a prebuilt argmin-s3 binary; standard target paths build it
+  --client-binary PATH   Use a prebuilt UAT client; standard target paths build it
   --release              Build and deploy target/release/argmin-s3
   --remote-root PATH     Common absolute remote root (default: /home/argmin-test/argmin-soak)
   --ssh-config PATH      Explicit SSH client config (or ARGMIN_MULTIHOST_RAFT_SSH_CONFIG)
@@ -51,6 +53,47 @@ print_command() {
     printf '+'
     printf ' %q' "$@"
     printf '\n'
+}
+
+build_cargo_binary() {
+    local -n output_path="$1"
+    local binary_name="$2"
+    shift 2
+
+    local build_messages
+    build_messages="$(mktemp "${TMPDIR:-/tmp}/argmin-cargo-build.XXXXXX")"
+    print_command "$@" --message-format=json-render-diagnostics
+    if ! "$@" --message-format=json-render-diagnostics >"$build_messages"; then
+        jq --join-output --raw-output \
+            'select(.reason == "compiler-message") | .message.rendered // empty' \
+            "$build_messages" >&2 || true
+        rm -f -- "$build_messages"
+        die "failed to build $binary_name"
+    fi
+
+    jq --join-output --raw-output \
+        'select(.reason == "compiler-message") | .message.rendered // empty' \
+        "$build_messages" >&2
+
+    local -a executable_paths=()
+    mapfile -t executable_paths < <(
+        jq --raw-output --arg binary_name "$binary_name" '
+            select(
+                .reason == "compiler-artifact"
+                and .target.name == $binary_name
+                and (.target.kind | index("bin")) != null
+                and .executable != null
+            )
+            | .executable
+        ' "$build_messages"
+    )
+    rm -f -- "$build_messages"
+
+    ((${#executable_paths[@]} == 1)) ||
+        die "Cargo reported ${#executable_paths[@]} executable artifacts for $binary_name"
+    output_path="${executable_paths[0]}"
+    [[ -x "$output_path" ]] ||
+        die "Cargo-built $binary_name binary is not executable: $output_path"
 }
 
 split_exact_three() {
@@ -261,6 +304,59 @@ for address in "${addresses[@]}"; do
 done
 
 declare -A machine_id_hosts=()
+declare -a server_build=() client_build=()
+
+if [[ -z "$binary" ]]; then
+    server_build=(cargo build -p argmin-s3 --bin argmin-s3)
+    if ((release)); then
+        server_build=(cargo build --release -p argmin-s3 --bin argmin-s3)
+    fi
+elif [[ "$binary" != /* ]]; then
+    binary="$ROOT/$binary"
+fi
+case "$binary" in
+    "$ROOT/target/debug/argmin-s3")
+        server_build=(cargo build -p argmin-s3 --bin argmin-s3)
+        ;;
+    "$ROOT/target/release/argmin-s3")
+        server_build=(cargo build --release -p argmin-s3 --bin argmin-s3)
+        ;;
+esac
+
+if [[ -z "$client_binary" ]]; then
+    client_build=(cargo build -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
+    if ((release)); then
+        client_build=(cargo build --release -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
+    fi
+elif [[ "$client_binary" != /* ]]; then
+    client_binary="$ROOT/$client_binary"
+fi
+case "$client_binary" in
+    "$ROOT/target/debug/uat_pg_backfill_smoke")
+        client_build=(cargo build -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
+        ;;
+    "$ROOT/target/release/uat_pg_backfill_smoke")
+        client_build=(cargo build --release -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
+        ;;
+esac
+
+if ((${#server_build[@]} != 0 || ${#client_build[@]} != 0)); then
+    command -v cargo >/dev/null 2>&1 || die "cargo is required to build the UAT binaries"
+    command -v jq >/dev/null 2>&1 || die "jq is required to locate Cargo-built UAT binaries"
+fi
+command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the test PKI"
+command -v scp >/dev/null 2>&1 || die "scp is required"
+
+if ((${#server_build[@]} != 0)); then
+    build_cargo_binary binary argmin-s3 "${server_build[@]}"
+fi
+[[ -x "$binary" ]] || die "argmin-s3 binary is not executable: $binary"
+
+if ((${#client_build[@]} != 0)); then
+    build_cargo_binary client_binary uat_pg_backfill_smoke "${client_build[@]}"
+fi
+[[ -x "$client_binary" ]] || die "S3 UAT client binary is not executable: $client_binary"
+
 for host in "${hosts[@]}"; do
     if ! machine_id="$(remote_exec_quiet "$host" cat /etc/machine-id)"; then
         die "could not read /etc/machine-id from $host"
@@ -274,41 +370,6 @@ for host in "${hosts[@]}"; do
     fi
     machine_id_hosts["$machine_id"]="$host"
 done
-
-profile_dir="debug"
-if ((release)); then
-    profile_dir="release"
-fi
-
-if [[ -z "$binary" ]]; then
-    if ((release)); then
-        print_command cargo build --release -p argmin-s3 --bin argmin-s3
-        cargo build --release -p argmin-s3 --bin argmin-s3
-        binary="$ROOT/target/release/argmin-s3"
-    else
-        print_command cargo build -p argmin-s3 --bin argmin-s3
-        cargo build -p argmin-s3 --bin argmin-s3
-        binary="$ROOT/target/debug/argmin-s3"
-    fi
-elif [[ "$binary" != /* ]]; then
-    binary="$ROOT/$binary"
-fi
-[[ -x "$binary" ]] || die "argmin-s3 binary is not executable: $binary"
-
-if [[ -z "$client_binary" ]]; then
-    client_build=(cargo build -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
-    if ((release)); then
-        client_build=(cargo build --release -p s3-tests --features uat-pg-topology --bin uat_pg_backfill_smoke)
-    fi
-    print_command "${client_build[@]}"
-    "${client_build[@]}"
-    client_binary="$ROOT/target/$profile_dir/uat_pg_backfill_smoke"
-elif [[ "$client_binary" != /* ]]; then
-    client_binary="$ROOT/$client_binary"
-fi
-[[ -x "$client_binary" ]] || die "S3 UAT client binary is not executable: $client_binary"
-command -v openssl >/dev/null 2>&1 || die "openssl is required to generate the test PKI"
-command -v scp >/dev/null 2>&1 || die "scp is required"
 
 run_id="$(date -u +%Y%m%dT%H%M%SZ)-$$-$RANDOM"
 run_name="argmin-multihost-raft-$run_id"

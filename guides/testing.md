@@ -201,6 +201,12 @@ addresses. Each alias must support noninteractive SSH, identify a distinct
 machine through `/etc/machine-id`, provide `systemd-run --user`, and allow the
 selected five-port range between all hosts. The test generates a private test
 PKI and scoped credentials for each run; it does not use operator credentials.
+By default the harness builds `argmin-s3` and `uat_pg_backfill_smoke` locally
+before contacting the remote hosts, and deploys the exact executable artifacts
+reported by Cargo. `--binary` and `--client-binary` remain available when an
+explicit prebuilt executable is required. Supplying their conventional
+`target/debug` or `target/release` paths selects and builds that profile rather
+than requiring the artifact to exist already.
 
 The default profile uses 116 PGs, 256 retained route-epoch advances, eight
 one-MiB persistent objects, and three leader-loss/restart cycles:
