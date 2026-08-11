@@ -8372,6 +8372,106 @@ fn reserve_object_version_abandons_stale_pending_reservation_and_retries() {
 }
 
 #[test]
+fn reserve_object_version_retries_pending_allocator_recovery_contention() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(object_pg);
+    let pending = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let apply_attempts = Arc::new(AtomicUsize::new(0));
+    let apply_attempts_for_hook = Arc::clone(&apply_attempts);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |_command| {
+            if apply_attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected pre-witness pending allocator recovery race",
+                });
+            }
+            Ok(())
+        }));
+
+    let reserved = cluster
+        .reserve_next_object_version(pg_id, &bucket, &key)
+        .expect("a partial allocator conflict should retry from the current pending slot");
+    assert_eq!(reserved, crate::VersionId::from_u64(2));
+    assert!(apply_attempts.load(Ordering::SeqCst) >= 3);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 3);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
+fn reserve_object_version_retries_fresh_allocator_apply_contention() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(object_pg);
+    let _serial = lock_metadata_command_apply_hook_test();
+    let apply_attempts = Arc::new(AtomicUsize::new(0));
+    let apply_attempts_for_hook = Arc::clone(&apply_attempts);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |_command| {
+            if apply_attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected pre-witness fresh allocator apply race",
+                });
+            }
+            Ok(())
+        }));
+
+    let reserved = cluster
+        .reserve_next_object_version(pg_id, &bucket, &key)
+        .expect("fresh allocator apply contention should converge from the pending slot");
+    assert_eq!(reserved, crate::VersionId::from_u64(2));
+    assert!(apply_attempts.load(Ordering::SeqCst) >= 3);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 3);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
 fn reserve_object_version_clears_fully_applied_pending_then_allocates_fresh_version() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

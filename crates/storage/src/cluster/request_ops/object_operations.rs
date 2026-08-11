@@ -409,13 +409,46 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
-        let mut command = command.clone();
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
             None,
         )
         .for_operation("new_object_metadata_command_apply")
         .for_pg(pg_id);
+        self.apply_new_object_metadata_command_for_bucket_inner(
+            pg_id,
+            bucket,
+            command,
+            &mut work_budget,
+            false,
+        )
+    }
+
+    pub(super) fn apply_new_object_metadata_command_for_bucket_allocator(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        self.apply_new_object_metadata_command_for_bucket_inner(
+            pg_id,
+            bucket,
+            command,
+            work_budget,
+            true,
+        )
+    }
+
+    fn apply_new_object_metadata_command_for_bucket_inner(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+        return_metadata_command_contention: bool,
+    ) -> Result<(), ObjectPgActionError> {
+        let mut command = command.clone();
         loop {
             work_budget.check("object metadata command apply retry budget exhausted")?;
             match self.apply_metadata_command_to_acting_set(&command) {
@@ -431,7 +464,7 @@ impl super::StorageCluster {
                                 pg_id,
                                 command.bucket_name(),
                                 &command,
-                                &mut work_budget,
+                                work_budget,
                             )
                             .map_err(ObjectPgActionError::from)?;
                         }
@@ -449,6 +482,14 @@ impl super::StorageCluster {
                         progress,
                         source,
                     } = error;
+                    if progress.is_abortable()
+                        && return_metadata_command_contention
+                        && metadata_command_apply_error_is_contention(&source)
+                    {
+                        return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                            source,
+                        ));
+                    }
                     if progress.is_abortable()
                         && metadata_command_apply_transport_error_is_retryable(&source)
                     {
@@ -479,7 +520,7 @@ impl super::StorageCluster {
                                     pg_id,
                                     command.bucket_name(),
                                     &command,
-                                    &mut work_budget,
+                                    work_budget,
                                 )
                                 .map_err(ObjectPgActionError::from)?;
                             }
@@ -532,7 +573,7 @@ impl super::StorageCluster {
                             pg_id,
                             bucket,
                             &command,
-                            &mut work_budget,
+                            work_budget,
                         )
                         .map_err(ObjectPgActionError::from)?;
                         return Err(super::bucket_snapshot_error_to_object_pg_action_error(
@@ -556,7 +597,7 @@ impl super::StorageCluster {
                             pg_id,
                             bucket,
                             &command,
-                            &mut work_budget,
+                            work_budget,
                         )
                         .map_err(ObjectPgActionError::from)?;
                     }

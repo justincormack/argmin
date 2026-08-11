@@ -134,6 +134,27 @@ pub(super) fn metadata_command_apply_transport_error_is_retryable(
     )
 }
 
+pub(super) fn store_error_is_metadata_command_contention(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::MetadataCommandContention { .. }
+            | StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::MetadataCommandContention,
+                ..
+            }
+    )
+}
+
+pub(super) fn metadata_command_apply_error_is_contention(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    matches!(
+        error,
+        BucketSnapshotLoadError::Store(error)
+            if store_error_is_metadata_command_contention(error)
+    )
+}
+
 fn metadata_command_apply_error_can_handoff_to_recovery(
     error: &BucketSnapshotLoadError,
 ) -> bool {

@@ -1,6 +1,31 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+fn object_version_allocator_command_contention(error: &ObjectPgActionError) -> bool {
+    matches!(
+        error,
+        ObjectPgActionError::Store(error)
+            if request_ops::store_error_is_metadata_command_contention(error)
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ObjectPendingCommandFinishPolicy {
+    Standard,
+    AbandonZeroApplyStaleReservation,
+    AllocatorReinspectContention,
+}
+
+impl ObjectPendingCommandFinishPolicy {
+    fn abandons_zero_apply_stale_reservation(self) -> bool {
+        matches!(self, Self::AbandonZeroApplyStaleReservation)
+    }
+
+    fn returns_metadata_command_contention(self) -> bool {
+        matches!(self, Self::AllocatorReinspectContention)
+    }
+}
+
 impl StorageCluster {
     pub(crate) fn place_payload_shards(
         &self,
@@ -745,7 +770,11 @@ impl StorageCluster {
                     let exact = ExactPendingObjectMetadataCommand::for_checked_request(&command);
                     require_valid_route().map_err(ObjectPgActionError::Store)?;
                     let outcome = match self
-                        .finish_exact_pending_object_metadata_command(pg_id, exact)
+                        .finish_exact_pending_object_metadata_command_for_allocator(
+                            pg_id,
+                            exact,
+                            &mut work_budget,
+                        )
                     {
                         Ok(outcome) => outcome,
                         Err(ObjectPgActionError::Metadata(
@@ -757,15 +786,15 @@ impl StorageCluster {
                                 })?;
                             let pending =
                                 self.pending_metadata_command_for_bucket(pg_id, bucket)?;
-                            if pending.as_ref() != Some(&command) {
-                                return Err(conflicting_pending_object_metadata_command(
-                                    "pending version reservation changed before stale cleanup",
-                                ));
+                            if pending.as_ref() == Some(&command) {
+                                self.remove_pending_metadata_command_for_bucket(
+                                    pg_id, bucket, &command,
+                                )
+                                .map_err(ObjectPgActionError::from)?;
                             }
-                            self.remove_pending_metadata_command_for_bucket(
-                                pg_id, bucket, &command,
-                            )
-                            .map_err(ObjectPgActionError::from)?;
+                            // Another helper may already have removed or replaced the abandoned
+                            // allocator command. In either case the current slot, not this stale
+                            // observation, determines the next version allocation attempt.
                             work_budget
                                 .sleep_after_contention(
                                     "object version reservation stale cleanup retry budget exhausted",
@@ -773,19 +802,29 @@ impl StorageCluster {
                                 .map_err(ObjectPgActionError::Store)?;
                             continue;
                         }
+                        Err(error) if object_version_allocator_command_contention(&error) => {
+                            // A concurrent helper can abandon or replace this identity-less
+                            // allocator command between observation and recovery reissue. The
+                            // changed slot is the authoritative state; inspect it again instead
+                            // of exposing the internal recovery race to the S3 operation.
+                            work_budget
+                                .sleep_after_contention(
+                                    "object version reservation recovery race retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
+                            continue;
+                        }
                         Err(error) => return Err(error),
                     };
                     match outcome {
-                        PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                            return Err(conflicting_pending_object_metadata_command(
-                                "retryable partial pending version reservation command",
-                            ));
-                        }
                         PendingMetadataCommandOutcome::Applied
-                        | PendingMetadataCommandOutcome::Abandoned => {
+                        | PendingMetadataCommandOutcome::Abandoned
+                        | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                             // A version reservation has no caller identity. Even when it targets
-                            // the same key, it may belong to a concurrent write, so converge it
-                            // and allocate a fresh version instead of adopting its result.
+                            // the same key, it may belong to a concurrent write. A partial retry
+                            // can also mean another helper displaced the allocator command while
+                            // reissuing it. Reinspect the slot and allocate a fresh version instead
+                            // of adopting its result or exposing internal command contention.
                             work_budget
                                 .sleep_after_contention(
                                     "object version reservation pending completion retry budget exhausted",
@@ -813,7 +852,7 @@ impl StorageCluster {
             )?;
             self.maybe_run_before_object_version_command_id_hook();
             require_valid_route().map_err(ObjectPgActionError::Store)?;
-            let command = match self.install_allocator_cleanup_metadata_command_with_fresh_id(
+            let install = match self.install_allocator_cleanup_metadata_command_with_fresh_id(
                 publisher,
                 pg_id,
                 bucket,
@@ -831,7 +870,19 @@ impl StorageCluster {
                         ),
                     )
                 },
-            )? {
+            ) {
+                Ok(install) => install,
+                Err(error) if object_version_allocator_command_contention(&error) => {
+                    work_budget
+                        .sleep_after_contention(
+                            "object version reservation install race retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let command = match install {
                 AllocatorCleanupFreshInstallOutcome::Installed(command) => *command,
                 AllocatorCleanupFreshInstallOutcome::PendingContenderDrained => {
                     work_budget
@@ -850,7 +901,12 @@ impl StorageCluster {
                     continue;
                 }
             };
-            match self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command) {
+            match self.apply_new_object_metadata_command_for_bucket_allocator(
+                pg_id,
+                bucket,
+                &command,
+                &mut work_budget,
+            ) {
                 Ok(()) => {}
                 Err(ObjectPgActionError::Metadata(
                     MetadataError::ObjectVersionReservationConflict {
@@ -860,6 +916,17 @@ impl StorageCluster {
                     work_budget
                         .sleep_after_contention(
                             "object version reservation stale version retry budget exhausted",
+                        )
+                        .map_err(ObjectPgActionError::Store)?;
+                    continue;
+                }
+                Err(error) if object_version_allocator_command_contention(&error) => {
+                    // The command remains recoverable from the pending slot when apply loses a
+                    // concurrent command-log race. Reinspect it instead of leaking that internal
+                    // allocator contention through the enclosing object mutation.
+                    work_budget
+                        .sleep_after_contention(
+                            "object version reservation apply race retry budget exhausted",
                         )
                         .map_err(ObjectPgActionError::Store)?;
                     continue;
@@ -907,6 +974,32 @@ impl StorageCluster {
         command: ExactPendingObjectMetadataCommand<'_>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         self.finish_object_pg_pending_slot(pg_id, command.command)
+    }
+
+    fn finish_exact_pending_object_metadata_command_for_allocator(
+        &self,
+        pg_id: PgId,
+        command: ExactPendingObjectMetadataCommand<'_>,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.finish_object_pg_pending_slot_inner(
+            pg_id,
+            command.command,
+            work_budget,
+            self,
+            MetadataCommandExecutionRoute::normal(),
+            ObjectPendingCommandFinishPolicy::AllocatorReinspectContention,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reserve_next_object_version(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        self.reserve_next_object_version(pg_id, bucket, key)
     }
 
     fn apply_exact_pending_object_metadata_command(
@@ -1325,7 +1418,6 @@ impl StorageCluster {
             self.finish_object_pg_pending_slot_inner(
                 pg_id,
                 command,
-                true,
                 work_budget,
                 reservation_authority,
                 match route_mode {
@@ -1336,6 +1428,7 @@ impl StorageCluster {
                         None,
                     ),
                 },
+                ObjectPendingCommandFinishPolicy::AbandonZeroApplyStaleReservation,
             )
         }
     }
@@ -1404,10 +1497,10 @@ impl StorageCluster {
         self.finish_object_pg_pending_slot_inner(
             pg_id,
             command,
-            false,
             &mut work_budget,
             self,
             MetadataCommandExecutionRoute::normal(),
+            ObjectPendingCommandFinishPolicy::Standard,
         )
     }
 
@@ -1415,10 +1508,10 @@ impl StorageCluster {
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
-        abandon_zero_apply_stale_reservation: bool,
         work_budget: &mut RequestWorkBudget,
         reservation_authority: &StorageCluster,
         mut execution_route: MetadataCommandExecutionRoute<'_>,
+        finish_policy: ObjectPendingCommandFinishPolicy,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         execution_route
             .require_command(pg_id, command)
@@ -1532,6 +1625,17 @@ impl StorageCluster {
                 }
                 Err(error)
                     if error.progress.is_abortable()
+                        && finish_policy.returns_metadata_command_contention()
+                        && request_ops::metadata_command_apply_error_is_contention(
+                            &error.source,
+                        ) =>
+                {
+                    return Err(bucket_snapshot_error_to_object_pg_action_error(
+                        error.source,
+                    ));
+                }
+                Err(error)
+                    if error.progress.is_abortable()
                         && request_ops::metadata_command_apply_transport_error_is_retryable(
                         &error.source,
                     ) =>
@@ -1624,7 +1728,7 @@ impl StorageCluster {
                         Err(BucketSnapshotLoadError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            if abandon_zero_apply_stale_reservation {
+                            if finish_policy.abandons_zero_apply_stale_reservation() {
                                 return Err(conflicting_pending_object_metadata_command(
                                     "retryable partial pending object metadata drain",
                                 ));
@@ -1641,7 +1745,7 @@ impl StorageCluster {
                     command = reissued;
                 }
                 Err(error)
-                    if abandon_zero_apply_stale_reservation
+                    if finish_policy.abandons_zero_apply_stale_reservation()
                         && error.progress.is_abortable()
                         && error.applied_nodes == 0
                         && (Self::reserve_object_generation_conflict_matches(
@@ -1736,10 +1840,10 @@ impl StorageCluster {
             match self.finish_object_pg_pending_slot_inner(
                 pg_id,
                 &follow_up,
-                false,
                 work_budget,
                 reservation_authority,
                 follow_up_route,
+                ObjectPendingCommandFinishPolicy::Standard,
             )? {
                 PendingMetadataCommandOutcome::Applied => {
                     self.after_object_metadata_command_abandoned_payload_cleanup(command);

@@ -20,7 +20,7 @@
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Barrier};
+    use std::sync::{mpsc, Arc, Barrier, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -4994,42 +4994,31 @@
         }
     }
 
-    #[derive(Clone, Copy)]
-    enum AuthenticatedFanoutFailurePoint {
-        Witness,
-        Primary,
-        TrailingRetryable,
-    }
-
-    fn authenticated_metadata_fanout_handles_apply_failure(
+    fn authenticated_fanout_cluster(
         tcp: bool,
-        failure_point: AuthenticatedFanoutFailurePoint,
+        namespace: &str,
+    ) -> (
+        test_util::TempDir,
+        AuthenticatedFanoutServerSet,
+        Arc<StorageCluster>,
     ) {
         let tmp = test_util::tempdir();
         let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
         let primary_node_id = NodeId::new(1);
-        let witness_node_id = NodeId::new(0);
-        let corrupt_node_id = match failure_point {
-            AuthenticatedFanoutFailurePoint::Witness => Some(witness_node_id),
-            AuthenticatedFanoutFailurePoint::Primary => Some(primary_node_id),
-            AuthenticatedFanoutFailurePoint::TrailingRetryable => None,
-        };
         let ec_shape = EcShape { k: 2, m: 1 };
         let route_map_validity = RouteMapValidity::until_ms_saturating(
             crate::clock::current_time_millis().saturating_add(60_000),
         );
         let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
-            instance_id: "fanout-frontend".to_owned(),
+            instance_id: format!("{namespace}-frontend"),
         });
-        let corrupted = Arc::new(AtomicBool::new(false));
-        let signed_retryable_response_observed = Arc::new(AtomicBool::new(false));
         let mut servers = Vec::new();
         let mut client_configs = Vec::new();
 
         for node_id in node_ids {
             let socket_path = tmp
                 .path()
-                .join("fanout-sockets")
+                .join(format!("{namespace}-sockets"))
                 .join(format!("node-{}.sock", node_id.as_u32()));
             private_socket_dir(socket_path.parent().unwrap());
             let config = StorageNodeProcessConfig {
@@ -5038,7 +5027,7 @@
                 route_map_validity,
                 data_dir: tmp
                     .path()
-                    .join(format!("fanout-node-{}", node_id.as_u32())),
+                    .join(format!("{namespace}-node-{}", node_id.as_u32())),
                 default_ec_shape: ec_shape,
                 pg_ids: vec![0],
                 socket_path: socket_path.clone(),
@@ -5066,30 +5055,6 @@
                 ]);
             }
             let server = Arc::new(prepared.bind().unwrap());
-            if Some(node_id) == corrupt_node_id {
-                let corrupted_hook = Arc::clone(&corrupted);
-                server.set_response_envelope_test_hook(Arc::new(move |kind, envelope| {
-                    if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord
-                        && !corrupted_hook.swap(true, Ordering::AcqRel)
-                    {
-                        *envelope
-                            .last_mut()
-                            .expect("authenticated response envelope must not be empty") ^= 1;
-                    }
-                }));
-            } else if node_id == NodeId::new(2)
-                && matches!(
-                    failure_point,
-                    AuthenticatedFanoutFailurePoint::TrailingRetryable
-                )
-            {
-                let response_observed = Arc::clone(&signed_retryable_response_observed);
-                server.set_response_envelope_test_hook(Arc::new(move |kind, _envelope| {
-                    if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord {
-                        response_observed.store(true, Ordering::Release);
-                    }
-                }));
-            }
             let endpoint = if tcp {
                 let address = server.tcp_listener_addr_for_test();
                 StorageRpcClientEndpoint::tcp_with_config(
@@ -5146,6 +5111,58 @@
         map.install_unix_storage_node_clients(client_configs)
             .unwrap();
         let cluster = StorageCluster::from_static_local_map(Arc::new(map)).unwrap();
+        (tmp, server_set, cluster)
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthenticatedFanoutFailurePoint {
+        Witness,
+        Primary,
+        TrailingRetryable,
+    }
+
+    fn authenticated_metadata_fanout_handles_apply_failure(
+        tcp: bool,
+        failure_point: AuthenticatedFanoutFailurePoint,
+    ) {
+        let primary_node_id = NodeId::new(1);
+        let witness_node_id = NodeId::new(0);
+        let corrupt_node_id = match failure_point {
+            AuthenticatedFanoutFailurePoint::Witness => Some(witness_node_id),
+            AuthenticatedFanoutFailurePoint::Primary => Some(primary_node_id),
+            AuthenticatedFanoutFailurePoint::TrailingRetryable => None,
+        };
+        let corrupted = Arc::new(AtomicBool::new(false));
+        let signed_retryable_response_observed = Arc::new(AtomicBool::new(false));
+        let (_tmp, server_set, cluster) = authenticated_fanout_cluster(tcp, "fanout");
+
+        for server in &server_set.servers {
+            let node_id = server.config_snapshot().node_id;
+            if Some(node_id) == corrupt_node_id {
+                let corrupted_hook = Arc::clone(&corrupted);
+                server.set_response_envelope_test_hook(Arc::new(move |kind, envelope| {
+                    if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord
+                        && !corrupted_hook.swap(true, Ordering::AcqRel)
+                    {
+                        *envelope
+                            .last_mut()
+                            .expect("authenticated response envelope must not be empty") ^= 1;
+                    }
+                }));
+            } else if node_id == NodeId::new(2)
+                && matches!(
+                    failure_point,
+                    AuthenticatedFanoutFailurePoint::TrailingRetryable
+                )
+            {
+                let response_observed = Arc::clone(&signed_retryable_response_observed);
+                server.set_response_envelope_test_hook(Arc::new(move |kind, _envelope| {
+                    if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord {
+                        response_observed.store(true, Ordering::Release);
+                    }
+                }));
+            }
+        }
         let retryable_error_injected = Arc::new(AtomicBool::new(false));
         let apply_hook = if matches!(
             failure_point,
@@ -5325,6 +5342,114 @@
             true,
             AuthenticatedFanoutFailurePoint::TrailingRetryable,
         );
+    }
+
+    fn authenticated_object_version_allocator_retries_remote_contention(tcp: bool) {
+        let (_tmp, server_set, cluster) =
+            authenticated_fanout_cluster(tcp, "allocator-contention");
+        let witness = server_set
+            .servers
+            .iter()
+            .find(|server| server.config_snapshot().node_id == NodeId::new(0))
+            .cloned()
+            .unwrap();
+        let _stderr_guard = witness.suppress_metadata_command_lock_wait_stderr();
+        let held_witness_lock = Arc::new(Mutex::new(None));
+        let contention_observed = Arc::new(AtomicBool::new(false));
+        let held_witness_lock_for_response = Arc::clone(&held_witness_lock);
+        let contention_observed_for_hook = Arc::clone(&contention_observed);
+        witness.set_response_envelope_test_hook(Arc::new(move |kind, _envelope| {
+            if kind == StorageRpcMessageKind::MetadataCommandApplyAndRecord
+                && !contention_observed_for_hook.swap(true, Ordering::AcqRel)
+            {
+                drop(
+                    held_witness_lock_for_response
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                        .expect("witness apply response must release the injected lock"),
+                );
+            }
+        }));
+        let apply_armed = Arc::new(AtomicBool::new(true));
+        let apply_armed_for_hook = Arc::clone(&apply_armed);
+        let held_witness_lock_for_apply = Arc::clone(&held_witness_lock);
+        let witness_for_apply = Arc::clone(&witness);
+        let _apply_hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+            move |node_id, command| {
+                if node_id == NodeId::new(0)
+                    && matches!(
+                        command.payload(),
+                        MetadataCommandPayload::ReserveObjectVersion(_)
+                    )
+                    && apply_armed_for_hook.swap(false, Ordering::AcqRel)
+                {
+                    let guard = witness_for_apply
+                        .metadata_command_locks
+                        .acquire(NodeId::new(0), PgId::new(0), None)
+                        .unwrap();
+                    let previous = held_witness_lock_for_apply
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .replace(guard);
+                    assert!(previous.is_none());
+                }
+                Ok(())
+            },
+        ));
+
+        let bucket = crate::tests::bucket_name("authenticated-allocator-bucket");
+        let key = crate::tests::object_key("key");
+        let reserved = cluster
+            .test_reserve_next_object_version(PgId::new(0), &bucket, &key)
+            .expect("remote contention must be followed by allocator reinspection");
+
+        assert!(!apply_armed.load(Ordering::Acquire));
+        assert!(contention_observed.load(Ordering::Acquire));
+        assert_eq!(
+            reserved,
+            VersionId::from_u64(2),
+            "the contended first command must converge before a fresh version is reserved"
+        );
+        for server in &server_set.servers {
+            let state = server
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .metadata_command_replica_state()
+                .unwrap();
+            assert_eq!(
+                state.applied_log_index,
+                2,
+                "allocator reinspection must converge both exact commands on node {}",
+                server.config_snapshot().node_id.as_u32()
+            );
+            let config = server.config_snapshot();
+            assert!(
+                server
+                    ._node
+                    .get_pg(0)
+                    .unwrap()
+                    .pending_metadata_command_slot(
+                        config.node_id.as_u32(),
+                        config.cluster_epoch,
+                    )
+                    .unwrap()
+                    .is_none(),
+                "allocator reinspection must leave no pending command on node {}",
+                config.node_id.as_u32()
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_unix_object_version_allocator_retries_remote_contention() {
+        authenticated_object_version_allocator_retries_remote_contention(false);
+    }
+
+    #[test]
+    fn authenticated_tls_object_version_allocator_retries_remote_contention() {
+        authenticated_object_version_allocator_retries_remote_contention(true);
     }
 
     #[test]
