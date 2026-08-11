@@ -62,7 +62,7 @@ use super::{
 use super::{
     maybe_run_multipart_complete_commit_hook, maybe_run_multipart_complete_pre_commit_hook,
     maybe_run_multipart_complete_snapshot_hook,
-    maybe_run_multipart_complete_terminal_reauthorization_hook,
+    maybe_run_multipart_complete_terminal_reauthorization_hook, multipart_complete_commit_failure,
     multipart_complete_stale_snapshot_retry_now,
 };
 use crate::checksum_claim::ChecksumClaim;
@@ -544,7 +544,16 @@ impl Coordinator {
         let mut terminal_reauthorization_only = false;
         'retry_stale_commit_snapshot: loop {
             let authorized =
-                self.authorize_complete_multipart_upload_on_admitted_route(admission, req)?;
+                match self.authorize_complete_multipart_upload_on_admitted_route(admission, req) {
+                    Ok(authorized) => authorized,
+                    Err(ServerError::SlowDown) if terminal_reauthorization_only => {
+                        // If the terminal probe itself cannot inspect an upload that remains under
+                        // metadata-command contention, preserve CompleteMultipartUpload's specific
+                        // concurrent-operation outcome instead of exposing generic throttling.
+                        return Err(ServerError::OperationAborted);
+                    }
+                    Err(error) => return Err(error),
+                };
             if terminal_reauthorization_only
                 && matches!(
                     &authorized,
@@ -903,8 +912,15 @@ impl Coordinator {
             #[cfg(test)]
             maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
 
-            let completion_outcome = match multipart_route
-                .complete_multipart_upload_commit_serialized(
+            #[cfg(test)]
+            let forced_commit_failure =
+                multipart_complete_commit_failure(bucket.as_str(), key.as_str())
+                    .map(storage::test_support::multipart_completion_failure_for_kind);
+            #[cfg(not(test))]
+            let forced_commit_failure: Option<storage::MultipartCompletionFailure> = None;
+            let completion_result = match forced_commit_failure {
+                Some(error) => Err(error),
+                None => multipart_route.complete_multipart_upload_commit_serialized(
                     completion_snapshot.into_commit_request(
                         storage::CompleteMultipartCommitInput {
                             completion_fingerprint: multipart_completion_fingerprint(req.parts),
@@ -920,7 +936,9 @@ impl Coordinator {
                             conditional_completion: !req.cond.is_empty(),
                         },
                     ),
-                ) {
+                ),
+            };
+            let completion_outcome = match completion_result {
                 Ok(outcome) => outcome,
                 Err(error)
                     if error.kind() == storage::MultipartCompletionFailureKind::StaleSnapshot =>
@@ -976,7 +994,17 @@ impl Coordinator {
                     if error.kind()
                         == storage::MultipartCompletionFailureKind::MetadataCommandContention =>
                 {
-                    return Err(ServerError::OperationAborted);
+                    // Commit-time contention can race a completion which consumes the upload.
+                    // Reauthorize once so a terminal winner resolves as replay/NoSuchUpload;
+                    // ordinary contention against an upload which is still in progress remains
+                    // OperationAborted at the top of the loop.
+                    #[cfg(test)]
+                    maybe_run_multipart_complete_terminal_reauthorization_hook(
+                        bucket.as_str(),
+                        key.as_str(),
+                    );
+                    terminal_reauthorization_only = true;
+                    continue 'retry_stale_commit_snapshot;
                 }
                 Err(error) => {
                     return Err(Coordinator::map_multipart_completion_failure(

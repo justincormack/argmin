@@ -407,6 +407,13 @@ struct MultipartCompleteStaleDeadlineRaceSync {
     _serial_guard: MutexGuard<'static, ()>,
 }
 
+struct MultipartCompleteContentionRaceSync {
+    terminal_reauthorization_gate: Arc<DeterministicFaultGate>,
+    contention_injections: Arc<AtomicUsize>,
+    _guard: ReclamationTestHookGuard,
+    _serial_guard: MutexGuard<'static, ()>,
+}
+
 #[derive(Clone)]
 struct MultipartCompleteRetryClock {
     now: Arc<Mutex<Instant>>,
@@ -488,6 +495,45 @@ fn install_multipart_complete_stale_deadline_race_hooks(
         pre_commit_resume,
         terminal_reauthorization_gate,
         retry_clock,
+        _guard: guard,
+        _serial_guard: serial,
+    }
+}
+
+fn install_multipart_complete_contention_race_hooks(
+    bucket: &str,
+    key: &str,
+) -> MultipartCompleteContentionRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let terminal_reauthorization_gate =
+        DeterministicFaultGate::new(MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN);
+    let inject_contention = Arc::new(AtomicBool::new(true));
+    let contention_injections = Arc::new(AtomicUsize::new(0));
+    let inject_contention_hook = Arc::clone(&inject_contention);
+    let contention_injections_hook = Arc::clone(&contention_injections);
+    let terminal_reauthorization_gate_hook = Arc::clone(&terminal_reauthorization_gate);
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        multipart_complete_commit_failure: Some(Arc::new(move || {
+            inject_contention_hook
+                .swap(false, Ordering::SeqCst)
+                .then(|| {
+                    contention_injections_hook.fetch_add(1, Ordering::SeqCst);
+                    storage::MultipartCompletionFailureKind::MetadataCommandContention
+                })
+        })),
+        before_multipart_complete_terminal_reauthorization: Some(Arc::new(move || {
+            terminal_reauthorization_gate_hook
+                .wait_at(MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN);
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    MultipartCompleteContentionRaceSync {
+        terminal_reauthorization_gate,
+        contention_injections,
         _guard: guard,
         _serial_guard: serial,
     }
@@ -1384,6 +1430,66 @@ fn identical_completion_published_at_stale_deadline_reauthorizes_replay() {
     let replay = delayed_completion.join().unwrap().unwrap();
     assert_eq!(replay.etag, winning.etag, "{invariant}");
     assert_eq!(replay.version_id, winning.version_id, "{invariant}");
+}
+
+#[test]
+fn different_completion_contention_after_winner_reauthorizes_no_such_upload() {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let winner = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let delayed = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let bucket = "race-different-contention-bucket";
+    let key = "race-different-contention-key";
+    let invariant = "commit-time contention after a different completion consumes the upload must reauthorize as NoSuchUpload";
+
+    winner
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let (upload_id, parts) =
+        create_upload_with_parts(&winner, bucket, key, &[(1, b"winner"), (2, b"loser")]);
+    let winning_parts = &parts[..1];
+    let delayed_parts = parts[1..].to_vec();
+
+    let sync = install_multipart_complete_contention_race_hooks(bucket, key);
+    let upload_id_for_delayed = upload_id.clone();
+    let delayed_completion = std::thread::spawn(move || {
+        delayed.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(bucket, key, &upload_id_for_delayed, test_requester()),
+            parts: &delayed_parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    let _terminal_reauthorization_release_guard =
+        sync.terminal_reauthorization_gate.release_on_drop();
+    sync.terminal_reauthorization_gate
+        .wait_until_arrived(MULTIPART_COMPLETE_RACE_TIMEOUT);
+    winner
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            parts: winning_parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    sync.terminal_reauthorization_gate.release();
+
+    let error = delayed_completion.join().unwrap().unwrap_err();
+    assert!(
+        matches!(error, ServerError::NoSuchUpload { .. }),
+        "{invariant}: got {error:?}"
+    );
+    assert_eq!(
+        sync.contention_injections.load(Ordering::SeqCst),
+        1,
+        "{invariant}: the delayed commit must exercise the contention branch exactly once"
+    );
 }
 
 #[test]
