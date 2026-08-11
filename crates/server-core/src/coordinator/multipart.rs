@@ -573,7 +573,7 @@ impl Coordinator {
                                 replay.tags(),
                                 replay.size(),
                                 replay.last_modified(),
-                            )?;
+                            );
                         return Ok(CompleteMultipartUploadResult {
                             etag: replay.etag().format(),
                             version_id: replay.version_id(),
@@ -982,7 +982,7 @@ impl Coordinator {
                 completion_outcome.live_tags(),
                 lifecycle_size,
                 lifecycle_last_modified,
-            )?;
+            );
             if let Some(generation_id) = stale_payload_generation_id {
                 multipart_route.enqueue_object_payload_reclaim(generation_id);
             }

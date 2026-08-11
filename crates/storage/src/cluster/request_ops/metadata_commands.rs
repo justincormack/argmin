@@ -77,7 +77,7 @@ impl super::StorageCluster {
         MetadataCommandApplyTestHookGuard { scope_id }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_install_after_metadata_command_apply_hook(
         &self,
         hook: MetadataCommandAfterApplyTestHook,
@@ -612,8 +612,15 @@ impl super::StorageCluster {
                 FinishPendingMetadataCommandResult::Abandoned => continue,
             }
 
-            let info = metadata_route.head_bucket_info()?;
-            return Ok(BucketCreateAttemptOutcome::Created(info));
+            let MetadataCommandPayload::CreateBucket(create) = command.payload() else {
+                unreachable!("create bucket completed a different command kind")
+            };
+            return Ok(BucketCreateAttemptOutcome::Created(
+                BucketMutationReceipt::new(
+                    create.bucket().name.clone(),
+                    create.bucket().bucket_execution_generation,
+                ),
+            ));
         }
     }
 

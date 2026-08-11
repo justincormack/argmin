@@ -772,6 +772,8 @@ pub mod test_support {
     >;
     pub type TestMetadataCommandApplyHookGuard =
         super::cluster::MetadataCommandApplyContextTestHookGuard;
+    pub type TestMetadataCommandAfterApplyHookGuard =
+        super::cluster::MetadataCommandAfterApplyTestHookGuard;
 
     /// Logical metadata-command evidence and deterministic faults for
     /// cross-crate request tests.
@@ -798,6 +800,19 @@ pub mod test_support {
             key: &ObjectKey,
             hook: TestMetadataCommandApplyHook,
         ) -> TestMetadataCommandApplyHookGuard;
+
+        fn test_install_after_bucket_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandAfterApplyHookGuard;
+
+        fn test_install_after_object_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandAfterApplyHookGuard;
 
         fn test_install_bucket_metadata_command_log_conflict(
             &self,
@@ -904,6 +919,60 @@ pub mod test_support {
                 }
                 Ok(())
             }))
+        }
+
+        fn test_install_after_bucket_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandAfterApplyHookGuard {
+            let pg_id = PgId::new(self.test_bucket_pg_id_for(bucket));
+            let primary_node = self
+                .local_pg_route(pg_id)
+                .expect("test bucket metadata route must exist")
+                .primary_node_id();
+            let bucket = bucket.clone();
+            self.test_install_after_metadata_command_apply_hook(Arc::new(
+                move |node_id, command| {
+                    let context =
+                        super::cluster::metadata_command_apply_test_context(node_id, command);
+                    if context.node_id == primary_node
+                        && context.bucket.as_ref() == Some(&bucket)
+                        && context.key.is_none()
+                    {
+                        hook(context.kind).map_err(TestInjectedStorageFailure::into_store_error)?;
+                    }
+                    Ok(())
+                },
+            ))
+        }
+
+        fn test_install_after_object_metadata_command_primary_apply_hook(
+            &self,
+            bucket: &BucketName,
+            key: &ObjectKey,
+            hook: TestMetadataCommandApplyHook,
+        ) -> TestMetadataCommandAfterApplyHookGuard {
+            let pg_id = PgId::new(self.test_object_pg_id_for(bucket, key));
+            let primary_node = self
+                .local_pg_route(pg_id)
+                .expect("test object metadata route must exist")
+                .primary_node_id();
+            let bucket = bucket.clone();
+            let key = key.clone();
+            self.test_install_after_metadata_command_apply_hook(Arc::new(
+                move |node_id, command| {
+                    let context =
+                        super::cluster::metadata_command_apply_test_context(node_id, command);
+                    if context.node_id == primary_node
+                        && context.bucket.as_ref() == Some(&bucket)
+                        && context.key.as_ref() == Some(&key)
+                    {
+                        hook(context.kind).map_err(TestInjectedStorageFailure::into_store_error)?;
+                    }
+                    Ok(())
+                },
+            ))
         }
 
         fn test_install_bucket_metadata_command_log_conflict(
@@ -3525,7 +3594,7 @@ pub mod test_support {
 pub use metadata_command::BucketWriteReservationProof;
 #[cfg(test)]
 pub(crate) use node::LocalStorageNode;
-pub use node::{BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome};
+pub use node::{BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, BucketMutationReceipt};
 pub(crate) use node::{BucketDeleteBeginRoot, ReclaimWorkItem};
 pub(crate) use node_runtime::role_facade::ObjectMetadataScanPgId;
 pub use node_runtime::role_facade::{BucketPgId, DataPgId, ObjectMetadataPgId};

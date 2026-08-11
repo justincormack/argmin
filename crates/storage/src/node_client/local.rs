@@ -1530,6 +1530,8 @@ impl LocalBucketMetadataRoute<'_> {
 
 impl BucketMetadataRoute for LocalBucketMetadataRoute<'_> {
     fn head_bucket_raw(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         let pg = self.client.storage_node.get_pg_for_metadata_read(
             self.client.node_id,
             self.pg_id.pg_id(),
@@ -1539,6 +1541,8 @@ impl BucketMetadataRoute for LocalBucketMetadataRoute<'_> {
     }
 
     fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         let pg = self.client.storage_node.get_pg_for_metadata_read(
             self.client.node_id,
             self.pg_id.pg_id(),
@@ -1551,6 +1555,8 @@ impl BucketMetadataRoute for LocalBucketMetadataRoute<'_> {
         &self,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         let pg = self.client.storage_node.get_pg_for_metadata_read(
             self.client.node_id,
             self.pg_id.pg_id(),
@@ -1726,6 +1732,8 @@ impl BucketMetadataRoute for LocalBucketMetadataRoute<'_> {
         &self,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         let pg = self.client.storage_node.get_pg_for_metadata_read(
             self.client.node_id,
             self.pg_id.pg_id(),

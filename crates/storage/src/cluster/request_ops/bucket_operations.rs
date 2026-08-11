@@ -92,7 +92,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         state: BucketVersioningState,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_versioning_and_load_info_with_route_validation(
+        self.put_bucket_versioning_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
                 pg_id: self.bucket_metadata_pg(bucket),
                 bucket,
@@ -100,15 +100,16 @@ impl super::StorageCluster {
             },
             || Ok(()),
             state,
-        )
+        )?;
+        self.head_bucket_info_internal(bucket)
     }
 
-    pub(super) fn put_bucket_versioning_and_load_info_with_route_validation(
+    pub(super) fn put_bucket_versioning_with_route_validation(
         &self,
         route: super::BucketMetadataMutationEffectRoute<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         state: BucketVersioningState,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketMutationReceipt, BucketSnapshotLoadError> {
         let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketVersioning);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
@@ -233,8 +234,13 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = metadata_route.head_bucket_raw()?;
-            return Ok(info);
+            let MetadataCommandPayload::PutBucketVersioning(versioning) = command.payload() else {
+                unreachable!("versioning mutation completed a different command kind")
+            };
+            return Ok(BucketMutationReceipt::new(
+                versioning.bucket.name.clone(),
+                versioning.bucket.bucket_execution_generation,
+            ));
         }
     }
 
@@ -406,7 +412,7 @@ impl super::StorageCluster {
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_acl_and_load_info_with_route_validation(
+        self.put_bucket_acl_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
                 pg_id: self.bucket_metadata_pg(bucket),
                 bucket,
@@ -415,16 +421,17 @@ impl super::StorageCluster {
             || Ok(()),
             acl_grants,
             summary,
-        )
+        )?;
+        self.head_bucket_info_internal(bucket)
     }
 
-    pub(super) fn put_bucket_acl_and_load_info_with_route_validation(
+    pub(super) fn put_bucket_acl_with_route_validation(
         &self,
         route: super::BucketMetadataMutationEffectRoute<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketMutationReceipt, BucketSnapshotLoadError> {
         let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketAcl);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
@@ -540,8 +547,13 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = metadata_route.head_bucket_raw()?;
-            return Ok(info);
+            let MetadataCommandPayload::PutBucketAcl(acl) = command.payload() else {
+                unreachable!("ACL mutation completed a different command kind")
+            };
+            return Ok(BucketMutationReceipt::new(
+                acl.bucket.name.clone(),
+                acl.bucket.bucket_execution_generation,
+            ));
         }
     }
 
@@ -551,7 +563,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         mutation: BucketPropertyMutation,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_property_command_and_load_info_with_route_validation(
+        self.put_bucket_property_command_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
                 pg_id: self.bucket_metadata_pg(bucket),
                 bucket,
@@ -559,15 +571,16 @@ impl super::StorageCluster {
             },
             || Ok(()),
             mutation,
-        )
+        )?;
+        self.head_bucket_info_internal(bucket)
     }
 
-    pub(super) fn put_bucket_property_command_and_load_info_with_route_validation(
+    pub(super) fn put_bucket_property_command_with_route_validation(
         &self,
         route: super::BucketMetadataMutationEffectRoute<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mutation: BucketPropertyMutation,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketMutationReceipt, BucketSnapshotLoadError> {
         let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketProperty);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
@@ -678,8 +691,13 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = metadata_route.head_bucket_raw()?;
-            return Ok(info);
+            let MetadataCommandPayload::PutBucketProperty(property) = command.payload() else {
+                unreachable!("bucket property mutation completed a different command kind")
+            };
+            return Ok(BucketMutationReceipt::new(
+                property.bucket.name.clone(),
+                property.bucket.bucket_execution_generation,
+            ));
         }
     }
 
@@ -699,7 +717,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_subresource_and_load_info_with_route_validation(
+        self.put_bucket_subresource_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
                 pg_id: self.bucket_metadata_pg(bucket),
                 bucket,
@@ -707,22 +725,23 @@ impl super::StorageCluster {
             },
             || Ok(()),
             req,
-        )
+        )?;
+        self.head_bucket_info_internal(bucket)
     }
 
-    pub(super) fn put_bucket_subresource_and_load_info_with_route_validation(
+    pub(super) fn put_bucket_subresource_with_route_validation(
         &self,
         route: super::BucketMetadataMutationEffectRoute<'_>,
         require_valid_route: impl FnMut() -> Result<(), StoreError>,
         req: PutBucketSubresource<'_>,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketMutationReceipt, BucketSnapshotLoadError> {
         let mutation = BucketSubresourceMutation::from_put_request(req).map_err(|error| {
             MetadataError::InvariantViolation {
                 context: "put bucket subresource",
                 reason: format!("bucket subresource request is invalid: {error}"),
             }
         })?;
-        self.put_bucket_subresource_command_and_load_info_with_route_validation(
+        self.put_bucket_subresource_command_with_route_validation(
             route,
             require_valid_route,
             mutation,
@@ -745,7 +764,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         kind: OpaqueBucketSubresourceKind,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.delete_bucket_subresource_and_load_info_with_route_validation(
+        self.delete_bucket_subresource_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
                 pg_id: self.bucket_metadata_pg(bucket),
                 bucket,
@@ -753,7 +772,8 @@ impl super::StorageCluster {
             },
             || Ok(()),
             kind.stored_kind(),
-        )
+        )?;
+        self.head_bucket_info_internal(bucket)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -770,7 +790,7 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.delete_bucket_subresource_and_load_info_with_route_validation(
+        self.delete_bucket_subresource_with_route_validation(
             super::BucketMetadataMutationEffectRoute {
                 pg_id: self.bucket_metadata_pg(bucket),
                 bucket,
@@ -778,28 +798,29 @@ impl super::StorageCluster {
             },
             || Ok(()),
             BucketSubresourceKind::Tagging,
-        )
+        )?;
+        self.head_bucket_info_internal(bucket)
     }
 
-    pub(super) fn delete_bucket_subresource_and_load_info_with_route_validation(
+    pub(super) fn delete_bucket_subresource_with_route_validation(
         &self,
         route: super::BucketMetadataMutationEffectRoute<'_>,
         require_valid_route: impl FnMut() -> Result<(), StoreError>,
         kind: BucketSubresourceKind,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
-        self.put_bucket_subresource_command_and_load_info_with_route_validation(
+    ) -> Result<BucketMutationReceipt, BucketSnapshotLoadError> {
+        self.put_bucket_subresource_command_with_route_validation(
             route,
             require_valid_route,
             BucketSubresourceMutation::Delete { kind },
         )
     }
 
-    fn put_bucket_subresource_command_and_load_info_with_route_validation(
+    fn put_bucket_subresource_command_with_route_validation(
         &self,
         route: super::BucketMetadataMutationEffectRoute<'_>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mutation: BucketSubresourceMutation,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketMutationReceipt, BucketSnapshotLoadError> {
         let publisher = crate::metadata_command::metadata_command_publisher!(PutBucketSubresource);
         let super::BucketMetadataMutationEffectRoute {
             pg_id: bucket_pg_id,
@@ -897,8 +918,14 @@ impl super::StorageCluster {
                 continue;
             }
 
-            let info = metadata_route.head_bucket_raw()?;
-            return Ok(info);
+            let MetadataCommandPayload::PutBucketSubresource(subresource) = command.payload()
+            else {
+                unreachable!("bucket subresource mutation completed a different command kind")
+            };
+            return Ok(BucketMutationReceipt::new(
+                subresource.name.clone(),
+                subresource.bucket_execution_generation,
+            ));
         }
     }
 

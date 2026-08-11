@@ -212,6 +212,7 @@ impl Drop for ObjectMetadataCommandPublishTestHookGuard {
 #[derive(Default, Clone)]
 pub struct BucketScopedTestHooks {
     pub target: Option<BucketName>,
+    pub before_bucket_metadata_read: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_bucket_write_drain_wait: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_lifecycle_context_load: Option<Arc<dyn Fn() + Send + Sync>>,
     pub before_lifecycle_bucket_write_proof_acquire: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -282,6 +283,11 @@ fn maybe_run_bucket_scoped_test_hook(
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn maybe_run_bucket_write_drain_wait_hook(bucket: &BucketName) {
     maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_write_drain_wait)
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn maybe_run_bucket_metadata_read_hook(bucket: &BucketName) {
+    maybe_run_bucket_scoped_test_hook(bucket, |hooks| hooks.before_bucket_metadata_read)
 }
 
 #[cfg(not(any(test, feature = "test-hooks")))]
@@ -704,8 +710,35 @@ impl BucketDeleteFinalizeOutcome {
 
 #[derive(Debug, Clone)]
 pub enum BucketCreateAttemptOutcome {
-    Created(BucketInfo),
+    Created(BucketMutationReceipt),
     Exists(BucketInfo),
+}
+
+/// Durable result of a bucket metadata mutation.
+///
+/// The receipt is derived from the exact command that reached terminal apply;
+/// constructing it does not require a second storage RPC after publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BucketMutationReceipt {
+    name: BucketName,
+    bucket_execution_generation: u64,
+}
+
+impl BucketMutationReceipt {
+    pub(crate) fn new(name: BucketName, bucket_execution_generation: u64) -> Self {
+        Self {
+            name,
+            bucket_execution_generation,
+        }
+    }
+
+    pub fn name(&self) -> &BucketName {
+        &self.name
+    }
+
+    pub fn bucket_execution_generation(&self) -> u64 {
+        self.bucket_execution_generation
+    }
 }
 
 struct ReclaimQueueState {

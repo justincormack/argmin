@@ -5010,10 +5010,14 @@ impl UnixBucketMetadataRoute<'_> {
 
 impl BucketMetadataRoute for UnixBucketMetadataRoute<'_> {
     fn head_bucket_raw(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         self.client.head_bucket_raw(self.pg_id, &self.bucket)
     }
 
     fn head_bucket_info(&self) -> Result<BucketInfo, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         self.client.head_bucket_info(self.pg_id, &self.bucket)
     }
 
@@ -5021,6 +5025,8 @@ impl BucketMetadataRoute for UnixBucketMetadataRoute<'_> {
         &self,
         request: BucketSnapshotRequest,
     ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         self.client
             .load_bucket_snapshot(self.pg_id, &self.bucket, request)
     }
@@ -5206,6 +5212,8 @@ impl BucketMetadataRoute for UnixBucketMetadataRoute<'_> {
         &self,
         kind: BucketSubresourceKind,
     ) -> Result<Option<String>, BucketSnapshotLoadError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::node::maybe_run_bucket_metadata_read_hook(&self.bucket);
         self.client
             .get_bucket_subresource(self.pg_id, &self.bucket, kind)
     }

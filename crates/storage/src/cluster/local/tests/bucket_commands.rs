@@ -578,12 +578,26 @@ fn create_bucket_command_applies_to_all_acting_pg_nodes() {
             },
         })
         .unwrap();
-    let created = match created {
-        crate::BucketCreateAttemptOutcome::Created(info) => info,
+    let receipt = match created {
+        crate::BucketCreateAttemptOutcome::Created(receipt) => receipt,
         crate::BucketCreateAttemptOutcome::Exists(_) => {
             panic!("fresh bucket unexpectedly existed")
         }
     };
+    let created = {
+        let pg = map
+            .node(node_ids[0])
+            .unwrap()
+            .storage_node()
+            .get_pg(1)
+            .unwrap();
+        crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap()
+    };
+    assert_eq!(receipt.name(), &created.name);
+    assert_eq!(
+        receipt.bucket_execution_generation(),
+        created.bucket_execution_generation
+    );
 
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
@@ -692,7 +706,7 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
         .unwrap();
     assert!(matches!(
         published,
-        crate::BucketCreateAttemptOutcome::Created(info) if info.name == bucket
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name() == &bucket
     ));
     assert!(!fail_once.load(Ordering::SeqCst));
     {
@@ -735,10 +749,9 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
         .unwrap();
     assert!(matches!(
         retried,
-        crate::BucketCreateAttemptOutcome::Created(info)
-            if info.name == bucket
-                && info.created_at == partial_info.created_at
-                && info.bucket_execution_generation
+        crate::BucketCreateAttemptOutcome::Created(receipt)
+            if receipt.name() == &bucket
+                && receipt.bucket_execution_generation()
                     == partial_info.bucket_execution_generation
     ));
 
@@ -838,7 +851,7 @@ fn create_bucket_retries_partial_exact_command_conflict() {
         .unwrap();
     assert!(matches!(
         created,
-        crate::BucketCreateAttemptOutcome::Created(info) if info.name == bucket
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name() == &bucket
     ));
     assert!(applied_by_hook.load(Ordering::SeqCst));
 
@@ -917,7 +930,7 @@ fn create_bucket_retries_partial_exact_command_conflict_on_first_replica() {
         .unwrap();
     assert!(matches!(
         created,
-        crate::BucketCreateAttemptOutcome::Created(info) if info.name == bucket
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name() == &bucket
     ));
     assert!(applied_by_hook.load(Ordering::SeqCst));
 
@@ -990,7 +1003,7 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
         .unwrap();
     assert!(matches!(
         published,
-        crate::BucketCreateAttemptOutcome::Created(info) if info.name == first_bucket
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name() == &first_bucket
     ));
     assert!(pending_metadata_command_for_test(&map, PgId::new(1), &first_bucket).is_some());
     drop(hook_guard);
@@ -1012,7 +1025,7 @@ fn create_bucket_drains_different_bucket_pending_command_on_same_pg() {
         .unwrap();
     assert!(matches!(
         second,
-        crate::BucketCreateAttemptOutcome::Created(info) if info.name == second_bucket
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name() == &second_bucket
     ));
     assert!(pending_metadata_command_for_test(&map, PgId::new(1), &second_bucket).is_none());
 

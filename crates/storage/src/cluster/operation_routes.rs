@@ -1577,13 +1577,13 @@ impl ActiveBucketRoute<'_> {
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn put_bucket_versioning_and_load_info(
+    pub fn put_bucket_versioning(
         &self,
         state: BucketVersioningState,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
-            .put_bucket_versioning_and_load_info_with_route_validation(
+            .put_bucket_versioning_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now_raw(),
                 state,
@@ -1591,85 +1591,85 @@ impl ActiveBucketRoute<'_> {
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    fn put_bucket_property_and_load_info(
+    fn put_bucket_property(
         &self,
         mutation: BucketPropertyMutation,
-    ) -> Result<BucketInfo, BucketSnapshotLoadError> {
+    ) -> Result<BucketMutationReceipt, BucketSnapshotLoadError> {
         self.admission
             .cluster
-            .put_bucket_property_command_and_load_info_with_route_validation(
+            .put_bucket_property_command_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now_raw(),
                 mutation,
             )
     }
 
-    pub fn put_bucket_object_lock_and_load_info(
+    pub fn put_bucket_object_lock(
         &self,
         config: BucketObjectLockConfig,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
-        self.put_bucket_property_and_load_info(BucketPropertyMutation::ObjectLock(config))
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_property(BucketPropertyMutation::ObjectLock(config))
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn put_bucket_encryption_and_load_info(
+    pub fn put_bucket_encryption(
         &self,
         config: BucketEncryptionConfig,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
-        self.put_bucket_property_and_load_info(BucketPropertyMutation::Encryption(config))
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_property(BucketPropertyMutation::Encryption(config))
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn put_bucket_public_access_block_and_load_info(
+    pub fn put_bucket_public_access_block(
         &self,
         config: PublicAccessBlockConfig,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
-        self.put_bucket_property_and_load_info(BucketPropertyMutation::PublicAccessBlock(Some(
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_property(BucketPropertyMutation::PublicAccessBlock(Some(
             config,
         )))
         .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn delete_bucket_public_access_block_and_load_info(
+    pub fn delete_bucket_public_access_block(
         &self,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
-        self.put_bucket_property_and_load_info(BucketPropertyMutation::PublicAccessBlock(None))
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_property(BucketPropertyMutation::PublicAccessBlock(None))
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn put_bucket_ownership_controls_and_load_info(
+    pub fn put_bucket_ownership_controls(
         &self,
         config: BucketOwnershipControls,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
-        self.put_bucket_property_and_load_info(BucketPropertyMutation::OwnershipControls(Some(
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_property(BucketPropertyMutation::OwnershipControls(Some(
             config,
         )))
         .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn delete_bucket_ownership_controls_and_load_info(
+    pub fn delete_bucket_ownership_controls(
         &self,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
-        self.put_bucket_property_and_load_info(BucketPropertyMutation::OwnershipControls(None))
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_property(BucketPropertyMutation::OwnershipControls(None))
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn put_bucket_abac_enabled_and_load_info(
+    pub fn put_bucket_abac_enabled(
         &self,
         enabled: bool,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
-        self.put_bucket_property_and_load_info(BucketPropertyMutation::AbacEnabled(enabled))
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
+        self.put_bucket_property(BucketPropertyMutation::AbacEnabled(enabled))
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn put_bucket_acl_and_load_info(
+    pub fn put_bucket_acl(
         &self,
         acl_grants: &AclGrants,
         summary: BucketAclSummary,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
-            .put_bucket_acl_and_load_info_with_route_validation(
+            .put_bucket_acl_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now_raw(),
                 acl_grants,
@@ -1678,13 +1678,13 @@ impl ActiveBucketRoute<'_> {
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn put_bucket_subresource_and_load_info(
+    pub fn put_bucket_subresource(
         &self,
         req: PutBucketSubresource<'_>,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
-            .put_bucket_subresource_and_load_info_with_route_validation(
+            .put_bucket_subresource_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now_raw(),
                 req,
@@ -1692,13 +1692,13 @@ impl ActiveBucketRoute<'_> {
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn delete_bucket_subresource_and_load_info(
+    pub fn delete_bucket_subresource(
         &self,
         kind: crate::OpaqueBucketSubresourceKind,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
-            .delete_bucket_subresource_and_load_info_with_route_validation(
+            .delete_bucket_subresource_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now_raw(),
                 kind.stored_kind(),
@@ -1706,12 +1706,12 @@ impl ActiveBucketRoute<'_> {
             .map_err(crate::BucketSnapshotLoadFailure::from)
     }
 
-    pub fn delete_bucket_tags_and_load_info(
+    pub fn delete_bucket_tags(
         &self,
-    ) -> Result<BucketInfo, crate::BucketSnapshotLoadFailure> {
+    ) -> Result<BucketMutationReceipt, crate::BucketSnapshotLoadFailure> {
         self.admission
             .cluster
-            .delete_bucket_subresource_and_load_info_with_route_validation(
+            .delete_bucket_subresource_with_route_validation(
                 self.mutation_effect_route(),
                 || self.admission.require_valid_now_raw(),
                 BucketSubresourceKind::Tagging,

@@ -9,6 +9,8 @@ use super::*;
 use crate::conditional::{DeleteCondition, SpecificEtag, WriteCondition};
 use crate::coordinator::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 use crate::sse::SSE_CUSTOMER_ALGORITHM;
+use proptest::prelude::*;
+use proptest::test_runner::Config as ProptestConfig;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -103,6 +105,485 @@ fn setup_direct_coordinator_with_storage_cluster(
         BackgroundWorkerMode::all(),
     )
     .unwrap()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationFailureOperation {
+    CreateBucket,
+    PutBucketVersioning,
+    PutBucketAcl,
+    PutBucketAbac,
+    PutBucketLifecycle,
+    DirectPut,
+    FinalizeStreamPut,
+}
+
+impl PublicationFailureOperation {
+    const ALL: [Self; 7] = [
+        Self::CreateBucket,
+        Self::PutBucketVersioning,
+        Self::PutBucketAcl,
+        Self::PutBucketAbac,
+        Self::PutBucketLifecycle,
+        Self::DirectPut,
+        Self::FinalizeStreamPut,
+    ];
+
+    fn command_kind(self) -> MetadataCommandApplyTestKind {
+        match self {
+            Self::CreateBucket => MetadataCommandApplyTestKind::CreateBucket,
+            Self::PutBucketVersioning => MetadataCommandApplyTestKind::PutBucketVersioning,
+            Self::PutBucketAcl => MetadataCommandApplyTestKind::PutBucketAcl,
+            Self::PutBucketAbac => MetadataCommandApplyTestKind::PutBucketProperty,
+            Self::PutBucketLifecycle => MetadataCommandApplyTestKind::PutBucketSubresource,
+            Self::DirectPut | Self::FinalizeStreamPut => {
+                MetadataCommandApplyTestKind::CommitDirectPutObject
+            }
+        }
+    }
+
+    fn is_object_operation(self) -> bool {
+        matches!(self, Self::DirectPut | Self::FinalizeStreamPut)
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|operation| *operation == self)
+            .expect("publication operation belongs to ALL")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PublicationFailureObservation {
+    Bucket(Option<u64>),
+    Versioning(BucketVersioningState),
+    Acl(AclGrants),
+    Abac(bool),
+    Lifecycle(Option<String>),
+    Object(Option<Vec<u8>>),
+}
+
+fn publication_failure_operation_order(order_keys: [u64; 7]) -> [PublicationFailureOperation; 7] {
+    let mut operations = PublicationFailureOperation::ALL;
+    operations.sort_by_key(|operation| (order_keys[operation.index()], operation.index()));
+    operations
+}
+
+fn observe_publication_failure_operation(
+    operation: PublicationFailureOperation,
+    coord: &Coordinator,
+    storage: &StorageCluster,
+    bucket: &BucketName,
+    key: &ObjectKey,
+) -> PublicationFailureObservation {
+    match operation {
+        PublicationFailureOperation::CreateBucket => match storage.head_bucket_info(bucket) {
+            Ok(info) => {
+                PublicationFailureObservation::Bucket(Some(info.bucket_execution_generation))
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    storage::BucketSnapshotLoadFailureKind::BucketNotFound { .. }
+                ) =>
+            {
+                PublicationFailureObservation::Bucket(None)
+            }
+            Err(error) => panic!("create-bucket publication observation failed: {error:?}"),
+        },
+        PublicationFailureOperation::PutBucketVersioning => {
+            PublicationFailureObservation::Versioning(
+                storage.head_bucket_info(bucket).unwrap().versioning,
+            )
+        }
+        PublicationFailureOperation::PutBucketAcl => {
+            PublicationFailureObservation::Acl(storage.head_bucket_info(bucket).unwrap().acl_grants)
+        }
+        PublicationFailureOperation::PutBucketAbac => PublicationFailureObservation::Abac(
+            storage
+                .head_bucket_info(bucket)
+                .unwrap()
+                .bucket_abac_enabled,
+        ),
+        PublicationFailureOperation::PutBucketLifecycle => {
+            PublicationFailureObservation::Lifecycle(
+                storage
+                    .get_bucket_subresource(bucket, storage::OpaqueBucketSubresourceKind::Lifecycle)
+                    .unwrap(),
+            )
+        }
+        PublicationFailureOperation::DirectPut | PublicationFailureOperation::FinalizeStreamPut => {
+            let request = GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    bucket.as_str(),
+                    key.as_str(),
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            };
+            let body = match coord.get_object(&request) {
+                Ok(result) => Some(result.body.read_all().unwrap()),
+                Err(ServerError::ObjectNotFound { .. }) => None,
+                Err(error) => panic!("publication observation failed: {error:?}"),
+            };
+            PublicationFailureObservation::Object(body)
+        }
+    }
+}
+
+fn execute_publication_failure_operation(
+    operation: PublicationFailureOperation,
+    coord: &Coordinator,
+    bucket: &BucketName,
+    key: &ObjectKey,
+    stream_session: Option<&SessionId>,
+) -> Result<(), ServerError> {
+    match operation {
+        PublicationFailureOperation::CreateBucket => coord.create_bucket(&CreateBucketRequest {
+            name: bucket.clone(),
+            requester: test_requester(),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        }),
+        PublicationFailureOperation::PutBucketVersioning => coord.put_bucket_versioning(
+            &PutBucketVersioningRequest {
+                bucket: bucket_request_with_expected_owner(
+                    bucket.as_str(),
+                    test_requester(),
+                    None,
+                ),
+                state: BucketVersioningState::Enabled,
+            },
+        ),
+        PublicationFailureOperation::PutBucketAcl => {
+            coord.put_bucket_acl(&PutBucketAclRequest {
+                bucket: bucket_request_with_expected_owner(
+                    bucket.as_str(),
+                    test_requester(),
+                    None,
+                ),
+                acl: PutBucketAclInput::Canned(BucketAcl::PublicRead),
+                policy_context: PutObjectPolicyContext::default()
+                    .with_default_canned_acl(Some("public-read")),
+            })
+        }
+        PublicationFailureOperation::PutBucketAbac => {
+            coord.put_bucket_abac(&PutBucketAbacRequest {
+                bucket: bucket_request_with_expected_owner(
+                    bucket.as_str(),
+                    test_requester(),
+                    None,
+                ),
+                enabled: true,
+            })
+        }
+        PublicationFailureOperation::PutBucketLifecycle => {
+            coord.put_bucket_lifecycle(&PutBucketConfigRequest {
+                bucket: bucket_request_with_expected_owner(
+                    bucket.as_str(),
+                    test_requester(),
+                    None,
+                ),
+                config: "<LifecycleConfiguration><Rule><ID>publication-failure</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+            })
+        }
+        PublicationFailureOperation::DirectPut => test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    bucket.as_str(),
+                    key.as_str(),
+                    test_requester(),
+                    None,
+                ),
+                data: b"published-direct-put",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .map(|_| ()),
+        PublicationFailureOperation::FinalizeStreamPut => {
+            let session_id = stream_session.expect("stream operation has a prepared session");
+            let write_encryption = coord
+                .load_stream_put_write_encryption(bucket, key, session_id, None)?;
+            coord
+                .finalize_stream_put(&FinalizeStreamPutRequest {
+                    object: object_request(bucket.as_str(), key.as_str(), test_requester()),
+                    session_id,
+                    crc64: checksum::crc64::checksum(b"published-stream-put"),
+                    total_size: b"published-stream-put".len() as u64,
+                    metadata_blob: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    write_encryption: write_encryption.as_ref(),
+                    tags: None,
+                    cond: &WriteCondition::default(),
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    requested_object_lock: ObjectLockState::default(),
+                })
+                .map(|_| ())
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(15))]
+
+    #[test]
+    fn prop_retryable_failure_after_publication_never_escapes_across_operations(
+        order_keys in any::<[u64; 7]>(),
+    ) {
+        for operation in publication_failure_operation_order(order_keys) {
+            let tmp = test_util::tempdir();
+            let storage = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+            let coord = Coordinator::new_with_managed_key_provider_for_storage_cluster_route_handle_with_background_worker_mode(
+                test_storage_route_handle(Arc::clone(&storage)),
+                "us-east-1".to_string(),
+                None,
+                test_sse_s3_provider(),
+                BackgroundWorkerMode::none(),
+            )
+            .unwrap();
+            let bucket = trusted_bucket_name("publication-failure-property");
+            let key = trusted_object_key("key");
+            if !matches!(operation, PublicationFailureOperation::CreateBucket) {
+                coord
+                    .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+                    .unwrap();
+            }
+
+            let stream_session = if matches!(operation, PublicationFailureOperation::FinalizeStreamPut) {
+                let session_id = begin_stream_put_test(&coord, bucket.as_str(), key.as_str()).unwrap();
+                coord
+                    .append_plaintext_stream_segment_for_test(
+                        bucket.as_str(),
+                        key.as_str(),
+                        &session_id,
+                        0,
+                        b"published-stream-put",
+                    )
+                    .unwrap();
+                Some(session_id)
+            } else {
+                None
+            };
+
+            let before = observe_publication_failure_operation(
+                operation,
+                &coord,
+                &storage,
+                &bucket,
+                &key,
+            );
+            let published = Arc::new(AtomicBool::new(false));
+            let published_for_hook = Arc::clone(&published);
+            let command_kind = operation.command_kind();
+            let hook: storage::test_support::TestMetadataCommandApplyHook = Arc::new(move |kind| {
+                if kind == command_kind && !published_for_hook.swap(true, Ordering::SeqCst) {
+                    return Err(storage::test_support::injected_retryable_convergence_failure());
+                }
+                Ok(())
+            });
+            let apply_hook_guard = if operation.is_object_operation() {
+                storage.test_install_after_object_metadata_command_primary_apply_hook(
+                    &bucket,
+                    &key,
+                    hook,
+                )
+            } else {
+                storage.test_install_after_bucket_metadata_command_primary_apply_hook(&bucket, hook)
+            };
+            let post_publication_reads = Arc::new(AtomicUsize::new(0));
+            let post_publication_reads_for_hook = Arc::clone(&post_publication_reads);
+            let published_for_read_hook = Arc::clone(&published);
+            let read_hook_guard = install_bucket_scoped_test_hooks(BucketScopedTestHooks {
+                target: Some(bucket.clone()),
+                before_bucket_metadata_read: Some(Arc::new(move || {
+                    if published_for_read_hook.load(Ordering::SeqCst) {
+                        post_publication_reads_for_hook.fetch_add(1, Ordering::SeqCst);
+                    }
+                })),
+                ..BucketScopedTestHooks::default()
+            });
+
+            let result = execute_publication_failure_operation(
+                operation,
+                &coord,
+                &bucket,
+                &key,
+                stream_session.as_ref(),
+            );
+            prop_assert_eq!(
+                post_publication_reads.load(Ordering::SeqCst),
+                0,
+                "bucket metadata was read after publication for {:?}",
+                operation,
+            );
+            storage.head_bucket_info(&bucket).unwrap();
+            storage
+                .get_bucket_subresource(
+                    &bucket,
+                    storage::OpaqueBucketSubresourceKind::Lifecycle,
+                )
+                .unwrap();
+            storage.get_bucket_tags(&bucket).unwrap();
+            prop_assert_eq!(
+                post_publication_reads.load(Ordering::SeqCst),
+                3,
+                "post-publication read observer did not intercept its head, lifecycle, and tag canary reads for {:?}",
+                operation,
+            );
+            drop(apply_hook_guard);
+            drop(read_hook_guard);
+            let after = observe_publication_failure_operation(
+                operation,
+                &coord,
+                &storage,
+                &bucket,
+                &key,
+            );
+            let retryable = matches!(
+                &result,
+                Err(ServerError::SlowDown | ServerError::OperationAborted)
+            );
+
+            prop_assert!(published.load(Ordering::SeqCst), "fault was not injected for {operation:?}");
+            prop_assert!(
+                !retryable || before == after,
+                "retryable result escaped after changing visible state for {operation:?}: before={before:?} after={after:?} result={result:?}",
+            );
+            prop_assert_ne!(
+                before,
+                after,
+                "published operation did not change visible state: {:?}",
+                operation,
+            );
+            prop_assert!(
+                result.is_ok(),
+                "published operation returned an error after an injected response failure: operation={operation:?} result={result:?}",
+            );
+        }
+    }
+}
+
+fn install_malformed_lifecycle_for_put_test(coord: &Coordinator, bucket: &BucketName) {
+    coord
+        .storage_node()
+        .put_bucket_subresource_and_load_info(
+            bucket,
+            storage::PutBucketSubresource::lifecycle("<LifecycleConfiguration><Rule><ID>truncated"),
+        )
+        .unwrap();
+}
+
+#[test]
+fn direct_put_rejects_malformed_stored_lifecycle_before_object_metadata_changes() {
+    let tmp = test_util::tempdir();
+    let storage = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage));
+    let bucket = trusted_bucket_name("malformed-lifecycle-direct-put");
+    let key = trusted_object_key("key");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    install_malformed_lifecycle_for_put_test(&coord, &bucket);
+    let before = storage
+        .test_capture_object_metadata_command_state(&bucket, &key)
+        .unwrap();
+
+    let error = execute_publication_failure_operation(
+        PublicationFailureOperation::DirectPut,
+        &coord,
+        &bucket,
+        &key,
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(error, ServerError::InternalError { .. }));
+
+    let after = storage
+        .test_capture_object_metadata_command_state(&bucket, &key)
+        .unwrap();
+    assert!(
+        after.is_same_position_as(&before),
+        "invalid stored lifecycle must be rejected before direct PUT reserves or publishes metadata"
+    );
+    assert_eq!(
+        observe_publication_failure_operation(
+            PublicationFailureOperation::DirectPut,
+            &coord,
+            &storage,
+            &bucket,
+            &key,
+        ),
+        PublicationFailureObservation::Object(None),
+    );
+}
+
+#[test]
+fn stream_put_rejects_malformed_stored_lifecycle_before_finalize_metadata_changes() {
+    let tmp = test_util::tempdir();
+    let storage = open_test_storage_cluster(tmp.path(), &[0, 1]);
+    let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage));
+    let bucket = trusted_bucket_name("malformed-lifecycle-stream-put");
+    let key = trusted_object_key("key");
+    coord
+        .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+        .unwrap();
+    let session_id = begin_stream_put_test(&coord, bucket.as_str(), key.as_str()).unwrap();
+    coord
+        .append_plaintext_stream_segment_for_test(
+            bucket.as_str(),
+            key.as_str(),
+            &session_id,
+            0,
+            b"stream-body",
+        )
+        .unwrap();
+    install_malformed_lifecycle_for_put_test(&coord, &bucket);
+    let before = storage
+        .test_capture_object_metadata_command_state(&bucket, &key)
+        .unwrap();
+
+    let error = execute_publication_failure_operation(
+        PublicationFailureOperation::FinalizeStreamPut,
+        &coord,
+        &bucket,
+        &key,
+        Some(&session_id),
+    )
+    .unwrap_err();
+    assert!(matches!(error, ServerError::InternalError { .. }));
+
+    let after = storage
+        .test_capture_object_metadata_command_state(&bucket, &key)
+        .unwrap();
+    assert!(
+        after.is_same_position_as(&before),
+        "invalid stored lifecycle must be rejected before stream finalization publishes metadata"
+    );
+    assert_eq!(
+        observe_publication_failure_operation(
+            PublicationFailureOperation::FinalizeStreamPut,
+            &coord,
+            &storage,
+            &bucket,
+            &key,
+        ),
+        PublicationFailureObservation::Object(None),
+    );
 }
 
 fn setup_coordinator_with_only_reclaim_worker(

@@ -27,6 +27,10 @@ pub use request_ops::leased_object_snapshot::{
     LeasedObjectReadSnapshot, LeasedObjectReadSnapshotOutcome,
 };
 pub use request_ops::BucketIdentityGenerations;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) use request_ops::{
+    metadata_command_apply_test_context, MetadataCommandAfterApplyTestHookGuard,
+};
 pub(crate) use request_ops::{DurableReclaimScanBatch, DurableReclaimScanOutcome};
 
 use crate::control_plane::{
@@ -58,6 +62,7 @@ use crate::metadata_command::{
     UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
     UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
+use crate::node::BucketMutationReceipt;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::node::SharedStorageNode;
 use crate::node_client::{

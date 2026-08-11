@@ -165,6 +165,18 @@ the process-wide per-command recovery flight to deduplicate convergence. The
 pending slot and bucket-write reservation remain durable until that worker has
 converged every required replica and completed terminal cleanup.
 
+Response construction must not introduce a new fallible storage or parsing
+boundary after publication. Bucket metadata mutations return a receipt derived
+from the exact applied command, including its bucket execution generation;
+they do not issue a second bucket read to construct success or invalidate the
+frontend cache. This includes the `Created` outcome from `CreateBucket`.
+`CreateBucket::Exists` carries the pre-publication bucket snapshot needed to
+apply AWS ownership and legacy-region semantics; it is not reconstructed after
+a create command publishes. Object operations must parse stored lifecycle
+configuration and resolve every other fallible response input before publishing
+object metadata. After publication, only infallible projection of the
+already-validated inputs and command outcome is permitted.
+
 Cross-PG dependency commands are stricter. Publishing a dependency command on
 its witness and primary is irrevocable, but does not authorize publication of
 the dependent PG command. The dependency finisher must require convergence on
@@ -297,10 +309,10 @@ Current production pending-command publishers:
 | `create_bucket_with_config_and_load_info_with_route_validation` | `CreateBucket` | `ApplyValidated` | Revalidate the admitted bucket route before command construction and carry its immutable effect fence to pending-slot insertion; drain competing PG slot during pending-slot checks and command-id allocation, while exact-row apply handles idempotence/conflict. |
 | `begin_bucket_delete_if_current_with_route_validation` | `MarkBucketDeleting` | `SnapshotSensitive` | Revalidate the admitted bucket route before the durable write drain and pending-slot insertion, then rebuild from current bucket/delete preconditions after contention. |
 | `delete_bucket_from_acting_set` | `DeleteFinalizedBucket` | `SnapshotSensitive` | Rebuild from the current deleting-bucket generations after unrelated contention; an equivalent pending finalization may be finished only after its exact bucket identity is matched. |
-| `put_bucket_versioning_and_load_info_with_route_validation` | `PutBucketVersioning` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
-| `put_bucket_acl_and_load_info_with_route_validation` | `PutBucketAcl` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
-| `put_bucket_property_command_and_load_info_with_route_validation` | `PutBucketProperty` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
-| `put_bucket_subresource_command_and_load_info_with_route_validation` | `PutBucketSubresource` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `put_bucket_versioning_with_route_validation` | `PutBucketVersioning` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `put_bucket_acl_with_route_validation` | `PutBucketAcl` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `put_bucket_property_command_with_route_validation` | `PutBucketProperty` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
+| `put_bucket_subresource_command_with_route_validation` | `PutBucketSubresource` | `SnapshotSensitive` | Drain competing PG slot during pending-slot checks and command-id allocation; rebuild bucket post-image after contention. |
 | `reserve_put_object_generation_with_route_validation` | `ReserveObjectGeneration` | `AllocatorCleanup` | Revalidate admitted PutObject authority before each allocation attempt and carry its immutable effect fence to pending-slot insertion. Drain competing PG slot before and during command-id allocation, reread the allocator before final command-id allocation, then allocate/reuse through the reservation owner. If the generation becomes stale before publish, exact `ObjectGenerationReservationConflict` is retried without releasing a non-matching reservation. |
 | `reserve_next_object_version` | `ReserveObjectVersion` | `AllocatorCleanup` | Drain competing PG slot before and during command-id allocation, then allocate/reuse through the version reservation owner. |
 | `release_object_generation_reservation_command_required` | `ReleaseObjectGeneration` | `AllocatorCleanup` | Required cleanup must retry through slot contention, including command-id contention, until terminal or fail without losing the cleanup intent. |
@@ -525,10 +537,10 @@ outcome is only valid after an exact matching predicate has succeeded.
 | Finish caller/path | Command scope | Finish classification | Notes |
 | --- | --- | --- | --- |
 | `create_bucket_with_config_and_load_info_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A confirmed primary publication is returned as success while trailing convergence retains the exact slot. |
-| `put_bucket_versioning_and_load_info_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence. |
-| `put_bucket_acl_and_load_info_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence. |
-| `put_bucket_property_command_and_load_info_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence. |
-| `put_bucket_subresource_command_and_load_info_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence. |
+| `put_bucket_versioning_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
+| `put_bucket_acl_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
+| `put_bucket_property_command_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
+| `put_bucket_subresource_command_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
 | `begin_bucket_delete_if_current_with_route_validation` | bucket PG | After witness dispatch, partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash`; divergent same-index rows fail closed. | Once the primary publishes `Deleting`, a recoverable trailing error returns the committed outcome and retains the slot for recovery. |
 | `establish_multipart_completion_barrier` | bucket PG | Abort only before witness dispatch; after publication, retain the exact command and require complete acting-set convergence. | A published but unconverged barrier returns an internal dependency-pending outcome and must not publish the object-PG command. The returned idempotence sequence comes only from the exact fully converged barrier. |
 | `drain_pending_metadata_command_pg_slot` and `drain_pending_multipart_completion_barrier_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |

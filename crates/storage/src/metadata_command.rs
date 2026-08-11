@@ -312,22 +312,22 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     PutBucketVersioning => (
-        "put_bucket_versioning_and_load_info_with_route_validation",
+        "put_bucket_versioning_with_route_validation",
         "PutBucketVersioning",
         SnapshotSensitive
     ),
     PutBucketAcl => (
-        "put_bucket_acl_and_load_info_with_route_validation",
+        "put_bucket_acl_with_route_validation",
         "PutBucketAcl",
         SnapshotSensitive
     ),
     PutBucketProperty => (
-        "put_bucket_property_command_and_load_info_with_route_validation",
+        "put_bucket_property_command_with_route_validation",
         "PutBucketProperty",
         SnapshotSensitive
     ),
     PutBucketSubresource => (
-        "put_bucket_subresource_command_and_load_info_with_route_validation",
+        "put_bucket_subresource_command_with_route_validation",
         "PutBucketSubresource",
         SnapshotSensitive
     ),

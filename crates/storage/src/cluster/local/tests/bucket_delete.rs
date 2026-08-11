@@ -275,7 +275,7 @@ fn finalized_bucket_delete_clears_pending_versioning_command_for_recreate() {
         })
         .unwrap();
     let recreated_generation = match recreated {
-        crate::BucketCreateAttemptOutcome::Created(info) => info.bucket_execution_generation,
+        crate::BucketCreateAttemptOutcome::Created(info) => info.bucket_execution_generation(),
         other => panic!("expected recreated bucket, got {other:?}"),
     };
     assert!(recreated_generation > old_partial_generation);
@@ -388,8 +388,8 @@ fn finalized_bucket_delete_removes_replicated_create_rows() {
     assert!(matches!(
         recreated,
         crate::BucketCreateAttemptOutcome::Created(info)
-            if info.name == bucket
-                && info.bucket_execution_generation > pre_delete_generation
+            if info.name() == &bucket
+                && info.bucket_execution_generation() > pre_delete_generation
     ));
 
     for node_id in node_ids {

@@ -254,6 +254,9 @@ impl Coordinator {
                     let mut proof_transferred_to_command = false;
                     let result = (|| {
                         let bucket_info = bucket_handle.bucket().clone();
+                        let lifecycle =
+                            self.cached_bucket_lifecycle_for_loaded_handle(&bucket_handle)?;
+                        let stored_tags = Self::stored_object_tags(authorized.tags())?;
                         let write_encryption = &authorized.write_encryption;
                         Self::ensure_sse_c_allowed(
                             &bucket_info,
@@ -312,7 +315,7 @@ impl Coordinator {
                             etag_crc64: object_crc64,
                             object_lock: resolved_object_lock,
                             encryption,
-                            tags: Self::stored_object_tags(authorized.tags())?,
+                            tags: stored_tags,
                             metadata_blob,
                             system_metadata_blob,
                             bucket_write_reservation: proof,
@@ -365,14 +368,14 @@ impl Coordinator {
                                 },
                             )
                             .map_err(Coordinator::map_direct_put_failure)??;
-                        let lifecycle_expiration = self
-                            .current_object_write_lifecycle_expiration_for_loaded_bucket(
-                                &bucket_handle,
+                        let lifecycle_expiration =
+                            Self::current_object_write_lifecycle_expiration_for_config(
+                                lifecycle.as_ref(),
                                 authorized.key(),
                                 outcome.live_tags.as_deref(),
                                 outcome.live_size,
                                 outcome.live_last_modified,
-                            )?;
+                            );
                         if let Some(generation_id) = outcome.stale_generation_id {
                             put_route.enqueue_object_payload_reclaim(generation_id);
                         }
@@ -754,6 +757,7 @@ impl Coordinator {
         req: &FinalizeStreamPutRequest,
     ) -> Result<PutObjectResult, ServerError> {
         let bucket_info = bucket_handle.bucket().clone();
+        let lifecycle = self.cached_bucket_lifecycle_for_loaded_handle(&bucket_handle)?;
         let key = req.object.key();
         let session_id = req.session_id;
         let crc64 = req.crc64;
@@ -831,14 +835,13 @@ impl Coordinator {
             let outcome = route
                 .finalize(session_id, total_size, &mut prepare)
                 .map_err(Coordinator::map_stream_upload_failure)??;
-            let lifecycle_expiration = self
-                .current_object_write_lifecycle_expiration_for_loaded_bucket(
-                    &bucket_handle,
-                    key,
-                    outcome.live_tags.as_deref(),
-                    outcome.live_size,
-                    outcome.live_last_modified,
-                )?;
+            let lifecycle_expiration = Self::current_object_write_lifecycle_expiration_for_config(
+                lifecycle.as_ref(),
+                key,
+                outcome.live_tags.as_deref(),
+                outcome.live_size,
+                outcome.live_last_modified,
+            );
             if let Some(generation_id) = outcome.stale_generation_id {
                 route.enqueue_object_payload_reclaim(generation_id);
             }

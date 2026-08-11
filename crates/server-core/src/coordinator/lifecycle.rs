@@ -105,51 +105,19 @@ impl Coordinator {
         ))
     }
 
-    pub(super) fn current_object_write_lifecycle_expiration_for_loaded_bucket(
-        &self,
-        bucket: &LoadedBucketHandle,
-        key: &str,
-        tags: Option<&s3_types::TagSet>,
-        size: u64,
-        last_modified: u64,
-    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
-        let Some(config) = self.cached_bucket_lifecycle_for_loaded_handle(bucket)? else {
-            return Ok(None);
-        };
-        let tags = match tags {
-            Some(tags) => tags.clone().into_pairs(),
-            None => Vec::new(),
-        };
-        Ok(Self::evaluate_current_object_lifecycle_expiration(
-            &config,
-            key,
-            &tags,
-            size,
-            last_modified,
-        ))
-    }
-
     pub(super) fn current_object_write_lifecycle_expiration_for_config(
         lifecycle: Option<&BucketLifecycleConfiguration>,
         key: &str,
         tags: Option<&s3_types::TagSet>,
         size: u64,
         last_modified: u64,
-    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
-        let Some(config) = lifecycle else {
-            return Ok(None);
-        };
+    ) -> Option<LifecycleExpirationHeader> {
+        let config = lifecycle?;
         let tags = match tags {
             Some(tags) => tags.clone().into_pairs(),
             None => Vec::new(),
         };
-        Ok(Self::evaluate_current_object_lifecycle_expiration(
-            config,
-            key,
-            &tags,
-            size,
-            last_modified,
-        ))
+        Self::evaluate_current_object_lifecycle_expiration(config, key, &tags, size, last_modified)
     }
 
     pub(super) fn multipart_lifecycle_abort_headers_on_admitted_route(

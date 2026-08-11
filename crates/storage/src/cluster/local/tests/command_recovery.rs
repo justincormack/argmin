@@ -6728,7 +6728,7 @@ fn partial_abandoned_create_bucket_retry_rebuilds_command_before_reporting_creat
     let crate::BucketCreateAttemptOutcome::Created(info) = outcome else {
         panic!("abandoned create retry must create a fresh bucket, got {outcome:?}");
     };
-    assert_eq!(info.name, bucket);
+    assert_eq!(info.name(), &bucket);
     for node_id in node_ids {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let state = pg.metadata_command_replica_state().unwrap();

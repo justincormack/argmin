@@ -32,9 +32,12 @@ impl SharedStorageNode {
         let pg_id = self.pg_topology.bucket_pg_for(&bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         match bucket_pg.create_bucket_with_config(config) {
-            Ok(()) => Ok(BucketCreateAttemptOutcome::Created(
-                bucket_pg.head_bucket(&bucket)?,
-            )),
+            Ok(()) => {
+                let info = bucket_pg.head_bucket(&bucket)?;
+                Ok(BucketCreateAttemptOutcome::Created(
+                    BucketMutationReceipt::new(info.name, info.bucket_execution_generation),
+                ))
+            }
             Err(crate::error::MetadataError::BucketAlreadyExists) => Ok(
                 BucketCreateAttemptOutcome::Exists(bucket_pg.head_bucket_raw(&bucket)?),
             ),

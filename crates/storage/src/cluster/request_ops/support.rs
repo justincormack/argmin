@@ -433,8 +433,8 @@ struct BucketLifecycleContext {
 type MetadataCommandApplyTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
 
-#[cfg(test)]
-type MetadataCommandAfterApplyTestHook =
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) type MetadataCommandAfterApplyTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(test)]
@@ -533,7 +533,7 @@ static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 static AFTER_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandAfterApplyTestHook>>,
 > = OnceLock::new();
@@ -638,8 +638,8 @@ pub(crate) struct MetadataCommandApplyTestHookGuard {
     scope_id: usize,
 }
 
-#[cfg(test)]
-pub(crate) struct MetadataCommandAfterApplyTestHookGuard {
+#[cfg(any(test, feature = "test-hooks"))]
+pub struct MetadataCommandAfterApplyTestHookGuard {
     scope_id: usize,
 }
 
@@ -744,7 +744,7 @@ impl Drop for MetadataCommandApplyTestHookGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 impl Drop for MetadataCommandAfterApplyTestHookGuard {
     fn drop(&mut self) {
         let hooks = AFTER_METADATA_COMMAND_APPLY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -1020,7 +1020,7 @@ fn maybe_run_after_metadata_command_apply_hook(
     _node_id: NodeId,
     _command: &MetadataCommandEnvelope,
 ) -> Result<(), StoreError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     {
         let hook = AFTER_METADATA_COMMAND_APPLY_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1321,7 +1321,7 @@ pub(super) fn maybe_run_metadata_command_terminal_reservation_release_hook(
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
-fn metadata_command_apply_test_context(
+pub(crate) fn metadata_command_apply_test_context(
     node_id: NodeId,
     command: &MetadataCommandEnvelope,
 ) -> MetadataCommandApplyTestContext {

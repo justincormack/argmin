@@ -459,15 +459,18 @@ pub(super) mod node_facade {
     };
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) use super::engine::{
-        maybe_run_after_direct_put_metadata_publish_hook, BucketPgTestGuard,
-        DirectPutMetadataPublishHook, DirectPutMetadataPublishTestHookGuard, SharedStorageNode,
+        maybe_run_after_direct_put_metadata_publish_hook, maybe_run_bucket_metadata_read_hook,
+        BucketPgTestGuard, DirectPutMetadataPublishHook, DirectPutMetadataPublishTestHookGuard,
+        SharedStorageNode,
     };
     #[cfg(test)]
     pub(crate) use super::engine::{
         maybe_run_after_object_metadata_command_publish_hook,
         ObjectMetadataCommandPublishTestHookGuard,
     };
-    pub use super::engine::{BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome};
+    pub use super::engine::{
+        BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, BucketMutationReceipt,
+    };
     pub(crate) use super::engine::{BucketDeleteBeginRoot, ReclaimWorkItem};
 }
 
