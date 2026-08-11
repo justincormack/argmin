@@ -6401,7 +6401,10 @@ fn deferred_bucket_finalize_clears_its_original_runtime_map_queue_owner() {
     let initial = open_dynamic_test_storage_cluster(tmp.path(), &pg_ids);
     let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
     let bucket = trusted_bucket_name("deferred-finalize-runtime-refresh");
-    let direct_coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&initial));
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
     direct_coord
         .create_bucket_for_owner("default-owner", bucket.as_str(), false)
         .unwrap();
