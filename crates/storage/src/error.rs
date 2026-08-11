@@ -819,6 +819,7 @@ impl StoreError {
                 | StorageRpcWireErrorCode::BucketWriteReservationConflict
                 | StorageRpcWireErrorCode::BucketWriteReservationNotFound
                 | StorageRpcWireErrorCode::ShardIntegrity
+                | StorageRpcWireErrorCode::MetadataCommandIntegrity
                 | StorageRpcWireErrorCode::MultipartConditionalRequestConflict
                 | StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive
                 | StorageRpcWireErrorCode::TransportTimeout
@@ -958,7 +959,8 @@ impl StoreError {
                 StorageRpcWireErrorCode::ResourceExhausted => {
                     StoreFailureDiagnosticCategory::ResourceExhausted
                 }
-                StorageRpcWireErrorCode::ShardIntegrity => {
+                StorageRpcWireErrorCode::ShardIntegrity
+                | StorageRpcWireErrorCode::MetadataCommandIntegrity => {
                     StoreFailureDiagnosticCategory::Integrity
                 }
                 StorageRpcWireErrorCode::NotFound => StoreFailureDiagnosticCategory::NotFound,
@@ -1060,6 +1062,7 @@ impl StoreError {
                 | StorageRpcWireErrorCode::BucketWriteReservationConflict
                 | StorageRpcWireErrorCode::BucketWriteReservationNotFound
                 | StorageRpcWireErrorCode::ShardIntegrity
+                | StorageRpcWireErrorCode::MetadataCommandIntegrity
                 | StorageRpcWireErrorCode::MultipartConditionalRequestConflict => None,
             },
             _ => None,
@@ -3792,6 +3795,7 @@ mod tests {
             StorageRpcErrorCode::BucketWriteReservationConflict,
             StorageRpcErrorCode::BucketWriteReservationNotFound,
             StorageRpcErrorCode::ShardIntegrity,
+            StorageRpcErrorCode::MetadataCommandIntegrity,
             StorageRpcErrorCode::MultipartConditionalRequestConflict,
         ] {
             assert_eq!(remote_failure(code).storage_node_failure_class(), None);
@@ -4001,6 +4005,7 @@ mod tests {
             StorageRpcErrorCode::BucketWriteReservationConflict,
             StorageRpcErrorCode::BucketWriteReservationNotFound,
             StorageRpcErrorCode::ShardIntegrity,
+            StorageRpcErrorCode::MetadataCommandIntegrity,
             StorageRpcErrorCode::MultipartConditionalRequestConflict,
             StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
             StorageRpcErrorCode::TransportTimeout,

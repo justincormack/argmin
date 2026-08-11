@@ -954,20 +954,51 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        let outcome = self.drain_pending_object_metadata_command_outcome_with_work_budget(
-            publisher,
-            pg_id,
-            command,
-            work_budget,
-        )?;
-        match outcome {
-            PendingMetadataCommandOutcome::Applied | PendingMetadataCommandOutcome::Abandoned => {
-                Ok(outcome)
-            }
-            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
-                Err(conflicting_pending_object_metadata_command(
-                    "retryable partial pending object metadata drain",
-                ))
+        loop {
+            #[cfg(test)]
+            let force_partial_conflict =
+                request_ops::maybe_force_pending_object_metadata_partial_conflict_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    command,
+                    work_budget,
+                );
+            #[cfg(not(test))]
+            let force_partial_conflict = false;
+            let outcome = if force_partial_conflict {
+                PendingMetadataCommandOutcome::RetryPartialExactConflict
+            } else {
+                self.drain_pending_object_metadata_command_outcome_with_work_budget(
+                    publisher,
+                    pg_id,
+                    command,
+                    work_budget,
+                )?
+            };
+            match outcome {
+                PendingMetadataCommandOutcome::Applied
+                | PendingMetadataCommandOutcome::Abandoned => return Ok(outcome),
+                PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                    // The exact command has crossed its publication boundary. A helper for a
+                    // later request must keep converging that command rather than exposing its
+                    // internal log race as contention on the later S3 operation.
+                    if let Err(error) = work_budget.sleep_after_contention(
+                        "partial pending object metadata convergence budget exhausted",
+                    ) {
+                        return Err(match error {
+                            StoreError::MetadataCommandContention { .. } => {
+                                let id = command.id();
+                                ObjectPgActionError::Store(
+                                    StoreError::MetadataCommandIrrevocableConvergencePending {
+                                        pg_id: id.pg_id().get(),
+                                        cluster_epoch: id.cluster_epoch(),
+                                        log_index: id.log_index().get(),
+                                    },
+                                )
+                            }
+                            error => ObjectPgActionError::Store(error),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1085,9 +1116,15 @@ impl StorageCluster {
         recovery_authorized_source: Option<&MetadataCommandEnvelope>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         loop {
-            authority
+            if let Err(error) = authority
                 .work_budget()
-                .check("pending command recovery gate budget exhausted")?;
+                .check("pending command recovery gate budget exhausted")
+            {
+                let error = self.classify_pending_metadata_command_budget_exhaustion(
+                    pg_id, command, route_mode, error,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let recovery = self
                 .local_map
                 .runtime_state()
@@ -1110,10 +1147,40 @@ impl StorageCluster {
                         wait_us,
                     );
                     self.emit_pending_slot_action_for_command(pg_id, command, "drain_wait");
-                    let waiter_outcome = self
+                    #[cfg(test)]
+                    request_ops::maybe_run_pending_command_recovery_waited_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        command,
+                        authority.work_budget(),
+                    );
+                    if let Err(error) = authority
+                        .work_budget()
+                        .check("pending command recovery wait budget exhausted")
+                    {
+                        let error = self.classify_pending_metadata_command_budget_exhaustion(
+                            pg_id, command, route_mode, error,
+                        )?;
+                        return Err(ObjectPgActionError::Store(error));
+                    }
+                    let waiter_outcome = match self
                         .pending_command_recovery_waiter_outcome_with_route_mode(
                             pg_id, command, route_mode,
-                        )?;
+                        ) {
+                        Ok(outcome) => outcome,
+                        Err(waiter_error) => {
+                            if let Err(error) = authority
+                                .work_budget()
+                                .check("pending command recovery wait budget exhausted")
+                            {
+                                let error = self
+                                    .classify_pending_metadata_command_budget_exhaustion(
+                                        pg_id, command, route_mode, error,
+                                    )?;
+                                return Err(ObjectPgActionError::Store(error));
+                            }
+                            return Err(waiter_error);
+                        }
+                    };
                     self.emit_metadata_command_recovery_outcome_for_command(
                         pg_id,
                         command,
@@ -1143,10 +1210,21 @@ impl StorageCluster {
                         "timed_out",
                     );
                     self.emit_pending_slot_action_for_command(pg_id, command, "drain_timeout");
-                    authority
+                    #[cfg(test)]
+                    request_ops::maybe_run_pending_command_recovery_timeout_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        command,
+                        authority.work_budget(),
+                    );
+                    if let Err(error) = authority
                         .work_budget()
                         .sleep_after_contention("pending command recovery retry budget exhausted")
-                        .map_err(ObjectPgActionError::Store)?;
+                    {
+                        let error = self.classify_pending_metadata_command_budget_exhaustion(
+                            pg_id, command, route_mode, error,
+                        )?;
+                        return Err(ObjectPgActionError::Store(error));
+                    }
                     continue;
                 }
             };
@@ -1168,6 +1246,35 @@ impl StorageCluster {
                 outcome.metric_label(),
             );
             return Ok(outcome);
+        }
+    }
+
+    fn classify_pending_metadata_command_budget_exhaustion(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        budget_error: StoreError,
+    ) -> Result<StoreError, ObjectPgActionError> {
+        let confirmation_deadline =
+            Instant::now() + request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+        if self
+            .metadata_command_has_exact_or_uncertain_applied_entry_on_acting_set_until(
+                pg_id,
+                command,
+                route_mode,
+                confirmation_deadline,
+            )
+            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+        {
+            let id = command.id();
+            Ok(StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: id.pg_id().get(),
+                cluster_epoch: id.cluster_epoch(),
+                log_index: id.log_index().get(),
+            })
+        } else {
+            Ok(budget_error)
         }
     }
 
@@ -1321,7 +1428,14 @@ impl StorageCluster {
         let recovery_abandoned_source = execution_route.recovery_abandoned_source.cloned();
         let mut command = command.clone();
         loop {
-            work_budget.check("object metadata pending command apply budget exhausted")?;
+            if let Err(error) =
+                work_budget.check("object metadata pending command apply budget exhausted")
+            {
+                let error = self.classify_pending_metadata_command_budget_exhaustion(
+                    pg_id, &command, route_mode, error,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let command_bucket = command.bucket_name();
             let abandoned_on_acting_set = match route_mode {
                 MetadataCommandRouteMode::Normal => {
@@ -1422,11 +1536,14 @@ impl StorageCluster {
                         &error.source,
                     ) =>
                 {
-                    work_budget
-                        .sleep_after_contention(
-                            "pending metadata command transport retry budget exhausted",
-                        )
-                        .map_err(ObjectPgActionError::Store)?;
+                    if let Err(error) = work_budget.sleep_after_contention(
+                        "pending metadata command transport retry budget exhausted",
+                    ) {
+                        let error = self.classify_pending_metadata_command_budget_exhaustion(
+                            pg_id, &command, route_mode, error,
+                        )?;
+                        return Err(ObjectPgActionError::Store(error));
+                    }
                     continue;
                 }
                 Err(error)
@@ -1481,7 +1598,15 @@ impl StorageCluster {
                         self.after_object_metadata_command_applied(&command);
                         return Ok(PendingMetadataCommandOutcome::Applied);
                     }
-                    return Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict);
+                    if let Err(error) = work_budget.sleep_after_contention(
+                        "partial pending object metadata convergence budget exhausted",
+                    ) {
+                        let error = self.classify_pending_metadata_command_budget_exhaustion(
+                            pg_id, &command, route_mode, error,
+                        )?;
+                        return Err(ObjectPgActionError::Store(error));
+                    }
+                    continue;
                 }
                 Err(error)
                     if error.progress.is_abortable()
@@ -1499,6 +1624,11 @@ impl StorageCluster {
                         Err(BucketSnapshotLoadError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
+                            if abandon_zero_apply_stale_reservation {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "retryable partial pending object metadata drain",
+                                ));
+                            }
                             return Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict);
                         }
                         Err(error) => {

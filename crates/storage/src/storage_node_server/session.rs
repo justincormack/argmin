@@ -764,6 +764,15 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
                 message: error.to_string(),
             }
         }
+        error @ (StoreError::MetadataCommandLogChecksumMismatch { .. }
+        | StoreError::MetadataCommandLogHashMismatch { .. }
+        | StoreError::MetadataCommandReplicaStateEncodingVersion { .. }
+        | StoreError::MetadataCommandReplicaStateDiverged { .. }
+        | StoreError::MetadataStateDigestMismatch { .. }
+        | StoreError::MetadataCheckpointInvalid { .. }) => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::MetadataCommandIntegrity,
+            message: error.to_string(),
+        },
         error => StorageRpcErrorResponse {
             code: StorageRpcErrorCode::Internal,
             message: error.to_string(),

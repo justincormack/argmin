@@ -2399,6 +2399,401 @@ fn multipart_barrier_sequence_is_bucket_primary_serialized_across_object_pgs() {
 }
 
 #[test]
+fn identical_multipart_completions_help_partial_barrier_without_contention() {
+    struct TrailingApplyReleaseGuard {
+        gate: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    impl TrailingApplyReleaseGuard {
+        fn release(&self) {
+            let (released, wake) = &*self.gate;
+            *released.lock().unwrap_or_else(|error| error.into_inner()) = true;
+            wake.notify_all();
+        }
+    }
+
+    impl Drop for TrailingApplyReleaseGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "samebarrierhelper");
+    let upload_id = request.upload_id.clone();
+    let completion_fingerprint = request.completion_fingerprint;
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let trailing_attempts = Arc::new(AtomicUsize::new(0));
+    let block_first_trailing_apply = Arc::new(AtomicBool::new(true));
+    let hook_attempts = Arc::clone(&trailing_attempts);
+    let hook_block = Arc::clone(&block_first_trailing_apply);
+    let hook_bucket = bucket.clone();
+    let (trailing_reached_tx, trailing_reached_rx) = std::sync::mpsc::channel();
+    let trailing_release = TrailingApplyReleaseGuard {
+        gate: Arc::new((Mutex::new(false), Condvar::new())),
+    };
+    let hook_release = Arc::clone(&trailing_release.gate);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            let MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance) =
+                command.payload()
+            else {
+                return Ok(());
+            };
+            if advance.bucket != hook_bucket
+                || advance.barrier_sequence != 1
+                || node_id != NodeId::new(2)
+            {
+                return Ok(());
+            }
+
+            hook_attempts.fetch_add(1, Ordering::SeqCst);
+            if hook_block.swap(false, Ordering::SeqCst) {
+                trailing_reached_tx
+                    .send(())
+                    .expect("test should observe the blocked trailing barrier apply");
+                let (released, wake) = &*hook_release;
+                let mut released = released.lock().unwrap_or_else(|error| error.into_inner());
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+            }
+            Ok(())
+        },
+    ));
+
+    let first_cluster = Arc::clone(&cluster);
+    let first_request = request.clone();
+    let (first_result_tx, first_result_rx) = std::sync::mpsc::channel();
+    let first = std::thread::spawn(move || {
+        first_result_tx
+            .send(first_cluster.complete_multipart_upload_commit_serialized(first_request))
+            .expect("test should retain the first completion receiver");
+    });
+    trailing_reached_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first completion did not reach the trailing barrier apply");
+
+    let (pending_observed_tx, pending_observed_rx) = std::sync::mpsc::channel();
+    let pending_bucket = bucket.clone();
+    let pending_hook = cluster.test_install_multipart_completion_pending_barrier_observed_hook(
+        Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(advance)
+                    if advance.bucket == pending_bucket && advance.barrier_sequence == 1
+            ) {
+                pending_observed_tx
+                    .send(())
+                    .expect("test should retain the pending-barrier observation receiver");
+                return true;
+            }
+            false
+        }),
+    );
+    let confirmation_deadlines = Arc::new(Mutex::new(Vec::new()));
+    let confirmation_deadlines_for_hook = Arc::clone(&confirmation_deadlines);
+    let inspection_hook = cluster.test_install_post_budget_metadata_command_inspection_hook(
+        Arc::new(move |node_id, deadline| {
+            confirmation_deadlines_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(deadline);
+            (node_id == NodeId::new(2)).then(|| {
+                Err(StoreError::Io {
+                    context: "injected post-budget metadata command inspection timeout",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "injected post-budget metadata command inspection timeout",
+                    ),
+                })
+            })
+        }),
+    );
+    let second_cluster = Arc::clone(&cluster);
+    let second_request = request.clone();
+    let (second_result_tx, second_result_rx) = std::sync::mpsc::channel();
+    let second = std::thread::spawn(move || {
+        second_result_tx
+            .send(second_cluster.complete_multipart_upload_commit_serialized(second_request))
+            .expect("test should retain the second completion receiver");
+    });
+    pending_observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second completion did not observe the partial barrier");
+    let second_result = second_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("second completion did not classify the expired partial barrier");
+    assert!(matches!(
+        second_result,
+        Err(crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandDependencyConvergencePending { .. }
+        ))
+    ));
+    let confirmation_deadlines = confirmation_deadlines
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert_eq!(confirmation_deadlines.len(), node_ids.len());
+    assert!(
+        confirmation_deadlines
+            .iter()
+            .all(|deadline| *deadline == confirmation_deadlines[0]),
+        "all post-budget actor inspections must share one absolute deadline"
+    );
+    drop(confirmation_deadlines);
+    drop(inspection_hook);
+    drop(pending_hook);
+
+    let pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    let pending_command = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("partial barrier command must remain pending");
+
+    let integrity_pending_command = pending_command.clone();
+    let integrity_pending_hook = cluster
+        .test_install_multipart_completion_pending_barrier_observed_hook(Arc::new(
+            move |command| command == &integrity_pending_command,
+        ));
+    let integrity_inspection_hook = cluster
+        .test_install_post_budget_metadata_command_inspection_hook(Arc::new(
+            move |node_id, _deadline| {
+                Some(Err(StoreError::StorageRpc {
+                    node_id: node_id.as_u32(),
+                    operation: "inspect metadata command log hashes",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::MetadataCommandIntegrity,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "injected authenticated metadata command integrity failure",
+                    ),
+                }))
+            },
+        ));
+    let integrity_error = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .unwrap_err();
+    drop(integrity_inspection_hook);
+    drop(integrity_pending_hook);
+    assert!(matches!(
+        integrity_error,
+        crate::ObjectPgActionError::Store(StoreError::StorageRpc {
+            failure: crate::storage_rpc::StorageRpcErrorCode::MetadataCommandIntegrity,
+            ..
+        })
+    ));
+
+    let expired_route_observed = Arc::new(AtomicBool::new(false));
+    let expired_route_observed_for_hook = Arc::clone(&expired_route_observed);
+    let expired_route_cluster = Arc::clone(&cluster);
+    let expired_route_command = pending_command.clone();
+    let expired_route_hook = cluster
+        .test_install_multipart_completion_pending_barrier_observed_hook(Arc::new(
+            move |command| {
+                if command != &expired_route_command
+                    || expired_route_observed_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    return false;
+                }
+                expired_route_cluster
+                    .test_store_route_map_validity(crate::RouteMapValidity::until_ms(0).unwrap());
+                true
+            },
+        ));
+    let expired_route_cluster = Arc::clone(&cluster);
+    let expired_route_request = request.clone();
+    let (expired_route_result_tx, expired_route_result_rx) = std::sync::mpsc::channel();
+    let expired_route_helper = std::thread::spawn(move || {
+        expired_route_result_tx
+            .send(
+                expired_route_cluster
+                    .complete_multipart_upload_commit_serialized(expired_route_request),
+            )
+            .expect("test should retain the expired-route helper result receiver");
+    });
+    let expired_route_result = expired_route_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("expired-route helper did not classify the partial barrier");
+    cluster.test_store_route_map_validity(crate::RouteMapValidity::Forever);
+    drop(expired_route_hook);
+    expired_route_helper.join().unwrap();
+    assert!(expired_route_observed.load(Ordering::SeqCst));
+    assert!(matches!(
+        expired_route_result,
+        Err(crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandDependencyConvergencePending { .. }
+        ))
+    ));
+
+    let recovery_owner_cluster = Arc::clone(&cluster);
+    let recovery_owner_command = pending_command.clone();
+    let (recovery_owner_result_tx, recovery_owner_result_rx) = std::sync::mpsc::channel();
+    let recovery_owner = std::thread::spawn(move || {
+        recovery_owner_result_tx
+            .send(
+                recovery_owner_cluster.drain_pending_metadata_command_with_recovery_gate(
+                    pg_id,
+                    &recovery_owner_command,
+                ),
+            )
+            .expect("test should retain the recovery-owner result receiver");
+    });
+    let recovery_flight_deadline = Instant::now() + Duration::from_secs(5);
+    while cluster.test_metadata_command_recovery_flight_count() != 1 {
+        assert!(
+            Instant::now() < recovery_flight_deadline,
+            "recovery owner did not register the pending-command flight"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        cluster.test_metadata_command_recovery_flight_count(),
+        1,
+        "recovery owner must retain the command flight while trailing apply is blocked"
+    );
+
+    let timeout_selected = Arc::new(Barrier::new(2));
+    let retry_selected = Arc::new(Barrier::new(2));
+    cluster.test_install_metadata_command_recovery_wait_hook(
+        pg_id,
+        &pending_command,
+        Arc::clone(&timeout_selected),
+        retry_selected,
+    );
+    let timeout_command = pending_command.clone();
+    let timeout_observed = Arc::new(AtomicBool::new(false));
+    let timeout_observed_for_hook = Arc::clone(&timeout_observed);
+    let timeout_hook =
+        cluster.test_install_pending_command_recovery_timeout_hook(Arc::new(move |command| {
+            command == &timeout_command && !timeout_observed_for_hook.swap(true, Ordering::SeqCst)
+        }));
+    let recovery_waiter_cluster = Arc::clone(&cluster);
+    let recovery_waiter_command = pending_command.clone();
+    let (recovery_waiter_result_tx, recovery_waiter_result_rx) = std::sync::mpsc::channel();
+    let recovery_waiter = std::thread::spawn(move || {
+        recovery_waiter_result_tx
+            .send(
+                recovery_waiter_cluster.drain_pending_metadata_command_with_recovery_gate(
+                    pg_id,
+                    &recovery_waiter_command,
+                ),
+            )
+            .expect("test should retain the recovery-waiter result receiver");
+    });
+    timeout_selected.wait();
+    let recovery_waiter_result = recovery_waiter_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("recovery waiter did not classify its expired wait budget");
+    drop(timeout_hook);
+    assert!(timeout_observed.load(Ordering::SeqCst));
+    assert!(matches!(
+        recovery_waiter_result,
+        Err(crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+        ))
+    ));
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (1, 0),
+        "expired recovery wait must classify publication uncertainty without retrying"
+    );
+
+    let owner_release_selected = Arc::new(Barrier::new(2));
+    cluster.test_install_metadata_command_recovery_owner_completion_hook(
+        pg_id,
+        &pending_command,
+        Arc::clone(&owner_release_selected),
+    );
+    let waited_command = pending_command.clone();
+    let waited_observed = Arc::new(AtomicBool::new(false));
+    let waited_observed_for_hook = Arc::clone(&waited_observed);
+    let waited_hook =
+        cluster.test_install_pending_command_recovery_waited_hook(Arc::new(move |command| {
+            command == &waited_command && !waited_observed_for_hook.swap(true, Ordering::SeqCst)
+        }));
+    let waited_cluster = Arc::clone(&cluster);
+    let waited_command = pending_command.clone();
+    let (waited_result_tx, waited_result_rx) = std::sync::mpsc::channel();
+    let waited_recovery = std::thread::spawn(move || {
+        waited_result_tx
+            .send(
+                waited_cluster
+                    .drain_pending_metadata_command_with_recovery_gate(pg_id, &waited_command),
+            )
+            .expect("test should retain the waited-recovery result receiver");
+    });
+    owner_release_selected.wait();
+    trailing_release.release();
+    let first_result = first_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first completion did not finish after releasing the trailing apply")
+        .expect("first completion should publish the object");
+    let _ = recovery_owner_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("recovery owner did not finish after releasing the trailing apply")
+        .expect("recovery owner should converge the pending barrier");
+    let waited_result = waited_result_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("waited recovery did not classify its expired budget");
+    drop(waited_hook);
+    assert!(waited_observed.load(Ordering::SeqCst));
+    assert!(matches!(
+        waited_result,
+        Err(crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+        ))
+    ));
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (1, 0),
+        "owner completion after budget expiry must classify before route inspection"
+    );
+    first.join().unwrap();
+    second.join().unwrap();
+    recovery_owner.join().unwrap();
+    recovery_waiter.join().unwrap();
+    waited_recovery.join().unwrap();
+    drop(hook_guard);
+
+    let primary = map
+        .metadata_pg_primary_node(cluster.operation_epoch(), PgId::new(object_pg))
+        .unwrap()
+        .storage_node();
+    let pg = primary.get_pg(object_pg).unwrap();
+    let replay = pg
+        .get_multipart_completion_replay(&bucket, &key, &upload_id)
+        .unwrap()
+        .expect("the coordinator must be able to reauthorize the completed upload");
+    assert_eq!(replay.version_id, first_result.version_id);
+    assert_eq!(replay.fingerprint, completion_fingerprint);
+    drop(pg);
+    assert!(
+        trailing_attempts.load(Ordering::SeqCst) >= 1,
+        "the delayed trailing barrier apply must be exercised"
+    );
+    assert_clean_metadata_command_stream(
+        &map,
+        &[cluster.bucket_metadata_pg_id(&bucket), object_pg],
+    );
+}
+
+#[test]
 fn multipart_completion_zero_apply_failure_retains_pending_command_for_retry() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -2663,6 +3058,51 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
     assert!(
         pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
         "published completion must remain pending while a trailing replica is unavailable"
+    );
+
+    let reservation_ids = || {
+        let pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+        let primary = map
+            .metadata_pg_primary_node(cluster.operation_epoch(), pg_id)
+            .unwrap();
+        let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+        let mut ids = crate::PgMetadataStore::durable_bucket_write_reservations(&*pg, &bucket)
+            .unwrap()
+            .into_iter()
+            .map(|reservation| reservation.reservation_id)
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    };
+    let reservations_before_typed_timeout = reservation_ids();
+    let typed_timeout_observed = Arc::new(AtomicBool::new(false));
+    let typed_timeout_observed_for_hook = Arc::clone(&typed_timeout_observed);
+    let typed_timeout_hook =
+        cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+            move |event, _proof| {
+                event
+                    == crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::PendingDrain
+                    && !typed_timeout_observed_for_hook.swap(true, Ordering::SeqCst)
+            },
+        ));
+    let mut typed_timeout_request = request.clone();
+    typed_timeout_request.completion_fingerprint =
+        crate::MultipartCompletionFingerprint::from_bytes([0x5a; 32]);
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(typed_timeout_request)
+        .unwrap_err();
+    drop(typed_timeout_hook);
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+        )
+    ));
+    assert!(typed_timeout_observed.load(Ordering::SeqCst));
+    assert_eq!(
+        reservation_ids(),
+        reservations_before_typed_timeout,
+        "typed convergence timeout must release the retry's auxiliary reservation"
     );
 
     let auxiliary_release_observed = Arc::new(AtomicBool::new(false));
@@ -2936,32 +3376,11 @@ fn multipart_completion_retries_partial_bucket_barrier_command() {
         },
     ));
 
-    let err = cluster
-        .complete_multipart_upload_commit_serialized(req.clone())
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            crate::ObjectPgActionError::Store(
-                StoreError::MetadataCommandDependencyConvergencePending { pg_id: 1, .. }
-            )
-        ),
-        "expected published but unconverged bucket-PG dependency, got {err:?}"
-    );
-    drop(hook_guard);
-    assert!(!fail_once.load(Ordering::SeqCst));
-    assert!(
-        pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_some(),
-        "partial bucket-PG barrier command must remain pending"
-    );
-    assert!(
-        pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none(),
-        "object-PG completion must not publish before the barrier command converges"
-    );
-
     let outcome = cluster
         .complete_multipart_upload_commit_serialized(req.clone())
-        .unwrap();
+        .expect("one-shot trailing barrier failure must converge within the request");
+    drop(hook_guard);
+    assert!(!fail_once.load(Ordering::SeqCst));
 
     assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
     assert!(pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none());

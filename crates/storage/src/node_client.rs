@@ -1383,7 +1383,7 @@ impl StorageRpcRequestDispatchFailure {
     }
 }
 
-fn storage_rpc_deadline_expired(context: &'static str) -> StoreError {
+pub(crate) fn storage_rpc_deadline_expired(context: &'static str) -> StoreError {
     StoreError::Io {
         context,
         source: io::Error::new(

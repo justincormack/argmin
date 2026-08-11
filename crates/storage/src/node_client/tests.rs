@@ -3606,6 +3606,41 @@ fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope 
     )
 }
 
+#[test]
+fn local_metadata_command_hash_inspection_bounds_pg_lock_wait_by_deadline() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let pg_guard = storage_node.get_pg(0).unwrap();
+    let started = Instant::now();
+    let error =
+        MetadataCommandInspectionNodeClient::applied_metadata_command_log_entry_hashes_until(
+            &client,
+            PgId::new(0),
+            &test_metadata_command(0, 1),
+            Instant::now() + Duration::from_millis(20),
+        )
+        .unwrap_err();
+    drop(pg_guard);
+
+    assert!(matches!(
+        error,
+        StoreError::Io { source, .. }
+            if source.kind() == std::io::ErrorKind::TimedOut
+    ));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "local PG lock wait ignored the confirmation deadline"
+    );
+}
+
 fn test_metadata_command_recovery_chain(
     pg_id: u32,
 ) -> (

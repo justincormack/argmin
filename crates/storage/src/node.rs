@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, feature = "test-hooks"))]
 use std::sync::OnceLock;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use placement::NodeId;
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1507,6 +1508,57 @@ impl SharedStorageNode {
             .get(&pg_id)
             .ok_or(StoreError::PgNotFound { pg_id })?;
         Ok(mutex.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    pub(crate) fn get_pg_until(
+        &self,
+        pg_id: u32,
+        deadline: Instant,
+    ) -> Result<MutexGuard<'_, PgStore>, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::get_pg_until",
+            "pg_id={}",
+            pg_id
+        );
+        let mutex = self
+            .stores
+            .get(&pg_id)
+            .ok_or(StoreError::PgNotFound { pg_id })?;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(crate::node_client::storage_rpc_deadline_expired(
+                    "acquire local PG for metadata command confirmation",
+                ));
+            }
+            match mutex.try_lock() {
+                Ok(guard) => {
+                    if Instant::now() >= deadline {
+                        drop(guard);
+                        return Err(crate::node_client::storage_rpc_deadline_expired(
+                            "acquire local PG for metadata command confirmation",
+                        ));
+                    }
+                    return Ok(guard);
+                }
+                Err(std::sync::TryLockError::Poisoned(error)) => {
+                    let guard = error.into_inner();
+                    if Instant::now() >= deadline {
+                        drop(guard);
+                        return Err(crate::node_client::storage_rpc_deadline_expired(
+                            "acquire local PG for metadata command confirmation",
+                        ));
+                    }
+                    return Ok(guard);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        continue;
+                    };
+                    std::thread::sleep(remaining.min(Duration::from_millis(1)));
+                }
+            }
+        }
     }
 
     pub(crate) fn get_pg_for_metadata_read(

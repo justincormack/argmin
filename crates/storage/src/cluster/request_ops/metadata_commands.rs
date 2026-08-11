@@ -315,6 +315,76 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_multipart_completion_pending_barrier_observed_hook(
+        &self,
+        hook: MultipartCompletionPendingBarrierObservedTestHook,
+    ) -> MultipartCompletionPendingBarrierObservedTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = MULTIPART_COMPLETION_PENDING_BARRIER_OBSERVED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MultipartCompletionPendingBarrierObservedTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_pending_object_metadata_partial_conflict_hook(
+        &self,
+        hook: PendingObjectMetadataPartialConflictTestHook,
+    ) -> PendingObjectMetadataPartialConflictTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        PendingObjectMetadataPartialConflictTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_post_budget_metadata_command_inspection_hook(
+        &self,
+        hook: PostBudgetMetadataCommandInspectionTestHook,
+    ) -> PostBudgetMetadataCommandInspectionTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = POST_BUDGET_METADATA_COMMAND_INSPECTION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        PostBudgetMetadataCommandInspectionTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_pending_command_recovery_timeout_hook(
+        &self,
+        hook: PendingCommandRecoveryTimeoutTestHook,
+    ) -> PendingCommandRecoveryTimeoutTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = PENDING_COMMAND_RECOVERY_TIMEOUT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        PendingCommandRecoveryTimeoutTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_pending_command_recovery_waited_hook(
+        &self,
+        hook: PendingCommandRecoveryWaitedTestHook,
+    ) -> PendingCommandRecoveryWaitedTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = PENDING_COMMAND_RECOVERY_WAITED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        PendingCommandRecoveryWaitedTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_multipart_completion_stale_retry_hook(
         &self,
         hook: MultipartCompletionStaleRetryTestHook,
@@ -370,7 +440,7 @@ impl super::StorageCluster {
         MetadataCommandApplyContextTestHookGuard { scope_id }
     }
 
-    fn metadata_command_apply_test_hook_scope_id(&self) -> usize {
+    pub(super) fn metadata_command_apply_test_hook_scope_id(&self) -> usize {
         std::sync::Arc::as_ptr(&self.local_map) as usize
     }
 
@@ -823,9 +893,7 @@ impl super::StorageCluster {
         execution_route: MetadataCommandExecutionRoute<'_>,
         reservation_authority: &StorageCluster,
     ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
-        const PUBLICATION_CONFIRM_BUDGET: Duration = Duration::from_secs(1);
-
-        let deadline = Instant::now() + PUBLICATION_CONFIRM_BUDGET;
+        let deadline = Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
         let mut progress = MetadataCommandApplyProgress::Abortable;
         let mut publication_may_have_applied = false;
         let mut applied_nodes = 0usize;
@@ -1842,7 +1910,7 @@ impl super::StorageCluster {
             command,
             MetadataCommandFinishPolicy {
                 clear_pending_on_zero_apply,
-                retry_partial_exact_conflict: false,
+                retry_partial_exact_conflict: true,
                 convergence_requirement: MetadataCommandConvergenceRequirement::RequireAllReplicas,
             },
             MetadataCommandExecutionRoute::normal(),
@@ -1854,9 +1922,9 @@ impl super::StorageCluster {
             FinishPendingMetadataCommandResult::Abandoned => {
                 Ok(super::PendingMetadataCommandOutcome::Abandoned)
             }
-            FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
-                unreachable!("partial exact conflict retry is disabled for this caller")
-            }
+            FinishPendingMetadataCommandResult::RetryPartialExactConflict => Ok(
+                super::PendingMetadataCommandOutcome::RetryPartialExactConflict,
+            ),
         }
     }
 
@@ -1922,7 +1990,38 @@ impl super::StorageCluster {
         let recovery_abandoned_source = execution_route.recovery_abandoned_source.cloned();
         let mut command = command.clone();
         loop {
-            work_budget.check("metadata command apply retry budget exhausted")?;
+            if let Err(error) = work_budget.check("metadata command apply retry budget exhausted") {
+                let confirmation_deadline =
+                    Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+                if self
+                    .metadata_command_has_exact_or_uncertain_applied_entry_on_acting_set_until(
+                        pg_id,
+                        &command,
+                        route_mode,
+                        confirmation_deadline,
+                    )?
+                {
+                    let id = command.id();
+                    return Err(match policy.convergence_requirement {
+                        MetadataCommandConvergenceRequirement::AllowRecoveryHandoff => {
+                            StoreError::MetadataCommandIrrevocableConvergencePending {
+                                pg_id: id.pg_id().get(),
+                                cluster_epoch: id.cluster_epoch(),
+                                log_index: id.log_index().get(),
+                            }
+                        }
+                        MetadataCommandConvergenceRequirement::RequireAllReplicas => {
+                            StoreError::MetadataCommandDependencyConvergencePending {
+                                pg_id: id.pg_id().get(),
+                                cluster_epoch: id.cluster_epoch(),
+                                log_index: id.log_index().get(),
+                            }
+                        }
+                    }
+                    .into());
+                }
+                return Err(error.into());
+            }
             let command_bucket = command.bucket_name();
             let abandoned_on_acting_set = match route_mode {
                 MetadataCommandRouteMode::Normal => {

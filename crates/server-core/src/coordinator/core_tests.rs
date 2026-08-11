@@ -13068,27 +13068,18 @@ fn delete_object_marker_version_reservation_maps_command_log_conflict_to_slow_do
 }
 
 #[test]
-fn conditional_delete_maps_metadata_command_budget_exhaustion_to_request_conflict() {
-    let cond = DeleteCondition::IfMatch("\"etag\"".into());
+fn conditional_delete_maps_metadata_command_budget_exhaustion_to_slow_down() {
     let error = Coordinator::map_delete_object_pg_action_error(
         storage::test_support::object_metadata_mutation_failure_for_kind(
             storage::ObjectMetadataMutationFailureKind::MetadataCommandContention,
         ),
-        &cond,
-        "key",
     );
-    assert!(matches!(
-        error,
-        ServerError::ConditionalRequestConflict { key, condition }
-            if key == "key" && condition == "If-Match"
-    ));
+    assert!(matches!(error, ServerError::SlowDown));
 
     let error = Coordinator::map_delete_object_pg_action_error(
         storage::test_support::object_metadata_mutation_failure_for_kind(
             storage::ObjectMetadataMutationFailureKind::MetadataCommandContention,
         ),
-        &DeleteCondition::None,
-        "key",
     );
     assert!(matches!(error, ServerError::SlowDown));
 
@@ -13096,14 +13087,12 @@ fn conditional_delete_maps_metadata_command_budget_exhaustion_to_request_conflic
         storage::test_support::object_metadata_mutation_failure_for_kind(
             storage::ObjectMetadataMutationFailureKind::RetryableConvergence,
         ),
-        &cond,
-        "key",
     );
     assert!(matches!(error, ServerError::SlowDown));
 }
 
 #[test]
-fn conditional_delete_marker_version_reservation_conflict_is_request_conflict() {
+fn conditional_delete_marker_version_reservation_conflict_is_slow_down() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -13158,11 +13147,7 @@ fn conditional_delete_marker_version_reservation_conflict_is_request_conflict() 
             &cond,
         ))
         .unwrap_err();
-    assert!(matches!(
-        error,
-        ServerError::ConditionalRequestConflict { ref key, condition }
-            if key == "key" && condition == "If-Match"
-    ));
+    assert!(matches!(error, ServerError::SlowDown));
     drop(hook_guard);
 
     let versions = coord

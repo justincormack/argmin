@@ -484,6 +484,115 @@ impl StorageCluster {
         Ok(expected_hashes.is_some())
     }
 
+    fn metadata_command_has_exact_or_uncertain_applied_entry_on_acting_set_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let nodes = match route_mode {
+            MetadataCommandRouteMode::Normal => self
+                .local_map
+                .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id),
+            MetadataCommandRouteMode::Recovery => self
+                .local_map
+                .metadata_pg_acting_nodes_for_metadata_command_recovery(
+                    command.id().cluster_epoch(),
+                    pg_id,
+                ),
+        };
+        let nodes = match nodes {
+            Ok(nodes) => nodes,
+            // This probe runs only after the caller's ordinary work budget has
+            // expired. A stale/unavailable route cannot prove that no actor
+            // durably published the exact command, so preserve the typed
+            // convergence state instead of reclassifying it as contention.
+            Err(_) => return Ok(true),
+        };
+        let mut exact_entry = None;
+        let mut conflicting_node_id = None;
+        let mut uncertain = false;
+        for node in nodes {
+            if Instant::now() >= deadline {
+                uncertain = true;
+                break;
+            }
+            #[cfg(test)]
+            let observation = request_ops::maybe_run_post_budget_metadata_command_inspection_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                node.node_id(),
+                deadline,
+            )
+            .unwrap_or_else(|| {
+                node.metadata_command_inspection_client()
+                    .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline)
+            });
+            #[cfg(not(test))]
+            let observation = node
+                .metadata_command_inspection_client()
+                .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline);
+            let hashes = match observation {
+                Ok(Some(hashes)) => hashes,
+                Ok(None) => continue,
+                Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                    conflicting_node_id = Some(node.node_id());
+                    continue;
+                }
+                Err(
+                    error @ (StoreError::MetadataCommandLogChecksumMismatch { .. }
+                    | StoreError::MetadataCommandLogHashMismatch { .. }
+                    | StoreError::MetadataCommandReplicaStateEncodingVersion { .. }
+                    | StoreError::MetadataCommandReplicaStateDiverged { .. }
+                    | StoreError::MetadataStateDigestMismatch { .. }
+                    | StoreError::MetadataCheckpointInvalid { .. }),
+                ) => return Err(error.into()),
+                Err(
+                    error @ StoreError::StorageRpc {
+                        failure: crate::storage_rpc::StorageRpcErrorCode::MetadataCommandIntegrity,
+                        ..
+                    },
+                ) => return Err(error.into()),
+                Err(_) => {
+                    uncertain = true;
+                    continue;
+                }
+            };
+            match exact_entry {
+                None => exact_entry = Some((node.node_id(), hashes)),
+                Some((_, expected)) if hashes == expected => {}
+                Some((_, (expected_previous_log_hash, expected_log_hash))) => {
+                    let (actual_previous_log_hash, actual_log_hash) = hashes;
+                    return Err(StoreError::MetadataCommandLogHashMismatch {
+                        node_id: node.node_id().as_u32(),
+                        pg_id: pg_id.get(),
+                        cluster_epoch: command.id().cluster_epoch(),
+                        log_index: command.id().log_index().get(),
+                        expected_previous_log_hash,
+                        actual_previous_log_hash,
+                        expected_log_hash,
+                        actual_log_hash,
+                    }
+                    .into());
+                }
+            }
+        }
+        if let (Some((exact_node_id, _)), Some(conflicting_node_id)) =
+            (exact_entry, conflicting_node_id)
+        {
+            return Err(MetadataError::InvariantViolation {
+                context: "confirm metadata command publication after request budget exhaustion",
+                reason: format!(
+                    "acting set contains exact command on node {} and a conflicting command at the same PG/epoch/log index on node {}",
+                    exact_node_id.as_u32(),
+                    conflicting_node_id.as_u32()
+                ),
+            }
+            .into());
+        }
+        Ok(exact_entry.is_some() || uncertain)
+    }
+
     fn retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
         &self,
         pg_id: PgId,
@@ -503,6 +612,57 @@ impl StorageCluster {
         }
         self.metadata_command_is_applied_on_all_acting_nodes(pg_id, command)
             .map(Some)
+    }
+
+    fn exact_metadata_command_conflict_is_retryable(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        source: &BucketSnapshotLoadError,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+            node_id: conflict_node_id,
+            ..
+        }) = source
+        else {
+            return Ok(false);
+        };
+        if !Self::metadata_command_log_conflict_matches(command, source) {
+            return Ok(false);
+        }
+
+        let primary_node_id = self
+            .local_map
+            .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id)?
+            .node_id();
+        let mut nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
+        let witness_node_id = nodes
+            .iter()
+            .map(|node| node.node_id())
+            .filter(|node_id| *node_id != primary_node_id)
+            .min();
+        nodes.sort_by_key(|node| {
+            Self::metadata_command_publication_order_key(
+                node.node_id(),
+                primary_node_id,
+                witness_node_id,
+            )
+        });
+        let Some(applied_nodes) = nodes
+            .iter()
+            .position(|node| node.node_id().as_u32() == *conflict_node_id)
+        else {
+            return Ok(false);
+        };
+
+        self.partial_exact_metadata_command_conflict_is_retryable(
+            pg_id,
+            command,
+            applied_nodes,
+            source,
+        )
     }
 
     #[cfg(test)]
@@ -3883,6 +4043,22 @@ impl StorageCluster {
                 command,
                 timeout_selected,
                 retry_selected,
+            );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_metadata_command_recovery_owner_completion_hook(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        owner_release_selected: Arc<std::sync::Barrier>,
+    ) {
+        self.local_map
+            .runtime_state()
+            .test_install_metadata_command_recovery_owner_completion_hook(
+                pg_id,
+                command,
+                owner_release_selected,
             );
     }
 

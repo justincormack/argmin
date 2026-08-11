@@ -22,27 +22,16 @@ use crate::error::ServerError;
 impl Coordinator {
     pub(super) fn map_delete_object_pg_action_error(
         error: storage::ObjectMetadataMutationFailure,
-        cond: &DeleteCondition,
-        key: &str,
     ) -> ServerError {
-        if !cond.is_empty()
-            && error.kind() == storage::ObjectMetadataMutationFailureKind::MetadataCommandContention
-        {
-            ServerError::ConditionalRequestConflict {
-                key: key.to_string(),
-                condition: "If-Match",
+        match error.kind() {
+            storage::ObjectMetadataMutationFailureKind::ResourceExhausted
+            | storage::ObjectMetadataMutationFailureKind::MetadataCommandContention
+            | storage::ObjectMetadataMutationFailureKind::RetryableConvergence => {
+                ServerError::SlowDown
             }
-        } else {
-            match error.kind() {
-                storage::ObjectMetadataMutationFailureKind::ResourceExhausted
-                | storage::ObjectMetadataMutationFailureKind::MetadataCommandContention
-                | storage::ObjectMetadataMutationFailureKind::RetryableConvergence => {
-                    ServerError::SlowDown
-                }
-                storage::ObjectMetadataMutationFailureKind::ObjectNotFound
-                | storage::ObjectMetadataMutationFailureKind::InternalError => {
-                    ServerError::ObjectMetadataMutation(error)
-                }
+            storage::ObjectMetadataMutationFailureKind::ObjectNotFound
+            | storage::ObjectMetadataMutationFailureKind::InternalError => {
+                ServerError::ObjectMetadataMutation(error)
             }
         }
     }
@@ -97,9 +86,7 @@ impl Coordinator {
                         }
                         Ok(())
                     })
-                    .map_err(|error| {
-                        Self::map_delete_object_pg_action_error(error, cond, key.as_str())
-                    })??;
+                    .map_err(Self::map_delete_object_pg_action_error)??;
 
                 if let storage::DeletedCurrentObject::Live {
                     generation_id,
@@ -206,9 +193,7 @@ impl Coordinator {
                             }
                             Ok(())
                         })
-                    .map_err(|error| {
-                        Self::map_delete_object_pg_action_error(error, cond, key.as_str())
-                    })??;
+                    .map_err(Self::map_delete_object_pg_action_error)??;
 
                 match deleted.deleted {
                     storage::DeletedSpecificObjectVersion::Missing => Ok(DeleteObjectResult {
@@ -295,9 +280,7 @@ impl Coordinator {
                             Ok(())
                         },
                     )
-                    .map_err(|error| {
-                        Self::map_delete_object_pg_action_error(error, cond, key.as_str())
-                    })??;
+                    .map_err(Self::map_delete_object_pg_action_error)??;
 
                 Ok(DeleteObjectResult {
                     version_id: Some(marker.version_id),

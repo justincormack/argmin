@@ -8,7 +8,7 @@
     };
     use crate::node_client::{
         LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
-        PlacedShardNodeClient, UnixStorageNodeClient,
+        MetadataCommandInspectionNodeClient, PlacedShardNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::{
@@ -4544,6 +4544,108 @@
         }
         drop(client);
         assert!(join.join().unwrap().is_ok());
+    }
+
+    fn authenticated_metadata_hash_inspection_preserves_integrity_failure(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        let bucket = crate::tests::bucket_name("metadata-integrity-rpc-bucket");
+        let create_config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config_for_test(&create_config, 1_234, 1).unwrap(),
+            ),
+        );
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            pg.apply_metadata_command_and_record(config.node_id.as_u32(), &command)
+                .unwrap();
+            pg.test_set_metadata_command_log_checksum(
+                1,
+                command.checksum_crc64().wrapping_add(1),
+            )
+            .unwrap();
+        }
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let error = MetadataCommandInspectionNodeClient::applied_metadata_command_log_entry_hashes(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::MetadataCommandIntegrity,
+                ..
+            }
+        ));
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_hash_inspection_preserves_integrity_failure() {
+        authenticated_metadata_hash_inspection_preserves_integrity_failure(false);
+    }
+
+    #[test]
+    fn authenticated_tls_metadata_hash_inspection_preserves_integrity_failure() {
+        authenticated_metadata_hash_inspection_preserves_integrity_failure(true);
     }
 
     fn authenticated_metadata_apply_preconnect_failure_is_not_sent(tcp: bool) {

@@ -7994,7 +7994,7 @@ fn direct_put_commit_drains_unrelated_pending_command_before_publish() {
 }
 
 #[test]
-fn direct_put_commit_returns_contention_after_unrelated_partial_exact_pending_conflict() {
+fn direct_put_preserves_irrevocable_outcome_after_partial_pending_conflict_budget_expiry() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -8096,76 +8096,29 @@ fn direct_put_commit_returns_contention_after_unrelated_partial_exact_pending_co
         "unrelated object metadata command must start pending"
     );
 
-    let _serial = lock_metadata_command_apply_hook_test();
-    let fail_once = Arc::new(AtomicBool::new(true));
-    let hook_map = Arc::clone(&map);
-    let hook_bucket = bucket.clone();
-    let hook_key = pending_key.clone();
-    let fail_once_hook = Arc::clone(&fail_once);
-    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
-        move |node_id, command| {
-            match command.payload() {
-                MetadataCommandPayload::PutObjectMetadata(update)
-                    if update.object.bucket == hook_bucket
-                        && update.object.key == hook_key
-                        && node_id == NodeId::new(2)
-                        && fail_once_hook.swap(false, Ordering::SeqCst) =>
-                {
-                    let node = hook_map.node(NodeId::new(2)).unwrap().storage_node();
-                    let pg = node.get_pg(command.id().pg_id().get())?;
-                    pg.apply_metadata_command_and_record(NodeId::new(2).as_u32(), command)
-                        .map_err(|error| match error {
-                            crate::BucketSnapshotLoadError::Store(error) => error,
-                            crate::BucketSnapshotLoadError::Metadata(error) => {
-                                panic!("manual object metadata command apply failed: {error}")
-                            }
-                        })?;
-                    return Err(StoreError::MetadataCommandLogConflict {
-                        node_id: node_id.as_u32(),
-                        pg_id: command.id().pg_id().get(),
-                        cluster_epoch: command.id().cluster_epoch(),
-                        log_index: command.id().log_index().get(),
-                    });
-                }
-                _ => {}
-            }
-            Ok(())
-        },
-    ));
-
-    let outcome = cluster
+    let partial_conflict_observed = Arc::new(AtomicBool::new(false));
+    let partial_conflict_observed_for_hook = Arc::clone(&partial_conflict_observed);
+    let partial_conflict_hook = cluster.test_install_pending_object_metadata_partial_conflict_hook(
+        Arc::new(move |command| {
+            matches!(
+                command.payload(),
+                MetadataCommandPayload::PutObjectMetadata(_)
+            ) && !partial_conflict_observed_for_hook.swap(true, Ordering::SeqCst)
+        }),
+    );
+    let error = cluster
         .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
             Ok::<_, ()>(())
         })
-        .unwrap()
-        .unwrap();
-    drop(hook_guard);
-    for node_id in node_ids {
-        let pg = map
-            .node(node_id)
-            .unwrap()
-            .storage_node()
-            .get_pg(object_pg)
-            .unwrap();
-        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key).unwrap();
-        assert_eq!(
-            stored
-                .as_live()
-                .unwrap()
-                .tags
-                .as_ref()
-                .map(crate::SerializedTagSet::as_str),
-            Some(crate::tests::object_tags(tags).as_str())
-        );
-        assert!(
-            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
-                .unwrap()
-                .as_live()
-                .is_some(),
-            "direct PUT should publish after recovering a now-complete unrelated pending command"
-        );
-    }
-    assert_eq!(outcome.version_id.to_u64(), 1);
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+        )
+    ));
+    assert!(partial_conflict_observed.load(Ordering::SeqCst));
+    drop(partial_conflict_hook);
 }
 
 #[test]

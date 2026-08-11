@@ -1375,6 +1375,7 @@ struct MetadataCommandRecoveryWaitTestHook {
     key: MetadataCommandRecoveryKey,
     existing_flight_selections: usize,
     forced_timeouts_remaining: usize,
+    wait_for_owner_selection: usize,
     timeout_selected: Arc<Barrier>,
     retry_selected: Arc<Barrier>,
 }
@@ -1495,8 +1496,34 @@ impl LocalClusterRuntimeState {
             key: MetadataCommandRecoveryKey::new(pg_id, command),
             existing_flight_selections: 0,
             forced_timeouts_remaining: 1,
+            wait_for_owner_selection: 2,
             timeout_selected,
             retry_selected,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_metadata_command_recovery_owner_completion_hook(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        owner_release_selected: Arc<Barrier>,
+    ) {
+        let mut hook = self
+            .metadata_command_recovery_wait_hook
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        assert!(
+            hook.is_none(),
+            "metadata command recovery wait hook already installed"
+        );
+        *hook = Some(MetadataCommandRecoveryWaitTestHook {
+            key: MetadataCommandRecoveryKey::new(pg_id, command),
+            existing_flight_selections: 0,
+            forced_timeouts_remaining: 0,
+            wait_for_owner_selection: 1,
+            timeout_selected: Arc::new(Barrier::new(1)),
+            retry_selected: owner_release_selected,
         });
     }
 
@@ -1586,7 +1613,7 @@ impl LocalClusterRuntimeState {
                         Some(MetadataCommandRecoveryWaitTestAction::ForceTimeout(
                             Arc::clone(&hook.timeout_selected),
                         ))
-                    } else if hook.existing_flight_selections == 2 {
+                    } else if hook.existing_flight_selections == hook.wait_for_owner_selection {
                         Some(MetadataCommandRecoveryWaitTestAction::WaitForOwner(
                             Arc::clone(&hook.retry_selected),
                         ))

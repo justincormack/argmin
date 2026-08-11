@@ -5940,6 +5940,20 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         MetadataCommandNodeClient::applied_metadata_command_log_entry_hashes(self, pg_id, command)
     }
 
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let hashes =
+            pg.applied_metadata_command_log_entry_hashes(self.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(hashes)
+    }
+
     fn retained_metadata_command_log_hashes(
         &self,
         pg_id: PgId,

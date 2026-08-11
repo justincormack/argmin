@@ -210,6 +210,7 @@ pub(crate) enum StorageRpcWireErrorCode {
     ShardIntegrity = 23,
     TransportClosed = 24,
     MultipartConditionalRequestConflict = 25,
+    MetadataCommandIntegrity = 26,
 }
 
 pub(crate) type StorageRpcErrorCode = StorageNodeFailure;
@@ -252,6 +253,8 @@ impl StorageNodeFailure {
     pub(crate) const TransportClosed: Self = Self(StorageRpcWireErrorCode::TransportClosed);
     pub(crate) const MultipartConditionalRequestConflict: Self =
         Self(StorageRpcWireErrorCode::MultipartConditionalRequestConflict);
+    pub(crate) const MetadataCommandIntegrity: Self =
+        Self(StorageRpcWireErrorCode::MetadataCommandIntegrity);
 
     fn from_u16(value: u16) -> Result<Self, StorageRpcPayloadError> {
         match value {
@@ -280,6 +283,7 @@ impl StorageNodeFailure {
             23 => Ok(Self::ShardIntegrity),
             24 => Ok(Self::TransportClosed),
             25 => Ok(Self::MultipartConditionalRequestConflict),
+            26 => Ok(Self::MetadataCommandIntegrity),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),

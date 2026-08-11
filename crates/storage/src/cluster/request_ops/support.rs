@@ -21,6 +21,7 @@ const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(10);
 pub(super) const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
+pub(super) const METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET: Duration = Duration::from_secs(1);
 const BUCKET_WRITE_RESERVATION_LEASE_MILLIS: u64 = 15_000;
 // HTTP streaming PutObject heartbeats active sessions every 10s. Keep the
 // durable create reservation only slightly longer than that so abandoned
@@ -99,6 +100,8 @@ fn metadata_command_terminal_cleanup_error_is_retryable(error: &StoreError) -> b
         StoreError::Io { .. }
             | StoreError::StorageRpcResourceExhausted { .. }
             | StoreError::MetadataCommandContention { .. }
+            | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+            | StoreError::MetadataCommandDependencyConvergencePending { .. }
             | StoreError::PgNotActive { .. }
             | StoreError::RouteMapExpired { .. }
             | StoreError::StaleMetadataOperation { .. }
@@ -497,6 +500,27 @@ pub(crate) type BucketDeleteExactDrainStartTestHook =
 type MultipartCompletionBarrierCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+type MultipartCompletionPendingBarrierObservedTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
+type PendingObjectMetadataPartialConflictTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
+type PostBudgetMetadataCommandInspectionTestHook = Arc<
+    dyn Fn(NodeId, Instant) -> Option<Result<Option<(u64, u64)>, StoreError>> + Send + Sync,
+>;
+
+#[cfg(test)]
+type PendingCommandRecoveryTimeoutTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
+type PendingCommandRecoveryWaitedTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MultipartCompletionStaleRetryTestEvent {
     BeforeStalePayloadSourceLoad,
@@ -511,6 +535,7 @@ type MultipartCompletionStaleRetryTestHook =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MultipartCompletionAuxiliaryReservationTestEvent {
     ExactPending,
+    PendingDrain,
     MatchingContender,
 }
 
@@ -611,6 +636,31 @@ static BEFORE_BUCKET_DELETE_EXACT_DRAIN_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, MultipartCompletionBarrierCommandIdTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static MULTIPART_COMPLETION_PENDING_BARRIER_OBSERVED_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MultipartCompletionPendingBarrierObservedTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS: OnceLock<
+    Mutex<HashMap<usize, PendingObjectMetadataPartialConflictTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static POST_BUDGET_METADATA_COMMAND_INSPECTION_HOOKS: OnceLock<
+    Mutex<HashMap<usize, PostBudgetMetadataCommandInspectionTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static PENDING_COMMAND_RECOVERY_TIMEOUT_HOOKS: OnceLock<
+    Mutex<HashMap<usize, PendingCommandRecoveryTimeoutTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static PENDING_COMMAND_RECOVERY_WAITED_HOOKS: OnceLock<
+    Mutex<HashMap<usize, PendingCommandRecoveryWaitedTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -715,6 +765,31 @@ pub(crate) struct BucketDeleteExactDrainStartTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct MultipartCompletionBarrierCommandIdTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MultipartCompletionPendingBarrierObservedTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct PendingObjectMetadataPartialConflictTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct PostBudgetMetadataCommandInspectionTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct PendingCommandRecoveryTimeoutTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct PendingCommandRecoveryWaitedTestHookGuard {
     scope_id: usize,
 }
 
@@ -927,6 +1002,66 @@ impl Drop for BucketDeleteExactDrainStartTestHookGuard {
 impl Drop for MultipartCompletionBarrierCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks = BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultipartCompletionPendingBarrierObservedTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = MULTIPART_COMPLETION_PENDING_BARRIER_OBSERVED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingObjectMetadataPartialConflictTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for PostBudgetMetadataCommandInspectionTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = POST_BUDGET_METADATA_COMMAND_INSPECTION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingCommandRecoveryTimeoutTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = PENDING_COMMAND_RECOVERY_TIMEOUT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingCommandRecoveryWaitedTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = PENDING_COMMAND_RECOVERY_WAITED_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -1265,6 +1400,91 @@ fn maybe_run_before_multipart_completion_barrier_command_id_hook(_scope_id: usiz
         .cloned();
     if let Some(hook) = hook {
         hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_multipart_completion_pending_barrier_observed_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = MULTIPART_COMPLETION_PENDING_BARRIER_OBSERVED_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook(command)) {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_force_pending_object_metadata_partial_conflict_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
+) -> bool {
+    let hook = PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    let force_partial_conflict = hook.is_some_and(|hook| hook(command));
+    if force_partial_conflict {
+        work_budget.expire_for_test();
+    }
+    force_partial_conflict
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_post_budget_metadata_command_inspection_hook(
+    scope_id: usize,
+    node_id: NodeId,
+    deadline: Instant,
+) -> Option<Result<Option<(u64, u64)>, StoreError>> {
+    POST_BUDGET_METADATA_COMMAND_INSPECTION_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned()
+        .and_then(|hook| hook(node_id, deadline))
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_pending_command_recovery_timeout_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = PENDING_COMMAND_RECOVERY_TIMEOUT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook(command)) {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_pending_command_recovery_waited_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = PENDING_COMMAND_RECOVERY_WAITED_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook(command)) {
+        work_budget.expire_for_test();
     }
 }
 
