@@ -61,7 +61,9 @@ use super::{
 #[cfg(test)]
 use super::{
     maybe_run_multipart_complete_commit_hook, maybe_run_multipart_complete_pre_commit_hook,
-    maybe_run_multipart_complete_snapshot_hook, multipart_complete_stale_snapshot_retry_now,
+    maybe_run_multipart_complete_snapshot_hook,
+    maybe_run_multipart_complete_terminal_reauthorization_hook,
+    multipart_complete_stale_snapshot_retry_now,
 };
 use crate::checksum_claim::ChecksumClaim;
 use crate::conditional::{check_write_conditions, WriteCondition};
@@ -539,9 +541,18 @@ impl Coordinator {
         );
         let mut terminal_race_retries = 0usize;
         let mut stale_snapshot_retry_deadline = None;
+        let mut terminal_reauthorization_only = false;
         'retry_stale_commit_snapshot: loop {
             let authorized =
                 self.authorize_complete_multipart_upload_on_admitted_route(admission, req)?;
+            if terminal_reauthorization_only
+                && matches!(
+                    &authorized,
+                    AuthorizedCompleteMultipartUpload::InProgress { .. }
+                )
+            {
+                return Err(ServerError::OperationAborted);
+            }
             let bucket = req.upload.bucket_name_typed().clone();
             let key = req.upload.key_typed().clone();
             let (bucket_info, lifecycle, upload, completion_context, multipart_write_encryption) =
@@ -923,7 +934,13 @@ impl Coordinator {
                     {
                         continue 'retry_stale_commit_snapshot;
                     }
-                    return Err(ServerError::OperationAborted);
+                    #[cfg(test)]
+                    maybe_run_multipart_complete_terminal_reauthorization_hook(
+                        bucket.as_str(),
+                        key.as_str(),
+                    );
+                    terminal_reauthorization_only = true;
+                    continue 'retry_stale_commit_snapshot;
                 }
                 Err(error)
                     if error.kind() == storage::MultipartCompletionFailureKind::NoSuchUpload

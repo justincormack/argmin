@@ -27,6 +27,8 @@ pub(super) struct ReclamationTestHooks {
     pub(super) after_multipart_complete_pre_commit: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) multipart_complete_stale_snapshot_retry_now:
         Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    pub(super) before_multipart_complete_terminal_reauthorization:
+        Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_complete_commit: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_object_read_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_upload_part_copy_stream_session: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -97,8 +99,10 @@ impl DeterministicFaultGate {
             .changed
             .wait_timeout_while(state, timeout, |state| !state.arrived)
             .unwrap();
+        let arrived = state.arrived;
+        drop(state);
         assert!(
-            state.arrived,
+            arrived,
             "timed out waiting for deterministic fault gate {:?}",
             self.token
         );
@@ -470,6 +474,23 @@ pub(super) fn multipart_complete_stale_snapshot_retry_now(bucket: &str, key: &st
         }
     }
     Instant::now()
+}
+
+pub(super) fn maybe_run_multipart_complete_terminal_reauthorization_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.before_multipart_complete_terminal_reauthorization {
+            hook();
+        }
+    }
 }
 
 pub(super) fn maybe_run_multipart_complete_snapshot_hook(bucket: &str, key: &str) {

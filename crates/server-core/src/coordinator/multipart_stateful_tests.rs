@@ -26,6 +26,9 @@ const NO_READ: &ReadCondition = &ReadCondition {
 };
 const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
+const MULTIPART_COMPLETE_RACE_TIMEOUT: Duration = Duration::from_secs(2);
+const MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN: DeterministicFaultToken =
+    DeterministicFaultToken::new("multipart-complete-terminal-reauthorization");
 
 fn test_sse_s3_provider() -> StaticManagedKeyProvider {
     StaticManagedKeyProvider::single(
@@ -391,8 +394,17 @@ struct MultipartCompletePreCommitRaceSync {
     reached: Arc<Barrier>,
     resume: Arc<Barrier>,
     retry_clock: Option<MultipartCompleteRetryClock>,
-    _serial_guard: MutexGuard<'static, ()>,
     _guard: ReclamationTestHookGuard,
+    _serial_guard: MutexGuard<'static, ()>,
+}
+
+struct MultipartCompleteStaleDeadlineRaceSync {
+    pre_commit_reached: Arc<Barrier>,
+    pre_commit_resume: Arc<Barrier>,
+    terminal_reauthorization_gate: Arc<DeterministicFaultGate>,
+    retry_clock: MultipartCompleteRetryClock,
+    _guard: ReclamationTestHookGuard,
+    _serial_guard: MutexGuard<'static, ()>,
 }
 
 #[derive(Clone)]
@@ -426,6 +438,61 @@ impl MultipartCompletePreCommitRaceSync {
     }
 }
 
+impl MultipartCompleteStaleDeadlineRaceSync {
+    fn advance_retry_clock(&self, elapsed: Duration) {
+        self.retry_clock.advance(elapsed);
+    }
+}
+
+fn install_multipart_complete_stale_deadline_race_hooks(
+    bucket: &str,
+    key: &str,
+) -> MultipartCompleteStaleDeadlineRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let pre_commit_reached = Arc::new(Barrier::new(2));
+    let pre_commit_resume = Arc::new(Barrier::new(2));
+    let terminal_reauthorization_gate =
+        DeterministicFaultGate::new(MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN);
+    let pre_commit_reached_hook = Arc::clone(&pre_commit_reached);
+    let pre_commit_resume_hook = Arc::clone(&pre_commit_resume);
+    let terminal_reauthorization_gate_hook = Arc::clone(&terminal_reauthorization_gate);
+    let remaining_pre_commit_pauses = Arc::new(AtomicUsize::new(2));
+    let remaining_pre_commit_pauses_hook = Arc::clone(&remaining_pre_commit_pauses);
+    let retry_clock = MultipartCompleteRetryClock::frozen();
+    let retry_clock_hook = retry_clock.clone();
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        after_multipart_complete_pre_commit: Some(Arc::new(move || {
+            if remaining_pre_commit_pauses_hook
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                pre_commit_reached_hook.wait();
+                pre_commit_resume_hook.wait();
+            }
+        })),
+        multipart_complete_stale_snapshot_retry_now: Some(Arc::new(move || retry_clock_hook.now())),
+        before_multipart_complete_terminal_reauthorization: Some(Arc::new(move || {
+            terminal_reauthorization_gate_hook
+                .wait_at(MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN);
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    MultipartCompleteStaleDeadlineRaceSync {
+        pre_commit_reached,
+        pre_commit_resume,
+        terminal_reauthorization_gate,
+        retry_clock,
+        _guard: guard,
+        _serial_guard: serial,
+    }
+}
+
 fn install_multipart_complete_pre_commit_race_hooks(
     bucket: &str,
     key: &str,
@@ -453,8 +520,8 @@ fn install_multipart_complete_pre_commit_race_hooks(
         reached,
         resume,
         retry_clock: Some(retry_clock),
-        _serial_guard: serial,
         _guard: guard,
+        _serial_guard: serial,
     }
 }
 
@@ -495,8 +562,8 @@ fn install_counted_multipart_complete_pre_commit_race_hooks(
         reached,
         resume,
         retry_clock: Some(retry_clock),
-        _serial_guard: serial,
         _guard: guard,
+        _serial_guard: serial,
     }
 }
 
@@ -528,8 +595,8 @@ fn install_one_shot_multipart_complete_pre_commit_race_hooks(
         reached,
         resume,
         retry_clock: None,
-        _serial_guard: serial,
         _guard: guard,
+        _serial_guard: serial,
     }
 }
 
@@ -557,8 +624,8 @@ fn install_multipart_complete_snapshot_race_hooks(
         reached,
         resume,
         retry_clock: None,
-        _serial_guard: serial,
         _guard: guard,
+        _serial_guard: serial,
     }
 }
 
@@ -590,8 +657,8 @@ fn install_one_shot_multipart_complete_snapshot_race_hooks(
         reached,
         resume,
         retry_clock: None,
-        _serial_guard: serial,
         _guard: guard,
+        _serial_guard: serial,
     }
 }
 
@@ -1233,6 +1300,90 @@ fn identical_completion_after_pre_commit_race_replays_success() {
         install_one_shot_multipart_complete_pre_commit_race_hooks,
         "an identical completion with a validated snapshot must restart when another completion publishes before its commit and resolve through terminal replay",
     );
+}
+
+#[test]
+fn identical_completion_published_at_stale_deadline_reauthorizes_replay() {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &pg_ids);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let delayed = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let uploader = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let bucket = "race-identical-stale-deadline-bucket";
+    let key = "race-identical-stale-deadline-key";
+    let invariant = "an identical winner published at stale-snapshot budget expiry must be observed by final reauthorization";
+
+    admin
+        .create_bucket_for_owner("default-owner", bucket, false)
+        .unwrap();
+    let part_bytes = b"same part bytes";
+    let (upload_id, parts) = create_upload_with_parts(&admin, bucket, key, &[(1, part_bytes)]);
+
+    let sync = install_multipart_complete_stale_deadline_race_hooks(bucket, key);
+    let upload_id_for_delayed = upload_id.clone();
+    let parts_for_delayed = parts.clone();
+    let delayed_completion = std::thread::spawn(move || {
+        delayed.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(bucket, key, &upload_id_for_delayed, test_requester()),
+            parts: &parts_for_delayed,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    sync.pre_commit_reached.wait();
+    let replacement = test_helpers::upload_part(
+        &uploader,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number: 1,
+            data: part_bytes,
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(replacement.etag, parts[0].etag, "{invariant}");
+    sync.pre_commit_resume.wait();
+
+    sync.pre_commit_reached.wait();
+    let second_replacement = test_helpers::upload_part(
+        &uploader,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            part_number: 1,
+            data: part_bytes,
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(second_replacement.etag, parts[0].etag, "{invariant}");
+    sync.advance_retry_clock(multipart::COMPLETE_MULTIPART_STALE_SNAPSHOT_RETRY_BUDGET);
+    sync.pre_commit_resume.wait();
+
+    let _terminal_reauthorization_release_guard =
+        sync.terminal_reauthorization_gate.release_on_drop();
+    sync.terminal_reauthorization_gate
+        .wait_until_arrived(MULTIPART_COMPLETE_RACE_TIMEOUT);
+    let winning = admin
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(bucket, key, &upload_id, test_requester()),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+    sync.terminal_reauthorization_gate.release();
+
+    let replay = delayed_completion.join().unwrap().unwrap();
+    assert_eq!(replay.etag, winning.etag, "{invariant}");
+    assert_eq!(replay.version_id, winning.version_id, "{invariant}");
 }
 
 #[test]
