@@ -954,16 +954,12 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        let mut authority = MetadataCommandDrainAuthority::for_publisher(publisher, work_budget);
-        let outcome = self.drain_pending_metadata_command_with_authority_inner(
+        let outcome = self.drain_pending_object_metadata_command_outcome_with_work_budget(
+            publisher,
             pg_id,
             command,
-            &mut authority,
-            self,
-            MetadataCommandRouteMode::Normal,
-            None,
+            work_budget,
         )?;
-        self.maybe_run_after_metadata_command_drain_hook();
         match outcome {
             PendingMetadataCommandOutcome::Applied | PendingMetadataCommandOutcome::Abandoned => {
                 Ok(outcome)
@@ -974,6 +970,26 @@ impl StorageCluster {
                 ))
             }
         }
+    }
+
+    fn drain_pending_object_metadata_command_outcome_with_work_budget(
+        &self,
+        publisher: impl crate::metadata_command::MetadataCommandPublisher,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        let mut authority = MetadataCommandDrainAuthority::for_publisher(publisher, work_budget);
+        let outcome = self.drain_pending_metadata_command_with_authority_inner(
+            pg_id,
+            command,
+            &mut authority,
+            self,
+            MetadataCommandRouteMode::Normal,
+            None,
+        )?;
+        self.maybe_run_after_metadata_command_drain_hook();
+        Ok(outcome)
     }
 
     #[cfg(test)]

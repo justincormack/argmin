@@ -508,6 +508,27 @@ type MultipartCompletionStaleRetryTestHook =
     Arc<dyn Fn(MultipartCompletionStaleRetryTestEvent, &UploadId) + Send + Sync>;
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MultipartCompletionAuxiliaryReservationTestEvent {
+    ExactPending,
+    MatchingContender,
+}
+
+#[cfg(test)]
+type MultipartCompletionAuxiliaryReservationTestHook = Arc<
+    dyn Fn(
+            MultipartCompletionAuxiliaryReservationTestEvent,
+            &BucketWriteReservationProof,
+        ) -> bool
+        + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+type MetadataCommandTerminalReservationReleaseTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), BucketSnapshotLoadError> + Send + Sync>;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
@@ -595,6 +616,16 @@ static BEFORE_MULTIPART_COMPLETION_BARRIER_COMMAND_ID_HOOKS: OnceLock<
 #[cfg(test)]
 static MULTIPART_COMPLETION_STALE_RETRY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MultipartCompletionStaleRetryTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static MULTIPART_COMPLETION_AUXILIARY_RESERVATION_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MultipartCompletionAuxiliaryReservationTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MetadataCommandTerminalReservationReleaseTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -689,6 +720,16 @@ pub(crate) struct MultipartCompletionBarrierCommandIdTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct MultipartCompletionStaleRetryTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MultipartCompletionAuxiliaryReservationTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MetadataCommandTerminalReservationReleaseTestHookGuard {
     scope_id: usize,
 }
 
@@ -899,6 +940,30 @@ impl Drop for MultipartCompletionStaleRetryTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             MULTIPART_COMPLETION_STALE_RETRY_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultipartCompletionAuxiliaryReservationTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = MULTIPART_COMPLETION_AUXILIARY_RESERVATION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCommandTerminalReservationReleaseTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1217,6 +1282,41 @@ fn maybe_run_multipart_completion_stale_retry_hook(
         .cloned();
     if let Some(hook) = hook {
         hook(_event, _upload_id);
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_multipart_completion_auxiliary_reservation_hook(
+    scope_id: usize,
+    event: MultipartCompletionAuxiliaryReservationTestEvent,
+    proof: &BucketWriteReservationProof,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = MULTIPART_COMPLETION_AUXILIARY_RESERVATION_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook(event, proof)) {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_metadata_command_terminal_reservation_release_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), BucketSnapshotLoadError> {
+    let hook = METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    match hook {
+        Some(hook) => hook(command),
+        None => Ok(()),
     }
 }
 

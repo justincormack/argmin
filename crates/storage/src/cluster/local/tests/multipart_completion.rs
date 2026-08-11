@@ -2616,6 +2616,145 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
 }
 
 #[test]
+fn multipart_completion_races_classify_published_pending_command_by_manifest() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "pendingracecomplete");
+
+    let hook_upload_id = request.upload_id.clone();
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitMultipartObject(commit)
+                    if commit.upload_id == hook_upload_id && node_id == NodeId::new(2)
+            ) {
+                return Err(StoreError::Io {
+                    context: "injected persistent trailing multipart completion failure",
+                    source: std::io::Error::other(
+                        "injected persistent trailing multipart completion failure",
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let published = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .unwrap();
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+        "published completion must remain pending while a trailing replica is unavailable"
+    );
+
+    let auxiliary_release_observed = Arc::new(AtomicBool::new(false));
+    let auxiliary_release_observed_for_hook = Arc::clone(&auxiliary_release_observed);
+    let cluster_for_hook = Arc::clone(&cluster);
+    let auxiliary_release_hook =
+        cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+            move |event, proof| {
+                if event
+                    == crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::ExactPending
+                    && !auxiliary_release_observed_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    cluster_for_hook
+                        .release_bucket_write_reservation_proof(proof)
+                        .expect("test should remove the retry's auxiliary reservation");
+                }
+                false
+            },
+        ));
+    let replay = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .unwrap();
+    drop(auxiliary_release_hook);
+    assert!(auxiliary_release_observed.load(Ordering::SeqCst));
+    assert_eq!(replay.version_id, published.version_id);
+    assert_eq!(replay.live_size, published.live_size);
+    assert_eq!(replay.live_last_modified, published.live_last_modified);
+
+    let mut different_manifest = request.clone();
+    different_manifest.completion_fingerprint =
+        crate::MultipartCompletionFingerprint::from_bytes([0xa5; 32]);
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(different_manifest)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })
+    ));
+
+    drop(hook_guard);
+    let command_release_response_lost = Arc::new(AtomicBool::new(false));
+    let command_release_response_lost_for_hook = Arc::clone(&command_release_response_lost);
+    let release_upload_id = request.upload_id.clone();
+    let command_release_hook = cluster
+        .test_install_metadata_command_terminal_reservation_release_hook(Arc::new(
+            move |command| {
+                if matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitMultipartObject(commit)
+                        if commit.upload_id == release_upload_id
+                ) && !command_release_response_lost_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    return Err(crate::BucketSnapshotLoadError::Store(StoreError::Io {
+                        context: "injected multipart command reservation release response loss",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "injected response loss after command reservation release",
+                        ),
+                    }));
+                }
+                Ok(())
+            },
+        ));
+    let cleanup_deferred = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .unwrap();
+    assert_eq!(cleanup_deferred.version_id, published.version_id);
+    assert!(command_release_response_lost.load(Ordering::SeqCst));
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_some(),
+        "response loss after command reservation release must retain the pending slot"
+    );
+    drop(command_release_hook);
+
+    let converged = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .unwrap();
+    assert_eq!(converged.version_id, published.version_id);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &published,
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn multipart_completion_command_id_race_drains_winner_and_resnapshots_stale_payload() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -3034,11 +3173,27 @@ fn multipart_completion_pending_install_conflict_with_matching_completion_return
             insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &hook_command);
         }));
 
+    let contender_transition_observed = Arc::new(AtomicBool::new(false));
+    let contender_transition_observed_for_hook = Arc::clone(&contender_transition_observed);
+    let _contender_budget_hook =
+        cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+            move |event, _proof| {
+                if event
+                    != crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::MatchingContender
+                    || contender_transition_observed_for_hook.swap(true, Ordering::SeqCst)
+                {
+                    return false;
+                }
+                true
+            },
+        ));
+
     let outcome = cluster
         .complete_multipart_upload_commit_serialized(req.clone())
         .unwrap();
 
     assert!(hook_runs.load(Ordering::SeqCst) >= 2);
+    assert!(contender_transition_observed.load(Ordering::SeqCst));
     assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
     assert_eq!(outcome.version_id, crate::VersionId::Null);
     assert_eq!(outcome.live_tags, req.tags);

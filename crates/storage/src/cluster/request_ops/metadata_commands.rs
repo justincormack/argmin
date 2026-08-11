@@ -328,6 +328,34 @@ impl super::StorageCluster {
         MultipartCompletionStaleRetryTestHookGuard { scope_id }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_multipart_completion_auxiliary_reservation_hook(
+        &self,
+        hook: MultipartCompletionAuxiliaryReservationTestHook,
+    ) -> MultipartCompletionAuxiliaryReservationTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = MULTIPART_COMPLETION_AUXILIARY_RESERVATION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MultipartCompletionAuxiliaryReservationTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_metadata_command_terminal_reservation_release_hook(
+        &self,
+        hook: MetadataCommandTerminalReservationReleaseTestHook,
+    ) -> MetadataCommandTerminalReservationReleaseTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MetadataCommandTerminalReservationReleaseTestHookGuard { scope_id }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_install_before_metadata_command_apply_context_hook(
         &self,

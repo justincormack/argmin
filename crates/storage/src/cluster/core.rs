@@ -394,6 +394,13 @@ impl RequestWorkBudget {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn expire_for_test(&mut self) {
+        self.started = Instant::now()
+            .checked_sub(self.budget)
+            .unwrap_or(self.started);
+    }
+
     fn check(&mut self, context: &'static str) -> Result<(), StoreError> {
         if self.started.elapsed() >= self.budget
             || self

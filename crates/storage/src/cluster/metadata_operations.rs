@@ -4465,7 +4465,15 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        match self.release_applied_metadata_command_bucket_write_reservations(command) {
+        let release_result = self.release_applied_metadata_command_bucket_write_reservations(command);
+        #[cfg(test)]
+        let release_result = release_result.and_then(|()| {
+            request_ops::maybe_run_metadata_command_terminal_reservation_release_hook(
+                Arc::as_ptr(&self.local_map) as usize,
+                command,
+            )
+        });
+        match release_result {
             Ok(()) => Ok(true),
             Err(error)
                 if request_ops::applied_metadata_command_cleanup_error_is_retryable(&error) =>

@@ -285,6 +285,43 @@ mod pending_command_terminal_cleanup_tests {
     }
 
     #[test]
+    fn auxiliary_multipart_reservation_accepts_only_exact_not_found_identity() {
+        let proof = BucketWriteReservationProof {
+            bucket: BucketName::try_from("cleanup-identity-bucket").unwrap(),
+            reservation_id: "expected-reservation".to_string(),
+            owner_token: "owner-token".to_string(),
+            cluster_epoch: ClusterEpoch::INITIAL,
+            bucket_execution_generation: 1,
+            bucket_incarnation_generation: 1,
+            operation_kind: COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND.to_string(),
+            created_at: 10,
+            lease_deadline: 20,
+            target_context: Some("object-key".to_string()),
+        };
+        let missing = |reservation_id: &str| {
+            BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationNotFound {
+                    reservation_id: reservation_id.to_string(),
+                },
+            )
+        };
+
+        assert!(
+            StorageCluster::auxiliary_multipart_completion_reservation_is_exactly_absent(
+                &proof,
+                &missing("expected-reservation"),
+            )
+        );
+        assert!(
+            !StorageCluster::auxiliary_multipart_completion_reservation_is_exactly_absent(
+                &proof,
+                &missing("different-reservation"),
+            ),
+            "a signed remote error for another reservation must fail closed"
+        );
+    }
+
+    #[test]
     fn pending_slot_remove_retries_response_loss_after_remote_removal() {
         let mut pending = true;
         let mut attempts = 0usize;
