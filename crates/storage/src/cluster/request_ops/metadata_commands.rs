@@ -2015,12 +2015,13 @@ impl super::StorageCluster {
                 let confirmation_deadline =
                     Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
                 if self
-                    .metadata_command_has_exact_or_uncertain_applied_entry_on_acting_set_until(
+                    .metadata_command_publication_state_on_acting_set_until(
                         pg_id,
                         &command,
                         route_mode,
                         confirmation_deadline,
                     )?
+                    != MetadataCommandPublicationState::NotPublished
                 {
                     let id = command.id();
                     return Err(match policy.convergence_requirement {

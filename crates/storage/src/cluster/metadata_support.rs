@@ -50,11 +50,19 @@ enum ReissuedPendingCommandDecision {
 
 enum ReissuePendingMetadataCommandOutcome {
     Reissued(MetadataCommandEnvelope),
+    MatchingCurrent(MetadataCommandEnvelope),
     Missing,
     MatchingCurrentConflict {
         command: MetadataCommandEnvelope,
         source: StoreError,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetadataCommandPublicationState {
+    NotPublished,
+    IrrevocableUnconfirmed,
+    Published,
 }
 
 #[must_use = "ContenderDrained must restart from a fresh snapshot"]

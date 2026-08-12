@@ -1445,13 +1445,14 @@ impl StorageCluster {
         let confirmation_deadline =
             Instant::now() + request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
         if self
-            .metadata_command_has_exact_or_uncertain_applied_entry_on_acting_set_until(
+            .metadata_command_publication_state_on_acting_set_until(
                 pg_id,
                 command,
                 route_mode,
                 confirmation_deadline,
             )
             .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+            != MetadataCommandPublicationState::NotPublished
         {
             let id = command.id();
             Ok(StoreError::MetadataCommandIrrevocableConvergencePending {
@@ -1826,7 +1827,10 @@ impl StorageCluster {
                             execution_route,
                             command.payload(),
                         ) {
-                        Ok(ReissuePendingMetadataCommandOutcome::Reissued(reissued)) => reissued,
+                        Ok(ReissuePendingMetadataCommandOutcome::Reissued(reissued)
+                        | ReissuePendingMetadataCommandOutcome::MatchingCurrent(reissued)) => {
+                            reissued
+                        }
                         Ok(ReissuePendingMetadataCommandOutcome::Missing) => {
                             return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
                         }

@@ -438,6 +438,16 @@ impl super::StorageCluster {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_apply_new_object_metadata_command_for_bucket(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), ObjectPgActionError> {
+        self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, command)
+    }
+
     pub(super) fn apply_new_object_metadata_command_for_bucket_allocator(
         &self,
         pg_id: PgId,
@@ -508,6 +518,15 @@ impl super::StorageCluster {
                     self.abandon_definitively_unapplied_object_metadata_command(
                         pg_id, bucket, &command, None,
                     )?;
+                    return Err(ObjectPgActionError::Store(error));
+                }
+                if apply_may_have_applied {
+                    return self.finish_new_object_metadata_command_after_budget_exhaustion(
+                        pg_id,
+                        bucket,
+                        &command,
+                        error,
+                    );
                 }
                 return Err(ObjectPgActionError::Store(error));
             }
@@ -568,8 +587,14 @@ impl super::StorageCluster {
                                 self.abandon_definitively_unapplied_object_metadata_command(
                                     pg_id, bucket, &command, None,
                                 )?;
+                                return Err(ObjectPgActionError::Store(error));
                             }
-                            return Err(ObjectPgActionError::Store(error));
+                            return self.finish_new_object_metadata_command_after_budget_exhaustion(
+                                pg_id,
+                                bucket,
+                                &command,
+                                error,
+                            );
                         }
                         retrying_definitively_unapplied_contention = !apply_may_have_applied;
                         continue;
@@ -593,8 +618,14 @@ impl super::StorageCluster {
                                 self.abandon_definitively_unapplied_object_metadata_command(
                                     pg_id, bucket, &command, None,
                                 )?;
+                                return Err(ObjectPgActionError::Store(error));
                             }
-                            return Err(ObjectPgActionError::Store(error));
+                            return self.finish_new_object_metadata_command_after_budget_exhaustion(
+                                pg_id,
+                                bucket,
+                                &command,
+                                error,
+                            );
                         }
                         retrying_definitively_unapplied_contention = !apply_may_have_applied;
                         continue;
@@ -639,15 +670,47 @@ impl super::StorageCluster {
                             &command, &source,
                         )
                     {
-                        let Some(reissued) = self
-                            .reissue_pending_metadata_command(pg_id, &command)
+                        let reissued = match self
+                            .reissue_pending_metadata_command_outcome_with_route_mode(
+                                pg_id,
+                                &command,
+                                MetadataCommandExecutionRoute::normal(),
+                                command.payload(),
+                            )
                             .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
-                        else {
-                            return Err(super::conflicting_pending_object_metadata_command(
-                                "pending object metadata command was displaced during reissue",
-                            ));
+                        {
+                            super::ReissuePendingMetadataCommandOutcome::Reissued(reissued) => {
+                                retrying_definitively_unapplied_contention =
+                                    !apply_may_have_applied;
+                                reissued
+                            }
+                            super::ReissuePendingMetadataCommandOutcome::MatchingCurrent(
+                                current,
+                            ) => {
+                                apply_may_have_applied = true;
+                                current
+                            }
+                            super::ReissuePendingMetadataCommandOutcome::Missing => {
+                                return Err(super::conflicting_pending_object_metadata_command(
+                                    "pending object metadata command was displaced during reissue",
+                                ));
+                            }
+                            super::ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                                command: current,
+                                ..
+                            } => {
+                                apply_may_have_applied = true;
+                                current
+                            }
                         };
                         command = reissued;
+                        #[cfg(test)]
+                        if maybe_force_pending_object_metadata_partial_conflict_hook(
+                            self.metadata_command_apply_test_hook_scope_id(),
+                            &command,
+                        ) {
+                            work_budget.expire_for_test();
+                        }
                         continue;
                     }
                     if progress.is_abortable()
@@ -691,6 +754,53 @@ impl super::StorageCluster {
                         source,
                     ));
                 }
+            }
+        }
+    }
+
+    fn finish_new_object_metadata_command_after_budget_exhaustion(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        budget_error: StoreError,
+    ) -> Result<(), ObjectPgActionError> {
+        let confirmation_deadline =
+            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+        match self
+            .metadata_command_publication_state_on_acting_set_until(
+                pg_id,
+                command,
+                MetadataCommandRouteMode::Normal,
+                confirmation_deadline,
+            )
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
+        {
+            MetadataCommandPublicationState::Published => {
+                #[cfg(test)]
+                crate::node::maybe_run_after_object_metadata_command_publish_hook(
+                    self.metadata_primary_test_hook_node().test_hook_scope_id(),
+                )?;
+                Ok(())
+            }
+            MetadataCommandPublicationState::IrrevocableUnconfirmed => {
+                let id = command.id();
+                Err(ObjectPgActionError::Store(
+                    StoreError::MetadataCommandIrrevocableConvergencePending {
+                        pg_id: id.pg_id().get(),
+                        cluster_epoch: id.cluster_epoch(),
+                        log_index: id.log_index().get(),
+                    },
+                ))
+            }
+            MetadataCommandPublicationState::NotPublished => {
+                self.abandon_definitively_unapplied_object_metadata_command(
+                    pg_id,
+                    bucket,
+                    command,
+                    None,
+                )?;
+                Err(ObjectPgActionError::Store(budget_error))
             }
         }
     }

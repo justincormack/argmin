@@ -484,13 +484,13 @@ impl StorageCluster {
         Ok(expected_hashes.is_some())
     }
 
-    fn metadata_command_has_exact_or_uncertain_applied_entry_on_acting_set_until(
+    fn metadata_command_publication_state_on_acting_set_until(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
         deadline: Instant,
-    ) -> Result<bool, BucketSnapshotLoadError> {
+    ) -> Result<MetadataCommandPublicationState, BucketSnapshotLoadError> {
         let nodes = match route_mode {
             MetadataCommandRouteMode::Normal => self
                 .local_map
@@ -502,15 +502,44 @@ impl StorageCluster {
                     pg_id,
                 ),
         };
-        let nodes = match nodes {
+        let mut nodes = match nodes {
             Ok(nodes) => nodes,
             // This probe runs only after the caller's ordinary work budget has
             // expired. A stale/unavailable route cannot prove that no actor
             // durably published the exact command, so preserve the typed
             // convergence state instead of reclassifying it as contention.
-            Err(_) => return Ok(true),
+            Err(_) => return Ok(MetadataCommandPublicationState::IrrevocableUnconfirmed),
         };
+        let primary_node_id = match route_mode {
+            MetadataCommandRouteMode::Normal => self
+                .local_map
+                .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id),
+            MetadataCommandRouteMode::Recovery => self
+                .local_map
+                .metadata_pg_primary_node_for_metadata_command_recovery(
+                    command.id().cluster_epoch(),
+                    pg_id,
+                ),
+        };
+        let primary_node_id = match primary_node_id {
+            Ok(primary) => primary.node_id(),
+            Err(_) => return Ok(MetadataCommandPublicationState::IrrevocableUnconfirmed),
+        };
+        let witness_node_id = nodes
+            .iter()
+            .map(|node| node.node_id())
+            .filter(|node_id| *node_id != primary_node_id)
+            .min();
+        nodes.sort_by_key(|node| {
+            Self::metadata_command_publication_order_key(
+                node.node_id(),
+                primary_node_id,
+                witness_node_id,
+            )
+        });
         let mut exact_entry = None;
+        let mut primary_exact = false;
+        let mut witness_exact = witness_node_id.is_none();
         let mut conflicting_node_id = None;
         let mut uncertain = false;
         for node in nodes {
@@ -576,6 +605,8 @@ impl StorageCluster {
                     .into());
                 }
             }
+            primary_exact |= node.node_id() == primary_node_id;
+            witness_exact |= Some(node.node_id()) == witness_node_id;
         }
         if let (Some((exact_node_id, _)), Some(conflicting_node_id)) =
             (exact_entry, conflicting_node_id)
@@ -590,7 +621,13 @@ impl StorageCluster {
             }
             .into());
         }
-        Ok(exact_entry.is_some() || uncertain)
+        if primary_exact && witness_exact {
+            Ok(MetadataCommandPublicationState::Published)
+        } else if exact_entry.is_some() || uncertain {
+            Ok(MetadataCommandPublicationState::IrrevocableUnconfirmed)
+        } else {
+            Ok(MetadataCommandPublicationState::NotPublished)
+        }
     }
 
     fn retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
@@ -712,7 +749,8 @@ impl StorageCluster {
             current,
             route_mode,
         )? {
-            ReissuePendingMetadataCommandOutcome::Reissued(command) => Ok(Some(command)),
+            ReissuePendingMetadataCommandOutcome::Reissued(command)
+            | ReissuePendingMetadataCommandOutcome::MatchingCurrent(command) => Ok(Some(command)),
             ReissuePendingMetadataCommandOutcome::Missing => Ok(None),
             ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict { source, .. } => {
                 Err(source)
@@ -764,7 +802,7 @@ impl StorageCluster {
                 &current,
                 route_mode,
             ) {
-                Ok(()) => Ok(ReissuePendingMetadataCommandOutcome::Reissued(current)),
+                Ok(()) => Ok(ReissuePendingMetadataCommandOutcome::MatchingCurrent(current)),
                 Err(source @ StoreError::MetadataCommandLogConflict { .. }) => Ok(
                     ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
                         command: current,
@@ -870,7 +908,7 @@ impl StorageCluster {
                 Ok(ReissuePendingMetadataCommandOutcome::Missing)
             }
             ReissuedPendingCommandDecision::ReloadCurrent => {
-                Ok(ReissuePendingMetadataCommandOutcome::Reissued(current))
+                Ok(ReissuePendingMetadataCommandOutcome::MatchingCurrent(current))
             }
             ReissuedPendingCommandDecision::Conflict { node_id, log_index } => {
                 let _ = observability::event(
@@ -1027,7 +1065,8 @@ impl StorageCluster {
             execution_route,
             replacement_payload,
         )? {
-            ReissuePendingMetadataCommandOutcome::Reissued(command) => Ok(Some(command)),
+            ReissuePendingMetadataCommandOutcome::Reissued(command)
+            | ReissuePendingMetadataCommandOutcome::MatchingCurrent(command) => Ok(Some(command)),
             ReissuePendingMetadataCommandOutcome::Missing => Ok(None),
             ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict { source, .. } => {
                 Err(source.into())

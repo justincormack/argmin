@@ -1144,6 +1144,290 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
 }
 
 #[test]
+fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_replica() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let session_id = crate::tests::stream_session_id("put-reissue");
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"stream PUT replacement publication";
+    let payload_crc64 = checksum::crc64::checksum(payload);
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: payload_crc64,
+                payload_crc64,
+                segment_okh: [0xb2; 16],
+            },
+        )
+        .unwrap();
+    let written = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let pg_id = PgId::new(object_pg);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let (generation_id, write_sequence) = {
+        let pg = primary.storage_node().get_pg(object_pg).unwrap();
+        (
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &session_id,
+            )
+            .unwrap(),
+            pg.next_object_write_sequence(bucket.as_str(), key.as_str())
+                .unwrap(),
+        )
+    };
+    let proof = cluster
+        .load_stream_upload_session(&bucket, &key, &session_id)
+        .unwrap()
+        .bucket_write_reservation
+        .unwrap();
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::CommitDirectPutObject(Box::new(CommitDirectPutObjectCommand {
+            object: crate::PutLiveObjectReq {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: crate::VersionId::Null,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                generation_id,
+                size: payload.len() as u64,
+                etag: crate::ObjectEtag::single_part(payload_crc64),
+                ec: EcShape {
+                    k: segment.ec_k,
+                    m: segment.ec_m,
+                },
+                layout: crate::ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            },
+            segments: vec![crate::ObjectSegmentRecord {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: crate::VersionId::Null,
+                segment_index: segment.segment_index,
+                size: segment.size,
+                segment_crc64: segment.segment_crc64,
+                segment_okh: segment.segment_okh,
+                segment_vid: segment.segment_vid,
+                data_pg_id: segment.data_pg_id,
+                placement_cluster_epoch: segment.placement_cluster_epoch,
+                ec_k: segment.ec_k,
+                ec_m: segment.ec_m,
+            }],
+            generation_reservation_id: session_id.clone(),
+            write_sequence,
+            last_modified_millis: 123_460,
+            stale_payload: None,
+            bucket_write_reservation: proof,
+        })),
+    );
+    let occupant_bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        object_pg,
+        "stream-put-reissue-occupant-",
+    );
+    let occupant =
+        create_bucket_metadata_command(pg_id, command.id().log_index().get(), occupant_bucket);
+    for node_id in node_ids {
+        map.node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap()
+            .apply_metadata_command_and_record(node_id.as_u32(), &occupant)
+            .unwrap();
+    }
+    let replacement = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(command.id().log_index().get() + 1).unwrap(),
+        ),
+        command.payload().clone(),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &replacement);
+    for node_id in [NodeId::new(0), NodeId::new(2)] {
+        map.node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap()
+            .apply_metadata_command_and_record(node_id.as_u32(), &replacement)
+            .unwrap();
+    }
+    let tail_bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        object_pg,
+        "stream-put-reissue-tail-",
+    );
+    let tail =
+        create_bucket_metadata_command(pg_id, replacement.id().log_index().get() + 1, tail_bucket);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &tail)
+        .unwrap();
+    let expire_once = Arc::new(AtomicBool::new(true));
+    let expire_once_for_hook = Arc::clone(&expire_once);
+    let expire_bucket = bucket.clone();
+    let expire_key = key.clone();
+    let expire_session = session_id.clone();
+    let budget_guard = cluster.test_install_pending_object_metadata_partial_conflict_hook(
+        Arc::new(move |command| {
+            matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.matches_stream_session(
+                        &expire_bucket,
+                        &expire_key,
+                        &expire_session,
+                    )
+            ) && command.id().log_index().get() > 1
+                && expire_once_for_hook.swap(false, Ordering::SeqCst)
+        }),
+    );
+    let inspected_nodes = Arc::new(Mutex::new(Vec::new()));
+    let inspected_nodes_for_hook = Arc::clone(&inspected_nodes);
+    let inspection_guard = cluster.test_install_post_budget_metadata_command_inspection_hook(
+        Arc::new(move |node_id, deadline| {
+            inspected_nodes_for_hook
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(node_id);
+            (node_id == NodeId::new(1)).then(|| {
+                std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                Err(StoreError::Io {
+                    context: "injected trailing post-budget inspection timeout",
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "injected trailing post-budget inspection timeout",
+                    ),
+                })
+            })
+        }),
+    );
+
+    cluster
+        .test_apply_new_object_metadata_command_for_bucket(pg_id, &bucket, &command)
+        .expect("witness-plus-primary replacement publication must return success");
+    drop(inspection_guard);
+    drop(budget_guard);
+
+    assert!(!expire_once.load(Ordering::SeqCst));
+    assert_eq!(
+        *inspected_nodes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        [NodeId::new(0), NodeId::new(2), NodeId::new(1)],
+        "publication confirmation must inspect witness and primary before trailing replicas"
+    );
+    let primary_pg = map
+        .node(NodeId::new(2))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap();
+    let stored = crate::PgMetadataStore::get_object_meta(&*primary_pg, &bucket, &key).unwrap();
+    assert_eq!(
+        stored
+            .as_live()
+            .expect("replacement stream commit must be published")
+            .size,
+        payload.len() as u64
+    );
+    drop(primary_pg);
+    let pending = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("published replacement must remain recoverable");
+    assert_eq!(pending, replacement);
+
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        if node_id == NodeId::new(1) {
+            pg.apply_metadata_command_and_record(node_id.as_u32(), &replacement)
+                .unwrap();
+        }
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &tail)
+            .unwrap();
+    }
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(PgId::new(object_pg), &bucket)
+        .unwrap();
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn abandoned_put_object_stream_upload_does_not_block_bucket_delete() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

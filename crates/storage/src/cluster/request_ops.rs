@@ -14,7 +14,8 @@ use placement::NodeId;
 
 use super::{
     LocalClusterRuntimeState, MetadataCommandCheckpointRecordSummary,
-    MetadataCommandExecutionRoute, MetadataCommandRecoveryProof, MetadataCommandRouteMode,
+    MetadataCommandExecutionRoute, MetadataCommandPublicationState, MetadataCommandRecoveryProof,
+    MetadataCommandRouteMode,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{
