@@ -3930,6 +3930,160 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
 }
 
 #[test]
+fn stream_part_finalize_retries_definitive_command_contention_before_publication() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec).unwrap());
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let upload_id = upload_id_from_label("partcontention");
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id.clone(),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, existing_object| {
+                assert!(existing_object.is_none());
+                Ok::<_, ()>(((), create.clone()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let session_id = crate::tests::stream_session_id("part-contention");
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &upload_id)
+        .unwrap();
+    cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(upload),
+            1,
+            &session_id,
+        )
+        .unwrap();
+
+    let payload = b"UploadPartCopy finalization contention";
+    let payload_crc64 = checksum::crc64::checksum(payload);
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: payload_crc64,
+                payload_crc64,
+                segment_okh: [0xb2; 16],
+            },
+        )
+        .unwrap();
+    let written = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let part = crate::MultipartPartRecord {
+        upload_id: upload_id.clone(),
+        part_number: 1,
+        generation: 0,
+        size: payload.len() as u64,
+        payload_crc64,
+        etag: payload_crc64.to_be_bytes().to_vec(),
+        etag_kind: crate::EtagKind::Crc64,
+        part_vid: crate::GenerationId::MIN,
+        placement_cluster_epoch: segment.placement_cluster_epoch,
+        ec_k: segment.ec_k,
+        ec_m: segment.ec_m,
+        last_modified: 123_456,
+        checksum: None,
+    };
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    let hook_upload_id = upload_id.clone();
+    let hook_session = session_id.clone();
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitStreamPart(commit)
+                    if commit.upload.upload_id == hook_upload_id
+                        && commit.session_id == hook_session
+                        && commit.part.part_number == 1
+            ) && hook_attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected UploadPartCopy publication contention",
+                });
+            }
+            Ok(())
+        }));
+
+    let outcome = cluster
+        .finalize_upload_part_stream(
+            &bucket,
+            &key,
+            stream_part_finalize_input(&upload_id, &session_id, 1, part.size, part.payload_crc64),
+            |_| Ok::<_, ()>(prepared_stream_part((), &part)),
+        )
+        .expect("definitive pre-publication contention must be retried")
+        .expect("stream part preparation should succeed");
+
+    assert_eq!(outcome.last_modified, part.last_modified);
+    assert!(attempts.load(Ordering::SeqCst) >= 2);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1).unwrap();
+        assert_eq!(stored, part);
+    }
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn multipart_payload_snapshot_does_not_treat_shard_rows_without_files_as_absent() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

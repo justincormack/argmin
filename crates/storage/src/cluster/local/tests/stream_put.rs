@@ -1024,6 +1024,126 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
 }
 
 #[test]
+fn stream_put_finalize_retries_definitive_command_contention_before_publication() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec).unwrap());
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let session_id = crate::tests::stream_session_id("put-contention");
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"stream PUT publication contention";
+    let payload_crc64 = checksum::crc64::checksum(payload);
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: payload_crc64,
+                payload_crc64,
+                segment_okh: [0xb1; 16],
+            },
+        )
+        .unwrap();
+    let written = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_session = session_id.clone();
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.matches_stream_session(&hook_bucket, &hook_key, &hook_session)
+            ) && hook_attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected streamed PUT publication contention",
+                });
+            }
+            Ok(())
+        }));
+
+    let outcome = cluster
+        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Enabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: payload_crc64,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
+        .expect("definitive pre-publication contention must be retried")
+        .expect("stream PUT preparation should succeed");
+
+    assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
+    assert!(attempts.load(Ordering::SeqCst) >= 2);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        let live = stored
+            .as_live()
+            .expect("stream PUT must publish a live object");
+        assert_eq!(live.version_id, outcome.version_id);
+        assert_eq!(live.size, payload.len() as u64);
+    }
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn abandoned_put_object_stream_upload_does_not_block_bucket_delete() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
