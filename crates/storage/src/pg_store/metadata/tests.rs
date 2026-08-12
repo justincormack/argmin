@@ -5501,6 +5501,15 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
         store
             .try_insert_pending_metadata_command_slot(0, &first_command, Some(&first_bucket))
             .unwrap();
+        assert!(!store
+            .pending_metadata_command_publication_started(0, &first_command)
+            .unwrap());
+        store
+            .mark_pending_metadata_command_publication_started(0, &first_command)
+            .unwrap();
+        store
+            .mark_pending_metadata_command_publication_started(0, &first_command)
+            .unwrap();
         store
             .try_insert_pending_metadata_command_slot(0, &first_command, Some(&first_bucket))
             .unwrap();
@@ -5527,7 +5536,22 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
     assert_eq!(slot.id, first_command.id());
     assert_eq!(slot.command_checksum, first_command.checksum_crc64());
     assert_eq!(slot.command_bytes, first_command.command_bytes());
+    assert!(slot.publication_started);
     assert_eq!(slot.scope_bucket.as_ref(), Some(&first_bucket));
+    assert!(store
+        .pending_metadata_command_publication_started(0, &first_command)
+        .unwrap());
+    assert!(
+        !store
+            .replace_pending_metadata_command_slot_for_reissue(
+                0,
+                &first_command,
+                &second_command,
+                Some(&second_bucket),
+            )
+            .unwrap(),
+        "publication-started commands must not be replaced"
+    );
     let err = store
         .remove_pending_metadata_command_slot(0, &first_command)
         .unwrap_err();

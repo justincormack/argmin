@@ -20,7 +20,7 @@
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Barrier, Mutex};
+    use std::sync::{mpsc, Arc, Barrier, Condvar, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -33,7 +33,8 @@
         BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateBucketCommand,
         CreateStreamUploadCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
         InsertDeleteMarkerCommand, MetadataCommandEnvelope, MetadataCommandId,
-        MetadataCommandLogIndex, MetadataCommandPayload, MetadataTransferCommand,
+        MetadataCommandAcceptance, MetadataCommandLogIndex, MetadataCommandPayload,
+        MetadataTransferCommand,
         PutBucketAclCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
     };
     use crate::node_runtime::traits::{PgMetadataStore, ShardStore};
@@ -4977,6 +4978,68 @@
         joins: Vec<thread::JoinHandle<()>>,
     }
 
+    #[derive(Default)]
+    struct MetadataCommandCommitGate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl MetadataCommandCommitGate {
+        fn block_until_released(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        }
+
+        fn wait_until_arrived(&self) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            while !state.0 {
+                let remaining = deadline
+                    .checked_duration_since(Instant::now())
+                    .expect("metadata command did not reach the witness commit gate");
+                let (next, timeout) = self
+                    .changed
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = next;
+                assert!(
+                    !timeout.timed_out() || state.0,
+                    "metadata command did not reach the witness commit gate"
+                );
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    struct MetadataCommandCommitGateRelease(Arc<MetadataCommandCommitGate>);
+
+    impl Drop for MetadataCommandCommitGateRelease {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
     impl Drop for AuthenticatedFanoutServerSet {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
@@ -5296,6 +5359,175 @@
         }
     }
 
+    fn authenticated_fanout_publication_start_fences_delayed_witness(tcp: bool) {
+        let primary_node_id = NodeId::new(1);
+        let witness_node_id = NodeId::new(0);
+        let (_tmp, server_set, cluster) =
+            authenticated_fanout_cluster(tcp, "publication-start-fence");
+        let witness = server_set
+            .servers
+            .iter()
+            .find(|server| server.config_snapshot().node_id == witness_node_id)
+            .cloned()
+            .unwrap();
+        let primary = server_set
+            .servers
+            .iter()
+            .find(|server| server.config_snapshot().node_id == primary_node_id)
+            .cloned()
+            .unwrap();
+
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        let bucket = crate::tests::bucket_name("publication-start-fence-bucket");
+        let create_config = CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        };
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::CreateBucket(
+                CreateBucketCommand::from_config_for_test(&create_config, 1_234, 1).unwrap(),
+            ),
+        );
+
+        let gate = Arc::new(MetadataCommandCommitGate::default());
+        let _release = MetadataCommandCommitGateRelease(Arc::clone(&gate));
+        let gate_for_hook = Arc::clone(&gate);
+        let command_for_hook = command.clone();
+        witness.set_metadata_command_before_commit_test_hook(Arc::new(
+            move |_node_id, received| {
+                if received == &command_for_hook {
+                    gate_for_hook.block_until_released();
+                }
+            },
+        ));
+        primary
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .try_insert_pending_metadata_command_slot(
+                primary_node_id.as_u32(),
+                &command,
+                Some(&bucket),
+            )
+            .unwrap();
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let owner_cluster = Arc::clone(&cluster);
+        let owner_command = command.clone();
+        let owner_join = thread::spawn(move || {
+            let result = owner_cluster
+                .test_apply_pending_metadata_command_to_acting_set_from_origin(
+                    primary_node_id,
+                    &owner_command,
+                );
+            let _ = result_tx.send(result);
+        });
+
+        gate.wait_until_arrived();
+        let owner_result = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("owner must stop at its publication confirmation deadline");
+        assert!(matches!(
+            owner_result,
+            Err(BucketSnapshotLoadError::Store(
+                StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+                    | StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+            ))
+        ));
+        owner_join.join().unwrap();
+
+        let primary_pg = primary._node.get_pg(0).unwrap();
+        assert!(
+            primary_pg
+                .pending_metadata_command_publication_started(
+                    primary_node_id.as_u32(),
+                    &command,
+                )
+                .unwrap(),
+            "publication-start marker must precede witness dispatch"
+        );
+        drop(primary_pg);
+        let abandonment = cluster
+            .test_record_abandoned_metadata_command_to_acting_set_until(
+                &command,
+                Instant::now() + Duration::from_secs(1),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            abandonment,
+            BucketSnapshotLoadError::Store(
+                StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+            )
+        ));
+
+        gate.release();
+        let witness_commit_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if witness
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .metadata_command_replica_state()
+                .unwrap()
+                .applied_log_index
+                == 1
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < witness_commit_deadline,
+                "released witness request did not commit"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(
+            witness
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .metadata_command_acceptance(witness_node_id.as_u32(), &command)
+                .unwrap(),
+            MetadataCommandAcceptance::AlreadyApplied,
+            "the pre-loss witness request must retain the exact command"
+        );
+        let primary_pg = primary._node.get_pg(0).unwrap();
+        assert_eq!(
+            primary_pg
+                .metadata_command_acceptance(primary_node_id.as_u32(), &command)
+                .unwrap(),
+            MetadataCommandAcceptance::Apply,
+            "recovery must not abandon the publication-started command"
+        );
+        assert!(primary_pg
+            .pending_metadata_command_publication_started(primary_node_id.as_u32(), &command)
+            .unwrap());
+    }
+
+    #[test]
+    fn authenticated_unix_publication_start_fences_delayed_witness_after_owner_loss() {
+        authenticated_fanout_publication_start_fences_delayed_witness(false);
+    }
+
+    #[test]
+    fn authenticated_tls_publication_start_fences_delayed_witness_after_owner_loss() {
+        authenticated_fanout_publication_start_fences_delayed_witness(true);
+    }
+
     #[test]
     fn authenticated_unix_fanout_confirms_witness_after_response_auth_failure() {
         authenticated_metadata_fanout_handles_apply_failure(
@@ -5408,8 +5640,8 @@
         assert!(contention_observed.load(Ordering::Acquire));
         assert_eq!(
             reserved,
-            VersionId::from_u64(2),
-            "the contended first command must converge before a fresh version is reserved"
+            VersionId::from_u64(1),
+            "publication-started allocator command must converge as the request outcome"
         );
         for server in &server_set.servers {
             let state = server
@@ -5420,8 +5652,8 @@
                 .unwrap();
             assert_eq!(
                 state.applied_log_index,
-                2,
-                "allocator reinspection must converge both exact commands on node {}",
+                1,
+                "allocator reinspection must converge the publication-started command on node {}",
                 server.config_snapshot().node_id.as_u32()
             );
             let config = server.config_snapshot();

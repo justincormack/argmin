@@ -760,6 +760,7 @@ pub(crate) fn encode_metadata_command_pending_envelope_response(
             put_bytes(&mut out, &command.command_bytes());
         }
     }
+    put_u8(&mut out, u8::from(response.publication_started));
     out
 }
 
@@ -780,8 +781,25 @@ pub(crate) fn decode_metadata_command_pending_envelope_response(
             ))
         }
     };
+    let publication_started = match decoder.read_u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid metadata command publication-start tag",
+            ));
+        }
+    };
+    if command.is_none() && publication_started {
+        return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+            "missing pending command cannot have publication started",
+        ));
+    }
     decoder.finish()?;
-    Ok(StorageRpcMetadataCommandPendingEnvelopeResponse { command })
+    Ok(StorageRpcMetadataCommandPendingEnvelopeResponse {
+        command,
+        publication_started,
+    })
 }
 
 pub(crate) fn encode_metadata_command_matching_applied_request(

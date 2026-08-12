@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use placement::NodeId;
 
 use super::{
-    LocalClusterRuntimeState, MetadataCommandCheckpointRecordSummary,
-    MetadataCommandExecutionRoute, MetadataCommandPublicationState, MetadataCommandRecoveryProof,
-    MetadataCommandRouteMode,
+    lock_metadata_command_pg_until, HeldPrimaryMetadataCommandObservation,
+    HeldPrimaryMetadataCommandSection, LocalClusterRuntimeState,
+    MetadataCommandCheckpointRecordSummary, MetadataCommandExecutionRoute,
+    MetadataCommandPublicationState, MetadataCommandRecoveryProof, MetadataCommandRouteMode,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{

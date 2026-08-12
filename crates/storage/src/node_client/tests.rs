@@ -1413,6 +1413,69 @@ fn local_recovery_critical_section_rejects_future_epoch_command_without_mutation
 }
 
 #[test]
+fn local_recovery_abandonment_operations_honor_absolute_deadline_while_pg_locked() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let recovery =
+        MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+            &client,
+            PgId::new(0),
+            ClusterEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+    let command = test_metadata_command(0, 1);
+    let storage_node_for_holder = Arc::clone(&storage_node);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = thread::spawn(move || {
+        let held_pg = storage_node_for_holder.get_pg(0).unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        drop(held_pg);
+    });
+    locked_rx.recv().unwrap();
+
+    for operation in ["acceptance", "record"] {
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let error = match operation {
+            "acceptance" => recovery
+                .metadata_command_abandon_acceptance_until(&command, deadline)
+                .map(|_| ()),
+            "record" => recovery
+                .record_metadata_command_abandoned_until(&command, deadline)
+                .map(|_| ()),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
+        assert!(
+            matches!(error, StoreError::Io { ref source, .. } if source.kind() == std::io::ErrorKind::TimedOut),
+            "{operation} should stop at the absolute deadline, got {error:?}"
+        );
+    }
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    drop(recovery);
+    assert_eq!(
+        storage_node
+            .get_pg(0)
+            .unwrap()
+            .max_metadata_command_log_index(ClusterEpoch::new(1).unwrap())
+            .unwrap(),
+        0,
+        "deadline expiry must not record an abandonment"
+    );
+}
+
+#[test]
 fn local_recovery_replica_route_rejects_crossed_authority_without_mutation() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(

@@ -445,6 +445,153 @@ impl UnixStorageNodeMetadataCommandSession {
         })
     }
 
+    fn applied_metadata_command_log_entry_hashes_request_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        let pg_id = self.metadata_command_pg_id();
+        let payload = self.encode_metadata_command_request(pg_id, command)?;
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandAppliedLogHashes,
+            payload,
+            deadline,
+        )?;
+        let response =
+            decode_metadata_command_applied_hashes_response(&response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command applied hashes response",
+                    error.to_string(),
+                )
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandAppliedHashesOutcome::Hashes(hashes) => Ok(hashes),
+            StorageRpcMetadataCommandAppliedHashesOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_log_conflict_error(
+                self.cluster_epoch,
+                pg_id,
+                "decode metadata command applied hashes response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
+    }
+
+    fn pending_metadata_command_publication_started_request_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        let pg_id = self.metadata_command_pg_id();
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            payload,
+            deadline,
+        )?;
+        let response = decode_metadata_command_pending_envelope_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command publication state response",
+                error.to_string(),
+            )
+        })?;
+        match response.command {
+            Some(pending)
+                if pending.id() == command.id()
+                    && pending.checksum_crc64() == command.checksum_crc64()
+                    && pending.command_bytes() == command.command_bytes() =>
+            {
+                Ok(response.publication_started)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    fn mark_pending_metadata_command_publication_started_request_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyError> {
+        let pg_id = self.metadata_command_pg_id();
+        let payload = self
+            .encode_metadata_command_request(pg_id, command)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        let response = match self.rpc_request_result_until(
+            StorageRpcMessageKind::MetadataCommandPublicationStart,
+            payload,
+            deadline,
+        ) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                return Err(MetadataCommandApplyError::definitive(
+                    self.rpc_response_error(
+                        StorageRpcMessageKind::MetadataCommandPublicationStart,
+                        error,
+                    ),
+                ));
+            }
+            Err(error) => return Err(error.into_metadata_command_apply_error()),
+        };
+        self.decode_metadata_command_state_outcome(
+            pg_id,
+            command,
+            &response,
+            "decode metadata command publication start response",
+        )
+        .map(|_| ())
+    }
+
+    fn decode_record_metadata_command_abandoned_response(
+        &self,
+        pg_id: PgId,
+        response: &[u8],
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let response =
+            decode_metadata_command_state_outcome_response(response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command record abandoned response",
+                    error.to_string(),
+                )
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_log_conflict_error(
+                self.cluster_epoch,
+                pg_id,
+                "decode metadata command record abandoned response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+            _ => Err(self.rpc_payload_error(
+                "decode metadata command record abandoned response",
+                "record abandoned response contained a mutation conflict".to_string(),
+            )),
+        }
+    }
+
     fn rpc_request(
         &self,
         kind: StorageRpcMessageKind,
@@ -715,7 +862,17 @@ impl UnixStorageNodeMetadataCommandSession {
             }
             Err(error) => return Err(error.into_metadata_command_apply_error()),
         };
-        let response = decode_metadata_command_state_outcome_response(&response)
+        self.decode_metadata_command_state_outcome(pg_id, command, &response, decode_context)
+    }
+
+    fn decode_metadata_command_state_outcome(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        response: &[u8],
+        decode_context: &'static str,
+    ) -> Result<MetadataCommandReplicaState, MetadataCommandApplyError> {
+        let response = decode_metadata_command_state_outcome_response(response)
             .map_err(|error| self.rpc_payload_error(decode_context, error.to_string()))
             .map_err(MetadataCommandApplyError::may_have_applied)?;
         match response.outcome {
@@ -928,6 +1085,43 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
         )
     }
 
+    fn pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        self.pending_metadata_command_publication_started_request_until(command, deadline)
+    }
+
+    fn mark_pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyError> {
+        self.mark_pending_metadata_command_publication_started_request_until(command, deadline)
+    }
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        self.applied_metadata_command_log_entry_hashes_request_until(command, deadline)
+    }
+
+    fn metadata_command_abandon_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.metadata_command_acceptance_request_until(
+            StorageRpcMessageKind::MetadataCommandAbandonAcceptance,
+            self.metadata_command_pg_id(),
+            command,
+            deadline,
+        )
+    }
+
     fn replace_pending_metadata_command_slot_for_reissue(
         &self,
         previous: &MetadataCommandEnvelope,
@@ -1080,64 +1274,22 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
             StorageRpcMessageKind::MetadataCommandRecordAbandoned,
             payload,
         )?;
-        let response =
-            decode_metadata_command_state_outcome_response(&response).map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    error.to_string(),
-                )
-            })?;
-        match response.outcome {
-            StorageRpcMetadataCommandStateOutcome::State(state) => Ok(state),
-            StorageRpcMetadataCommandStateOutcome::LogConflict {
-                node_id,
-                pg_id: conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(metadata_command_log_conflict_error(
-                self.cluster_epoch,
-                pg_id,
-                "decode metadata command record abandoned response",
-                |operation, message| self.rpc_payload_error(operation, message),
-                MetadataCommandLogConflictRpcFields {
-                    node_id,
-                    pg_id: conflict_pg_id,
-                    cluster_epoch,
-                    log_index,
-                },
-            )),
-            StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
-                ..
-            } => Err(self.rpc_payload_error(
-                "decode metadata command record abandoned response",
-                "record abandoned response cannot contain object generation reservation conflict"
-                    .to_string(),
-            )),
-            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict { .. } => {
-                Err(self.rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain object version reservation conflict"
-                        .to_string(),
-                ))
-            }
-            StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand { .. } => Err(self
-                .rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain stale bucket metadata command"
-                        .to_string(),
-                )),
-            StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand { .. } => Err(self
-                .rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain stale object write command"
-                        .to_string(),
-                )),
-            StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { .. } => Err(self
-                .rpc_payload_error(
-                    "decode metadata command record abandoned response",
-                    "record abandoned response cannot contain stream segment conflict".to_string(),
-                )),
-        }
+        self.decode_record_metadata_command_abandoned_response(pg_id, &response)
+    }
+
+    fn record_metadata_command_abandoned_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg_id = self.metadata_command_pg_id();
+        let payload = self.encode_metadata_command_request(pg_id, command)?;
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            payload,
+            deadline,
+        )?;
+        self.decode_record_metadata_command_abandoned_response(pg_id, &response)
     }
 }
 
@@ -1164,6 +1316,43 @@ impl MetadataCommandCriticalSection for UnixStorageNodeMetadataCommandSession {
             command,
             deadline,
         )
+    }
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        self.applied_metadata_command_log_entry_hashes_request_until(command, deadline)
+    }
+
+    fn metadata_command_abandon_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.metadata_command_acceptance_request_until(
+            StorageRpcMessageKind::MetadataCommandAbandonAcceptance,
+            self.metadata_command_pg_id(),
+            command,
+            deadline,
+        )
+    }
+
+    fn pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        self.pending_metadata_command_publication_started_request_until(command, deadline)
+    }
+
+    fn mark_pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyError> {
+        self.mark_pending_metadata_command_publication_started_request_until(command, deadline)
     }
 
     fn apply_metadata_command_and_record(

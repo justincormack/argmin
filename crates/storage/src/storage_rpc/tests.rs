@@ -1560,9 +1560,17 @@ mod tests {
     fn metadata_command_pending_envelope_response_round_trips() {
         let command = test_metadata_command();
         for response in [
-            StorageRpcMetadataCommandPendingEnvelopeResponse { command: None },
+            StorageRpcMetadataCommandPendingEnvelopeResponse {
+                command: None,
+                publication_started: false,
+            },
             StorageRpcMetadataCommandPendingEnvelopeResponse {
                 command: Some(command.clone()),
+                publication_started: false,
+            },
+            StorageRpcMetadataCommandPendingEnvelopeResponse {
+                command: Some(command.clone()),
+                publication_started: true,
             },
         ] {
             let bytes = encode_metadata_command_pending_envelope_response(&response);

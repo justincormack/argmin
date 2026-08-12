@@ -630,7 +630,7 @@ impl PgStore {
         }
     }
 
-    fn commit_immediate_txn(&self, context: &'static str) -> Result<(), MetadataError> {
+    pub(super) fn commit_immediate_txn(&self, context: &'static str) -> Result<(), MetadataError> {
         #[cfg(test)]
         if self
             .fail_next_metadata_txn_commit

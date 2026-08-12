@@ -1174,6 +1174,7 @@ fn authorized_roles(kind: StorageRpcMessageKind) -> StorageRpcAuthorizedRoles {
         | StorageRpcMessageKind::MetadataCommandMaxLogIndex
         | StorageRpcMessageKind::MetadataCommandNextId
         | StorageRpcMessageKind::MetadataCommandPendingEnvelope
+        | StorageRpcMessageKind::MetadataCommandPublicationStart
         | StorageRpcMessageKind::MetadataCommandValidateReplayState
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
         | StorageRpcMessageKind::MetadataCommandCheckpointCandidates
@@ -1620,6 +1621,7 @@ mod tests {
         StorageRpcMessageKind::MetadataCommandMaxLogIndex,
         StorageRpcMessageKind::MetadataCommandNextId,
         StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+        StorageRpcMessageKind::MetadataCommandPublicationStart,
         StorageRpcMessageKind::MetadataCommandValidateReplayState,
         StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending,
         StorageRpcMessageKind::MetadataCommandAbandoned,
@@ -2129,7 +2131,7 @@ mod tests {
         };
         let kinds = recognized_storage_rpc_message_kinds();
 
-        assert_eq!(kinds.len(), 168, "every wire kind must be classified");
+        assert_eq!(kinds.len(), 169, "every wire kind must be classified");
         for kind in kinds {
             assert!(
                 [&frontend, &storage, &admin, &maintenance,]

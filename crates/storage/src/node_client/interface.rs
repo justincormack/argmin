@@ -1552,6 +1552,16 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError>;
 
+    fn metadata_command_abandon_acceptance_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.metadata_command_abandon_acceptance(pg_id, command)
+    }
+
     fn applied_metadata_command_log_entry_hashes(
         &self,
         pg_id: PgId,
@@ -1712,6 +1722,14 @@ pub(crate) trait MetadataCommandRecoveryReplicaApplyRoute: Send {
 
 pub(crate) trait MetadataCommandRecoveryReplicaAbandonRoute: Send {
     fn record_abandoned(self: Box<Self>) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn record_abandoned_until(
+        self: Box<Self>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.record_abandoned()
+    }
 }
 
 /// Pending-command convergence and explicitly authorized recovery mutation
@@ -1743,6 +1761,33 @@ pub(crate) trait MetadataCommandRecoveryCriticalSection: Send {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn metadata_command_abandon_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.metadata_command_abandon_acceptance(command)
+    }
+
+    fn pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError>;
+
+    fn mark_pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyError>;
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError>;
 
     fn replace_pending_metadata_command_slot_for_reissue(
         &self,
@@ -1788,6 +1833,15 @@ pub(crate) trait MetadataCommandRecoveryCriticalSection: Send {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn record_metadata_command_abandoned_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.record_metadata_command_abandoned(command)
+    }
 }
 
 pub(crate) trait MetadataCommandNodeClient: Send + Sync {
@@ -1970,6 +2024,16 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandReplicaState, StoreError>;
+
+    fn record_metadata_command_abandoned_on_replica_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.record_metadata_command_abandoned_on_replica(pg_id, command)
+    }
 }
 
 /// Active publisher authority serialized for one metadata PG and epoch.
@@ -1991,6 +2055,30 @@ pub(crate) trait MetadataCommandCriticalSection: Send {
         require_metadata_command_operation_deadline(deadline)?;
         self.metadata_command_acceptance(command)
     }
+
+    fn metadata_command_abandon_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError>;
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError>;
+
+    fn pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError>;
+
+    fn mark_pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyError>;
 
     fn apply_metadata_command_and_record(
         &self,

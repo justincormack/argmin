@@ -97,24 +97,27 @@ For a new metadata mutation:
    before starting new work.
 3. In a PG-primary transaction, allocate the next log index and insert the new
    pending command slot.
-4. For a redundant acting set, validate request admission and durably apply the
+4. After final admission succeeds, durably mark the exact primary pending slot
+   as publication-started while holding the primary command section. This mark
+   must commit before any witness apply is dispatched.
+5. For a redundant acting set, durably apply the
    exact command to the lowest-node-ID non-primary replica. This deterministic
    member is the off-primary publication witness.
-5. Apply the exact command to the PG primary. The primary's durable row is the
+6. Apply the exact command to the PG primary. The primary's durable row is the
    serving-publication boundary; the off-primary witness ensures that state
    visible through the primary is already durable in another configured failure
    domain.
-6. Apply the exact command to the remaining non-primary acting-set replicas in
+7. Apply the exact command to the remaining non-primary acting-set replicas in
    deterministic node-id order.
-7. Record the applied command log entry or abandoned tombstone durably on each
+8. Record the applied command log entry or abandoned tombstone durably on each
    acting-set member as part of that member's atomic metadata transaction.
-8. Mark the slot terminal and remove it only after the terminal durable record
+9. Mark the slot terminal and remove it only after the terminal durable record
    is visible enough for retry/recovery and acting-set convergence has been
    proven, or an explicit command path owns an equivalent cleanup proof.
 
-A pre-witness remote apply failure uses the caller's finite work budget. Once
-the witness may have accepted the command, publication confirmation uses its
-own short absolute deadline and retries only the exact installed command. The
+A failure before publication-start uses the caller's finite work budget. Once
+publication-start may have been recorded, publication confirmation uses its own
+short absolute deadline and retries only the exact installed command. The
 client transport carries a typed `NotSent`, `Definitive`, or `MayHaveApplied`
 result from connection admission through authenticated response verification;
 coordinators must not infer dispatch from a broad error such as `Io` or
@@ -123,7 +126,7 @@ and exact-state observation, and no new operation may start after it expires.
 Once the primary has confirmed publication, a recoverable trailing-replica
 failure is handed to the long-lived recovery worker instead of retaining the
 request worker. No stage may allocate a replacement command or rerun request
-preparation after witness dispatch. After acting-set application has converged,
+preparation after publication-start. After acting-set application has converged,
 transient reservation-release failure is terminal cleanup rather than a failed
 mutation outcome. The primary pending slot remains durable so command recovery
 can retry replica convergence or release, and is removed only after both
@@ -132,18 +135,40 @@ succeed.
 ### Publication And Retry Boundary
 
 Witness-then-primary fanout is a deliberate protocol contract, not merely an
-iteration order. Before the off-primary witness apply is dispatched, the
-request is in the **abortable** state. Bounded contention or an authoritative
-pre-dispatch rejection may return `SlowDown`, and a command that provably did
-not reach any acting-set member may be abandoned according to its
-command-family rules.
+iteration order. A request remains **abortable** only until final admission has
+succeeded and before the primary pending slot is durably marked
+publication-started. Bounded contention or an authoritative rejection in that
+state may return `SlowDown`, and a command that provably did not cross that
+marker may be abandoned according to its command-family rules.
 
 The request enters **irrevocable convergence** as soon as either:
 
+- the exact primary pending slot is durably marked publication-started;
 - any acting-set member is known to have accepted, mutated, or logged the exact
   command; or
 - a dispatched apply has an ambiguous transport outcome, so the caller cannot
   prove that no durable apply occurred.
+
+The publication-start marker is durable intent, not a serving-publication or
+success witness. It closes the interval in which a witness RPC has been
+accepted by the server but has not committed yet: a replacement owner that
+acquires the primary section must reconstruct the marker and retain the exact
+command even when no actor row is currently observable. Abandonment and reissue
+must reject the marked slot. The S3 success boundary remains confirmed exact
+rows on both the deterministic witness and the primary.
+
+Standalone restart must also treat a marked primary pending slot as
+irrevocable even when every actor row is still at the preceding log index. It
+must converge that exact command without revalidating an expired command-owned
+reservation, then perform terminal reservation release and pending-slot
+cleanup. An unmarked command with no applied actor row remains abortable and
+must pass ordinary admission validation before its first apply.
+
+Post-budget publication classification must observe the exact primary pending
+slot while holding the command-bound primary section. If the section, marker,
+or actor state cannot be observed before the shared absolute deadline, the
+classifier retains irrevocable uncertainty; it must not infer `NotPublished`
+from the absence of an actor row and return caller-visible `SlowDown`.
 
 After that boundary the implementation must converge the same canonical
 command and hash-chain position. It must not abandon or replace the command,
@@ -536,13 +561,13 @@ outcome is only valid after an exact matching predicate has succeeded.
 
 | Finish caller/path | Command scope | Finish classification | Notes |
 | --- | --- | --- | --- |
-| `create_bucket_with_config_and_load_info_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A confirmed primary publication is returned as success while trailing convergence retains the exact slot. |
-| `put_bucket_versioning_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
-| `put_bucket_acl_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
-| `put_bucket_property_command_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
-| `put_bucket_subresource_command_with_route_validation` | bucket PG | Abort only before witness dispatch; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
-| `begin_bucket_delete_if_current_with_route_validation` | bucket PG | After witness dispatch, partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash`; divergent same-index rows fail closed. | Once the primary publishes `Deleting`, a recoverable trailing error returns the committed outcome and retains the slot for recovery. |
-| `establish_multipart_completion_barrier` | bucket PG | Abort only before witness dispatch; after publication, retain the exact command and require complete acting-set convergence. | A published but unconverged barrier returns an internal dependency-pending outcome and must not publish the object-PG command. The returned idempotence sequence comes only from the exact fully converged barrier. |
+| `create_bucket_with_config_and_load_info_with_route_validation` | bucket PG | Abort only before publication-start; exact confirmation or recovery handoff afterward. | A confirmed primary publication is returned as success while trailing convergence retains the exact slot. |
+| `put_bucket_versioning_with_route_validation` | bucket PG | Abort only before publication-start; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
+| `put_bucket_acl_with_route_validation` | bucket PG | Abort only before publication-start; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
+| `put_bucket_property_command_with_route_validation` | bucket PG | Abort only before publication-start; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
+| `put_bucket_subresource_command_with_route_validation` | bucket PG | Abort only before publication-start; exact confirmation or recovery handoff afterward. | A fresh request snapshot is allowed only before irrevocable convergence; success carries a command-derived mutation receipt. |
+| `begin_bucket_delete_if_current_with_route_validation` | bucket PG | After publication-start, partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash`; divergent same-index rows fail closed. | Once the primary publishes `Deleting`, a recoverable trailing error returns the committed outcome and retains the slot for recovery. |
+| `establish_multipart_completion_barrier` | bucket PG | Abort only before publication-start; after publication-start, retain the exact command and require complete acting-set convergence. | A published but unconverged barrier returns an internal dependency-pending outcome and must not publish the object-PG command. The returned idempotence sequence comes only from the exact fully converged barrier. |
 | `drain_pending_metadata_command_pg_slot` and `drain_pending_multipart_completion_barrier_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
 | `finish_pending_command_for_multipart_completion_barrier` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 pins the multipart serialization rules. |
 

@@ -394,6 +394,10 @@ impl RequestWorkBudget {
         self
     }
 
+    fn deadline(&self) -> Instant {
+        self.started.checked_add(self.budget).unwrap_or(self.started)
+    }
+
     #[cfg(test)]
     pub(super) fn expire_for_test(&mut self) {
         self.started = Instant::now()

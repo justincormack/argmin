@@ -6337,6 +6337,21 @@ impl MetadataCommandRecoveryReplicaAbandonRoute for LocalMetadataCommandRecovery
         };
         route.record_metadata_command_abandoned(self.command)
     }
+
+    fn record_abandoned_until(
+        self: Box<Self>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let state =
+            pg.record_metadata_command_abandoned(self.client.node_id.as_u32(), self.command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(state)
+    }
 }
 
 impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCriticalSection {
@@ -6380,6 +6395,72 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
             self.pg_id,
             command,
         )
+    }
+
+    fn metadata_command_abandon_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let acceptance =
+            pg.metadata_command_abandon_acceptance(self.client.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(acceptance)
+    }
+
+    fn pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let started =
+            pg.pending_metadata_command_publication_started(self.client.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(started)
+    }
+
+    fn mark_pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyError> {
+        self.validate_command_route(command)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        pg.mark_pending_metadata_command_publication_started(self.client.node_id.as_u32(), command)
+            .map_err(MetadataCommandApplyError::definitive)?;
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandApplyError::may_have_applied)
+    }
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let hashes =
+            pg.applied_metadata_command_log_entry_hashes(self.client.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(hashes)
     }
 
     fn replace_pending_metadata_command_slot_for_reissue(
@@ -6440,6 +6521,21 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
         self.validate_command_route(command)?;
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.record_metadata_command_abandoned(self.client.node_id.as_u32(), command)
+    }
+
+    fn record_metadata_command_abandoned_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let state = pg.record_metadata_command_abandoned(self.client.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(state)
     }
 }
 
@@ -6512,6 +6608,72 @@ impl MetadataCommandCriticalSection for LocalMetadataCommandCriticalSection {
         self.validate_command_route(command)?;
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
         pg.metadata_command_acceptance(self.client.node_id.as_u32(), command)
+    }
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let hashes =
+            pg.applied_metadata_command_log_entry_hashes(self.client.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(hashes)
+    }
+
+    fn metadata_command_abandon_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let acceptance =
+            pg.metadata_command_abandon_acceptance(self.client.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(acceptance)
+    }
+
+    fn pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        self.validate_command_route(command)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let started =
+            pg.pending_metadata_command_publication_started(self.client.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(started)
+    }
+
+    fn mark_pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyError> {
+        self.validate_command_route(command)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)
+            .map_err(MetadataCommandApplyError::not_sent)?;
+        pg.mark_pending_metadata_command_publication_started(self.client.node_id.as_u32(), command)
+            .map_err(MetadataCommandApplyError::definitive)?;
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandApplyError::may_have_applied)
     }
 
     fn apply_metadata_command_and_record(
@@ -6773,5 +6935,17 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)
+    }
+
+    fn record_metadata_command_abandoned_on_replica_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let state = pg.record_metadata_command_abandoned(self.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(state)
     }
 }

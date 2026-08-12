@@ -158,6 +158,9 @@ pub struct StorageNodeServer {
     runtime_route_before_publish_lock_test_hook: Mutex<Option<RuntimeConfigStageTestHook>>,
     #[cfg(test)]
     response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
+    #[cfg(test)]
+    metadata_command_before_commit_test_hook:
+        Arc<Mutex<Option<MetadataCommandBeforeCommitTestHook>>>,
 }
 
 #[cfg(test)]
@@ -797,6 +800,8 @@ impl StorageNodeServer {
             runtime_route_before_publish_lock_test_hook: Mutex::new(None),
             #[cfg(test)]
             response_envelope_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            metadata_command_before_commit_test_hook: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1230,6 +1235,10 @@ impl StorageNodeServer {
             runtime_route_capture_test_hook: Arc::clone(&self.runtime_route_capture_test_hook),
             #[cfg(test)]
             response_envelope_test_hook: Arc::clone(&self.response_envelope_test_hook),
+            #[cfg(test)]
+            metadata_command_before_commit_test_hook: Arc::clone(
+                &self.metadata_command_before_commit_test_hook,
+            ),
         }
     }
 
@@ -1240,6 +1249,17 @@ impl StorageNodeServer {
     ) {
         *self
             .response_envelope_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_metadata_command_before_commit_test_hook(
+        &self,
+        hook: MetadataCommandBeforeCommitTestHook,
+    ) {
+        *self
+            .metadata_command_before_commit_test_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }

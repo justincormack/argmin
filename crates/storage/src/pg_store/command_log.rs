@@ -941,6 +941,7 @@ pub(crate) struct PendingMetadataCommandSlot {
     pub(crate) id: MetadataCommandId,
     pub(crate) command_checksum: u64,
     pub(crate) command_bytes: Vec<u8>,
+    pub(crate) publication_started: bool,
     pub(crate) scope_bucket: Option<BucketName>,
 }
 
@@ -1289,7 +1290,7 @@ impl PgStore {
             self.encode_pending_placed_segment_reference_pages(command)?;
         self.with_pending_slot_transaction(|| {
             self.execute_cached(
-                "INSERT INTO metadata_command_pending_slot (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, placed_segment_reference_count, scope_bucket) VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(singleton) DO UPDATE SET cluster_epoch = excluded.cluster_epoch, pg_id = excluded.pg_id, log_index = excluded.log_index, command_checksum = excluded.command_checksum, command_bytes = excluded.command_bytes, placed_segment_reference_count = excluded.placed_segment_reference_count, scope_bucket = excluded.scope_bucket",
+                "INSERT INTO metadata_command_pending_slot (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, placed_segment_reference_count, scope_bucket) VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT(singleton) DO UPDATE SET cluster_epoch = excluded.cluster_epoch, pg_id = excluded.pg_id, log_index = excluded.log_index, command_checksum = excluded.command_checksum, command_bytes = excluded.command_bytes, publication_started = 0, placed_segment_reference_count = excluded.placed_segment_reference_count, scope_bucket = excluded.scope_bucket",
                 params![
                     command.id().cluster_epoch().get() as i64,
                     command.id().pg_id().get() as i64,
@@ -2524,7 +2525,8 @@ impl PgStore {
         node_id: u32,
     ) -> Result<Option<PendingMetadataCommandSlot>, StoreError> {
         let raw = self.query_row_cached_optional(
-            "SELECT cluster_epoch, pg_id, log_index, command_checksum, command_bytes, scope_bucket \
+            "SELECT cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
+                    publication_started, scope_bucket \
              FROM metadata_command_pending_slot WHERE singleton = 0",
             [],
             "load metadata command pending slot",
@@ -2535,7 +2537,8 @@ impl PgStore {
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, Vec<u8>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
                 ))
             },
         )?;
@@ -2545,6 +2548,7 @@ impl PgStore {
             raw_log_index,
             raw_command_checksum,
             command_bytes,
+            raw_publication_started,
             raw_scope_bucket,
         )) = raw
         else {
@@ -2611,7 +2615,7 @@ impl PgStore {
             .map_err(|reason| StoreError::Db {
                 context: "decode pending slot scope bucket",
                 source: crate::error::DatabaseError::from_sql_conversion_failure(
-                    5,
+                    6,
                     rusqlite::types::Type::Text,
                     Box::from(reason.to_string()),
                 ),
@@ -2620,8 +2624,136 @@ impl PgStore {
             id,
             command_checksum,
             command_bytes,
+            publication_started: match raw_publication_started {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch: stored_epoch,
+                        log_index: log_index.get(),
+                    });
+                }
+            },
             scope_bucket,
         }))
+    }
+
+    pub(crate) fn pending_metadata_command_publication_started(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            });
+        }
+        let Some(slot) =
+            self.pending_metadata_command_slot(node_id, command.id().cluster_epoch())?
+        else {
+            return Ok(false);
+        };
+        if slot.id != command.id()
+            || slot.command_checksum != command.checksum_crc64()
+            || slot.command_bytes != command.command_bytes()
+        {
+            return Ok(false);
+        }
+        Ok(slot.publication_started)
+    }
+
+    pub(crate) fn mark_pending_metadata_command_publication_started(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        if command.id().pg_id().get() != self.pg_id {
+            return Err(StoreError::MetadataCommandWrongPg {
+                node_id,
+                command_pg_id: command.id().pg_id().get(),
+                target_pg_id: self.pg_id,
+                cluster_epoch: command.id().cluster_epoch(),
+            }
+            .into());
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE; SAVEPOINT validate_publication_start")
+            .map_err(|source| {
+                BucketSnapshotLoadError::Metadata(MetadataError::Db {
+                    context: "validate metadata command publication start (begin txn)",
+                    source: source.into(),
+                })
+            })?;
+        let result = (|| {
+            match self
+                .metadata_command_acceptance(node_id, command)
+                .map_err(BucketSnapshotLoadError::Store)?
+            {
+                MetadataCommandAcceptance::Apply => self
+                    .apply_metadata_command(command)
+                    .map_err(BucketSnapshotLoadError::Metadata)?,
+                MetadataCommandAcceptance::AlreadyApplied => {}
+            }
+            self.conn
+                .execute_batch(
+                    "ROLLBACK TO validate_publication_start; RELEASE validate_publication_start",
+                )
+                .map_err(|source| {
+                    BucketSnapshotLoadError::Metadata(MetadataError::Db {
+                        context: "validate metadata command publication start (rollback probe)",
+                        source: source.into(),
+                    })
+                })?;
+            self.invalidate_clean_metadata_digest_revision();
+
+            let changed = self
+                .execute_cached(
+                    "UPDATE metadata_command_pending_slot SET publication_started = 1 \
+                     WHERE singleton = 0 AND cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3 \
+                       AND command_checksum = ?4 AND command_bytes = ?5",
+                    params![
+                        command.id().cluster_epoch().get() as i64,
+                        command.id().pg_id().get() as i64,
+                        command.id().log_index().get() as i64,
+                        command.checksum_crc64() as i64,
+                        command.command_bytes(),
+                    ],
+                    "mark pending metadata command publication started",
+                )
+                .map_err(BucketSnapshotLoadError::Store)?;
+            if changed == 1
+                || self
+                    .pending_metadata_command_publication_started(node_id, command)
+                    .map_err(BucketSnapshotLoadError::Store)?
+            {
+                Ok(())
+            } else {
+                Err(BucketSnapshotLoadError::Store(
+                    StoreError::MetadataCommandPendingConflict {
+                        pg_id: self.pg_id,
+                        cluster_epoch: command.id().cluster_epoch(),
+                        existing_log_index: 0,
+                        candidate_log_index: command.id().log_index().get(),
+                    },
+                ))
+            }
+        })();
+
+        match result {
+            Ok(()) => self
+                .commit_immediate_txn("mark metadata command publication started (commit txn)")
+                .map_err(BucketSnapshotLoadError::Metadata),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                self.invalidate_clean_metadata_digest_revision();
+                Err(error)
+            }
+        }
     }
 
     /// Remove an epoch-mismatched pending slot during pre-serving recovery.
@@ -3004,6 +3136,9 @@ impl PgStore {
         {
             return Ok(false);
         }
+        if slot.publication_started {
+            return Ok(false);
+        }
         let expected_bytes = expected.command_bytes();
         let replacement_bytes = replacement.command_bytes();
         let (reference_count, pages) =
@@ -3013,6 +3148,7 @@ impl PgStore {
                 "UPDATE metadata_command_pending_slot \
                  SET cluster_epoch = ?1, pg_id = ?2, log_index = ?3, \
                      command_checksum = ?4, command_bytes = ?5, \
+                     publication_started = 0, \
                      placed_segment_reference_count = ?6, scope_bucket = ?7 \
                  WHERE singleton = 0 \
                    AND cluster_epoch = ?8 \

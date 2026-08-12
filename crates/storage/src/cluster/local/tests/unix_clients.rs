@@ -1950,16 +1950,14 @@ fn unix_historical_recovery_reissues_then_cleans_stale_stream_generation() {
         .unwrap();
     let current_cluster = StorageCluster::from_static_local_map(Arc::new(current_map)).unwrap();
 
-    assert_eq!(
-        historical_cluster
-            .drain_pending_metadata_command_with_authorized_recovery_route(
-                pg_id,
-                &source,
-                &current_cluster,
-            )
-            .unwrap(),
-        PendingMetadataCommandOutcome::Abandoned
-    );
+    let recovery_outcome = historical_cluster
+        .drain_pending_metadata_command_with_authorized_recovery_route(
+            pg_id,
+            &source,
+            &current_cluster,
+        )
+        .unwrap();
+    assert_eq!(recovery_outcome, PendingMetadataCommandOutcome::Abandoned);
     drop(historical_cluster);
     drop(current_cluster);
     drop(server_guard);
@@ -2724,11 +2722,8 @@ fn frontend_unix_metadata_command_mode_uses_storage_node_owned_data_dir() {
     assert!(remote_data_dir.join(".argmin-storage-node.lock").is_file());
     let server_thread = {
         let server = Arc::clone(&server);
-        thread::spawn(move || {
-            for _ in 0..2 {
-                server.accept_one().unwrap();
-            }
-        })
+        // Acceptance, inspection, and apply share one held primary section.
+        thread::spawn(move || server.accept_one().unwrap())
     };
 
     let frontend_data_dir = tmp.path().join("frontend-only-metadata-routing");

@@ -61,8 +61,150 @@ enum ReissuePendingMetadataCommandOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataCommandPublicationState {
     NotPublished,
+    PublicationStarted,
+    Witnessed,
+    PublicationUnconfirmed,
     IrrevocableUnconfirmed,
     Published,
+}
+
+struct HeldPrimaryMetadataCommandObservation {
+    node_id: NodeId,
+    result: Result<Option<(u64, u64)>, StoreError>,
+    abandonment: Result<MetadataCommandAcceptance, StoreError>,
+    publication_started: Result<bool, StoreError>,
+}
+
+enum HeldPrimaryMetadataCommandSection {
+    Active(Box<dyn crate::node_client::MetadataCommandCriticalSection>),
+    Recovery(Box<dyn crate::node_client::MetadataCommandRecoveryCriticalSection>),
+}
+
+impl HeldPrimaryMetadataCommandSection {
+    fn acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        match self {
+            Self::Active(section) => section.metadata_command_acceptance_until(command, deadline),
+            Self::Recovery(section) => {
+                section.metadata_command_acceptance_until(command, deadline)
+            }
+        }
+    }
+
+    fn applied_metadata_command_log_entry_hashes_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        match self {
+            Self::Active(section) => {
+                section.applied_metadata_command_log_entry_hashes_until(command, deadline)
+            }
+            Self::Recovery(section) => {
+                section.applied_metadata_command_log_entry_hashes_until(command, deadline)
+            }
+        }
+    }
+
+    fn abandonment_acceptance_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        match self {
+            Self::Active(section) => {
+                section.metadata_command_abandon_acceptance_until(command, deadline)
+            }
+            Self::Recovery(section) => {
+                section.metadata_command_abandon_acceptance_until(command, deadline)
+            }
+        }
+    }
+
+    fn pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        match self {
+            Self::Active(section) => {
+                section.pending_metadata_command_publication_started_until(command, deadline)
+            }
+            Self::Recovery(section) => {
+                section.pending_metadata_command_publication_started_until(command, deadline)
+            }
+        }
+    }
+
+    fn mark_pending_metadata_command_publication_started_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), crate::node_client::MetadataCommandApplyError> {
+        match self {
+            Self::Active(section) => {
+                section.mark_pending_metadata_command_publication_started_until(command, deadline)
+            }
+            Self::Recovery(section) => {
+                section.mark_pending_metadata_command_publication_started_until(command, deadline)
+            }
+        }
+    }
+
+    fn apply_until(
+        &self,
+        authorized_source: Option<&MetadataCommandEnvelope>,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, crate::node_client::MetadataCommandApplyError> {
+        match self {
+            Self::Active(section) => {
+                section.apply_metadata_command_and_record_until(command, deadline)
+            }
+            Self::Recovery(section) => section.apply_metadata_command_and_record_for_recovery_until(
+                authorized_source.expect("recovery section must retain its authorized source"),
+                abandoned_source,
+                command,
+                deadline,
+            ),
+        }
+    }
+}
+
+fn lock_metadata_command_pg_until(
+    lock: &std::sync::Mutex<()>,
+    deadline: Instant,
+) -> Option<std::sync::MutexGuard<'_, ()>> {
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        match lock.try_lock() {
+            Ok(guard) => {
+                if Instant::now() >= deadline {
+                    drop(guard);
+                    return None;
+                }
+                return Some(guard);
+            }
+            Err(std::sync::TryLockError::Poisoned(error)) => {
+                let guard = error.into_inner();
+                if Instant::now() >= deadline {
+                    drop(guard);
+                    return None;
+                }
+                return Some(guard);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+        }
+    }
 }
 
 #[must_use = "ContenderDrained must restart from a fresh snapshot"]

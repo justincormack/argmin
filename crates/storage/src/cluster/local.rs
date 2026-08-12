@@ -68,6 +68,68 @@ const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_WORKER_WAIT_POLL_MILLIS: u64 = 100;
 const METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT: Duration = Duration::from_secs(1);
 const LOCAL_PLACED_SEGMENT_SHARD_REPAIR_HINT_QUEUE_LIMIT: usize = 4096;
 
+#[cfg(test)]
+type OpenMetadataCommandAfterApplyTestHook = Arc<
+    dyn Fn(
+            &BTreeMap<NodeId, LocalNodeStore>,
+            &BTreeMap<PgId, LocalPgRoute>,
+            NodeId,
+            &MetadataCommandEnvelope,
+        ) + Send
+        + Sync,
+>;
+
+#[cfg(test)]
+static OPEN_METADATA_COMMAND_AFTER_APPLY_TEST_HOOK: std::sync::OnceLock<
+    Mutex<Option<OpenMetadataCommandAfterApplyTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(super) struct OpenMetadataCommandAfterApplyTestHookGuard;
+
+#[cfg(test)]
+impl Drop for OpenMetadataCommandAfterApplyTestHookGuard {
+    fn drop(&mut self) {
+        *OPEN_METADATA_COMMAND_AFTER_APPLY_TEST_HOOK
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_install_open_metadata_command_after_apply_hook(
+    hook: OpenMetadataCommandAfterApplyTestHook,
+) -> OpenMetadataCommandAfterApplyTestHookGuard {
+    let mut slot = OPEN_METADATA_COMMAND_AFTER_APPLY_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    assert!(
+        slot.is_none(),
+        "open metadata-command apply hook already installed"
+    );
+    *slot = Some(hook);
+    OpenMetadataCommandAfterApplyTestHookGuard
+}
+
+#[cfg(test)]
+fn maybe_run_open_metadata_command_after_apply_hook(
+    nodes: &BTreeMap<NodeId, LocalNodeStore>,
+    pg_routes: &BTreeMap<PgId, LocalPgRoute>,
+    node_id: NodeId,
+    command: &MetadataCommandEnvelope,
+) {
+    let hook = OPEN_METADATA_COMMAND_AFTER_APPLY_TEST_HOOK
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    if let Some(hook) = hook {
+        hook(nodes, pg_routes, node_id, command);
+    }
+}
+
 fn object_payload_lease_node_is_unavailable(error: &StoreError) -> bool {
     if error.storage_node_failure_class()
         == Some(crate::error::StorageNodeFailureClass::TransportInterrupted)
@@ -4820,12 +4882,47 @@ impl LocalClusterMap {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_metadata_command_abandon_for_replica(
         &self,
         origin_node_id: NodeId,
         target_node_id: NodeId,
         target_pg_id: PgId,
         command: &MetadataCommandEnvelope,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_metadata_command_abandon_for_replica_inner(
+            origin_node_id,
+            target_node_id,
+            target_pg_id,
+            command,
+            None,
+        )
+    }
+
+    pub(crate) fn validate_metadata_command_abandon_for_replica_until(
+        &self,
+        origin_node_id: NodeId,
+        target_node_id: NodeId,
+        target_pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandAcceptance, StoreError> {
+        self.validate_metadata_command_abandon_for_replica_inner(
+            origin_node_id,
+            target_node_id,
+            target_pg_id,
+            command,
+            Some(deadline),
+        )
+    }
+
+    fn validate_metadata_command_abandon_for_replica_inner(
+        &self,
+        origin_node_id: NodeId,
+        target_node_id: NodeId,
+        target_pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Option<Instant>,
     ) -> Result<MetadataCommandAcceptance, StoreError> {
         let command_pg_id = command.id().pg_id();
         if command_pg_id != target_pg_id {
@@ -4900,9 +4997,14 @@ impl LocalClusterMap {
                 pg_id: target_pg_id.get(),
                 cluster_epoch: self.epoch,
             })?;
-        target_node
-            .metadata_command_inspection_client()
-            .metadata_command_abandon_acceptance(target_pg_id, command)
+        match deadline {
+            Some(deadline) => target_node
+                .metadata_command_inspection_client()
+                .metadata_command_abandon_acceptance_until(target_pg_id, command, deadline),
+            None => target_node
+                .metadata_command_inspection_client()
+                .metadata_command_abandon_acceptance(target_pg_id, command),
+        }
     }
 
     pub(crate) fn place_payload_shards(
@@ -5643,6 +5745,7 @@ fn validate_metadata_command_replay_state(
             .primary_node_id();
         let mut replica_states = Vec::new();
         let mut primary_pending_command = None;
+        let mut primary_pending_publication_started = false;
         for node in nodes.values() {
             let node_id = node.node_id();
             let peering_route = node
@@ -5659,18 +5762,37 @@ fn validate_metadata_command_replay_state(
                 .metadata_command_inspection_client()
                 .pending_metadata_command_envelope(pg_id, cluster_epoch)
                 .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?;
-            if pending_command.is_some() && node_id != primary_node_id {
-                return Err(ClusterBuildError::open_local_node(
-                    node_id.as_u32(),
-                    StoreError::MetadataCommandPendingOnNonPrimary {
-                        node_id: node_id.as_u32(),
-                        primary_node_id: primary_node_id.as_u32(),
-                        pg_id: pg_id.get(),
+            if let Some(pending) = pending_command.as_ref() {
+                if node_id != primary_node_id {
+                    return Err(ClusterBuildError::open_local_node(
+                        node_id.as_u32(),
+                        StoreError::MetadataCommandPendingOnNonPrimary {
+                            node_id: node_id.as_u32(),
+                            primary_node_id: primary_node_id.as_u32(),
+                            pg_id: pg_id.get(),
+                            cluster_epoch,
+                        },
+                    ));
+                }
+                let marker_deadline = Instant::now()
+                    .checked_add(super::request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET)
+                    .expect("metadata command marker deadline must fit in Instant");
+                primary_pending_publication_started = node
+                    .metadata_command_client()
+                    .open_metadata_command_critical_section_until(
+                        pg_id,
                         cluster_epoch,
-                    },
-                ));
-            }
-            if pending_command.is_some() && node_id == primary_node_id {
+                        marker_deadline,
+                    )
+                    .and_then(|section| {
+                        section.pending_metadata_command_publication_started_until(
+                            pending,
+                            marker_deadline,
+                        )
+                    })
+                    .map_err(|source| {
+                        ClusterBuildError::open_local_node(node_id.as_u32(), source)
+                    })?;
                 primary_pending_command = pending_command;
             }
             replica_states.push((node_id, state));
@@ -5683,6 +5805,7 @@ fn validate_metadata_command_replay_state(
                 cluster_epoch,
                 &replica_states,
                 primary_pending_command.as_ref(),
+                primary_pending_publication_started,
             )?;
         if should_converge_primary_pending {
             let command = primary_pending_command
@@ -5695,6 +5818,7 @@ fn validate_metadata_command_replay_state(
                 primary_node_id,
                 cluster_epoch,
                 command,
+                primary_pending_publication_started,
             )?;
         } else if let Some(command) = primary_pending_command.as_ref() {
             let primary_state = replica_states
@@ -5784,11 +5908,23 @@ fn converge_in_flight_metadata_command_on_open(
     primary_node_id: NodeId,
     cluster_epoch: ClusterEpoch,
     command: &MetadataCommandEnvelope,
+    publication_started: bool,
 ) -> Result<(), ClusterBuildError> {
     let mut nodes_primary_last = nodes.iter().collect::<Vec<_>>();
     nodes_primary_last.sort_by_key(|(node_id, _node)| **node_id == primary_node_id);
-    for (node_id, node) in nodes_primary_last {
+    let command_already_irrevocable = publication_started
+        || nodes_primary_last
+            .iter()
+            .try_fold(false, |witnessed, (node_id, node)| {
+                node.metadata_command_inspection_client()
+                    .applied_metadata_command_log_entry_hashes(pg_id, command)
+                    .map(|hashes| witnessed || hashes.is_some())
+                    .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))
+            })?;
+    if !command_already_irrevocable {
         validate_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
+    }
+    for (node_id, node) in nodes_primary_last {
         node.metadata_command_client()
             .apply_metadata_command_and_record(pg_id, command)
             .map_err(|source| {
@@ -5797,6 +5933,8 @@ fn converge_in_flight_metadata_command_on_open(
                     bucket_snapshot_error_to_store_error(source),
                 )
             })?;
+        #[cfg(test)]
+        maybe_run_open_metadata_command_after_apply_hook(nodes, pg_routes, *node_id, command);
     }
 
     release_open_metadata_command_bucket_write_reservation(nodes, pg_routes, command)?;
@@ -5820,6 +5958,7 @@ fn converge_in_flight_metadata_command_on_open(
         cluster_epoch,
         &converged_states,
         None,
+        false,
     )
     .map(|_| ())
 }
@@ -5925,14 +6064,15 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
     cluster_epoch: ClusterEpoch,
     replica_states: &[(NodeId, MetadataCommandReplicaState)],
     primary_pending_command: Option<&MetadataCommandEnvelope>,
+    primary_pending_publication_started: bool,
 ) -> Result<bool, ClusterBuildError> {
     let Some((reference_node_id, reference_state)) = replica_states.first() else {
         return Ok(false);
     };
-    if replica_states
+    let replicas_equal = replica_states
         .iter()
-        .all(|(_node_id, state)| state == reference_state)
-    {
+        .all(|(_node_id, state)| state == reference_state);
+    if !primary_pending_publication_started && replicas_equal {
         return Ok(false);
     }
 
@@ -5960,6 +6100,38 @@ fn validate_metadata_command_replica_agreement_or_in_flight_recovery(
         ));
     }
     let command_index = command.id().log_index().get();
+    if replicas_equal && primary_state.applied_log_index == command_index {
+        let mut expected_hashes = None;
+        for (node_id, state) in replica_states {
+            let node = nodes
+                .get(node_id)
+                .expect("replica state node must exist in local node set");
+            let Some(hashes) = node
+                .metadata_command_inspection_client()
+                .applied_metadata_command_log_entry_hashes(pg_id, command)
+                .map_err(|source| ClusterBuildError::open_local_node(node_id.as_u32(), source))?
+            else {
+                return Err(metadata_command_replica_state_diverged_error(
+                    pg_id,
+                    *node_id,
+                    primary_node_id,
+                    state,
+                    primary_state,
+                ));
+            };
+            if expected_hashes.is_some_and(|expected| expected != hashes) {
+                return Err(metadata_command_replica_state_diverged_error(
+                    pg_id,
+                    *node_id,
+                    primary_node_id,
+                    state,
+                    primary_state,
+                ));
+            }
+            expected_hashes = Some(hashes);
+        }
+        return Ok(false);
+    }
     if primary_state.applied_log_index == command_index {
         let previous_index = command_index.checked_sub(1).ok_or_else(|| {
             metadata_command_replica_state_diverged_error(

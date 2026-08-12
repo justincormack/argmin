@@ -712,6 +712,7 @@ CREATE TABLE metadata_command_pending_slot (
     log_index        INTEGER NOT NULL CHECK (log_index > 0),
     command_checksum INTEGER NOT NULL,
     command_bytes    BLOB NOT NULL,
+    publication_started INTEGER NOT NULL DEFAULT 0 CHECK (publication_started IN (0, 1)),
     placed_segment_reference_count INTEGER NOT NULL \
         CHECK (placed_segment_reference_count BETWEEN 0 AND 4294967295),
     scope_bucket     TEXT

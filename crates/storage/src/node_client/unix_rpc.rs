@@ -4123,6 +4123,29 @@ impl MetadataCommandRecoveryReplicaAbandonRoute for UnixMetadataCommandRecoveryR
             "decode metadata command recovery replica abandonment response",
         )
     }
+
+    fn record_abandoned_until(
+        self: Box<Self>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let payload =
+            encode_metadata_command_recovery_request(&self.request()).map_err(|error| {
+                self.client.rpc_payload_error(
+                    "encode metadata command recovery replica abandonment request",
+                    error.to_string(),
+                )
+            })?;
+        let response = self.client.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandRecoveryRecordAbandoned,
+            payload,
+            deadline,
+        )?;
+        self.client.decode_metadata_command_abandonment_response(
+            self.pg_id,
+            &response,
+            "decode metadata command recovery replica abandonment response",
+        )
+    }
 }
 
 impl MetadataCommandNodeClient for UnixStorageNodeClient {
@@ -4452,6 +4475,24 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         }
         UnixStorageNodeClient::record_metadata_command_abandoned_on_replica(self, pg_id, command)
     }
+
+    fn record_metadata_command_abandoned_on_replica_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        if command.id().cluster_epoch() != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: command.id().cluster_epoch(),
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        UnixStorageNodeClient::record_metadata_command_abandoned_on_replica_until(
+            self, pg_id, command, deadline,
+        )
+    }
 }
 
 impl UnixStorageNodeClient {
@@ -4464,6 +4505,25 @@ impl UnixStorageNodeClient {
             StorageRpcMessageKind::BucketDeleteReplicaHead,
             pg_id.pg_id(),
             bucket,
+        )
+    }
+
+    fn record_metadata_command_abandoned_on_replica_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        let payload = self.encode_metadata_command_request(pg_id, command)?;
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandRecordAbandoned,
+            payload,
+            deadline,
+        )?;
+        self.decode_metadata_command_abandonment_response(
+            pg_id,
+            &response,
+            "decode metadata command replica abandonment response",
         )
     }
 

@@ -491,6 +491,107 @@ impl StorageCluster {
         route_mode: MetadataCommandRouteMode,
         deadline: Instant,
     ) -> Result<MetadataCommandPublicationState, BucketSnapshotLoadError> {
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let pg_guard = match pg_lock.try_lock() {
+            Ok(guard) => Some(guard),
+            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if pg_guard.is_none() {
+            let state = self.metadata_command_publication_state_on_acting_set_until_inner(
+                pg_id, command, route_mode, deadline, true, None,
+            )?;
+            return Ok(match state {
+                MetadataCommandPublicationState::NotPublished => {
+                    MetadataCommandPublicationState::IrrevocableUnconfirmed
+                }
+                state => state,
+            });
+        }
+        let primary = match route_mode {
+            MetadataCommandRouteMode::Normal => self
+                .local_map
+                .metadata_pg_primary_node(command.id().cluster_epoch(), pg_id),
+            MetadataCommandRouteMode::Recovery => self
+                .local_map
+                .metadata_pg_primary_node_for_metadata_command_recovery(
+                    command.id().cluster_epoch(),
+                    pg_id,
+                ),
+        };
+        let Ok(primary) = primary else {
+            return Ok(MetadataCommandPublicationState::IrrevocableUnconfirmed);
+        };
+        let primary_node_id = primary.node_id();
+        let primary_section = match route_mode {
+            MetadataCommandRouteMode::Normal => primary
+                .metadata_command_client()
+                .open_metadata_command_critical_section_until(
+                    pg_id,
+                    command.id().cluster_epoch(),
+                    deadline,
+                )
+                .map(HeldPrimaryMetadataCommandSection::Active),
+            MetadataCommandRouteMode::Recovery => primary
+                .metadata_command_recovery_client()
+                .open_metadata_command_recovery_critical_section_until(
+                    pg_id,
+                    command.id().cluster_epoch(),
+                    deadline,
+                )
+                .map(HeldPrimaryMetadataCommandSection::Recovery),
+        };
+        let Ok(primary_section) = primary_section else {
+            return Ok(MetadataCommandPublicationState::IrrevocableUnconfirmed);
+        };
+        let primary_observation = HeldPrimaryMetadataCommandObservation {
+            node_id: primary_node_id,
+            result: primary_section
+                .applied_metadata_command_log_entry_hashes_until(command, deadline),
+            abandonment: primary_section.abandonment_acceptance_until(command, deadline),
+            publication_started: primary_section
+                .pending_metadata_command_publication_started_until(command, deadline),
+        };
+        self.metadata_command_publication_state_on_acting_set_until_inner(
+            pg_id,
+            command,
+            route_mode,
+            deadline,
+            true,
+            Some(primary_observation),
+        )
+    }
+
+    fn reconstruct_metadata_command_publication_state_with_held_primary_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        primary_observation: HeldPrimaryMetadataCommandObservation,
+        deadline: Instant,
+    ) -> Result<MetadataCommandPublicationState, BucketSnapshotLoadError> {
+        self.metadata_command_publication_state_on_acting_set_until_inner(
+            pg_id,
+            command,
+            route_mode,
+            deadline,
+            false,
+            Some(primary_observation),
+        )
+    }
+
+    fn metadata_command_publication_state_on_acting_set_until_inner(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Instant,
+        run_post_budget_test_hook: bool,
+        mut held_primary_observation: Option<HeldPrimaryMetadataCommandObservation>,
+    ) -> Result<MetadataCommandPublicationState, BucketSnapshotLoadError> {
         let nodes = match route_mode {
             MetadataCommandRouteMode::Normal => self
                 .local_map
@@ -504,10 +605,10 @@ impl StorageCluster {
         };
         let mut nodes = match nodes {
             Ok(nodes) => nodes,
-            // This probe runs only after the caller's ordinary work budget has
-            // expired. A stale/unavailable route cannot prove that no actor
-            // durably published the exact command, so preserve the typed
-            // convergence state instead of reclassifying it as contention.
+            Err(error @ StoreError::NodeNotFound { .. }) => return Err(error.into()),
+            // A stale or unavailable route cannot prove that no actor durably
+            // published the exact command. Preserve typed convergence rather
+            // than reclassifying recovered work as ordinary contention.
             Err(_) => return Ok(MetadataCommandPublicationState::IrrevocableUnconfirmed),
         };
         let primary_node_id = match route_mode {
@@ -542,30 +643,102 @@ impl StorageCluster {
         let mut witness_exact = witness_node_id.is_none();
         let mut conflicting_node_id = None;
         let mut uncertain = false;
+        let publication_started = matches!(
+            held_primary_observation.as_ref(),
+            Some(HeldPrimaryMetadataCommandObservation {
+                publication_started: Ok(true),
+                ..
+            })
+        );
+        let publication_start_uncertain = matches!(
+            held_primary_observation.as_ref(),
+            Some(HeldPrimaryMetadataCommandObservation {
+                publication_started: Err(_),
+                ..
+            })
+        );
+        let mut abandoned_exact_node_id = None;
         for node in nodes {
-            if Instant::now() >= deadline {
+            let held_observation = held_primary_observation
+                .take_if(|observation| observation.node_id == node.node_id())
+                .map(|observation| {
+                    #[cfg(test)]
+                    let result = run_post_budget_test_hook
+                        .then(|| {
+                            request_ops::maybe_run_post_budget_metadata_command_inspection_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                                node.node_id(),
+                                deadline,
+                            )
+                        })
+                        .flatten()
+                        .unwrap_or(observation.result);
+                    #[cfg(not(test))]
+                    let result = observation.result;
+                    (result, Some(observation.abandonment))
+                });
+            if held_observation.is_none() && Instant::now() >= deadline {
                 uncertain = true;
                 break;
             }
             #[cfg(test)]
-            let observation = request_ops::maybe_run_post_budget_metadata_command_inspection_hook(
-                self.metadata_command_apply_test_hook_scope_id(),
-                node.node_id(),
-                deadline,
-            )
-            .unwrap_or_else(|| {
-                node.metadata_command_inspection_client()
-                    .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline)
+            let (observation, held_abandonment) = held_observation.unwrap_or_else(|| {
+                run_post_budget_test_hook
+                .then(|| {
+                    request_ops::maybe_run_post_budget_metadata_command_inspection_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        node.node_id(),
+                        deadline,
+                    )
+                })
+                .flatten()
+                .map(|observation| (observation, None))
+                .unwrap_or_else(|| {
+                    (
+                        node.metadata_command_inspection_client()
+                            .applied_metadata_command_log_entry_hashes_until(
+                                pg_id, command, deadline,
+                            ),
+                        None,
+                    )
+                })
             });
             #[cfg(not(test))]
-            let observation = node
-                .metadata_command_inspection_client()
-                .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline);
+            let _ = run_post_budget_test_hook;
+            #[cfg(not(test))]
+            let (observation, held_abandonment) = held_observation.unwrap_or_else(|| {
+                (
+                    node.metadata_command_inspection_client()
+                        .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline),
+                    None,
+                )
+            });
             let hashes = match observation {
                 Ok(Some(hashes)) => hashes,
                 Ok(None) => continue,
                 Err(StoreError::MetadataCommandLogConflict { .. }) => {
-                    conflicting_node_id = Some(node.node_id());
+                    let abandonment = held_abandonment.unwrap_or_else(|| {
+                        node.metadata_command_inspection_client()
+                            .metadata_command_abandon_acceptance_until(pg_id, command, deadline)
+                    });
+                    match abandonment {
+                        Ok(MetadataCommandAcceptance::AlreadyApplied) => {
+                            abandoned_exact_node_id.get_or_insert(node.node_id());
+                        }
+                        Ok(MetadataCommandAcceptance::Apply)
+                        | Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                            conflicting_node_id = Some(node.node_id());
+                        }
+                        Err(
+                            error @ (StoreError::MetadataCommandLogChecksumMismatch { .. }
+                            | StoreError::MetadataCommandLogHashMismatch { .. }
+                            | StoreError::MetadataCommandReplicaStateEncodingVersion { .. }
+                            | StoreError::MetadataCommandReplicaStateDiverged { .. }
+                            | StoreError::MetadataStateDigestMismatch { .. }
+                            | StoreError::MetadataCheckpointInvalid { .. }),
+                        ) => return Err(error.into()),
+                        Err(_) => uncertain = true,
+                    }
                     continue;
                 }
                 Err(
@@ -621,9 +794,42 @@ impl StorageCluster {
             }
             .into());
         }
+        if let (Some((exact_node_id, _)), Some(abandoned_node_id)) =
+            (exact_entry, abandoned_exact_node_id)
+        {
+            return Err(MetadataError::InvariantViolation {
+                context: "confirm metadata command publication after request budget exhaustion",
+                reason: format!(
+                    "acting set contains exact command on node {} and its exact abandonment on node {}",
+                    exact_node_id.as_u32(),
+                    abandoned_node_id.as_u32()
+                ),
+            }
+            .into());
+        }
+        if publication_started {
+            if let Some(abandoned_node_id) = abandoned_exact_node_id {
+                return Err(MetadataError::InvariantViolation {
+                    context: "confirm metadata command publication after request budget exhaustion",
+                    reason: format!(
+                        "metadata command publication started but node {} contains its exact abandonment",
+                        abandoned_node_id.as_u32()
+                    ),
+                }
+                .into());
+            }
+        }
         if primary_exact && witness_exact {
             Ok(MetadataCommandPublicationState::Published)
-        } else if exact_entry.is_some() || uncertain {
+        } else if witness_exact && exact_entry.is_some() {
+            Ok(MetadataCommandPublicationState::Witnessed)
+        } else if exact_entry.is_some() {
+            Ok(MetadataCommandPublicationState::PublicationUnconfirmed)
+        } else if publication_started {
+            Ok(MetadataCommandPublicationState::PublicationStarted)
+        } else if abandoned_exact_node_id.is_some() && exact_entry.is_none() && !uncertain {
+            Ok(MetadataCommandPublicationState::NotPublished)
+        } else if uncertain || publication_start_uncertain {
             Ok(MetadataCommandPublicationState::IrrevocableUnconfirmed)
         } else {
             Ok(MetadataCommandPublicationState::NotPublished)

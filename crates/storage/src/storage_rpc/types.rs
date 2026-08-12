@@ -48,6 +48,7 @@ pub(crate) enum StorageRpcMessageKind {
     MetadataCommandRecoveryApplyAndRecord = 162,
     MetadataCommandRecoveryPendingSlotReplace = 163,
     MetadataCommandRecoveryRecordAbandoned = 168,
+    MetadataCommandPublicationStart = 172,
     PlacedSegmentBackfillReferencePage = 169,
     ObjectPayloadReclaimCommandBuild = 170,
     MetadataCommandRetainedAbortApply = 165,
@@ -391,6 +392,7 @@ impl StorageRpcMessageKind {
             Self::MetadataCommandRecoveryRecordAbandoned => {
                 "metadata command recovery record abandoned"
             }
+            Self::MetadataCommandPublicationStart => "metadata command publication start",
             Self::MetadataCommandRetainedAbortApply => {
                 "metadata command retained stream abort apply"
             }
@@ -589,6 +591,7 @@ impl StorageRpcMessageKind {
             162 => Ok(Self::MetadataCommandRecoveryApplyAndRecord),
             163 => Ok(Self::MetadataCommandRecoveryPendingSlotReplace),
             168 => Ok(Self::MetadataCommandRecoveryRecordAbandoned),
+            172 => Ok(Self::MetadataCommandPublicationStart),
             169 => Ok(Self::PlacedSegmentBackfillReferencePage),
             170 => Ok(Self::ObjectPayloadReclaimCommandBuild),
             165 => Ok(Self::MetadataCommandRetainedAbortApply),
@@ -2326,6 +2329,7 @@ pub(crate) struct StorageRpcMetadataCommandNextIdResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingEnvelopeResponse {
     pub(crate) command: Option<crate::metadata_command::MetadataCommandEnvelope>,
+    pub(crate) publication_started: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

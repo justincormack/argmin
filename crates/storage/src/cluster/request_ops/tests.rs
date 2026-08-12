@@ -197,9 +197,42 @@ mod pending_command_terminal_cleanup_tests {
     }
 
     #[test]
+    fn witnessed_command_retry_requires_typed_exact_confirmation_state() {
+        assert!(metadata_command_apply_error_requires_exact_confirmation(
+            &StoreError::MetadataCommandOutcomeUnconfirmed {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 2,
+            }
+            .into()
+        ));
+        assert!(metadata_command_apply_error_requires_exact_confirmation(
+            &StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 2,
+            }
+            .into()
+        ));
+        assert!(!metadata_command_apply_error_requires_exact_confirmation(
+            &StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 2,
+            }
+            .into()
+        ));
+        assert!(!metadata_command_apply_error_requires_exact_confirmation(
+            &remote_failure(StorageRpcErrorCode::PayloadDecode)
+        ));
+    }
+
+    #[test]
     fn metadata_command_publication_progress_is_monotonic() {
         let states = [
             MetadataCommandApplyProgress::Abortable,
+            MetadataCommandApplyProgress::PublicationStarted,
             MetadataCommandApplyProgress::Witnessed,
             MetadataCommandApplyProgress::PublicationUnconfirmed,
             MetadataCommandApplyProgress::Published,
@@ -220,6 +253,10 @@ mod pending_command_terminal_cleanup_tests {
             MetadataCommandApplyProgress::Witnessed
         );
         assert_eq!(
+            MetadataCommandApplyProgress::PublicationStarted.after_dispatch(false),
+            MetadataCommandApplyProgress::Witnessed
+        );
+        assert_eq!(
             MetadataCommandApplyProgress::Witnessed.after_dispatch(true),
             MetadataCommandApplyProgress::PublicationUnconfirmed
         );
@@ -232,8 +269,9 @@ mod pending_command_terminal_cleanup_tests {
             MetadataCommandApplyProgress::Published
         );
 
-        let failure = MetadataCommandApplyAttemptFailure::before_apply(
+        let failure = MetadataCommandApplyAttemptFailure::before_apply_with_progress(
             2,
+            MetadataCommandApplyProgress::Abortable,
             StoreError::MetadataCommandContention {
                 context: "test pre-dispatch failure",
             },

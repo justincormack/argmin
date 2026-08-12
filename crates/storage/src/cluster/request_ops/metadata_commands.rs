@@ -1,38 +1,6 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
-fn lock_metadata_command_pg_until(
-    lock: &std::sync::Mutex<()>,
-    deadline: Instant,
-) -> Option<std::sync::MutexGuard<'_, ()>> {
-    loop {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        match lock.try_lock() {
-            Ok(guard) => {
-                if Instant::now() >= deadline {
-                    drop(guard);
-                    return None;
-                }
-                return Some(guard);
-            }
-            Err(std::sync::TryLockError::Poisoned(error)) => {
-                let guard = error.into_inner();
-                if Instant::now() >= deadline {
-                    drop(guard);
-                    return None;
-                }
-                return Some(guard);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let remaining = deadline.checked_duration_since(Instant::now())?;
-                std::thread::sleep(remaining.min(Duration::from_millis(1)));
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
@@ -698,55 +666,58 @@ impl super::StorageCluster {
         &self,
         command: &MetadataCommandEnvelope,
     ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_with_initial_progress(
+            command,
+            MetadataCommandApplyProgress::Abortable,
+        )
+    }
+
+    pub(super) fn apply_metadata_command_to_acting_set_with_initial_progress(
+        &self,
+        command: &MetadataCommandEnvelope,
+        initial_progress: MetadataCommandApplyProgress,
+    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
         self.apply_metadata_command_to_acting_set_with_route_mode(
             command,
             MetadataCommandExecutionRoute::normal(),
             self,
+            initial_progress,
         )
     }
 
-    pub(super) fn apply_metadata_command_to_acting_set_with_reservation_authority(
+    fn reconstruct_pending_metadata_command_apply_progress_with_held_primary_until(
         &self,
+        pg_id: PgId,
         command: &MetadataCommandEnvelope,
-        reservation_authority: &StorageCluster,
-    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
-        self.apply_metadata_command_to_acting_set_with_route_mode(
+        route_mode: MetadataCommandRouteMode,
+        primary_observation: HeldPrimaryMetadataCommandObservation,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandApplyProgress>, BucketSnapshotLoadError> {
+        let state = self.reconstruct_metadata_command_publication_state_with_held_primary_until(
+            pg_id,
             command,
-            MetadataCommandExecutionRoute::normal(),
-            reservation_authority,
-        )
-    }
-
-    pub(super) fn apply_reissued_metadata_command_to_acting_set_for_recovery(
-        &self,
-        recovery_proof: MetadataCommandRecoveryProof<'_>,
-        authorized_source: &MetadataCommandEnvelope,
-        abandoned_source: Option<&MetadataCommandEnvelope>,
-        command: &MetadataCommandEnvelope,
-        reservation_authority: &StorageCluster,
-    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
-        self.apply_metadata_command_to_acting_set_with_route_mode(
-            command,
-            MetadataCommandExecutionRoute::recovery(
-                recovery_proof,
-                Some(authorized_source),
-                abandoned_source,
-            ),
-            reservation_authority,
-        )
-    }
-
-    pub(super) fn apply_metadata_command_to_acting_set_for_recovery(
-        &self,
-        recovery_proof: MetadataCommandRecoveryProof<'_>,
-        command: &MetadataCommandEnvelope,
-        reservation_authority: &StorageCluster,
-    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
-        self.apply_metadata_command_to_acting_set_with_route_mode(
-            command,
-            MetadataCommandExecutionRoute::recovery(recovery_proof, None, None),
-            reservation_authority,
-        )
+            route_mode,
+            primary_observation,
+            deadline,
+        )?;
+        match state {
+            MetadataCommandPublicationState::NotPublished => {
+                Ok(Some(MetadataCommandApplyProgress::Abortable))
+            }
+            MetadataCommandPublicationState::PublicationStarted => {
+                Ok(Some(MetadataCommandApplyProgress::PublicationStarted))
+            }
+            MetadataCommandPublicationState::Witnessed => {
+                Ok(Some(MetadataCommandApplyProgress::Witnessed))
+            }
+            MetadataCommandPublicationState::PublicationUnconfirmed => {
+                Ok(Some(MetadataCommandApplyProgress::PublicationUnconfirmed))
+            }
+            MetadataCommandPublicationState::Published => {
+                Ok(Some(MetadataCommandApplyProgress::Published))
+            }
+            MetadataCommandPublicationState::IrrevocableUnconfirmed => Ok(None),
+        }
     }
 
     #[cfg(test)]
@@ -790,10 +761,11 @@ impl super::StorageCluster {
                 may_have_applied: false,
                 source: source.into(),
             })?;
-        self.apply_metadata_command_to_acting_set_for_recovery(
-            leader.proof(),
+        self.apply_metadata_command_to_acting_set_with_route_mode(
             command,
+            MetadataCommandExecutionRoute::recovery(leader.proof(), None, None),
             reservation_authority,
+            MetadataCommandApplyProgress::Abortable,
         )
     }
 
@@ -839,6 +811,7 @@ impl super::StorageCluster {
             derivative,
             MetadataCommandExecutionRoute::recovery(derivative_proof, Some(leader_command), None),
             reservation_authority,
+            MetadataCommandApplyProgress::Abortable,
         )
     }
 
@@ -847,12 +820,50 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         execution_route: MetadataCommandExecutionRoute<'_>,
         reservation_authority: &StorageCluster,
+        initial_progress: MetadataCommandApplyProgress,
+    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_with_route_mode_until_inner(
+            command,
+            execution_route,
+            reservation_authority,
+            initial_progress,
+            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET,
+            MetadataCommandApplyProgressProvenance::Authoritative,
+        )
+    }
+
+    pub(super) fn apply_metadata_command_to_acting_set_with_route_mode_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        reservation_authority: &StorageCluster,
+        initial_progress: MetadataCommandApplyProgress,
+        deadline: Instant,
+    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_with_route_mode_until_inner(
+            command,
+            execution_route,
+            reservation_authority,
+            initial_progress,
+            deadline,
+            MetadataCommandApplyProgressProvenance::RecoveredPending,
+        )
+    }
+
+    fn apply_metadata_command_to_acting_set_with_route_mode_until_inner(
+        &self,
+        command: &MetadataCommandEnvelope,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        reservation_authority: &StorageCluster,
+        initial_progress: MetadataCommandApplyProgress,
+        deadline: Instant,
+        progress_provenance: MetadataCommandApplyProgressProvenance,
     ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
         execution_route
             .require_command(command.id().pg_id(), command)
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
-                progress: MetadataCommandApplyProgress::Abortable,
+                progress: initial_progress,
                 may_have_applied: false,
                 source: source.into(),
             })?;
@@ -860,7 +871,7 @@ impl super::StorageCluster {
             .require_recovery_predecessor(command.id().pg_id())
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
-                progress: MetadataCommandApplyProgress::Abortable,
+                progress: initial_progress,
                 may_have_applied: false,
                 source: source.into(),
             })?;
@@ -879,7 +890,7 @@ impl super::StorageCluster {
         }
         .map_err(|source| MetadataCommandApplyFailure {
             applied_nodes: 0,
-            progress: MetadataCommandApplyProgress::Abortable,
+            progress: initial_progress,
             may_have_applied: false,
             source: source.into(),
         })?
@@ -889,6 +900,12 @@ impl super::StorageCluster {
             command,
             execution_route,
             reservation_authority,
+            MetadataCommandApplyAttemptContext {
+                progress: initial_progress,
+                deadline,
+                provenance: progress_provenance,
+                publication_start: MetadataCommandPublicationStartPolicy::Required,
+            },
         )
     }
 
@@ -898,9 +915,10 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         execution_route: MetadataCommandExecutionRoute<'_>,
         reservation_authority: &StorageCluster,
+        attempt_context: MetadataCommandApplyAttemptContext,
     ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
-        let deadline = Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
-        let mut progress = MetadataCommandApplyProgress::Abortable;
+        let mut progress = attempt_context.progress;
+        let deadline = attempt_context.deadline;
         let mut publication_may_have_applied = false;
         let mut applied_nodes = 0usize;
         let mut retries = 0usize;
@@ -909,15 +927,23 @@ impl super::StorageCluster {
                 self.metadata_command_apply_test_hook_scope_id(),
                 command,
             )
-            .map_err(|source| MetadataCommandApplyAttemptFailure::before_apply(0, source))
+            .map_err(|source| {
+                MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                    0, progress, source,
+                )
+            })
             .and_then(|()| {
                 self.apply_metadata_command_to_acting_set_once(
                     origin_node_id,
                     command,
                     execution_route,
                     reservation_authority,
-                    progress,
-                    deadline,
+                    MetadataCommandApplyAttemptContext {
+                        progress,
+                        deadline,
+                        provenance: attempt_context.provenance,
+                        publication_start: attempt_context.publication_start,
+                    },
                 )
             });
             match attempt {
@@ -1001,7 +1027,8 @@ impl super::StorageCluster {
                     }
                     if matches!(
                         progress,
-                        MetadataCommandApplyProgress::Witnessed
+                        MetadataCommandApplyProgress::PublicationStarted
+                            | MetadataCommandApplyProgress::Witnessed
                             | MetadataCommandApplyProgress::PublicationUnconfirmed
                     ) && publication_may_have_applied
                         && !definitive_apply_failure
@@ -1020,7 +1047,8 @@ impl super::StorageCluster {
                         .into();
                     } else if matches!(
                         progress,
-                        MetadataCommandApplyProgress::Witnessed
+                        MetadataCommandApplyProgress::PublicationStarted
+                            | MetadataCommandApplyProgress::Witnessed
                             | MetadataCommandApplyProgress::PublicationUnconfirmed
                     ) && (can_handoff || exact_conflict_retryable)
                     {
@@ -1107,9 +1135,10 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         execution_route: MetadataCommandExecutionRoute<'_>,
         reservation_authority: &StorageCluster,
-        initial_progress: MetadataCommandApplyProgress,
-        deadline: Instant,
+        attempt_context: MetadataCommandApplyAttemptContext,
     ) -> Result<(), MetadataCommandApplyAttemptFailure> {
+        let initial_progress = attempt_context.progress;
+        let deadline = attempt_context.deadline;
         if Instant::now() >= deadline {
             return Err(MetadataCommandApplyAttemptFailure::before_apply_with_progress(
                 0,
@@ -1123,10 +1152,22 @@ impl super::StorageCluster {
         }
         execution_route
             .require_command(command.id().pg_id(), command)
-            .map_err(|source| MetadataCommandApplyAttemptFailure::before_apply(0, source))?;
+            .map_err(|source| {
+                MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                    0,
+                    initial_progress,
+                    source,
+                )
+            })?;
         execution_route
             .require_recovery_predecessor(command.id().pg_id())
-            .map_err(|source| MetadataCommandApplyAttemptFailure::before_apply(0, source))?;
+            .map_err(|source| {
+                MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                    0,
+                    initial_progress,
+                    source,
+                )
+            })?;
         let route_mode = execution_route.mode;
         let authorized_source = execution_route.recovery_authorized_source;
         let abandoned_source = execution_route.recovery_abandoned_source;
@@ -1157,7 +1198,13 @@ impl super::StorageCluster {
                     pg_id,
                 ),
         }
-        .map_err(|source| MetadataCommandApplyAttemptFailure::before_apply(0, source))?;
+        .map_err(|source| {
+            MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                0,
+                initial_progress,
+                source,
+            )
+        })?;
         let primary_node_id = match route_mode {
             MetadataCommandRouteMode::Normal => self
                 .local_map
@@ -1169,11 +1216,18 @@ impl super::StorageCluster {
                     pg_id,
                 ),
         }
-        .map_err(|source| MetadataCommandApplyAttemptFailure::before_apply(0, source))?
+        .map_err(|source| {
+            MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                0,
+                initial_progress,
+                source,
+            )
+        })?
         .node_id();
         if origin_node_id != primary_node_id {
-            return Err(MetadataCommandApplyAttemptFailure::before_apply(
+            return Err(MetadataCommandApplyAttemptFailure::before_apply_with_progress(
                 0,
+                initial_progress,
                 StoreError::MetadataCommandFromNonPrimary {
                     node_id: primary_node_id.as_u32(),
                     pg_id: pg_id.get(),
@@ -1187,9 +1241,9 @@ impl super::StorageCluster {
             .iter()
             .find(|node| node.node_id() == primary_node_id)
             .expect("validated metadata primary must be in the acting set");
-        let primary_acceptance = match execution_route.recovery_authorized_source {
-            Some(_) => {
-                let section = primary
+        let primary_section = match execution_route.recovery_authorized_source {
+            Some(_) => HeldPrimaryMetadataCommandSection::Recovery(
+                primary
                     .metadata_command_recovery_client()
                     .open_metadata_command_recovery_critical_section_until(
                         pg_id,
@@ -1202,11 +1256,10 @@ impl super::StorageCluster {
                             initial_progress,
                             source,
                         )
-                    })?;
-                section.metadata_command_acceptance_until(command, deadline)
-            }
-            None => {
-                let section = primary
+                    })?,
+            ),
+            None => HeldPrimaryMetadataCommandSection::Active(
+                primary
                     .metadata_command_client()
                     .open_metadata_command_critical_section_until(
                         pg_id,
@@ -1219,11 +1272,61 @@ impl super::StorageCluster {
                             initial_progress,
                             source,
                         )
-                    })?;
-                section.metadata_command_acceptance_until(command, deadline)
+                    })?,
+            ),
+        };
+        // A recovered pending command has no in-process progress owner. Rebuild
+        // that progress only after acquiring the primary's cross-process
+        // section, which excludes fanout and abandonment by other frontends.
+        let initial_progress = if initial_progress.is_abortable()
+            && attempt_context.provenance
+                == MetadataCommandApplyProgressProvenance::RecoveredPending
+        {
+            let primary_observation = primary_section
+                .applied_metadata_command_log_entry_hashes_until(command, deadline);
+            let primary_abandonment =
+                primary_section.abandonment_acceptance_until(command, deadline);
+            let primary_publication_started = primary_section
+                .pending_metadata_command_publication_started_until(command, deadline);
+            match self
+                .reconstruct_pending_metadata_command_apply_progress_with_held_primary_until(
+                    pg_id,
+                    command,
+                    route_mode,
+                    HeldPrimaryMetadataCommandObservation {
+                        node_id: primary_node_id,
+                        result: primary_observation,
+                        abandonment: primary_abandonment,
+                        publication_started: primary_publication_started,
+                    },
+                    deadline,
+                )
+                .map_err(|source| {
+                    MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                        0,
+                        MetadataCommandApplyProgress::PublicationUnconfirmed,
+                        source,
+                    )
+                })? {
+                Some(progress) => progress,
+                None => {
+                    return Err(MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                        0,
+                        MetadataCommandApplyProgress::PublicationUnconfirmed,
+                        StoreError::MetadataCommandOutcomeUnconfirmed {
+                            pg_id: pg_id.get(),
+                            cluster_epoch: command.id().cluster_epoch(),
+                            log_index: command.id().log_index().get(),
+                        },
+                    ));
+                }
             }
-        }
-        .map_err(|source| {
+        } else {
+            initial_progress
+        };
+        let primary_acceptance = primary_section
+            .acceptance_until(command, deadline)
+            .map_err(|source| {
             MetadataCommandApplyAttemptFailure::before_apply_with_progress(
                 0,
                 initial_progress,
@@ -1267,159 +1370,10 @@ impl super::StorageCluster {
         // row is the cross-failure-domain publication witness.
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             if node.node_id() == primary_node_id {
-                if let Some(source) = authorized_source {
-                    let primary_critical_section = node
-                        .metadata_command_recovery_client()
-                        .open_metadata_command_recovery_critical_section_until(
-                            pg_id,
-                            command.id().cluster_epoch(),
-                            deadline,
-                        )
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::before_apply_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                source,
-                            )
-                        })?;
-                    let metadata_client = primary_critical_section.as_ref();
-                    let acceptance = metadata_client
-                        .metadata_command_acceptance_until(command, deadline)
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::before_apply_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                source,
-                            )
-                        })?;
-                    if acceptance == MetadataCommandAcceptance::AlreadyApplied {
-                        attempt_progress =
-                            attempt_progress.merge(MetadataCommandApplyProgress::Published);
-                        metadata_client
-                            .apply_metadata_command_and_record_for_recovery_until(
-                                source,
-                                abandoned_source,
-                                command,
-                                deadline,
-                            )
-                            .map_err(|source| {
-                                MetadataCommandApplyAttemptFailure::from_apply_call_error_with_progress(
-                                    applied_nodes,
-                                    attempt_progress,
-                                    true,
-                                    source,
-                                )
-                            })?;
-                        maybe_run_after_metadata_command_apply_hook(
-                            self.metadata_command_apply_test_hook_scope_id(),
-                            node.node_id(),
-                            command,
-                        )
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::after_apply_dispatch_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                true,
-                                source,
-                            )
-                        })?;
-                        continue;
-                    }
-                    maybe_run_before_metadata_command_apply_hook(
-                        self.metadata_command_apply_test_hook_scope_id(),
-                        node.node_id(),
-                        command,
-                    )
-                    .map_err(|source| {
-                        MetadataCommandApplyAttemptFailure::before_apply_with_progress(
-                            applied_nodes,
-                            attempt_progress,
-                            source,
-                        )
-                    })?;
-                    metadata_client
-                        .apply_metadata_command_and_record_for_recovery_until(
-                            source,
-                            abandoned_source,
-                            command,
-                            deadline,
-                        )
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::from_apply_call_error_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                true,
-                                source,
-                            )
-                        })?;
-                    maybe_run_after_metadata_command_apply_hook(
-                        self.metadata_command_apply_test_hook_scope_id(),
-                        node.node_id(),
-                        command,
-                    )
-                    .map_err(|source| {
-                        MetadataCommandApplyAttemptFailure::after_apply_dispatch_with_progress(
-                            applied_nodes,
-                            attempt_progress,
-                            true,
-                            source,
-                        )
-                    })?;
+                if primary_acceptance == MetadataCommandAcceptance::AlreadyApplied {
                     attempt_progress =
                         attempt_progress.merge(MetadataCommandApplyProgress::Published);
                 } else {
-                    let primary_critical_section = node
-                        .metadata_command_client()
-                        .open_metadata_command_critical_section_until(
-                            pg_id,
-                            command.id().cluster_epoch(),
-                            deadline,
-                        )
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::before_apply_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                source,
-                            )
-                        })?;
-                    let metadata_client = primary_critical_section.as_ref();
-                    let acceptance = metadata_client
-                        .metadata_command_acceptance_until(command, deadline)
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::before_apply_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                source,
-                            )
-                        })?;
-                    if acceptance == MetadataCommandAcceptance::AlreadyApplied {
-                        attempt_progress =
-                            attempt_progress.merge(MetadataCommandApplyProgress::Published);
-                        metadata_client
-                            .apply_metadata_command_and_record_until(command, deadline)
-                            .map_err(|source| {
-                                MetadataCommandApplyAttemptFailure::from_apply_call_error_with_progress(
-                                    applied_nodes,
-                                    attempt_progress,
-                                    true,
-                                    source,
-                                )
-                            })?;
-                        maybe_run_after_metadata_command_apply_hook(
-                            self.metadata_command_apply_test_hook_scope_id(),
-                            node.node_id(),
-                            command,
-                        )
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::after_apply_dispatch_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                true,
-                                source,
-                            )
-                        })?;
-                        continue;
-                    }
                     maybe_run_before_metadata_command_apply_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
                         node.node_id(),
@@ -1432,32 +1386,63 @@ impl super::StorageCluster {
                             source,
                         )
                     })?;
-                    metadata_client
-                        .apply_metadata_command_and_record_until(command, deadline)
-                        .map_err(|source| {
-                            MetadataCommandApplyAttemptFailure::from_apply_call_error_with_progress(
-                                applied_nodes,
-                                attempt_progress,
-                                true,
-                                source,
+                    if attempt_progress.is_abortable()
+                        && attempt_context.publication_start
+                            == MetadataCommandPublicationStartPolicy::Required
+                    {
+                        primary_section
+                            .mark_pending_metadata_command_publication_started_until(
+                                command, deadline,
                             )
-                        })?;
-                    maybe_run_after_metadata_command_apply_hook(
-                        self.metadata_command_apply_test_hook_scope_id(),
-                        node.node_id(),
+                            .map_err(|error| {
+                                let progress = if error.kind()
+                                    == MetadataCommandApplyErrorKind::MayHaveApplied
+                                {
+                                    MetadataCommandApplyProgress::PublicationUnconfirmed
+                                } else {
+                                    attempt_progress
+                                };
+                                MetadataCommandApplyAttemptFailure::from_apply_call_error_with_progress(
+                                    applied_nodes,
+                                    progress,
+                                    false,
+                                    error,
+                                )
+                            })?;
+                        attempt_progress = attempt_progress
+                            .merge(MetadataCommandApplyProgress::PublicationStarted);
+                    }
+                }
+                primary_section
+                    .apply_until(
+                        authorized_source,
+                        abandoned_source,
                         command,
+                        deadline,
                     )
                     .map_err(|source| {
-                        MetadataCommandApplyAttemptFailure::after_apply_dispatch_with_progress(
+                        MetadataCommandApplyAttemptFailure::from_apply_call_error_with_progress(
                             applied_nodes,
                             attempt_progress,
                             true,
                             source,
                         )
                     })?;
-                    attempt_progress =
-                        attempt_progress.merge(MetadataCommandApplyProgress::Published);
-                }
+                maybe_run_after_metadata_command_apply_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    node.node_id(),
+                    command,
+                )
+                .map_err(|source| {
+                    MetadataCommandApplyAttemptFailure::after_apply_dispatch_with_progress(
+                        applied_nodes,
+                        attempt_progress,
+                        true,
+                        source,
+                    )
+                })?;
+                attempt_progress =
+                    attempt_progress.merge(MetadataCommandApplyProgress::Published);
                 continue;
             }
 
@@ -1544,6 +1529,30 @@ impl super::StorageCluster {
                     source,
                 )
             })?;
+            if attempt_progress.is_abortable()
+                && attempt_context.publication_start
+                    == MetadataCommandPublicationStartPolicy::Required
+            {
+                primary_section
+                    .mark_pending_metadata_command_publication_started_until(command, deadline)
+                    .map_err(|error| {
+                        let progress = if error.kind()
+                            == MetadataCommandApplyErrorKind::MayHaveApplied
+                        {
+                            MetadataCommandApplyProgress::PublicationUnconfirmed
+                        } else {
+                            attempt_progress
+                        };
+                        MetadataCommandApplyAttemptFailure::from_apply_call_error_with_progress(
+                            applied_nodes,
+                            progress,
+                            false,
+                            error,
+                        )
+                    })?;
+                attempt_progress =
+                    attempt_progress.merge(MetadataCommandApplyProgress::PublicationStarted);
+            }
             let apply = match authorized_source {
                 Some(source) => node
                     .metadata_command_recovery_client()
@@ -1596,15 +1605,39 @@ impl super::StorageCluster {
         self.record_abandoned_metadata_command_to_acting_set_with_route_mode(
             command,
             MetadataCommandExecutionRoute::normal(),
+            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET,
         )
     }
 
-    pub(super) fn record_abandoned_metadata_command_to_acting_set_for_recovery(
+    pub(super) fn record_abandoned_metadata_command_to_acting_set_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandApplyFailure> {
+        self.record_abandoned_metadata_command_to_acting_set_with_route_mode(
+            command,
+            MetadataCommandExecutionRoute::normal(),
+            deadline,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_record_abandoned_metadata_command_to_acting_set_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.record_abandoned_metadata_command_to_acting_set_until(command, deadline)
+            .map_err(|error| error.source)
+    }
+
+    pub(super) fn record_abandoned_metadata_command_to_acting_set_for_recovery_until(
         &self,
         recovery_proof: MetadataCommandRecoveryProof<'_>,
         command: &MetadataCommandEnvelope,
         authorized_source: Option<&MetadataCommandEnvelope>,
         abandoned_source: Option<&MetadataCommandEnvelope>,
+        deadline: Instant,
     ) -> Result<(), MetadataCommandApplyFailure> {
         self.record_abandoned_metadata_command_to_acting_set_with_route_mode(
             command,
@@ -1613,6 +1646,7 @@ impl super::StorageCluster {
                 authorized_source,
                 abandoned_source,
             ),
+            deadline,
         )
     }
 
@@ -1620,6 +1654,7 @@ impl super::StorageCluster {
         &self,
         command: &MetadataCommandEnvelope,
         execution_route: MetadataCommandExecutionRoute<'_>,
+        deadline: Instant,
     ) -> Result<(), MetadataCommandApplyFailure> {
         execution_route
             .require_command(command.id().pg_id(), command)
@@ -1645,7 +1680,19 @@ impl super::StorageCluster {
             .local_map
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
-        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _pg_guard = lock_metadata_command_pg_until(&pg_lock, deadline).ok_or_else(|| {
+            MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                progress: MetadataCommandApplyProgress::PublicationUnconfirmed,
+                may_have_applied: false,
+                source: StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: pg_id.get(),
+                    cluster_epoch: command.id().cluster_epoch(),
+                    log_index: command.id().log_index().get(),
+                }
+                .into(),
+            }
+        })?;
         let primary_node_id = match route_mode {
             MetadataCommandRouteMode::Normal => self
                 .local_map
@@ -1681,24 +1728,80 @@ impl super::StorageCluster {
             may_have_applied: false,
             source: source.into(),
         })?;
+        let primary = nodes
+            .iter()
+            .find(|node| node.node_id() == primary_node_id)
+            .expect("validated metadata primary must be in the acting set");
+        let primary_critical_section = primary
+            .metadata_command_recovery_client()
+            .open_metadata_command_recovery_critical_section_until(
+                pg_id,
+                command.id().cluster_epoch(),
+                deadline,
+            )
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                progress: MetadataCommandApplyProgress::PublicationUnconfirmed,
+                may_have_applied: false,
+                source: source.into(),
+            })?;
+        let reconstructed = self
+            .reconstruct_pending_metadata_command_apply_progress_with_held_primary_until(
+                pg_id,
+                command,
+                route_mode,
+                HeldPrimaryMetadataCommandObservation {
+                    node_id: primary_node_id,
+                    result: primary_critical_section
+                        .applied_metadata_command_log_entry_hashes_until(command, deadline),
+                    abandonment: primary_critical_section
+                        .metadata_command_abandon_acceptance_until(command, deadline),
+                    publication_started: primary_critical_section
+                        .pending_metadata_command_publication_started_until(command, deadline),
+                },
+                deadline,
+            )
+            .map_err(|source| MetadataCommandApplyFailure {
+                applied_nodes: 0,
+                progress: MetadataCommandApplyProgress::PublicationUnconfirmed,
+                may_have_applied: false,
+                source,
+            })?;
+        match reconstructed {
+            Some(MetadataCommandApplyProgress::Abortable) => {}
+            Some(progress) => {
+                return Err(MetadataCommandApplyFailure {
+                    applied_nodes: 0,
+                    progress,
+                    may_have_applied: false,
+                    source: StoreError::MetadataCommandIrrevocableConvergencePending {
+                        pg_id: pg_id.get(),
+                        cluster_epoch: command.id().cluster_epoch(),
+                        log_index: command.id().log_index().get(),
+                    }
+                    .into(),
+                });
+            }
+            None => {
+                return Err(MetadataCommandApplyFailure {
+                    applied_nodes: 0,
+                    progress: MetadataCommandApplyProgress::PublicationUnconfirmed,
+                    may_have_applied: false,
+                    source: StoreError::MetadataCommandOutcomeUnconfirmed {
+                        pg_id: pg_id.get(),
+                        cluster_epoch: command.id().cluster_epoch(),
+                        log_index: command.id().log_index().get(),
+                    }
+                    .into(),
+                });
+            }
+        }
         nodes.sort_by_key(|node| node.node_id() != primary_node_id);
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             if node.node_id() == primary_node_id {
-                let primary_critical_section = node
-                    .metadata_command_recovery_client()
-                    .open_metadata_command_recovery_critical_section(
-                        pg_id,
-                        command.id().cluster_epoch(),
-                    )
-                    .map_err(|source| MetadataCommandApplyFailure {
-                        applied_nodes,
-                        progress: MetadataCommandApplyProgress::Abortable,
-                        may_have_applied: false,
-                        source: BucketSnapshotLoadError::Store(source),
-                    })?;
                 let metadata_client = primary_critical_section.as_ref();
                 let acceptance = metadata_client
-                    .metadata_command_abandon_acceptance(command)
+                    .metadata_command_abandon_acceptance_until(command, deadline)
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         progress: MetadataCommandApplyProgress::Abortable,
@@ -1707,7 +1810,7 @@ impl super::StorageCluster {
                     })?;
                 if acceptance != MetadataCommandAcceptance::AlreadyApplied {
                     metadata_client
-                        .record_metadata_command_abandoned(command)
+                        .record_metadata_command_abandoned_until(command, deadline)
                         .map_err(|source| MetadataCommandApplyFailure {
                             applied_nodes,
                             progress: MetadataCommandApplyProgress::Abortable,
@@ -1719,11 +1822,12 @@ impl super::StorageCluster {
             }
             let acceptance = self
                 .local_map
-                .validate_metadata_command_abandon_for_replica(
+                .validate_metadata_command_abandon_for_replica_until(
                     primary_node_id,
                     node.node_id(),
                     pg_id,
                     command,
+                    deadline,
                 )
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
@@ -1737,7 +1841,9 @@ impl super::StorageCluster {
             let result = match route_mode {
                 MetadataCommandRouteMode::Normal => node
                     .metadata_command_client()
-                    .record_metadata_command_abandoned_on_replica(pg_id, command),
+                    .record_metadata_command_abandoned_on_replica_until(
+                        pg_id, command, deadline,
+                    ),
                 MetadataCommandRouteMode::Recovery => node
                     .metadata_command_recovery_client()
                     .open_metadata_command_recovery_replica_abandon_route(
@@ -1747,7 +1853,7 @@ impl super::StorageCluster {
                         recovery_abandoned_source,
                         command,
                     )
-                    .and_then(|route| route.record_abandoned()),
+                    .and_then(|route| route.record_abandoned_until(deadline)),
             };
             result.map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes,
@@ -1861,6 +1967,34 @@ impl super::StorageCluster {
             command,
             MetadataCommandExecutionRoute::normal(),
             self,
+            MetadataCommandApplyAttemptContext {
+                progress: MetadataCommandApplyProgress::Abortable,
+                deadline: Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET,
+                provenance: MetadataCommandApplyProgressProvenance::Authoritative,
+                publication_start: MetadataCommandPublicationStartPolicy::RawFanoutTestBypass,
+            },
+        )
+        .map(|_| ())
+        .map_err(|error| error.source)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_apply_pending_metadata_command_to_acting_set_from_origin(
+        &self,
+        origin_node_id: NodeId,
+        command: &MetadataCommandEnvelope,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.apply_metadata_command_to_acting_set_from_origin_with_route_mode(
+            origin_node_id,
+            command,
+            MetadataCommandExecutionRoute::normal(),
+            self,
+            MetadataCommandApplyAttemptContext {
+                progress: MetadataCommandApplyProgress::Abortable,
+                deadline: Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET,
+                provenance: MetadataCommandApplyProgressProvenance::Authoritative,
+                publication_start: MetadataCommandPublicationStartPolicy::Required,
+            },
         )
         .map(|_| ())
         .map_err(|error| error.source)
@@ -2010,6 +2144,7 @@ impl super::StorageCluster {
         let recovery_authorized_source = execution_route.recovery_authorized_source.cloned();
         let recovery_abandoned_source = execution_route.recovery_abandoned_source.cloned();
         let mut command = command.clone();
+        let mut apply_progress = MetadataCommandApplyProgress::Abortable;
         loop {
             if let Err(error) = work_budget.check("metadata command apply retry budget exhausted") {
                 let confirmation_deadline =
@@ -2045,30 +2180,37 @@ impl super::StorageCluster {
                 return Err(error.into());
             }
             let command_bucket = command.bucket_name();
-            let abandoned_on_acting_set = match route_mode {
-                MetadataCommandRouteMode::Normal => {
-                    self.metadata_command_has_abandoned_log_on_acting_set(&command)
-                }
-                MetadataCommandRouteMode::Recovery => self
-                    .metadata_command_has_abandoned_log_on_acting_set_for_recovery(
-                        execution_route.recovery_proof(),
-                        &command,
-                        recovery_authorized_source.as_ref(),
-                        recovery_abandoned_source.as_ref(),
-                    ),
-            }
-            .map_err(|error| error.source)?;
-            if abandoned_on_acting_set {
+            let abandoned_on_acting_set = if apply_progress.is_abortable() {
                 match route_mode {
                     MetadataCommandRouteMode::Normal => {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
+                        self.metadata_command_has_abandoned_log_on_acting_set(&command)
                     }
                     MetadataCommandRouteMode::Recovery => self
-                        .record_abandoned_metadata_command_to_acting_set_for_recovery(
+                        .metadata_command_has_abandoned_log_on_acting_set_for_recovery(
                             execution_route.recovery_proof(),
                             &command,
                             recovery_authorized_source.as_ref(),
                             recovery_abandoned_source.as_ref(),
+                        ),
+                }
+            } else {
+                Ok(false)
+            }
+            .map_err(|error| error.source)?;
+            if abandoned_on_acting_set {
+                match route_mode {
+                    MetadataCommandRouteMode::Normal => self
+                        .record_abandoned_metadata_command_to_acting_set_until(
+                            &command,
+                            work_budget.deadline(),
+                        ),
+                    MetadataCommandRouteMode::Recovery => self
+                        .record_abandoned_metadata_command_to_acting_set_for_recovery_until(
+                            execution_route.recovery_proof(),
+                            &command,
+                            recovery_authorized_source.as_ref(),
+                            recovery_abandoned_source.as_ref(),
+                            work_budget.deadline(),
                         ),
                 }
                 .map_err(|error| error.source)?;
@@ -2092,26 +2234,16 @@ impl super::StorageCluster {
                 }?;
                 return Ok(FinishPendingMetadataCommandResult::Abandoned);
             }
-            let apply_result = match route_mode {
-                MetadataCommandRouteMode::Normal => {
-                    self.apply_metadata_command_to_acting_set(&command)
-                }
-                MetadataCommandRouteMode::Recovery => match recovery_authorized_source.as_ref() {
-                    Some(authorized_source) => self
-                        .apply_reissued_metadata_command_to_acting_set_for_recovery(
-                            execution_route.recovery_proof(),
-                            authorized_source,
-                            None,
-                            &command,
-                            self,
-                        ),
-                    None => self.apply_metadata_command_to_acting_set_for_recovery(
-                        execution_route.recovery_proof(),
-                        &command,
-                        self,
-                    ),
-                },
-            };
+            let apply_result = self.apply_metadata_command_to_acting_set_with_route_mode_until(
+                &command,
+                execution_route,
+                self,
+                apply_progress,
+                work_budget.deadline(),
+            );
+            if let Err(error) = &apply_result {
+                apply_progress = apply_progress.merge(error.progress);
+            }
             match apply_result {
                 Ok(outcome) => {
                     if outcome == MetadataCommandApplyOutcome::PublishedPendingRecovery
@@ -2235,6 +2367,7 @@ impl super::StorageCluster {
                         execution_route =
                             execution_route.for_reissued_command(pg_id, &command, &reissued)?;
                         command = reissued;
+                        apply_progress = MetadataCommandApplyProgress::Abortable;
                         continue;
                     }
                     if policy.clear_pending_on_zero_apply
@@ -2242,15 +2375,18 @@ impl super::StorageCluster {
                         && applied_nodes == 0
                     {
                         match route_mode {
-                            MetadataCommandRouteMode::Normal => {
-                                self.record_abandoned_metadata_command_to_acting_set(&command)
-                            }
+                            MetadataCommandRouteMode::Normal => self
+                                .record_abandoned_metadata_command_to_acting_set_until(
+                                    &command,
+                                    work_budget.deadline(),
+                                ),
                             MetadataCommandRouteMode::Recovery => self
-                                .record_abandoned_metadata_command_to_acting_set_for_recovery(
+                                .record_abandoned_metadata_command_to_acting_set_for_recovery_until(
                                     execution_route.recovery_proof(),
                                     &command,
                                     recovery_authorized_source.as_ref(),
                                     recovery_abandoned_source.as_ref(),
+                                    work_budget.deadline(),
                                 ),
                         }
                         .map_err(|error| error.source)?;

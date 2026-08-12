@@ -1616,6 +1616,7 @@ impl StorageCluster {
         let recovery_authorized_source = execution_route.recovery_authorized_source.cloned();
         let recovery_abandoned_source = execution_route.recovery_abandoned_source.cloned();
         let mut command = command.clone();
+        let mut apply_progress = request_ops::MetadataCommandApplyProgress::Abortable;
         loop {
             if let Err(error) =
                 work_budget.check("object metadata pending command apply budget exhausted")
@@ -1626,31 +1627,38 @@ impl StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             let command_bucket = command.bucket_name();
-            let abandoned_on_acting_set = match route_mode {
-                MetadataCommandRouteMode::Normal => {
-                    self.metadata_command_has_abandoned_log_on_acting_set(&command)
+            let abandoned_on_acting_set = if apply_progress.is_abortable() {
+                match route_mode {
+                    MetadataCommandRouteMode::Normal => {
+                        self.metadata_command_has_abandoned_log_on_acting_set(&command)
+                    }
+                    MetadataCommandRouteMode::Recovery => self
+                        .metadata_command_has_abandoned_log_on_acting_set_for_recovery(
+                            execution_route.recovery_proof(),
+                            &command,
+                            recovery_authorized_source.as_ref(),
+                            recovery_abandoned_source.as_ref(),
+                        ),
                 }
-                MetadataCommandRouteMode::Recovery => self
-                    .metadata_command_has_abandoned_log_on_acting_set_for_recovery(
-                        execution_route.recovery_proof(),
-                        &command,
-                        recovery_authorized_source.as_ref(),
-                        recovery_abandoned_source.as_ref(),
-                    ),
+            } else {
+                Ok(false)
             };
             if abandoned_on_acting_set
                 .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?
             {
                 let record_result = match route_mode {
-                    MetadataCommandRouteMode::Normal => {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                    }
+                    MetadataCommandRouteMode::Normal => self
+                        .record_abandoned_metadata_command_to_acting_set_until(
+                            &command,
+                            work_budget.deadline(),
+                        ),
                     MetadataCommandRouteMode::Recovery => self
-                        .record_abandoned_metadata_command_to_acting_set_for_recovery(
+                        .record_abandoned_metadata_command_to_acting_set_for_recovery_until(
                             execution_route.recovery_proof(),
                             &command,
                             recovery_authorized_source.as_ref(),
                             recovery_abandoned_source.as_ref(),
+                            work_budget.deadline(),
                         ),
                 };
                 record_result.map_err(|error| {
@@ -1665,28 +1673,16 @@ impl StorageCluster {
                 )?;
                 return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
             }
-            let apply_result = match route_mode {
-                MetadataCommandRouteMode::Normal => self
-                    .apply_metadata_command_to_acting_set_with_reservation_authority(
-                        &command,
-                        reservation_authority,
-                    ),
-                MetadataCommandRouteMode::Recovery => match recovery_authorized_source.as_ref() {
-                    Some(authorized_source) => self
-                        .apply_reissued_metadata_command_to_acting_set_for_recovery(
-                            execution_route.recovery_proof(),
-                            authorized_source,
-                            recovery_abandoned_source.as_ref(),
-                            &command,
-                            reservation_authority,
-                        ),
-                    None => self.apply_metadata_command_to_acting_set_for_recovery(
-                        execution_route.recovery_proof(),
-                        &command,
-                        reservation_authority,
-                    ),
-                },
-            };
+            let apply_result = self.apply_metadata_command_to_acting_set_with_route_mode_until(
+                &command,
+                execution_route,
+                reservation_authority,
+                apply_progress,
+                work_budget.deadline(),
+            );
+            if let Err(error) = &apply_result {
+                apply_progress = apply_progress.merge(error.progress);
+            }
             match apply_result {
                 Ok(outcome) => {
                     if outcome == request_ops::MetadataCommandApplyOutcome::Converged {
@@ -1878,6 +1874,7 @@ impl StorageCluster {
                         .for_reissued_command(pg_id, &command, &reissued)
                         .map_err(ObjectPgActionError::Store)?;
                     command = reissued;
+                    apply_progress = request_ops::MetadataCommandApplyProgress::Abortable;
                     #[cfg(test)]
                     if request_ops::maybe_force_pending_object_metadata_partial_conflict_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
@@ -1902,15 +1899,18 @@ impl StorageCluster {
                         )) =>
                 {
                     match route_mode {
-                        MetadataCommandRouteMode::Normal => {
-                            self.record_abandoned_metadata_command_to_acting_set(&command)
-                        }
+                        MetadataCommandRouteMode::Normal => self
+                            .record_abandoned_metadata_command_to_acting_set_until(
+                                &command,
+                                work_budget.deadline(),
+                            ),
                         MetadataCommandRouteMode::Recovery => self
-                            .record_abandoned_metadata_command_to_acting_set_for_recovery(
+                            .record_abandoned_metadata_command_to_acting_set_for_recovery_until(
                                 execution_route.recovery_proof(),
                                 &command,
                                 recovery_authorized_source.as_ref(),
                                 recovery_abandoned_source.as_ref(),
+                                work_budget.deadline(),
                             ),
                     }
                     .map_err(|error| {

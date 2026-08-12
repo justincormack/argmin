@@ -621,6 +621,7 @@ pub(crate) fn storage_rpc_admission_class(
         | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
         | StorageRpcMessageKind::MetadataCommandMaxLogIndex
         | StorageRpcMessageKind::MetadataCommandPendingEnvelope
+        | StorageRpcMessageKind::MetadataCommandPublicationStart
         | StorageRpcMessageKind::MetadataCommandValidateReplayState
         | StorageRpcMessageKind::MetadataCommandValidateReplayStatePreservingPending
         | StorageRpcMessageKind::MetadataCommandReplicaStateCanInitialize

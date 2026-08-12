@@ -155,7 +155,19 @@ pub(super) fn metadata_command_apply_error_is_contention(
     )
 }
 
-fn metadata_command_apply_error_can_handoff_to_recovery(
+pub(super) fn metadata_command_apply_error_requires_exact_confirmation(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    matches!(
+        error,
+        BucketSnapshotLoadError::Store(
+            StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+                | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+        )
+    )
+}
+
+pub(super) fn metadata_command_apply_error_can_handoff_to_recovery(
     error: &BucketSnapshotLoadError,
 ) -> bool {
     if metadata_command_apply_transport_error_is_retryable(error) {
@@ -1908,9 +1920,35 @@ pub(super) struct MetadataCommandApplyFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetadataCommandApplyProgress {
     Abortable,
+    PublicationStarted,
     Witnessed,
     PublicationUnconfirmed,
     Published,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetadataCommandApplyProgressProvenance {
+    /// The caller owns this command's fanout and has retained all progress
+    /// observed by earlier attempts in this process.
+    Authoritative,
+    /// The command was recovered from a durable pending slot, so an Abortable
+    /// value is provisional until acting-set state is reconstructed.
+    RecoveredPending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetadataCommandPublicationStartPolicy {
+    Required,
+    #[cfg(test)]
+    RawFanoutTestBypass,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct MetadataCommandApplyAttemptContext {
+    pub(super) progress: MetadataCommandApplyProgress,
+    pub(super) deadline: Instant,
+    pub(super) provenance: MetadataCommandApplyProgressProvenance,
+    pub(super) publication_start: MetadataCommandPublicationStartPolicy,
 }
 
 impl MetadataCommandApplyProgress {
@@ -1922,13 +1960,14 @@ impl MetadataCommandApplyProgress {
         }
     }
 
-    fn merge(self, other: Self) -> Self {
+    pub(super) fn merge(self, other: Self) -> Self {
         fn rank(progress: MetadataCommandApplyProgress) -> u8 {
             match progress {
                 MetadataCommandApplyProgress::Abortable => 0,
-                MetadataCommandApplyProgress::Witnessed => 1,
-                MetadataCommandApplyProgress::PublicationUnconfirmed => 2,
-                MetadataCommandApplyProgress::Published => 3,
+                MetadataCommandApplyProgress::PublicationStarted => 1,
+                MetadataCommandApplyProgress::Witnessed => 2,
+                MetadataCommandApplyProgress::PublicationUnconfirmed => 3,
+                MetadataCommandApplyProgress::Published => 4,
             }
         }
         if rank(self) >= rank(other) {
@@ -1969,21 +2008,6 @@ struct MetadataCommandApplyAttemptFailure {
 }
 
 impl MetadataCommandApplyAttemptFailure {
-    fn before_apply(
-        applied_nodes: usize,
-        source: impl Into<BucketSnapshotLoadError>,
-    ) -> Self {
-        Self {
-            failure: MetadataCommandApplyFailure {
-                applied_nodes,
-                progress: MetadataCommandApplyProgress::Abortable,
-                may_have_applied: false,
-                source: source.into(),
-            },
-            apply_error_kind: None,
-        }
-    }
-
     fn before_apply_with_progress(
         applied_nodes: usize,
         progress: MetadataCommandApplyProgress,

@@ -372,6 +372,104 @@ type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
 #[cfg(test)]
 type StorageRpcResponseEnvelopeTestHook =
     Arc<dyn Fn(StorageRpcMessageKind, &mut Vec<u8>) + Send + Sync>;
+#[cfg(test)]
+type MetadataCommandBeforeCommitTestHook =
+    Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) + Send + Sync>;
+
+fn metadata_command_state_result_response(
+    command: &MetadataCommandEnvelope,
+    result: Result<crate::metadata_command::MetadataCommandReplicaState, BucketSnapshotLoadError>,
+) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+    let outcome = match result {
+        Ok(state) => StorageRpcMetadataCommandStateOutcome::State(state),
+        Err(BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        })) => {
+            emit_storage_node_metadata_command_log_conflict(
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+                Some(command.payload().kind_name()),
+            );
+            StorageRpcMetadataCommandStateOutcome::LogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }
+        }
+        Err(BucketSnapshotLoadError::Store(error)) => {
+            return encode_storage_rpc_error_response(&store_error_response(error));
+        }
+        Err(BucketSnapshotLoadError::Metadata(
+            crate::MetadataError::ObjectGenerationReservationConflict {
+                reservation_id,
+                generation_id,
+            },
+        )) => StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
+            reservation_id: SessionId::try_from(reservation_id).map_err(|_| {
+                crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "stored reservation id is invalid",
+                )
+            })?,
+            generation_id: GenerationId::new(generation_id).ok_or(
+                crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "stored generation id is invalid",
+                ),
+            )?,
+        },
+        Err(BucketSnapshotLoadError::Metadata(
+            crate::MetadataError::ObjectVersionReservationConflict { version_id },
+        )) => {
+            StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict { version_id }
+        }
+        Err(BucketSnapshotLoadError::Metadata(
+            crate::MetadataError::StaleBucketMetadataCommand {
+                name,
+                bucket_execution_generation,
+            },
+        )) => StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
+            name,
+            bucket_execution_generation,
+        },
+        Err(BucketSnapshotLoadError::Metadata(crate::MetadataError::StaleObjectWriteCommand {
+            bucket,
+            key,
+            write_sequence,
+            generation_id,
+        })) => StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
+            bucket,
+            key,
+            write_sequence,
+            generation_id: generation_id
+                .map(|generation_id| {
+                    GenerationId::new(generation_id).ok_or(
+                        crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                            "stored stale object generation id is invalid",
+                        ),
+                    )
+                })
+                .transpose()?,
+        },
+        Err(BucketSnapshotLoadError::Metadata(crate::MetadataError::StreamSegmentConflict {
+            segment_index,
+        })) => StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index },
+        Err(BucketSnapshotLoadError::Metadata(error)) => {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::Internal,
+                message: error.to_string(),
+            });
+        }
+    };
+    let payload = encode_metadata_command_state_outcome_response(
+        &StorageRpcMetadataCommandStateOutcomeResponse { outcome },
+    );
+    Ok(encode_storage_rpc_success_response(&payload))
+}
 
 const STORAGE_NODE_DATA_DIR_LOCK_FILE_NAME: &str = ".argmin-storage-node.lock";
 const STORAGE_NODE_INCARNATION_FILE: &str = "control-plane-node-incarnation";
@@ -1906,6 +2004,17 @@ impl StorageNodeConnectionHandler {
                 match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
                     Ok(request) => {
                         self.metadata_command_abandon_acceptance_response(session, request)
+                    }
+                    Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::PayloadDecode,
+                        message: error.to_string(),
+                    }),
+                }
+            }
+            StorageRpcMessageKind::MetadataCommandPublicationStart => {
+                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
+                    Ok(request) => {
+                        self.metadata_command_publication_start_response(session, request)
                     }
                     Err(error) => encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                         code: StorageRpcErrorCode::PayloadDecode,
@@ -7470,14 +7579,23 @@ impl StorageNodeConnectionHandler {
         }
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
-            pg.pending_metadata_command_envelope(
+            let slot = pg.pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
                 request.cluster_epoch,
-            )
+            )?;
+            let publication_started = slot.as_ref().is_some_and(|slot| slot.publication_started);
+            let command = pg.pending_metadata_command_envelope(
+                self.config.node_id.as_u32(),
+                request.cluster_epoch,
+            )?;
+            Ok((command, publication_started))
         }) {
-            Ok(command) => {
+            Ok((command, publication_started)) => {
                 let payload = encode_metadata_command_pending_envelope_response(
-                    &StorageRpcMetadataCommandPendingEnvelopeResponse { command },
+                    &StorageRpcMetadataCommandPendingEnvelopeResponse {
+                        command,
+                        publication_started,
+                    },
                 );
                 encode_storage_rpc_success_response(&payload)
             }
@@ -8347,158 +8465,29 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .metadata_command_before_commit_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook(request.node_id, &request.command);
+        }
         let response = match self.node.get_pg(request.pg_id.get()) {
-            Ok(pg) => match pg.apply_metadata_command_and_record_with_commit_guard(
-                self.config.node_id.as_u32(),
+            Ok(pg) => metadata_command_state_result_response(
                 &request.command,
-                || {
-                    mutation_fence.validate_store_at(
-                        crate::clock::current_time_millis(),
-                        crate::clock::monotonic_time_millis(),
-                    )
-                },
-            ) {
-                Ok(state) => {
-                    let payload = encode_metadata_command_state_outcome_response(
-                        &StorageRpcMetadataCommandStateOutcomeResponse {
-                            outcome: StorageRpcMetadataCommandStateOutcome::State(state),
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
-                    node_id,
-                    pg_id,
-                    cluster_epoch,
-                    log_index,
-                })) => {
-                    emit_storage_node_metadata_command_log_conflict(
-                        node_id,
-                        pg_id,
-                        cluster_epoch,
-                        log_index,
-                        Some(request.command.payload().kind_name()),
-                    );
-                    let payload = encode_metadata_command_state_outcome_response(
-                        &StorageRpcMetadataCommandStateOutcomeResponse {
-                            outcome: StorageRpcMetadataCommandStateOutcome::LogConflict {
-                                node_id,
-                                pg_id,
-                                cluster_epoch,
-                                log_index,
-                            },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(BucketSnapshotLoadError::Store(error)) => {
-                    encode_storage_rpc_error_response(&store_error_response(error))?
-                }
-                Err(BucketSnapshotLoadError::Metadata(
-                    crate::MetadataError::ObjectGenerationReservationConflict {
-                        reservation_id,
-                        generation_id,
-                    },
-                )) => {
-                    let reservation_id = SessionId::try_from(reservation_id).map_err(|_| {
-                        crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                            "stored reservation id is invalid",
+                pg.apply_metadata_command_and_record_with_commit_guard(
+                    self.config.node_id.as_u32(),
+                    &request.command,
+                    || {
+                        mutation_fence.validate_store_at(
+                            crate::clock::current_time_millis(),
+                            crate::clock::monotonic_time_millis(),
                         )
-                    })?;
-                    let generation_id = GenerationId::new(generation_id).ok_or(
-                        crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                            "stored generation id is invalid",
-                        ),
-                    )?;
-                    let payload = encode_metadata_command_state_outcome_response(
-                        &StorageRpcMetadataCommandStateOutcomeResponse {
-                            outcome: StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
-                                reservation_id,
-                                generation_id,
-                            },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(BucketSnapshotLoadError::Metadata(
-                    crate::MetadataError::ObjectVersionReservationConflict { version_id },
-                )) => {
-                    let payload = encode_metadata_command_state_outcome_response(
-                        &StorageRpcMetadataCommandStateOutcomeResponse {
-                            outcome:
-                                StorageRpcMetadataCommandStateOutcome::ObjectVersionReservationConflict {
-                                    version_id,
-                                },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(BucketSnapshotLoadError::Metadata(
-                    crate::MetadataError::StaleBucketMetadataCommand {
-                        name,
-                        bucket_execution_generation,
                     },
-                )) => {
-                    let payload = encode_metadata_command_state_outcome_response(
-                        &StorageRpcMetadataCommandStateOutcomeResponse {
-                            outcome:
-                                StorageRpcMetadataCommandStateOutcome::StaleBucketMetadataCommand {
-                                    name,
-                                    bucket_execution_generation,
-                                },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(BucketSnapshotLoadError::Metadata(
-                    crate::MetadataError::StaleObjectWriteCommand {
-                        bucket,
-                        key,
-                        write_sequence,
-                        generation_id,
-                    },
-                )) => {
-                    let generation_id = generation_id
-                        .map(|generation_id| {
-                            GenerationId::new(generation_id).ok_or(
-                                crate::storage_rpc::StorageRpcPayloadError::InvalidObjectMetadataRequest(
-                                    "stored stale object generation id is invalid",
-                                ),
-                            )
-                        })
-                        .transpose()?;
-                    let payload = encode_metadata_command_state_outcome_response(
-                        &StorageRpcMetadataCommandStateOutcomeResponse {
-                            outcome:
-                                StorageRpcMetadataCommandStateOutcome::StaleObjectWriteCommand {
-                                    bucket,
-                                    key,
-                                    write_sequence,
-                                    generation_id,
-                                },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(BucketSnapshotLoadError::Metadata(
-                    crate::MetadataError::StreamSegmentConflict { segment_index },
-                )) => {
-                    let payload = encode_metadata_command_state_outcome_response(
-                        &StorageRpcMetadataCommandStateOutcomeResponse {
-                            outcome: StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict {
-                                segment_index,
-                            },
-                        },
-                    );
-                    encode_storage_rpc_success_response(&payload)
-                }
-                Err(BucketSnapshotLoadError::Metadata(error)) => {
-                    encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                        code: StorageRpcErrorCode::Internal,
-                        message: error.to_string(),
-                    })?
-                }
-            },
+                ),
+            )?,
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
         Ok(response)
@@ -8555,6 +8544,51 @@ impl StorageNodeConnectionHandler {
                     },
                 );
                 encode_storage_rpc_success_response(&payload)
+            }
+            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+        };
+        Ok(response)
+    }
+
+    fn metadata_command_publication_start_response(
+        &self,
+        session: &StorageNodeSession,
+        request: StorageRpcMetadataCommandRequest,
+    ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
+        if let Err(error) = validate_metadata_command_request_epoch(&request) {
+            return encode_storage_rpc_error_response(&error);
+        }
+        let required_binding = StorageNodeMetadataCommandLockBinding {
+            pg_id: request.pg_id,
+            cluster_epoch: request.cluster_epoch,
+            authority: if request.cluster_epoch < self.config.cluster_epoch {
+                StorageNodeMetadataCommandLockAuthority::HistoricalRecoveryPrimary
+            } else {
+                StorageNodeMetadataCommandLockAuthority::CurrentPrimary
+            },
+        };
+        if !session.holds_metadata_command_pg_lock_with_binding(required_binding) {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::StaleShardLocation,
+                message: format!(
+                    "metadata command publication start for PG {} epoch {} requires the exact held primary lock binding",
+                    request.pg_id.get(),
+                    request.cluster_epoch.get(),
+                ),
+            });
+        }
+        let response = match self.node.get_pg(request.pg_id.get()) {
+            Ok(pg) => {
+                let result = pg
+                    .mark_pending_metadata_command_publication_started(
+                        self.config.node_id.as_u32(),
+                        &request.command,
+                    )
+                    .and_then(|()| {
+                        pg.metadata_command_replica_state()
+                            .map_err(BucketSnapshotLoadError::Store)
+                    });
+                metadata_command_state_result_response(&request.command, result)?
             }
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };

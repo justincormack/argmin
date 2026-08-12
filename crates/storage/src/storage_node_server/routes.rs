@@ -15,6 +15,9 @@ struct StorageNodeConnectionHandler {
     runtime_route_capture_test_hook: Arc<Mutex<Option<RuntimeConfigStageTestHook>>>,
     #[cfg(test)]
     response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
+    #[cfg(test)]
+    metadata_command_before_commit_test_hook:
+        Arc<Mutex<Option<MetadataCommandBeforeCommitTestHook>>>,
 }
 #[derive(Debug)]
 enum StorageNodeBucketRouteError {

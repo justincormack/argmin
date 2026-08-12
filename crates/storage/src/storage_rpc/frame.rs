@@ -305,6 +305,7 @@ fn message_kind_request_max_payload_len(
         | StorageRpcMessageKind::MetadataCommandAbandonAcceptance
         | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
         | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
+        | StorageRpcMessageKind::MetadataCommandPublicationStart
         | StorageRpcMessageKind::MetadataCommandAbandoned
         | StorageRpcMessageKind::MetadataCommandRecordAbandoned
         | StorageRpcMessageKind::MetadataCommandApplyAndRecord

@@ -509,7 +509,8 @@ impl super::StorageCluster {
     ) -> Result<(), ObjectPgActionError> {
         let mut command = command.clone();
         let mut retrying_definitively_unapplied_contention = false;
-        let mut apply_may_have_applied = false;
+        let mut apply_progress = MetadataCommandApplyProgress::Abortable;
+        let mut publication_may_have_applied = false;
         loop {
             if let Err(error) =
                 work_budget.check("object metadata command apply retry budget exhausted")
@@ -520,7 +521,7 @@ impl super::StorageCluster {
                     )?;
                     return Err(ObjectPgActionError::Store(error));
                 }
-                if apply_may_have_applied {
+                if publication_may_have_applied || !apply_progress.is_abortable() {
                     return self.finish_new_object_metadata_command_after_budget_exhaustion(
                         pg_id,
                         bucket,
@@ -531,7 +532,10 @@ impl super::StorageCluster {
                 return Err(ObjectPgActionError::Store(error));
             }
             retrying_definitively_unapplied_contention = false;
-            match self.apply_metadata_command_to_acting_set(&command) {
+            match self.apply_metadata_command_to_acting_set_with_initial_progress(
+                &command,
+                apply_progress,
+            ) {
                 Ok(outcome) => {
                     if outcome == MetadataCommandApplyOutcome::Converged {
                         if self
@@ -559,12 +563,15 @@ impl super::StorageCluster {
                 Err(error) => {
                     let MetadataCommandApplyFailure {
                         applied_nodes,
-                        progress,
+                        progress: observed_progress,
                         may_have_applied,
                         source,
                     } = error;
-                    apply_may_have_applied |= may_have_applied;
-                    if progress.is_abortable()
+                    apply_progress = apply_progress.merge(observed_progress);
+                    publication_may_have_applied |= may_have_applied;
+                    let command_is_irrevocable =
+                        publication_may_have_applied || !apply_progress.is_abortable();
+                    if apply_progress.is_abortable()
                         && return_metadata_command_contention
                         && metadata_command_apply_error_is_contention(&source)
                     {
@@ -572,7 +579,7 @@ impl super::StorageCluster {
                             source,
                         ));
                     }
-                    if progress.is_abortable()
+                    if apply_progress.is_abortable()
                         && matches!(
                             &source,
                             BucketSnapshotLoadError::Store(
@@ -583,7 +590,7 @@ impl super::StorageCluster {
                         if let Err(error) = work_budget.sleep_after_contention(
                             "object metadata command contention retry budget exhausted",
                         ) {
-                            if !apply_may_have_applied {
+                            if !command_is_irrevocable {
                                 self.abandon_definitively_unapplied_object_metadata_command(
                                     pg_id, bucket, &command, None,
                                 )?;
@@ -596,14 +603,14 @@ impl super::StorageCluster {
                                 error,
                             );
                         }
-                        retrying_definitively_unapplied_contention = !apply_may_have_applied;
+                        retrying_definitively_unapplied_contention = !command_is_irrevocable;
                         continue;
                     }
-                    if progress.is_abortable()
+                    if apply_progress.is_abortable()
                         && metadata_command_apply_transport_error_is_retryable(&source)
                     {
                         #[cfg(test)]
-                        if !apply_may_have_applied {
+                        if !command_is_irrevocable {
                             maybe_run_object_metadata_command_definitive_retry_hook(
                                 self.metadata_command_apply_test_hook_scope_id(),
                                 &command,
@@ -614,7 +621,7 @@ impl super::StorageCluster {
                         if let Err(error) = work_budget.sleep_after_contention(
                             "object metadata command transport retry budget exhausted",
                         ) {
-                            if !apply_may_have_applied {
+                            if !command_is_irrevocable {
                                 self.abandon_definitively_unapplied_object_metadata_command(
                                     pg_id, bucket, &command, None,
                                 )?;
@@ -627,7 +634,23 @@ impl super::StorageCluster {
                                 error,
                             );
                         }
-                        retrying_definitively_unapplied_contention = !apply_may_have_applied;
+                        retrying_definitively_unapplied_contention = !command_is_irrevocable;
+                        continue;
+                    }
+                    if !apply_progress.is_abortable()
+                        && (metadata_command_apply_error_can_handoff_to_recovery(&source)
+                            || metadata_command_apply_error_requires_exact_confirmation(&source))
+                    {
+                        if let Err(error) = work_budget.sleep_after_contention(
+                            "irrevocable object metadata command convergence budget exhausted",
+                        ) {
+                            return self.finish_new_object_metadata_command_after_budget_exhaustion(
+                                pg_id,
+                                bucket,
+                                &command,
+                                error,
+                            );
+                        }
                         continue;
                     }
                     match self
@@ -664,7 +687,7 @@ impl super::StorageCluster {
                         }
                         None => {}
                     }
-                    if progress.is_abortable()
+                    if apply_progress.is_abortable()
                         && applied_nodes == 0
                         && super::StorageCluster::metadata_command_log_conflict_matches(
                             &command, &source,
@@ -681,13 +704,14 @@ impl super::StorageCluster {
                         {
                             super::ReissuePendingMetadataCommandOutcome::Reissued(reissued) => {
                                 retrying_definitively_unapplied_contention =
-                                    !apply_may_have_applied;
+                                    !command_is_irrevocable;
                                 reissued
                             }
                             super::ReissuePendingMetadataCommandOutcome::MatchingCurrent(
                                 current,
                             ) => {
-                                apply_may_have_applied = true;
+                                apply_progress = apply_progress
+                                    .merge(MetadataCommandApplyProgress::PublicationUnconfirmed);
                                 current
                             }
                             super::ReissuePendingMetadataCommandOutcome::Missing => {
@@ -699,7 +723,8 @@ impl super::StorageCluster {
                                 command: current,
                                 ..
                             } => {
-                                apply_may_have_applied = true;
+                                apply_progress = apply_progress
+                                    .merge(MetadataCommandApplyProgress::PublicationUnconfirmed);
                                 current
                             }
                         };
@@ -713,7 +738,7 @@ impl super::StorageCluster {
                         }
                         continue;
                     }
-                    if progress.is_abortable()
+                    if apply_progress.is_abortable()
                         && applied_nodes == 0
                         && super::StorageCluster::reserve_object_version_conflict_matches(
                             &command, &source,
@@ -742,7 +767,7 @@ impl super::StorageCluster {
                             source,
                         ));
                     }
-                    if progress.is_abortable() && applied_nodes == 0 {
+                    if apply_progress.is_abortable() && applied_nodes == 0 {
                         self.abandon_definitively_unapplied_object_metadata_command(
                             pg_id,
                             bucket,
@@ -783,7 +808,10 @@ impl super::StorageCluster {
                 )?;
                 Ok(())
             }
-            MetadataCommandPublicationState::IrrevocableUnconfirmed => {
+            MetadataCommandPublicationState::PublicationStarted
+            | MetadataCommandPublicationState::Witnessed
+            | MetadataCommandPublicationState::PublicationUnconfirmed
+            | MetadataCommandPublicationState::IrrevocableUnconfirmed => {
                 let id = command.id();
                 Err(ObjectPgActionError::Store(
                     StoreError::MetadataCommandIrrevocableConvergencePending {

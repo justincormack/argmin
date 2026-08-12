@@ -8344,7 +8344,7 @@ fn reserve_object_version_abandons_stale_pending_reservation_and_retries() {
         )),
     );
     cluster
-        .apply_metadata_command_to_acting_set(&first)
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &first)
         .unwrap();
     assert_object_version_counter_on_acting_nodes(&map, &node_ids, object_pg, &bucket, &key, 2);
 
