@@ -787,6 +787,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         self.apply_metadata_command_to_acting_set_for_recovery(
@@ -822,6 +823,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         let derivative_proof = leader
@@ -830,6 +832,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         self.apply_metadata_command_to_acting_set_with_route_mode(
@@ -850,6 +853,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         execution_route
@@ -857,6 +861,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         let route_mode = execution_route.mode;
@@ -875,6 +880,7 @@ impl super::StorageCluster {
         .map_err(|source| MetadataCommandApplyFailure {
             applied_nodes: 0,
             progress: MetadataCommandApplyProgress::Abortable,
+            may_have_applied: false,
             source: source.into(),
         })?
         .node_id();
@@ -917,7 +923,7 @@ impl super::StorageCluster {
             match attempt {
                 Ok(()) => return Ok(MetadataCommandApplyOutcome::Converged),
                 Err(mut error) => {
-                    publication_may_have_applied |= error.may_have_applied;
+                    publication_may_have_applied |= error.failure.may_have_applied;
                     let apply_error_kind = error.apply_error_kind;
                     let attempt_applied_nodes = error.failure.applied_nodes;
                     let observed_progress = self
@@ -932,6 +938,7 @@ impl super::StorageCluster {
                         .merge(observed_progress);
                     error.failure.applied_nodes = applied_nodes;
                     error.failure.progress = progress;
+                    error.failure.may_have_applied = publication_may_have_applied;
                     let can_handoff = metadata_command_apply_error_can_handoff_to_recovery(
                         &error.failure.source,
                     );
@@ -1619,6 +1626,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         execution_route
@@ -1626,6 +1634,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         let route_mode = execution_route.mode;
@@ -1651,6 +1660,7 @@ impl super::StorageCluster {
         .map_err(|source| MetadataCommandApplyFailure {
             applied_nodes: 0,
             progress: MetadataCommandApplyProgress::Abortable,
+            may_have_applied: false,
             source: source.into(),
         })?
         .node_id();
@@ -1668,6 +1678,7 @@ impl super::StorageCluster {
         .map_err(|source| MetadataCommandApplyFailure {
             applied_nodes: 0,
             progress: MetadataCommandApplyProgress::Abortable,
+            may_have_applied: false,
             source: source.into(),
         })?;
         nodes.sort_by_key(|node| node.node_id() != primary_node_id);
@@ -1682,6 +1693,7 @@ impl super::StorageCluster {
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         progress: MetadataCommandApplyProgress::Abortable,
+                        may_have_applied: false,
                         source: BucketSnapshotLoadError::Store(source),
                     })?;
                 let metadata_client = primary_critical_section.as_ref();
@@ -1690,6 +1702,7 @@ impl super::StorageCluster {
                     .map_err(|source| MetadataCommandApplyFailure {
                         applied_nodes,
                         progress: MetadataCommandApplyProgress::Abortable,
+                        may_have_applied: false,
                         source: BucketSnapshotLoadError::Store(source),
                     })?;
                 if acceptance != MetadataCommandAcceptance::AlreadyApplied {
@@ -1698,6 +1711,7 @@ impl super::StorageCluster {
                         .map_err(|source| MetadataCommandApplyFailure {
                             applied_nodes,
                             progress: MetadataCommandApplyProgress::Abortable,
+                            may_have_applied: false,
                             source: source.into(),
                         })?;
                 }
@@ -1714,6 +1728,7 @@ impl super::StorageCluster {
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     progress: MetadataCommandApplyProgress::Abortable,
+                    may_have_applied: false,
                     source: source.into(),
                 })?;
             if acceptance == MetadataCommandAcceptance::AlreadyApplied {
@@ -1737,6 +1752,7 @@ impl super::StorageCluster {
             result.map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         }
@@ -1780,6 +1796,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         execution_route
@@ -1787,6 +1804,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             })?;
         let route_mode = execution_route.mode;
@@ -1794,6 +1812,7 @@ impl super::StorageCluster {
             .map_err(|source| MetadataCommandApplyFailure {
                 applied_nodes: 0,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source,
             })?;
         let pg_id = command.id().pg_id();
@@ -1811,6 +1830,7 @@ impl super::StorageCluster {
         .map_err(|source| MetadataCommandApplyFailure {
             applied_nodes: 0,
             progress: MetadataCommandApplyProgress::Abortable,
+            may_have_applied: false,
             source: source.into(),
         })?;
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
@@ -1820,6 +1840,7 @@ impl super::StorageCluster {
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     progress: MetadataCommandApplyProgress::Abortable,
+                    may_have_applied: false,
                     source: source.into(),
                 })?
             {
@@ -2135,6 +2156,7 @@ impl super::StorageCluster {
                         applied_nodes,
                         progress,
                         source,
+                        ..
                     } = error;
                     if progress.is_abortable()
                         && metadata_command_apply_transport_error_is_retryable(&source)

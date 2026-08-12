@@ -5452,6 +5452,138 @@
         authenticated_object_version_allocator_retries_remote_contention(true);
     }
 
+    fn authenticated_object_command_contention_is_abandoned_before_return(tcp: bool) {
+        let namespace = if tcp {
+            "tls-object-contention-abandon"
+        } else {
+            "unix-object-contention-abandon"
+        };
+        let (_tmp, server_set, cluster) = authenticated_fanout_cluster(tcp, namespace);
+        let bucket = crate::tests::bucket_name("authenticated-object-contention-bucket");
+        let key = crate::tests::object_key("key");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        let acl_grants = AclGrants::default();
+        cluster
+            .create_bucket_with_config_and_load_info(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &acl_grants,
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Suspended,
+                object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
+            })
+            .expect("authenticated bucket creation must converge before contention injection");
+
+        let witness = server_set
+            .servers
+            .iter()
+            .find(|server| server.config_snapshot().node_id == NodeId::new(0))
+            .cloned()
+            .unwrap();
+        let _stderr_guard = witness.suppress_metadata_command_lock_wait_stderr();
+        let held_witness_lock = Arc::new(Mutex::new(Some(
+            witness
+                .metadata_command_locks
+                .acquire(NodeId::new(0), PgId::new(0), None)
+                .unwrap(),
+        )));
+        let retry_hook_ran = Arc::new(AtomicBool::new(false));
+        let retry_hook_ran_for_hook = Arc::clone(&retry_hook_ran);
+        let held_witness_lock_for_hook = Arc::clone(&held_witness_lock);
+        let _retry_hook = cluster.test_install_object_metadata_command_definitive_retry_hook(
+            Arc::new(move |command, source| {
+                if !matches!(
+                    command.payload(),
+                    MetadataCommandPayload::InsertDeleteMarker(_)
+                ) {
+                    return false;
+                }
+                assert!(matches!(
+                    source,
+                    BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                        failure,
+                        ..
+                    }) if failure.wire_code()
+                        == crate::storage_rpc::StorageRpcWireErrorCode::MetadataCommandContention
+                ), "retry must follow authenticated RPC contention, got {source:?}");
+                retry_hook_ran_for_hook.store(true, Ordering::Release);
+                drop(
+                    held_witness_lock_for_hook
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take()
+                        .expect("definitive retry must release the injected witness lock"),
+                );
+                true
+            }),
+        );
+
+        let error = cluster
+            .insert_current_delete_marker_if(
+                &bucket,
+                &key,
+                BucketVersioningState::Suspended,
+                owner,
+                |_| Ok::<(), ()>(()),
+            )
+            .expect_err("definitive authenticated contention must exhaust the request budget");
+
+        assert!(
+            error.is_metadata_command_contention(),
+            "unexpected definitive contention result: {}",
+            match &error {
+                crate::ObjectPgActionError::Store(StoreError::StorageRpc {
+                    operation,
+                    failure,
+                    ..
+                }) => format!("{operation}: {:?}", failure.wire_code()),
+                crate::ObjectPgActionError::Store(source) => format!("{source:?}"),
+                _ => format!("{error:?}"),
+            }
+        );
+        assert!(retry_hook_ran.load(Ordering::Acquire));
+        assert!(
+            held_witness_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "the injected lock must be released before abandonment"
+        );
+        for server in &server_set.servers {
+            let config = server.config_snapshot();
+            let pg = server._node.get_pg(0).unwrap();
+            assert!(
+                pg.pending_metadata_command_slot(
+                    config.node_id.as_u32(),
+                    config.cluster_epoch,
+                )
+                .unwrap()
+                .is_none(),
+                "definitively unapplied command remained recoverable on node {}",
+                config.node_id.as_u32()
+            );
+            assert!(matches!(
+                PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+        }
+    }
+
+    #[test]
+    fn authenticated_unix_object_command_contention_is_abandoned_before_return() {
+        authenticated_object_command_contention_is_abandoned_before_return(false);
+    }
+
+    #[test]
+    fn authenticated_tls_object_command_contention_is_abandoned_before_return() {
+        authenticated_object_command_contention_is_abandoned_before_return(true);
+    }
+
     #[test]
     fn tls_tcp_ordinary_pool_reserves_single_connection_limit_for_stateful_session() {
         let tmp = test_util::tempdir();

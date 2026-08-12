@@ -529,6 +529,10 @@ type PendingObjectMetadataPartialConflictTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
 #[cfg(test)]
+type ObjectMetadataCommandDefinitiveRetryTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope, &BucketSnapshotLoadError) -> bool + Send + Sync>;
+
+#[cfg(test)]
 type PostBudgetMetadataCommandInspectionTestHook = Arc<
     dyn Fn(NodeId, Instant) -> Option<Result<Option<(u64, u64)>, StoreError>> + Send + Sync,
 >;
@@ -670,6 +674,11 @@ static PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, ObjectMetadataCommandDefinitiveRetryTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static POST_BUDGET_METADATA_COMMAND_INSPECTION_HOOKS: OnceLock<
     Mutex<HashMap<usize, PostBudgetMetadataCommandInspectionTestHook>>,
 > = OnceLock::new();
@@ -796,6 +805,11 @@ pub(crate) struct MultipartCompletionPendingBarrierObservedTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct PendingObjectMetadataPartialConflictTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct ObjectMetadataCommandDefinitiveRetryTestHookGuard {
     scope_id: usize,
 }
 
@@ -1047,6 +1061,18 @@ impl Drop for MultipartCompletionPendingBarrierObservedTestHookGuard {
 impl Drop for PendingObjectMetadataPartialConflictTestHookGuard {
     fn drop(&mut self) {
         let hooks = PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObjectMetadataCommandDefinitiveRetryTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -1461,6 +1487,24 @@ pub(super) fn maybe_force_pending_object_metadata_partial_conflict_hook(
 }
 
 #[cfg(test)]
+fn maybe_run_object_metadata_command_definitive_retry_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    source: &BucketSnapshotLoadError,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook(command, source)) {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
 pub(super) fn maybe_run_post_budget_metadata_command_inspection_hook(
     scope_id: usize,
     node_id: NodeId,
@@ -1862,6 +1906,7 @@ fn bucket_snapshot_error_to_bucket_write_drain_error(
 pub(super) struct MetadataCommandApplyFailure {
     pub(super) applied_nodes: usize,
     pub(super) progress: MetadataCommandApplyProgress,
+    pub(super) may_have_applied: bool,
     pub(super) source: BucketSnapshotLoadError,
 }
 
@@ -1925,7 +1970,6 @@ pub(super) struct MetadataCommandFinishPolicy {
 #[derive(Debug)]
 struct MetadataCommandApplyAttemptFailure {
     failure: MetadataCommandApplyFailure,
-    may_have_applied: bool,
     apply_error_kind: Option<MetadataCommandApplyErrorKind>,
 }
 
@@ -1938,9 +1982,9 @@ impl MetadataCommandApplyAttemptFailure {
             failure: MetadataCommandApplyFailure {
                 applied_nodes,
                 progress: MetadataCommandApplyProgress::Abortable,
+                may_have_applied: false,
                 source: source.into(),
             },
-            may_have_applied: false,
             apply_error_kind: None,
         }
     }
@@ -1954,9 +1998,9 @@ impl MetadataCommandApplyAttemptFailure {
             failure: MetadataCommandApplyFailure {
                 applied_nodes,
                 progress,
+                may_have_applied: false,
                 source: source.into(),
             },
-            may_have_applied: false,
             apply_error_kind: None,
         }
     }
@@ -1971,9 +2015,9 @@ impl MetadataCommandApplyAttemptFailure {
             failure: MetadataCommandApplyFailure {
                 applied_nodes,
                 progress: progress.after_dispatch(is_primary),
+                may_have_applied: true,
                 source: source.into(),
             },
-            may_have_applied: true,
             apply_error_kind: Some(MetadataCommandApplyErrorKind::MayHaveApplied),
         }
     }
@@ -1999,7 +2043,6 @@ impl MetadataCommandApplyAttemptFailure {
         failure.apply_error_kind = Some(kind);
         failure
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

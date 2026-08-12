@@ -2,6 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 impl super::StorageCluster {
+    #[cfg(test)]
+    pub(crate) fn test_install_object_metadata_command_definitive_retry_hook(
+        &self,
+        hook: ObjectMetadataCommandDefinitiveRetryTestHook,
+    ) -> ObjectMetadataCommandDefinitiveRetryTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        ObjectMetadataCommandDefinitiveRetryTestHookGuard { scope_id }
+    }
+
     pub(crate) fn payload_reclaim_exists(
         &self,
         bucket: &BucketName,
@@ -440,6 +454,41 @@ impl super::StorageCluster {
         )
     }
 
+    fn abandon_definitively_unapplied_object_metadata_command(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: Option<&mut super::RequestWorkBudget>,
+    ) -> Result<(), ObjectPgActionError> {
+        self.record_abandoned_metadata_command_to_acting_set(command)
+            .map_err(|error| {
+                super::bucket_snapshot_error_to_object_pg_action_error(error.source)
+            })?;
+        let pending = self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+        if pending.as_ref() != Some(command) {
+            return Err(super::conflicting_pending_object_metadata_command(
+                "pending object metadata command changed before abandoned cleanup",
+            ));
+        }
+        self.release_metadata_command_bucket_write_reservation(command)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+        match work_budget {
+            Some(work_budget) => self
+                .remove_pending_metadata_command_for_bucket_with_work_budget(
+                    pg_id,
+                    bucket,
+                    command,
+                    work_budget,
+                )
+                .map_err(ObjectPgActionError::from)?,
+            None => self
+                .remove_pending_metadata_command_for_bucket(pg_id, bucket, command)
+                .map_err(ObjectPgActionError::from)?,
+        };
+        Ok(())
+    }
+
     fn apply_new_object_metadata_command_for_bucket_inner(
         &self,
         pg_id: PgId,
@@ -449,8 +498,20 @@ impl super::StorageCluster {
         return_metadata_command_contention: bool,
     ) -> Result<(), ObjectPgActionError> {
         let mut command = command.clone();
+        let mut retrying_definitively_unapplied_contention = false;
+        let mut apply_may_have_applied = false;
         loop {
-            work_budget.check("object metadata command apply retry budget exhausted")?;
+            if let Err(error) =
+                work_budget.check("object metadata command apply retry budget exhausted")
+            {
+                if retrying_definitively_unapplied_contention {
+                    self.abandon_definitively_unapplied_object_metadata_command(
+                        pg_id, bucket, &command, None,
+                    )?;
+                }
+                return Err(ObjectPgActionError::Store(error));
+            }
+            retrying_definitively_unapplied_contention = false;
             match self.apply_metadata_command_to_acting_set(&command) {
                 Ok(outcome) => {
                     if outcome == MetadataCommandApplyOutcome::Converged {
@@ -480,8 +541,10 @@ impl super::StorageCluster {
                     let MetadataCommandApplyFailure {
                         applied_nodes,
                         progress,
+                        may_have_applied,
                         source,
                     } = error;
+                    apply_may_have_applied |= may_have_applied;
                     if progress.is_abortable()
                         && return_metadata_command_contention
                         && metadata_command_apply_error_is_contention(&source)
@@ -491,13 +554,49 @@ impl super::StorageCluster {
                         ));
                     }
                     if progress.is_abortable()
+                        && matches!(
+                            &source,
+                            BucketSnapshotLoadError::Store(
+                                StoreError::MetadataCommandContention { .. }
+                            )
+                        )
+                    {
+                        if let Err(error) = work_budget.sleep_after_contention(
+                            "object metadata command contention retry budget exhausted",
+                        ) {
+                            if !apply_may_have_applied {
+                                self.abandon_definitively_unapplied_object_metadata_command(
+                                    pg_id, bucket, &command, None,
+                                )?;
+                            }
+                            return Err(ObjectPgActionError::Store(error));
+                        }
+                        retrying_definitively_unapplied_contention = !apply_may_have_applied;
+                        continue;
+                    }
+                    if progress.is_abortable()
                         && metadata_command_apply_transport_error_is_retryable(&source)
                     {
-                        work_budget
-                            .sleep_after_contention(
-                                "object metadata command transport retry budget exhausted",
-                            )
-                            .map_err(ObjectPgActionError::Store)?;
+                        #[cfg(test)]
+                        if !apply_may_have_applied {
+                            maybe_run_object_metadata_command_definitive_retry_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                                &command,
+                                &source,
+                                work_budget,
+                            );
+                        }
+                        if let Err(error) = work_budget.sleep_after_contention(
+                            "object metadata command transport retry budget exhausted",
+                        ) {
+                            if !apply_may_have_applied {
+                                self.abandon_definitively_unapplied_object_metadata_command(
+                                    pg_id, bucket, &command, None,
+                                )?;
+                            }
+                            return Err(ObjectPgActionError::Store(error));
+                        }
+                        retrying_definitively_unapplied_contention = !apply_may_have_applied;
                         continue;
                     }
                     match self
@@ -581,25 +680,12 @@ impl super::StorageCluster {
                         ));
                     }
                     if progress.is_abortable() && applied_nodes == 0 {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                            .map_err(|error| {
-                                super::bucket_snapshot_error_to_object_pg_action_error(error.source)
-                            })?;
-                        let pending = self.pending_metadata_command_for_bucket(pg_id, bucket)?;
-                        if pending.as_ref() != Some(&command) {
-                            return Err(super::conflicting_pending_object_metadata_command(
-                                "pending object metadata command changed before abandoned cleanup",
-                            ));
-                        }
-                        self.release_metadata_command_bucket_write_reservation(&command)
-                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
-                        self.remove_pending_metadata_command_for_bucket_with_work_budget(
+                        self.abandon_definitively_unapplied_object_metadata_command(
                             pg_id,
                             bucket,
                             &command,
-                            work_budget,
-                        )
-                        .map_err(ObjectPgActionError::from)?;
+                            Some(work_budget),
+                        )?;
                     }
                     return Err(super::bucket_snapshot_error_to_object_pg_action_error(
                         source,

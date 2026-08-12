@@ -3554,6 +3554,186 @@ fn insert_delete_marker_metadata_command_applies_to_all_acting_object_pg_nodes()
 }
 
 #[test]
+fn insert_delete_marker_retries_local_command_contention_before_publication() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::InsertDeleteMarker(_)
+            ) && hook_attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected local delete-marker publication contention",
+                });
+            }
+            Ok(())
+        }));
+
+    let marker = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            crate::OwnerIdentity::from_principal("owner"),
+            |stored| {
+                assert!(stored.is_none());
+                Ok::<(), ()>(())
+            },
+        )
+        .expect("local command contention should be retried")
+        .expect("delete-marker condition should succeed");
+
+    assert_eq!(marker.version_id, crate::VersionId::Null);
+    assert!(attempts.load(Ordering::SeqCst) >= 2);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn insert_delete_marker_abandons_persistent_local_contention_at_retry_deadline() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::InsertDeleteMarker(_)
+            ) {
+                hook_attempts.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected persistent local delete-marker publication contention",
+                });
+            }
+            Ok(())
+        }));
+
+    let error = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            crate::OwnerIdentity::from_principal("owner"),
+            |_| Ok::<(), ()>(()),
+        )
+        .expect_err("persistent local contention must exhaust the bounded retry budget");
+
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert!(attempts.load(Ordering::SeqCst) > 1);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn delete_current_object_retries_local_command_contention_before_publication() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    write_committed_direct_segment_for(&cluster, &bucket, &key, b"delete after contention");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::DeleteObjectVersion(_)
+            ) && hook_attempts.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected local current-delete publication contention",
+                });
+            }
+            Ok(())
+        }));
+
+    let deleted = cluster
+        .delete_current_object_if(&bucket, &key, |stored| {
+            assert!(stored.is_some());
+            Ok::<(), ()>(())
+        })
+        .expect("local command contention should be retried")
+        .expect("delete condition should succeed");
+
+    assert!(matches!(
+        deleted.deleted,
+        crate::DeletedCurrentObject::Live { .. }
+    ));
+    assert!(attempts.load(Ordering::SeqCst) >= 2);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservation() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
