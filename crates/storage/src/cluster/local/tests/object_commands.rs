@@ -3858,6 +3858,150 @@ fn insert_delete_marker_abandons_persistent_local_contention_at_retry_deadline()
 }
 
 #[test]
+fn suspended_delete_marker_reinspects_replacement_after_unpublished_command_is_abandoned() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Suspended);
+    let original = write_committed_direct_segment_for_with_versioning(
+        &cluster,
+        &bucket,
+        &key,
+        crate::BucketVersioningState::Suspended,
+        [0xa1; 16],
+        [0xa2; 16],
+        b"original conditional delete subject",
+    );
+
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let _apply_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::InsertDeleteMarker(marker)
+                    if marker.bucket == hook_bucket && marker.key == hook_key
+            ) && fail_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected unpublished conditional delete contention",
+                });
+            }
+            Ok(())
+        }));
+    let expire_bucket = bucket.clone();
+    let expire_key = key.clone();
+    let _budget_hook = cluster.test_install_object_metadata_command_definitive_retry_hook(
+        Arc::new(move |command, source| {
+            matches!(
+                command.payload(),
+                MetadataCommandPayload::InsertDeleteMarker(marker)
+                    if marker.bucket == expire_bucket && marker.key == expire_key
+            ) && crate::cluster::request_ops::metadata_command_apply_error_is_contention(source)
+        }),
+    );
+
+    let replacement_generation = Arc::new(Mutex::new(None));
+    let replacement_generation_for_hook = Arc::clone(&replacement_generation);
+    let replacement_cluster = cluster.clone();
+    let replacement_bucket = bucket.clone();
+    let replacement_key = key.clone();
+    let replace_once = Arc::new(AtomicBool::new(true));
+    let replace_once_for_hook = Arc::clone(&replace_once);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let _abandoned_hook =
+        cluster.test_install_object_metadata_command_abandoned_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::InsertDeleteMarker(marker)
+                    if marker.bucket == hook_bucket && marker.key == hook_key
+            ) && replace_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                let replacement = write_committed_direct_segment_for_with_versioning(
+                    &replacement_cluster,
+                    &replacement_bucket,
+                    &replacement_key,
+                    crate::BucketVersioningState::Suspended,
+                    [0xb1; 16],
+                    [0xb2; 16],
+                    b"different concurrent replacement",
+                );
+                *replacement_generation_for_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(replacement.generation_id);
+            }
+        }));
+
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let replacement_generation_for_closure = Arc::clone(&replacement_generation);
+    let result = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            crate::OwnerIdentity::from_principal("owner"),
+            move |stored| {
+                action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                let generation_id = stored
+                    .and_then(crate::StoredObject::as_live)
+                    .map(|live| live.generation_id);
+                if generation_id == Some(original.generation_id) {
+                    Ok(())
+                } else {
+                    let expected = replacement_generation_for_closure
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .expect("replacement generation must be recorded");
+                    assert_eq!(generation_id, Some(expected));
+                    Err("conditional request conflict")
+                }
+            },
+        )
+        .expect("safe unpublished contention must be reinspected");
+
+    assert!(matches!(result, Err("conditional request conflict")));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 2);
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(!replace_once.load(Ordering::SeqCst));
+    let replacement_generation = replacement_generation
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .expect("replacement generation must be recorded");
+    let pg = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap();
+    let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+    assert_eq!(
+        stored.as_live().map(|live| live.generation_id),
+        Some(replacement_generation)
+    );
+    drop(pg);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn insert_delete_marker_abandons_fresh_reissue_before_returning_contention() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

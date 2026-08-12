@@ -139,7 +139,12 @@ iteration order. A request remains **abortable** only until final admission has
 succeeded and before the primary pending slot is durably marked
 publication-started. Bounded contention or an authoritative rejection in that
 state may return `SlowDown`, and a command that provably did not cross that
-marker may be abandoned according to its command-family rules.
+marker may be abandoned according to its command-family rules. Snapshot-sensitive
+conditional mutations must distinguish that safe abandonment from uncertain
+publication: while their request budget remains, they discard the stale computed
+result and re-evaluate the condition against a fresh snapshot. Only exhaustion of
+that outer budget may return `SlowDown` for repeated, definitively unpublished
+contention.
 
 The request enters **irrevocable convergence** as soon as either:
 

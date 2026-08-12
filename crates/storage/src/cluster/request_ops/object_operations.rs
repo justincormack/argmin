@@ -1,6 +1,12 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+#[derive(Debug)]
+enum NewObjectMetadataCommandApplyOutcome {
+    Applied,
+    Reinspect(ObjectPgActionError),
+}
+
 impl super::StorageCluster {
     #[cfg(test)]
     pub(crate) fn test_install_object_metadata_command_definitive_retry_hook(
@@ -14,6 +20,20 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         ObjectMetadataCommandDefinitiveRetryTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_object_metadata_command_abandoned_hook(
+        &self,
+        hook: ObjectMetadataCommandAbandonedTestHook,
+    ) -> ObjectMetadataCommandAbandonedTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = OBJECT_METADATA_COMMAND_ABANDONED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        ObjectMetadataCommandAbandonedTestHookGuard { scope_id }
     }
 
     pub(crate) fn payload_reclaim_exists(
@@ -429,11 +449,30 @@ impl super::StorageCluster {
         )
         .for_operation("new_object_metadata_command_apply")
         .for_pg(pg_id);
-        self.apply_new_object_metadata_command_for_bucket_inner(
+        match self.apply_new_object_metadata_command_for_bucket_inner(
             pg_id,
             bucket,
             command,
             &mut work_budget,
+            false,
+        )? {
+            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Reinspect(error) => Err(error),
+        }
+    }
+
+    fn apply_new_object_metadata_command_for_bucket_or_reinspect(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        self.apply_new_object_metadata_command_for_bucket_inner(
+            pg_id,
+            bucket,
+            command,
+            work_budget,
             false,
         )
     }
@@ -455,13 +494,16 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
-        self.apply_new_object_metadata_command_for_bucket_inner(
+        match self.apply_new_object_metadata_command_for_bucket_inner(
             pg_id,
             bucket,
             command,
             work_budget,
             true,
-        )
+        )? {
+            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Reinspect(error) => Err(error),
+        }
     }
 
     fn abandon_definitively_unapplied_object_metadata_command(
@@ -506,7 +548,7 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut super::RequestWorkBudget,
         return_metadata_command_contention: bool,
-    ) -> Result<(), ObjectPgActionError> {
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         let mut command = command.clone();
         let mut retrying_definitively_unapplied_contention = false;
         let mut apply_progress = MetadataCommandApplyProgress::Abortable;
@@ -519,7 +561,9 @@ impl super::StorageCluster {
                     self.abandon_definitively_unapplied_object_metadata_command(
                         pg_id, bucket, &command, None,
                     )?;
-                    return Err(ObjectPgActionError::Store(error));
+                    return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                        ObjectPgActionError::Store(error),
+                    ));
                 }
                 if publication_may_have_applied || !apply_progress.is_abortable() {
                     return self.finish_new_object_metadata_command_after_budget_exhaustion(
@@ -558,7 +602,7 @@ impl super::StorageCluster {
                     crate::node::maybe_run_after_object_metadata_command_publish_hook(
                         self.metadata_primary_test_hook_node().test_hook_scope_id(),
                     )?;
-                    return Ok(());
+                    return Ok(NewObjectMetadataCommandApplyOutcome::Applied);
                 }
                 Err(error) => {
                     let MetadataCommandApplyFailure {
@@ -587,6 +631,15 @@ impl super::StorageCluster {
                             )
                         )
                     {
+                        #[cfg(test)]
+                        if !command_is_irrevocable {
+                            maybe_run_object_metadata_command_definitive_retry_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                                &command,
+                                &source,
+                                work_budget,
+                            );
+                        }
                         if let Err(error) = work_budget.sleep_after_contention(
                             "object metadata command contention retry budget exhausted",
                         ) {
@@ -594,7 +647,9 @@ impl super::StorageCluster {
                                 self.abandon_definitively_unapplied_object_metadata_command(
                                     pg_id, bucket, &command, None,
                                 )?;
-                                return Err(ObjectPgActionError::Store(error));
+                                return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                                    ObjectPgActionError::Store(error),
+                                ));
                             }
                             return self.finish_new_object_metadata_command_after_budget_exhaustion(
                                 pg_id,
@@ -625,7 +680,9 @@ impl super::StorageCluster {
                                 self.abandon_definitively_unapplied_object_metadata_command(
                                     pg_id, bucket, &command, None,
                                 )?;
-                                return Err(ObjectPgActionError::Store(error));
+                                return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                                    ObjectPgActionError::Store(error),
+                                ));
                             }
                             return self.finish_new_object_metadata_command_after_budget_exhaustion(
                                 pg_id,
@@ -678,7 +735,7 @@ impl super::StorageCluster {
                                 .map_err(ObjectPgActionError::from)?;
                             }
                             self.after_object_metadata_command_applied(&command);
-                            return Ok(());
+                            return Ok(NewObjectMetadataCommandApplyOutcome::Applied);
                         }
                         Some(false) => {
                             return Err(super::conflicting_pending_object_metadata_command(
@@ -763,17 +820,24 @@ impl super::StorageCluster {
                             work_budget,
                         )
                         .map_err(ObjectPgActionError::from)?;
-                        return Err(super::bucket_snapshot_error_to_object_pg_action_error(
-                            source,
+                        return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                            super::bucket_snapshot_error_to_object_pg_action_error(source),
                         ));
                     }
                     if apply_progress.is_abortable() && applied_nodes == 0 {
+                        let can_reinspect =
+                            metadata_command_apply_error_can_reinspect_after_abandonment(&source);
                         self.abandon_definitively_unapplied_object_metadata_command(
                             pg_id,
                             bucket,
                             &command,
                             Some(work_budget),
                         )?;
+                        if can_reinspect {
+                            return Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                                super::bucket_snapshot_error_to_object_pg_action_error(source),
+                            ));
+                        }
                     }
                     return Err(super::bucket_snapshot_error_to_object_pg_action_error(
                         source,
@@ -789,7 +853,7 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         budget_error: StoreError,
-    ) -> Result<(), ObjectPgActionError> {
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         let confirmation_deadline =
             Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
         match self
@@ -806,7 +870,7 @@ impl super::StorageCluster {
                 crate::node::maybe_run_after_object_metadata_command_publish_hook(
                     self.metadata_primary_test_hook_node().test_hook_scope_id(),
                 )?;
-                Ok(())
+                Ok(NewObjectMetadataCommandApplyOutcome::Applied)
             }
             MetadataCommandPublicationState::PublicationStarted
             | MetadataCommandPublicationState::Witnessed
@@ -828,7 +892,9 @@ impl super::StorageCluster {
                     command,
                     None,
                 )?;
-                Err(ObjectPgActionError::Store(budget_error))
+                Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                    ObjectPgActionError::Store(budget_error),
+                ))
             }
         }
     }
@@ -1360,8 +1426,23 @@ impl super::StorageCluster {
             });
         }
         let pg_id = object_pg_id.pg_id();
+        let mut work_budget = super::RequestWorkBudget::new(
+            std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("insert_current_delete_marker")
+        .for_pg(pg_id);
+        #[cfg(test)]
+        let mut abandoned_hook_command = None;
 
         loop {
+            #[cfg(test)]
+            if let Some(command) = abandoned_hook_command.take() {
+                maybe_run_object_metadata_command_abandoned_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    &command,
+                );
+            }
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let storage_client = self.object_delete_metadata_primary_route(bucket, key)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -1426,6 +1507,14 @@ impl super::StorageCluster {
                     return Ok(Err(error));
                 }
             };
+            if let Err(error) =
+                work_budget.check("insert delete marker retry budget exhausted")
+            {
+                self.release_bucket_write_proof_for_object_metadata_command(
+                    &bucket_write_reservation,
+                )?;
+                return Err(ObjectPgActionError::Store(error));
+            }
             let null_snapshot = if versioning == BucketVersioningState::Suspended {
                 if let Err(error) = require_valid_route() {
                     self.release_bucket_write_proof_for_object_metadata_command(
@@ -1551,7 +1640,20 @@ impl super::StorageCluster {
                     continue;
                 }
             }
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+            if let NewObjectMetadataCommandApplyOutcome::Reinspect(_) = self
+                .apply_new_object_metadata_command_for_bucket_or_reinspect(
+                pg_id,
+                bucket,
+                &command,
+                &mut work_budget,
+            )?
+            {
+                #[cfg(test)]
+                {
+                    abandoned_hook_command = Some(command.clone());
+                }
+                continue;
+            }
             return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
                 value,
                 version_id: marker_vid,

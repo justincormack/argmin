@@ -155,6 +155,20 @@ pub(super) fn metadata_command_apply_error_is_contention(
     )
 }
 
+pub(super) fn metadata_command_apply_error_can_reinspect_after_abandonment(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    match error {
+        BucketSnapshotLoadError::Store(error) => matches!(
+            error.operation_failure_class(),
+            StoreOperationFailureClass::ResourceExhausted
+                | StoreOperationFailureClass::MetadataCommandContention
+                | StoreOperationFailureClass::RetryableConvergence
+        ),
+        BucketSnapshotLoadError::Metadata(error) => error.is_command_contention(),
+    }
+}
+
 pub(super) fn metadata_command_apply_error_requires_exact_confirmation(
     error: &BucketSnapshotLoadError,
 ) -> bool {
@@ -545,6 +559,10 @@ type ObjectMetadataCommandDefinitiveRetryTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope, &BucketSnapshotLoadError) -> bool + Send + Sync>;
 
 #[cfg(test)]
+type ObjectMetadataCommandAbandonedTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
+
+#[cfg(test)]
 type PostBudgetMetadataCommandInspectionTestHook = Arc<
     dyn Fn(NodeId, Instant) -> Option<Result<Option<(u64, u64)>, StoreError>> + Send + Sync,
 >;
@@ -691,6 +709,11 @@ static OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static OBJECT_METADATA_COMMAND_ABANDONED_HOOKS: OnceLock<
+    Mutex<HashMap<usize, ObjectMetadataCommandAbandonedTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static POST_BUDGET_METADATA_COMMAND_INSPECTION_HOOKS: OnceLock<
     Mutex<HashMap<usize, PostBudgetMetadataCommandInspectionTestHook>>,
 > = OnceLock::new();
@@ -822,6 +845,11 @@ pub(crate) struct PendingObjectMetadataPartialConflictTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct ObjectMetadataCommandDefinitiveRetryTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct ObjectMetadataCommandAbandonedTestHookGuard {
     scope_id: usize,
 }
 
@@ -1085,6 +1113,18 @@ impl Drop for PendingObjectMetadataPartialConflictTestHookGuard {
 impl Drop for ObjectMetadataCommandDefinitiveRetryTestHookGuard {
     fn drop(&mut self) {
         let hooks = OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObjectMetadataCommandAbandonedTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = OBJECT_METADATA_COMMAND_ABANDONED_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -1508,6 +1548,22 @@ fn maybe_run_object_metadata_command_definitive_retry_hook(
         .cloned();
     if hook.is_some_and(|hook| hook(command, source)) {
         work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_object_metadata_command_abandoned_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) {
+    let hook = OBJECT_METADATA_COMMAND_ABANDONED_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(command);
     }
 }
 
