@@ -1236,10 +1236,13 @@ impl super::StorageCluster {
                             Err(error) => return Ok(Err(error)),
                         };
                         require_valid_route().map_err(ObjectPgActionError::Store)?;
-                        self.apply_exact_pending_object_metadata_command(
+                        if self.apply_exact_pending_object_metadata_command_or_reinspect(
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                        )?;
+                        )? == super::ExactPendingObjectMetadataCommandOutcome::Reinspect
+                        {
+                            continue;
+                        }
                         return Ok(Ok(InsertCurrentDeleteMarkerOutcome {
                             value,
                             version_id: marker.version_id,

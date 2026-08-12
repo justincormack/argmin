@@ -48,6 +48,15 @@ enum ReissuedPendingCommandDecision {
     Conflict { node_id: NodeId, log_index: u64 },
 }
 
+enum ReissuePendingMetadataCommandOutcome {
+    Reissued(MetadataCommandEnvelope),
+    Missing,
+    MatchingCurrentConflict {
+        command: MetadataCommandEnvelope,
+        source: StoreError,
+    },
+}
+
 #[must_use = "ContenderDrained must restart from a fresh snapshot"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotSensitiveInstallOutcome {

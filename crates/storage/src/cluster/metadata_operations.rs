@@ -689,6 +689,7 @@ impl StorageCluster {
         )
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn matching_reissued_pending_command_if_safe_with_route_mode(
         &self,
@@ -701,6 +702,36 @@ impl StorageCluster {
         current: MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        match self.matching_reissued_pending_command_outcome_with_route_mode(
+            pg_id,
+            primary_node_id,
+            primary_metadata_client,
+            primary_max_log_index,
+            acting_set_max_log_index,
+            expected_payload,
+            current,
+            route_mode,
+        )? {
+            ReissuePendingMetadataCommandOutcome::Reissued(command) => Ok(Some(command)),
+            ReissuePendingMetadataCommandOutcome::Missing => Ok(None),
+            ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict { source, .. } => {
+                Err(source)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matching_reissued_pending_command_outcome_with_route_mode(
+        &self,
+        pg_id: PgId,
+        primary_node_id: NodeId,
+        primary_metadata_client: &dyn MetadataCommandInspectionNodeClient,
+        primary_max_log_index: u64,
+        acting_set_max_log_index: u64,
+        expected_payload: &MetadataCommandPayload,
+        current: MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+    ) -> Result<ReissuePendingMetadataCommandOutcome, StoreError> {
         let payload_matches = current.payload() == expected_payload;
         let current_log_index = current.id().log_index().get();
         let primary_state = primary_metadata_client.metadata_command_replica_state(pg_id)?;
@@ -722,17 +753,26 @@ impl StorageCluster {
                 ));
             }
             if !payload_matches {
-                return Ok(None);
+                return Ok(ReissuePendingMetadataCommandOutcome::Missing);
             }
-            return self.matching_terminal_pending_command_if_safe(
+            return match self.matching_terminal_pending_command_if_safe(
                 pg_id,
                 primary_node_id,
                 primary_metadata_client,
                 acting_set_max_log_index,
                 &primary_state,
-                current,
+                &current,
                 route_mode,
-            );
+            ) {
+                Ok(()) => Ok(ReissuePendingMetadataCommandOutcome::Reissued(current)),
+                Err(source @ StoreError::MetadataCommandLogConflict { .. }) => Ok(
+                    ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                        command: current,
+                        source,
+                    },
+                ),
+                Err(error) => Err(error),
+            };
         }
         let primary_summary = ReissuedPendingCommandPrimarySummary {
             node_id: primary_node_id,
@@ -747,7 +787,9 @@ impl StorageCluster {
             payload_matches,
             &[],
         ) {
-            ReissuedPendingCommandDecision::StaleCommandDisplaced => return Ok(None),
+            ReissuedPendingCommandDecision::StaleCommandDisplaced => {
+                return Ok(ReissuePendingMetadataCommandOutcome::Missing);
+            }
             ReissuedPendingCommandDecision::Conflict { node_id, log_index } => {
                 let _ = observability::event(
                     TRACE_TARGET,
@@ -765,7 +807,13 @@ impl StorageCluster {
                         payload_matches,
                     )),
                 );
-                return Err(self.metadata_command_conflict(node_id, pg_id, log_index));
+                let source = self.metadata_command_conflict(node_id, pg_id, log_index);
+                return Ok(
+                    ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                        command: current,
+                        source,
+                    },
+                );
             }
             ReissuedPendingCommandDecision::ReloadCurrent => {}
         }
@@ -818,8 +866,12 @@ impl StorageCluster {
             payload_matches,
             &replicas,
         ) {
-            ReissuedPendingCommandDecision::StaleCommandDisplaced => Ok(None),
-            ReissuedPendingCommandDecision::ReloadCurrent => Ok(Some(current)),
+            ReissuedPendingCommandDecision::StaleCommandDisplaced => {
+                Ok(ReissuePendingMetadataCommandOutcome::Missing)
+            }
+            ReissuedPendingCommandDecision::ReloadCurrent => {
+                Ok(ReissuePendingMetadataCommandOutcome::Reissued(current))
+            }
             ReissuedPendingCommandDecision::Conflict { node_id, log_index } => {
                 let _ = observability::event(
                     TRACE_TARGET,
@@ -837,7 +889,13 @@ impl StorageCluster {
                         payload_matches,
                     )),
                 );
-                Err(self.metadata_command_conflict(node_id, pg_id, log_index))
+                let source = self.metadata_command_conflict(node_id, pg_id, log_index);
+                Ok(
+                    ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                        command: current,
+                        source,
+                    },
+                )
             }
         }
     }
@@ -850,9 +908,9 @@ impl StorageCluster {
         primary_metadata_client: &dyn MetadataCommandInspectionNodeClient,
         acting_set_max_log_index: u64,
         primary_state: &MetadataCommandReplicaState,
-        current: MetadataCommandEnvelope,
+        current: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
-    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+    ) -> Result<(), StoreError> {
         let current_log_index = current.id().log_index().get();
         let Some(previous_log_index) = current_log_index.checked_sub(1) else {
             return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
@@ -865,7 +923,7 @@ impl StorageCluster {
             ));
         }
         let Some((previous_log_hash, terminal_log_hash)) =
-            primary_metadata_client.applied_metadata_command_log_entry_hashes(pg_id, &current)?
+            primary_metadata_client.applied_metadata_command_log_entry_hashes(pg_id, current)?
         else {
             return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
         };
@@ -921,14 +979,14 @@ impl StorageCluster {
             let matches_applied = if node.node_id() == primary_node_id {
                 primary_metadata_client.has_matching_applied_metadata_command_log_entry(
                     pg_id,
-                    &current,
+                    current,
                     previous_log_hash,
                 )?
             } else {
                 node.metadata_command_inspection_client()
                     .has_matching_applied_metadata_command_log_entry(
                         pg_id,
-                        &current,
+                        current,
                         previous_log_hash,
                     )?
             };
@@ -940,7 +998,7 @@ impl StorageCluster {
                 ));
             }
         }
-        Ok(Some(current))
+        Ok(())
     }
 
     fn reissue_pending_metadata_command(
@@ -963,6 +1021,27 @@ impl StorageCluster {
         execution_route: MetadataCommandExecutionRoute<'_>,
         replacement_payload: &MetadataCommandPayload,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
+        match self.reissue_pending_metadata_command_outcome_with_route_mode(
+            pg_id,
+            command,
+            execution_route,
+            replacement_payload,
+        )? {
+            ReissuePendingMetadataCommandOutcome::Reissued(command) => Ok(Some(command)),
+            ReissuePendingMetadataCommandOutcome::Missing => Ok(None),
+            ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict { source, .. } => {
+                Err(source.into())
+            }
+        }
+    }
+
+    fn reissue_pending_metadata_command_outcome_with_route_mode(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        replacement_payload: &MetadataCommandPayload,
+    ) -> Result<ReissuePendingMetadataCommandOutcome, BucketSnapshotLoadError> {
         execution_route.require_reissue_source(pg_id, command, replacement_payload)?;
         let route_mode = execution_route.mode;
         let recovery_authorized_source = execution_route.recovery_authorized_source;
@@ -1019,7 +1098,7 @@ impl StorageCluster {
                 primary_critical_section.max_metadata_command_log_index()?;
             let Some(current) = primary_critical_section.pending_metadata_command_envelope()?
             else {
-                return Ok(None);
+                return Ok(ReissuePendingMetadataCommandOutcome::Missing);
             };
             if current != *command || acting_set_max_log_index > primary_max_log_index {
                 ReissueReplaceOutcome::Reload {
@@ -1074,8 +1153,10 @@ impl StorageCluster {
             }
         };
         match replace_outcome {
-            ReissueReplaceOutcome::Replaced(replacement) => Ok(Some(replacement)),
-            ReissueReplaceOutcome::Missing => Ok(None),
+            ReissueReplaceOutcome::Replaced(replacement) => Ok(
+                ReissuePendingMetadataCommandOutcome::Reissued(replacement),
+            ),
+            ReissueReplaceOutcome::Missing => Ok(ReissuePendingMetadataCommandOutcome::Missing),
             ReissueReplaceOutcome::Reload {
                 current,
                 primary_max_log_index,
@@ -1086,7 +1167,7 @@ impl StorageCluster {
                         route_mode,
                         route_epoch,
                     )?;
-                self.matching_reissued_pending_command_if_safe_with_route_mode(
+                self.matching_reissued_pending_command_outcome_with_route_mode(
                     pg_id,
                     primary.node_id(),
                     primary.metadata_command_inspection_client().as_ref(),

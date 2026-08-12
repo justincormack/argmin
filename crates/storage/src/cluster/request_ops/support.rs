@@ -1471,7 +1471,6 @@ fn maybe_run_multipart_completion_pending_barrier_observed_hook(
 pub(super) fn maybe_force_pending_object_metadata_partial_conflict_hook(
     scope_id: usize,
     command: &MetadataCommandEnvelope,
-    work_budget: &mut super::RequestWorkBudget,
 ) -> bool {
     let hook = PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1479,11 +1478,7 @@ pub(super) fn maybe_force_pending_object_metadata_partial_conflict_hook(
         .unwrap_or_else(|e| e.into_inner())
         .get(&scope_id)
         .cloned();
-    let force_partial_conflict = hook.is_some_and(|hook| hook(command));
-    if force_partial_conflict {
-        work_budget.expire_for_test();
-    }
-    force_partial_conflict
+    hook.is_some_and(|hook| hook(command))
 }
 
 #[cfg(test)]

@@ -3855,3 +3855,310 @@ fn insert_delete_marker_partial_apply_reopens_and_releases_bucket_write_reservat
     assert_clean_metadata_command_stream(&reopened, &[object_pg]);
     assert_bucket_write_reservations_released(&reopened, &bucket);
 }
+
+#[test]
+fn suspended_delete_marker_reissue_conflict_classifies_replacement_identity_after_publication() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let owner = crate::OwnerIdentity::from_principal("owner");
+
+    let pg_id = PgId::new(object_pg);
+    let stale_log_index = map.test_next_metadata_command_log_index(pg_id);
+    let occupant_bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        object_pg,
+        "marker-reissue-occupant-",
+    );
+    let occupant = create_bucket_metadata_command(pg_id, stale_log_index.get(), occupant_bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &occupant)
+        .unwrap();
+
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let stale = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, stale_log_index),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: crate::VersionId::Null,
+            owner,
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &stale);
+    let replacement_log_index = stale_log_index.get() + 1;
+
+    let helper_ran = Arc::new(AtomicBool::new(false));
+    let helper_ran_for_action = Arc::clone(&helper_ran);
+    let helper_cluster = cluster.clone();
+    let helper_stale = stale.clone();
+    let helper_map = Arc::clone(&map);
+    let tail_command = Arc::new(Mutex::new(None));
+    let tail_command_for_action = Arc::clone(&tail_command);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let expire_once = Arc::new(AtomicBool::new(true));
+    let expire_once_for_hook = Arc::clone(&expire_once);
+    let budget_guard = cluster.test_install_pending_object_metadata_partial_conflict_hook(
+        Arc::new(move |command| {
+            if command.id().log_index().get() == replacement_log_index
+                && matches!(
+                    command.payload(),
+                    MetadataCommandPayload::InsertDeleteMarker(marker)
+                        if marker.bucket == hook_bucket && marker.key == hook_key
+                )
+                && expire_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                return true;
+            }
+            false
+        }),
+    );
+    let error = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            crate::OwnerIdentity::from_principal("owner"),
+            move |_| {
+                if !helper_ran_for_action.swap(true, Ordering::SeqCst) {
+                    let replacement = helper_cluster
+                        .test_reissue_pending_metadata_command(pg_id, &helper_stale)
+                        .unwrap()
+                        .expect("concurrent helper must replace the stale command");
+                    assert_eq!(replacement.id().log_index().get(), replacement_log_index);
+                    let witness_node_id = NodeId::new(0);
+                    let witness_pg = helper_map
+                        .node(witness_node_id)
+                        .unwrap()
+                        .storage_node()
+                        .get_pg(pg_id.get())
+                        .unwrap();
+                    witness_pg
+                        .apply_metadata_command_and_record(witness_node_id.as_u32(), &replacement)
+                        .unwrap();
+                    let tail_bucket = bucket_for_pg(
+                        helper_map
+                            .node(witness_node_id)
+                            .unwrap()
+                            .storage_node()
+                            .pg_topology(),
+                        pg_id.get(),
+                        "marker-reissue-tail-",
+                    );
+                    let tail = create_bucket_metadata_command(
+                        pg_id,
+                        replacement_log_index + 1,
+                        tail_bucket,
+                    );
+                    witness_pg
+                        .apply_metadata_command_and_record(witness_node_id.as_u32(), &tail)
+                        .unwrap();
+                    *tail_command_for_action
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner()) = Some(tail);
+                }
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap_err();
+    drop(budget_guard);
+
+    assert!(helper_ran.load(Ordering::SeqCst));
+    assert!(!expire_once.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: error_pg_id,
+                log_index,
+                ..
+            }
+        ) if error_pg_id == object_pg && log_index == replacement_log_index
+    ));
+    let pending = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("published replacement must remain recoverable");
+    assert_eq!(pending.id().log_index().get(), replacement_log_index);
+
+    let tail = tail_command
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+        .expect("helper must retain its later command");
+    for node_id in [NodeId::new(1), NodeId::new(2)] {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &pending)
+            .unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &tail)
+            .unwrap();
+    }
+
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn suspended_delete_marker_exact_retry_rechecks_after_abandonment() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Suspended);
+    let owner = crate::OwnerIdentity::from_principal("owner");
+    cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            owner.clone(),
+            |_| Ok::<(), ()>(()),
+        )
+        .unwrap()
+        .unwrap();
+
+    let pg_id = PgId::new(object_pg);
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let pending = MetadataCommandEnvelope::new(
+        cluster.next_object_metadata_command_id(pg_id).unwrap(),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: crate::VersionId::Null,
+            owner: owner.clone(),
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending);
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let replacement_generation = Arc::new(Mutex::new(None));
+    let replacement_generation_for_closure = Arc::clone(&replacement_generation);
+    let replacement_cluster = cluster.clone();
+    let replacement_bucket = bucket.clone();
+    let replacement_key = key.clone();
+    let pending_for_closure = pending.clone();
+    let retried = cluster
+        .insert_current_delete_marker_if(
+            &bucket,
+            &key,
+            crate::BucketVersioningState::Suspended,
+            owner,
+            move |stored| {
+                let call = action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    assert!(matches!(stored, Some(crate::StoredObject::DeleteMarker(_))));
+                    replacement_cluster
+                        .record_abandoned_metadata_command_to_acting_set(&pending_for_closure)
+                        .unwrap();
+                    replacement_cluster
+                        .remove_pending_metadata_command_for_bucket(
+                            pg_id,
+                            &replacement_bucket,
+                            &pending_for_closure,
+                        )
+                        .unwrap();
+                    let replacement = write_committed_direct_segment_for_with_versioning(
+                        &replacement_cluster,
+                        &replacement_bucket,
+                        &replacement_key,
+                        crate::BucketVersioningState::Suspended,
+                        [0xd1; 16],
+                        [0xd2; 16],
+                        b"concurrent suspended replacement",
+                    );
+                    *replacement_generation_for_closure.lock().unwrap() =
+                        Some(replacement.generation_id);
+                } else {
+                    let expected = replacement_generation_for_closure
+                        .lock()
+                        .unwrap()
+                        .expect("replacement generation must be recorded");
+                    assert!(matches!(
+                        stored,
+                        Some(crate::StoredObject::Live(live))
+                            if live.generation_id == expected
+                    ));
+                }
+                Ok::<(), ()>(())
+            },
+        )
+        .expect("abandoned matching command must restart from a fresh snapshot")
+        .expect("delete-marker condition should succeed after reinspection");
+
+    assert_eq!(retried.version_id, crate::VersionId::Null);
+    assert_eq!(action_calls.load(Ordering::SeqCst), 2);
+    assert!(replacement_generation.lock().unwrap().is_some());
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}

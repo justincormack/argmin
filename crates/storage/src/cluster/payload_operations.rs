@@ -9,6 +9,31 @@ fn object_version_allocator_command_contention(error: &ObjectPgActionError) -> b
     )
 }
 
+#[derive(Debug)]
+enum PendingObjectMetadataCommandCompletion {
+    Applied,
+    Abandoned,
+    RetryPartialExactConflict(Box<MetadataCommandEnvelope>),
+}
+
+impl PendingObjectMetadataCommandCompletion {
+    fn into_outcome(self) -> PendingMetadataCommandOutcome {
+        match self {
+            Self::Applied => PendingMetadataCommandOutcome::Applied,
+            Self::Abandoned => PendingMetadataCommandOutcome::Abandoned,
+            Self::RetryPartialExactConflict(_) => {
+                PendingMetadataCommandOutcome::RetryPartialExactConflict
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExactPendingObjectMetadataCommandOutcome {
+    Applied,
+    Reinspect,
+}
+
 #[derive(Clone, Copy)]
 enum ObjectPendingCommandFinishPolicy {
     Standard,
@@ -973,7 +998,34 @@ impl StorageCluster {
         pg_id: PgId,
         command: ExactPendingObjectMetadataCommand<'_>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
-        self.finish_object_pg_pending_slot(pg_id, command.command)
+        let mut work_budget = RequestWorkBudget::new(
+            Duration::from_millis(request_ops::METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("exact_pending_object_metadata_command_apply")
+        .for_pg(pg_id);
+        self.finish_exact_pending_object_metadata_command_with_work_budget(
+            pg_id,
+            command,
+            &mut work_budget,
+        )
+        .map(PendingObjectMetadataCommandCompletion::into_outcome)
+    }
+
+    fn finish_exact_pending_object_metadata_command_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: ExactPendingObjectMetadataCommand<'_>,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<PendingObjectMetadataCommandCompletion, ObjectPgActionError> {
+        self.finish_object_pg_pending_slot_inner(
+            pg_id,
+            command.command,
+            work_budget,
+            self,
+            MetadataCommandExecutionRoute::normal(),
+            ObjectPendingCommandFinishPolicy::Standard,
+        )
     }
 
     fn finish_exact_pending_object_metadata_command_for_allocator(
@@ -990,6 +1042,7 @@ impl StorageCluster {
             MetadataCommandExecutionRoute::normal(),
             ObjectPendingCommandFinishPolicy::AllocatorReinspectContention,
         )
+        .map(PendingObjectMetadataCommandCompletion::into_outcome)
     }
 
     #[cfg(test)]
@@ -1007,17 +1060,56 @@ impl StorageCluster {
         pg_id: PgId,
         command: ExactPendingObjectMetadataCommand<'_>,
     ) -> Result<(), ObjectPgActionError> {
-        match self.finish_exact_pending_object_metadata_command(pg_id, command)? {
-            PendingMetadataCommandOutcome::Applied => Ok(()),
-            PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+        match self.apply_exact_pending_object_metadata_command_or_reinspect(pg_id, command)? {
+            ExactPendingObjectMetadataCommandOutcome::Applied => Ok(()),
+            ExactPendingObjectMetadataCommandOutcome::Reinspect => {
                 Err(conflicting_pending_object_metadata_command(
-                    "retryable partial pending object metadata command",
+                "abandoned pending object metadata command",
                 ))
             }
-            PendingMetadataCommandOutcome::Abandoned => {
-                Err(conflicting_pending_object_metadata_command(
-                    "abandoned pending object metadata command",
-                ))
+        }
+    }
+
+    fn apply_exact_pending_object_metadata_command_or_reinspect(
+        &self,
+        pg_id: PgId,
+        command: ExactPendingObjectMetadataCommand<'_>,
+    ) -> Result<ExactPendingObjectMetadataCommandOutcome, ObjectPgActionError> {
+        let mut work_budget = RequestWorkBudget::new(
+            Duration::from_millis(request_ops::METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
+            None,
+        )
+        .for_operation("exact_pending_object_metadata_command_apply")
+        .for_pg(pg_id);
+        let mut command = command.command.clone();
+        loop {
+            match self.finish_exact_pending_object_metadata_command_with_work_budget(
+                pg_id,
+                ExactPendingObjectMetadataCommand::for_checked_request(&command),
+                &mut work_budget,
+            )? {
+                PendingObjectMetadataCommandCompletion::Applied => {
+                    return Ok(ExactPendingObjectMetadataCommandOutcome::Applied);
+                }
+                PendingObjectMetadataCommandCompletion::RetryPartialExactConflict(
+                    current_command,
+                ) => {
+                    command = *current_command;
+                    if let Err(error) = work_budget.sleep_after_contention(
+                        "exact pending object metadata convergence budget exhausted",
+                    ) {
+                        let error = self.classify_pending_metadata_command_budget_exhaustion(
+                            pg_id,
+                            &command,
+                            MetadataCommandRouteMode::Normal,
+                            error,
+                        )?;
+                        return Err(ObjectPgActionError::Store(error));
+                    }
+                }
+                PendingObjectMetadataCommandCompletion::Abandoned => {
+                    return Ok(ExactPendingObjectMetadataCommandOutcome::Reinspect);
+                }
             }
         }
     }
@@ -1053,11 +1145,12 @@ impl StorageCluster {
                 request_ops::maybe_force_pending_object_metadata_partial_conflict_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
                     command,
-                    work_budget,
                 );
             #[cfg(not(test))]
             let force_partial_conflict = false;
             let outcome = if force_partial_conflict {
+                #[cfg(test)]
+                work_budget.expire_for_test();
                 PendingMetadataCommandOutcome::RetryPartialExactConflict
             } else {
                 self.drain_pending_object_metadata_command_outcome_with_work_budget(
@@ -1430,6 +1523,7 @@ impl StorageCluster {
                 },
                 ObjectPendingCommandFinishPolicy::AbandonZeroApplyStaleReservation,
             )
+            .map(PendingObjectMetadataCommandCompletion::into_outcome)
         }
     }
 
@@ -1502,6 +1596,7 @@ impl StorageCluster {
             MetadataCommandExecutionRoute::normal(),
             ObjectPendingCommandFinishPolicy::Standard,
         )
+        .map(PendingObjectMetadataCommandCompletion::into_outcome)
     }
 
     fn finish_object_pg_pending_slot_inner(
@@ -1512,7 +1607,7 @@ impl StorageCluster {
         reservation_authority: &StorageCluster,
         mut execution_route: MetadataCommandExecutionRoute<'_>,
         finish_policy: ObjectPendingCommandFinishPolicy,
-    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+    ) -> Result<PendingObjectMetadataCommandCompletion, ObjectPgActionError> {
         execution_route
             .require_command(pg_id, command)
             .map_err(ObjectPgActionError::Store)?;
@@ -1567,7 +1662,7 @@ impl StorageCluster {
                     execution_route,
                     work_budget,
                 )?;
-                return Ok(PendingMetadataCommandOutcome::Abandoned);
+                return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
             }
             let apply_result = match route_mode {
                 MetadataCommandRouteMode::Normal => self
@@ -1621,7 +1716,7 @@ impl StorageCluster {
                         }
                         self.after_object_metadata_command_applied(&command);
                     }
-                    return Ok(PendingMetadataCommandOutcome::Applied);
+                    return Ok(PendingObjectMetadataCommandCompletion::Applied);
                 }
                 Err(error)
                     if error.progress.is_abortable()
@@ -1700,7 +1795,14 @@ impl StorageCluster {
                             .map_err(ObjectPgActionError::from)?;
                         }
                         self.after_object_metadata_command_applied(&command);
-                        return Ok(PendingMetadataCommandOutcome::Applied);
+                        return Ok(PendingObjectMetadataCommandCompletion::Applied);
+                    }
+                    #[cfg(test)]
+                    if request_ops::maybe_force_pending_object_metadata_partial_conflict_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        &command,
+                    ) {
+                        work_budget.expire_for_test();
                     }
                     if let Err(error) = work_budget.sleep_after_contention(
                         "partial pending object metadata convergence budget exhausted",
@@ -1717,14 +1819,39 @@ impl StorageCluster {
                         && error.applied_nodes == 0
                         && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
                 {
-                    let reissued = match self.reissue_pending_metadata_command_with_route_mode(
-                        pg_id,
-                        &command,
-                        execution_route,
-                        command.payload(),
-                    ) {
-                        Ok(Some(reissued)) => reissued,
-                        Ok(None) => return Ok(PendingMetadataCommandOutcome::Abandoned),
+                    let reissued = match self
+                        .reissue_pending_metadata_command_outcome_with_route_mode(
+                            pg_id,
+                            &command,
+                            execution_route,
+                            command.payload(),
+                        ) {
+                        Ok(ReissuePendingMetadataCommandOutcome::Reissued(reissued)) => reissued,
+                        Ok(ReissuePendingMetadataCommandOutcome::Missing) => {
+                            return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
+                        }
+                        Ok(ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                            command: current,
+                            ..
+                        }) => {
+                            if finish_policy.abandons_zero_apply_stale_reservation() {
+                                return Err(conflicting_pending_object_metadata_command(
+                                    "retryable partial pending object metadata drain",
+                                ));
+                            }
+                            #[cfg(test)]
+                            if request_ops::maybe_force_pending_object_metadata_partial_conflict_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                                &current,
+                            ) {
+                                work_budget.expire_for_test();
+                            }
+                            return Ok(
+                                PendingObjectMetadataCommandCompletion::RetryPartialExactConflict(
+                                    Box::new(current),
+                                ),
+                            );
+                        }
                         Err(BucketSnapshotLoadError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
@@ -1733,7 +1860,11 @@ impl StorageCluster {
                                     "retryable partial pending object metadata drain",
                                 ));
                             }
-                            return Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict);
+                            return Ok(
+                                PendingObjectMetadataCommandCompletion::RetryPartialExactConflict(
+                                    Box::new(command),
+                                ),
+                            );
                         }
                         Err(error) => {
                             return Err(bucket_snapshot_error_to_object_pg_action_error(error));
@@ -1743,6 +1874,13 @@ impl StorageCluster {
                         .for_reissued_command(pg_id, &command, &reissued)
                         .map_err(ObjectPgActionError::Store)?;
                     command = reissued;
+                    #[cfg(test)]
+                    if request_ops::maybe_force_pending_object_metadata_partial_conflict_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        &command,
+                    ) {
+                        work_budget.expire_for_test();
+                    }
                 }
                 Err(error)
                     if finish_policy.abandons_zero_apply_stale_reservation()
@@ -1781,7 +1919,7 @@ impl StorageCluster {
                         execution_route,
                         work_budget,
                     )?;
-                    return Ok(PendingMetadataCommandOutcome::Abandoned);
+                    return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
                 }
                 Err(error) => {
                     return Err(bucket_snapshot_error_to_object_pg_action_error(
@@ -1845,12 +1983,12 @@ impl StorageCluster {
                 follow_up_route,
                 ObjectPendingCommandFinishPolicy::Standard,
             )? {
-                PendingMetadataCommandOutcome::Applied => {
+                PendingObjectMetadataCommandCompletion::Applied => {
                     self.after_object_metadata_command_abandoned_payload_cleanup(command);
                     return Ok(());
                 }
-                PendingMetadataCommandOutcome::Abandoned
-                | PendingMetadataCommandOutcome::RetryPartialExactConflict => {
+                PendingObjectMetadataCommandCompletion::Abandoned
+                | PendingObjectMetadataCommandCompletion::RetryPartialExactConflict(_) => {
                     return Err(conflicting_pending_object_metadata_command(
                         "certified generation cleanup did not apply",
                     ));
