@@ -3407,7 +3407,16 @@ pub(crate) fn encode_bucket_subresource_get_response(
     response: &StorageRpcBucketSubresourceGetResponse,
 ) -> Vec<u8> {
     let mut out = Vec::new();
-    put_optional_string(&mut out, response.body.as_deref());
+    match &response.outcome {
+        StorageRpcBucketSubresourceGetOutcome::Loaded(body) => {
+            put_u8(&mut out, 0);
+            put_optional_string(&mut out, body.as_deref());
+        }
+        StorageRpcBucketSubresourceGetOutcome::BucketNotFound { name } => {
+            put_u8(&mut out, 1);
+            put_string(&mut out, name.as_str());
+        }
+    }
     out
 }
 
@@ -3415,9 +3424,19 @@ pub(crate) fn decode_bucket_subresource_get_response(
     bytes: &[u8],
 ) -> Result<StorageRpcBucketSubresourceGetResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let body = decoder.read_optional_string()?;
+    let outcome = match decoder.read_u8()? {
+        0 => StorageRpcBucketSubresourceGetOutcome::Loaded(decoder.read_optional_string()?),
+        1 => StorageRpcBucketSubresourceGetOutcome::BucketNotFound {
+            name: decoder.read_bucket_name()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "invalid bucket subresource get outcome tag",
+            ));
+        }
+    };
     decoder.finish()?;
-    Ok(StorageRpcBucketSubresourceGetResponse { body })
+    Ok(StorageRpcBucketSubresourceGetResponse { outcome })
 }
 
 pub(crate) fn encode_lifecycle_sweep_roots_request(

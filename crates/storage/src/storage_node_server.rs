@@ -225,10 +225,10 @@ use crate::storage_rpc::{
     StorageRpcBucketMetadataControlCommandBuildResponse, StorageRpcBucketMetadataControlMutation,
     StorageRpcBucketMetadataControlPendingMatchRequest, StorageRpcBucketPgRequest,
     StorageRpcBucketRequest, StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotRequest,
-    StorageRpcBucketSnapshotResponse, StorageRpcBucketSubresourceGetRequest,
-    StorageRpcBucketSubresourceGetResponse, StorageRpcBucketWriteDrainBeginOutcome,
-    StorageRpcBucketWriteDrainBeginRequest, StorageRpcBucketWriteDrainBeginResponse,
-    StorageRpcBucketWriteDrainClearExpiredRequest,
+    StorageRpcBucketSnapshotResponse, StorageRpcBucketSubresourceGetOutcome,
+    StorageRpcBucketSubresourceGetRequest, StorageRpcBucketSubresourceGetResponse,
+    StorageRpcBucketWriteDrainBeginOutcome, StorageRpcBucketWriteDrainBeginRequest,
+    StorageRpcBucketWriteDrainBeginResponse, StorageRpcBucketWriteDrainClearExpiredRequest,
     StorageRpcBucketWriteDrainOptionalRecordResponse, StorageRpcBucketWriteDrainRecordRequest,
     StorageRpcBucketWriteReservationAcquireOutcome, StorageRpcBucketWriteReservationAcquireRequest,
     StorageRpcBucketWriteReservationHeartbeatRequest, StorageRpcBucketWriteReservationProofRequest,
@@ -5952,7 +5952,19 @@ impl StorageNodeConnectionHandler {
         match route.get_subresource(request.kind) {
             Ok(body) => {
                 let payload = encode_bucket_subresource_get_response(
-                    &StorageRpcBucketSubresourceGetResponse { body },
+                    &StorageRpcBucketSubresourceGetResponse {
+                        outcome: StorageRpcBucketSubresourceGetOutcome::Loaded(body),
+                    },
+                );
+                Ok(encode_storage_rpc_success_response(&payload))
+            }
+            Err(StorageNodeBucketRouteError::Bucket(BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketNotFound { name },
+            ))) => {
+                let payload = encode_bucket_subresource_get_response(
+                    &StorageRpcBucketSubresourceGetResponse {
+                        outcome: StorageRpcBucketSubresourceGetOutcome::BucketNotFound { name },
+                    },
                 );
                 Ok(encode_storage_rpc_success_response(&payload))
             }

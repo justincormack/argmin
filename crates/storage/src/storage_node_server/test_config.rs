@@ -7,8 +7,9 @@
         ControlPlaneScopedCredentialStore,
     };
     use crate::node_client::{
-        LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
-        MetadataCommandInspectionNodeClient, PlacedShardNodeClient, UnixStorageNodeClient,
+        BucketMetadataNodeClient, LocalUnixStorageNodeClientAdmissionSettings,
+        MetadataCommandApplyErrorKind, MetadataCommandInspectionNodeClient, PlacedShardNodeClient,
+        UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::{
@@ -4545,6 +4546,79 @@
         }
         drop(client);
         assert!(join.join().unwrap().is_ok());
+    }
+
+    fn authenticated_bucket_subresource_get_preserves_bucket_not_found(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        )
+        .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()));
+        let bucket = crate::tests::bucket_name("missing-subresource-rpc-bucket");
+        let route = client
+            .open_bucket_metadata_route(
+                config.cluster_epoch,
+                crate::BucketPgId::new_for_test(PgId::new(0)),
+                &bucket,
+            )
+            .unwrap();
+
+        let error = route
+            .get_bucket_subresource(BucketSubresourceKind::Cors)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::BucketSnapshotLoadError::Metadata(crate::MetadataError::BucketNotFound {
+                name
+            }) if name == bucket
+        ));
+
+        drop(route);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_bucket_subresource_get_preserves_bucket_not_found() {
+        authenticated_bucket_subresource_get_preserves_bucket_not_found(false);
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_bucket_subresource_get_preserves_bucket_not_found() {
+        authenticated_bucket_subresource_get_preserves_bucket_not_found(true);
     }
 
     fn authenticated_metadata_hash_inspection_preserves_integrity_failure(tcp: bool) {

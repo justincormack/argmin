@@ -4931,7 +4931,20 @@ impl UnixStorageNodeClient {
                 self.rpc_payload_error("decode bucket subresource get response", error.to_string()),
             )
         })?;
-        Ok(response.body)
+        match response.outcome {
+            StorageRpcBucketSubresourceGetOutcome::Loaded(body) => Ok(body),
+            StorageRpcBucketSubresourceGetOutcome::BucketNotFound { name } => {
+                if name != *bucket {
+                    return Err(BucketSnapshotLoadError::Store(self.rpc_payload_error(
+                        "validate bucket subresource get response",
+                        "bucket-not-found response name does not match request".to_string(),
+                    )));
+                }
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::BucketNotFound { name },
+                ))
+            }
+        }
     }
 
     fn open_bucket_metadata_scan_route_impl(

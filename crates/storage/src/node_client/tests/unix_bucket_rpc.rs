@@ -9,14 +9,15 @@ use crate::storage_rpc::{
     encode_bucket_delete_finalize_roots_response, encode_bucket_execution_generations_response,
     encode_bucket_fast_path_identities_response, encode_bucket_info_outcome_response,
     encode_bucket_list_response, encode_bucket_snapshot_response,
-    encode_bucket_write_reservations_list_response, encode_lifecycle_sweep_buckets_response,
-    encode_lifecycle_sweep_roots_response, StorageRpcAbortingMultipartUploadBucketsResponse,
-    StorageRpcBucketDeleteBeginRootsResponse,
+    encode_bucket_subresource_get_response, encode_bucket_write_reservations_list_response,
+    encode_lifecycle_sweep_buckets_response, encode_lifecycle_sweep_roots_response,
+    StorageRpcAbortingMultipartUploadBucketsResponse, StorageRpcBucketDeleteBeginRootsResponse,
     StorageRpcBucketDeleteFinalizeClaimOptionalRecordResponse,
     StorageRpcBucketDeleteFinalizeRootsResponse, StorageRpcBucketExecutionGenerationsResponse,
     StorageRpcBucketFastPathIdentitiesResponse, StorageRpcBucketInfoOutcome,
     StorageRpcBucketInfoOutcomeResponse, StorageRpcBucketListResponse,
     StorageRpcBucketSnapshotOutcome, StorageRpcBucketSnapshotResponse,
+    StorageRpcBucketSubresourceGetOutcome, StorageRpcBucketSubresourceGetResponse,
     StorageRpcBucketWriteReservationsListResponse, StorageRpcLifecycleSweepBucketsResponse,
     StorageRpcLifecycleSweepRootsResponse,
 };
@@ -329,6 +330,22 @@ fn unix_exact_bucket_routes_bind_not_found_response_subjects() {
                 StorageRpcMessageKind::BucketSnapshotLoad,
                 encode_bucket_snapshot_response(&StorageRpcBucketSnapshotResponse {
                     outcome: StorageRpcBucketSnapshotOutcome::BucketNotFound {
+                        name: source_for_server.clone(),
+                    },
+                }),
+            ),
+            (
+                StorageRpcMessageKind::BucketSubresourceGet,
+                encode_bucket_subresource_get_response(&StorageRpcBucketSubresourceGetResponse {
+                    outcome: StorageRpcBucketSubresourceGetOutcome::BucketNotFound {
+                        name: foreign_bucket,
+                    },
+                }),
+            ),
+            (
+                StorageRpcMessageKind::BucketSubresourceGet,
+                encode_bucket_subresource_get_response(&StorageRpcBucketSubresourceGetResponse {
+                    outcome: StorageRpcBucketSubresourceGetOutcome::BucketNotFound {
                         name: source_for_server,
                     },
                 }),
@@ -370,6 +387,18 @@ fn unix_exact_bucket_routes_bind_not_found_response_subjects() {
     assert!(matches!(
         route
             .load_bucket_snapshot(BucketSnapshotRequest::default())
+            .unwrap_err(),
+        BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })
+            if name == source_bucket
+    ));
+    assert_bucket_metadata_payload_decode(
+        route
+            .get_bucket_subresource(BucketSubresourceKind::Cors)
+            .unwrap_err(),
+    );
+    assert!(matches!(
+        route
+            .get_bucket_subresource(BucketSubresourceKind::Cors)
             .unwrap_err(),
         BucketSnapshotLoadError::Metadata(MetadataError::BucketNotFound { name })
             if name == source_bucket

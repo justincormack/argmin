@@ -20,6 +20,26 @@ mod tests {
         MetadataCommandDecodeAuthority::new_for_test()
     }
 
+    #[test]
+    fn bucket_subresource_get_outcomes_round_trip_without_conflating_missing_states() {
+        let bucket = BucketName::try_from("missing-subresource-bucket").unwrap();
+        for outcome in [
+            StorageRpcBucketSubresourceGetOutcome::Loaded(None),
+            StorageRpcBucketSubresourceGetOutcome::Loaded(Some("cors-body".to_string())),
+            StorageRpcBucketSubresourceGetOutcome::BucketNotFound {
+                name: bucket.clone(),
+            },
+        ] {
+            let encoded = encode_bucket_subresource_get_response(
+                &StorageRpcBucketSubresourceGetResponse {
+                    outcome: outcome.clone(),
+                },
+            );
+            let decoded = decode_bucket_subresource_get_response(&encoded).unwrap();
+            assert_eq!(decoded.outcome, outcome);
+        }
+    }
+
     struct FlushFailureWriter;
 
     impl Write for FlushFailureWriter {
@@ -43,9 +63,9 @@ mod tests {
         },
         types::{
             AclGrants, BucketDeleteAttemptOutcomeKind, BucketDeleteAttemptOutcomeRecord,
-            BucketDeleteFinalizeClaimRecord, BucketObjectLockConfig, BucketVersioningState,
-            BucketWriteDrainRecord, BucketWriteDrainState, CanonicalUserId, ClusterEpoch,
-            CreateBucketConfig, GenerationId, ObjectKey, PgId, SessionId,
+            BucketDeleteFinalizeClaimRecord, BucketName, BucketObjectLockConfig,
+            BucketVersioningState, BucketWriteDrainRecord, BucketWriteDrainState, CanonicalUserId,
+            ClusterEpoch, CreateBucketConfig, GenerationId, ObjectKey, PgId, SessionId,
         },
     };
 

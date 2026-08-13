@@ -2102,8 +2102,14 @@ pub(crate) struct StorageRpcBucketSubresourceGetRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcBucketSubresourceGetOutcome {
+    Loaded(Option<String>),
+    BucketNotFound { name: BucketName },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcBucketSubresourceGetResponse {
-    pub(crate) body: Option<String>,
+    pub(crate) outcome: StorageRpcBucketSubresourceGetOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
