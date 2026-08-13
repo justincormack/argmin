@@ -457,6 +457,14 @@ fn configured_test_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(timeout_secs)
 }
 
+fn test_stalled_stream_protection(
+    timeout: std::time::Duration,
+) -> aws_sdk_s3::config::StalledStreamProtectionConfig {
+    aws_sdk_s3::config::StalledStreamProtectionConfig::enabled()
+        .grace_period(timeout)
+        .build()
+}
+
 pub fn build_client_with_ca(
     endpoint: &str,
     access_key: &str,
@@ -475,6 +483,7 @@ pub fn build_client_with_ca(
         .connect_timeout(timeout)
         .operation_attempt_timeout(timeout)
         .build();
+    let stalled_stream_protection = test_stalled_stream_protection(timeout);
 
     let http_client = hyper_client::TestHttpClient::new(tls_ca_pem);
 
@@ -484,6 +493,7 @@ pub fn build_client_with_ca(
         .region(aws_sdk_s3::config::Region::new(region.to_string()))
         .endpoint_url(endpoint)
         .timeout_config(timeout_config)
+        .stalled_stream_protection(stalled_stream_protection)
         .http_client(http_client)
         .force_path_style(true)
         .build();
@@ -777,4 +787,19 @@ pub fn build_test_agent(
 /// Build a raw test client using the suite's configured request timeout.
 pub fn build_configured_test_agent(endpoint: &str, tls_ca_pem: Option<&[u8]>) -> Agent {
     build_test_agent(endpoint, tls_ca_pem, configured_test_timeout())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stalled_stream_protection_uses_the_test_timeout_as_its_grace_period() {
+        let timeout = Duration::from_secs(37);
+        let config = test_stalled_stream_protection(timeout);
+
+        assert!(config.upload_enabled());
+        assert!(config.download_enabled());
+        assert_eq!(config.grace_period(), timeout);
+    }
 }
