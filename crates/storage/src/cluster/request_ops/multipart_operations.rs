@@ -2757,6 +2757,12 @@ impl super::StorageCluster {
                     release_bucket_write_proof_if_unowned!()?;
                     return Err(ObjectPgActionError::Store(error));
                 }
+                if let Err(error) = pending_work_budget
+                    .check("stream part command install retry budget exhausted")
+                {
+                    release_bucket_write_proof_if_unowned!()?;
+                    return Err(ObjectPgActionError::Store(error));
+                }
                 match self.install_terminal_session_retry_metadata_command(
                     publisher,
                     pg_id,
@@ -2811,13 +2817,26 @@ impl super::StorageCluster {
                 unreachable!("stream part pending command kind changed");
             };
             let last_modified = commit.part.last_modified;
-            if command_is_pending {
-                self.apply_exact_pending_object_metadata_command(
+            let reinspect = if command_is_pending {
+                self.apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
                     pg_id,
                     super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                )?;
+                    &mut pending_work_budget,
+                )? == super::ExactPendingObjectMetadataCommandOutcome::Reinspect
             } else {
-                self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+                match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
+                        pg_id,
+                        bucket,
+                        &command,
+                        &mut pending_work_budget,
+                    )? {
+                    NewObjectMetadataCommandApplyOutcome::Applied => false,
+                    NewObjectMetadataCommandApplyOutcome::Reinspect(_) => true,
+                    NewObjectMetadataCommandApplyOutcome::Abandoned(error) => return Err(error),
+                }
+            };
+            if reinspect {
+                continue;
             }
             return Ok(Ok(FinalizeStreamPartOutcome {
                 value: prepared.value,

@@ -1081,12 +1081,25 @@ impl StorageCluster {
         )
         .for_operation("exact_pending_object_metadata_command_apply")
         .for_pg(pg_id);
+        self.apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
+            pg_id,
+            command,
+            &mut work_budget,
+        )
+    }
+
+    fn apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: ExactPendingObjectMetadataCommand<'_>,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<ExactPendingObjectMetadataCommandOutcome, ObjectPgActionError> {
         let mut command = command.command.clone();
         loop {
             match self.finish_exact_pending_object_metadata_command_with_work_budget(
                 pg_id,
                 ExactPendingObjectMetadataCommand::for_checked_request(&command),
-                &mut work_budget,
+                work_budget,
             )? {
                 PendingObjectMetadataCommandCompletion::Applied => {
                     return Ok(ExactPendingObjectMetadataCommandOutcome::Applied);
@@ -1728,9 +1741,11 @@ impl StorageCluster {
                 }
                 Err(error)
                     if error.progress.is_abortable()
-                        && request_ops::metadata_command_apply_transport_error_is_retryable(
-                        &error.source,
-                    ) =>
+                        && (request_ops::metadata_command_apply_transport_error_is_retryable(
+                            &error.source,
+                        ) || request_ops::metadata_command_apply_error_is_contention(
+                            &error.source,
+                        )) =>
                 {
                     if let Err(error) = work_budget.sleep_after_contention(
                         "pending metadata command transport retry budget exhausted",
@@ -3319,6 +3334,9 @@ impl StorageCluster {
                 return Err(error);
             }
             if new_pending_command {
+                check_direct_put_work_before_command_ownership!(
+                    "direct PUT command install retry budget exhausted"
+                );
                 self.maybe_run_before_metadata_command_pending_install_hook();
                 let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
                     publisher,
@@ -3441,161 +3459,45 @@ impl StorageCluster {
                 }
             };
 
-            let mut command = command;
-            let converged = loop {
-                match self.apply_metadata_command_to_acting_set(&command) {
-                    Ok(outcome) => {
-                        break outcome == request_ops::MetadataCommandApplyOutcome::Converged;
-                    }
-                    Err(error)
-                        if error.progress.is_abortable()
-                            && request_ops::metadata_command_apply_transport_error_is_retryable(
-                            &error.source,
-                        ) =>
-                    {
-                        work_budget
-                            .sleep_after_contention(
-                                "direct PUT metadata command transport retry budget exhausted",
-                            )
-                            .map_err(ObjectPgActionError::Store)?;
-                        continue;
-                    }
-                    Err(error)
-                        if matches!(
-                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
-                                pg_id,
-                                &command,
-                                error.applied_nodes,
-                                &error.source,
-                            )
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
-                            Some(true)
-                        ) =>
-                    {
-                        break true;
-                    }
-                    Err(error)
-                        if matches!(
-                            self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
-                                pg_id,
-                                &command,
-                                error.applied_nodes,
-                                &error.source,
-                            )
-                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
-                            Some(false)
-                        ) =>
-                    {
-                        return Err(conflicting_pending_object_metadata_command(
-                            "retryable partial direct PUT command conflict",
-                        ));
-                    }
-                    Err(error)
-                        if error.progress.is_abortable()
-                            && error.applied_nodes == 0
-                            && Self::metadata_command_log_conflict_matches(
-                                &command,
-                                &error.source,
-                            ) =>
-                    {
-                        let reissue_result = self.reissue_pending_metadata_command(pg_id, &command);
-                        let Some(reissued) = (match reissue_result {
-                            Ok(reissued) => reissued,
-                            Err(BucketSnapshotLoadError::Store(
-                                StoreError::MetadataCommandLogConflict { .. },
-                            )) => {
-                                return Err(conflicting_pending_object_metadata_command(
-                                    "retryable direct PUT commit reissue conflict",
-                                ));
-                            }
-                            Err(error) => {
-                                return Err(bucket_snapshot_error_to_object_pg_action_error(error));
-                            }
-                        }) else {
-                            if new_pending_command {
-                                self.release_metadata_command_bucket_write_reservation(&command)
-                                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                                self.release_object_generation_reservation_best_effort(
-                                    &req.bucket,
-                                    &req.key,
-                                    &req.generation_reservation_id,
-                                );
-                                self.delete_direct_put_segment_payload_shards(
-                                    req.data_pg_id,
-                                    req.ec,
-                                    &req.segment_okh,
-                                    req.segment_vid,
-                                    written_shards,
-                                );
-                            }
-                            return Err(conflicting_pending_object_metadata_command(
-                                "pending direct PUT command was displaced during reissue",
-                            ));
-                        };
-                        work_budget
-                            .sleep_after_contention(
-                                "direct PUT commit reissue retry budget exhausted",
-                            )
-                            .map_err(ObjectPgActionError::Store)?;
-                        command = reissued;
-                    }
-                    Err(error) => {
-                        if new_pending_command
-                            && error.progress.is_abortable()
-                            && error.applied_nodes == 0
-                        {
-                            self.record_abandoned_metadata_command_to_acting_set(&command)
-                                .map_err(|error| {
-                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
-                                })?;
-                            self.release_metadata_command_bucket_write_reservation(&command)
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?;
-                            self.remove_pending_metadata_command_for_bucket(
-                                pg_id,
-                                &req.bucket,
-                                &command,
-                            )
-                            .map_err(ObjectPgActionError::from)?;
-                            self.release_object_generation_reservation_best_effort(
-                                &req.bucket,
-                                &req.key,
-                                &req.generation_reservation_id,
-                            );
-                            self.delete_direct_put_segment_payload_shards(
-                                req.data_pg_id,
-                                req.ec,
-                                &req.segment_okh,
-                                req.segment_vid,
-                                written_shards,
-                            );
-                        }
-                        return Err(bucket_snapshot_error_to_object_pg_action_error(
-                            error.source,
-                        ));
-                    }
-                }
-            };
-
-            if converged
-                && self
-                .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                    pg_id, &command,
-                )
-                .map_err(bucket_snapshot_error_to_object_pg_action_error)?
-            {
-                self.remove_pending_metadata_command_for_bucket(
+            let apply = if new_pending_command {
+                self.apply_new_object_metadata_command_for_bucket_or_reinspect(
                     pg_id,
-                    command.bucket_name(),
+                    &req.bucket,
                     &command,
+                    &mut work_budget,
                 )
-                .map_err(ObjectPgActionError::from)?;
+            } else {
+                self.apply_recovered_pending_object_metadata_command_for_bucket_or_reinspect(
+                    pg_id,
+                    &req.bucket,
+                    &command,
+                    &mut work_budget,
+                )
+            }?;
+            match apply {
+                request_ops::NewObjectMetadataCommandApplyOutcome::Applied => {
+                    self.emit_metadata_command_recovery_outcome_for_command(
+                        pg_id, &command, "applied",
+                    );
+                    break command;
+                }
+                request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(error)
+                | request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
+                    self.release_object_generation_reservation(
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    )?;
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Err(error);
+                }
             }
-            if converged {
-                self.emit_metadata_command_recovery_outcome_for_command(
-                    pg_id, &command, "applied",
-                );
-            }
-            break command;
         };
 
         debug_assert!(matches!(

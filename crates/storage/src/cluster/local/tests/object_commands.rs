@@ -3858,7 +3858,7 @@ fn insert_delete_marker_abandons_persistent_local_contention_at_retry_deadline()
 }
 
 #[test]
-fn suspended_delete_marker_reinspects_replacement_after_unpublished_command_is_abandoned() {
+fn suspended_delete_marker_reinspects_replacement_after_transported_contention() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3898,8 +3898,13 @@ fn suspended_delete_marker_reinspects_replacement_after_unpublished_command_is_a
                     if marker.bucket == hook_bucket && marker.key == hook_key
             ) && fail_once_for_hook.swap(false, Ordering::SeqCst)
             {
-                return Err(StoreError::MetadataCommandContention {
-                    context: "injected unpublished conditional delete contention",
+                return Err(StoreError::StorageRpc {
+                    node_id: 0,
+                    operation: "apply metadata command",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::MetadataCommandContention,
+                    detail: crate::error::StorageNodeFailureDetail::new(
+                        "injected transported conditional delete contention",
+                    ),
                 });
             }
             Ok(())

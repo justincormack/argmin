@@ -685,6 +685,21 @@ impl super::StorageCluster {
         )
     }
 
+    pub(super) fn apply_recovered_pending_metadata_command_to_acting_set_with_initial_progress(
+        &self,
+        command: &MetadataCommandEnvelope,
+        initial_progress: MetadataCommandApplyProgress,
+    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_with_route_mode_until_inner(
+            command,
+            MetadataCommandExecutionRoute::normal(),
+            self,
+            initial_progress,
+            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET,
+            MetadataCommandApplyProgressProvenance::RecoveredPending,
+        )
+    }
+
     fn reconstruct_pending_metadata_command_apply_progress_with_held_primary_until(
         &self,
         pg_id: PgId,

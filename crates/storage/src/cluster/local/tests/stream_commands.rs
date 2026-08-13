@@ -3930,7 +3930,7 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
 }
 
 #[test]
-fn stream_part_finalize_retries_definitive_command_contention_before_publication() {
+fn stream_part_finalize_abandons_expired_install_then_retries_transported_contention() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4036,26 +4036,79 @@ fn stream_part_finalize_retries_definitive_command_contention_before_publication
         last_modified: 123_456,
         checksum: None,
     };
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let hook_attempts = Arc::clone(&attempts);
+    let expired = Arc::new(AtomicBool::new(false));
+    let hook_expired = Arc::clone(&expired);
     let hook_upload_id = upload_id.clone();
     let hook_session = session_id.clone();
-    let _hook =
-        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+    let hook =
+        cluster.test_install_before_object_metadata_command_apply_hook(Arc::new(move |command| {
             if matches!(
                 command.payload(),
                 MetadataCommandPayload::CommitStreamPart(commit)
                     if commit.upload.upload_id == hook_upload_id
                         && commit.session_id == hook_session
                         && commit.part.part_number == 1
+                        && !hook_expired.swap(true, Ordering::SeqCst)
+            ) {
+                return true;
+            }
+            false
+        }));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let hook_attempts = Arc::clone(&attempts);
+    let attempt_upload_id = upload_id.clone();
+    let attempt_session = session_id.clone();
+    let attempt_hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitStreamPart(commit)
+                    if commit.upload.upload_id == attempt_upload_id
+                        && commit.session_id == attempt_session
+                        && commit.part.part_number == 1
             ) && hook_attempts.fetch_add(1, Ordering::SeqCst) == 0
             {
-                return Err(StoreError::MetadataCommandContention {
-                    context: "injected UploadPartCopy publication contention",
+                return Err(StoreError::StorageRpc {
+                    node_id: 0,
+                    operation: "apply metadata command",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::MetadataCommandContention,
+                    detail: crate::error::StorageNodeFailureDetail::new(
+                        "injected transported UploadPartCopy publication contention",
+                    ),
                 });
             }
             Ok(())
         }));
+
+    let error = cluster
+        .finalize_upload_part_stream(
+            &bucket,
+            &key,
+            stream_part_finalize_input(&upload_id, &session_id, 1, part.size, part.payload_crc64),
+            |_| Ok::<_, ()>(prepared_stream_part((), &part)),
+        )
+        .expect_err("expired inherited budget must not publish the stream part");
+    drop(hook);
+
+    assert!(expired.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_multipart_part(&*pg, &upload_id, 1),
+            Err(crate::MetadataError::PartNotFound { .. })
+        ));
+    }
 
     let outcome = cluster
         .finalize_upload_part_stream(
@@ -4064,11 +4117,11 @@ fn stream_part_finalize_retries_definitive_command_contention_before_publication
             stream_part_finalize_input(&upload_id, &session_id, 1, part.size, part.payload_crc64),
             |_| Ok::<_, ()>(prepared_stream_part((), &part)),
         )
-        .expect("definitive pre-publication contention must be retried")
+        .expect("a fresh retry must publish after the abandoned attempt")
         .expect("stream part preparation should succeed");
-
     assert_eq!(outcome.last_modified, part.last_modified);
     assert!(attempts.load(Ordering::SeqCst) >= 2);
+    drop(attempt_hook);
     for node_id in node_ids {
         let pg = map
             .node(node_id)

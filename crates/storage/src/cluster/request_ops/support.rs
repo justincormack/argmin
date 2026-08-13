@@ -559,6 +559,10 @@ type ObjectMetadataCommandDefinitiveRetryTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope, &BucketSnapshotLoadError) -> bool + Send + Sync>;
 
 #[cfg(test)]
+type BeforeObjectMetadataCommandApplyTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
 type ObjectMetadataCommandAbandonedTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
 
@@ -709,6 +713,11 @@ static OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static BEFORE_OBJECT_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BeforeObjectMetadataCommandApplyTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static OBJECT_METADATA_COMMAND_ABANDONED_HOOKS: OnceLock<
     Mutex<HashMap<usize, ObjectMetadataCommandAbandonedTestHook>>,
 > = OnceLock::new();
@@ -845,6 +854,11 @@ pub(crate) struct PendingObjectMetadataPartialConflictTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct ObjectMetadataCommandDefinitiveRetryTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BeforeObjectMetadataCommandApplyTestHookGuard {
     scope_id: usize,
 }
 
@@ -1113,6 +1127,18 @@ impl Drop for PendingObjectMetadataPartialConflictTestHookGuard {
 impl Drop for ObjectMetadataCommandDefinitiveRetryTestHookGuard {
     fn drop(&mut self) {
         let hooks = OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for BeforeObjectMetadataCommandApplyTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BEFORE_OBJECT_METADATA_COMMAND_APPLY_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -1547,6 +1573,23 @@ fn maybe_run_object_metadata_command_definitive_retry_hook(
         .get(&scope_id)
         .cloned();
     if hook.is_some_and(|hook| hook(command, source)) {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_object_metadata_command_apply_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = BEFORE_OBJECT_METADATA_COMMAND_APPLY_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook(command)) {
         work_budget.expire_for_test();
     }
 }

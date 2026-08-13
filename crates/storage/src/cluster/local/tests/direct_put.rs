@@ -59,8 +59,8 @@ fn assert_direct_payload_staging_cleaned(
             .unwrap());
     }
     let object_pg_id = cluster.object_metadata_pg(bucket, key).pg_id().get();
-    for node_id in trace_node_ids() {
-        let node = map.node(node_id).unwrap().storage_node();
+    for node in map.nodes.values() {
+        let node = node.storage_node();
         let pg = node.get_pg(object_pg_id).unwrap();
         assert!(matches!(
             crate::PgMetadataStore::get_object_generation_reservation(
@@ -1265,7 +1265,222 @@ fn direct_put_committed_response_loss_retry_returns_existing_commit() {
 }
 
 #[test]
-fn versioned_direct_put_hands_persistent_trailing_replica_failure_to_recovery() {
+fn direct_put_budget_expiry_after_pending_install_abandons_and_cleans_staging() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("install-expiry");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let data = b"direct PUT inherited budget expiry after pending install";
+    let payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    let payload_identity = direct_payload_test_identity(&payload);
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Enabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(data),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_hook = Arc::clone(&expired);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_guard =
+        cluster.test_install_before_object_metadata_command_apply_hook(Arc::new(move |command| {
+            matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.object.bucket == hook_bucket
+                        && commit.object.key == hook_key
+                        && !expired_hook.swap(true, Ordering::SeqCst)
+            )
+        }));
+    let error = route
+        .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
+        .unwrap_err();
+    drop(hook_guard);
+
+    assert!(expired.load(Ordering::SeqCst));
+    assert_eq!(
+        error.kind(),
+        crate::DirectPutFailureKind::MetadataCommandContention
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert_direct_payload_staging_cleaned(
+        &map,
+        &cluster,
+        &bucket,
+        &key,
+        &reservation_id,
+        payload_identity,
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+}
+
+#[test]
+fn direct_put_retry_reconstructs_matching_witness_before_reservation_validation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    set_route_primary(&mut map, data_pg, NodeId::new(2));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket_with_versioning(&cluster, &bucket, crate::BucketVersioningState::Enabled);
+
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("adopt-witness");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let data = b"direct PUT matching pending witness adoption";
+    let payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Enabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(data),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+    let request = direct_put_commit_req_with_bucket_write_proof(
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: reservation_id.clone(),
+            generation_id,
+            payload: data,
+            segment_okh: payload.segment_okh,
+            written: &payload.written,
+        },
+        prepared.bucket_write_reservation.clone(),
+    );
+    let shard_batch = payload
+        .written
+        .written_shards
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .register_payload_shard_acks(request.data_pg_id, &shard_batch)
+        .unwrap();
+    let pg_id = PgId::new(object_pg);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(object_pg).unwrap();
+    let command = cluster
+        .prepare_commit_direct_put_object_command(
+            pg_id,
+            &primary_pg,
+            &request,
+            crate::VersionId::from_u64(1),
+            prepared.bucket_write_reservation.clone(),
+        )
+        .unwrap();
+    drop(primary_pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    map.node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .apply_metadata_command_and_record(NodeId::new(0).as_u32(), &command)
+        .unwrap();
+    cluster
+        .release_bucket_write_reservation_proof(&prepared.bucket_write_reservation)
+        .unwrap();
+
+    let outcome = route
+        .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.version_id, crate::VersionId::from_u64(1));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let live = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
+            .unwrap()
+            .into_live()
+            .expect("recovered direct PUT must publish a live object");
+        assert_eq!(live.version_id, outcome.version_id);
+        assert_eq!(live.generation_id, generation_id);
+    }
+}
+
+#[test]
+fn versioned_direct_put_hands_transported_trailing_contention_to_recovery() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1330,9 +1545,9 @@ fn versioned_direct_put_hands_persistent_trailing_replica_failure_to_recovery() 
                 return Err(StoreError::StorageRpc {
                     node_id: node_id.as_u32(),
                     operation: "apply metadata command",
-                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportTimeout,
+                    failure: crate::storage_rpc::StorageRpcErrorCode::MetadataCommandContention,
                     detail: crate::error::StorageNodeFailureDetail::new(
-                        "injected persistent direct PUT trailing-replica timeout",
+                        "injected transported direct PUT trailing-replica contention",
                     ),
                 });
             }
