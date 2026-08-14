@@ -3668,6 +3668,11 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
             if call >= STALE_SNAPSHOTS {
                 return;
             }
+            if call == 0 {
+                // The conditional mutation owns a ten-second operation budget. Crossing the
+                // former one-second stale-snapshot sub-budget must not expose contention.
+                thread::sleep(Duration::from_millis(1_100));
+            }
             let pg_id = PgId::new(2);
             let primary = hook_map
                 .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
@@ -3727,4 +3732,201 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
 
     assert_bucket_write_reservations_released(&first_map, &bucket);
+}
+
+#[test]
+fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
+    let _guard = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-shared-budget-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let loser_payload = b"loser direct put shared budget";
+    let loser_reservation_id =
+        crate::SessionId::try_from("42424242424242424242424242424242".to_string()).unwrap();
+    let loser_generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &loser_reservation_id)
+        .unwrap();
+    let loser_written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            loser_generation_id,
+            0,
+            &[0xc1; 16],
+            loser_payload,
+        )
+        .unwrap();
+    let loser_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: loser_reservation_id,
+            generation_id: loser_generation_id,
+            payload: loser_payload,
+            segment_okh: [0xc1; 16],
+            written: &loser_written,
+        },
+    );
+
+    let contender_payload = b"pending contender shared budget";
+    let contender_reservation_id =
+        crate::SessionId::try_from("43434343434343434343434343434343".to_string()).unwrap();
+    let contender_generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &contender_reservation_id)
+        .unwrap();
+    let contender_written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            contender_generation_id,
+            0,
+            &[0xc2; 16],
+            contender_payload,
+        )
+        .unwrap();
+    let contender_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id: contender_reservation_id,
+            generation_id: contender_generation_id,
+            payload: contender_payload,
+            segment_okh: [0xc2; 16],
+            written: &contender_written,
+        },
+    );
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let pending_installed = Arc::new(AtomicBool::new(false));
+    let hook_map = Arc::clone(&map);
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_contender_req = contender_req.clone();
+    let hook_contender_shards = contender_written.written_shards.clone();
+    let hook_calls_for_closure = Arc::clone(&hook_calls);
+    let pending_installed_for_closure = Arc::clone(&pending_installed);
+    let _command_id_hook =
+        cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+            let call = hook_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            let pg_id = PgId::new(2);
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            if call == 0 {
+                thread::sleep(Duration::from_millis(1_100));
+                let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+                crate::PgMetadataStore::put_object_meta(
+                    &*pg,
+                    &crate::PutObjectReq::Live(crate::PutLiveObjectReq {
+                        bucket: hook_bucket.clone(),
+                        key: hook_key.clone(),
+                        version_id: crate::VersionId::Null,
+                        owner: crate::OwnerIdentity::from_principal("owner"),
+                        acl_grants: crate::AclGrants::default(),
+                        public_read: false,
+                        generation_id: crate::GenerationId::new(44_000).unwrap(),
+                        size: 44,
+                        etag: crate::ObjectEtag::single_part(44_000),
+                        ec: EcShape { k: 1, m: 0 },
+                        layout: crate::ObjectLayout::Standard,
+                        tags: None,
+                        metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+                        system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+                        object_lock: crate::ObjectLockState::default(),
+                        encryption: crate::ObjectEncryption::None,
+                    }),
+                )
+                .unwrap();
+                pg.refresh_metadata_command_state_digest().unwrap();
+                return;
+            }
+            if call != 1 {
+                return;
+            }
+            let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_contender_shards
+                .iter()
+                .map(|written| (&written.key, written.ack))
+                .collect();
+            hook_cluster
+                .register_payload_shard_acks(hook_contender_req.data_pg_id, &shard_batch)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            let command = hook_cluster
+                .prepare_commit_direct_put_object_command(
+                    pg_id,
+                    &pg,
+                    &hook_contender_req,
+                    crate::VersionId::Null,
+                    hook_contender_req.bucket_write_reservation.clone(),
+                )
+                .unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                &command,
+                Some(&hook_bucket),
+            )
+            .unwrap();
+            pending_installed_for_closure.store(true, Ordering::SeqCst);
+        }));
+
+    let drain_hook_ran = Arc::new(AtomicBool::new(false));
+    let drain_hook_ran_for_closure = Arc::clone(&drain_hook_ran);
+    let _drain_hook = cluster.test_install_direct_put_pending_drain_hook(Arc::new(move || {
+        !drain_hook_ran_for_closure.swap(true, Ordering::SeqCst)
+    }));
+
+    let error = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &loser_req,
+            &loser_written.written_shards,
+            |_| Ok::<(), ()>(()),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+    assert!(pending_installed.load(Ordering::SeqCst));
+    assert!(drain_hook_ran.load(Ordering::SeqCst));
+
+    let pending = pending_metadata_command_for_test(&map, PgId::new(2), &bucket)
+        .expect("expired direct PUT budget must not drain the pending contender");
+    assert!(matches!(
+        pending.payload(),
+        MetadataCommandPayload::CommitDirectPutObject(commit)
+            if commit.object.generation_id == contender_generation_id
+    ));
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+        .unwrap();
+    let pg = primary.storage_node().get_pg(2).unwrap();
+    let live = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
+        .unwrap()
+        .as_live()
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        live.generation_id,
+        crate::GenerationId::new(44_000).unwrap()
+    );
 }

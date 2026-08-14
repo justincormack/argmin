@@ -29,9 +29,8 @@ impl fmt::Debug for ProcessLocalRegistryKey {
     }
 }
 
-const DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
-const STREAM_PUT_STALE_COMMIT_RETRY_BUDGET: Duration = Duration::from_secs(1);
 const DIRECT_PUT_METADATA_RETRY_BUDGET: Duration = Duration::from_secs(10);
+const STREAM_PUT_FINALIZE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const OBJECT_GENERATION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const OBJECT_VERSION_RESERVATION_RETRY_BUDGET: Duration = Duration::from_secs(10);
 pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs(10);

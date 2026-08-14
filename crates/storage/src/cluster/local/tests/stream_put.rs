@@ -679,9 +679,13 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
     }
 }
 
-fn assert_stream_put_finalize_command_id_race(
-    injected_action: crate::cluster::request_ops::StreamPutPendingDrainTestAction,
-) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamPutFinalizeCommandIdRace {
+    PendingDrain(crate::cluster::request_ops::StreamPutPendingDrainTestAction),
+    StaleSnapshotPastLegacyBudget,
+}
+
+fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRace) {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -807,6 +811,18 @@ fn assert_stream_put_finalize_command_id_race(
             if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
                 return;
             }
+            if mode == StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget {
+                thread::sleep(Duration::from_millis(1_100));
+                hook_cluster
+                    .commit_direct_put_object_from_payload_shards(
+                        &hook_req,
+                        &hook_written_shards,
+                        |_| Ok::<(), ()>(()),
+                    )
+                    .unwrap()
+                    .unwrap();
+                return;
+            }
             let pg_id = PgId::new(2);
             let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
                 .iter()
@@ -853,6 +869,9 @@ fn assert_stream_put_finalize_command_id_race(
             if event == crate::cluster::request_ops::StreamPutPendingDrainTestEvent::LateConflict
                 && !recovery_timeout_observed_for_hook.swap(true, Ordering::SeqCst)
             {
+                let StreamPutFinalizeCommandIdRace::PendingDrain(injected_action) = mode else {
+                    return crate::cluster::request_ops::StreamPutPendingDrainTestAction::Continue;
+                };
                 if matches!(
                     injected_action,
                     crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
@@ -874,7 +893,12 @@ fn assert_stream_put_finalize_command_id_race(
         stream_payload.len() as u64,
         move |snapshot| {
             calls_for_action.fetch_add(1, Ordering::SeqCst);
-            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+            if mode == StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget
+                && snapshot.existing_etag.is_some()
+            {
+                return Err("if-none-match failed");
+            }
+            Ok::<_, &'static str>(crate::PreparedStreamPutCommit {
                 value: snapshot.existing_etag,
                 versioning: crate::BucketVersioningState::Disabled,
                 owner: crate::OwnerIdentity::from_principal("owner"),
@@ -890,9 +914,37 @@ fn assert_stream_put_finalize_command_id_race(
         },
     );
     assert!(hook_ran.load(Ordering::SeqCst));
+    if mode == StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget {
+        assert!(!recovery_timeout_observed.load(Ordering::SeqCst));
+        assert_eq!(result.unwrap().unwrap_err(), "if-none-match failed");
+        assert_eq!(
+            action_calls.load(Ordering::SeqCst),
+            2,
+            "stale stream PUT finalization must re-evaluate its condition"
+        );
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
+        for node_id in node_ids {
+            let pg = first_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(2)
+                .unwrap();
+            let live = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key)
+                .unwrap()
+                .as_live()
+                .cloned()
+                .expect("competing direct PUT winner must remain live");
+            assert_eq!(live.generation_id, winner_generation_id);
+            assert_eq!(live.size, winner_payload.len() as u64);
+        }
+        return;
+    }
     assert!(recovery_timeout_observed.load(Ordering::SeqCst));
-    if injected_action
-        == crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget
+    if mode
+        == StreamPutFinalizeCommandIdRace::PendingDrain(
+            crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget,
+        )
     {
         let error = result.expect_err("late pending drain must honor the outer work deadline");
         assert!(matches!(
@@ -948,15 +1000,22 @@ fn assert_stream_put_finalize_command_id_race(
 
 #[test]
 fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
-    assert_stream_put_finalize_command_id_race(
+    assert_stream_put_finalize_command_id_race(StreamPutFinalizeCommandIdRace::PendingDrain(
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure,
-    );
+    ));
 }
 
 #[test]
 fn stream_put_finalize_late_pending_drain_honors_outer_budget() {
-    assert_stream_put_finalize_command_id_race(
+    assert_stream_put_finalize_command_id_race(StreamPutFinalizeCommandIdRace::PendingDrain(
         crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget,
+    ));
+}
+
+#[test]
+fn stream_put_finalize_rechecks_condition_after_legacy_stale_snapshot_budget() {
+    assert_stream_put_finalize_command_id_race(
+        StreamPutFinalizeCommandIdRace::StaleSnapshotPastLegacyBudget,
     );
 }
 

@@ -4092,8 +4092,33 @@ impl StorageCluster {
         bucket: &BucketName,
         pending_visible: bool,
     ) -> Result<(), ObjectPgActionError> {
+        let mut work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
+            .for_operation("object_pg_log_conflict_drain")
+            .for_pg(pg_id);
+        self.drain_after_object_pg_log_conflict_with_work_budget(
+            publisher,
+            pg_id,
+            bucket,
+            pending_visible,
+            &mut work_budget,
+        )
+    }
+
+    fn drain_after_object_pg_log_conflict_with_work_budget(
+        &self,
+        publisher: impl crate::metadata_command::MetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        pending_visible: bool,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
         if pending_visible {
-            self.drain_one_pending_object_metadata_command(publisher, pg_id, bucket)?;
+            self.drain_one_pending_object_metadata_command_with_work_budget(
+                publisher,
+                pg_id,
+                bucket,
+                work_budget,
+            )?;
         }
         Ok(())
     }
@@ -4106,6 +4131,28 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         effect_fence: Option<AdmittedRouteEffectFence>,
     ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
+        let mut work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
+            .for_operation("snapshot_sensitive_metadata_command_install")
+            .for_pg(pg_id);
+        self.install_snapshot_sensitive_metadata_command_or_drain_with_work_budget(
+            publisher,
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            &mut work_budget,
+        )
+    }
+
+    fn install_snapshot_sensitive_metadata_command_or_drain_with_work_budget(
+        &self,
+        publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
         match self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
             pg_id,
             bucket,
@@ -4115,7 +4162,12 @@ impl StorageCluster {
             Ok(true) => Ok(SnapshotSensitiveInstallOutcome::Installed),
             Ok(false)
             | Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
-                self.drain_one_pending_object_metadata_command(publisher, pg_id, bucket)?;
+                self.drain_one_pending_object_metadata_command_with_work_budget(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    work_budget,
+                )?;
                 Ok(SnapshotSensitiveInstallOutcome::ContenderDrained)
             }
             Err(error) => Err(error),

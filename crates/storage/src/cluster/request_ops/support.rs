@@ -544,6 +544,9 @@ type StreamPutPendingDrainTestHook =
     Arc<dyn Fn(StreamPutPendingDrainTestEvent) -> StreamPutPendingDrainTestAction + Send + Sync>;
 
 #[cfg(test)]
+type DirectPutPendingDrainTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[cfg(test)]
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -705,6 +708,11 @@ static STREAM_PUT_PENDING_DRAIN_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static DIRECT_PUT_PENDING_DRAIN_HOOKS: OnceLock<
+    Mutex<HashMap<usize, DirectPutPendingDrainTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteCommandIdTestHook>>,
 > = OnceLock::new();
@@ -861,6 +869,11 @@ pub(crate) struct StreamPutFinalizeCommandIdTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct StreamPutPendingDrainTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectPutPendingDrainTestHookGuard {
     scope_id: usize,
 }
 
@@ -1065,6 +1078,17 @@ impl Drop for StreamPutFinalizeCommandIdTestHookGuard {
 impl Drop for StreamPutPendingDrainTestHookGuard {
     fn drop(&mut self) {
         let hooks = STREAM_PUT_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutPendingDrainTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = DIRECT_PUT_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1513,6 +1537,22 @@ fn maybe_run_stream_put_pending_drain_hook(
             work_budget.expire_for_test();
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_direct_put_pending_drain_hook(
+    scope_id: usize,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let expire = DIRECT_PUT_PENDING_DRAIN_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .is_some_and(|hook| hook());
+    if expire {
+        work_budget.expire_for_test();
     }
 }
 

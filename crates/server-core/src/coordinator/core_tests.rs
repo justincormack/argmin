@@ -12116,7 +12116,7 @@ fn stream_put_finalize_version_reservation_maps_command_log_conflict_to_slow_dow
 }
 
 #[test]
-fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_cleanupable() {
+fn stream_put_finalize_retries_stale_snapshot_past_legacy_budget() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12126,7 +12126,7 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
 
-    let stream_body = b"stream body that must not be published";
+    let stream_body = b"stream body published after stale retry";
     let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
     coord
         .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, stream_body)
@@ -12169,7 +12169,7 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
     );
 
     let metadata = MetadataBlob::new();
-    let err = coord
+    coord
         .finalize_stream_put(&FinalizeStreamPutRequest {
             object: object_request("bucket", "key", test_requester()),
             session_id: &session_id,
@@ -12184,12 +12184,8 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
             policy_context: PutObjectPolicyContext::default(),
             requested_object_lock: ObjectLockState::default(),
         })
-        .unwrap_err();
+        .unwrap();
     assert!(hook_ran.load(Ordering::SeqCst));
-    assert!(
-        matches!(err, ServerError::SlowDown),
-        "stale stream finalization exhaustion must be retryable, got {err:?}"
-    );
     drop(hook_guard);
 
     let current = coord
@@ -12199,23 +12195,12 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
             cond: NO_READ,
         })
         .unwrap();
-    assert_eq!(current.body.read_all().unwrap(), b"competing object");
+    assert_eq!(current.body.read_all().unwrap(), stream_body);
     assert!(
         storage_cluster
-            .test_capture_stream_upload_payload(&bucket, &key, &session_id)
-            .unwrap()
-            .has_same_staged_payload_as(&staged_payload),
-        "retry exhaustion must preserve the session for caller-owned cleanup"
-    );
-
-    coord
-        .abort_stream_put_session(&bucket, &key, &session_id)
-        .unwrap();
-    assert!(
-        storage_cluster
-            .test_stream_upload_payload_snapshot_is_fully_absent(&staged_payload)
+            .test_stream_upload_payload_snapshot_is_fully_present(&staged_payload)
             .unwrap(),
-        "caller cleanup must remove the staged stream segments"
+        "successful finalization must preserve its published payload"
     );
     assert!(
         !storage::test_support::stream_upload_session_exists(
@@ -12225,7 +12210,7 @@ fn stream_put_finalize_stale_snapshot_budget_returns_slow_down_and_remains_clean
             &session_id,
         )
         .unwrap(),
-        "caller cleanup must remove the stale stream session"
+        "successful finalization must remove the stream session"
     );
 }
 
@@ -12369,7 +12354,7 @@ fn copy_object_destination_finalize_maps_command_log_conflict_to_slow_down() {
 }
 
 #[test]
-fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
+fn copy_object_retries_stale_destination_past_legacy_budget_and_cleans_stream() {
     let tmp = test_util::tempdir();
     let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
     let coord = setup_direct_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
@@ -12387,7 +12372,7 @@ fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
             policy_context: PutObjectPolicyContext::default(),
             object_lock: ObjectLockState::default(),
             object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
-            data: b"copy source that must not be published",
+            data: b"copy source published after stale retry",
             metadata: &metadata,
             system_metadata: &SystemMetadata::EMPTY,
             tags: None,
@@ -12428,7 +12413,7 @@ fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
         }),
     );
 
-    let err = coord
+    coord
         .copy_object(&CopyObjectRequest {
             source: copy_source("bucket", "src", None),
             destination: object_request_with_expected_owner(
@@ -12447,12 +12432,8 @@ fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
             destination_encryption: WriteEncryptionRequest::none(),
             object_lock: ObjectLockState::default(),
         })
-        .unwrap_err();
+        .unwrap();
     assert!(hook_ran.load(Ordering::SeqCst));
-    assert!(
-        matches!(err, ServerError::SlowDown),
-        "stale CopyObject destination exhaustion must be retryable, got {err:?}"
-    );
     drop(hook_guard);
 
     let destination = coord
@@ -12464,7 +12445,7 @@ fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
         .unwrap();
     assert_eq!(
         destination.body.read_all().unwrap(),
-        b"competing destination"
+        b"copy source published after stale retry"
     );
     let source = coord
         .get_object(&GetObjectRequest {
@@ -12475,7 +12456,7 @@ fn copy_object_stale_destination_budget_returns_slow_down_and_cleans_stream() {
         .unwrap();
     assert_eq!(
         source.body.read_all().unwrap(),
-        b"copy source that must not be published"
+        b"copy source published after stale retry"
     );
     assert_eq!(
         storage::test_support::stream_upload_session_count(&storage_cluster).unwrap(),

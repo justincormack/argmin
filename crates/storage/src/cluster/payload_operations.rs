@@ -3129,7 +3129,6 @@ impl StorageCluster {
             }
         };
 
-        let stale_commit_snapshot_deadline = Instant::now() + DIRECT_PUT_STALE_COMMIT_RETRY_BUDGET;
         let (command, new_pending_command) = loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
@@ -3215,19 +3214,11 @@ impl StorageCluster {
                         },
                     ) {
                         Ok(command) => command,
-                        Err(ObjectPgActionError::StaleDirectPutCommitSnapshot)
-                            if Instant::now() < stale_commit_snapshot_deadline =>
-                        {
+                        Err(ObjectPgActionError::StaleDirectPutCommitSnapshot) => {
                             sleep_direct_put_before_command_ownership_after_contention!(
                                 "direct PUT stale snapshot retry budget exhausted"
                             );
                             continue;
-                        }
-                        Err(ObjectPgActionError::StaleDirectPutCommitSnapshot) => {
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(conflicting_pending_object_metadata_command(
-                                "direct PUT stale commit snapshot retry budget exhausted",
-                            ));
                         }
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
@@ -3241,12 +3232,19 @@ impl StorageCluster {
                                     return Err(error.into());
                                 }
                             };
-                            let drain_result = self.drain_after_object_pg_log_conflict(
-                                publisher,
-                                pg_id,
-                                &req.bucket,
-                                pending_visible,
+                            #[cfg(test)]
+                            request_ops::maybe_run_direct_put_pending_drain_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                                &mut work_budget,
                             );
+                            let drain_result =
+                                self.drain_after_object_pg_log_conflict_with_work_budget(
+                                    publisher,
+                                    pg_id,
+                                    &req.bucket,
+                                    pending_visible,
+                                    &mut work_budget,
+                                );
                             if let Err(error) = drain_result {
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
@@ -3328,19 +3326,27 @@ impl StorageCluster {
                         let exact =
                             ExactPendingObjectMetadataCommand::for_checked_request(&command);
                         let error =
-                            match self.finish_exact_pending_object_metadata_command(pg_id, exact) {
-                                Ok(PendingMetadataCommandOutcome::Applied) => {
+                            match self.finish_exact_pending_object_metadata_command_with_work_budget(
+                                pg_id,
+                                exact,
+                                &mut work_budget,
+                            ) {
+                                Ok(PendingObjectMetadataCommandCompletion::Applied) => {
                                     unreachable!(
                                         "already-classified abandoned metadata command was applied"
                                     )
                                 }
-                                Ok(PendingMetadataCommandOutcome::Abandoned) => {
+                                Ok(PendingObjectMetadataCommandCompletion::Abandoned) => {
                                     cleanup_direct_put_attempt_before_command_ownership!();
                                     return Err(conflicting_pending_object_metadata_command(
                                         "abandoned pending command for direct put commit",
                                     ));
                                 }
-                                Ok(PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
+                                Ok(
+                                    PendingObjectMetadataCommandCompletion::RetryPartialExactConflict(
+                                        _,
+                                    ),
+                                ) => {
                                     conflicting_pending_object_metadata_command(
                                         "retryable partial pending command for direct put commit",
                                     )
@@ -3350,9 +3356,12 @@ impl StorageCluster {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
-                    if let Err(error) =
-                        self.drain_pending_object_metadata_command(publisher, pg_id, &command)
-                    {
+                    if let Err(error) = self.drain_pending_object_metadata_command_with_work_budget(
+                        publisher,
+                        pg_id,
+                        &command,
+                        &mut work_budget,
+                    ) {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
@@ -3364,9 +3373,12 @@ impl StorageCluster {
                 if is_matching_direct_put {
                     break (command, false, false);
                 }
-                if let Err(error) =
-                    self.drain_pending_object_metadata_command(publisher, pg_id, &command)
-                {
+                if let Err(error) = self.drain_pending_object_metadata_command_with_work_budget(
+                    publisher,
+                    pg_id,
+                    &command,
+                    &mut work_budget,
+                ) {
                     cleanup_direct_put_attempt_before_command_ownership!();
                     return Err(error);
                 }
@@ -3428,13 +3440,15 @@ impl StorageCluster {
                     "direct PUT command install retry budget exhausted"
                 );
                 self.maybe_run_before_metadata_command_pending_install_hook();
-                let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                    publisher,
-                    pg_id,
-                    &req.bucket,
-                    &command,
-                    Some(effect_fence),
-                ) {
+                let install = match self
+                    .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget(
+                        publisher,
+                        pg_id,
+                        &req.bucket,
+                        &command,
+                        Some(effect_fence),
+                        &mut work_budget,
+                    ) {
                     Ok(install) => install,
                     Err(error) => {
                         cleanup_direct_put_attempt_before_command_ownership!();

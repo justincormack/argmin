@@ -419,18 +419,14 @@ impl super::StorageCluster {
             key,
             session_id,
         )?;
-        let mut stale_snapshot_work_budget =
-            super::RequestWorkBudget::new(super::STREAM_PUT_STALE_COMMIT_RETRY_BUDGET, None)
+        let mut finalization_work_budget =
+            super::RequestWorkBudget::new(super::STREAM_PUT_FINALIZE_RETRY_BUDGET, None)
                 .for_operation("finalize_stream_put")
-                .for_pg(pg_id);
-        let mut pending_work_budget =
-            super::RequestWorkBudget::new(super::BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
-                .for_operation("finalize_stream_put_pending")
                 .for_pg(pg_id);
 
         let (command, new_pending_command, prepared) = loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
-            pending_work_budget
+            finalization_work_budget
                 .check("stream PUT finalization pending retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -444,13 +440,13 @@ impl super::StorageCluster {
                     let drain = match maybe_run_stream_put_pending_drain_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
                         StreamPutPendingDrainTestEvent::Initial,
-                        &mut pending_work_budget,
+                        &mut finalization_work_budget,
                     ) {
                         Ok(()) => self.drain_pending_object_metadata_command_with_work_budget(
                             publisher,
                             pg_id,
                             &command,
-                            &mut pending_work_budget,
+                            &mut finalization_work_budget,
                         ),
                         Err(error) => Err(error),
                     };
@@ -459,14 +455,14 @@ impl super::StorageCluster {
                         publisher,
                         pg_id,
                         &command,
-                        &mut pending_work_budget,
+                        &mut finalization_work_budget,
                     );
                     match drain {
                         Ok(_) => {}
                         Err(error)
                             if Self::stream_put_pending_drain_error_is_retryable(&error) =>
                         {
-                            pending_work_budget
+                            finalization_work_budget
                                 .sleep_after_contention(
                                     "stream PUT finalization pending drain retry budget exhausted",
                                 )
@@ -475,7 +471,7 @@ impl super::StorageCluster {
                         }
                         Err(error) => return Err(error),
                     }
-                    pending_work_budget
+                    finalization_work_budget
                         .sleep_after_contention(
                             "stream PUT finalization pending drain retry budget exhausted",
                         )
@@ -583,11 +579,11 @@ impl super::StorageCluster {
                     ) {
                         Ok(command) => command,
                         Err(ObjectPgActionError::StaleStreamFinalizeSnapshot) => {
-                            if let Err(error) = stale_snapshot_work_budget.sleep_after_contention(
-                                "stream PUT stale commit snapshot retry budget exhausted",
-                            ) {
-                                return Err(ObjectPgActionError::Store(error));
-                            }
+                            finalization_work_budget
+                                .sleep_after_contention(
+                                    "stream PUT stale commit snapshot retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
                             continue;
                         }
                         Err(ObjectPgActionError::Store(
@@ -597,14 +593,14 @@ impl super::StorageCluster {
                             let drain = match maybe_run_stream_put_pending_drain_hook(
                                 self.metadata_command_apply_test_hook_scope_id(),
                                 StreamPutPendingDrainTestEvent::LateConflict,
-                                &mut pending_work_budget,
+                                &mut finalization_work_budget,
                             ) {
                                 Ok(()) => self
                                     .drain_one_pending_object_metadata_command_with_work_budget(
                                         publisher,
                                         pg_id,
                                         bucket,
-                                        &mut pending_work_budget,
+                                        &mut finalization_work_budget,
                                     ),
                                 Err(error) => Err(error),
                             };
@@ -614,7 +610,7 @@ impl super::StorageCluster {
                                     publisher,
                                     pg_id,
                                     bucket,
-                                    &mut pending_work_budget,
+                                    &mut finalization_work_budget,
                                 );
                             match drain {
                                 Ok(()) => {}
@@ -623,7 +619,7 @@ impl super::StorageCluster {
                                         &error,
                                     ) =>
                                 {
-                                    pending_work_budget
+                                    finalization_work_budget
                                         .sleep_after_contention(
                                             "stream PUT finalization late pending drain retry budget exhausted",
                                         )
@@ -632,7 +628,7 @@ impl super::StorageCluster {
                                 }
                                 Err(error) => return Err(error),
                             }
-                            pending_work_budget
+                            finalization_work_budget
                                 .sleep_after_contention(
                                     "stream PUT finalization late pending drain retry budget exhausted",
                                 )

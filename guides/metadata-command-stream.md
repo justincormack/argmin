@@ -144,7 +144,10 @@ conditional mutations must distinguish that safe abandonment from uncertain
 publication: while their request budget remains, they discard the stale computed
 result and re-evaluate the condition against a fresh snapshot. Only exhaustion of
 that outer budget may return `SlowDown` for repeated, definitively unpublished
-contention.
+contention. Direct and streamed PutObject pending-command drains and stale-snapshot
+retries consume this same outer operation budget; they must not use a shorter or
+fresh nested budget that can expose internal PG churn as `SlowDown` before the
+condition is re-evaluated or extend work beyond the operation deadline.
 
 The request enters **irrevocable convergence** as soon as either:
 
