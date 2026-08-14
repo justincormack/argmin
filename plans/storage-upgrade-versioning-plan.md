@@ -1757,6 +1757,16 @@ Rules:
   version should have separate tests.
 - If a format is SQLite-backed, use a dedicated metadata table or `PRAGMA user_version`
   consistently; do not infer schema version from incidental table/column presence alone.
+- Every versioned durable, wire, transport, configuration, digest, and database format must have
+  frozen, complete owner-local representation evidence. A leaf format or independently versioned
+  outer grammar has an immutable manifest keyed by its own version. A composite containing
+  independently versioned nested payloads additionally has append-only fixtures keyed by the
+  complete relevant version vector. An incompatible grammar change requires a new owning version;
+  an inner-only advancement with unchanged outer grammar appends a new composite-vector fixture
+  without rewriting the old fixture or advancing the outer version.
+- A SQLite schema version applies that general rule to the complete physical schema. Adding,
+  removing, or changing any table, column, constraint, index, foreign key, view, or trigger requires
+  a new schema version and a new manifest.
 
 This phase still does not implement upgrade steps. It only creates a clean baseline that a
 later upgrade framework can reason about.
@@ -1770,11 +1780,60 @@ owner-side rejection point, and permanent tests for all applicable cases:
 1. the current writer always emits the current marker;
 2. missing, too-old, and too-new versions fail before dispatch, mutation, or publication;
 3. malformed magic and unsupported version are separate failures for magic-plus-version formats;
-4. exact current bytes or an equivalent sealed fixture pin the marker location and byte order;
+4. exact current bytes or equivalent sealed evidence pin the marker location and byte order,
+   separating immutable outer grammar from composites containing independently versioned payloads;
 5. authenticated or checksummed formats have resealed unsupported-version fixtures, so a checksum
    failure cannot accidentally stand in for version rejection; and
 6. a nested representation either carries its own private marker or has an explicit rule binding
    every incompatible change to advancement of all containing formats.
+
+The evidence in item 4 is append-only and version-indexed, not merely an exact fixture for whatever
+the current writer happens to emit today. A format containing an independently self-describing
+nested payload has two evidence layers:
+
+- immutable outer-grammar evidence keyed only by the outer version, covering the outer marker,
+  fields, ordering, widths, discriminants, and framing while treating nested bytes as an opaque
+  field; and
+- immutable composite fixtures keyed by the complete relevant version vector, for example
+  `(replicated_snapshot_v1, control_plane_state_v28)`. Advancing only the inner version appends a
+  new vector entry and retains the previous entry; it does not alter the outer-v1 grammar evidence.
+
+If an inner change alters its containing field's width, ordering, optionality, framing, or other
+outer grammar, the outer version advances as required by the dependency ledger. The representation
+appropriate to each format family is:
+
+- self-describing binary formats: the complete header, field order and widths, discriminants,
+  optionality, and a mechanically exhaustive all-variant/all-branch exact-byte corpus;
+- RPC and transport formats: the complete message-kind registry plus exact payload and outer-frame
+  fixtures, including authenticated or checksummed unsupported-version fixtures;
+- canonical text/configuration formats: the complete key/grammar manifest and exact canonical
+  output fixtures;
+- digest, hash-chain, and cryptographic binding formats: frozen domain separators, tag and field
+  order, input encodings, and exact vectors;
+- SQLite formats: the complete canonical physical catalogue described below; and
+- unversioned nested representations: an explicit dependency ledger naming every containing
+  version that must advance, with sealed evidence in every direct container.
+
+Historical evidence remains even while its reader is unsupported. Retaining a manifest, exact
+fixture, or rejection vector does not authorize a compatibility decoder. Existing `Recorded`
+statuses must be re-audited against this append-only rule; a mutable current-only fixture does not
+satisfy it.
+
+Corpus completeness must be enforced rather than asserted by convention. Where a representation
+has variants, message kinds, request/success/error shapes, or optional branches:
+
+1. Compare fixture case identities against the authoritative production registry; do not maintain
+   a disconnected test-only list that can omit a new production kind.
+2. Construct cases through compiler-exhaustive matches over production enums, without wildcard or
+   catch-all arms. Adding a variant must cause compilation failure until its evidence is supplied.
+3. Construct framed structs without update syntax or defaults that can silently fill a new field,
+   and explicitly cover present and absent forms of every optional field.
+4. Require exact set equality between the production registry and fixture coverage for request,
+   success, error, and optional payload families as applicable. Duplicate cases and unknown fixture
+   identities fail as well as missing cases.
+5. Where Rust's type system cannot enumerate a structural branch, expose a private owner registry
+   from the production codec and compare it with the sealed corpus. A source-code grep is not
+   sufficient completeness evidence.
 
 `Evidence required` means a marker exists in current code but the complete evidence above has not
 yet been consolidated in this matrix. `Design required` means the representation has no
@@ -1783,7 +1842,7 @@ to add an inner frame. Neither status permits adding a fallback reader.
 
 | Boundary family | Owner | Current candidate baseline | Gate status |
 | --- | --- | --- | --- |
-| PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 2`; version zero is valid only with no user schema objects | Recorded; the coordinated baseline added the two replica-state carrier-version columns and rejects schemas 1 and 3 |
+| PG SQLite schema and physical layout | `storage` | `PRAGMA user_version = 2`; version zero is valid only with no user schema objects | Evidence required; version rejection exists, but the complete version-indexed schema manifests and automatic schema-change-without-version-bump regression described below are not implemented. Adding `metadata_command_pending_slot.publication_started` without advancing version 2 exposed this gap. |
 | Applied metadata-command envelope | `storage` | magic `argmin-metadata-command`; command encoding 7 | Evidence required; the coordinated baseline and exact all-variant checksum corpus are implemented, while the wider persistence/RPC evidence remains under review below |
 | Abandoned metadata-command record | `storage` | magic `argmin-metadata-command-abandoned`; abandoned-command encoding 1 | Evidence required; first owner audit recorded below |
 | Metadata-command log hash chain | `storage` | private `ARGMIN-METADATA-COMMAND-LOG-V1` hash domain and opaque fixed-width `MetadataCommandLogHash` carrier version 1 | Recorded for the coordinated carrier slice: PG hash columns remain schema-bound and every exported proof carries the independent version and value; broader command-log-format evidence remains a separate row below |
@@ -1831,6 +1890,58 @@ to add an inner frame. Neither status permits adding a fallback reader.
 | Static control-plane outer identity | `argmin-s3` | magic `ARGSCPID`; identity encoding 2 with a trailing lowercase-hex SHA-256 digest | Evidence required; correctly resealed versions 1/3 are rejected directly, but exact current bytes, typed rejection, and full authority-startup no-mutation evidence are incomplete |
 | Temporary-credential session token | `auth` | `ARGST1` envelope / version 1 | Recorded |
 | Internal TLS protocol identifiers | `storage` | storage RPC, control-plane RPC, and Raft peer ALPN `/1` identifiers | Evidence required; all three identifiers and protocol-profile constructors are owner-private and boundary-checked |
+
+#### Versioned-format bump regressions
+
+Each format owner must give its bump test a conspicuous policy name, following the form
+`current_<format>_matches_frozen_versioned_manifest_and_requires_version_bump`. A leaf-format test
+selects immutable evidence by the writer's current version. A composite test selects immutable
+outer-grammar evidence by the outer version and an append-only exact fixture by the complete
+relevant version vector. Adding a field, variant, message kind, tag, domain, framing rule, or other
+incompatible representation detail while leaving its owning version unchanged must fail. An
+independently versioned inner change appends a vector fixture instead. Neither repair rewrites an
+old entry.
+
+Maintain every historical entry permanently. They provide old/new rejection inputs immediately
+and become golden upgrade inputs for durable formats if migration support is later introduced.
+Transport formats may remain current-version-only at runtime while still preserving old fixtures
+that prove unsupported versions fail before authentication-sensitive dispatch or mutation.
+
+#### PG SQLite schema-version manifest and bump regression
+
+The `PRAGMA user_version` check alone does not prove that the schema associated with that version
+is unchanged. A database whose marker equals the current version is currently accepted without
+comparing its physical schema with the schema that originally defined that version. The addition
+of `metadata_command_pending_slot.publication_started` while
+`CURRENT_PG_SCHEMA_VERSION` remained 2 demonstrated this failure mode.
+
+As the SQLite-specific instance of the general rule, add an owner-local test named clearly enough
+to make its policy visible in failures, for example
+`current_pg_schema_matches_frozen_versioned_manifest_and_requires_version_bump`. The test and its
+fixtures must satisfy all of the following:
+
+1. Maintain an append-only manifest catalogue keyed by every historical PG schema version. Recover
+   and freeze the known version-1 and version-2 schemas from repository history; version 2 remains
+   the schema before `metadata_command_pending_slot.publication_started`, and the schema containing
+   that column must receive a new version and manifest.
+2. Create a fresh current database through the production schema initializer, read the complete
+   SQLite catalogue through storage-owned test code, canonicalize it deterministically, and require
+   exact equality with the manifest selected by `CURRENT_PG_SCHEMA_VERSION`.
+3. Cover every user schema object and structural property that can change durable interpretation:
+   tables and their complete columns, defaults and constraints; primary, unique, and ordinary
+   indexes; foreign keys; strict/rowid properties; views; and complete trigger bodies. Do not use a
+   column-presence probe or a manifest assembled from only a hand-selected subset of objects.
+4. Assert separately that fresh construction writes the same version to `PRAGMA user_version`.
+   Any schema change with the version constant left unchanged must therefore fail against the
+   frozen manifest. The repair is to add the next version and its manifest, never to rewrite the
+   existing manifest.
+5. Keep every historical manifest permanently. Besides making version bumps conspicuous in review,
+   these manifests become inputs to the golden-store and upgrade tests when migrations are
+   deliberately implemented.
+
+This current-format bump regression is distinct from Phase 4. The manifest freezes complete
+trigger bodies as part of each schema version; Phase 4 additionally defines how a supported old
+store with an old trigger generation is recognized, migrated, and recovered after a crash.
 
 #### Metadata-command family evidence inventory (2026-08-08)
 
@@ -1935,7 +2046,9 @@ The replicated snapshot frame remains v1 because it contains the already self-de
 state; Raft restart/WAL/peer containers likewise retain their versions when they contain only a
 self-describing control-plane state, command, or snapshot frame. Storage/control-plane
 authentication bindings retain their versions when their framed payload grammar is unchanged.
-Their exact fixtures must still be updated to prove the new current nested versions are present.
+Their immutable outer-grammar fixtures remain unchanged. Each appends a composite fixture keyed by
+the new complete version vector to prove the new current nested versions are present, while
+retaining the fixture for the preceding vector.
 
 The coordinated implementation replaced the former unversioned proof triples at every container
 listed above. Owner fixtures now seal the versioned carrier bytes independently in the big-endian
