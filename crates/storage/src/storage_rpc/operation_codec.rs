@@ -2157,31 +2157,40 @@ pub(crate) fn decode_stream_part_finalize_snapshot_request(
 pub(crate) fn encode_stream_part_finalize_snapshot_response(
     response: &StorageRpcStreamPartFinalizeSnapshotResponse,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    let auth = &response.snapshot.auth_snapshot;
-    let StreamUploadTarget::UploadPart {
-        upload_id,
-        part_number,
-    } = &auth.session.target
-    else {
-        return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
-            "stream part finalize response target mismatch",
-        ));
-    };
-    validate_stream_part_finalize_snapshot_identity(
-        &StorageRpcObjectRequest {
-            node_id: NodeId::new(0),
-            cluster_epoch: ClusterEpoch::new(1).expect("nonzero epoch"),
-            pg_id: PgId::new(0),
-            bucket: auth.session.bucket.clone(),
-            key: auth.session.key.clone(),
-        },
-        upload_id,
-        &auth.session.session_id,
-        *part_number,
-        &response.snapshot,
-    )?;
     let mut out = Vec::new();
-    put_stream_part_finalize_storage_snapshot(&mut out, &response.snapshot);
+    match &response.outcome {
+        StorageRpcStreamPartFinalizeSnapshotOutcome::Loaded(snapshot) => {
+            let auth = &snapshot.auth_snapshot;
+            let StreamUploadTarget::UploadPart {
+                upload_id,
+                part_number,
+            } = &auth.session.target
+            else {
+                return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                    "stream part finalize response target mismatch",
+                ));
+            };
+            validate_stream_part_finalize_snapshot_identity(
+                &StorageRpcObjectRequest {
+                    node_id: NodeId::new(0),
+                    cluster_epoch: ClusterEpoch::new(1).expect("nonzero epoch"),
+                    pg_id: PgId::new(0),
+                    bucket: auth.session.bucket.clone(),
+                    key: auth.session.key.clone(),
+                },
+                upload_id,
+                &auth.session.session_id,
+                *part_number,
+                snapshot,
+            )?;
+            put_u8(&mut out, 1);
+            put_stream_part_finalize_storage_snapshot(&mut out, snapshot);
+        }
+        StorageRpcStreamPartFinalizeSnapshotOutcome::NoSuchUpload { upload_id } => {
+            put_u8(&mut out, 2);
+            put_string(&mut out, upload_id.as_str());
+        }
+    }
     Ok(out)
 }
 
@@ -2189,9 +2198,21 @@ pub(crate) fn decode_stream_part_finalize_snapshot_response(
     bytes: &[u8],
 ) -> Result<StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcPayloadError> {
     let mut decoder = StorageRpcDecoder::new(bytes);
-    let snapshot = decoder.read_stream_part_finalize_storage_snapshot()?;
+    let outcome = match decoder.read_u8()? {
+        1 => StorageRpcStreamPartFinalizeSnapshotOutcome::Loaded(Box::new(
+            decoder.read_stream_part_finalize_storage_snapshot()?,
+        )),
+        2 => StorageRpcStreamPartFinalizeSnapshotOutcome::NoSuchUpload {
+            upload_id: decoder.read_upload_id()?,
+        },
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidObjectMetadataRequest(
+                "invalid stream part finalize snapshot outcome",
+            ));
+        }
+    };
     decoder.finish()?;
-    Ok(StorageRpcStreamPartFinalizeSnapshotResponse { snapshot })
+    Ok(StorageRpcStreamPartFinalizeSnapshotResponse { outcome })
 }
 
 pub(crate) fn encode_stream_part_commit_command_build_request(

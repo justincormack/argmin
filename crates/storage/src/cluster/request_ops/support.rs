@@ -98,6 +98,8 @@ fn metadata_command_terminal_cleanup_error_is_retryable(error: &StoreError) -> b
     matches!(
         error,
         StoreError::Io { .. }
+            | StoreError::MetadataCommandTerminalEntryPending { .. }
+            | StoreError::OperationDeadlineExceeded { .. }
             | StoreError::StorageRpcResourceExhausted { .. }
             | StoreError::MetadataCommandContention { .. }
             | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
@@ -177,6 +179,24 @@ pub(super) fn metadata_command_apply_error_requires_exact_confirmation(
         BucketSnapshotLoadError::Store(
             StoreError::MetadataCommandOutcomeUnconfirmed { .. }
                 | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+        )
+    )
+}
+
+fn metadata_command_probe_error_is_fatal_integrity(error: &BucketSnapshotLoadError) -> bool {
+    matches!(
+        error,
+        BucketSnapshotLoadError::Store(
+            StoreError::MetadataCommandLogChecksumMismatch { .. }
+                | StoreError::MetadataCommandLogHashMismatch { .. }
+                | StoreError::MetadataCommandReplicaStateEncodingVersion { .. }
+                | StoreError::MetadataCommandReplicaStateDiverged { .. }
+                | StoreError::MetadataStateDigestMismatch { .. }
+                | StoreError::MetadataCheckpointInvalid { .. }
+                | StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::MetadataCommandIntegrity,
+                    ..
+                }
         )
     )
 }
@@ -504,6 +524,26 @@ type StreamPutCreateCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 pub type StreamPutFinalizeCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamPutPendingDrainTestEvent {
+    Initial,
+    LateConflict,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamPutPendingDrainTestAction {
+    Continue,
+    RetryableFailure,
+    IrrevocableFailure,
+    ExpireOuterBudget,
+}
+
+#[cfg(test)]
+type StreamPutPendingDrainTestHook =
+    Arc<dyn Fn(StreamPutPendingDrainTestEvent) -> StreamPutPendingDrainTestAction + Send + Sync>;
+
+#[cfg(test)]
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -563,6 +603,14 @@ type BeforeObjectMetadataCommandApplyTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
 #[cfg(test)]
+type DirectPutPendingInstalledTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
+type BeforeObjectMetadataCommandReissueTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
+
+#[cfg(test)]
 type ObjectMetadataCommandAbandonedTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
 
@@ -594,8 +642,12 @@ type MultipartCompletionStaleRetryTestHook =
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MultipartCompletionAuxiliaryReservationTestEvent {
     ExactPending,
+    AfterAuxiliaryRelease,
     PendingDrain,
     MatchingContender,
+    BeforeCommandBuild,
+    NoSuchUploadCleanup,
+    AfterApplyFailure,
 }
 
 #[cfg(test)]
@@ -645,6 +697,11 @@ static BEFORE_STREAM_PUT_CREATE_COMMAND_ID_HOOKS: OnceLock<
 #[cfg(any(test, feature = "test-hooks"))]
 static BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, StreamPutFinalizeCommandIdTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static STREAM_PUT_PENDING_DRAIN_HOOKS: OnceLock<
+    Mutex<HashMap<usize, StreamPutPendingDrainTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -715,6 +772,16 @@ static OBJECT_METADATA_COMMAND_DEFINITIVE_RETRY_HOOKS: OnceLock<
 #[cfg(test)]
 static BEFORE_OBJECT_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, BeforeObjectMetadataCommandApplyTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static DIRECT_PUT_PENDING_INSTALLED_HOOKS: OnceLock<
+    Mutex<HashMap<usize, DirectPutPendingInstalledTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_OBJECT_METADATA_COMMAND_REISSUE_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BeforeObjectMetadataCommandReissueTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -793,6 +860,11 @@ pub(crate) struct StreamPutFinalizeCommandIdTestHookGuard {
 }
 
 #[cfg(test)]
+pub(crate) struct StreamPutPendingDrainTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
 pub(crate) struct BucketDeleteCommandIdTestHookGuard {
     scope_id: usize,
 }
@@ -859,6 +931,16 @@ pub(crate) struct ObjectMetadataCommandDefinitiveRetryTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct BeforeObjectMetadataCommandApplyTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectPutPendingInstalledTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BeforeObjectMetadataCommandReissueTestHookGuard {
     scope_id: usize,
 }
 
@@ -972,6 +1054,17 @@ impl Drop for StreamPutFinalizeCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_STREAM_PUT_FINALIZE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for StreamPutPendingDrainTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = STREAM_PUT_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1139,6 +1232,30 @@ impl Drop for ObjectMetadataCommandDefinitiveRetryTestHookGuard {
 impl Drop for BeforeObjectMetadataCommandApplyTestHookGuard {
     fn drop(&mut self) {
         let hooks = BEFORE_OBJECT_METADATA_COMMAND_APPLY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutPendingInstalledTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = DIRECT_PUT_PENDING_INSTALLED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for BeforeObjectMetadataCommandReissueTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BEFORE_OBJECT_METADATA_COMMAND_REISSUE_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -1363,6 +1480,39 @@ fn maybe_run_before_stream_put_finalize_command_id_hook(_scope_id: usize) {
         .cloned();
     if let Some(hook) = hook {
         hook();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_stream_put_pending_drain_hook(
+    scope_id: usize,
+    event: StreamPutPendingDrainTestEvent,
+    work_budget: &mut super::RequestWorkBudget,
+) -> Result<(), ObjectPgActionError> {
+    let action = STREAM_PUT_PENDING_DRAIN_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .map_or(StreamPutPendingDrainTestAction::Continue, |hook| hook(event));
+    match action {
+        StreamPutPendingDrainTestAction::Continue => Ok(()),
+        StreamPutPendingDrainTestAction::RetryableFailure => Err(ObjectPgActionError::Store(
+            StoreError::MetadataCommandContention {
+                context: "injected stream PUT pending drain contention",
+            },
+        )),
+        StreamPutPendingDrainTestAction::IrrevocableFailure => Err(ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: 1,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 1,
+            },
+        )),
+        StreamPutPendingDrainTestAction::ExpireOuterBudget => {
+            work_budget.expire_for_test();
+            Ok(())
+        }
     }
 }
 
@@ -1595,6 +1745,39 @@ fn maybe_run_before_object_metadata_command_apply_hook(
 }
 
 #[cfg(test)]
+pub(super) fn maybe_run_direct_put_pending_installed_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = DIRECT_PUT_PENDING_INSTALLED_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook(command)) {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_before_object_metadata_command_reissue_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) {
+    let hook = BEFORE_OBJECT_METADATA_COMMAND_REISSUE_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(command);
+    }
+}
+
+#[cfg(test)]
 fn maybe_run_object_metadata_command_abandoned_hook(
     scope_id: usize,
     command: &MetadataCommandEnvelope,
@@ -1682,7 +1865,7 @@ fn maybe_run_multipart_completion_auxiliary_reservation_hook(
     event: MultipartCompletionAuxiliaryReservationTestEvent,
     proof: &BucketWriteReservationProof,
     work_budget: &mut super::RequestWorkBudget,
-) {
+) -> bool {
     let hook = MULTIPART_COMPLETION_AUXILIARY_RESERVATION_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -1691,6 +1874,9 @@ fn maybe_run_multipart_completion_auxiliary_reservation_hook(
         .cloned();
     if hook.is_some_and(|hook| hook(event, proof)) {
         work_budget.expire_for_test();
+        true
+    } else {
+        false
     }
 }
 

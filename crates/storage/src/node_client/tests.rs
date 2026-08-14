@@ -1456,7 +1456,7 @@ fn local_recovery_abandonment_operations_honor_absolute_deadline_while_pg_locked
         }
         .unwrap_err();
         assert!(
-            matches!(error, StoreError::Io { ref source, .. } if source.kind() == std::io::ErrorKind::TimedOut),
+            matches!(error, StoreError::OperationDeadlineExceeded { .. }),
             "{operation} should stop at the absolute deadline, got {error:?}"
         );
     }
@@ -3695,12 +3695,99 @@ fn local_metadata_command_hash_inspection_bounds_pg_lock_wait_by_deadline() {
 
     assert!(matches!(
         error,
-        StoreError::Io { source, .. }
-            if source.kind() == std::io::ErrorKind::TimedOut
+        StoreError::OperationDeadlineExceeded { .. }
     ));
+    assert_eq!(
+        error.operation_failure_class(),
+        crate::StoreOperationFailureClass::RetryableConvergence
+    );
     assert!(
         started.elapsed() < Duration::from_secs(1),
         "local PG lock wait ignored the confirmation deadline"
+    );
+}
+
+#[test]
+fn local_partial_conflict_state_and_reservation_checks_bound_pg_lock_wait() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("deadline-lock-bucket");
+    let key = crate::tests::object_key("deadline-lock-key");
+    let route = client
+        .open_bucket_write_reservation_route(
+            ClusterEpoch::new(1).unwrap(),
+            BucketPgId::new_for_test(PgId::new(0)),
+            &bucket,
+        )
+        .unwrap();
+    let proof = test_bucket_write_reservation_proof(bucket, &key);
+    let pg_guard = storage_node.get_pg(0).unwrap();
+
+    for operation in ["replica-state", "reservation"] {
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(20);
+        let error = match operation {
+            "replica-state" => {
+                MetadataCommandInspectionNodeClient::metadata_command_replica_state_until(
+                    &client,
+                    PgId::new(0),
+                    deadline,
+                )
+                .map(|_| ())
+                .map_err(BucketSnapshotLoadError::Store)
+            }
+            "reservation" => route.validate_bucket_write_reservation_proof_until(&proof, deadline),
+            _ => unreachable!(),
+        }
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                BucketSnapshotLoadError::Store(StoreError::OperationDeadlineExceeded { .. })
+            ),
+            "{operation} should stop at the absolute deadline, got {error:?}"
+        );
+        let BucketSnapshotLoadError::Store(error) = &error else {
+            unreachable!("matched store error")
+        };
+        assert_eq!(
+            error.operation_failure_class(),
+            crate::StoreOperationFailureClass::RetryableConvergence,
+            "{operation} timeout must map to retryable S3 convergence"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{operation} local PG lock wait ignored the deadline"
+        );
+    }
+    drop(pg_guard);
+}
+
+#[test]
+fn unix_endpoint_absence_is_retryable_convergence() {
+    let client = test_unix_storage_node_client();
+    let error = client
+        .metadata_command_replica_state(PgId::new(0))
+        .expect_err("missing Unix endpoint must fail before dispatch");
+
+    assert!(matches!(
+        error,
+        StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::TransportClosed,
+            ..
+        }
+    ));
+    assert_eq!(
+        error.operation_failure_class(),
+        crate::StoreOperationFailureClass::RetryableConvergence
     );
 }
 

@@ -58,6 +58,40 @@ enum ReissuePendingMetadataCommandOutcome {
     },
 }
 
+enum ReissuePendingMetadataCommandFailure {
+    DefinitelyNotReissued(BucketSnapshotLoadError),
+    MayHaveReissued {
+        source: BucketSnapshotLoadError,
+        lineage_tip: Box<MetadataCommandEnvelope>,
+    },
+}
+
+impl ReissuePendingMetadataCommandFailure {
+    fn into_source(self) -> BucketSnapshotLoadError {
+        match self {
+            Self::DefinitelyNotReissued(source) | Self::MayHaveReissued { source, .. } => source,
+        }
+    }
+}
+
+impl From<StoreError> for ReissuePendingMetadataCommandFailure {
+    fn from(source: StoreError) -> Self {
+        Self::DefinitelyNotReissued(source.into())
+    }
+}
+
+impl From<MetadataError> for ReissuePendingMetadataCommandFailure {
+    fn from(source: MetadataError) -> Self {
+        Self::DefinitelyNotReissued(source.into())
+    }
+}
+
+impl From<BucketSnapshotLoadError> for ReissuePendingMetadataCommandFailure {
+    fn from(source: BucketSnapshotLoadError) -> Self {
+        Self::DefinitelyNotReissued(source)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MetadataCommandPublicationState {
     NotPublished,

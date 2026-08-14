@@ -2287,6 +2287,50 @@ impl BucketWriteReservationRoute for LocalBucketWriteReservationRoute<'_> {
             .validate_bucket_write_reservation_proof(self.pg_id, proof)
     }
 
+    fn validate_bucket_write_reservation_proof_until(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_bucket_subject(&proof.bucket, "validate bucket write reservation proof")?;
+        require_metadata_command_operation_deadline(deadline)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &proof.bucket,
+            &proof.reservation_id,
+        )?
+        else {
+            return Err(MetadataError::BucketWriteReservationNotFound {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into());
+        };
+        if !proof.matches_record(&record)
+            || record.lease_deadline <= crate::clock::current_time_millis()
+        {
+            return Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into());
+        }
+        let current_bucket = PgMetadataStore::head_bucket_raw(&*pg, &proof.bucket)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        if current_bucket.state == BucketState::Active
+            && current_bucket.bucket_incarnation_generation == proof.bucket_incarnation_generation
+        {
+            Ok(())
+        } else {
+            Err(MetadataError::BucketWriteReservationConflict {
+                reservation_id: proof.reservation_id.clone(),
+            }
+            .into())
+        }
+    }
+
     fn begin_durable_bucket_write_drain(
         &self,
         drain_id: &str,
@@ -5868,6 +5912,18 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         MetadataCommandNodeClient::max_metadata_command_log_index(self, pg_id, cluster_epoch)
     }
 
+    fn max_metadata_command_log_index_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<u64, StoreError> {
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let max = pg.max_metadata_command_log_index(cluster_epoch)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(max)
+    }
+
     fn pending_metadata_command_envelope(
         &self,
         pg_id: PgId,
@@ -5881,6 +5937,18 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         pg_id: PgId,
     ) -> Result<MetadataCommandReplicaState, StoreError> {
         MetadataCommandNodeClient::metadata_command_replica_state(self, pg_id)
+    }
+
+    fn metadata_command_replica_state_until(
+        &self,
+        pg_id: PgId,
+        deadline: Instant,
+    ) -> Result<MetadataCommandReplicaState, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let state = pg.metadata_command_replica_state()?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(state)
     }
 
     fn metadata_command_checkpoint(
@@ -6363,6 +6431,16 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
         )
     }
 
+    fn max_metadata_command_log_index_until(&self, deadline: Instant) -> Result<u64, StoreError> {
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let max = pg.max_metadata_command_log_index(self.cluster_epoch)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(max)
+    }
+
     fn pending_metadata_command_envelope(
         &self,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
@@ -6371,6 +6449,20 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
             self.pg_id,
             self.cluster_epoch,
         )
+    }
+
+    fn pending_metadata_command_envelope_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let pending =
+            pg.pending_metadata_command_envelope(self.client.node_id.as_u32(), self.cluster_epoch)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(pending)
     }
 
     fn metadata_command_acceptance(
@@ -6468,16 +6560,61 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
-        self.validate_command_route(previous)?;
-        self.validate_command_route(replacement)?;
-        let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
-        pg.replace_pending_metadata_command_slot_for_reissue(
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        let deadline = Instant::now()
+            .checked_add(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT)
+            .ok_or_else(|| {
+                MetadataCommandPendingSlotReplaceError::not_sent(
+                    crate::node_client::storage_rpc_deadline_expired(
+                        "set local metadata command pending slot replace deadline",
+                    ),
+                )
+            })?;
+        self.replace_pending_metadata_command_slot_for_reissue_until(
+            previous,
+            replacement,
+            bucket,
+            deadline,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_reissue_until(
+        &self,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        self.validate_command_route(previous)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        self.validate_command_route(replacement)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        let result = pg.replace_pending_metadata_command_slot_for_reissue(
             self.client.node_id.as_u32(),
             previous,
             replacement,
             bucket,
-        )
+        );
+        if Instant::now() >= deadline {
+            return Err(MetadataCommandPendingSlotReplaceError::may_have_applied(
+                crate::node_client::storage_rpc_deadline_expired(
+                    "local metadata command pending slot replace deadline expired",
+                ),
+            ));
+        }
+        result.map_err(|error| match error {
+            crate::pg_store::PendingMetadataCommandSlotReplaceError::Definitive(source) => {
+                MetadataCommandPendingSlotReplaceError::definitive(source)
+            }
+            crate::pg_store::PendingMetadataCommandSlotReplaceError::MayHaveApplied(source) => {
+                MetadataCommandPendingSlotReplaceError::may_have_applied(source)
+            }
+        })
     }
 
     fn replace_pending_metadata_command_slot_for_recovery(
@@ -6487,14 +6624,38 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
-        self.validate_command_route(authorized_source)?;
-        self.validate_optional_command_route(abandoned_source)?;
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        self.validate_command_route(authorized_source)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        self.validate_optional_command_route(abandoned_source)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
         MetadataCommandRecoveryCriticalSection::replace_pending_metadata_command_slot_for_reissue(
             self,
             previous,
             replacement,
             bucket,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_recovery_until(
+        &self,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        self.validate_command_route(authorized_source)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        self.validate_optional_command_route(abandoned_source)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        MetadataCommandRecoveryCriticalSection::replace_pending_metadata_command_slot_for_reissue_until(
+            self,
+            previous,
+            replacement,
+            bucket,
+            deadline,
         )
     }
 

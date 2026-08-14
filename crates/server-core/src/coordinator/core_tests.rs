@@ -12517,10 +12517,10 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap();
-    let hook_guard = storage_cluster.test_install_object_metadata_command_log_conflict_once(
+    let hook_guard = storage_cluster.test_install_object_metadata_command_log_conflict(
         &bucket,
         &key,
-        MetadataCommandApplyTestKind::AppendStreamSegment,
+        MetadataCommandApplyTestKind::CommitDirectPutObject,
     );
     let retained_abort_guard =
         storage_cluster.test_fail_retained_stream_abort_with_contention_for_attempts(2);
@@ -12547,7 +12547,7 @@ fn copy_object_failure_retries_destination_stream_abort_cleanup() {
         .unwrap_err();
     assert!(
         matches!(err, ServerError::SlowDown),
-        "expected CopyObject append conflict to map to SlowDown, got {err:?}"
+        "expected CopyObject destination finalize contention to map to SlowDown, got {err:?}"
     );
     drop(hook_guard);
     assert_eq!(

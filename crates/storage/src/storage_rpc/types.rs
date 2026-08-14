@@ -212,6 +212,7 @@ pub(crate) enum StorageRpcWireErrorCode {
     TransportClosed = 24,
     MultipartConditionalRequestConflict = 25,
     MetadataCommandIntegrity = 26,
+    MetadataCommandMutationUncertain = 27,
 }
 
 pub(crate) type StorageRpcErrorCode = StorageNodeFailure;
@@ -256,6 +257,8 @@ impl StorageNodeFailure {
         Self(StorageRpcWireErrorCode::MultipartConditionalRequestConflict);
     pub(crate) const MetadataCommandIntegrity: Self =
         Self(StorageRpcWireErrorCode::MetadataCommandIntegrity);
+    pub(crate) const MetadataCommandMutationUncertain: Self =
+        Self(StorageRpcWireErrorCode::MetadataCommandMutationUncertain);
 
     fn from_u16(value: u16) -> Result<Self, StorageRpcPayloadError> {
         match value {
@@ -285,6 +288,7 @@ impl StorageNodeFailure {
             24 => Ok(Self::TransportClosed),
             25 => Ok(Self::MultipartConditionalRequestConflict),
             26 => Ok(Self::MetadataCommandIntegrity),
+            27 => Ok(Self::MetadataCommandMutationUncertain),
             _ => Err(StorageRpcPayloadError::InvalidResponseEnvelope(
                 "unknown storage RPC error code",
             )),
@@ -1547,8 +1551,14 @@ pub(crate) struct StorageRpcStreamPartFinalizeSnapshotRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcStreamPartFinalizeSnapshotOutcome {
+    Loaded(Box<StreamUploadPartStorageSnapshot>),
+    NoSuchUpload { upload_id: UploadId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcStreamPartFinalizeSnapshotResponse {
-    pub(crate) snapshot: StreamUploadPartStorageSnapshot,
+    pub(crate) outcome: StorageRpcStreamPartFinalizeSnapshotOutcome,
 }
 
 #[derive(Debug, Clone)]
@@ -2297,6 +2307,28 @@ pub(crate) struct StorageRpcMetadataCommandPendingSlotInsertResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StorageRpcMetadataCommandPendingSlotRemoveResponse {
     pub(crate) removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StorageRpcMetadataCommandPendingSlotCleanupOutcome {
+    Value(bool),
+    TerminalEntryPending {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+    LogConflict {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StorageRpcMetadataCommandPendingSlotCleanupResponse {
+    pub(crate) outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

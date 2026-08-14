@@ -3057,7 +3057,7 @@ impl PgStore {
             command.id().log_index(),
         )?
         else {
-            return Err(StoreError::MetadataCommandLogConflict {
+            return Err(StoreError::MetadataCommandTerminalEntryPending {
                 node_id,
                 pg_id: self.pg_id,
                 cluster_epoch: command.id().cluster_epoch(),
@@ -3082,45 +3082,58 @@ impl PgStore {
         expected: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, PendingMetadataCommandSlotReplaceError> {
         if expected.id().pg_id().get() != self.pg_id {
-            return Err(StoreError::MetadataCommandWrongPg {
-                node_id,
-                command_pg_id: expected.id().pg_id().get(),
-                target_pg_id: self.pg_id,
-                cluster_epoch: expected.id().cluster_epoch(),
-            });
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::MetadataCommandWrongPg {
+                    node_id,
+                    command_pg_id: expected.id().pg_id().get(),
+                    target_pg_id: self.pg_id,
+                    cluster_epoch: expected.id().cluster_epoch(),
+                },
+            ));
         }
         if replacement.id().pg_id().get() != self.pg_id {
-            return Err(StoreError::MetadataCommandWrongPg {
-                node_id,
-                command_pg_id: replacement.id().pg_id().get(),
-                target_pg_id: self.pg_id,
-                cluster_epoch: replacement.id().cluster_epoch(),
-            });
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::MetadataCommandWrongPg {
+                    node_id,
+                    command_pg_id: replacement.id().pg_id().get(),
+                    target_pg_id: self.pg_id,
+                    cluster_epoch: replacement.id().cluster_epoch(),
+                },
+            ));
         }
-        let durable_log_tip = self.max_metadata_command_log_index(expected.id().cluster_epoch())?;
+        let durable_log_tip = self
+            .max_metadata_command_log_index(expected.id().cluster_epoch())
+            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
         let expected_replacement_index = durable_log_tip
             .max(expected.id().log_index().get())
             .checked_add(1)
-            .ok_or(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch: expected.id().cluster_epoch(),
-                log_index: u64::MAX,
+            .ok_or_else(|| {
+                PendingMetadataCommandSlotReplaceError::definitive(
+                    StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: self.pg_id,
+                        cluster_epoch: expected.id().cluster_epoch(),
+                        log_index: u64::MAX,
+                    },
+                )
             })?;
         if replacement.id().cluster_epoch() != expected.id().cluster_epoch()
             || replacement.id().log_index().get() != expected_replacement_index
         {
-            return Err(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id: self.pg_id,
-                cluster_epoch: expected.id().cluster_epoch(),
-                log_index: replacement.id().log_index().get(),
-            });
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id: self.pg_id,
+                    cluster_epoch: expected.id().cluster_epoch(),
+                    log_index: replacement.id().log_index().get(),
+                },
+            ));
         }
-        let Some(slot) =
-            self.pending_metadata_command_slot(node_id, expected.id().cluster_epoch())?
+        let Some(slot) = self
+            .pending_metadata_command_slot(node_id, expected.id().cluster_epoch())
+            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?
         else {
             return Ok(false);
         };
@@ -3141,11 +3154,13 @@ impl PgStore {
         }
         let expected_bytes = expected.command_bytes();
         let replacement_bytes = replacement.command_bytes();
-        let (reference_count, pages) =
-            self.encode_pending_placed_segment_reference_pages(replacement)?;
-        self.with_pending_slot_transaction(|| {
-            let updated = self.execute_cached(
-                "UPDATE metadata_command_pending_slot \
+        let (reference_count, pages) = self
+            .encode_pending_placed_segment_reference_pages(replacement)
+            .map_err(PendingMetadataCommandSlotReplaceError::definitive)?;
+        let replaced = self
+            .with_pending_slot_transaction(|| {
+                let updated = self.execute_cached(
+                    "UPDATE metadata_command_pending_slot \
                  SET cluster_epoch = ?1, pg_id = ?2, log_index = ?3, \
                      command_checksum = ?4, command_bytes = ?5, \
                      publication_started = 0, \
@@ -3156,27 +3171,44 @@ impl PgStore {
                    AND log_index = ?10 \
                    AND command_checksum = ?11 \
                    AND command_bytes = ?12",
-                params![
-                    replacement.id().cluster_epoch().get() as i64,
-                    replacement.id().pg_id().get() as i64,
-                    replacement.id().log_index().get() as i64,
-                    replacement.checksum_crc64() as i64,
-                    replacement_bytes,
-                    reference_count as i64,
-                    scope_bucket.map(BucketName::as_str),
-                    expected.id().cluster_epoch().get() as i64,
-                    expected.id().pg_id().get() as i64,
-                    expected.id().log_index().get() as i64,
-                    expected.checksum_crc64() as i64,
-                    expected_bytes,
-                ],
-                "replace metadata command pending slot for reissue",
-            )?;
-            if updated == 1 {
-                self.replace_pending_placed_reference_pages(reference_count, &pages)?;
-            }
-            Ok(updated == 1)
-        })
+                    params![
+                        replacement.id().cluster_epoch().get() as i64,
+                        replacement.id().pg_id().get() as i64,
+                        replacement.id().log_index().get() as i64,
+                        replacement.checksum_crc64() as i64,
+                        replacement_bytes,
+                        reference_count as i64,
+                        scope_bucket.map(BucketName::as_str),
+                        expected.id().cluster_epoch().get() as i64,
+                        expected.id().pg_id().get() as i64,
+                        expected.id().log_index().get() as i64,
+                        expected.checksum_crc64() as i64,
+                        expected_bytes,
+                    ],
+                    "replace metadata command pending slot for reissue",
+                )?;
+                if updated == 1 {
+                    self.replace_pending_placed_reference_pages(reference_count, &pages)?;
+                }
+                Ok(updated == 1)
+            })
+            .map_err(PendingMetadataCommandSlotReplaceError::may_have_applied)?;
+        #[cfg(test)]
+        if replaced
+            && self
+                .fail_next_pending_slot_replace_after_commit
+                .swap(false, Ordering::Relaxed)
+        {
+            return Err(PendingMetadataCommandSlotReplaceError::may_have_applied(
+                StoreError::Io {
+                    context: "injected pending metadata command slot replacement response failure",
+                    source: std::io::Error::other(
+                        "injected failure after pending slot replacement commit",
+                    ),
+                },
+            ));
+        }
+        Ok(replaced)
     }
 
     pub(crate) fn validate_metadata_command_replay_state(

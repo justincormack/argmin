@@ -4133,6 +4133,146 @@ fn insert_delete_marker_abandons_fresh_reissue_before_returning_contention() {
 }
 
 #[test]
+fn insert_delete_marker_reissue_pg_lock_timeout_is_not_retryable_while_source_is_pending() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(object_pg);
+    let stale_log_index = map.test_next_metadata_command_log_index(pg_id);
+    let occupant_bucket = bucket_for_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        object_pg,
+        "marker-reissue-timeout-occupant-",
+    );
+    let occupant = create_bucket_metadata_command(pg_id, stale_log_index.get(), occupant_bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &occupant)
+        .unwrap();
+
+    let proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::INSERT_DELETE_MARKER_BUCKET_WRITE_OPERATION_KIND,
+        Some(key.as_str()),
+    );
+    let write_sequence = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .next_object_write_sequence(bucket.as_str(), key.as_str())
+        .unwrap();
+    let stale = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(ClusterEpoch::INITIAL, pg_id, stale_log_index),
+        MetadataCommandPayload::InsertDeleteMarker(InsertDeleteMarkerCommand {
+            bucket_write_reservation: proof,
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: crate::VersionId::Null,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            write_sequence,
+            last_modified_millis: crate::clock::current_time_millis(),
+            stale_payload: None,
+        }),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &stale);
+
+    let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("reissue hook must start the PG-lock holder");
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+        locked_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test must release the reissue PG lock");
+    });
+    let hook_command_id = stale.id();
+    let hook_once = Arc::new(AtomicBool::new(true));
+    let hook_once_for_reissue = Arc::clone(&hook_once);
+    let locked_rx = Arc::new(Mutex::new(locked_rx));
+    let locked_rx_for_reissue = Arc::clone(&locked_rx);
+    let _hook = cluster.test_install_before_object_metadata_command_reissue_hook(Arc::new(
+        move |command| {
+            if command.id() == hook_command_id
+                && hook_once_for_reissue.swap(false, Ordering::SeqCst)
+            {
+                start_tx.send(()).unwrap();
+                locked_rx_for_reissue
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("PG-lock holder must acquire the lock before reissue");
+            }
+        },
+    ));
+    let error = cluster
+        .test_apply_new_object_metadata_command_for_bucket_with_budget(
+            pg_id,
+            &bucket,
+            &stale,
+            Duration::from_millis(25),
+        )
+        .expect_err("a pre-reissue deadline must retain non-retryable source uncertainty");
+    release_tx.send(()).unwrap();
+    holder.join().expect("PG-lock holder must not panic");
+
+    assert!(!hook_once.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: error_pg_id,
+                log_index,
+                ..
+            }
+        ) if error_pg_id == object_pg && log_index == stale_log_index.get()
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(stale.clone())
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(!pg
+            .metadata_command_abandoned(node_id.as_u32(), &stale)
+            .unwrap());
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+}
+
+#[test]
 fn delete_current_object_retries_local_command_contention_before_publication() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

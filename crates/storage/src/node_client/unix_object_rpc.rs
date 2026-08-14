@@ -3626,10 +3626,10 @@ impl MultipartCompletionMutationMetadataRoute for UnixMultipartCompletionMutatio
             },
         )? {
             Some(command) => Ok(command),
-            None => Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
-                "decode complete multipart command build response",
-                "complete multipart command build cannot return missing".to_string(),
-            ))),
+            None => Err(MetadataError::NoSuchUpload {
+                upload_id: request.request.upload_id.to_string(),
+            }
+            .into()),
         }
     }
 }
@@ -4811,16 +4811,34 @@ impl StreamPartFinalizationMetadataRoute for UnixStreamPartFinalizationMetadataR
                     error.to_string(),
                 ))
             })?;
-        self.client
-            .validate_stream_part_finalize_snapshot_response(
-                &response.snapshot,
-                &self.bucket,
-                &self.key,
-                &self.upload_id,
-                &self.session_id,
-                self.part_number,
-            )?;
-        Ok(response.snapshot)
+        match response.outcome {
+            StorageRpcStreamPartFinalizeSnapshotOutcome::Loaded(snapshot) => {
+                self.client
+                    .validate_stream_part_finalize_snapshot_response(
+                        &snapshot,
+                        &self.bucket,
+                        &self.key,
+                        &self.upload_id,
+                        &self.session_id,
+                        self.part_number,
+                    )?;
+                Ok(*snapshot)
+            }
+            StorageRpcStreamPartFinalizeSnapshotOutcome::NoSuchUpload {
+                upload_id: returned_upload_id,
+            } => {
+                if returned_upload_id != self.upload_id {
+                    return Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
+                        "validate stream part finalize snapshot response",
+                        "missing upload id does not match request".to_string(),
+                    )));
+                }
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: self.upload_id.to_string(),
+                }
+                .into())
+            }
+        }
     }
 
     fn build_commit_command(
@@ -4898,10 +4916,10 @@ impl StreamPartFinalizationMetadataRoute for UnixStreamPartFinalizationMetadataR
                 Err(ObjectPgActionError::StaleStreamFinalizeSnapshot)
             }
             StorageRpcObjectMetadataCommandBuildOutcome::Missing => {
-                Err(ObjectPgActionError::Store(self.client.rpc_payload_error(
-                    "decode stream part commit command build response",
-                    "stream part commit command build cannot return missing".to_string(),
-                )))
+                Err(MetadataError::NoSuchUpload {
+                    upload_id: self.upload_id.to_string(),
+                }
+                .into())
             }
             StorageRpcObjectMetadataCommandBuildOutcome::LogConflict {
                 node_id,

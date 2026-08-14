@@ -2906,6 +2906,160 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
     }
 }
 
+fn assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+    mark_publication_started: bool,
+    injected_action: crate::cluster::request_ops::StreamPutPendingDrainTestAction,
+) {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map =
+        Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap());
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "stream-finalize-drain-retry-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::tests::stream_session_id("final-drain");
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+
+    let pg_id = PgId::new(2);
+    let unrelated = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReleaseObjectGeneration(ReleaseObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::tests::stream_session_id("unrelated-gen"),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &unrelated);
+    if mark_publication_started {
+        let primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+            .unwrap();
+        primary
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .mark_pending_metadata_command_publication_started(
+                primary.node_id().as_u32(),
+                &unrelated,
+            )
+            .unwrap();
+    }
+    let owner = match map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &unrelated)
+    {
+        crate::cluster::MetadataCommandRecoveryAdmission::Leader(owner) => owner,
+        _ => panic!("test must acquire the initial unrelated-command recovery flight"),
+    };
+    let owner = Arc::new(Mutex::new(Some(owner)));
+    let owner_for_hook = Arc::clone(&owner);
+    let injected = Arc::new(AtomicBool::new(false));
+    let injected_for_hook = Arc::clone(&injected);
+    let hook = cluster.test_install_stream_put_pending_drain_hook(Arc::new(move |event| {
+        if event == crate::cluster::request_ops::StreamPutPendingDrainTestEvent::Initial
+            && !injected_for_hook.swap(true, Ordering::SeqCst)
+        {
+            if matches!(
+                injected_action,
+                crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
+                    | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
+            ) {
+                drop(owner_for_hook.lock().unwrap().take());
+            }
+            injected_action
+        } else {
+            crate::cluster::request_ops::StreamPutPendingDrainTestAction::Continue
+        }
+    }));
+
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let result = cluster.finalize_put_object_stream(&bucket, &key, &session_id, 0, |_| {
+        action_calls.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, ()>(crate::PreparedStreamPutCommit {
+            value: (),
+            versioning: crate::BucketVersioningState::Disabled,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            etag_crc64: checksum::crc64::checksum(&[]),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+        })
+    });
+    drop(hook);
+    assert!(injected.load(Ordering::SeqCst));
+    match injected_action {
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
+        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure => {
+            result
+                .expect("transient unrelated-command drain failure must be retried")
+                .expect("stream PUT preparation should succeed");
+            assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+            assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+            assert_bucket_write_reservations_released(&map, &bucket);
+        }
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget => {
+            let error = result.expect_err("expired outer drain budget must stop finalization");
+            assert!(matches!(
+                error,
+                crate::ObjectPgActionError::Store(ref source)
+                    if source.operation_failure_class()
+                        == crate::StoreOperationFailureClass::MetadataCommandContention
+            ));
+            assert_eq!(action_calls.load(Ordering::SeqCst), 0);
+        }
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::Continue => {
+            unreachable!("test helper requires an injected stream drain action")
+        }
+    }
+}
+
+#[test]
+fn stream_put_finalize_retries_transient_unrelated_pending_drain_failure() {
+    assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+        false,
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure,
+    );
+}
+
+#[test]
+fn stream_put_finalize_retries_publication_started_pending_drain_failure() {
+    assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+        true,
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure,
+    );
+}
+
+#[test]
+fn stream_put_finalize_initial_pending_drain_honors_outer_budget() {
+    assert_stream_put_finalize_retries_transient_unrelated_pending_drain_failure(
+        false,
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget,
+    );
+}
+
 #[test]
 fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preserves_staging() {
     let tmp = test_util::tempdir();
@@ -4630,6 +4784,114 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
 }
 
 #[test]
+fn stream_put_finalize_converges_after_zero_apply_exact_witness_conflict() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let session_id = crate::SessionId::try_from("77".repeat(16)).unwrap();
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let conflict_once = Arc::new(AtomicBool::new(true));
+    let conflict_once_for_hook = Arc::clone(&conflict_once);
+    let hook_map = Arc::clone(&map);
+    let hook_session_id = session_id.clone();
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if node_id == NodeId::new(0)
+                && matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.generation_reservation_id == hook_session_id
+                )
+                && conflict_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1_100));
+                let pg = hook_map
+                    .node(node_id)
+                    .unwrap()
+                    .storage_node()
+                    .get_pg(command.id().pg_id().get())?;
+                pg.apply_metadata_command_and_record(node_id.as_u32(), command)
+                    .map_err(|error| match error {
+                        crate::BucketSnapshotLoadError::Store(error) => error,
+                        crate::BucketSnapshotLoadError::Metadata(error) => {
+                            panic!("manual stream commit apply failed: {error}")
+                        }
+                    })?;
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id: node_id.as_u32(),
+                    pg_id: command.id().pg_id().get(),
+                    cluster_epoch: command.id().cluster_epoch(),
+                    log_index: command.id().log_index().get(),
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let outcome = cluster
+        .finalize_put_object_stream(&bucket, &key, &session_id, 0, |_| {
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: "published",
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: checksum::crc64::checksum(&[]),
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
+        .unwrap()
+        .unwrap();
+    drop(hook_guard);
+
+    assert_eq!(outcome.value, "published");
+    assert!(
+        !conflict_once.load(Ordering::SeqCst),
+        "stream finalization must exercise the zero-apply exact witness conflict"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).unwrap();
+        assert_eq!(stored.as_live().unwrap().size, 0);
+    }
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -6005,11 +6267,11 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
     assert!(
         matches!(
             err,
-            crate::ObjectPgActionError::Metadata(
-                crate::MetadataError::StreamSessionNotFound { .. }
-            )
+            crate::ObjectPgActionError::Metadata(crate::MetadataError::NoSuchUpload {
+                upload_id: ref missing
+            }) if missing == upload_id.as_str()
         ),
-        "expected finalize to reload after abort removed the session, got {err:?}"
+        "expected finalize to reload after abort removed the upload, got {err:?}"
     );
     assert!(hook_ran.load(Ordering::SeqCst));
     assert_eq!(action_calls.load(Ordering::SeqCst), 1);
@@ -6302,11 +6564,11 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
     assert!(
         matches!(
             err,
-            crate::ObjectPgActionError::Metadata(
-                crate::MetadataError::StreamSessionNotFound { .. }
-            )
+            crate::ObjectPgActionError::Metadata(crate::MetadataError::NoSuchUpload {
+                upload_id: ref missing
+            }) if missing == req.upload_id.as_str()
         ),
-        "expected finalize to reload after complete removed the session, got {err:?}"
+        "expected finalize to reload after complete removed the upload, got {err:?}"
     );
     assert!(hook_ran.load(Ordering::SeqCst));
     assert_eq!(action_calls.load(Ordering::SeqCst), 1);

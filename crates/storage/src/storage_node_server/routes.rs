@@ -16,6 +16,8 @@ struct StorageNodeConnectionHandler {
     #[cfg(test)]
     response_envelope_test_hook: Arc<Mutex<Option<StorageRpcResponseEnvelopeTestHook>>>,
     #[cfg(test)]
+    response_frame_test_hook: Arc<Mutex<Option<StorageRpcResponseFrameTestHook>>>,
+    #[cfg(test)]
     metadata_command_before_commit_test_hook:
         Arc<Mutex<Option<MetadataCommandBeforeCommitTestHook>>>,
 }

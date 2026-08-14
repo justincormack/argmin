@@ -90,11 +90,11 @@ impl UnixStorageNodeClient {
         deadline: Instant,
     ) -> Result<BoxStorageRpcStream, StoreError> {
         if Instant::now() >= deadline {
-            return Err(storage_rpc_deadline_expired(context));
+            return Err(storage_rpc_endpoint_deadline_expired(self.node_id, context));
         }
         self.endpoint
-            .connect(deadline)
-            .map_err(|source| StoreError::Io { context, source })
+            .connect_classified(deadline)
+            .map_err(|failure| storage_rpc_endpoint_connect_error(self.node_id, context, failure))
     }
 
     #[cfg(test)]
@@ -623,19 +623,27 @@ impl UnixStorageNodeMetadataCommandSession {
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,
     ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StoreError> {
+        self.rpc_request_result_classified(kind, payload)
+            .map_err(StorageRpcRequestDispatchFailure::into_source)
+    }
+
+    fn rpc_request_result_classified(
+        &self,
+        kind: StorageRpcMessageKind,
+        payload: Vec<u8>,
+    ) -> Result<Result<Vec<u8>, StorageRpcErrorResponse>, StorageRpcRequestDispatchFailure> {
         let io_timeout = self
             .inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .io_timeout;
         let deadline = Instant::now().checked_add(io_timeout).ok_or_else(|| {
-            self.rpc_payload_error(
+            StorageRpcRequestDispatchFailure::NotSent(self.rpc_payload_error(
                 "set metadata command session RPC deadline",
                 "storage-node metadata command session RPC deadline overflowed".to_string(),
-            )
+            ))
         })?;
         self.rpc_request_result_until(kind, payload, deadline)
-            .map_err(StorageRpcRequestDispatchFailure::into_source)
     }
 
     fn rpc_request_result_until(
@@ -1040,6 +1048,23 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
         )
     }
 
+    fn max_metadata_command_log_index_until(&self, deadline: Instant) -> Result<u64, StoreError> {
+        let payload = self.encode_metadata_command_state_request(self.metadata_command_pg_id());
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandMaxLogIndex,
+            payload,
+            deadline,
+        )?;
+        decode_metadata_command_max_log_index_response(&response)
+            .map(|response| response.max_log_index)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command max log index response",
+                    error.to_string(),
+                )
+            })
+    }
+
     fn pending_metadata_command_envelope(
         &self,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
@@ -1048,6 +1073,38 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
             self.metadata_command_pg_id(),
             self.cluster_epoch,
         )
+    }
+
+    fn pending_metadata_command_envelope_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let pg_id = self.metadata_command_pg_id();
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            payload,
+            deadline,
+        )?;
+        let response = decode_metadata_command_pending_envelope_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command pending envelope response",
+                error.to_string(),
+            )
+        })?;
+        if let Some(command) = response.command.as_ref() {
+            if command.id().cluster_epoch() != self.cluster_epoch || command.id().pg_id() != pg_id {
+                return Err(self.rpc_payload_error(
+                    "decode metadata command pending envelope response",
+                    "metadata command pending envelope route mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(response.command)
     }
 
     fn metadata_command_acceptance(
@@ -1127,7 +1184,35 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        let deadline = Instant::now()
+            .checked_add(
+                self.inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .io_timeout,
+            )
+            .ok_or_else(|| {
+                MetadataCommandPendingSlotReplaceError::not_sent(self.rpc_payload_error(
+                    "set metadata command pending slot replace deadline",
+                    "metadata command pending slot replace deadline overflowed".to_string(),
+                ))
+            })?;
+        self.replace_pending_metadata_command_slot_for_reissue_until(
+            previous,
+            replacement,
+            bucket,
+            deadline,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_reissue_until(
+        &self,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
         let pg_id = self.metadata_command_pg_id();
         let request = StorageRpcMetadataCommandPendingSlotReplaceRequest {
             node_id: self.node_id,
@@ -1139,22 +1224,34 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
         };
         let payload =
             encode_metadata_command_pending_slot_replace_request(&request).map_err(|error| {
-                self.rpc_payload_error(
+                MetadataCommandPendingSlotReplaceError::not_sent(self.rpc_payload_error(
                     "encode metadata command pending slot replace request",
                     error.to_string(),
-                )
+                ))
             })?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandPendingSlotReplace,
-            payload,
-        )?;
+        let kind = StorageRpcMessageKind::MetadataCommandPendingSlotReplace;
+        let response = match self.rpc_request_result_until(kind, payload, deadline) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let uncertain = error.code == StorageRpcErrorCode::MetadataCommandMutationUncertain;
+                let source = self.rpc_response_error(kind, error);
+                return Err(if uncertain {
+                    MetadataCommandPendingSlotReplaceError::may_have_applied(source)
+                } else {
+                    MetadataCommandPendingSlotReplaceError::definitive(source)
+                });
+            }
+            Err(error) => {
+                return Err(error.into_metadata_command_pending_slot_replace_error());
+            }
+        };
         decode_metadata_command_pending_slot_remove_response(&response)
             .map(|response| response.removed)
             .map_err(|error| {
-                self.rpc_payload_error(
+                MetadataCommandPendingSlotReplaceError::may_have_applied(self.rpc_payload_error(
                     "decode metadata command pending slot replace response",
                     error.to_string(),
-                )
+                ))
             })
     }
 
@@ -1165,7 +1262,42 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError> {
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        let deadline = Instant::now()
+            .checked_add(
+                self.inner
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .io_timeout,
+            )
+            .ok_or_else(|| {
+                MetadataCommandPendingSlotReplaceError::not_sent(
+                    self.rpc_payload_error(
+                        "set metadata command recovery pending slot replace deadline",
+                        "metadata command recovery pending slot replace deadline overflowed"
+                            .to_string(),
+                    ),
+                )
+            })?;
+        self.replace_pending_metadata_command_slot_for_recovery_until(
+            authorized_source,
+            abandoned_source,
+            previous,
+            replacement,
+            bucket,
+            deadline,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_recovery_until(
+        &self,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
         let pg_id = self.metadata_command_pg_id();
         let request = StorageRpcMetadataCommandRecoveryPendingSlotReplaceRequest {
             node_id: self.node_id,
@@ -1179,22 +1311,34 @@ impl MetadataCommandRecoveryCriticalSection for UnixStorageNodeMetadataCommandSe
         };
         let payload = encode_metadata_command_recovery_pending_slot_replace_request(&request)
             .map_err(|error| {
-                self.rpc_payload_error(
+                MetadataCommandPendingSlotReplaceError::not_sent(self.rpc_payload_error(
                     "encode metadata command recovery pending slot replace request",
                     error.to_string(),
-                )
+                ))
             })?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace,
-            payload,
-        )?;
+        let kind = StorageRpcMessageKind::MetadataCommandRecoveryPendingSlotReplace;
+        let response = match self.rpc_request_result_until(kind, payload, deadline) {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let uncertain = error.code == StorageRpcErrorCode::MetadataCommandMutationUncertain;
+                let source = self.rpc_response_error(kind, error);
+                return Err(if uncertain {
+                    MetadataCommandPendingSlotReplaceError::may_have_applied(source)
+                } else {
+                    MetadataCommandPendingSlotReplaceError::definitive(source)
+                });
+            }
+            Err(error) => {
+                return Err(error.into_metadata_command_pending_slot_replace_error());
+            }
+        };
         decode_metadata_command_pending_slot_remove_response(&response)
             .map(|response| response.removed)
             .map_err(|error| {
-                self.rpc_payload_error(
+                MetadataCommandPendingSlotReplaceError::may_have_applied(self.rpc_payload_error(
                     "decode metadata command recovery pending slot replace response",
                     error.to_string(),
-                )
+                ))
             })
     }
 
@@ -1668,14 +1812,54 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
             payload,
         )?;
-        decode_metadata_command_pending_slot_remove_response(&response)
-            .map(|response| response.removed)
-            .map_err(|error| {
+        let response =
+            decode_metadata_command_pending_slot_cleanup_response(&response).map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command pending slot remove response",
                     error.to_string(),
                 )
-            })
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(removed) => Ok(removed),
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+                node_id,
+                pg_id: pending_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_terminal_entry_pending_error(
+                self.node_id,
+                command.id().cluster_epoch(),
+                pg_id,
+                command.id().log_index(),
+                "decode metadata command pending slot remove response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: pending_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_terminal_log_conflict_error(
+                self.node_id,
+                command.id().cluster_epoch(),
+                pg_id,
+                command.id().log_index(),
+                "decode metadata command pending slot remove response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
     }
 
     fn metadata_command_replica_state(

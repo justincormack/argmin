@@ -57,6 +57,22 @@ use crate::node_runtime::MetadataCommandDecodeAuthority;
 use crate::types::*;
 use placement::NodeId;
 
+#[derive(Debug)]
+pub(crate) enum PendingMetadataCommandSlotReplaceError {
+    Definitive(StoreError),
+    MayHaveApplied(StoreError),
+}
+
+impl PendingMetadataCommandSlotReplaceError {
+    pub(crate) fn definitive(source: StoreError) -> Self {
+        Self::Definitive(source)
+    }
+
+    pub(crate) fn may_have_applied(source: StoreError) -> Self {
+        Self::MayHaveApplied(source)
+    }
+}
+
 /// Unforgeable authority for restoring or producing PG-owned metadata proof
 /// carriers from the durable implementation representation.
 pub(crate) struct MetadataProofStorageIssuer(());
@@ -656,6 +672,8 @@ pub struct PgStore {
     #[cfg(test)]
     fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     before_object_payload_reclaim_claim_effect_check:
         std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
     #[cfg(test)]
@@ -863,6 +881,8 @@ pub(crate) fn inspect_pg_shard_inventory(
         clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
         #[cfg(test)]
         fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
         before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
         #[cfg(test)]
@@ -1114,6 +1134,8 @@ impl PgStore {
             clean_metadata_digest_revision: AtomicU64::new(UNCLEAN_METADATA_DIGEST_REVISION),
             #[cfg(test)]
             fail_next_metadata_txn_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_pending_slot_replace_after_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             before_object_payload_reclaim_claim_effect_check: std::sync::Mutex::new(None),
             #[cfg(test)]

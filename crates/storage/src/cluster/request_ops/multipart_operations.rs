@@ -1,6 +1,20 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+fn inconclusive_multipart_apply_failure_requires_uncertainty(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    if matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict { .. })
+    ) || metadata_command_probe_error_is_fatal_integrity(error)
+    {
+        return false;
+    }
+    metadata_command_apply_error_can_handoff_to_recovery(error)
+        || metadata_command_apply_error_requires_exact_confirmation(error)
+}
+
 impl super::StorageCluster {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_put_object_stream_session<T, E>(
@@ -426,7 +440,41 @@ impl super::StorageCluster {
                         if commit.matches_stream_session(bucket, key, session_id)
                 );
                 if !is_matching_stream_commit {
-                    self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+                    #[cfg(test)]
+                    let drain = match maybe_run_stream_put_pending_drain_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        StreamPutPendingDrainTestEvent::Initial,
+                        &mut pending_work_budget,
+                    ) {
+                        Ok(()) => self.drain_pending_object_metadata_command_with_work_budget(
+                            publisher,
+                            pg_id,
+                            &command,
+                            &mut pending_work_budget,
+                        ),
+                        Err(error) => Err(error),
+                    };
+                    #[cfg(not(test))]
+                    let drain = self.drain_pending_object_metadata_command_with_work_budget(
+                        publisher,
+                        pg_id,
+                        &command,
+                        &mut pending_work_budget,
+                    );
+                    match drain {
+                        Ok(_) => {}
+                        Err(error)
+                            if Self::stream_put_pending_drain_error_is_retryable(&error) =>
+                        {
+                            pending_work_budget
+                                .sleep_after_contention(
+                                    "stream PUT finalization pending drain retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error),
+                    }
                     pending_work_budget
                         .sleep_after_contention(
                             "stream PUT finalization pending drain retry budget exhausted",
@@ -545,9 +593,50 @@ impl super::StorageCluster {
                         Err(ObjectPgActionError::Store(
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
-                            self.drain_one_pending_object_metadata_command(
-                                publisher, pg_id, bucket,
-                            )?;
+                            #[cfg(test)]
+                            let drain = match maybe_run_stream_put_pending_drain_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                                StreamPutPendingDrainTestEvent::LateConflict,
+                                &mut pending_work_budget,
+                            ) {
+                                Ok(()) => self
+                                    .drain_one_pending_object_metadata_command_with_work_budget(
+                                        publisher,
+                                        pg_id,
+                                        bucket,
+                                        &mut pending_work_budget,
+                                    ),
+                                Err(error) => Err(error),
+                            };
+                            #[cfg(not(test))]
+                            let drain = self
+                                .drain_one_pending_object_metadata_command_with_work_budget(
+                                    publisher,
+                                    pg_id,
+                                    bucket,
+                                    &mut pending_work_budget,
+                                );
+                            match drain {
+                                Ok(()) => {}
+                                Err(error)
+                                    if Self::stream_put_pending_drain_error_is_retryable(
+                                        &error,
+                                    ) =>
+                                {
+                                    pending_work_budget
+                                        .sleep_after_contention(
+                                            "stream PUT finalization late pending drain retry budget exhausted",
+                                        )
+                                        .map_err(ObjectPgActionError::Store)?;
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                            pending_work_budget
+                                .sleep_after_contention(
+                                    "stream PUT finalization late pending drain retry budget exhausted",
+                                )
+                                .map_err(ObjectPgActionError::Store)?;
                             continue;
                         }
                         Err(error) => return Err(error),
@@ -926,6 +1015,24 @@ impl super::StorageCluster {
                 Ok(Attempt::Retry) => continue,
                 Err(error) => return Ok(Err(error)),
             }
+        }
+    }
+
+    fn stream_put_pending_drain_error_is_retryable(error: &ObjectPgActionError) -> bool {
+        match error {
+            ObjectPgActionError::Store(
+                StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+                | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+                | StoreError::MetadataCommandDependencyConvergencePending { .. },
+            ) => true,
+            ObjectPgActionError::Store(error) => matches!(
+                error.operation_failure_class(),
+                StoreOperationFailureClass::ResourceExhausted
+                    | StoreOperationFailureClass::MetadataCommandContention
+                    | StoreOperationFailureClass::RetryableConvergence
+            ),
+            ObjectPgActionError::Metadata(error) => error.is_command_contention(),
+            _ => false,
         }
     }
 
@@ -1757,11 +1864,108 @@ impl super::StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
+        mut provenance: MetadataCommandApplyProgressProvenance,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
         let mut command = command.clone();
+        let mut apply_progress = MetadataCommandApplyProgress::Abortable;
         loop {
-            match self.apply_metadata_command_to_acting_set(&command) {
+            let caller_deadline = work_budget.deadline();
+            let mut abortable_probe_was_inconclusive = false;
+            let abortable_apply_uses_caller_deadline = if apply_progress.is_abortable() {
+                let confirmation_deadline =
+                    Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+                match self.metadata_command_publication_state_on_acting_set_until(
+                    pg_id,
+                    &command,
+                    super::MetadataCommandRouteMode::Normal,
+                    confirmation_deadline,
+                ) {
+                    Ok(super::MetadataCommandPublicationState::NotPublished) => true,
+                    Ok(super::MetadataCommandPublicationState::PublicationStarted) => {
+                        apply_progress = apply_progress
+                            .merge(MetadataCommandApplyProgress::PublicationStarted);
+                        false
+                    }
+                    Ok(super::MetadataCommandPublicationState::Witnessed) => {
+                        apply_progress =
+                            apply_progress.merge(MetadataCommandApplyProgress::Witnessed);
+                        false
+                    }
+                    Ok(super::MetadataCommandPublicationState::PublicationUnconfirmed) => {
+                        apply_progress = apply_progress
+                            .merge(MetadataCommandApplyProgress::PublicationUnconfirmed);
+                        false
+                    }
+                    Ok(super::MetadataCommandPublicationState::Published) => {
+                        apply_progress =
+                            apply_progress.merge(MetadataCommandApplyProgress::Published);
+                        false
+                    }
+                    Ok(super::MetadataCommandPublicationState::IrrevocableUnconfirmed) => {
+                        abortable_probe_was_inconclusive = true;
+                        true
+                    }
+                    Err(error) => {
+                        return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                            error,
+                        ));
+                    }
+                }
+            } else {
+                false
+            };
+            if abortable_apply_uses_caller_deadline && Instant::now() >= caller_deadline {
+                if abortable_probe_was_inconclusive {
+                    return Err(Self::irrevocable_multipart_command_error(&command));
+                }
+                return self.finish_multipart_completion_after_uncertainty(
+                    pg_id,
+                    bucket,
+                    &command,
+                    ObjectPgActionError::Store(StoreError::OperationDeadlineExceeded {
+                        context: "multipart completion application budget exhausted",
+                    }),
+                );
+            }
+            let attempt_deadline = if abortable_apply_uses_caller_deadline {
+                caller_deadline
+            } else {
+                Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET
+            };
+            let apply = match provenance {
+                MetadataCommandApplyProgressProvenance::Authoritative => self
+                    .apply_metadata_command_to_acting_set_with_initial_progress_until(
+                        &command,
+                        apply_progress,
+                        attempt_deadline,
+                    ),
+                MetadataCommandApplyProgressProvenance::RecoveredPending => self
+                    .apply_recovered_pending_metadata_command_to_acting_set_with_initial_progress_until(
+                        &command,
+                        apply_progress,
+                        attempt_deadline,
+                    ),
+            };
+            #[cfg(test)]
+            let force_caller_deadline_expired = if apply.is_err() {
+                if let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(&command)
+                {
+                    maybe_run_multipart_completion_auxiliary_reservation_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        MultipartCompletionAuxiliaryReservationTestEvent::AfterApplyFailure,
+                        proof,
+                        work_budget,
+                    )
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            #[cfg(not(test))]
+            let force_caller_deadline_expired = false;
+            match apply {
                 Ok(outcome) => {
                     if outcome == MetadataCommandApplyOutcome::Converged {
                         self.finish_converged_multipart_completion_command(
@@ -1770,84 +1974,603 @@ impl super::StorageCluster {
                     }
                     return Ok(());
                 }
-                Err(error)
-                    if super::StorageCluster::metadata_command_log_conflict_matches(
-                        &command,
-                        &error.source,
-                    ) && self
-                        .metadata_command_is_applied_on_all_acting_nodes(pg_id, &command)
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)? =>
-                {
-                    // A concurrent exact helper may converge this command and advance the PG
-                    // log again before this helper observes the conflict. Historical exact-log
-                    // proof is sufficient; requiring the command to remain the current tip
-                    // would turn successful identical completions into contention.
-                    self.finish_converged_multipart_completion_command(pg_id, bucket, &command)?;
-                    return Ok(());
-                }
-                Err(error)
-                    if matches!(
-                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
-                            pg_id,
-                            &command,
-                            error.applied_nodes,
-                            &error.source,
-                        )
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
-                        Some(true)
-                    ) =>
-                {
-                    self.finish_converged_multipart_completion_command(pg_id, bucket, &command)?;
-                    return Ok(());
-                }
-                Err(error)
-                    if matches!(
-                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
-                            pg_id,
-                            &command,
-                            error.applied_nodes,
-                            &error.source,
-                        )
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?,
-                        Some(false)
-                    ) =>
-                {
-                    // Another completion helper can advance this exact command between
-                    // acceptance and apply. That is irrevocable convergence, not a competing
-                    // S3 operation, so keep helping the installed command instead of exposing
-                    // OperationAborted.
-                    Self::retry_irrevocable_multipart_command(
-                        work_budget,
-                        &command,
-                        "partial multipart completion convergence budget exhausted",
-                    )?;
-                    continue;
-                }
-                Err(error)
-                    if error.progress.is_abortable()
-                        && error.applied_nodes == 0
-                        && super::StorageCluster::metadata_command_log_conflict_matches(
-                            &command,
-                            &error.source,
-                        ) =>
-                {
-                    let Some(reissued) = self
-                        .reissue_pending_metadata_command(pg_id, &command)
-                        .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
-                    else {
-                        return Err(super::conflicting_pending_object_metadata_command(
-                            "pending multipart completion command was displaced during reissue",
-                        ));
-                    };
-                    command = reissued;
-                }
                 Err(error) => {
+                    apply_progress = apply_progress.merge(error.progress);
+                    if abortable_probe_was_inconclusive
+                        && apply_progress.is_abortable()
+                        && inconclusive_multipart_apply_failure_requires_uncertainty(&error.source)
+                    {
+                        return Err(Self::irrevocable_multipart_command_error(&command));
+                    }
+                    if abortable_apply_uses_caller_deadline
+                        && apply_progress.is_abortable()
+                        && (force_caller_deadline_expired
+                            || Instant::now() >= caller_deadline)
+                        && inconclusive_multipart_apply_failure_requires_uncertainty(&error.source)
+                    {
+                        if abortable_probe_was_inconclusive {
+                            return Err(Self::irrevocable_multipart_command_error(&command));
+                        }
+                        return self.finish_multipart_completion_after_uncertainty(
+                            pg_id,
+                            bucket,
+                            &command,
+                            super::bucket_snapshot_error_to_object_pg_action_error(error.source),
+                        );
+                    }
+                    let exact_log_conflict =
+                        super::StorageCluster::metadata_command_log_conflict_matches(
+                            &command,
+                            &error.source,
+                        );
+                    let abortable_conflict_crossed_caller_deadline = exact_log_conflict
+                        && apply_progress.is_abortable()
+                        && abortable_apply_uses_caller_deadline
+                        && (force_caller_deadline_expired
+                            || Instant::now() >= caller_deadline);
+                    let certification_deadline = if abortable_conflict_crossed_caller_deadline {
+                        Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET
+                    } else {
+                        attempt_deadline
+                    };
+
+                    if exact_log_conflict {
+                        match self.metadata_command_is_applied_on_all_acting_nodes_until(
+                            pg_id,
+                            &command,
+                            certification_deadline,
+                        ) {
+                            Ok(true) => {
+                                // A concurrent exact helper may converge this command and advance
+                                // the PG log again before this helper observes the conflict.
+                                self.finish_converged_multipart_completion_command(
+                                    pg_id, bucket, &command,
+                                )?;
+                                return Ok(());
+                            }
+                            Ok(false) => {}
+                            Err(probe_error)
+                                if !inconclusive_multipart_apply_failure_requires_uncertainty(
+                                    &probe_error,
+                                ) =>
+                            {
+                                return Err(
+                                    super::bucket_snapshot_error_to_object_pg_action_error(
+                                        probe_error,
+                                    ),
+                                );
+                            }
+                            Err(_) if abortable_conflict_crossed_caller_deadline => {
+                                return Err(
+                                    super::bucket_snapshot_error_to_object_pg_action_error(
+                                        error.source,
+                                    ),
+                                );
+                            }
+                            Err(_probe_error) if !apply_progress.is_abortable() =>
+                            {
+                                Self::retry_irrevocable_multipart_command(
+                                    work_budget,
+                                    &command,
+                                    "multipart completion exact-state probe budget exhausted",
+                                )?;
+                                continue;
+                            }
+                            Err(probe_error) => {
+                                return Err(
+                                    super::bucket_snapshot_error_to_object_pg_action_error(
+                                        probe_error,
+                                    ),
+                                );
+                            }
+                        }
+                    }
+
+                    let partial_exact = self
+                        .retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes_until(
+                            pg_id,
+                            &command,
+                            error.applied_nodes,
+                            &error.source,
+                            certification_deadline,
+                        );
+                    match partial_exact {
+                        Ok(Some(true)) => {
+                            self.finish_converged_multipart_completion_command(
+                                pg_id, bucket, &command,
+                            )?;
+                            return Ok(());
+                        }
+                        Ok(Some(false)) => {
+                            // Certifying an exact applied prefix proves that this command may no
+                            // longer be abandoned even when the fanout error carried stale progress.
+                            apply_progress =
+                                apply_progress.merge(MetadataCommandApplyProgress::Witnessed);
+                            Self::retry_irrevocable_multipart_command(
+                                work_budget,
+                                &command,
+                                "partial multipart completion convergence budget exhausted",
+                            )?;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(probe_error)
+                            if !inconclusive_multipart_apply_failure_requires_uncertainty(
+                                &probe_error,
+                            ) =>
+                        {
+                            return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                                probe_error,
+                            ));
+                        }
+                        Err(_) if abortable_conflict_crossed_caller_deadline => {
+                            return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                                error.source,
+                            ));
+                        }
+                        Err(_probe_error) if !apply_progress.is_abortable() =>
+                        {
+                            Self::retry_irrevocable_multipart_command(
+                                work_budget,
+                                &command,
+                                "multipart completion partial-state probe budget exhausted",
+                            )?;
+                            continue;
+                        }
+                        Err(probe_error) => {
+                            return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                                probe_error,
+                            ));
+                        }
+                    }
+
+                    if abortable_conflict_crossed_caller_deadline {
+                        return Err(super::bucket_snapshot_error_to_object_pg_action_error(
+                            error.source,
+                        ));
+                    }
+
+                    if apply_progress.is_abortable()
+                        && error.applied_nodes == 0
+                        && exact_log_conflict
+                    {
+                        let reissued = match self
+                            .reissue_pending_metadata_command_outcome_with_route_mode_classified_until(
+                                pg_id,
+                                &command,
+                                super::MetadataCommandExecutionRoute::normal(),
+                                command.payload(),
+                                work_budget.deadline(),
+                            )
+                        {
+                            Ok(
+                                super::ReissuePendingMetadataCommandOutcome::Reissued(reissued)
+                                | super::ReissuePendingMetadataCommandOutcome::MatchingCurrent(
+                                    reissued,
+                                ),
+                            ) => reissued,
+                            Ok(super::ReissuePendingMetadataCommandOutcome::Missing) => {
+                                return Err(super::conflicting_pending_object_metadata_command(
+                                    "pending multipart completion command was displaced during reissue",
+                                ));
+                            }
+                            Ok(
+                                super::ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                                    command: current,
+                                    source,
+                                },
+                            ) => {
+                                return self.finish_multipart_completion_after_uncertainty(
+                                    pg_id,
+                                    bucket,
+                                    &current,
+                                    super::bucket_snapshot_error_to_object_pg_action_error(
+                                        source.into(),
+                                    ),
+                                );
+                            }
+                            Err(
+                                super::ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                                    source,
+                                ),
+                            ) => {
+                                return self.finish_multipart_completion_after_uncertainty(
+                                    pg_id,
+                                    bucket,
+                                    &command,
+                                    super::bucket_snapshot_error_to_object_pg_action_error(source),
+                                );
+                            }
+                            Err(super::ReissuePendingMetadataCommandFailure::MayHaveReissued {
+                                source,
+                                lineage_tip,
+                            }) => {
+                                return self.finish_multipart_completion_after_uncertainty(
+                                    pg_id,
+                                    bucket,
+                                    &lineage_tip,
+                                    super::bucket_snapshot_error_to_object_pg_action_error(source),
+                                );
+                            }
+                        };
+                        command = reissued;
+                        apply_progress = MetadataCommandApplyProgress::Abortable;
+                        provenance = MetadataCommandApplyProgressProvenance::Authoritative;
+                        continue;
+                    }
+
+                    if !apply_progress.is_abortable()
+                        && (metadata_command_apply_error_can_handoff_to_recovery(&error.source)
+                            || metadata_command_apply_error_requires_exact_confirmation(
+                                &error.source,
+                            ))
+                    {
+                        Self::retry_irrevocable_multipart_command(
+                            work_budget,
+                            &command,
+                            "multipart completion publication confirmation budget exhausted",
+                        )?;
+                        continue;
+                    }
+
                     return Err(super::bucket_snapshot_error_to_object_pg_action_error(
                         error.source,
-                    ))
+                    ));
                 }
             }
         }
+    }
+
+    fn prepare_adopted_multipart_completion_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        auxiliary_reservation: &BucketWriteReservationProof,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<
+        (
+            MetadataCommandEnvelope,
+            MetadataCommandApplyProgressProvenance,
+        ),
+        ObjectPgActionError,
+    > {
+        let confirmation_deadline =
+            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+        let publication_state = match self
+            .metadata_command_publication_state_on_acting_set_until(
+                pg_id,
+                command,
+                super::MetadataCommandRouteMode::Normal,
+                confirmation_deadline,
+            )
+        {
+            Ok(state) => state,
+            Err(error) => {
+                return self.fail_adopted_multipart_completion_before_reissue(
+                    pg_id,
+                    auxiliary_reservation,
+                    super::bucket_snapshot_error_to_object_pg_action_error(error),
+                );
+            }
+        };
+        if publication_state != super::MetadataCommandPublicationState::NotPublished {
+            self.release_auxiliary_multipart_completion_reservation(
+                pg_id,
+                auxiliary_reservation,
+            )?;
+            return Ok((
+                command.clone(),
+                MetadataCommandApplyProgressProvenance::RecoveredPending,
+            ));
+        }
+
+        let reservation_validation = loop {
+            let validation_deadline =
+                Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+            let result = self.validate_metadata_command_bucket_write_reservation_until(
+                command,
+                validation_deadline,
+            );
+            if matches!(
+                result,
+                Err(BucketSnapshotLoadError::Store(
+                    StoreError::OperationDeadlineExceeded { .. }
+                ))
+            ) && Instant::now() < work_budget.deadline()
+            {
+                continue;
+            }
+            break result;
+        };
+        match reservation_validation {
+            Ok(()) => {
+                if work_budget
+                    .check("adopted multipart completion application budget exhausted")
+                    .is_err()
+                {
+                    let deadline_error = StoreError::OperationDeadlineExceeded {
+                        context: "adopted multipart completion application budget exhausted",
+                    };
+                    return match self.finish_multipart_completion_after_uncertainty(
+                        pg_id,
+                        command.bucket_name(),
+                        command,
+                        ObjectPgActionError::Store(deadline_error),
+                    ) {
+                        Ok(()) => {
+                            self.release_auxiliary_multipart_completion_reservation(
+                                pg_id,
+                                auxiliary_reservation,
+                            )?;
+                            Ok((
+                                command.clone(),
+                                MetadataCommandApplyProgressProvenance::RecoveredPending,
+                            ))
+                        }
+                        Err(error) => self.fail_adopted_multipart_completion_before_reissue(
+                            pg_id,
+                            auxiliary_reservation,
+                            error,
+                        ),
+                    };
+                }
+                self.release_auxiliary_multipart_completion_reservation(
+                    pg_id,
+                    auxiliary_reservation,
+                )?;
+                #[cfg(test)]
+                maybe_run_multipart_completion_auxiliary_reservation_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    MultipartCompletionAuxiliaryReservationTestEvent::AfterAuxiliaryRelease,
+                    auxiliary_reservation,
+                    work_budget,
+                );
+                Ok((
+                    command.clone(),
+                    MetadataCommandApplyProgressProvenance::RecoveredPending,
+                ))
+            }
+            Err(error @ BucketSnapshotLoadError::Store(
+                StoreError::OperationDeadlineExceeded { .. },
+            )) => match self.finish_multipart_completion_after_uncertainty(
+                pg_id,
+                command.bucket_name(),
+                command,
+                super::bucket_snapshot_error_to_object_pg_action_error(error),
+            ) {
+                Ok(()) => {
+                    self.release_auxiliary_multipart_completion_reservation(
+                        pg_id,
+                        auxiliary_reservation,
+                    )?;
+                    Ok((
+                        command.clone(),
+                        MetadataCommandApplyProgressProvenance::RecoveredPending,
+                    ))
+                }
+                Err(error) => self.fail_adopted_multipart_completion_before_reissue(
+                    pg_id,
+                    auxiliary_reservation,
+                    error,
+                ),
+            },
+            Err(error) if Self::metadata_command_reservation_is_definitively_rejected(command, &error) => {
+                if work_budget
+                    .check(
+                    "adopted multipart completion reservation takeover budget exhausted",
+                    )
+                    .is_err()
+                {
+                    let deadline_error = StoreError::OperationDeadlineExceeded {
+                        context: "adopted multipart completion reservation takeover budget exhausted",
+                    };
+                    return match self.finish_multipart_completion_after_uncertainty(
+                        pg_id,
+                        command.bucket_name(),
+                        command,
+                        ObjectPgActionError::Store(deadline_error),
+                    ) {
+                        Ok(()) => {
+                            self.release_auxiliary_multipart_completion_reservation(
+                                pg_id,
+                                auxiliary_reservation,
+                            )?;
+                            Ok((
+                                command.clone(),
+                                MetadataCommandApplyProgressProvenance::RecoveredPending,
+                            ))
+                        }
+                        Err(error) => self.fail_adopted_multipart_completion_before_reissue(
+                            pg_id,
+                            auxiliary_reservation,
+                            error,
+                        ),
+                    };
+                }
+                let mutation_deadline = work_budget.deadline();
+                if let Err(failure) = self.record_abandoned_metadata_command_to_acting_set_until(
+                    command,
+                    mutation_deadline,
+                ) {
+                    return self.fail_adopted_multipart_completion_before_reissue(
+                        pg_id,
+                        auxiliary_reservation,
+                        super::bucket_snapshot_error_to_object_pg_action_error(failure.source),
+                    );
+                }
+                if let Err(error) = self.release_auxiliary_multipart_completion_reservation(
+                    pg_id,
+                    Self::metadata_command_bucket_write_reservation_proof(command)
+                        .expect("multipart completion command carries a reservation"),
+                ) {
+                    return self.fail_adopted_multipart_completion_before_reissue(
+                        pg_id,
+                        auxiliary_reservation,
+                        error,
+                    );
+                }
+                let mut replacement_payload = command.payload().clone();
+                let MetadataCommandPayload::CommitMultipartObject(commit) = &mut replacement_payload
+                else {
+                    return self.fail_adopted_multipart_completion_before_reissue(
+                        pg_id,
+                        auxiliary_reservation,
+                        MetadataError::InvariantViolation {
+                            context: "prepare adopted multipart completion",
+                            reason: "adopted command changed payload kind".into(),
+                        }
+                        .into(),
+                    );
+                };
+                commit.bucket_write_reservation = auxiliary_reservation.clone();
+                let replacement = match self
+                    .reissue_pending_metadata_command_outcome_with_route_mode_classified_until(
+                        pg_id,
+                        command,
+                        super::MetadataCommandExecutionRoute::normal(),
+                        &replacement_payload,
+                        mutation_deadline,
+                    )
+                {
+                    Ok(
+                        super::ReissuePendingMetadataCommandOutcome::Reissued(replacement)
+                        | super::ReissuePendingMetadataCommandOutcome::MatchingCurrent(
+                            replacement,
+                        ),
+                    ) => replacement,
+                    Ok(super::ReissuePendingMetadataCommandOutcome::Missing) => {
+                        return self.fail_adopted_multipart_completion_before_reissue(
+                            pg_id,
+                            auxiliary_reservation,
+                            super::conflicting_pending_object_metadata_command(
+                            "pending multipart completion disappeared during reservation takeover",
+                            ),
+                        );
+                    }
+                    Ok(
+                        super::ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                            command: current,
+                            source,
+                        },
+                    ) => match self.finish_multipart_completion_after_uncertainty(
+                            pg_id,
+                            current.bucket_name(),
+                            &current,
+                            super::bucket_snapshot_error_to_object_pg_action_error(source.into()),
+                        ) {
+                            Ok(()) => current,
+                            Err(error) => {
+                                return self.fail_adopted_multipart_completion_before_reissue(
+                                    pg_id,
+                                    auxiliary_reservation,
+                                    error,
+                                );
+                            }
+                        },
+                    Err(super::ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                        error,
+                    )) => {
+                        return self.fail_adopted_multipart_completion_before_reissue(
+                            pg_id,
+                            auxiliary_reservation,
+                            super::bucket_snapshot_error_to_object_pg_action_error(error),
+                        );
+                    }
+                    // Replacement may have committed before an ambiguous response failure. The
+                    // fresh proof must remain available for recovery in that case.
+                    Err(super::ReissuePendingMetadataCommandFailure::MayHaveReissued {
+                        source: error,
+                        lineage_tip,
+                    }) => match self.finish_multipart_completion_after_uncertainty(
+                            pg_id,
+                            lineage_tip.bucket_name(),
+                            &lineage_tip,
+                            super::bucket_snapshot_error_to_object_pg_action_error(error),
+                        ) {
+                            Ok(()) => *lineage_tip,
+                            Err(error) => {
+                                return self.fail_adopted_multipart_completion_before_reissue(
+                                    pg_id,
+                                    auxiliary_reservation,
+                                    error,
+                                );
+                            }
+                        },
+                };
+                let replacement_owns_auxiliary = matches!(
+                    replacement.payload(),
+                    MetadataCommandPayload::CommitMultipartObject(commit)
+                        if commit.bucket_write_reservation == *auxiliary_reservation
+                );
+                if replacement_owns_auxiliary {
+                    Ok((
+                        replacement,
+                        MetadataCommandApplyProgressProvenance::RecoveredPending,
+                    ))
+                } else {
+                    self.release_auxiliary_multipart_completion_reservation(
+                        pg_id,
+                        auxiliary_reservation,
+                    )?;
+                    Ok((
+                        replacement,
+                        MetadataCommandApplyProgressProvenance::RecoveredPending,
+                    ))
+                }
+            }
+            Err(error) => self.fail_adopted_multipart_completion_before_reissue(
+                pg_id,
+                auxiliary_reservation,
+                super::bucket_snapshot_error_to_object_pg_action_error(error),
+            ),
+        }
+    }
+
+    fn finish_multipart_completion_after_uncertainty(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        fallback_error: ObjectPgActionError,
+    ) -> Result<(), ObjectPgActionError> {
+        match self.finish_new_object_metadata_command_after_uncertainty(
+            pg_id,
+            bucket,
+            command,
+            fallback_error,
+        )? {
+            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Reinspect(error)
+            | NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
+        }
+    }
+
+    fn fail_adopted_multipart_completion_before_reissue<T>(
+        &self,
+        pg_id: PgId,
+        auxiliary_reservation: &BucketWriteReservationProof,
+        error: ObjectPgActionError,
+    ) -> Result<T, ObjectPgActionError> {
+        self.release_auxiliary_multipart_completion_reservation(
+            pg_id,
+            auxiliary_reservation,
+        )?;
+        Err(error)
+    }
+
+    fn metadata_command_reservation_is_definitively_rejected(
+        command: &MetadataCommandEnvelope,
+        error: &BucketSnapshotLoadError,
+    ) -> bool {
+        let expected_id = Self::metadata_command_bucket_write_reservation_proof(command)
+            .map(|proof| proof.reservation_id.as_str());
+        matches!(
+            error,
+            BucketSnapshotLoadError::Metadata(
+                MetadataError::BucketWriteReservationConflict { reservation_id }
+                    | MetadataError::BucketWriteReservationNotFound { reservation_id }
+            ) if expected_id == Some(reservation_id.as_str())
+        )
     }
 
     fn finish_converged_multipart_completion_command(
@@ -2084,14 +2807,18 @@ impl super::StorageCluster {
                             &bucket_write_reservation,
                             &mut work_budget,
                         );
-                        self.release_auxiliary_multipart_completion_reservation(
-                            pg_id,
-                            &bucket_write_reservation,
-                        )?;
+                        let (command, provenance) = self
+                            .prepare_adopted_multipart_completion_command(
+                                pg_id,
+                                &command,
+                                &bucket_write_reservation,
+                                &mut work_budget,
+                            )?;
                         self.apply_multipart_completion_command(
                             pg_id,
                             &bucket,
                             &command,
+                            provenance,
                             &mut work_budget,
                         )?;
                         return Ok(outcome);
@@ -2274,6 +3001,13 @@ impl super::StorageCluster {
                 release_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
+            #[cfg(test)]
+            maybe_run_multipart_completion_auxiliary_reservation_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                MultipartCompletionAuxiliaryReservationTestEvent::BeforeCommandBuild,
+                &bucket_write_reservation,
+                &mut work_budget,
+            );
             let command = match multipart_completion_route.build_complete_multipart_object_command(
                 BuildCompleteMultipartObjectCommandReq {
                     request: &req,
@@ -2329,6 +3063,20 @@ impl super::StorageCluster {
                     req.expected_stale_payload_source = current_stale_payload_source;
                     continue 'retry_after_pending_conflict;
                 }
+                Err(error @ ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })) => {
+                    #[cfg(test)]
+                    maybe_run_multipart_completion_auxiliary_reservation_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        MultipartCompletionAuxiliaryReservationTestEvent::NoSuchUploadCleanup,
+                        &bucket_write_reservation,
+                        &mut work_budget,
+                    );
+                    self.release_auxiliary_multipart_completion_reservation(
+                        pg_id,
+                        &bucket_write_reservation,
+                    )?;
+                    return Err(error);
+                }
                 Err(error) => {
                     release_bucket_write_proof!()?;
                     return Err(error);
@@ -2377,7 +3125,12 @@ impl super::StorageCluster {
                         MetadataCommandPayload::CommitMultipartObject(commit)
                             if commit.bucket_write_reservation == bucket_write_reservation
                     );
-                    if !pending_owns_proof {
+                    let (pending, provenance) = if pending_owns_proof {
+                        (
+                            *pending,
+                            MetadataCommandApplyProgressProvenance::RecoveredPending,
+                        )
+                    } else {
                         #[cfg(test)]
                         maybe_run_multipart_completion_auxiliary_reservation_hook(
                             self.metadata_command_apply_test_hook_scope_id(),
@@ -2385,15 +3138,18 @@ impl super::StorageCluster {
                             &bucket_write_reservation,
                             &mut work_budget,
                         );
-                        self.release_auxiliary_multipart_completion_reservation(
+                        self.prepare_adopted_multipart_completion_command(
                             pg_id,
+                            &pending,
                             &bucket_write_reservation,
-                        )?;
-                    }
+                            &mut work_budget,
+                        )?
+                    };
                     self.apply_multipart_completion_command(
                         pg_id,
                         &bucket,
                         &pending,
+                        provenance,
                         &mut work_budget,
                     )?;
                     return Ok(outcome);
@@ -2414,6 +3170,7 @@ impl super::StorageCluster {
                 pg_id,
                 &bucket,
                 &command,
+                MetadataCommandApplyProgressProvenance::Authoritative,
                 &mut work_budget,
             )?;
 

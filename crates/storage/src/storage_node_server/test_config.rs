@@ -7,9 +7,11 @@
         ControlPlaneScopedCredentialStore,
     };
     use crate::node_client::{
-        BucketMetadataNodeClient, LocalUnixStorageNodeClientAdmissionSettings,
-        MetadataCommandApplyErrorKind, MetadataCommandInspectionNodeClient, PlacedShardNodeClient,
-        UnixStorageNodeClient,
+        BucketMetadataNodeClient, BuildCompleteMultipartObjectCommandReq,
+        BuildStreamPartCommitCommandReq,
+        LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
+        MetadataCommandInspectionNodeClient, MetadataCommandRecoveryNodeClient,
+        ObjectMutationMetadataNodeClient, PlacedShardNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::{
@@ -47,6 +49,7 @@
         decode_metadata_command_log_hash_range_response,
         decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
         decode_metadata_command_pending_envelope_response,
+        decode_metadata_command_pending_slot_cleanup_response,
         decode_metadata_command_pending_slot_insert_response,
         decode_metadata_command_pending_slot_remove_response,
         decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
@@ -56,6 +59,7 @@
         decode_storage_rpc_response_payload, encode_bucket_mark_deleting_command_build_request,
         encode_bucket_pg_request, encode_metadata_command_log_hash_range_request,
         encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
+        encode_metadata_command_pending_slot_cleanup_response,
         encode_metadata_command_pending_slot_request, encode_metadata_command_request,
         encode_metadata_command_state_request, encode_metadata_command_transfer_adopt_request,
         encode_metadata_command_transfer_checkpoint_base_request,
@@ -4621,6 +4625,338 @@
         authenticated_bucket_subresource_get_preserves_bucket_not_found(true);
     }
 
+    fn authenticated_complete_multipart_command_build_preserves_no_such_upload(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let bucket = crate::tests::bucket_name("missing-complete-multipart-rpc-bucket");
+        let key = crate::tests::object_key("missing-complete-multipart-rpc-key");
+        let upload_id = crate::tests::multipart_upload_id("missing-complete-multipart-rpc-upload");
+        let reservation = {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            let now = crate::clock::current_time_millis();
+            let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "missing-complete-multipart-rpc-reservation",
+                    owner_token: "missing-complete-multipart-rpc-owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
+                    created_at: now,
+                    lease_deadline: now.saturating_add(60_000),
+                    target_context: Some(key.as_str()),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            BucketWriteReservationProof::from(&reservation)
+        };
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let topology = Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        )
+        .with_pg_topology(Arc::clone(&topology));
+        let part = crate::MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            generation: 1,
+            size: 12,
+            payload_crc64: 0,
+            etag: vec![1; 8],
+            etag_kind: crate::EtagKind::Crc64,
+            part_vid: GenerationId::new(2).unwrap(),
+            placement_cluster_epoch: config.cluster_epoch,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 1,
+            checksum: None,
+        };
+        let request = crate::CompleteMultipartCommitRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            upload_id: upload_id.clone(),
+            completion_fingerprint: crate::MultipartCompletionFingerprint::from_bytes([0xA5; 32]),
+            versioning: BucketVersioningState::Disabled,
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(3).unwrap(),
+            size: part.size,
+            etag_crc64: [4; 8],
+            tags: None,
+            metadata_blob: Some(crate::SerializedMetadataBlob::default()),
+            system_metadata_blob: Some(crate::SerializedSystemMetadataBlob::default()),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            expected_stale_payload_source: None,
+            expected_current_object_identity: None,
+            conditional_completion: false,
+            part_records: vec![part],
+            selected_streaming_segments: Vec::new(),
+            expected_cleanup: crate::CompleteMultipartCommitCleanup::default(),
+        };
+        let expected_object_parts = crate::node_client::complete_multipart_expected_object_parts(
+            &request,
+            VersionId::Null,
+            &topology,
+        );
+        let route = client
+            .open_multipart_completion_mutation_metadata_route(
+                config.cluster_epoch,
+                crate::ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+            )
+            .unwrap();
+
+        let error = route
+            .build_complete_multipart_object_command(BuildCompleteMultipartObjectCommandReq {
+                request: &request,
+                version_id: VersionId::Null,
+                expected_object_parts: &expected_object_parts,
+                bucket_write_reservation: &reservation,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::ObjectPgActionError::Metadata(crate::MetadataError::NoSuchUpload {
+                upload_id: missing
+            }) if missing == upload_id.as_str()
+        ));
+
+        drop(route);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_complete_multipart_command_build_preserves_no_such_upload() {
+        authenticated_complete_multipart_command_build_preserves_no_such_upload(false);
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_complete_multipart_command_build_preserves_no_such_upload() {
+        authenticated_complete_multipart_command_build_preserves_no_such_upload(true);
+    }
+
+    fn authenticated_stream_part_finalize_preserves_no_such_upload(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = Arc::new(prepared.bind().unwrap());
+        let node = Arc::clone(&server._node);
+        let bucket = crate::tests::bucket_name("missing-stream-part-rpc-bucket");
+        let key = crate::tests::object_key("missing-stream-part-rpc-key");
+        let upload_id = crate::tests::multipart_upload_id("missing-stream-part-rpc-upload");
+        let session_id = crate::tests::stream_session_id("part-rpc");
+        let reservation = {
+            let pg = node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            PgMetadataStore::create_multipart_upload(
+                &*pg,
+                &CreateMultipartUploadReq {
+                    upload_id: upload_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    tags: None,
+                    metadata_blob: crate::SerializedMetadataBlob::default(),
+                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                    initiator: crate::OwnerIdentity::from_principal("owner"),
+                    owner: crate::OwnerIdentity::from_principal("owner"),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    object_lock: crate::ObjectLockState::default(),
+                    checksum: None,
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            PgMetadataStore::create_stream_upload(
+                &*pg,
+                &CreateStreamUploadReq {
+                    session_id: session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: crate::StreamUploadTarget::UploadPart {
+                        upload_id: upload_id.clone(),
+                        part_number: 1,
+                    },
+                    encryption: crate::ObjectEncryption::None,
+                },
+            )
+            .unwrap();
+            let now = crate::clock::current_time_millis();
+            let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "missing-stream-part-rpc-reservation",
+                    owner_token: "missing-stream-part-rpc-owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
+                    created_at: now,
+                    lease_deadline: now.saturating_add(60_000),
+                    target_context: Some(key.as_str()),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            BucketWriteReservationProof::from(&reservation)
+        };
+        let tcp_address = tcp.then(|| server.tcp_listener_addr_for_test());
+        let endpoint = if let Some(address) = tcp_address {
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_thread = Arc::clone(&server);
+        let server_stop = Arc::clone(&stop);
+        let join = thread::spawn(move || {
+            server_thread
+                .serve_until_stop_for_test(&server_stop)
+                .unwrap();
+        });
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        )
+        .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()));
+        let route = client
+            .open_stream_part_finalization_metadata_route(
+                config.cluster_epoch,
+                crate::ObjectMetadataPgId::new_for_test(PgId::new(0)),
+                &bucket,
+                &key,
+                &upload_id,
+                &session_id,
+                1,
+            )
+            .unwrap();
+        let snapshot = route.load_snapshot().unwrap();
+
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::delete_multipart_upload(&*pg, &upload_id).unwrap();
+        PgMetadataStore::delete_stream_upload(&*pg, &session_id).unwrap();
+        drop(pg);
+
+        let snapshot_error = route.load_snapshot().unwrap_err();
+        assert!(matches!(
+            &snapshot_error,
+            crate::ObjectPgActionError::Metadata(crate::MetadataError::NoSuchUpload {
+                upload_id: missing
+            }) if missing == upload_id.as_str()
+        ), "{snapshot_error:?}");
+
+        let part = crate::MultipartPartRecord {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+            generation: 0,
+            size: 0,
+            payload_crc64: 0,
+            etag: Vec::new(),
+            etag_kind: crate::EtagKind::Crc64,
+            part_vid: GenerationId::MIN,
+            placement_cluster_epoch: config.cluster_epoch,
+            ec_k: 4,
+            ec_m: 2,
+            last_modified: 1,
+            checksum: None,
+        };
+        let build_error = route
+            .build_commit_command(
+                BuildStreamPartCommitCommandReq {
+                    expected_snapshot: &snapshot,
+                    part: &part,
+                    segments: &[],
+                    bucket_write_reservation: &reservation,
+                },
+                AdmittedRouteEffectFence::unbounded(config.cluster_epoch),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            build_error,
+            crate::ObjectPgActionError::Metadata(crate::MetadataError::NoSuchUpload {
+                upload_id: missing
+            }) if missing == upload_id.as_str()
+        ));
+
+        drop(route);
+        drop(client);
+        stop.store(true, Ordering::Release);
+        if let Some(address) = tcp_address {
+            let _ = std::net::TcpStream::connect(address);
+        } else {
+            let _ = UnixStream::connect(&config.socket_path);
+        }
+        join.join().unwrap();
+    }
+
+    #[test]
+    fn authenticated_unix_stream_part_finalize_preserves_no_such_upload() {
+        authenticated_stream_part_finalize_preserves_no_such_upload(false);
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_stream_part_finalize_preserves_no_such_upload() {
+        authenticated_stream_part_finalize_preserves_no_such_upload(true);
+    }
+
     fn authenticated_metadata_hash_inspection_preserves_integrity_failure(tcp: bool) {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
@@ -5043,6 +5379,411 @@
         authenticated_metadata_session_classifies_apply_failure(
             true,
             AuthenticatedMetadataSessionFailure::DefinitiveConflict,
+        );
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthenticatedPendingSlotReplaceFailure {
+        SignedPreMutationRejection,
+        SignedPostCommitFailure,
+        ResponseAuthentication,
+    }
+
+    fn authenticated_pending_slot_replace_preserves_failure_certainty(
+        tcp: bool,
+        failure: AuthenticatedPendingSlotReplaceFailure,
+    ) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let previous = test_metadata_command(0, 1);
+        let replacement = test_metadata_command(0, 2);
+        let bucket = previous.bucket_name().clone();
+        server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &previous,
+                Some(&bucket),
+            )
+            .unwrap();
+        if matches!(
+            failure,
+            AuthenticatedPendingSlotReplaceFailure::ResponseAuthentication
+        ) {
+            server.set_response_envelope_test_hook(Arc::new(|kind, envelope| {
+                if kind == StorageRpcMessageKind::MetadataCommandPendingSlotReplace {
+                    *envelope
+                        .last_mut()
+                        .expect("authenticated response envelope must not be empty") ^= 1;
+                }
+            }));
+        }
+        if matches!(
+            failure,
+            AuthenticatedPendingSlotReplaceFailure::SignedPostCommitFailure
+        ) {
+            server
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .fail_next_pending_slot_replace_after_commit();
+        }
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let section =
+            MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+                &client,
+                PgId::new(0),
+                config.cluster_epoch,
+            )
+            .unwrap();
+        let scope_bucket = match failure {
+            AuthenticatedPendingSlotReplaceFailure::SignedPreMutationRejection => {
+                crate::tests::bucket_name("foreign-replacement-scope")
+            }
+            AuthenticatedPendingSlotReplaceFailure::SignedPostCommitFailure
+            | AuthenticatedPendingSlotReplaceFailure::ResponseAuthentication => bucket.clone(),
+        };
+        let error = section
+            .replace_pending_metadata_command_slot_for_reissue(
+                &previous,
+                &replacement,
+                Some(&scope_bucket),
+            )
+            .unwrap_err();
+        let expected_kind = match failure {
+            AuthenticatedPendingSlotReplaceFailure::SignedPreMutationRejection => {
+                MetadataCommandApplyErrorKind::Definitive
+            }
+            AuthenticatedPendingSlotReplaceFailure::SignedPostCommitFailure
+            | AuthenticatedPendingSlotReplaceFailure::ResponseAuthentication => {
+                MetadataCommandApplyErrorKind::MayHaveApplied
+            }
+        };
+        assert_eq!(error.kind(), expected_kind);
+        drop(section);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+
+        let pending = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap()
+        .get_pg(0)
+        .unwrap()
+        .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
+        .unwrap()
+        .unwrap();
+        let expected = match failure {
+            AuthenticatedPendingSlotReplaceFailure::SignedPreMutationRejection => &previous,
+            AuthenticatedPendingSlotReplaceFailure::SignedPostCommitFailure
+            | AuthenticatedPendingSlotReplaceFailure::ResponseAuthentication => &replacement,
+        };
+        assert_eq!(pending.command_bytes, expected.command_bytes());
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_replace_signed_rejection_is_definitive() {
+        authenticated_pending_slot_replace_preserves_failure_certainty(
+            false,
+            AuthenticatedPendingSlotReplaceFailure::SignedPreMutationRejection,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_replace_signed_rejection_is_definitive() {
+        authenticated_pending_slot_replace_preserves_failure_certainty(
+            true,
+            AuthenticatedPendingSlotReplaceFailure::SignedPreMutationRejection,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_replace_signed_post_commit_error_is_ambiguous() {
+        authenticated_pending_slot_replace_preserves_failure_certainty(
+            false,
+            AuthenticatedPendingSlotReplaceFailure::SignedPostCommitFailure,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_replace_signed_post_commit_error_is_ambiguous() {
+        authenticated_pending_slot_replace_preserves_failure_certainty(
+            true,
+            AuthenticatedPendingSlotReplaceFailure::SignedPostCommitFailure,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_replace_response_loss_is_ambiguous() {
+        authenticated_pending_slot_replace_preserves_failure_certainty(
+            false,
+            AuthenticatedPendingSlotReplaceFailure::ResponseAuthentication,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_replace_response_loss_is_ambiguous() {
+        authenticated_pending_slot_replace_preserves_failure_certainty(
+            true,
+            AuthenticatedPendingSlotReplaceFailure::ResponseAuthentication,
+        );
+    }
+
+    fn authenticated_pending_slot_remove_preserves_terminal_state(
+        tcp: bool,
+        divergent_terminal_row: bool,
+        subject_mismatch: Option<AuthenticatedPendingSlotRemoveSubjectMismatch>,
+    ) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let command = test_metadata_command(0, 1);
+        let bucket = command.bucket_name().clone();
+        server
+            ._node
+            .get_pg(0)
+            .unwrap()
+            .try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &command,
+                Some(&bucket),
+            )
+            .unwrap();
+        if divergent_terminal_row {
+            let divergent = MetadataCommandEnvelope::new(
+                command.id(),
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        crate::tests::bucket_name("metadata-rpc-bucket"),
+                        crate::tests::object_key("object"),
+                        crate::tests::stream_session_id("rpc-divergent"),
+                        GenerationId::new(2).unwrap(),
+                        456,
+                    ),
+                ),
+            );
+            server
+                ._node
+                .get_pg(0)
+                .unwrap()
+                .record_metadata_command_abandoned(config.node_id.as_u32(), &divergent)
+                .unwrap();
+        }
+        if let Some(subject_mismatch) = subject_mismatch {
+            server.set_response_frame_test_hook(Arc::new(move |kind, frame| {
+                if kind != StorageRpcMessageKind::MetadataCommandPendingSlotRemove {
+                    return;
+                }
+                let payload = decode_storage_rpc_response_payload(&frame.payload)
+                    .expect("decode pending-slot response envelope")
+                    .expect("pending-slot response must be successful");
+                let mut response = decode_metadata_command_pending_slot_cleanup_response(&payload)
+                    .expect("decode pending-slot cleanup response");
+                let (node_id, log_index) = match &mut response.outcome {
+                    StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+                        node_id,
+                        log_index,
+                        ..
+                    }
+                    | StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+                        node_id,
+                        log_index,
+                        ..
+                    } => (node_id, log_index),
+                    StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(_) => {
+                        panic!("expected terminal cleanup error response")
+                    }
+                };
+                match subject_mismatch {
+                    AuthenticatedPendingSlotRemoveSubjectMismatch::Node => *node_id += 1,
+                    AuthenticatedPendingSlotRemoveSubjectMismatch::LogIndex => *log_index += 1,
+                }
+                let payload = encode_metadata_command_pending_slot_cleanup_response(&response);
+                frame.payload = encode_storage_rpc_success_response(&payload);
+            }));
+        }
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+
+        let error = MetadataCommandNodeClient::remove_pending_metadata_command_slot(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap_err();
+        if subject_mismatch.is_some() {
+            assert!(
+                matches!(
+                    error,
+                    StoreError::StorageRpc {
+                        failure: StorageRpcErrorCode::PayloadDecode,
+                        ..
+                    }
+                ),
+                "unexpected mismatched pending-slot response error: {error:?}"
+            );
+        } else if divergent_terminal_row {
+            assert!(
+                matches!(
+                    error,
+                    StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: 0,
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        log_index: 1,
+                    } if node_id == config.node_id.as_u32()
+                ),
+                "unexpected divergent pending-slot removal error: {error:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    StoreError::MetadataCommandTerminalEntryPending {
+                        node_id,
+                        pg_id: 0,
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        log_index: 1,
+                    } if node_id == config.node_id.as_u32()
+                ),
+                "unexpected nonterminal pending-slot removal error: {error:?}"
+            );
+        }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthenticatedPendingSlotRemoveSubjectMismatch {
+        Node,
+        LogIndex,
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_remove_preserves_nonterminal_state() {
+        authenticated_pending_slot_remove_preserves_terminal_state(false, false, None);
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_remove_preserves_nonterminal_state() {
+        authenticated_pending_slot_remove_preserves_terminal_state(true, false, None);
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_remove_preserves_log_divergence() {
+        authenticated_pending_slot_remove_preserves_terminal_state(false, true, None);
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_remove_preserves_log_divergence() {
+        authenticated_pending_slot_remove_preserves_terminal_state(true, true, None);
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_remove_rejects_wrong_response_node() {
+        authenticated_pending_slot_remove_preserves_terminal_state(
+            false,
+            false,
+            Some(AuthenticatedPendingSlotRemoveSubjectMismatch::Node),
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_remove_rejects_wrong_response_log_index() {
+        authenticated_pending_slot_remove_preserves_terminal_state(
+            true,
+            false,
+            Some(AuthenticatedPendingSlotRemoveSubjectMismatch::LogIndex),
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_remove_rejects_wrong_log_conflict_index() {
+        authenticated_pending_slot_remove_preserves_terminal_state(
+            false,
+            true,
+            Some(AuthenticatedPendingSlotRemoveSubjectMismatch::LogIndex),
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_remove_rejects_wrong_log_conflict_node() {
+        authenticated_pending_slot_remove_preserves_terminal_state(
+            true,
+            true,
+            Some(AuthenticatedPendingSlotRemoveSubjectMismatch::Node),
         );
     }
 

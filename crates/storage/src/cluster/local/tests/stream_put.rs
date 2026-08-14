@@ -679,8 +679,9 @@ fn stream_put_create_command_id_race_releases_reservation_and_retries() {
     }
 }
 
-#[test]
-fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
+fn assert_stream_put_finalize_command_id_race(
+    injected_action: crate::cluster::request_ops::StreamPutPendingDrainTestAction,
+) {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -794,10 +795,13 @@ fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
     let action_calls = Arc::new(AtomicUsize::new(0));
     let hook_cluster = Arc::clone(&second_cluster);
     let hook_map = Arc::clone(&second_map);
+    let recovery_map = Arc::clone(&first_map);
     let hook_bucket = bucket.clone();
     let hook_req = winner_req.clone();
     let hook_written_shards = winner_written.written_shards.clone();
     let hook_ran_for_closure = Arc::clone(&hook_ran);
+    let recovery_owner = Arc::new(Mutex::new(None));
+    let recovery_owner_for_hook = Arc::clone(&recovery_owner);
     let _hook_guard = first_cluster.test_install_before_stream_put_finalize_command_id_hook(
         Arc::new(move || {
             if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
@@ -830,36 +834,78 @@ fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
                 Some(&hook_bucket),
             )
             .unwrap();
+            let owner = match recovery_map
+                .runtime_state()
+                .join_metadata_command_recovery(pg_id, &command)
+            {
+                crate::cluster::MetadataCommandRecoveryAdmission::Leader(owner) => owner,
+                _ => panic!("late stream PUT contender must acquire the recovery flight"),
+            };
+            *recovery_owner_for_hook.lock().unwrap() = Some(owner);
         }),
     );
 
+    let recovery_timeout_observed = Arc::new(AtomicBool::new(false));
+    let recovery_timeout_observed_for_hook = Arc::clone(&recovery_timeout_observed);
+    let recovery_owner_for_timeout = Arc::clone(&recovery_owner);
+    let _drain_hook =
+        first_cluster.test_install_stream_put_pending_drain_hook(Arc::new(move |event| {
+            if event == crate::cluster::request_ops::StreamPutPendingDrainTestEvent::LateConflict
+                && !recovery_timeout_observed_for_hook.swap(true, Ordering::SeqCst)
+            {
+                if matches!(
+                    injected_action,
+                    crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure
+                        | crate::cluster::request_ops::StreamPutPendingDrainTestAction::IrrevocableFailure
+                ) {
+                    drop(recovery_owner_for_timeout.lock().unwrap().take());
+                }
+                injected_action
+            } else {
+                crate::cluster::request_ops::StreamPutPendingDrainTestAction::Continue
+            }
+        }));
+
     let calls_for_action = Arc::clone(&action_calls);
-    let result = first_cluster
-        .finalize_put_object_stream(
-            &bucket,
-            &key,
-            &session_id,
-            stream_payload.len() as u64,
-            move |snapshot| {
-                calls_for_action.fetch_add(1, Ordering::SeqCst);
-                Ok::<_, ()>(crate::PreparedStreamPutCommit {
-                    value: snapshot.existing_etag,
-                    versioning: crate::BucketVersioningState::Disabled,
-                    owner: crate::OwnerIdentity::from_principal("owner"),
-                    acl_grants: crate::AclGrants::default(),
-                    public_read: false,
-                    etag_crc64: stream_crc64,
-                    tags: None,
-                    metadata_blob: crate::SerializedMetadataBlob::default(),
-                    system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                    object_lock: crate::ObjectLockState::default(),
-                    encryption: crate::ObjectEncryption::None,
-                })
-            },
-        )
-        .unwrap()
-        .unwrap();
+    let result = first_cluster.finalize_put_object_stream(
+        &bucket,
+        &key,
+        &session_id,
+        stream_payload.len() as u64,
+        move |snapshot| {
+            calls_for_action.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: snapshot.existing_etag,
+                versioning: crate::BucketVersioningState::Disabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: stream_crc64,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        },
+    );
     assert!(hook_ran.load(Ordering::SeqCst));
+    assert!(recovery_timeout_observed.load(Ordering::SeqCst));
+    if injected_action
+        == crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget
+    {
+        let error = result.expect_err("late pending drain must honor the outer work deadline");
+        assert!(matches!(
+            error,
+            crate::ObjectPgActionError::Store(ref source)
+                if source.operation_failure_class()
+                    == crate::StoreOperationFailureClass::MetadataCommandContention
+        ));
+        assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+        assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_some());
+        return;
+    }
+    let result = result.unwrap().unwrap();
     assert_eq!(
         action_calls.load(Ordering::SeqCst),
         2,
@@ -898,6 +944,20 @@ fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
             Err(crate::MetadataError::ObjectGenerationReservationNotFound { .. })
         ));
     }
+}
+
+#[test]
+fn stream_put_finalize_command_id_race_drains_winner_and_retries() {
+    assert_stream_put_finalize_command_id_race(
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::RetryableFailure,
+    );
+}
+
+#[test]
+fn stream_put_finalize_late_pending_drain_honors_outer_budget() {
+    assert_stream_put_finalize_command_id_race(
+        crate::cluster::request_ops::StreamPutPendingDrainTestAction::ExpireOuterBudget,
+    );
 }
 
 #[test]

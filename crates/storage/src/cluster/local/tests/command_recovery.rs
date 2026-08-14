@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::cluster::RequestWorkBudget;
 use crate::control_plane::{
     ControlPlaneError, ControlPlaneRuntimeMapSource, PendingMetadataCommandObservation,
     PendingMetadataCommandRecovery, PendingMetadataCommandRecoveryListing,
     PendingMetadataCommandRecoveryTask,
 };
+use crate::BucketSnapshotLoadError;
+use crate::ObjectPgActionError;
 use crate::StorageClusterRouteHandle;
 
 struct UnrelatedFullMapFailureSource<S> {
@@ -1104,6 +1107,319 @@ fn metadata_command_recovery_single_flight_wait_is_bounded() {
 }
 
 #[test]
+fn metadata_command_recovery_reissue_lineage_shares_owner_and_deadline() {
+    let runtime_state = Arc::new(LocalClusterRuntimeState::new());
+    let pg_id = PgId::new(1);
+    let bucket = BucketName::new("single-flight-reissue-lineage").unwrap();
+    let source = create_bucket_metadata_command(pg_id, 1, bucket);
+    let replacement = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        source.payload().clone(),
+    );
+    let MetadataCommandRecoveryAdmission::Leader(owner) =
+        runtime_state.join_metadata_command_recovery(pg_id, &source)
+    else {
+        panic!("source command should own the recovery flight");
+    };
+    owner
+        .bind_reissued_command(pg_id, &source, &replacement)
+        .unwrap();
+
+    let deadline = Instant::now();
+    let admission = runtime_state.join_metadata_command_recovery_until(pg_id, &source, deadline);
+    assert!(matches!(
+        admission,
+        MetadataCommandRecoveryAdmission::TimedOut {
+            lineage_tip,
+            ..
+        } if lineage_tip == replacement
+    ));
+
+    drop(owner);
+    assert_eq!(
+        runtime_state.test_metadata_command_recovery_flight_count(),
+        0
+    );
+}
+
+#[test]
+fn metadata_command_recovery_definite_reissue_failure_restores_waiter_lineage() {
+    let runtime_state = Arc::new(LocalClusterRuntimeState::new());
+    let pg_id = PgId::new(1);
+    let bucket = BucketName::new("single-flight-reissue-rollback").unwrap();
+    let source = create_bucket_metadata_command(pg_id, 1, bucket);
+    let replacement = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        source.payload().clone(),
+    );
+    let MetadataCommandRecoveryAdmission::Leader(owner) =
+        runtime_state.join_metadata_command_recovery(pg_id, &source)
+    else {
+        panic!("source command should own the recovery flight");
+    };
+    owner
+        .bind_reissued_command(pg_id, &source, &replacement)
+        .unwrap();
+
+    let waiter_state = Arc::clone(&runtime_state);
+    let waiter_replacement = replacement.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        tx.send(waiter_state.join_metadata_command_recovery(pg_id, &waiter_replacement))
+            .unwrap();
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "replacement waiter should share the source owner's flight"
+    );
+
+    owner
+        .rollback_reissued_command(pg_id, &source, &replacement)
+        .unwrap();
+    let expired_replacement =
+        runtime_state.join_metadata_command_recovery_until(pg_id, &replacement, Instant::now());
+    assert!(matches!(
+        expired_replacement,
+        MetadataCommandRecoveryAdmission::TimedOut { lineage_tip, .. }
+            if lineage_tip == replacement
+    ));
+
+    drop(owner);
+    let admission = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        admission,
+        MetadataCommandRecoveryAdmission::Waited { lineage_tip, .. }
+            if lineage_tip == source
+    ));
+    waiter.join().unwrap();
+}
+
+#[test]
+fn reissued_bucket_command_waiter_preserves_published_lineage_after_budget_expiry() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let first_bucket = bucket_for_pg(topology, 1, "lineage-first-");
+    let second_bucket = bucket_for_pg(topology, 1, "lineage-second-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let applied = create_bucket_metadata_command(pg_id, 1, first_bucket);
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &applied)
+        .unwrap();
+    let stale = create_bucket_metadata_command(pg_id, 1, second_bucket.clone());
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &second_bucket, &stale);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let (trailing_arrived_tx, trailing_arrived_rx) = std::sync::mpsc::channel();
+    let (trailing_release_tx, trailing_release_rx) = std::sync::mpsc::channel();
+    let trailing_release_rx = Arc::new(Mutex::new(trailing_release_rx));
+    let block_once = Arc::new(AtomicBool::new(true));
+    let hook_bucket = second_bucket.clone();
+    let hook_release = Arc::clone(&trailing_release_rx);
+    let hook_once = Arc::clone(&block_once);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if node_id == NodeId::new(2)
+                && command.bucket_name() == &hook_bucket
+                && command.id().log_index().get() == 2
+                && hook_once.swap(false, Ordering::SeqCst)
+            {
+                trailing_arrived_tx.send(()).unwrap();
+                hook_release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("timed out waiting to release trailing apply");
+            }
+            Ok(())
+        },
+    ));
+
+    let owner_cluster = cluster.clone();
+    let owner_bucket = second_bucket.clone();
+    let owner_command = stale.clone();
+    let owner = thread::spawn(move || {
+        owner_cluster.finish_pending_metadata_command_to_acting_set(
+            pg_id,
+            &owner_bucket,
+            &owner_command,
+            false,
+        )
+    });
+    trailing_arrived_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reissued command did not reach trailing apply");
+    let replacement = pending_metadata_command_for_test(&map, pg_id, &second_bucket)
+        .expect("reissued command should remain pending while trailing apply is blocked");
+    assert_eq!(replacement.id().log_index().get(), 2);
+
+    let mut waiter_budget = RequestWorkBudget::new(Duration::from_millis(20), None)
+        .for_operation("test_reissued_bucket_command_waiter")
+        .for_pg(pg_id);
+    waiter_budget.expire_for_test();
+    let error = cluster
+        .finish_pending_metadata_command_to_acting_set_with_work_budget(
+            pg_id,
+            &stale,
+            false,
+            &mut waiter_budget,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandIrrevocableConvergencePending {
+            log_index: 2,
+            ..
+        })
+    ));
+
+    trailing_release_tx.send(()).unwrap();
+    assert_eq!(
+        owner.join().unwrap().unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    drop(hook_guard);
+    assert_clean_metadata_command_stream(&map, &[1]);
+}
+
+#[test]
+fn reissued_object_command_transfers_owner_and_stale_waiter_lineage() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, target_key, object_pg, _data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let prior_key = key_for_object_pg(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology(),
+        &bucket,
+        object_pg,
+        "lineage-prior-",
+    );
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let pg_id = PgId::new(object_pg);
+    let stale_index = map.test_next_metadata_command_log_index(pg_id);
+    let prior = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(cluster.operation_epoch(), pg_id, stale_index),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            prior_key,
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(1), &prior)
+        .unwrap();
+    let stale = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(cluster.operation_epoch(), pg_id, stale_index),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            target_key,
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &stale);
+
+    let replacement_index = stale_index.get() + 1;
+    let _serial = lock_metadata_command_apply_hook_test();
+    let (trailing_arrived_tx, trailing_arrived_rx) = std::sync::mpsc::channel();
+    let (trailing_release_tx, trailing_release_rx) = std::sync::mpsc::channel();
+    let trailing_release_rx = Arc::new(Mutex::new(trailing_release_rx));
+    let block_once = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let hook_release = Arc::clone(&trailing_release_rx);
+    let hook_once = Arc::clone(&block_once);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if node_id == NodeId::new(2)
+                && command.bucket_name() == &hook_bucket
+                && command.id().log_index().get() == replacement_index
+                && hook_once.swap(false, Ordering::SeqCst)
+            {
+                trailing_arrived_tx.send(()).unwrap();
+                hook_release
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("timed out waiting to release trailing object-command apply");
+            }
+            Ok(())
+        },
+    ));
+
+    let owner_cluster = cluster.clone();
+    let owner_command = stale.clone();
+    let owner = thread::spawn(move || {
+        owner_cluster.drain_pending_metadata_command_with_recovery_gate(pg_id, &owner_command)
+    });
+    trailing_arrived_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("reissued object command did not reach trailing apply");
+    let replacement = pending_metadata_command_for_test(&map, pg_id, &bucket)
+        .expect("reissued object command should remain pending while trailing apply is blocked");
+    assert_eq!(replacement.id().log_index().get(), replacement_index);
+    assert!(map
+        .runtime_state()
+        .test_metadata_command_recovery_commands_share_flight(pg_id, &stale, &replacement));
+
+    let mut waiter_budget = RequestWorkBudget::new(Duration::from_millis(20), None)
+        .for_operation("test_reissued_object_command_stale_waiter")
+        .for_pg(pg_id);
+    waiter_budget.expire_for_test();
+    let error = cluster
+        .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+            pg_id,
+            &stale,
+            &mut waiter_budget,
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        ObjectPgActionError::Store(StoreError::MetadataCommandIrrevocableConvergencePending {
+            log_index,
+            ..
+        }) if log_index == replacement_index
+    ));
+
+    trailing_release_tx.send(()).unwrap();
+    assert_eq!(
+        owner.join().unwrap().unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    drop(hook_guard);
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
 fn stale_duplicate_metadata_command_index_is_reissued_before_apply() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1569,6 +1885,79 @@ fn recovery_waiter_drain_treats_missing_unapplied_command_as_abandoned() {
 }
 
 #[test]
+fn bucket_command_finisher_waits_for_existing_exact_recovery_owner() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "bucket-command-single-flight-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let MetadataCommandRecoveryAdmission::Leader(owner) = map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &command)
+    else {
+        panic!("first bucket-command finisher should own the exact recovery flight");
+    };
+    cluster.test_install_metadata_command_recovery_owner_completion_hook(
+        pg_id,
+        &command,
+        Arc::new(Barrier::new(1)),
+    );
+
+    let waiter_cluster = cluster.clone();
+    let waiter_bucket = bucket.clone();
+    let waiter_command = command.clone();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        result_tx
+            .send(
+                waiter_cluster.finish_pending_metadata_command_to_acting_set(
+                    pg_id,
+                    &waiter_bucket,
+                    &waiter_command,
+                    false,
+                ),
+            )
+            .unwrap();
+    });
+    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(
+        result_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "the second finisher must not bypass the exact-command recovery owner"
+    );
+
+    drop(owner);
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("bucket-command finisher did not resume after owner release")
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    waiter.join().unwrap();
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (1, 0),
+        "the second finisher must select the existing exact-command flight"
+    );
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[1]);
+}
+
+#[test]
 fn reissue_accepts_terminal_pending_command_after_stale_primary_max_snapshot() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1933,6 +2322,148 @@ fn stale_duplicate_reissue_reloads_replaced_slot_during_primary_last_fanout() {
         );
     }
     assert_clean_metadata_command_stream(&map, &[1]);
+}
+
+#[test]
+fn pending_slot_reissue_deadline_expires_before_pg_lock_and_preserves_slot() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "reissue-deadline-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
+    let _guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let error = cluster
+        .test_reissue_pending_metadata_command_until(
+            pg_id,
+            &command,
+            Instant::now() + Duration::from_millis(20),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::OperationDeadlineExceeded {
+            context: "acquire metadata command reissue PG lock"
+        })
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command),
+        "deadline expiry before PG serialization must not replace the pending slot"
+    );
+}
+
+#[test]
+fn pending_slot_reissue_rejected_by_publication_marker_rolls_back_flight_alias() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "reissue-flight-rollback-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    map.node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .mark_pending_metadata_command_publication_started(NodeId::new(1).as_u32(), &command)
+        .unwrap();
+    let replacement = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        command.payload().clone(),
+    );
+    let MetadataCommandRecoveryAdmission::Leader(owner) = map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &command)
+    else {
+        panic!("source command should own the recovery flight");
+    };
+
+    cluster
+        .test_reissue_pending_metadata_command_with_recovery_guard_until(
+            pg_id,
+            &command,
+            &owner,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+
+    let replacement_admission = map.runtime_state().join_metadata_command_recovery_until(
+        pg_id,
+        &replacement,
+        Instant::now() + Duration::from_millis(50),
+    );
+    assert!(matches!(
+        replacement_admission,
+        MetadataCommandRecoveryAdmission::Leader(_)
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command)
+    );
+}
+
+#[test]
+fn pending_slot_reissue_adopts_replacement_after_post_commit_failure() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "reissue-post-commit-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let pg_id = PgId::new(1);
+    let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    map.node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap()
+        .fail_next_pending_slot_replace_after_commit();
+
+    let replacement = cluster
+        .test_reissue_pending_metadata_command(pg_id, &command)
+        .unwrap()
+        .expect("reissue must inspect and adopt a replacement committed before failure");
+    assert_eq!(replacement.id().log_index().get(), 2);
+    assert_eq!(replacement.payload(), command.payload());
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(replacement)
+    );
 }
 
 #[test]
@@ -2420,13 +2951,15 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
         &stale_command,
     );
 
+    let mut work_budget = RequestWorkBudget::new(Duration::from_secs(10), None)
+        .for_operation("test_stream_append_duplicate_index_reissue")
+        .for_pg(PgId::new(object_pg));
     cluster
         .apply_new_stream_append_command(
             PgId::new(object_pg),
             &bucket,
             &stale_command,
-            &segment,
-            &shard_batch,
+            &mut work_budget,
         )
         .unwrap();
 

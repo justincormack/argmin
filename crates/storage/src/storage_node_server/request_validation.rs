@@ -55,20 +55,30 @@ impl StorageNodeConnectionHandler {
             .map(|_| request.replacement.bucket_name().clone());
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         metadata_mutation_route_guard_or_return!(self);
-        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
-            pg.replace_pending_metadata_command_slot_for_reissue(
+        let response = match self.node.get_pg(request.pg_id.get()) {
+            Ok(pg) => match pg.replace_pending_metadata_command_slot_for_reissue(
                 self.config.node_id.as_u32(),
                 &request.previous,
                 &request.replacement,
                 canonical_scope_bucket.as_ref(),
-            )
-        }) {
+            ) {
             Ok(removed) => {
                 let payload = encode_metadata_command_pending_slot_remove_response(
                     &StorageRpcMetadataCommandPendingSlotRemoveResponse { removed },
                 );
                 encode_storage_rpc_success_response(&payload)
             }
+                Err(crate::pg_store::PendingMetadataCommandSlotReplaceError::Definitive(error)) => {
+                    encode_storage_rpc_error_response(&store_error_response(error))?
+                }
+                Err(crate::pg_store::PendingMetadataCommandSlotReplaceError::MayHaveApplied(_)) => {
+                    encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::MetadataCommandMutationUncertain,
+                        message: "metadata command pending slot replacement outcome is uncertain"
+                            .to_string(),
+                    })?
+                }
+            },
             Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
         };
         Ok(response)
@@ -203,7 +213,16 @@ impl StorageNodeConnectionHandler {
                 );
                 encode_storage_rpc_success_response(&payload)
             }
-            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+            Err(crate::pg_store::PendingMetadataCommandSlotReplaceError::Definitive(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
+            Err(crate::pg_store::PendingMetadataCommandSlotReplaceError::MayHaveApplied(_)) => {
+                encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::MetadataCommandMutationUncertain,
+                    message: "metadata command recovery pending slot replacement outcome is uncertain"
+                        .to_string(),
+                })?
+            }
         };
         Ok(response)
     }

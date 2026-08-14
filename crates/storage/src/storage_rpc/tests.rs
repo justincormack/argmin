@@ -994,6 +994,40 @@ mod tests {
     }
 
     #[test]
+    fn metadata_command_pending_slot_cleanup_response_round_trips() {
+        for response in [
+            StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(false),
+            },
+            StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(true),
+            },
+            StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                outcome:
+                    StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+                        node_id: 7,
+                        pg_id: 11,
+                        cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                        log_index: 12,
+                    },
+            },
+            StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+                    node_id: 7,
+                    pg_id: 11,
+                    cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                    log_index: 12,
+                },
+            },
+        ] {
+            let bytes = encode_metadata_command_pending_slot_cleanup_response(&response);
+            let decoded = decode_metadata_command_pending_slot_cleanup_response(&bytes).unwrap();
+
+            assert_eq!(decoded, response);
+        }
+    }
+
+    #[test]
     fn metadata_command_next_id_request_and_response_round_trip() {
         let request = StorageRpcMetadataCommandNextIdRequest {
             node_id: NodeId::new(7),

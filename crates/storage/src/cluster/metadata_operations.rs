@@ -439,10 +439,25 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        self.metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
+        self.metadata_command_is_applied_on_all_acting_nodes_with_route_mode_and_deadline(
             pg_id,
             command,
             MetadataCommandRouteMode::Normal,
+            None,
+        )
+    }
+
+    fn metadata_command_is_applied_on_all_acting_nodes_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.metadata_command_is_applied_on_all_acting_nodes_with_route_mode_and_deadline(
+            pg_id,
+            command,
+            MetadataCommandRouteMode::Normal,
+            Some(deadline),
         )
     }
 
@@ -451,6 +466,21 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.metadata_command_is_applied_on_all_acting_nodes_with_route_mode_and_deadline(
+            pg_id,
+            command,
+            route_mode,
+            None,
+        )
+    }
+
+    fn metadata_command_is_applied_on_all_acting_nodes_with_route_mode_and_deadline(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Option<Instant>,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let mut expected_hashes = None;
         let nodes = match route_mode {
@@ -465,10 +495,23 @@ impl StorageCluster {
                 ),
         }?;
         for node in nodes {
-            let hashes = match node
-                .metadata_command_inspection_client()
-                .applied_metadata_command_log_entry_hashes(pg_id, command)
-            {
+            let client = node.metadata_command_inspection_client();
+            #[cfg(test)]
+            let injected = deadline.and_then(|deadline| {
+                request_ops::maybe_run_post_budget_metadata_command_inspection_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    node.node_id(),
+                    deadline,
+                )
+            });
+            let result = match deadline {
+                #[cfg(test)]
+                Some(_) if injected.is_some() => injected.expect("checked injected probe"),
+                Some(deadline) => client
+                    .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline),
+                None => client.applied_metadata_command_log_entry_hashes(pg_id, command),
+            };
+            let hashes = match result {
                 Ok(Some(hashes)) => hashes,
                 Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => {
                     return Ok(false);
@@ -857,6 +900,30 @@ impl StorageCluster {
             .map(Some)
     }
 
+    fn retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        applied_nodes: usize,
+        source: &BucketSnapshotLoadError,
+        deadline: Instant,
+    ) -> Result<Option<bool>, BucketSnapshotLoadError> {
+        if !Self::metadata_command_log_conflict_matches(command, source)
+            || !self.partial_exact_metadata_command_conflict_is_retryable_with_route_mode_until(
+                pg_id,
+                command,
+                applied_nodes,
+                source,
+                MetadataCommandRouteMode::Normal,
+                deadline,
+            )?
+        {
+            return Ok(None);
+        }
+        self.metadata_command_is_applied_on_all_acting_nodes_until(pg_id, command, deadline)
+            .map(Some)
+    }
+
     fn exact_metadata_command_conflict_is_retryable(
         &self,
         pg_id: PgId,
@@ -945,6 +1012,9 @@ impl StorageCluster {
         current: MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let deadline = Instant::now()
+            .checked_add(METADATA_COMMAND_REISSUE_BUDGET)
+            .unwrap_or_else(Instant::now);
         match self.matching_reissued_pending_command_outcome_with_route_mode(
             pg_id,
             primary_node_id,
@@ -954,6 +1024,7 @@ impl StorageCluster {
             expected_payload,
             current,
             route_mode,
+            deadline,
         )? {
             ReissuePendingMetadataCommandOutcome::Reissued(command)
             | ReissuePendingMetadataCommandOutcome::MatchingCurrent(command) => Ok(Some(command)),
@@ -975,13 +1046,15 @@ impl StorageCluster {
         expected_payload: &MetadataCommandPayload,
         current: MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
+        deadline: Instant,
     ) -> Result<ReissuePendingMetadataCommandOutcome, StoreError> {
         let payload_matches = current.payload() == expected_payload;
         let current_log_index = current.id().log_index().get();
-        let primary_state = primary_metadata_client.metadata_command_replica_state(pg_id)?;
+        let primary_state =
+            primary_metadata_client.metadata_command_replica_state_until(pg_id, deadline)?;
         if current_log_index == primary_state.applied_log_index {
             let Some((_, log_hash)) = primary_metadata_client
-                .applied_metadata_command_log_entry_hashes(pg_id, &current)?
+                .applied_metadata_command_log_entry_hashes_until(pg_id, &current, deadline)?
             else {
                 return Err(self.metadata_command_conflict(
                     primary_node_id,
@@ -999,7 +1072,7 @@ impl StorageCluster {
             if !payload_matches {
                 return Ok(ReissuePendingMetadataCommandOutcome::Missing);
             }
-            return match self.matching_terminal_pending_command_if_safe(
+            return match self.matching_terminal_pending_command_if_safe_until(
                 pg_id,
                 primary_node_id,
                 primary_metadata_client,
@@ -1007,6 +1080,7 @@ impl StorageCluster {
                 &primary_state,
                 &current,
                 route_mode,
+                deadline,
             ) {
                 Ok(()) => Ok(ReissuePendingMetadataCommandOutcome::MatchingCurrent(current)),
                 Err(source @ StoreError::MetadataCommandLogConflict { .. }) => Ok(
@@ -1077,19 +1151,19 @@ impl StorageCluster {
         for node in nodes {
             let node_max_log_index = node
                 .metadata_command_inspection_client()
-                .max_metadata_command_log_index(pg_id, route_epoch)?;
+                .max_metadata_command_log_index_until(pg_id, route_epoch, deadline)?;
             let node_state = node
                 .metadata_command_inspection_client()
-                .metadata_command_replica_state(pg_id)?;
+                .metadata_command_replica_state_until(pg_id, deadline)?;
             let replacement_match = if node_max_log_index < current_log_index {
                 ReissuedPendingCommandReplicaMatch::BelowReplacement
-            } else if node
-                .metadata_command_inspection_client()
-                .has_matching_applied_metadata_command_log_entry(
-                    pg_id,
-                    &current,
-                    primary_state.applied_log_hash.value(),
-                )?
+            } else if Self::has_matching_applied_metadata_command_log_entry_until(
+                node.metadata_command_inspection_client().as_ref(),
+                pg_id,
+                &current,
+                primary_state.applied_log_hash.value(),
+                deadline,
+            )?
             {
                 ReissuedPendingCommandReplicaMatch::MatchesHashChain
             } else {
@@ -1145,7 +1219,31 @@ impl StorageCluster {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn matching_terminal_pending_command_if_safe(
+    fn has_matching_applied_metadata_command_log_entry_until(
+        client: &dyn MetadataCommandInspectionNodeClient,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        expected_previous_log_hash: u64,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        let Some((previous_log_hash, log_hash)) = client
+            .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline)?
+        else {
+            return Ok(false);
+        };
+        let expected_log_hash = metadata_command_log_hash(
+            command.id().cluster_epoch(),
+            pg_id,
+            command.id().log_index(),
+            expected_previous_log_hash,
+            command.checksum_crc64(),
+        );
+        Ok(previous_log_hash == expected_previous_log_hash
+            && log_hash == expected_log_hash.value())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matching_terminal_pending_command_if_safe_until(
         &self,
         pg_id: PgId,
         primary_node_id: NodeId,
@@ -1154,6 +1252,7 @@ impl StorageCluster {
         primary_state: &MetadataCommandReplicaState,
         current: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
+        deadline: Instant,
     ) -> Result<(), StoreError> {
         let current_log_index = current.id().log_index().get();
         let Some(previous_log_index) = current_log_index.checked_sub(1) else {
@@ -1167,7 +1266,9 @@ impl StorageCluster {
             ));
         }
         let Some((previous_log_hash, terminal_log_hash)) =
-            primary_metadata_client.applied_metadata_command_log_entry_hashes(pg_id, current)?
+            primary_metadata_client.applied_metadata_command_log_entry_hashes_until(
+                pg_id, current, deadline,
+            )?
         else {
             return Err(self.metadata_command_conflict(primary_node_id, pg_id, current_log_index));
         };
@@ -1190,14 +1291,22 @@ impl StorageCluster {
         for node in nodes {
             let (node_max_log_index, node_state) = if node.node_id() == primary_node_id {
                 (
-                    primary_metadata_client.max_metadata_command_log_index(pg_id, route_epoch)?,
-                    primary_metadata_client.metadata_command_replica_state(pg_id)?,
+                    primary_metadata_client.max_metadata_command_log_index_until(
+                        pg_id,
+                        route_epoch,
+                        deadline,
+                    )?,
+                    primary_metadata_client.metadata_command_replica_state_until(pg_id, deadline)?,
                 )
             } else {
                 let metadata_client = node.metadata_command_inspection_client();
                 (
-                    metadata_client.max_metadata_command_log_index(pg_id, route_epoch)?,
-                    metadata_client.metadata_command_replica_state(pg_id)?,
+                    metadata_client.max_metadata_command_log_index_until(
+                        pg_id,
+                        route_epoch,
+                        deadline,
+                    )?,
+                    metadata_client.metadata_command_replica_state_until(pg_id, deadline)?,
                 )
             };
             if node_max_log_index > current_log_index {
@@ -1221,18 +1330,21 @@ impl StorageCluster {
                 continue;
             }
             let matches_applied = if node.node_id() == primary_node_id {
-                primary_metadata_client.has_matching_applied_metadata_command_log_entry(
+                Self::has_matching_applied_metadata_command_log_entry_until(
+                    primary_metadata_client,
                     pg_id,
                     current,
                     previous_log_hash,
+                    deadline,
                 )?
             } else {
-                node.metadata_command_inspection_client()
-                    .has_matching_applied_metadata_command_log_entry(
-                        pg_id,
-                        current,
-                        previous_log_hash,
-                    )?
+                Self::has_matching_applied_metadata_command_log_entry_until(
+                    node.metadata_command_inspection_client().as_ref(),
+                    pg_id,
+                    current,
+                    previous_log_hash,
+                    deadline,
+                )?
             };
             if !matches_applied {
                 return Err(self.metadata_command_conflict(
@@ -1245,31 +1357,38 @@ impl StorageCluster {
         Ok(())
     }
 
-    fn reissue_pending_metadata_command(
+    fn reissue_pending_metadata_command_until(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
+        deadline: Instant,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
-        self.reissue_pending_metadata_command_with_route_mode(
+        self.reissue_pending_metadata_command_with_route_mode_and_recovery_guard_until(
             pg_id,
             command,
             MetadataCommandExecutionRoute::normal(),
             command.payload(),
+            None,
+            deadline,
         )
     }
 
-    fn reissue_pending_metadata_command_with_route_mode(
+    fn reissue_pending_metadata_command_with_route_mode_and_recovery_guard_until(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         execution_route: MetadataCommandExecutionRoute<'_>,
         replacement_payload: &MetadataCommandPayload,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
+        deadline: Instant,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
-        match self.reissue_pending_metadata_command_outcome_with_route_mode(
+        match self.reissue_pending_metadata_command_outcome_with_route_mode_until(
             pg_id,
             command,
             execution_route,
             replacement_payload,
+            recovery_guard,
+            deadline,
         )? {
             ReissuePendingMetadataCommandOutcome::Reissued(command)
             | ReissuePendingMetadataCommandOutcome::MatchingCurrent(command) => Ok(Some(command)),
@@ -1280,13 +1399,73 @@ impl StorageCluster {
         }
     }
 
-    fn reissue_pending_metadata_command_outcome_with_route_mode(
+    fn rollback_definitive_reissue_lineage(
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
+        pg_id: PgId,
+        source: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+    ) -> Result<(), ReissuePendingMetadataCommandFailure> {
+        let Some(recovery_guard) = recovery_guard else {
+            return Ok(());
+        };
+        recovery_guard
+            .rollback_reissued_command(pg_id, source, replacement)
+            .map_err(|error| {
+                ReissuePendingMetadataCommandFailure::MayHaveReissued {
+                    source: error.into(),
+                    lineage_tip: Box::new(replacement.clone()),
+                }
+            })
+    }
+
+    fn reissue_pending_metadata_command_outcome_with_route_mode_until(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         execution_route: MetadataCommandExecutionRoute<'_>,
         replacement_payload: &MetadataCommandPayload,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
+        deadline: Instant,
     ) -> Result<ReissuePendingMetadataCommandOutcome, BucketSnapshotLoadError> {
+        self.reissue_pending_metadata_command_outcome_with_route_mode_classified_until_with_recovery_guard(
+            pg_id,
+            command,
+            execution_route,
+            replacement_payload,
+            deadline,
+            recovery_guard,
+        )
+        .map_err(ReissuePendingMetadataCommandFailure::into_source)
+    }
+
+    fn reissue_pending_metadata_command_outcome_with_route_mode_classified_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        replacement_payload: &MetadataCommandPayload,
+        deadline: Instant,
+    ) -> Result<ReissuePendingMetadataCommandOutcome, ReissuePendingMetadataCommandFailure> {
+        self.reissue_pending_metadata_command_outcome_with_route_mode_classified_until_with_recovery_guard(
+            pg_id,
+            command,
+            execution_route,
+            replacement_payload,
+            deadline,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reissue_pending_metadata_command_outcome_with_route_mode_classified_until_with_recovery_guard(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        replacement_payload: &MetadataCommandPayload,
+        deadline: Instant,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
+    ) -> Result<ReissuePendingMetadataCommandOutcome, ReissuePendingMetadataCommandFailure> {
         execution_route.require_reissue_source(pg_id, command, replacement_payload)?;
         let route_mode = execution_route.mode;
         let recovery_authorized_source = execution_route.recovery_authorized_source;
@@ -1295,7 +1474,14 @@ impl StorageCluster {
             .local_map
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
-        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _pg_guard = lock_metadata_command_pg_until(&pg_lock, deadline).ok_or_else(|| {
+            ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                StoreError::OperationDeadlineExceeded {
+                    context: "acquire metadata command reissue PG lock",
+                }
+                .into(),
+            )
+        })?;
         let bucket = command.bucket_name().clone();
         let primary = match route_mode {
             MetadataCommandRouteMode::Normal => self
@@ -1321,10 +1507,11 @@ impl StorageCluster {
         );
         let primary_metadata_client = primary.metadata_command_recovery_client();
         let acting_set_max_log_index = self
-            .max_metadata_command_log_index_on_acting_set_with_route_mode(
+            .max_metadata_command_log_index_on_acting_set_with_route_mode_until(
                 pg_id,
                 route_mode,
                 route_epoch,
+                deadline,
             )?;
 
         enum ReissueReplaceOutcome {
@@ -1338,10 +1525,15 @@ impl StorageCluster {
 
         let replace_outcome = {
             let primary_critical_section = primary_metadata_client
-                .open_metadata_command_recovery_critical_section(pg_id, route_epoch)?;
+                .open_metadata_command_recovery_critical_section_until(
+                    pg_id,
+                    route_epoch,
+                    deadline,
+                )?;
             let primary_max_log_index =
-                primary_critical_section.max_metadata_command_log_index()?;
-            let Some(current) = primary_critical_section.pending_metadata_command_envelope()?
+                primary_critical_section.max_metadata_command_log_index_until(deadline)?;
+            let Some(current) = primary_critical_section
+                .pending_metadata_command_envelope_until(deadline)?
             else {
                 return Ok(ReissuePendingMetadataCommandOutcome::Missing);
             };
@@ -1365,28 +1557,94 @@ impl StorageCluster {
                     MetadataCommandId::new(route_epoch, pg_id, next_log_index),
                     replacement_payload.clone(),
                 );
-                let replaced = match recovery_authorized_source {
+                if let Some(recovery_guard) = recovery_guard {
+                    recovery_guard
+                        .bind_reissued_command(pg_id, command, &replacement)
+                        .map_err(|source| {
+                            ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                                source.into(),
+                            )
+                        })?;
+                }
+                let replace_result = match recovery_authorized_source {
                     None => primary_critical_section
-                        .replace_pending_metadata_command_slot_for_reissue(
+                        .replace_pending_metadata_command_slot_for_reissue_until(
                             command,
                             &replacement,
                             Some(&bucket),
+                            deadline,
                         ),
                     Some(authorized_source) => primary_critical_section
-                        .replace_pending_metadata_command_slot_for_recovery(
+                        .replace_pending_metadata_command_slot_for_recovery_until(
                             authorized_source,
                             recovery_abandoned_source,
                             command,
                             &replacement,
                             Some(&bucket),
+                            deadline,
                         ),
-                }?;
+                };
+                let replaced = match replace_result {
+                    Ok(replaced) => replaced,
+                    Err(error)
+                        if error.kind()
+                            == crate::node_client::MetadataCommandApplyErrorKind::MayHaveApplied =>
+                    {
+                        let source = error.into_source();
+                        match primary_critical_section
+                            .pending_metadata_command_envelope_until(deadline)
+                        {
+                            Ok(Some(current)) if current == replacement => true,
+                            Ok(Some(current)) if current == *command => {
+                                Self::rollback_definitive_reissue_lineage(
+                                    recovery_guard,
+                                    pg_id,
+                                    command,
+                                    &replacement,
+                                )?;
+                                return Err(
+                                    ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                                        source.into(),
+                                    ),
+                                );
+                            }
+                            Ok(_) | Err(_) => {
+                                return Err(
+                                    ReissuePendingMetadataCommandFailure::MayHaveReissued {
+                                        source: source.into(),
+                                        lineage_tip: Box::new(replacement.clone()),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        Self::rollback_definitive_reissue_lineage(
+                            recovery_guard,
+                            pg_id,
+                            command,
+                            &replacement,
+                        )?;
+                        return Err(
+                            ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                                error.into_source().into(),
+                            ),
+                        );
+                    }
+                };
                 if replaced {
                     ReissueReplaceOutcome::Replaced(replacement)
                 } else {
-                    let current = primary_critical_section.pending_metadata_command_envelope()?;
+                    Self::rollback_definitive_reissue_lineage(
+                        recovery_guard,
+                        pg_id,
+                        command,
+                        &replacement,
+                    )?;
+                    let current = primary_critical_section
+                        .pending_metadata_command_envelope_until(deadline)?;
                     let primary_max_log_index =
-                        primary_critical_section.max_metadata_command_log_index()?;
+                        primary_critical_section.max_metadata_command_log_index_until(deadline)?;
                     match current {
                         Some(current) => ReissueReplaceOutcome::Reload {
                             current,
@@ -1407,12 +1665,13 @@ impl StorageCluster {
                 primary_max_log_index,
             } => {
                 let acting_set_max_log_index = self
-                    .max_metadata_command_log_index_on_acting_set_with_route_mode(
+                    .max_metadata_command_log_index_on_acting_set_with_route_mode_until(
                         pg_id,
                         route_mode,
                         route_epoch,
+                        deadline,
                     )?;
-                self.matching_reissued_pending_command_outcome_with_route_mode(
+                let outcome = self.matching_reissued_pending_command_outcome_with_route_mode(
                     pg_id,
                     primary.node_id(),
                     primary.metadata_command_inspection_client().as_ref(),
@@ -1421,8 +1680,33 @@ impl StorageCluster {
                     replacement_payload,
                     current,
                     route_mode,
+                    deadline,
                 )
-                .map_err(BucketSnapshotLoadError::from)
+                .map_err(ReissuePendingMetadataCommandFailure::from)?;
+                if let Some(recovery_guard) = recovery_guard {
+                    let replacement = match &outcome {
+                        ReissuePendingMetadataCommandOutcome::Reissued(command)
+                        | ReissuePendingMetadataCommandOutcome::MatchingCurrent(command) => {
+                            Some(command)
+                        }
+                        ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                            command,
+                            ..
+                        } => Some(command),
+                        ReissuePendingMetadataCommandOutcome::Missing => None,
+                    };
+                    if let Some(replacement) = replacement.filter(|replacement| *replacement != command)
+                    {
+                        recovery_guard
+                            .bind_reissued_command(pg_id, command, replacement)
+                            .map_err(|source| {
+                                ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                                    source.into(),
+                                )
+                            })?;
+                    }
+                }
+                Ok(outcome)
             }
         }
     }
@@ -1433,14 +1717,55 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<Option<MetadataCommandEnvelope>, BucketSnapshotLoadError> {
-        self.reissue_pending_metadata_command(pg_id, command)
+        let deadline = Instant::now()
+            .checked_add(METADATA_COMMAND_REISSUE_BUDGET)
+            .unwrap_or_else(Instant::now);
+        self.reissue_pending_metadata_command_until(pg_id, command, deadline)
     }
 
-    fn max_metadata_command_log_index_on_acting_set_with_route_mode(
+    #[cfg(test)]
+    pub(crate) fn test_reissue_pending_metadata_command_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.reissue_pending_metadata_command_outcome_with_route_mode_classified_until(
+            pg_id,
+            command,
+            MetadataCommandExecutionRoute::normal(),
+            command.payload(),
+            deadline,
+        )
+        .map(|_| ())
+        .map_err(ReissuePendingMetadataCommandFailure::into_source)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_reissue_pending_metadata_command_with_recovery_guard_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        recovery_guard: &MetadataCommandRecoveryGuard,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.reissue_pending_metadata_command_outcome_with_route_mode_until(
+            pg_id,
+            command,
+            MetadataCommandExecutionRoute::normal(),
+            command.payload(),
+            Some(recovery_guard),
+            deadline,
+        )
+        .map(|_| ())
+    }
+
+    fn max_metadata_command_log_index_on_acting_set_with_route_mode_until(
         &self,
         pg_id: PgId,
         route_mode: MetadataCommandRouteMode,
         route_epoch: ClusterEpoch,
+        deadline: Instant,
     ) -> Result<u64, StoreError> {
         let mut max_log_index = 0;
         let nodes = match route_mode {
@@ -1454,7 +1779,11 @@ impl StorageCluster {
         for node in nodes {
             let metadata_client = node.metadata_command_inspection_client();
             max_log_index = max_log_index
-                .max(metadata_client.max_metadata_command_log_index(pg_id, route_epoch)?);
+                .max(metadata_client.max_metadata_command_log_index_until(
+                    pg_id,
+                    route_epoch,
+                    deadline,
+                )?);
         }
         Ok(max_log_index)
     }
@@ -3993,6 +4322,33 @@ impl StorageCluster {
         primary
             .metadata_command_client()
             .pending_metadata_command_envelope(pg_id, route_epoch)
+    }
+
+    fn pending_metadata_command_for_bucket_with_route_mode_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        route_mode: MetadataCommandRouteMode,
+        route_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let _ = bucket;
+        let primary = match route_mode {
+            MetadataCommandRouteMode::Normal => {
+                self.local_map.metadata_pg_primary_node(route_epoch, pg_id)
+            }
+            MetadataCommandRouteMode::Recovery => self
+                .local_map
+                .metadata_pg_primary_node_for_metadata_command_recovery(route_epoch, pg_id),
+        }?;
+        primary
+            .metadata_command_recovery_client()
+            .open_metadata_command_recovery_critical_section_until(
+                pg_id,
+                route_epoch,
+                deadline,
+            )?
+            .pending_metadata_command_envelope_until(deadline)
     }
 
     fn drain_pending_metadata_commands_for_current_map(

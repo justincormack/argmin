@@ -323,6 +323,31 @@ mod pending_command_terminal_cleanup_tests {
     }
 
     #[test]
+    fn inconclusive_multipart_apply_rewrites_only_non_conflict_convergence_failures() {
+        assert!(inconclusive_multipart_apply_failure_requires_uncertainty(
+            &BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
+                cluster_epoch: ClusterEpoch::INITIAL,
+                valid_until_ms: 1,
+                now_ms: 2,
+            })
+        ));
+        assert!(!inconclusive_multipart_apply_failure_requires_uncertainty(
+            &BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                context: "test multipart apply",
+                reason: "test invariant".to_string(),
+            })
+        ));
+        assert!(!inconclusive_multipart_apply_failure_requires_uncertainty(
+            &BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            })
+        ));
+    }
+
+    #[test]
     fn auxiliary_multipart_reservation_accepts_only_exact_not_found_identity() {
         let proof = BucketWriteReservationProof {
             bucket: BucketName::try_from("cleanup-identity-bucket").unwrap(),
@@ -424,6 +449,52 @@ mod pending_command_terminal_cleanup_tests {
             "the remote cleanup committed before response loss"
         );
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn pending_slot_remove_defers_missing_terminal_entry() {
+        let cleanup = remove_pending_metadata_command_slot_after_terminal_outcome(
+            PgId::new(7),
+            None,
+            || {
+                Err(StoreError::MetadataCommandTerminalEntryPending {
+                    node_id: 2,
+                    pg_id: 7,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 11,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(cleanup, PendingMetadataCommandTerminalCleanup::Deferred);
+    }
+
+    #[test]
+    fn pending_slot_remove_fails_closed_on_terminal_log_divergence() {
+        let error = remove_pending_metadata_command_slot_after_terminal_outcome(
+            PgId::new(7),
+            None,
+            || {
+                Err(StoreError::MetadataCommandLogConflict {
+                    node_id: 2,
+                    pg_id: 7,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 11,
+                })
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::MetadataCommandLogConflict {
+                node_id: 2,
+                pg_id: 7,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 11,
+            }
+        ));
     }
 
     #[test]

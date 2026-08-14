@@ -176,6 +176,7 @@ use crate::storage_rpc::{
     encode_metadata_command_log_hash_range_response,
     encode_metadata_command_max_log_index_response, encode_metadata_command_next_id_response,
     encode_metadata_command_pending_envelope_response,
+    encode_metadata_command_pending_slot_cleanup_response,
     encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_pending_slot_remove_response,
     encode_metadata_command_state_outcome_response, encode_metadata_command_state_response,
@@ -265,6 +266,8 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandMaxLogIndexResponse, StorageRpcMetadataCommandNextIdOutcome,
     StorageRpcMetadataCommandNextIdRequest, StorageRpcMetadataCommandNextIdResponse,
     StorageRpcMetadataCommandPendingEnvelopeResponse,
+    StorageRpcMetadataCommandPendingSlotCleanupOutcome,
+    StorageRpcMetadataCommandPendingSlotCleanupResponse,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotInsertResponse,
     StorageRpcMetadataCommandPendingSlotRemoveResponse,
@@ -323,11 +326,11 @@ use crate::storage_rpc::{
     StorageRpcShardAckBatchRequest, StorageRpcShardAckItem, StorageRpcShardAckItemRequest,
     StorageRpcShardDeleteRequest, StorageRpcShardLocation, StorageRpcShardReadRangeRequest,
     StorageRpcShardReadRequest, StorageRpcShardWriteRequest, StorageRpcStreamError,
-    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotRequest,
-    StorageRpcStreamPartFinalizeSnapshotResponse, StorageRpcStreamPutCommitCommandBuildRequest,
-    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamPutFinalizeSnapshotResponse,
-    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
-    StorageRpcStreamSegmentAppendPrepareResponse,
+    StorageRpcStreamPartCommitCommandBuildRequest, StorageRpcStreamPartFinalizeSnapshotOutcome,
+    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPartFinalizeSnapshotResponse,
+    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
+    StorageRpcStreamPutFinalizeSnapshotResponse, StorageRpcStreamSegmentAppendPrepareOutcome,
+    StorageRpcStreamSegmentAppendPrepareRequest, StorageRpcStreamSegmentAppendPrepareResponse,
     StorageRpcStreamUploadBucketWriteReservationUpdateRequest, StorageRpcStreamUploadMatchRequest,
     StorageRpcStreamUploadMatchResponse, StorageRpcStreamUploadSegmentsOutcome,
     StorageRpcStreamUploadSegmentsResponse, StorageRpcStreamUploadSessionOutcome,
@@ -372,6 +375,9 @@ type MetadataCommandBeforeWaitHook = Arc<dyn Fn(PgId) + Send + Sync>;
 #[cfg(test)]
 type StorageRpcResponseEnvelopeTestHook =
     Arc<dyn Fn(StorageRpcMessageKind, &mut Vec<u8>) + Send + Sync>;
+#[cfg(test)]
+type StorageRpcResponseFrameTestHook =
+    Arc<dyn Fn(StorageRpcMessageKind, &mut StorageRpcFrame) + Send + Sync>;
 #[cfg(test)]
 type MetadataCommandBeforeCommitTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) + Send + Sync>;
@@ -533,6 +539,19 @@ impl StorageNodeConnectionHandler {
         request_auth: Option<&StorageRpcResponseSigningContext>,
         response: &StorageRpcFrame,
     ) -> Result<(), StorageRpcStreamError> {
+        #[cfg(test)]
+        let mut response = response.clone();
+        #[cfg(test)]
+        if let Some(hook) = self
+            .response_frame_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            hook(response.kind, &mut response);
+        }
+        #[cfg(test)]
+        let response = &response;
         let Some(auth) = self.rpc_auth.as_deref() else {
             return write_storage_rpc_frame_to(stream, response);
         };
@@ -5149,12 +5168,17 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        let snapshot = match route.load_stream_part_finalize_snapshot(
+        let outcome = match route.load_stream_part_finalize_snapshot(
             &request.upload_id,
             &request.session_id,
             request.part_number,
         ) {
-            Ok(snapshot) => snapshot,
+            Ok(snapshot) => StorageRpcStreamPartFinalizeSnapshotOutcome::Loaded(Box::new(snapshot)),
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::NoSuchUpload { .. },
+            ))) => StorageRpcStreamPartFinalizeSnapshotOutcome::NoSuchUpload {
+                upload_id: request.upload_id,
+            },
             Err(StorageNodeObjectRouteError::Route(error)) => {
                 return encode_storage_rpc_error_response(&error);
             }
@@ -5163,7 +5187,7 @@ impl StorageNodeConnectionHandler {
             }
         };
         let payload = encode_stream_part_finalize_snapshot_response(
-            &StorageRpcStreamPartFinalizeSnapshotResponse { snapshot },
+            &StorageRpcStreamPartFinalizeSnapshotResponse { outcome },
         )?;
         Ok(encode_storage_rpc_success_response(&payload))
     }
@@ -5198,6 +5222,9 @@ impl StorageNodeConnectionHandler {
             Err(StorageNodeObjectRouteError::Object(
                 ObjectPgActionError::StaleStreamFinalizeSnapshot,
             )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::NoSuchUpload { .. },
+            ))) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
             Err(StorageNodeObjectRouteError::Route(error)) => {
                 return encode_storage_rpc_error_response(&error);
             }
@@ -5237,6 +5264,9 @@ impl StorageNodeConnectionHandler {
             Err(StorageNodeObjectRouteError::Object(
                 ObjectPgActionError::StaleMultipartCompletionSnapshot,
             )) => StorageRpcObjectMetadataCommandBuildOutcome::StaleSnapshot,
+            Err(StorageNodeObjectRouteError::Object(ObjectPgActionError::Metadata(
+                MetadataError::NoSuchUpload { .. },
+            ))) => StorageRpcObjectMetadataCommandBuildOutcome::Missing,
             Err(StorageNodeObjectRouteError::Route(error)) => {
                 return encode_storage_rpc_error_response(&error);
             }
@@ -8875,8 +8905,53 @@ impl StorageNodeConnectionHandler {
             pg.remove_pending_metadata_command_slot(self.config.node_id.as_u32(), &request.command)
         }) {
             Ok(removed) => {
-                let payload = encode_metadata_command_pending_slot_remove_response(
-                    &StorageRpcMetadataCommandPendingSlotRemoveResponse { removed },
+                let payload = encode_metadata_command_pending_slot_cleanup_response(
+                    &StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                        outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(removed),
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandTerminalEntryPending {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                let payload = encode_metadata_command_pending_slot_cleanup_response(
+                    &StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                        outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
+                );
+                encode_storage_rpc_success_response(&payload)
+            }
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }) => {
+                emit_storage_node_metadata_command_log_conflict(
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                    Some(request.command.payload().kind_name()),
+                );
+                let payload = encode_metadata_command_pending_slot_cleanup_response(
+                    &StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                        outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+                            node_id,
+                            pg_id,
+                            cluster_epoch,
+                            log_index,
+                        },
+                    },
                 );
                 encode_storage_rpc_success_response(&payload)
             }

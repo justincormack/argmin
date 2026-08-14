@@ -129,6 +129,19 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_stream_put_pending_drain_hook(
+        &self,
+        hook: StreamPutPendingDrainTestHook,
+    ) -> StreamPutPendingDrainTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = STREAM_PUT_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        StreamPutPendingDrainTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_before_bucket_delete_command_id_hook(
         &self,
         hook: BucketDeleteCommandIdTestHook,
@@ -690,13 +703,42 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         initial_progress: MetadataCommandApplyProgress,
     ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
+        self.apply_recovered_pending_metadata_command_to_acting_set_with_initial_progress_until(
+            command,
+            initial_progress,
+            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET,
+        )
+    }
+
+    pub(super) fn apply_recovered_pending_metadata_command_to_acting_set_with_initial_progress_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        initial_progress: MetadataCommandApplyProgress,
+        deadline: Instant,
+    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
         self.apply_metadata_command_to_acting_set_with_route_mode_until_inner(
             command,
             MetadataCommandExecutionRoute::normal(),
             self,
             initial_progress,
-            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET,
+            deadline,
             MetadataCommandApplyProgressProvenance::RecoveredPending,
+        )
+    }
+
+    pub(super) fn apply_metadata_command_to_acting_set_with_initial_progress_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        initial_progress: MetadataCommandApplyProgress,
+        deadline: Instant,
+    ) -> Result<MetadataCommandApplyOutcome, MetadataCommandApplyFailure> {
+        self.apply_metadata_command_to_acting_set_with_route_mode_until_inner(
+            command,
+            MetadataCommandExecutionRoute::normal(),
+            self,
+            initial_progress,
+            deadline,
+            MetadataCommandApplyProgressProvenance::Authoritative,
         )
     }
 
@@ -2037,14 +2079,14 @@ impl super::StorageCluster {
         )
     }
 
-    fn finish_pending_metadata_command_to_acting_set_with_work_budget(
+    pub(super) fn finish_pending_metadata_command_to_acting_set_with_work_budget(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<super::PendingMetadataCommandOutcome, BucketSnapshotLoadError> {
-        match self.finish_pending_metadata_command_to_acting_set_inner(
+        match self.finish_pending_metadata_command_to_acting_set_coordinated_inner(
             pg_id,
             command,
             MetadataCommandFinishPolicy {
@@ -2085,6 +2127,7 @@ impl super::StorageCluster {
             },
             MetadataCommandExecutionRoute::normal(),
             work_budget,
+            None,
         )? {
             FinishPendingMetadataCommandResult::Applied => {
                 Ok(super::PendingMetadataCommandOutcome::Applied)
@@ -2105,7 +2148,7 @@ impl super::StorageCluster {
         clear_pending_on_zero_apply: bool,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
-        self.finish_pending_metadata_command_to_acting_set_inner(
+        self.finish_pending_metadata_command_to_acting_set_coordinated_inner(
             pg_id,
             command,
             MetadataCommandFinishPolicy {
@@ -2119,15 +2162,38 @@ impl super::StorageCluster {
         )
     }
 
+    pub(super) fn finish_pending_metadata_command_to_acting_set_under_recovery_leader_with_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        clear_pending_on_zero_apply: bool,
+        leader: &mut MetadataCommandRecoveryLeader<'_>,
+    ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+        let (work_budget, _proof, recovery_guard) = leader.parts_with_guard();
+        self.finish_pending_metadata_command_to_acting_set_inner(
+            pg_id,
+            command,
+            MetadataCommandFinishPolicy {
+                clear_pending_on_zero_apply,
+                retry_partial_exact_conflict: true,
+                convergence_requirement:
+                    MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+            },
+            MetadataCommandExecutionRoute::normal(),
+            work_budget,
+            Some(recovery_guard),
+        )
+    }
+
     pub(super) fn finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget(
         &self,
-        recovery_proof: MetadataCommandRecoveryProof<'_>,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
         recovery_authorized_source: Option<&MetadataCommandEnvelope>,
-        work_budget: &mut super::RequestWorkBudget,
+        leader: &mut MetadataCommandRecoveryLeader<'_>,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+        let (work_budget, recovery_proof, recovery_guard) = leader.parts_with_guard();
         self.finish_pending_metadata_command_to_acting_set_inner(
             pg_id,
             command,
@@ -2143,7 +2209,169 @@ impl super::StorageCluster {
                 None,
             ),
             work_budget,
+            Some(recovery_guard),
         )
+    }
+
+    fn finish_pending_metadata_command_to_acting_set_coordinated_inner(
+        &self,
+        pg_id: PgId,
+        initial_command: &MetadataCommandEnvelope,
+        policy: MetadataCommandFinishPolicy,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
+        debug_assert_eq!(execution_route.mode, MetadataCommandRouteMode::Normal);
+        let mut command = initial_command.clone();
+        loop {
+            match self
+                .local_map
+                .runtime_state()
+                .join_metadata_command_recovery_until(pg_id, &command, work_budget.deadline())
+            {
+                MetadataCommandRecoveryAdmission::Leader(guard) => {
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id,
+                        &command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Leader,
+                        0,
+                    );
+                    let outcome = self.finish_pending_metadata_command_to_acting_set_inner(
+                        pg_id,
+                        &command,
+                        policy,
+                        execution_route,
+                        work_budget,
+                        Some(&guard),
+                    )?;
+                    self.emit_metadata_command_recovery_outcome_for_command(
+                        pg_id,
+                        &command,
+                        match outcome {
+                            FinishPendingMetadataCommandResult::Applied => "applied",
+                            FinishPendingMetadataCommandResult::Abandoned => "abandoned",
+                            FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
+                                "retry_partial_exact_conflict"
+                            }
+                        },
+                    );
+                    return Ok(outcome);
+                }
+                MetadataCommandRecoveryAdmission::Waited {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id,
+                        &command,
+                        observability::MetadataCommandRecoveryAdmissionKind::Waited,
+                        wait_us,
+                    );
+                    if let Err(error) =
+                        work_budget.check("metadata command recovery waiter budget exhausted")
+                    {
+                        return Err(self
+                            .classify_bucket_metadata_command_budget_exhaustion(
+                                pg_id,
+                                &command,
+                                policy.convergence_requirement,
+                                error,
+                            )?
+                            .into());
+                    }
+                    let waiter_outcome = self
+                        .pending_command_recovery_waiter_outcome_with_route_mode_until(
+                            pg_id,
+                            &command,
+                            MetadataCommandRouteMode::Normal,
+                            work_budget.deadline(),
+                        )
+                        .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                    self.emit_metadata_command_recovery_outcome_for_command(
+                        pg_id,
+                        &command,
+                        waiter_outcome.metric_label(),
+                    );
+                    match waiter_outcome {
+                        MetadataCommandRecoveryWaiterOutcome::StillPending => continue,
+                        MetadataCommandRecoveryWaiterOutcome::Applied => {
+                            return Ok(FinishPendingMetadataCommandResult::Applied);
+                        }
+                        MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
+                        | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                            return Ok(FinishPendingMetadataCommandResult::Abandoned);
+                        }
+                    }
+                }
+                MetadataCommandRecoveryAdmission::TimedOut {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
+                    self.emit_metadata_command_recovery_admission_for_command(
+                        pg_id,
+                        &command,
+                        observability::MetadataCommandRecoveryAdmissionKind::TimedOut,
+                        wait_us,
+                    );
+                    self.emit_metadata_command_recovery_outcome_for_command(
+                        pg_id,
+                        &command,
+                        "timed_out",
+                    );
+                    if let Err(error) = work_budget.sleep_after_contention(
+                        "metadata command recovery gate retry budget exhausted",
+                    ) {
+                        return Err(self
+                            .classify_bucket_metadata_command_budget_exhaustion(
+                                pg_id,
+                                &command,
+                                policy.convergence_requirement,
+                                error,
+                            )?
+                            .into());
+                    }
+                }
+            }
+        }
+    }
+
+    fn classify_bucket_metadata_command_budget_exhaustion(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        convergence_requirement: MetadataCommandConvergenceRequirement,
+        budget_error: StoreError,
+    ) -> Result<StoreError, BucketSnapshotLoadError> {
+        let confirmation_deadline =
+            Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+        if self.metadata_command_publication_state_on_acting_set_until(
+            pg_id,
+            command,
+            MetadataCommandRouteMode::Normal,
+            confirmation_deadline,
+        )? == MetadataCommandPublicationState::NotPublished
+        {
+            return Ok(budget_error);
+        }
+        let id = command.id();
+        Ok(match convergence_requirement {
+            MetadataCommandConvergenceRequirement::AllowRecoveryHandoff => {
+                StoreError::MetadataCommandIrrevocableConvergencePending {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                }
+            }
+            MetadataCommandConvergenceRequirement::RequireAllReplicas => {
+                StoreError::MetadataCommandDependencyConvergencePending {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                }
+            }
+        })
     }
 
     fn finish_pending_metadata_command_to_acting_set_inner(
@@ -2153,6 +2381,7 @@ impl super::StorageCluster {
         policy: MetadataCommandFinishPolicy,
         mut execution_route: MetadataCommandExecutionRoute<'_>,
         work_budget: &mut super::RequestWorkBudget,
+        recovery_guard: Option<&super::MetadataCommandRecoveryGuard>,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
         execution_route.require_command(pg_id, command)?;
         let route_mode = execution_route.mode;
@@ -2370,11 +2599,13 @@ impl super::StorageCluster {
                         )
                     {
                         let Some(reissued) = self
-                            .reissue_pending_metadata_command_with_route_mode(
+                            .reissue_pending_metadata_command_with_route_mode_and_recovery_guard_until(
                                 pg_id,
                                 &command,
                                 execution_route,
                                 command.payload(),
+                                recovery_guard,
+                                work_budget.deadline(),
                             )?
                         else {
                             return Ok(FinishPendingMetadataCommandResult::Abandoned);

@@ -25,6 +25,52 @@ pub trait StorageRpcStream: Read + Write + Send {
 
 pub type BoxStorageRpcStream = Box<dyn StorageRpcStream>;
 
+#[derive(Debug)]
+pub(crate) enum StorageRpcEndpointConnectFailure {
+    Transport(io::Error),
+    Internal(io::Error),
+}
+
+impl StorageRpcEndpointConnectFailure {
+    fn transport(error: io::Error) -> Self {
+        Self::Transport(error)
+    }
+
+    fn internal(error: io::Error) -> Self {
+        Self::Internal(error)
+    }
+
+    fn classify_endpoint_io(error: io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::NotFound
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+            | io::ErrorKind::AddrNotAvailable
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::UnexpectedEof => Self::Transport(error),
+            _ => Self::Internal(error),
+        }
+    }
+
+    fn classify_connect_io(error: io::Error) -> Self {
+        Self::Transport(error)
+    }
+
+    #[cfg(test)]
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Transport(error) | Self::Internal(error) => error,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct StorageRpcClientEndpoint {
     inner: StorageRpcClientEndpointInner,
@@ -200,19 +246,24 @@ impl StorageRpcClientEndpoint {
         matches!(&self.inner, StorageRpcClientEndpointInner::Tcp { .. })
     }
 
-    pub(crate) fn connect(&self, deadline: Instant) -> io::Result<BoxStorageRpcStream> {
+    pub(crate) fn connect_classified(
+        &self,
+        deadline: Instant,
+    ) -> Result<BoxStorageRpcStream, StorageRpcEndpointConnectFailure> {
         match &self.inner {
             StorageRpcClientEndpointInner::Unix { socket_path, .. } => {
                 let stream = connect_unix_stream_until(
                     socket_path,
                     deadline,
                     "storage RPC absolute operation deadline expired",
-                )?;
+                )
+                .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
                 let stream = DeadlineStream::new(
                     stream,
                     deadline,
                     "storage RPC absolute operation deadline expired",
-                )?;
+                )
+                .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
                 Ok(Box::new(stream))
             }
             #[cfg(test)]
@@ -221,12 +272,14 @@ impl StorageRpcClientEndpoint {
                     socket_path,
                     deadline,
                     "storage RPC absolute operation deadline expired",
-                )?;
+                )
+                .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
                 let stream = DeadlineStream::new(
                     stream,
                     deadline,
                     "storage RPC absolute operation deadline expired",
-                )?;
+                )
+                .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
                 Ok(Box::new(stream))
             }
             StorageRpcClientEndpointInner::Tcp {
@@ -238,12 +291,18 @@ impl StorageRpcClientEndpoint {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn connect(&self, deadline: Instant) -> io::Result<BoxStorageRpcStream> {
+        self.connect_classified(deadline)
+            .map_err(StorageRpcEndpointConnectFailure::into_io_error)
+    }
+
     pub(crate) fn connect_request(
         &self,
         deadline: Instant,
         io_timeout: Duration,
         max_connections: usize,
-    ) -> io::Result<StorageRpcRequestConnection> {
+    ) -> Result<StorageRpcRequestConnection, StorageRpcEndpointConnectFailure> {
         match &self.inner {
             StorageRpcClientEndpointInner::Unix {
                 socket_path,
@@ -253,23 +312,24 @@ impl StorageRpcClientEndpoint {
                     socket_path,
                     deadline,
                     "storage RPC absolute operation deadline expired",
-                )?;
+                )
+                .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
                 let stream = DeadlineStream::new(
                     stream,
                     deadline,
                     "storage RPC absolute operation deadline expired",
-                )?;
+                )
+                .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
                 Ok(Box::new(stream))
             }),
             #[cfg(test)]
-            StorageRpcClientEndpointInner::TestUnpooledUnix { .. } => {
-                self.connect(deadline)
-                    .map(|stream| StorageRpcRequestConnection {
-                        stream: Some(stream),
-                        pool: None,
-                        reusable: false,
-                    })
-            }
+            StorageRpcClientEndpointInner::TestUnpooledUnix { .. } => self
+                .connect_classified(deadline)
+                .map(|stream| StorageRpcRequestConnection {
+                    stream: Some(stream),
+                    pool: None,
+                    reusable: false,
+                }),
             StorageRpcClientEndpointInner::Tcp {
                 addresses,
                 server_name,
@@ -378,15 +438,15 @@ impl StorageRpcClientConnectionPool {
         deadline: Instant,
         io_timeout: Duration,
         configured_max_connections: usize,
-        connect: impl FnOnce() -> io::Result<BoxStorageRpcStream>,
-    ) -> io::Result<StorageRpcRequestConnection> {
+        connect: impl FnOnce() -> Result<BoxStorageRpcStream, StorageRpcEndpointConnectFailure>,
+    ) -> Result<StorageRpcRequestConnection, StorageRpcEndpointConnectFailure> {
         let max_connections = configured_max_connections
             .clamp(1, STORAGE_RPC_CLIENT_POOL_MAX_CONNECTIONS_PER_ENDPOINT);
         let max_idle_age = io_timeout / 2;
         let mut connect = Some(connect);
 
         loop {
-            remaining(deadline)?;
+            remaining(deadline).map_err(StorageRpcEndpointConnectFailure::transport)?;
             let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
             let now = Instant::now();
             let idle_before = state.idle.len();
@@ -432,17 +492,17 @@ impl StorageRpcClientConnectionPool {
                 };
             }
 
-            let wait = remaining(deadline)?;
+            let wait = remaining(deadline).map_err(StorageRpcEndpointConnectFailure::transport)?;
             let (next_state, timeout) = self
                 .available
                 .wait_timeout(state, wait)
                 .unwrap_or_else(|error| error.into_inner());
             drop(next_state);
             if timeout.timed_out() {
-                return Err(io::Error::new(
+                return Err(StorageRpcEndpointConnectFailure::transport(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "storage RPC connection pool deadline expired",
-                ));
+                )));
             }
         }
     }
@@ -611,11 +671,12 @@ fn connect_tls_tcp(
     server_name: &str,
     tls_client_config: &Arc<rustls::ClientConfig>,
     deadline: Instant,
-) -> io::Result<BoxStorageRpcStream> {
+) -> Result<BoxStorageRpcStream, StorageRpcEndpointConnectFailure> {
     let mut last_error = None;
     let mut tcp_stream = None;
     for address in addresses {
-        match TcpStream::connect_timeout(address, remaining(deadline)?) {
+        let remaining = remaining(deadline).map_err(StorageRpcEndpointConnectFailure::transport)?;
+        match TcpStream::connect_timeout(address, remaining) {
             Ok(stream) => {
                 tcp_stream = Some(stream);
                 break;
@@ -624,38 +685,50 @@ fn connect_tls_tcp(
         }
     }
     let tcp_stream = tcp_stream.ok_or_else(|| {
-        last_error.unwrap_or_else(|| {
+        StorageRpcEndpointConnectFailure::classify_connect_io(last_error.unwrap_or_else(|| {
             io::Error::new(
                 io::ErrorKind::AddrNotAvailable,
                 "storage RPC TCP endpoint has no usable address",
             )
-        })
+        }))
     })?;
-    tcp_stream.set_nodelay(true)?;
+    tcp_stream
+        .set_nodelay(true)
+        .map_err(StorageRpcEndpointConnectFailure::classify_connect_io)?;
     let server_name = ServerName::try_from(server_name.to_string()).map_err(|_| {
-        io::Error::new(
+        StorageRpcEndpointConnectFailure::internal(io::Error::new(
             io::ErrorKind::InvalidInput,
             "storage RPC TCP endpoint has an invalid TLS server name",
-        )
+        ))
     })?;
     let connection = rustls::ClientConnection::new(Arc::clone(tls_client_config), server_name)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+        .map_err(|error| {
+            StorageRpcEndpointConnectFailure::internal(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                error,
+            ))
+        })?;
     let socket = DeadlineStream::new(
         tcp_stream,
         deadline,
         "storage RPC absolute operation deadline expired",
-    )?;
+    )
+    .map_err(StorageRpcEndpointConnectFailure::classify_connect_io)?;
     let mut stream = DeadlineTlsTcpStream {
         stream: rustls::StreamOwned::new(connection, socket),
     };
     while stream.stream.conn.is_handshaking() {
-        stream.stream.conn.complete_io(&mut stream.stream.sock)?;
+        stream
+            .stream
+            .conn
+            .complete_io(&mut stream.stream.sock)
+            .map_err(StorageRpcEndpointConnectFailure::classify_endpoint_io)?;
     }
     if stream.stream.conn.alpn_protocol() != Some(STORAGE_RPC_TLS_ALPN) {
-        return Err(io::Error::new(
+        return Err(StorageRpcEndpointConnectFailure::internal(io::Error::new(
             io::ErrorKind::InvalidData,
             "storage RPC TLS peer did not negotiate required argmin-storage-rpc/1 ALPN",
-        ));
+        )));
     }
     Ok(Box::new(stream))
 }
@@ -825,13 +898,76 @@ mod tests {
         .unwrap();
 
         let client_error = endpoint
-            .connect(Instant::now() + Duration::from_secs(1))
+            .connect_classified(Instant::now() + Duration::from_secs(1))
             .err()
             .expect("TLS 1.3 storage client must reject a TLS 1.2-only server");
         let server_error = server.join().unwrap();
 
-        assert_ne!(client_error.kind(), io::ErrorKind::TimedOut);
+        assert!(matches!(
+            client_error,
+            StorageRpcEndpointConnectFailure::Internal(_)
+        ));
         assert_ne!(server_error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn tcp_refusal_is_a_transport_connect_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let endpoint = StorageRpcClientEndpoint::tls_tcp(
+            format!("tcp://localhost:{}", address.port()),
+            vec![address],
+            "localhost",
+            test_trust_roots(),
+        )
+        .unwrap();
+
+        let error = endpoint
+            .connect_classified(Instant::now() + Duration::from_secs(1))
+            .err()
+            .expect("closed TCP endpoint must refuse the connection");
+
+        assert!(matches!(
+            error,
+            StorageRpcEndpointConnectFailure::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn tcp_network_reachability_errors_are_transport_connect_failures() {
+        for kind in [
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::NetworkDown,
+        ] {
+            let error = StorageRpcEndpointConnectFailure::classify_connect_io(io::Error::new(
+                kind,
+                "injected TCP reachability failure",
+            ));
+            assert!(
+                matches!(error, StorageRpcEndpointConnectFailure::Transport(_)),
+                "TCP connect error {kind:?} must remain retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn tls_handshake_network_reachability_errors_are_transport_failures() {
+        for kind in [
+            io::ErrorKind::HostUnreachable,
+            io::ErrorKind::NetworkUnreachable,
+            io::ErrorKind::NetworkDown,
+        ] {
+            let error = StorageRpcEndpointConnectFailure::classify_endpoint_io(io::Error::new(
+                kind,
+                "injected TLS handshake reachability failure",
+            ));
+            assert!(
+                matches!(error, StorageRpcEndpointConnectFailure::Transport(_)),
+                "TLS handshake socket error {kind:?} must remain retryable"
+            );
+        }
     }
 
     #[test]
@@ -1011,6 +1147,7 @@ mod tests {
         let mut first = pool
             .checkout(deadline, Duration::from_secs(1), 1, || {
                 accepted_unix_stream(first_stream, deadline)
+                    .map_err(StorageRpcEndpointConnectFailure::transport)
             })
             .unwrap();
 
@@ -1034,6 +1171,7 @@ mod tests {
         let replacement = pool
             .checkout(deadline, Duration::from_secs(1), 1, || {
                 accepted_unix_stream(replacement_stream, deadline)
+                    .map_err(StorageRpcEndpointConnectFailure::transport)
             })
             .unwrap();
         assert_eq!(pool.state.lock().unwrap().open, 1);

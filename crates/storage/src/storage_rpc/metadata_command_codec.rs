@@ -380,6 +380,96 @@ pub(crate) fn decode_metadata_command_pending_slot_remove_response(
     Ok(StorageRpcMetadataCommandPendingSlotRemoveResponse { removed })
 }
 
+pub(crate) fn encode_metadata_command_pending_slot_cleanup_response(
+    response: &StorageRpcMetadataCommandPendingSlotCleanupResponse,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    match response.outcome {
+        StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(value) => {
+            put_u8(&mut out, 0);
+            put_u8(&mut out, u8::from(value));
+        }
+        StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 1);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
+        StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+        } => {
+            put_u8(&mut out, 2);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+        }
+    }
+    out
+}
+
+pub(crate) fn decode_metadata_command_pending_slot_cleanup_response(
+    bytes: &[u8],
+) -> Result<StorageRpcMetadataCommandPendingSlotCleanupResponse, StorageRpcPayloadError> {
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let read_subject = |decoder: &mut StorageRpcDecoder<'_>| {
+        Ok((
+            decoder.read_u32()?,
+            decoder.read_u32()?,
+            decoder.read_cluster_epoch()?,
+            decoder.read_u64()?,
+        ))
+    };
+    let outcome = match decoder.read_u8()? {
+        0 => {
+            let value = match decoder.read_u8()? {
+                0 => false,
+                1 => true,
+                _ => {
+                    return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                        "invalid metadata command pending slot cleanup value tag",
+                    ))
+                }
+            };
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(value)
+        }
+        1 => {
+            let (node_id, pg_id, cluster_epoch, log_index) = read_subject(&mut decoder)?;
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }
+        }
+        2 => {
+            let (node_id, pg_id, cluster_epoch, log_index) = read_subject(&mut decoder)?;
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+                node_id,
+                pg_id,
+                cluster_epoch,
+                log_index,
+            }
+        }
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidResponseEnvelope(
+                "unknown metadata command pending slot cleanup outcome tag",
+            ))
+        }
+    };
+    decoder.finish()?;
+    Ok(StorageRpcMetadataCommandPendingSlotCleanupResponse { outcome })
+}
+
 pub(crate) fn encode_metadata_command_next_id_request(
     request: &StorageRpcMetadataCommandNextIdRequest,
 ) -> Vec<u8> {

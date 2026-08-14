@@ -493,6 +493,16 @@ pub(crate) enum StoreError {
     },
 
     #[error(
+        "metadata command for local node {node_id} PG {pg_id} epoch {cluster_epoch} log index {log_index} is not terminal yet"
+    )]
+    MetadataCommandTerminalEntryPending {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+    },
+
+    #[error(
         "metadata command for local node {node_id} PG {pg_id} epoch {cluster_epoch} has non-contiguous log index {log_index}, expected {expected_log_index}"
     )]
     MetadataCommandLogGap {
@@ -738,6 +748,9 @@ pub(crate) enum StoreError {
     #[error("metadata digest bootstrap state is invalid: {reason}")]
     MetadataDigestBootstrapInvalid { reason: String },
 
+    #[error("storage operation deadline expired: {context}")]
+    OperationDeadlineExceeded { context: &'static str },
+
     #[error("IO error: {context}")]
     Io {
         context: &'static str,
@@ -789,7 +802,11 @@ impl StoreError {
             | Self::StaleShardOperation { .. }
             | Self::StaleShardLocation { .. }
             | Self::PgNotActive { .. }
-            | Self::ShardPgNotActive { .. } => StoreOperationFailureClass::RetryableConvergence,
+            | Self::ShardPgNotActive { .. }
+            | Self::MetadataCommandTerminalEntryPending { .. }
+            | Self::OperationDeadlineExceeded { .. } => {
+                StoreOperationFailureClass::RetryableConvergence
+            }
             Self::ShardStore { source, .. } => source.operation_failure_class(),
             Self::StorageRpc { failure, .. } => match failure.wire_code() {
                 StorageRpcWireErrorCode::MetadataCommandContention => {
@@ -801,7 +818,10 @@ impl StoreError {
                 StorageRpcWireErrorCode::StaleShardLocation
                 | StorageRpcWireErrorCode::InactivePgRoute
                 | StorageRpcWireErrorCode::NonActingSetAccess
-                | StorageRpcWireErrorCode::WrongClusterEpoch => {
+                | StorageRpcWireErrorCode::WrongClusterEpoch
+                | StorageRpcWireErrorCode::TransportTimeout
+                | StorageRpcWireErrorCode::TransportClosed
+                | StorageRpcWireErrorCode::MetadataCommandMutationUncertain => {
                     StoreOperationFailureClass::RetryableConvergence
                 }
                 StorageRpcWireErrorCode::FrameDecode
@@ -821,9 +841,9 @@ impl StoreError {
                 | StorageRpcWireErrorCode::ShardIntegrity
                 | StorageRpcWireErrorCode::MetadataCommandIntegrity
                 | StorageRpcWireErrorCode::MultipartConditionalRequestConflict
-                | StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive
-                | StorageRpcWireErrorCode::TransportTimeout
-                | StorageRpcWireErrorCode::TransportClosed => StoreOperationFailureClass::Other,
+                | StorageRpcWireErrorCode::MetadataTransferHistoricalRouteActive => {
+                    StoreOperationFailureClass::Other
+                }
             },
             Self::NotFound
             | Self::IntegrityError { .. }
@@ -929,6 +949,7 @@ impl StoreError {
             }
             Self::ObjectPayloadReclaimFenceAuthorityMismatch
             | Self::MetadataTransferEmpty { .. }
+            | Self::MetadataCommandTerminalEntryPending { .. }
             | Self::MetadataCommandOutcomeUnconfirmed { .. }
             | Self::MetadataCommandIrrevocableConvergencePending { .. }
             | Self::MetadataCommandDependencyConvergencePending { .. }
@@ -986,12 +1007,18 @@ impl StoreError {
                 | StorageRpcWireErrorCode::MultipartConditionalRequestConflict => {
                     StoreFailureDiagnosticCategory::MetadataConsistency
                 }
+                StorageRpcWireErrorCode::MetadataCommandMutationUncertain => {
+                    StoreFailureDiagnosticCategory::MetadataConsistency
+                }
                 StorageRpcWireErrorCode::Internal => {
                     StoreFailureDiagnosticCategory::InternalInvariant
                 }
             },
             Self::PgSchemaInvalid { .. } | Self::MetadataDigestBootstrapInvalid { .. } => {
                 StoreFailureDiagnosticCategory::Schema
+            }
+            Self::OperationDeadlineExceeded { .. } => {
+                StoreFailureDiagnosticCategory::MetadataContention
             }
             Self::Io { .. } => StoreFailureDiagnosticCategory::Io,
             Self::Db { .. } => StoreFailureDiagnosticCategory::Database,
@@ -1063,7 +1090,8 @@ impl StoreError {
                 | StorageRpcWireErrorCode::BucketWriteReservationNotFound
                 | StorageRpcWireErrorCode::ShardIntegrity
                 | StorageRpcWireErrorCode::MetadataCommandIntegrity
-                | StorageRpcWireErrorCode::MultipartConditionalRequestConflict => None,
+                | StorageRpcWireErrorCode::MultipartConditionalRequestConflict
+                | StorageRpcWireErrorCode::MetadataCommandMutationUncertain => None,
             },
             _ => None,
         }
@@ -1129,6 +1157,9 @@ impl StoreError {
             Self::MetadataCommandWrongPg { .. } => "metadata_command_wrong_pg",
             Self::MetadataCommandFromNonPrimary { .. } => "metadata_command_from_non_primary",
             Self::MetadataCommandLogConflict { .. } => "metadata_command_log_conflict",
+            Self::MetadataCommandTerminalEntryPending { .. } => {
+                "metadata_command_terminal_entry_pending"
+            }
             Self::MetadataCommandLogGap { .. } => "metadata_command_log_gap",
             Self::MetadataCommandPendingConflict { .. } => "metadata_command_pending_conflict",
             Self::StaleShardOperation { .. } => "stale_shard_operation",
@@ -1178,6 +1209,7 @@ impl StoreError {
             Self::ShardScavengerScanIncomplete { .. } => "shard_scavenger_scan_incomplete",
             Self::PgSchemaInvalid { .. } => "pg_schema_invalid",
             Self::MetadataDigestBootstrapInvalid { .. } => "metadata_digest_bootstrap_invalid",
+            Self::OperationDeadlineExceeded { .. } => "operation_deadline_exceeded",
             Self::Io { context, .. }
                 if matches!(
                     *context,
@@ -3982,6 +4014,8 @@ mod tests {
             remote_failure(StorageRpcErrorCode::InactivePgRoute),
             remote_failure(StorageRpcErrorCode::NonActingSetAccess),
             remote_failure(StorageRpcErrorCode::WrongClusterEpoch),
+            remote_failure(StorageRpcErrorCode::TransportTimeout),
+            remote_failure(StorageRpcErrorCode::TransportClosed),
         ] {
             assert_eq!(
                 failure.operation_failure_class(),
@@ -4008,8 +4042,6 @@ mod tests {
             StorageRpcErrorCode::MetadataCommandIntegrity,
             StorageRpcErrorCode::MultipartConditionalRequestConflict,
             StorageRpcErrorCode::MetadataTransferHistoricalRouteActive,
-            StorageRpcErrorCode::TransportTimeout,
-            StorageRpcErrorCode::TransportClosed,
         ] {
             assert_eq!(
                 remote_failure(code).operation_failure_class(),
@@ -4131,7 +4163,7 @@ mod tests {
             ),
             (
                 remote_failure(StorageRpcErrorCode::TransportClosed),
-                StoreOperationFailureClass::Other,
+                StoreOperationFailureClass::RetryableConvergence,
                 "store_rpc_transport_failure",
             ),
             (
@@ -4207,6 +4239,23 @@ mod tests {
         assert_eq!(
             failure(BucketSnapshotLoadError::Store(StoreError::NotFound)),
             BucketSnapshotLoadFailureKind::InternalError
+        );
+        for code in [
+            StorageRpcErrorCode::TransportTimeout,
+            StorageRpcErrorCode::TransportClosed,
+        ] {
+            assert_eq!(
+                failure(BucketSnapshotLoadError::Store(remote_failure(code))),
+                BucketSnapshotLoadFailureKind::SlowDown,
+                "stream-session transport interruption must remain retryable"
+            );
+        }
+        assert_eq!(
+            failure(BucketSnapshotLoadError::Store(remote_failure(
+                StorageRpcErrorCode::PayloadDecode,
+            ))),
+            BucketSnapshotLoadFailureKind::InternalError,
+            "authenticated response corruption must remain an internal failure"
         );
 
         let bucket = BucketName::try_from("logical-snapshot-bucket").unwrap();

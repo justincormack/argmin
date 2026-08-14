@@ -38,6 +38,8 @@ pub(super) const BUCKET_WRITE_DRAIN_RETRY_BUDGET: Duration = Duration::from_secs
 const PUT_OBJECT_STREAM_CREATE_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const STREAM_SEGMENT_APPEND_RETRY_BUDGET: Duration = Duration::from_secs(10);
 const STREAM_UPLOAD_ABORT_RETRY_BUDGET: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const METADATA_COMMAND_REISSUE_BUDGET: Duration = Duration::from_secs(1);
 const METADATA_CONTENTION_BACKOFF_INITIAL: Duration = Duration::from_millis(1);
 const METADATA_CONTENTION_BACKOFF_MAX: Duration = Duration::from_millis(25);
 const PLACED_SEGMENT_SHARD_BACKFILL_CANDIDATE_SCAN_LIMIT: usize = 256;
@@ -189,10 +191,6 @@ mod metadata_command_drain_authority {
     }
 
     impl Leader<'_> {
-        pub(super) fn work_budget(&mut self) -> &mut RequestWorkBudget {
-            self.work_budget
-        }
-
         #[cfg(test)]
         pub(super) fn proof(&self) -> LeaderProof<'_> {
             LeaderProof {
@@ -203,7 +201,13 @@ mod metadata_command_drain_authority {
             }
         }
 
-        pub(super) fn parts(&mut self) -> (&mut RequestWorkBudget, LeaderProof<'_>) {
+        pub(super) fn parts_with_guard(
+            &mut self,
+        ) -> (
+            &mut RequestWorkBudget,
+            LeaderProof<'_>,
+            &MetadataCommandRecoveryGuard,
+        ) {
             (
                 &mut *self.work_budget,
                 LeaderProof {
@@ -212,6 +216,7 @@ mod metadata_command_drain_authority {
                     subject: self.subject,
                     predecessor_subject: None,
                 },
+                &self._guard,
             )
         }
     }

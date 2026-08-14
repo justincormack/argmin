@@ -68,6 +68,7 @@ use crate::storage_rpc::{
     decode_metadata_command_log_hash_range_response,
     decode_metadata_command_max_log_index_response, decode_metadata_command_next_id_response,
     decode_metadata_command_pending_envelope_response,
+    decode_metadata_command_pending_slot_cleanup_response,
     decode_metadata_command_pending_slot_insert_response,
     decode_metadata_command_pending_slot_remove_response,
     decode_metadata_command_state_outcome_response, decode_metadata_command_state_response,
@@ -204,6 +205,7 @@ use crate::storage_rpc::{
     StorageRpcMetadataCommandBoolOutcome, StorageRpcMetadataCommandCheckpointCandidatesRequest,
     StorageRpcMetadataCommandLogHashRangeRequest, StorageRpcMetadataCommandMatchingAppliedRequest,
     StorageRpcMetadataCommandNextIdOutcome, StorageRpcMetadataCommandNextIdRequest,
+    StorageRpcMetadataCommandPendingSlotCleanupOutcome,
     StorageRpcMetadataCommandPendingSlotInsertOutcome,
     StorageRpcMetadataCommandPendingSlotReplaceRequest,
     StorageRpcMetadataCommandPendingSlotRequest,
@@ -246,9 +248,9 @@ use crate::storage_rpc::{
     StorageRpcShardAckItem, StorageRpcShardAckItemRequest, StorageRpcShardDeleteRequest,
     StorageRpcShardReadRangeRequest, StorageRpcShardReadRequest, StorageRpcShardWriteRequest,
     StorageRpcStreamError, StorageRpcStreamPartCommitCommandBuildRequest,
-    StorageRpcStreamPartFinalizeSnapshotRequest, StorageRpcStreamPutCommitCommandBuildRequest,
-    StorageRpcStreamPutFinalizeSnapshotRequest, StorageRpcStreamSegmentAppendPrepareOutcome,
-    StorageRpcStreamSegmentAppendPrepareRequest,
+    StorageRpcStreamPartFinalizeSnapshotOutcome, StorageRpcStreamPartFinalizeSnapshotRequest,
+    StorageRpcStreamPutCommitCommandBuildRequest, StorageRpcStreamPutFinalizeSnapshotRequest,
+    StorageRpcStreamSegmentAppendPrepareOutcome, StorageRpcStreamSegmentAppendPrepareRequest,
     StorageRpcStreamUploadBucketWriteReservationUpdateRequest, StorageRpcStreamUploadMatchRequest,
     StorageRpcStreamUploadSegmentsOutcome, StorageRpcStreamUploadSessionOutcome,
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadsListRequest,
@@ -265,7 +267,9 @@ use crate::storage_rpc_auth::{
     write_storage_rpc_auth_transport_frame_with_limit, StorageRpcClientAuthConfig,
     StorageRpcRequestProof,
 };
-use crate::storage_rpc_transport::{BoxStorageRpcStream, StorageRpcClientEndpoint};
+use crate::storage_rpc_transport::{
+    BoxStorageRpcStream, StorageRpcClientEndpoint, StorageRpcEndpointConnectFailure,
+};
 #[cfg(test)]
 use crate::types::BucketSnapshotTagsRequest;
 use crate::types::{
@@ -722,7 +726,16 @@ fn load_stream_part_finalize_snapshot_from_pg(
     session_id: &SessionId,
     part_number: u32,
 ) -> Result<StreamUploadPartStorageSnapshot, ObjectPgActionError> {
-    let session = pg.get_stream_upload(session_id)?;
+    let session = match pg.get_stream_upload(session_id) {
+        Ok(session) => session,
+        Err(error @ MetadataError::StreamSessionNotFound { .. }) => {
+            // A terminal multipart command removes both records. Preserve a live
+            // upload's missing-session error, but report the terminal upload state.
+            load_in_progress_multipart_upload_from_pg(pg, bucket, key, upload_id)?;
+            return Err(error.into());
+        }
+        Err(other) => return Err(other.into()),
+    };
     validate_stream_part_finalize_session(&session, bucket, key, upload_id, part_number)?;
     let upload = load_in_progress_multipart_upload_from_pg(pg, bucket, key, upload_id)?;
     let existing_part = match PgMetadataStore::get_multipart_part(pg, upload_id, part_number) {
@@ -1382,15 +1395,54 @@ impl StorageRpcRequestDispatchFailure {
             Self::MayHaveApplied(source) => MetadataCommandApplyError::may_have_applied(source),
         }
     }
+
+    fn into_metadata_command_pending_slot_replace_error(
+        self,
+    ) -> MetadataCommandPendingSlotReplaceError {
+        match self {
+            Self::NotSent(source) => MetadataCommandPendingSlotReplaceError::not_sent(source),
+            Self::MayHaveApplied(source) => {
+                MetadataCommandPendingSlotReplaceError::may_have_applied(source)
+            }
+        }
+    }
 }
 
 pub(crate) fn storage_rpc_deadline_expired(context: &'static str) -> StoreError {
-    StoreError::Io {
-        context,
-        source: io::Error::new(
-            io::ErrorKind::TimedOut,
+    StoreError::OperationDeadlineExceeded { context }
+}
+
+fn storage_rpc_endpoint_deadline_expired(node_id: NodeId, context: &'static str) -> StoreError {
+    StoreError::StorageRpc {
+        node_id: node_id.as_u32(),
+        operation: context,
+        failure: StorageRpcErrorCode::TransportTimeout,
+        detail: crate::StorageNodeFailureDetail::new(
             "storage-node RPC absolute operation deadline expired",
         ),
+    }
+}
+
+fn storage_rpc_endpoint_connect_error(
+    node_id: NodeId,
+    operation: &'static str,
+    failure: StorageRpcEndpointConnectFailure,
+) -> StoreError {
+    match failure {
+        StorageRpcEndpointConnectFailure::Transport(source) => StoreError::StorageRpc {
+            node_id: node_id.as_u32(),
+            operation,
+            failure: if source.kind() == io::ErrorKind::TimedOut {
+                StorageRpcErrorCode::TransportTimeout
+            } else {
+                StorageRpcErrorCode::TransportClosed
+            },
+            detail: crate::StorageNodeFailureDetail::new(source.to_string()),
+        },
+        StorageRpcEndpointConnectFailure::Internal(source) => StoreError::Io {
+            context: operation,
+            source,
+        },
     }
 }
 
@@ -1721,6 +1773,77 @@ fn metadata_command_log_conflict_error(
         cluster_epoch: conflict.cluster_epoch,
         log_index: conflict.log_index,
     }
+}
+
+fn metadata_command_terminal_entry_pending_error(
+    expected_node_id: NodeId,
+    expected_cluster_epoch: ClusterEpoch,
+    expected_pg_id: PgId,
+    expected_log_index: MetadataCommandLogIndex,
+    decode_context: &'static str,
+    rpc_payload_error: impl FnOnce(&'static str, String) -> StoreError,
+    pending: MetadataCommandLogConflictRpcFields,
+) -> StoreError {
+    if !metadata_command_cleanup_response_subject_matches(
+        expected_node_id,
+        expected_cluster_epoch,
+        expected_pg_id,
+        expected_log_index,
+        pending,
+    ) {
+        return rpc_payload_error(
+            decode_context,
+            "metadata command terminal-entry-pending subject mismatch".to_string(),
+        );
+    }
+    StoreError::MetadataCommandTerminalEntryPending {
+        node_id: pending.node_id,
+        pg_id: pending.pg_id,
+        cluster_epoch: pending.cluster_epoch,
+        log_index: pending.log_index,
+    }
+}
+
+fn metadata_command_terminal_log_conflict_error(
+    expected_node_id: NodeId,
+    expected_cluster_epoch: ClusterEpoch,
+    expected_pg_id: PgId,
+    expected_log_index: MetadataCommandLogIndex,
+    decode_context: &'static str,
+    rpc_payload_error: impl FnOnce(&'static str, String) -> StoreError,
+    conflict: MetadataCommandLogConflictRpcFields,
+) -> StoreError {
+    if !metadata_command_cleanup_response_subject_matches(
+        expected_node_id,
+        expected_cluster_epoch,
+        expected_pg_id,
+        expected_log_index,
+        conflict,
+    ) {
+        return rpc_payload_error(
+            decode_context,
+            "metadata command terminal log-conflict subject mismatch".to_string(),
+        );
+    }
+    StoreError::MetadataCommandLogConflict {
+        node_id: conflict.node_id,
+        pg_id: conflict.pg_id,
+        cluster_epoch: conflict.cluster_epoch,
+        log_index: conflict.log_index,
+    }
+}
+
+fn metadata_command_cleanup_response_subject_matches(
+    expected_node_id: NodeId,
+    expected_cluster_epoch: ClusterEpoch,
+    expected_pg_id: PgId,
+    expected_log_index: MetadataCommandLogIndex,
+    response: MetadataCommandLogConflictRpcFields,
+) -> bool {
+    response.node_id == expected_node_id.as_u32()
+        && response.cluster_epoch == expected_cluster_epoch
+        && response.pg_id == expected_pg_id.get()
+        && response.log_index == expected_log_index.get()
 }
 
 fn stale_bucket_metadata_command_error(

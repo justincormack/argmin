@@ -1427,8 +1427,15 @@ impl MetadataCommandRecoveryKey {
 
 #[derive(Debug)]
 struct MetadataCommandRecoveryFlight {
-    in_progress: Mutex<bool>,
+    state: Mutex<MetadataCommandRecoveryFlightState>,
     done: Condvar,
+}
+
+#[derive(Debug)]
+struct MetadataCommandRecoveryFlightState {
+    in_progress: bool,
+    keys: HashSet<MetadataCommandRecoveryKey>,
+    lineage_tip: MetadataCommandEnvelope,
 }
 
 #[cfg(test)]
@@ -1451,41 +1458,129 @@ enum MetadataCommandRecoveryWaitTestAction {
 #[derive(Debug)]
 pub(crate) enum MetadataCommandRecoveryAdmission {
     Leader(MetadataCommandRecoveryGuard),
-    Waited { wait_us: u128 },
-    TimedOut { wait_us: u128 },
+    Waited {
+        wait_us: u128,
+        lineage_tip: MetadataCommandEnvelope,
+    },
+    TimedOut {
+        wait_us: u128,
+        lineage_tip: MetadataCommandEnvelope,
+    },
 }
 
 #[derive(Debug)]
 pub(crate) struct MetadataCommandRecoveryGuard {
-    key: MetadataCommandRecoveryKey,
+    root_key: MetadataCommandRecoveryKey,
     flight: Arc<MetadataCommandRecoveryFlight>,
     flights: Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
 }
 
 impl MetadataCommandRecoveryGuard {
     pub(crate) fn matches_command(&self, pg_id: PgId, command: &MetadataCommandEnvelope) -> bool {
-        self.key == MetadataCommandRecoveryKey::new(pg_id, command)
+        self.root_key == MetadataCommandRecoveryKey::new(pg_id, command)
+    }
+
+    pub(crate) fn lineage_tip(&self) -> MetadataCommandEnvelope {
+        self.flight
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .lineage_tip
+            .clone()
+    }
+
+    pub(crate) fn bind_reissued_command(
+        &self,
+        pg_id: PgId,
+        source: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+    ) -> Result<(), StoreError> {
+        let source_key = MetadataCommandRecoveryKey::new(pg_id, source);
+        let replacement_key = MetadataCommandRecoveryKey::new(pg_id, replacement);
+        let source_id = source.id();
+        let replacement_id = replacement.id();
+        let valid_chain = source_id.pg_id() == pg_id
+            && replacement_id.pg_id() == pg_id
+            && replacement_id.cluster_epoch() == source_id.cluster_epoch()
+            && replacement_id.log_index().get() > source_id.log_index().get()
+            && replacement
+                .payload()
+                .is_authorized_recovery_derivative_of(source.payload());
+        if !valid_chain {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "metadata-command-recovery-flight-reissue",
+            });
+        }
+
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.flight.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.in_progress || !state.keys.contains(&source_key) {
+            return Err(StoreError::MetadataCommandContention {
+                context: "metadata command recovery flight source is no longer owned",
+            });
+        }
+        if let Some(existing) = flights.get(&replacement_key) {
+            if !Arc::ptr_eq(existing, &self.flight) {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "metadata command replacement already has a recovery owner",
+                });
+            }
+        } else {
+            flights.insert(replacement_key, Arc::clone(&self.flight));
+        }
+        state.keys.insert(replacement_key);
+        state.lineage_tip = replacement.clone();
+        Ok(())
+    }
+
+    pub(crate) fn rollback_reissued_command(
+        &self,
+        pg_id: PgId,
+        source: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+    ) -> Result<(), StoreError> {
+        let source_key = MetadataCommandRecoveryKey::new(pg_id, source);
+        let replacement_key = MetadataCommandRecoveryKey::new(pg_id, replacement);
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self.flight.state.lock().unwrap_or_else(|e| e.into_inner());
+        if !state.in_progress
+            || !state.keys.contains(&source_key)
+            || !state.keys.contains(&replacement_key)
+            || state.lineage_tip != *replacement
+        {
+            return Err(StoreError::MetadataCommandContention {
+                context: "metadata command recovery flight replacement is no longer rollbackable",
+            });
+        }
+        if flights
+            .get(&replacement_key)
+            .is_none_or(|flight| !Arc::ptr_eq(flight, &self.flight))
+        {
+            return Err(StoreError::MetadataCommandContention {
+                context: "metadata command replacement recovery ownership changed",
+            });
+        }
+        flights.remove(&replacement_key);
+        state.keys.remove(&replacement_key);
+        state.lineage_tip = source.clone();
+        Ok(())
     }
 }
 
 impl Drop for MetadataCommandRecoveryGuard {
     fn drop(&mut self) {
-        {
-            let mut in_progress = self
-                .flight
-                .in_progress
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *in_progress = false;
-            self.flight.done.notify_all();
-        }
         let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
-        if flights
-            .get(&self.key)
-            .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
-        {
-            flights.remove(&self.key);
+        let mut state = self.flight.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.in_progress = false;
+        for key in &state.keys {
+            if flights
+                .get(key)
+                .is_some_and(|flight| Arc::ptr_eq(flight, &self.flight))
+            {
+                flights.remove(key);
+            }
         }
+        self.flight.done.notify_all();
     }
 }
 
@@ -1630,10 +1725,43 @@ impl LocalClusterRuntimeState {
             .len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_metadata_command_recovery_commands_share_flight(
+        &self,
+        pg_id: PgId,
+        first: &MetadataCommandEnvelope,
+        second: &MetadataCommandEnvelope,
+    ) -> bool {
+        let flights = self
+            .metadata_command_recovery_flights
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(first) = flights.get(&MetadataCommandRecoveryKey::new(pg_id, first)) else {
+            return false;
+        };
+        let Some(second) = flights.get(&MetadataCommandRecoveryKey::new(pg_id, second)) else {
+            return false;
+        };
+        Arc::ptr_eq(first, second)
+    }
+
+    #[cfg(test)]
     pub(crate) fn join_metadata_command_recovery(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
+    ) -> MetadataCommandRecoveryAdmission {
+        let deadline = Instant::now()
+            .checked_add(METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT)
+            .unwrap_or_else(Instant::now);
+        self.join_metadata_command_recovery_until(pg_id, command, deadline)
+    }
+
+    pub(crate) fn join_metadata_command_recovery_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
     ) -> MetadataCommandRecoveryAdmission {
         let key = MetadataCommandRecoveryKey::new(pg_id, command);
         let flights = Arc::clone(&self.metadata_command_recovery_flights);
@@ -1641,9 +1769,18 @@ impl LocalClusterRuntimeState {
             let mut flights_guard = flights.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(flight) = flights_guard.get(&key) {
                 (Arc::clone(flight), false)
+            } else if Instant::now() >= deadline {
+                return MetadataCommandRecoveryAdmission::TimedOut {
+                    wait_us: 0,
+                    lineage_tip: command.clone(),
+                };
             } else {
                 let flight = Arc::new(MetadataCommandRecoveryFlight {
-                    in_progress: Mutex::new(true),
+                    state: Mutex::new(MetadataCommandRecoveryFlightState {
+                        in_progress: true,
+                        keys: HashSet::from([key]),
+                        lineage_tip: command.clone(),
+                    }),
                     done: Condvar::new(),
                 });
                 flights_guard.insert(key, Arc::clone(&flight));
@@ -1652,10 +1789,22 @@ impl LocalClusterRuntimeState {
         };
         if is_leader {
             return MetadataCommandRecoveryAdmission::Leader(MetadataCommandRecoveryGuard {
-                key,
+                root_key: key,
                 flight,
                 flights,
             });
+        }
+        if Instant::now() >= deadline {
+            let lineage_tip = flight
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .lineage_tip
+                .clone();
+            return MetadataCommandRecoveryAdmission::TimedOut {
+                wait_us: 0,
+                lineage_tip,
+            };
         }
 
         #[cfg(test)]
@@ -1687,7 +1836,16 @@ impl LocalClusterRuntimeState {
             match action {
                 Some(MetadataCommandRecoveryWaitTestAction::ForceTimeout(barrier)) => {
                     barrier.wait();
-                    return MetadataCommandRecoveryAdmission::TimedOut { wait_us: 0 };
+                    let lineage_tip = flight
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .lineage_tip
+                        .clone();
+                    return MetadataCommandRecoveryAdmission::TimedOut {
+                        wait_us: 0,
+                        lineage_tip,
+                    };
                 }
                 Some(MetadataCommandRecoveryWaitTestAction::WaitForOwner(barrier)) => {
                     barrier.wait();
@@ -1697,20 +1855,30 @@ impl LocalClusterRuntimeState {
         }
 
         let wait_started = Instant::now();
+        let wait_timeout = deadline
+            .saturating_duration_since(wait_started)
+            .min(METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT);
         let (guard, wait_result) = flight
             .done
             .wait_timeout_while(
-                flight.in_progress.lock().unwrap_or_else(|e| e.into_inner()),
-                METADATA_COMMAND_RECOVERY_WAIT_TIMEOUT,
-                |in_progress| *in_progress,
+                flight.state.lock().unwrap_or_else(|e| e.into_inner()),
+                wait_timeout,
+                |state| state.in_progress,
             )
             .unwrap_or_else(|e| e.into_inner());
         let wait_us = wait_started.elapsed().as_micros();
-        if *guard {
+        let lineage_tip = guard.lineage_tip.clone();
+        if guard.in_progress {
             debug_assert!(wait_result.timed_out());
-            MetadataCommandRecoveryAdmission::TimedOut { wait_us }
+            MetadataCommandRecoveryAdmission::TimedOut {
+                wait_us,
+                lineage_tip,
+            }
         } else {
-            MetadataCommandRecoveryAdmission::Waited { wait_us }
+            MetadataCommandRecoveryAdmission::Waited {
+                wait_us,
+                lineage_tip,
+            }
         }
     }
 

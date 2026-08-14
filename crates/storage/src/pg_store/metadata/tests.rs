@@ -5556,7 +5556,7 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
         .remove_pending_metadata_command_slot(0, &first_command)
         .unwrap_err();
     assert!(
-        matches!(err, StoreError::MetadataCommandLogConflict { .. }),
+        matches!(err, StoreError::MetadataCommandTerminalEntryPending { .. }),
         "slot removal before a terminal log row must fail, got {err:?}"
     );
     store
@@ -5582,6 +5582,40 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
             .is_none(),
         "slot should be empty after exact removal"
     );
+}
+
+#[test]
+fn pending_slot_removal_rejects_divergent_terminal_row() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let pending_bucket = trusted_bucket_name("pending-slot-original");
+    let divergent_bucket = trusted_bucket_name("pending-slot-divergent");
+    let pending = create_bucket_probe_command(1, 1, pending_bucket.clone(), 1);
+    let divergent = create_bucket_probe_command(1, 1, divergent_bucket, 2);
+
+    store
+        .try_insert_pending_metadata_command_slot(0, &pending, Some(&pending_bucket))
+        .unwrap();
+    store
+        .record_metadata_command_abandoned(0, &divergent)
+        .unwrap();
+
+    let error = store
+        .remove_pending_metadata_command_slot(0, &pending)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::MetadataCommandLogConflict {
+            node_id: 0,
+            pg_id: 1,
+            cluster_epoch: ClusterEpoch::INITIAL,
+            log_index: 1,
+        }
+    ));
+    assert!(store
+        .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+        .unwrap()
+        .is_some());
 }
 
 #[test]

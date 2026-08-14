@@ -1490,6 +1490,16 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         cluster_epoch: ClusterEpoch,
     ) -> Result<u64, StoreError>;
 
+    fn max_metadata_command_log_index_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<u64, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.max_metadata_command_log_index(pg_id, cluster_epoch)
+    }
+
     fn pending_metadata_command_envelope(
         &self,
         pg_id: PgId,
@@ -1739,9 +1749,22 @@ pub(crate) trait MetadataCommandRecoveryReplicaAbandonRoute: Send {
 pub(crate) trait MetadataCommandRecoveryCriticalSection: Send {
     fn max_metadata_command_log_index(&self) -> Result<u64, StoreError>;
 
+    fn max_metadata_command_log_index_until(&self, deadline: Instant) -> Result<u64, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.max_metadata_command_log_index()
+    }
+
     fn pending_metadata_command_envelope(
         &self,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError>;
+
+    fn pending_metadata_command_envelope_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.pending_metadata_command_envelope()
+    }
 
     fn metadata_command_acceptance(
         &self,
@@ -1794,7 +1817,19 @@ pub(crate) trait MetadataCommandRecoveryCriticalSection: Send {
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError>;
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError>;
+
+    fn replace_pending_metadata_command_slot_for_reissue_until(
+        &self,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        self.replace_pending_metadata_command_slot_for_reissue(previous, replacement, bucket)
+    }
 
     fn replace_pending_metadata_command_slot_for_recovery(
         &self,
@@ -1803,7 +1838,27 @@ pub(crate) trait MetadataCommandRecoveryCriticalSection: Send {
         previous: &MetadataCommandEnvelope,
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
-    ) -> Result<bool, StoreError>;
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError>;
+
+    fn replace_pending_metadata_command_slot_for_recovery_until(
+        &self,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        previous: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        self.replace_pending_metadata_command_slot_for_recovery(
+            authorized_source,
+            abandoned_source,
+            previous,
+            replacement,
+            bucket,
+        )
+    }
 
     fn apply_metadata_command_and_record_for_recovery(
         &self,
@@ -2102,6 +2157,43 @@ pub(crate) enum MetadataCommandApplyErrorKind {
     NotSent,
     Definitive,
     MayHaveApplied,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataCommandPendingSlotReplaceError {
+    kind: MetadataCommandApplyErrorKind,
+    source: StoreError,
+}
+
+impl MetadataCommandPendingSlotReplaceError {
+    pub(crate) fn not_sent(source: StoreError) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::NotSent,
+            source,
+        }
+    }
+
+    pub(crate) fn definitive(source: StoreError) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::Definitive,
+            source,
+        }
+    }
+
+    pub(crate) fn may_have_applied(source: StoreError) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::MayHaveApplied,
+            source,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> MetadataCommandApplyErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn into_source(self) -> StoreError {
+        self.source
+    }
 }
 
 #[derive(Debug)]

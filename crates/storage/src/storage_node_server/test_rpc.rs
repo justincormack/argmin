@@ -3883,8 +3883,12 @@
             let payload = decode_storage_rpc_response_payload(&response.payload)
                 .unwrap()
                 .unwrap();
-            let decoded = decode_metadata_command_pending_slot_remove_response(&payload).unwrap();
-            assert_eq!(decoded.removed, expected_removed);
+            let decoded =
+                decode_metadata_command_pending_slot_cleanup_response(&payload).unwrap();
+            assert_eq!(
+                decoded.outcome,
+                StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(expected_removed)
+            );
         }
         drop(client);
         join.join().unwrap();

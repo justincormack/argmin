@@ -1941,7 +1941,8 @@ impl UnixStorageNodeClient {
             .checked_duration_since(started)
             .filter(|remaining| !remaining.is_zero())
             .ok_or_else(|| {
-                StorageRpcRequestDispatchFailure::NotSent(storage_rpc_deadline_expired(
+                StorageRpcRequestDispatchFailure::NotSent(storage_rpc_endpoint_deadline_expired(
+                    self.node_id,
                     "start storage-node RPC request",
                 ))
             })?;
@@ -1978,7 +1979,7 @@ impl UnixStorageNodeClient {
                             "storage_rpc_client",
                             "storage_rpc_client_connect_failed",
                             format!(
-                                "node_id={} rpc_request_id={} kind={} elapsed_us={} error={}",
+                                "node_id={} rpc_request_id={} kind={} elapsed_us={} error={:?}",
                                 self.node_id.as_u32(),
                                 request_id,
                                 kind.operation_name(),
@@ -1987,10 +1988,13 @@ impl UnixStorageNodeClient {
                             ),
                         );
                     }
-                    return Err(StorageRpcRequestDispatchFailure::NotSent(StoreError::Io {
-                        context: "connect storage-node RPC endpoint",
-                        source,
-                    }));
+                    return Err(StorageRpcRequestDispatchFailure::NotSent(
+                        storage_rpc_endpoint_connect_error(
+                            self.node_id,
+                            "connect storage-node RPC endpoint",
+                            source,
+                        ),
+                    ));
                 }
             };
         let request = StorageRpcFrame {
@@ -3400,14 +3404,54 @@ impl UnixStorageNodeClient {
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
             payload,
         )?;
-        decode_metadata_command_pending_slot_remove_response(&response)
-            .map(|response| response.removed)
-            .map_err(|error| {
+        let response =
+            decode_metadata_command_pending_slot_cleanup_response(&response).map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command pending slot remove response",
                     error.to_string(),
                 )
-            })
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(removed) => Ok(removed),
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+                node_id,
+                pg_id: pending_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_terminal_entry_pending_error(
+                self.node_id,
+                command.id().cluster_epoch(),
+                pg_id,
+                command.id().log_index(),
+                "decode metadata command pending slot remove response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: pending_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_terminal_log_conflict_error(
+                self.node_id,
+                command.id().cluster_epoch(),
+                pg_id,
+                command.id().log_index(),
+                "decode metadata command pending slot remove response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
     }
 
     fn metadata_command_acceptance_request(
@@ -3566,6 +3610,35 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         cluster_epoch: ClusterEpoch,
     ) -> Result<u64, StoreError> {
         MetadataCommandNodeClient::max_metadata_command_log_index(self, pg_id, cluster_epoch)
+    }
+
+    fn max_metadata_command_log_index_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<u64, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandMaxLogIndex,
+            payload,
+            deadline,
+        )?;
+        decode_metadata_command_max_log_index_response(&response)
+            .map(|response| response.max_log_index)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command max log index response",
+                    error.to_string(),
+                )
+            })
     }
 
     fn pending_metadata_command_envelope(

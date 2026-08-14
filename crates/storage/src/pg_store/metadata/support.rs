@@ -29,6 +29,12 @@ impl PgStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_pending_slot_replace_after_commit(&self) {
+        self.fail_next_pending_slot_replace_after_commit
+            .store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_before_object_payload_reclaim_claim_effect_check_hook(
         &self,
         hook: impl FnOnce() + Send + 'static,

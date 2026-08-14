@@ -3011,6 +3011,75 @@ fn multipart_completion_partial_apply_reopens_and_converges() {
 }
 
 #[test]
+fn multipart_completion_retries_after_witness_outlives_inner_confirmation_deadline() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "slowprimarycomplete");
+
+    let delayed = Arc::new(AtomicBool::new(false));
+    let delayed_for_hook = Arc::clone(&delayed);
+    let hook_upload_id = request.upload_id.clone();
+    let hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if node_id == NodeId::new(1)
+                && matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitMultipartObject(commit)
+                        if commit.upload_id == hook_upload_id
+                )
+                && !delayed_for_hook.swap(true, Ordering::SeqCst)
+            {
+                std::thread::sleep(Duration::from_millis(1_050));
+            }
+            Ok(())
+        },
+    ));
+
+    let outcome = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .expect("witnessed completion should use the remaining request budget");
+    drop(hook);
+
+    assert!(delayed.load(Ordering::SeqCst));
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &outcome,
+    );
+    assert_terminal_multipart_upload_invariants(
+        &map,
+        &node_ids,
+        object_pg,
+        &bucket,
+        &key,
+        &request.upload_id,
+        TerminalMultipartOutcome::Completed,
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn multipart_completion_races_classify_published_pending_command_by_manifest() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -3404,6 +3473,1145 @@ fn multipart_completion_retries_partial_bucket_barrier_command() {
 }
 
 #[test]
+fn multipart_completion_partial_exact_retry_retains_witnessed_progress() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "partialprogress");
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let injected = Arc::new(AtomicBool::new(false));
+    let injected_for_hook = Arc::clone(&injected);
+    let hook_map = Arc::clone(&map);
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_upload_id = request.upload_id.clone();
+    let hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            let MetadataCommandPayload::CommitMultipartObject(commit) = command.payload() else {
+                return Ok(());
+            };
+            if commit.upload_id != hook_upload_id
+                || node_id != NodeId::new(1)
+                || injected_for_hook.swap(true, Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+
+            hook_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(command.id().pg_id().get())?
+                .apply_metadata_command_and_record(node_id.as_u32(), command)
+                .map_err(|error| match error {
+                    crate::BucketSnapshotLoadError::Store(error) => error,
+                    crate::BucketSnapshotLoadError::Metadata(error) => {
+                        panic!("manual primary completion apply failed: {error}")
+                    }
+                })?;
+            hook_cluster
+                .release_bucket_write_reservation_proof(&commit.bucket_write_reservation)
+                .expect("test should expire admission after witness publication");
+            std::thread::sleep(
+                crate::cluster::request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET
+                    + Duration::from_millis(20),
+            );
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id: node_id.as_u32(),
+                pg_id: command.id().pg_id().get(),
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+            })
+        },
+    ));
+
+    let outcome = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .expect("partial exact retry must retain witnessed progress after reservation expiry");
+    drop(hook);
+
+    assert!(injected.load(Ordering::SeqCst));
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &outcome,
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn multipart_completion_adopts_marker_only_pending_command_after_reservation_expires() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let owner = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&owner, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&owner, &bucket, &key, "markeronlytakeover");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &owner, pg_id, &request, 42_000);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .mark_pending_metadata_command_publication_started(primary.node_id().as_u32(), &command)
+        .unwrap();
+    let proof = match command.payload() {
+        MetadataCommandPayload::CommitMultipartObject(commit) => {
+            commit.bucket_write_reservation.clone()
+        }
+        _ => unreachable!("test command changed payload kind"),
+    };
+    let bucket_pg_id = PgId::new(owner.bucket_metadata_pg_id(&bucket));
+    map.metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap()
+        .test_set_bucket_write_reservation_lease_deadline(
+            &proof.reservation_id,
+            crate::clock::current_time_millis().saturating_sub(1),
+        )
+        .unwrap();
+    for node_id in node_ids {
+        assert!(map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap()
+            .applied_metadata_command_log_entry_hashes(node_id.as_u32(), &command)
+            .unwrap()
+            .is_none());
+    }
+
+    let takeover = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let outcome = takeover
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .expect("takeover must reconstruct the marker before reservation admission");
+
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &outcome,
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn multipart_completion_reissues_unmarked_pending_command_after_reservation_expires() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let owner = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&owner, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&owner, &bucket, &key, "unmarkedtakeover");
+    let pg_id = PgId::new(object_pg);
+    let (mut command, _) =
+        pending_multipart_completion_command_for_test(&map, &owner, pg_id, &request, 42_500);
+    let expired_lease_deadline = crate::clock::current_time_millis().saturating_sub(1);
+    let mut payload = command.payload().clone();
+    let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
+        unreachable!("test command changed payload kind");
+    };
+    commit.bucket_write_reservation.lease_deadline = expired_lease_deadline;
+    command = MetadataCommandEnvelope::new(command.id(), payload);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let proof = match command.payload() {
+        MetadataCommandPayload::CommitMultipartObject(commit) => {
+            commit.bucket_write_reservation.clone()
+        }
+        _ => unreachable!("test command changed payload kind"),
+    };
+    let bucket_pg_id = PgId::new(owner.bucket_metadata_pg_id(&bucket));
+    map.metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap()
+        .test_set_bucket_write_reservation_lease_deadline(
+            &proof.reservation_id,
+            expired_lease_deadline,
+        )
+        .unwrap();
+    for node_id in node_ids {
+        assert!(map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap()
+            .applied_metadata_command_log_entry_hashes(node_id.as_u32(), &command)
+            .unwrap()
+            .is_none());
+    }
+
+    let takeover = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let outcome = takeover
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .expect("takeover must reissue an unmarked command under its fresh reservation");
+
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &outcome,
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn multipart_completion_takeover_resolves_post_commit_replacement_failure() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "postcommitreplace");
+    let pg_id = PgId::new(object_pg);
+    let (mut command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_625);
+    let expired_lease_deadline = crate::clock::current_time_millis().saturating_sub(1);
+    let mut payload = command.payload().clone();
+    let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
+        unreachable!("test command changed payload kind");
+    };
+    commit.bucket_write_reservation.lease_deadline = expired_lease_deadline;
+    command = MetadataCommandEnvelope::new(command.id(), payload);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let original_proof = match command.payload() {
+        MetadataCommandPayload::CommitMultipartObject(commit) => {
+            commit.bucket_write_reservation.clone()
+        }
+        _ => unreachable!("test command changed payload kind"),
+    };
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    map.metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap()
+        .test_set_bucket_write_reservation_lease_deadline(
+            &original_proof.reservation_id,
+            expired_lease_deadline,
+        )
+        .unwrap();
+    map.node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .fail_next_pending_slot_replace_after_commit();
+
+    let outcome = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .expect("takeover must inspect and adopt a replacement committed before error response");
+
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &outcome,
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn multipart_completion_takeover_lock_wait_uses_caller_deadline() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, expected_segment) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "takeoverlocktimeout");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_750);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let reached = Arc::new(AtomicBool::new(false));
+    let reached_for_hook = Arc::clone(&reached);
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let release_rx_for_hook = Arc::clone(&release_rx);
+    let hook = cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+        move |event, _proof| {
+            if event
+                == crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::ExactPending
+                && !reached_for_hook.swap(true, Ordering::SeqCst)
+            {
+                arrived_tx.send(()).unwrap();
+                release_rx_for_hook.lock().unwrap().recv().unwrap();
+            }
+            false
+        },
+    ));
+
+    let cluster_for_takeover = Arc::clone(&cluster);
+    let request_for_takeover = request.clone();
+    let takeover = std::thread::spawn(move || {
+        cluster_for_takeover.complete_multipart_upload_commit_serialized(request_for_takeover)
+    });
+    if arrived_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+        let _ = release_tx.send(());
+        let _ = takeover.join();
+        panic!("takeover did not reach exact-pending preparation");
+    }
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    let bucket_primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap()
+        .storage_node();
+    let held_bucket_pg = bucket_primary.get_pg(bucket_pg_id.get()).unwrap();
+    release_tx.send(()).unwrap();
+    std::thread::sleep(
+        crate::cluster::request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET
+            + Duration::from_millis(50),
+    );
+    drop(held_bucket_pg);
+
+    let outcome = takeover
+        .join()
+        .unwrap()
+        .expect("takeover must retain the caller deadline while the bucket PG is held");
+    drop(hook);
+    assert!(reached.load(Ordering::SeqCst));
+    assert_streamed_multipart_completion_on_acting_nodes(
+        &map,
+        &node_ids,
+        object_pg,
+        &request,
+        &expected_segment,
+        &outcome,
+    );
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+fn assert_multipart_completion_expired_caller_budget_does_not_reissue_adopted_command(
+    expire_original_reservation: bool,
+    expiry_event: crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent,
+) {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "expiredtakeoverbudget");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_812);
+    let expired_lease_deadline = crate::clock::current_time_millis().saturating_sub(1);
+    let command = if expire_original_reservation {
+        let mut payload = command.payload().clone();
+        let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
+            unreachable!("test command changed payload kind");
+        };
+        commit.bucket_write_reservation.lease_deadline = expired_lease_deadline;
+        MetadataCommandEnvelope::new(command.id(), payload)
+    } else {
+        command
+    };
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let original_proof = match command.payload() {
+        MetadataCommandPayload::CommitMultipartObject(commit) => {
+            commit.bucket_write_reservation.clone()
+        }
+        _ => unreachable!("test command changed payload kind"),
+    };
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    if expire_original_reservation {
+        map.metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(bucket_pg_id.get())
+            .unwrap()
+            .test_set_bucket_write_reservation_lease_deadline(
+                &original_proof.reservation_id,
+                expired_lease_deadline,
+            )
+            .unwrap();
+    }
+
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_for_hook = Arc::clone(&expired);
+    let hook = cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+        move |event, _proof| {
+            event == expiry_event && !expired_for_hook.swap(true, Ordering::SeqCst)
+        },
+    ));
+
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(request)
+        .expect_err("expired caller budget must not install a replacement command");
+    drop(hook);
+    assert!(expired.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(ref source)
+            if source.operation_failure_class()
+                == crate::StoreOperationFailureClass::RetryableConvergence
+    ));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).is_err());
+    }
+    let reservations = crate::PgMetadataStore::durable_bucket_write_reservations(
+        &*map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(bucket_pg_id.get())
+            .unwrap(),
+        &bucket,
+    )
+    .unwrap();
+    assert!(reservations.is_empty());
+}
+
+#[test]
+fn multipart_completion_expired_caller_budget_abandons_valid_adopted_command() {
+    assert_multipart_completion_expired_caller_budget_does_not_reissue_adopted_command(
+        false,
+        crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::AfterAuxiliaryRelease,
+    );
+}
+
+#[test]
+fn multipart_completion_expired_caller_budget_does_not_reissue_adopted_command() {
+    assert_multipart_completion_expired_caller_budget_does_not_reissue_adopted_command(
+        true,
+        crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::ExactPending,
+    );
+}
+
+#[test]
+fn multipart_completion_inconclusive_post_budget_probe_does_not_publish() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "inconclusivepostbudget");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_813);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let original_proof = match command.payload() {
+        MetadataCommandPayload::CommitMultipartObject(commit) => {
+            commit.bucket_write_reservation.clone()
+        }
+        _ => unreachable!("test command changed payload kind"),
+    };
+
+    let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
+    let (start_tx, start_rx) = std::sync::mpsc::sync_channel(1);
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        start_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("auxiliary cleanup must start the PG-lock holder");
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+        locked_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test must release the metadata-command PG lock");
+    });
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_for_hook = Arc::clone(&expired);
+    let locked_rx = Arc::new(Mutex::new(locked_rx));
+    let locked_rx_for_hook = Arc::clone(&locked_rx);
+    let hook = cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+        move |event, _proof| {
+            if event
+                == crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::AfterAuxiliaryRelease
+                && !expired_for_hook.swap(true, Ordering::SeqCst)
+            {
+                start_tx.send(()).unwrap();
+                locked_rx_for_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("metadata-command PG lock must be held before budget expiry");
+                return true;
+            }
+            false
+        },
+    ));
+
+    let result = cluster.complete_multipart_upload_commit_serialized(request);
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    drop(hook);
+    assert!(expired.load(Ordering::SeqCst));
+    assert!(matches!(
+        result,
+        Err(crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: error_pg_id,
+                log_index,
+                ..
+            }
+        )) if error_pg_id == object_pg && log_index == command.id().log_index().get()
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .applied_metadata_command_log_entry_hashes(node_id.as_u32(), &command)
+            .unwrap()
+            .is_none());
+        assert!(crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).is_err());
+    }
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    let reservations = crate::PgMetadataStore::durable_bucket_write_reservations(
+        &*map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(bucket_pg_id.get())
+            .unwrap(),
+        &bucket,
+    )
+    .unwrap();
+    assert!(reservations
+        .iter()
+        .any(|record| record.reservation_id == original_proof.reservation_id));
+}
+
+#[test]
+fn multipart_completion_inconclusive_probe_preserves_uncertainty_before_budget_expiry() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "inconclusiveprebudget");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_815);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .mark_pending_metadata_command_publication_started(primary.node_id().as_u32(), &command)
+        .unwrap();
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let apply_command_id = command.id();
+    let apply_hook = cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(
+        move |attempted_command| {
+            if attempted_command.id() == apply_command_id {
+                attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    valid_until_ms: 0,
+                    now_ms: 1,
+                });
+            }
+            Ok(())
+        },
+    ));
+    let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
+    let pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+
+    let result = cluster.complete_multipart_upload_commit_serialized(request);
+
+    drop(pg_guard);
+    drop(apply_hook);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        result,
+        Err(crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: error_pg_id,
+                log_index,
+                ..
+            }
+        )) if error_pg_id == object_pg && log_index == command.id().log_index().get()
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .applied_metadata_command_log_entry_hashes(node_id.as_u32(), &command)
+            .unwrap()
+            .is_none());
+        assert!(crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).is_err());
+    }
+}
+
+#[test]
+fn multipart_completion_deadline_crossing_preserves_raw_log_conflict() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "deadlineconflict");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_816);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let holder = std::thread::spawn(move || {
+        let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+        locked_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test must release the metadata-command PG lock");
+    });
+    locked_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("metadata-command PG lock must hide the initial publication probe");
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let apply_command_id = command.id();
+    let apply_hook = cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(
+        move |attempted_command| {
+            if attempted_command.id() != apply_command_id {
+                return Ok(());
+            }
+            attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id: NodeId::new(0).as_u32(),
+                pg_id: apply_command_id.pg_id().get(),
+                cluster_epoch: apply_command_id.cluster_epoch(),
+                log_index: apply_command_id.log_index().get(),
+            })
+        },
+    ));
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_for_hook = Arc::clone(&expired);
+    let expiry_hook = cluster
+        .test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+            move |event, _proof| {
+                event
+                    == crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::AfterApplyFailure
+                    && !expired_for_hook.swap(true, Ordering::SeqCst)
+            },
+        ));
+
+    let result = cluster.complete_multipart_upload_commit_serialized(request);
+
+    release_tx.send(()).unwrap();
+    drop(expiry_hook);
+    drop(apply_hook);
+    holder.join().unwrap();
+    assert!(expired.load(Ordering::SeqCst));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    match &result {
+        Err(crate::ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+            pg_id: error_pg_id,
+            cluster_epoch,
+            log_index,
+            ..
+        })) if *error_pg_id == object_pg
+            && *cluster_epoch == command.id().cluster_epoch()
+            && *log_index == command.id().log_index().get() => {}
+        Err(crate::ObjectPgActionError::Store(error)) => {
+            panic!("deadline-crossing raw conflict became {error:?}")
+        }
+        other => panic!("deadline-crossing raw conflict became {other:?}"),
+    }
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .applied_metadata_command_log_entry_hashes(node_id.as_u32(), &command)
+            .unwrap()
+            .is_none());
+        assert!(crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).is_err());
+    }
+}
+
+#[test]
+fn multipart_completion_preserves_publication_marker_across_apply_failure() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "markerapplyfailure");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_814);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .mark_pending_metadata_command_publication_started(primary.node_id().as_u32(), &command)
+        .unwrap();
+
+    let expired = Arc::new(AtomicBool::new(false));
+    let expired_for_hook = Arc::clone(&expired);
+    let expiry_hook = cluster
+        .test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+            move |event, _proof| {
+                event
+                    == crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::ExactPending
+                    && !expired_for_hook.swap(true, Ordering::SeqCst)
+            },
+        ));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_for_hook = Arc::clone(&attempts);
+    let apply_command_id = command.id();
+    let apply_hook = cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(
+        move |attempted_command| {
+            if attempted_command.id() == apply_command_id {
+                attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::RouteMapExpired {
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    valid_until_ms: 0,
+                    now_ms: 1,
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let result = cluster.complete_multipart_upload_commit_serialized(request);
+    drop(apply_hook);
+    drop(expiry_hook);
+    assert!(expired.load(Ordering::SeqCst));
+    assert!(attempts.load(Ordering::SeqCst) > 0);
+    assert!(matches!(
+        result,
+        Err(crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: error_pg_id,
+                log_index,
+                ..
+            }
+        )) if error_pg_id == object_pg && log_index == command.id().log_index().get()
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone())
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .applied_metadata_command_log_entry_hashes(node_id.as_u32(), &command)
+            .unwrap()
+            .is_none());
+        assert!(crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key).is_err());
+    }
+}
+
+#[test]
+fn multipart_completion_missing_takeover_reissue_releases_fresh_reservation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "missingreissue");
+    let pg_id = PgId::new(object_pg);
+    let (mut command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 42_875);
+    let expired_lease_deadline = crate::clock::current_time_millis().saturating_sub(1);
+    let mut payload = command.payload().clone();
+    let MetadataCommandPayload::CommitMultipartObject(commit) = &mut payload else {
+        unreachable!("test command changed payload kind");
+    };
+    commit.bucket_write_reservation.lease_deadline = expired_lease_deadline;
+    command = MetadataCommandEnvelope::new(command.id(), payload);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let original_proof = match command.payload() {
+        MetadataCommandPayload::CommitMultipartObject(commit) => {
+            commit.bucket_write_reservation.clone()
+        }
+        _ => unreachable!("test command changed payload kind"),
+    };
+    let bucket_pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    map.metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap()
+        .test_set_bucket_write_reservation_lease_deadline(
+            &original_proof.reservation_id,
+            expired_lease_deadline,
+        )
+        .unwrap();
+
+    let cleared = Arc::new(AtomicBool::new(false));
+    let cleared_for_hook = Arc::clone(&cleared);
+    let map_for_hook = Arc::clone(&map);
+    let hook = cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+        move |event, _proof| {
+            if event
+                == crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::ExactPending
+                && !cleared_for_hook.swap(true, Ordering::SeqCst)
+            {
+                clear_pending_metadata_command_for_node_for_test(
+                    &map_for_hook,
+                    NodeId::new(1),
+                    pg_id,
+                );
+            }
+            false
+        },
+    ));
+
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(request)
+        .expect_err("missing takeover reissue must fail without retaining the fresh proof");
+    drop(hook);
+    assert!(cleared.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert_bucket_write_reservations_released(&map, &bucket);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+}
+
+#[test]
+fn multipart_completion_exact_probes_honor_the_apply_attempt_deadline() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) = seed_streamed_multipart_completion(&cluster, &bucket, &key, "boundedprobe");
+    let pg_id = PgId::new(object_pg);
+    let (command, _) =
+        pending_multipart_completion_command_for_test(&map, &cluster, pg_id, &request, 43_000);
+    let deadline = Instant::now();
+
+    let exact_error = cluster
+        .metadata_command_is_applied_on_all_acting_nodes_until(pg_id, &command, deadline)
+        .expect_err("expired exact-state probe must not start a fresh RPC deadline");
+    assert!(matches!(
+        exact_error,
+        crate::BucketSnapshotLoadError::Store(ref error)
+            if error.operation_failure_class()
+                == crate::StoreOperationFailureClass::RetryableConvergence
+    ));
+
+    let source = crate::BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+        node_id: NodeId::new(1).as_u32(),
+        pg_id: pg_id.get(),
+        cluster_epoch: command.id().cluster_epoch(),
+        log_index: command.id().log_index().get(),
+    });
+    let partial_error = cluster
+        .retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes_until(
+            pg_id, &command, 1, &source, deadline,
+        )
+        .expect_err("expired partial-state probe must share the exact attempt deadline");
+    assert!(matches!(
+        partial_error,
+        crate::BucketSnapshotLoadError::Store(ref error)
+            if error.operation_failure_class()
+                == crate::StoreOperationFailureClass::RetryableConvergence
+    ));
+}
+
+#[test]
+fn multipart_completion_no_such_upload_survives_missing_auxiliary_reservation() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let (request, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "missingcleanup");
+
+    let upload_removed = Arc::new(AtomicBool::new(false));
+    let cleanup_reached = Arc::new(AtomicBool::new(false));
+    let upload_removed_for_hook = Arc::clone(&upload_removed);
+    let cleanup_reached_for_hook = Arc::clone(&cleanup_reached);
+    let hook_map = Arc::clone(&map);
+    let hook_cluster = Arc::clone(&cluster);
+    let hook_upload_id = request.upload_id.clone();
+    let hook = cluster.test_install_multipart_completion_auxiliary_reservation_hook(Arc::new(
+        move |event, proof| {
+            match event {
+                crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::BeforeCommandBuild
+                    if !upload_removed_for_hook.swap(true, Ordering::SeqCst) =>
+                {
+                    for node_id in node_ids {
+                        let pg = hook_map
+                            .node(node_id)
+                            .unwrap()
+                            .storage_node()
+                            .get_pg(object_pg)
+                            .unwrap();
+                        crate::PgMetadataStore::delete_multipart_upload(&*pg, &hook_upload_id)
+                            .unwrap();
+                        pg.refresh_metadata_command_state_digest().unwrap();
+                    }
+                }
+                crate::cluster::request_ops::MultipartCompletionAuxiliaryReservationTestEvent::NoSuchUploadCleanup
+                    if !cleanup_reached_for_hook.swap(true, Ordering::SeqCst) =>
+                {
+                    hook_cluster
+                        .release_bucket_write_reservation_proof(proof)
+                        .expect("test should remove the auxiliary reservation before cleanup");
+                }
+                _ => {}
+            }
+            false
+        },
+    ));
+
+    let error = cluster
+        .complete_multipart_upload_commit_serialized(request.clone())
+        .expect_err("removed upload must remain NoSuchUpload despite cleanup response loss");
+    drop(hook);
+
+    assert!(upload_removed.load(Ordering::SeqCst));
+    assert!(cleanup_reached.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { upload_id })
+            if upload_id == request.upload_id.as_str()
+    ));
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
 fn multipart_completion_barrier_command_id_race_drains_winner_and_retries() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -3603,7 +4811,7 @@ fn multipart_completion_pending_install_conflict_with_matching_completion_return
                 {
                     return false;
                 }
-                true
+                false
             },
         ));
 

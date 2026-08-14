@@ -16,7 +16,9 @@ use super::{
     lock_metadata_command_pg_until, HeldPrimaryMetadataCommandObservation,
     HeldPrimaryMetadataCommandSection, LocalClusterRuntimeState,
     MetadataCommandCheckpointRecordSummary, MetadataCommandExecutionRoute,
-    MetadataCommandPublicationState, MetadataCommandRecoveryProof, MetadataCommandRouteMode,
+    MetadataCommandPublicationState, MetadataCommandRecoveryAdmission,
+    MetadataCommandRecoveryGuard, MetadataCommandRecoveryLeader, MetadataCommandRecoveryProof,
+    MetadataCommandRecoveryWaiterOutcome, MetadataCommandRouteMode,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 use super::{
@@ -25,8 +27,8 @@ use super::{
 };
 #[cfg(test)]
 use super::{
-    MetadataCommandDrainAuthority, MetadataCommandRecoveryAdmission,
-    MetadataCommandRecoveryDrainAuthority, RequestWorkBudget, BUCKET_WRITE_DRAIN_RETRY_BUDGET,
+    MetadataCommandDrainAuthority, MetadataCommandRecoveryDrainAuthority, RequestWorkBudget,
+    BUCKET_WRITE_DRAIN_RETRY_BUDGET,
 };
 use crate::metadata_command::{
     BucketPropertyMutation, BucketSubresourceMutation, BucketWriteReservationProof,

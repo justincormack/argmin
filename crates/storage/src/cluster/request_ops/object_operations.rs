@@ -14,6 +14,13 @@ enum ObjectMetadataCommandApplyProvenance {
     RecoveredPending,
 }
 
+#[derive(Clone, Copy)]
+struct ObjectMetadataCommandApplyContext<'a> {
+    return_metadata_command_contention: bool,
+    provenance: ObjectMetadataCommandApplyProvenance,
+    recovery_guard: Option<&'a MetadataCommandRecoveryGuard>,
+}
+
 impl super::StorageCluster {
     #[cfg(test)]
     pub(crate) fn test_install_object_metadata_command_definitive_retry_hook(
@@ -41,6 +48,34 @@ impl super::StorageCluster {
             .unwrap_or_else(|e| e.into_inner())
             .insert(scope_id, hook);
         BeforeObjectMetadataCommandApplyTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_direct_put_pending_installed_hook(
+        &self,
+        hook: DirectPutPendingInstalledTestHook,
+    ) -> DirectPutPendingInstalledTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = DIRECT_PUT_PENDING_INSTALLED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        DirectPutPendingInstalledTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_object_metadata_command_reissue_hook(
+        &self,
+        hook: BeforeObjectMetadataCommandReissueTestHook,
+    ) -> BeforeObjectMetadataCommandReissueTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = BEFORE_OBJECT_METADATA_COMMAND_REISSUE_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(scope_id, hook);
+        BeforeObjectMetadataCommandReissueTestHookGuard { scope_id }
     }
 
     #[cfg(test)]
@@ -475,8 +510,11 @@ impl super::StorageCluster {
             bucket,
             command,
             &mut work_budget,
-            false,
-            ObjectMetadataCommandApplyProvenance::New,
+            ObjectMetadataCommandApplyContext {
+                return_metadata_command_contention: false,
+                provenance: ObjectMetadataCommandApplyProvenance::New,
+                recovery_guard: None,
+            },
         )? {
             NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
             NewObjectMetadataCommandApplyOutcome::Reinspect(error)
@@ -496,25 +534,53 @@ impl super::StorageCluster {
             bucket,
             command,
             work_budget,
-            false,
-            ObjectMetadataCommandApplyProvenance::New,
+            ObjectMetadataCommandApplyContext {
+                return_metadata_command_contention: false,
+                provenance: ObjectMetadataCommandApplyProvenance::New,
+                recovery_guard: None,
+            },
         )
     }
 
-    pub(super) fn apply_recovered_pending_object_metadata_command_for_bucket_or_reinspect(
+    pub(super) fn apply_new_object_metadata_command_for_bucket_or_reinspect_with_recovery_guard(
         &self,
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         work_budget: &mut super::RequestWorkBudget,
+        recovery_guard: &MetadataCommandRecoveryGuard,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         self.apply_new_object_metadata_command_for_bucket_inner(
             pg_id,
             bucket,
             command,
             work_budget,
-            false,
-            ObjectMetadataCommandApplyProvenance::RecoveredPending,
+            ObjectMetadataCommandApplyContext {
+                return_metadata_command_contention: false,
+                provenance: ObjectMetadataCommandApplyProvenance::New,
+                recovery_guard: Some(recovery_guard),
+            },
+        )
+    }
+
+    pub(super) fn apply_recovered_pending_object_metadata_command_for_bucket_or_reinspect_with_recovery_guard(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+        recovery_guard: &MetadataCommandRecoveryGuard,
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        self.apply_new_object_metadata_command_for_bucket_inner(
+            pg_id,
+            bucket,
+            command,
+            work_budget,
+            ObjectMetadataCommandApplyContext {
+                return_metadata_command_contention: false,
+                provenance: ObjectMetadataCommandApplyProvenance::RecoveredPending,
+                recovery_guard: Some(recovery_guard),
+            },
         )
     }
 
@@ -526,6 +592,34 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
     ) -> Result<(), ObjectPgActionError> {
         self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_apply_new_object_metadata_command_for_bucket_with_budget(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        retry_budget: Duration,
+    ) -> Result<(), ObjectPgActionError> {
+        let mut work_budget = super::RequestWorkBudget::new(retry_budget, None)
+            .for_operation("test_new_object_metadata_command_apply")
+            .for_pg(pg_id);
+        match self.apply_new_object_metadata_command_for_bucket_inner(
+            pg_id,
+            bucket,
+            command,
+            &mut work_budget,
+            ObjectMetadataCommandApplyContext {
+                return_metadata_command_contention: false,
+                provenance: ObjectMetadataCommandApplyProvenance::New,
+                recovery_guard: None,
+            },
+        )? {
+            NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
+            NewObjectMetadataCommandApplyOutcome::Reinspect(error)
+            | NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
+        }
     }
 
     pub(super) fn apply_new_object_metadata_command_for_bucket_allocator(
@@ -540,8 +634,11 @@ impl super::StorageCluster {
             bucket,
             command,
             work_budget,
-            true,
-            ObjectMetadataCommandApplyProvenance::New,
+            ObjectMetadataCommandApplyContext {
+                return_metadata_command_contention: true,
+                provenance: ObjectMetadataCommandApplyProvenance::New,
+                recovery_guard: None,
+            },
         )? {
             NewObjectMetadataCommandApplyOutcome::Applied => Ok(()),
             NewObjectMetadataCommandApplyOutcome::Reinspect(error)
@@ -590,9 +687,13 @@ impl super::StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         work_budget: &mut super::RequestWorkBudget,
-        return_metadata_command_contention: bool,
-        provenance: ObjectMetadataCommandApplyProvenance,
+        context: ObjectMetadataCommandApplyContext<'_>,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        let ObjectMetadataCommandApplyContext {
+            return_metadata_command_contention,
+            provenance,
+            recovery_guard,
+        } = context;
         let mut command = command.clone();
         let mut retrying_definitively_unapplied_contention = false;
         let mut apply_progress = MetadataCommandApplyProgress::Abortable;
@@ -789,9 +890,20 @@ impl super::StorageCluster {
                             return Ok(NewObjectMetadataCommandApplyOutcome::Applied);
                         }
                         Some(false) => {
-                            return Err(super::conflicting_pending_object_metadata_command(
-                                "retryable partial object metadata command conflict",
-                            ));
+                            apply_progress = apply_progress
+                                .merge(MetadataCommandApplyProgress::PublicationUnconfirmed);
+                            if let Err(error) = work_budget.sleep_after_contention(
+                                "partial exact object metadata command convergence budget exhausted",
+                            ) {
+                                return self
+                                    .finish_new_object_metadata_command_after_budget_exhaustion(
+                                        pg_id,
+                                        bucket,
+                                        &command,
+                                        error,
+                                    );
+                            }
+                            continue;
                         }
                         None => {}
                     }
@@ -801,39 +913,93 @@ impl super::StorageCluster {
                             &command, &source,
                         )
                     {
+                        #[cfg(test)]
+                        maybe_run_before_object_metadata_command_reissue_hook(
+                            self.metadata_command_apply_test_hook_scope_id(),
+                            &command,
+                        );
                         let reissued = match self
-                            .reissue_pending_metadata_command_outcome_with_route_mode(
+                            .reissue_pending_metadata_command_outcome_with_route_mode_classified_until_with_recovery_guard(
                                 pg_id,
                                 &command,
                                 MetadataCommandExecutionRoute::normal(),
                                 command.payload(),
+                                work_budget.deadline(),
+                                recovery_guard,
                             )
-                            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
                         {
-                            super::ReissuePendingMetadataCommandOutcome::Reissued(reissued) => {
+                            Ok(super::ReissuePendingMetadataCommandOutcome::Reissued(reissued)) => {
                                 retrying_definitively_unapplied_contention =
                                     !command_is_irrevocable;
                                 reissued
                             }
-                            super::ReissuePendingMetadataCommandOutcome::MatchingCurrent(
+                            Ok(super::ReissuePendingMetadataCommandOutcome::MatchingCurrent(
                                 current,
-                            ) => {
+                            )) => {
                                 apply_progress = apply_progress
                                     .merge(MetadataCommandApplyProgress::PublicationUnconfirmed);
                                 current
                             }
-                            super::ReissuePendingMetadataCommandOutcome::Missing => {
+                            Ok(super::ReissuePendingMetadataCommandOutcome::Missing) => {
                                 return Err(super::conflicting_pending_object_metadata_command(
                                     "pending object metadata command was displaced during reissue",
                                 ));
                             }
-                            super::ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
+                            Ok(super::ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict {
                                 command: current,
                                 ..
-                            } => {
+                            }) => {
                                 apply_progress = apply_progress
                                     .merge(MetadataCommandApplyProgress::PublicationUnconfirmed);
                                 current
+                            }
+                            Err(super::ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                                source,
+                            )) if !command_is_irrevocable => {
+                                if Instant::now() >= work_budget.deadline() {
+                                    return Err(Self::object_metadata_command_irrevocable_error(
+                                        &command,
+                                    ));
+                                }
+                                return match self
+                                    .abandon_definitively_unapplied_object_metadata_command(
+                                        pg_id, bucket, &command, None,
+                                    ) {
+                                    Ok(()) => {
+                                        Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
+                                            super::bucket_snapshot_error_to_object_pg_action_error(
+                                                source,
+                                            ),
+                                        ))
+                                    }
+                                    Err(_) => Err(Self::object_metadata_command_irrevocable_error(
+                                        &command,
+                                    )),
+                                };
+                            }
+                            Err(super::ReissuePendingMetadataCommandFailure::DefinitelyNotReissued(
+                                source,
+                            )) => {
+                                let lineage_tip = recovery_guard
+                                    .map(MetadataCommandRecoveryGuard::lineage_tip)
+                                    .unwrap_or_else(|| command.clone());
+                                return self.finish_new_object_metadata_command_after_uncertainty(
+                                    pg_id,
+                                    bucket,
+                                    &lineage_tip,
+                                    super::bucket_snapshot_error_to_object_pg_action_error(source),
+                                );
+                            }
+                            Err(super::ReissuePendingMetadataCommandFailure::MayHaveReissued {
+                                source,
+                                lineage_tip,
+                            }) => {
+                                return self.finish_new_object_metadata_command_after_uncertainty(
+                                    pg_id,
+                                    bucket,
+                                    &lineage_tip,
+                                    super::bucket_snapshot_error_to_object_pg_action_error(source),
+                                );
                             }
                         };
                         command = reissued;
@@ -908,6 +1074,21 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         budget_error: StoreError,
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        self.finish_new_object_metadata_command_after_uncertainty(
+            pg_id,
+            bucket,
+            command,
+            ObjectPgActionError::Store(budget_error),
+        )
+    }
+
+    pub(super) fn finish_new_object_metadata_command_after_uncertainty(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        fallback_error: ObjectPgActionError,
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         let confirmation_deadline =
             Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
         match self
@@ -930,14 +1111,7 @@ impl super::StorageCluster {
             | MetadataCommandPublicationState::Witnessed
             | MetadataCommandPublicationState::PublicationUnconfirmed
             | MetadataCommandPublicationState::IrrevocableUnconfirmed => {
-                let id = command.id();
-                Err(ObjectPgActionError::Store(
-                    StoreError::MetadataCommandIrrevocableConvergencePending {
-                        pg_id: id.pg_id().get(),
-                        cluster_epoch: id.cluster_epoch(),
-                        log_index: id.log_index().get(),
-                    },
-                ))
+                Err(Self::object_metadata_command_irrevocable_error(command))
             }
             MetadataCommandPublicationState::NotPublished => {
                 self.abandon_definitively_unapplied_object_metadata_command(
@@ -946,11 +1120,20 @@ impl super::StorageCluster {
                     command,
                     None,
                 )?;
-                Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(
-                    ObjectPgActionError::Store(budget_error),
-                ))
+                Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(fallback_error))
             }
         }
+    }
+
+    fn object_metadata_command_irrevocable_error(
+        command: &MetadataCommandEnvelope,
+    ) -> ObjectPgActionError {
+        let id = command.id();
+        ObjectPgActionError::Store(StoreError::MetadataCommandIrrevocableConvergencePending {
+            pg_id: id.pg_id().get(),
+            cluster_epoch: id.cluster_epoch(),
+            log_index: id.log_index().get(),
+        })
     }
 
     fn acquire_bucket_write_proof_for_object_metadata_command_with_effect_fence(

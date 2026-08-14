@@ -5535,8 +5535,9 @@ fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
     assert!(matches!(
         write_err,
         ShardIoError::Store {
-            source: StoreError::Io {
-                context: "connect storage-node RPC endpoint",
+            source: StoreError::StorageRpc {
+                operation: "connect storage-node RPC endpoint",
+                failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
                 ..
             },
             ..
@@ -5557,8 +5558,9 @@ fn unix_shard_client_fails_closed_when_storage_node_is_unavailable() {
     assert!(matches!(
         read_err,
         ShardIoError::Store {
-            source: StoreError::Io {
-                context: "connect storage-node read-handle RPC endpoint",
+            source: StoreError::StorageRpc {
+                operation: "connect storage-node read-handle RPC endpoint",
+                failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
                 ..
             },
             ..

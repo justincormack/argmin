@@ -41,6 +41,12 @@ enum ObjectPendingCommandFinishPolicy {
     AllocatorReinspectContention,
 }
 
+struct ObjectPendingCommandFinishContext<'a> {
+    execution_route: MetadataCommandExecutionRoute<'a>,
+    recovery_guard: Option<&'a MetadataCommandRecoveryGuard>,
+    finish_policy: ObjectPendingCommandFinishPolicy,
+}
+
 impl ObjectPendingCommandFinishPolicy {
     fn abandons_zero_apply_stale_reservation(self) -> bool {
         matches!(self, Self::AbandonZeroApplyStaleReservation)
@@ -675,8 +681,11 @@ impl StorageCluster {
                                 &error.source,
                             ) =>
                     {
-                        let reissued = match self.reissue_pending_metadata_command(pg_id, &command)
-                        {
+                        let reissued = match self.reissue_pending_metadata_command_until(
+                            pg_id,
+                            &command,
+                            work_budget.deadline(),
+                        ) {
                             Ok(Some(reissued)) => reissued,
                             Ok(None) => break,
                             Err(BucketSnapshotLoadError::Store(
@@ -690,12 +699,20 @@ impl StorageCluster {
                                 return Err(bucket_snapshot_error_to_object_pg_action_error(error));
                             }
                         };
-                        work_budget
-                            .sleep_after_contention(
-                                "object generation reservation reissue retry budget exhausted",
-                            )
-                            .map_err(ObjectPgActionError::Store)?;
                         command = reissued;
+                        if let Err(error) = work_budget.sleep_after_contention(
+                            "object generation reservation reissue retry budget exhausted",
+                        ) {
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                                .map_err(|error| {
+                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
+                                })?;
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
+                            return Err(ObjectPgActionError::Store(error));
+                        }
                     }
                     Err(error) => {
                         if error.progress.is_abortable() && error.applied_nodes == 0 {
@@ -1023,8 +1040,11 @@ impl StorageCluster {
             command.command,
             work_budget,
             self,
-            MetadataCommandExecutionRoute::normal(),
-            ObjectPendingCommandFinishPolicy::Standard,
+            ObjectPendingCommandFinishContext {
+                execution_route: MetadataCommandExecutionRoute::normal(),
+                recovery_guard: None,
+                finish_policy: ObjectPendingCommandFinishPolicy::Standard,
+            },
         )
     }
 
@@ -1039,8 +1059,11 @@ impl StorageCluster {
             command.command,
             work_budget,
             self,
-            MetadataCommandExecutionRoute::normal(),
-            ObjectPendingCommandFinishPolicy::AllocatorReinspectContention,
+            ObjectPendingCommandFinishContext {
+                execution_route: MetadataCommandExecutionRoute::normal(),
+                recovery_guard: None,
+                finish_policy: ObjectPendingCommandFinishPolicy::AllocatorReinspectContention,
+            },
         )
         .map(PendingObjectMetadataCommandCompletion::into_outcome)
     }
@@ -1231,7 +1254,21 @@ impl StorageCluster {
         let mut work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
             .for_operation("metadata_command_test_recovery")
             .for_pg(pg_id);
-        let mut recovery_authority = MetadataCommandRecoveryDrainAuthority::new(&mut work_budget);
+        self.drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+            pg_id,
+            command,
+            &mut work_budget,
+        )
+    }
+
+    #[cfg(test)]
+    fn drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        let mut recovery_authority = MetadataCommandRecoveryDrainAuthority::new(work_budget);
         let mut authority = MetadataCommandDrainAuthority::for_recovery(&mut recovery_authority);
         let outcome = self.drain_pending_metadata_command_with_authority_inner(
             pg_id,
@@ -1308,48 +1345,48 @@ impl StorageCluster {
     fn drain_pending_metadata_command_with_authority_inner(
         &self,
         pg_id: PgId,
-        command: &MetadataCommandEnvelope,
+        initial_command: &MetadataCommandEnvelope,
         authority: &mut MetadataCommandDrainAuthority<'_>,
         reservation_authority: &StorageCluster,
         route_mode: MetadataCommandRouteMode,
         recovery_authorized_source: Option<&MetadataCommandEnvelope>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        let mut command = initial_command.clone();
         loop {
-            if let Err(error) = authority
-                .work_budget()
-                .check("pending command recovery gate budget exhausted")
-            {
-                let error = self.classify_pending_metadata_command_budget_exhaustion(
-                    pg_id, command, route_mode, error,
-                )?;
-                return Err(ObjectPgActionError::Store(error));
-            }
             let recovery = self
                 .local_map
                 .runtime_state()
-                .join_metadata_command_recovery(pg_id, command);
+                .join_metadata_command_recovery_until(
+                    pg_id,
+                    &command,
+                    authority.work_budget().deadline(),
+                );
             let recovery_guard = match recovery {
                 MetadataCommandRecoveryAdmission::Leader(guard) => {
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
-                        command,
+                        &command,
                         observability::MetadataCommandRecoveryAdmissionKind::Leader,
                         0,
                     );
                     guard
                 }
-                MetadataCommandRecoveryAdmission::Waited { wait_us } => {
+                MetadataCommandRecoveryAdmission::Waited {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
-                        command,
+                        &command,
                         observability::MetadataCommandRecoveryAdmissionKind::Waited,
                         wait_us,
                     );
-                    self.emit_pending_slot_action_for_command(pg_id, command, "drain_wait");
+                    self.emit_pending_slot_action_for_command(pg_id, &command, "drain_wait");
                     #[cfg(test)]
                     request_ops::maybe_run_pending_command_recovery_waited_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
-                        command,
+                        &command,
                         authority.work_budget(),
                     );
                     if let Err(error) = authority
@@ -1357,13 +1394,16 @@ impl StorageCluster {
                         .check("pending command recovery wait budget exhausted")
                     {
                         let error = self.classify_pending_metadata_command_budget_exhaustion(
-                            pg_id, command, route_mode, error,
+                            pg_id, &command, route_mode, error,
                         )?;
                         return Err(ObjectPgActionError::Store(error));
                     }
                     let waiter_outcome = match self
-                        .pending_command_recovery_waiter_outcome_with_route_mode(
-                            pg_id, command, route_mode,
+                        .pending_command_recovery_waiter_outcome_with_route_mode_until(
+                            pg_id,
+                            &command,
+                            route_mode,
+                            authority.work_budget().deadline(),
                         ) {
                         Ok(outcome) => outcome,
                         Err(waiter_error) => {
@@ -1373,7 +1413,7 @@ impl StorageCluster {
                             {
                                 let error = self
                                     .classify_pending_metadata_command_budget_exhaustion(
-                                        pg_id, command, route_mode, error,
+                                        pg_id, &command, route_mode, error,
                                     )?;
                                 return Err(ObjectPgActionError::Store(error));
                             }
@@ -1382,7 +1422,7 @@ impl StorageCluster {
                     };
                     self.emit_metadata_command_recovery_outcome_for_command(
                         pg_id,
-                        command,
+                        &command,
                         waiter_outcome.metric_label(),
                     );
                     match waiter_outcome {
@@ -1396,23 +1436,27 @@ impl StorageCluster {
                         }
                     }
                 }
-                MetadataCommandRecoveryAdmission::TimedOut { wait_us } => {
+                MetadataCommandRecoveryAdmission::TimedOut {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
-                        command,
+                        &command,
                         observability::MetadataCommandRecoveryAdmissionKind::TimedOut,
                         wait_us,
                     );
                     self.emit_metadata_command_recovery_outcome_for_command(
                         pg_id,
-                        command,
+                        &command,
                         "timed_out",
                     );
-                    self.emit_pending_slot_action_for_command(pg_id, command, "drain_timeout");
+                    self.emit_pending_slot_action_for_command(pg_id, &command, "drain_timeout");
                     #[cfg(test)]
                     request_ops::maybe_run_pending_command_recovery_timeout_hook(
                         self.metadata_command_apply_test_hook_scope_id(),
-                        command,
+                        &command,
                         authority.work_budget(),
                     );
                     if let Err(error) = authority
@@ -1420,20 +1464,20 @@ impl StorageCluster {
                         .sleep_after_contention("pending command recovery retry budget exhausted")
                     {
                         let error = self.classify_pending_metadata_command_budget_exhaustion(
-                            pg_id, command, route_mode, error,
+                            pg_id, &command, route_mode, error,
                         )?;
                         return Err(ObjectPgActionError::Store(error));
                     }
                     continue;
                 }
             };
-            self.emit_pending_slot_action_for_command(pg_id, command, "drain_attempt");
+            self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
             let mut leader = authority
-                .admit_leader(recovery_guard, pg_id, command)
+                .admit_leader(recovery_guard, pg_id, &command)
                 .map_err(ObjectPgActionError::Store)?;
             let outcome = self.finish_pending_metadata_command_with_recovery_leader(
                 pg_id,
-                command,
+                &command,
                 &mut leader,
                 reservation_authority,
                 route_mode,
@@ -1441,7 +1485,7 @@ impl StorageCluster {
             )?;
             self.emit_metadata_command_recovery_outcome_for_command(
                 pg_id,
-                command,
+                &command,
                 outcome.metric_label(),
             );
             return Ok(outcome);
@@ -1478,6 +1522,42 @@ impl StorageCluster {
         }
     }
 
+    fn finish_direct_put_after_pending_command_uncertainty(
+        &self,
+        pg_id: PgId,
+        req: &CommitDirectPutObjectReq,
+        written_shards: &[WrittenShardAck],
+        command: &MetadataCommandEnvelope,
+        fallback_error: ObjectPgActionError,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        match self
+            .finish_new_object_metadata_command_after_uncertainty(
+                pg_id,
+                &req.bucket,
+                command,
+                fallback_error,
+            )?
+        {
+            request_ops::NewObjectMetadataCommandApplyOutcome::Applied => Ok(command.clone()),
+            request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(error)
+            | request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
+                self.release_object_generation_reservation(
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                )?;
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+                Err(error)
+            }
+        }
+    }
+
     fn finish_pending_metadata_command_with_recovery_leader(
         &self,
         pg_id: PgId,
@@ -1490,21 +1570,19 @@ impl StorageCluster {
         if Self::metadata_command_is_bucket_pg_command(command) {
             let outcome = match route_mode {
                     MetadataCommandRouteMode::Normal => self
-                        .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
+                        .finish_pending_metadata_command_to_acting_set_under_recovery_leader_with_work_budget(
                             pg_id,
                             command,
                             false,
-                            leader.work_budget(),
+                            leader,
                         ),
                     MetadataCommandRouteMode::Recovery => {
-                        let (work_budget, proof) = leader.parts();
                         self.finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget(
-                            proof,
                             pg_id,
                             command,
                             false,
                             recovery_authorized_source,
-                            work_budget,
+                            leader,
                         )
                     }
                 }
@@ -1521,26 +1599,35 @@ impl StorageCluster {
                 }
             })
         } else {
-            let (work_budget, proof) = leader.parts();
+            let (work_budget, proof, recovery_guard) = leader.parts_with_guard();
             self.finish_object_pg_pending_slot_inner(
                 pg_id,
                 command,
                 work_budget,
                 reservation_authority,
-                match route_mode {
-                    MetadataCommandRouteMode::Normal => MetadataCommandExecutionRoute::normal(),
-                    MetadataCommandRouteMode::Recovery => MetadataCommandExecutionRoute::recovery(
-                        proof,
-                        recovery_authorized_source,
-                        None,
-                    ),
+                ObjectPendingCommandFinishContext {
+                    execution_route: match route_mode {
+                        MetadataCommandRouteMode::Normal => {
+                            MetadataCommandExecutionRoute::normal()
+                        }
+                        MetadataCommandRouteMode::Recovery => {
+                            MetadataCommandExecutionRoute::recovery(
+                                proof,
+                                recovery_authorized_source,
+                                None,
+                            )
+                        }
+                    },
+                    recovery_guard: Some(recovery_guard),
+                    finish_policy:
+                        ObjectPendingCommandFinishPolicy::AbandonZeroApplyStaleReservation,
                 },
-                ObjectPendingCommandFinishPolicy::AbandonZeroApplyStaleReservation,
             )
             .map(PendingObjectMetadataCommandCompletion::into_outcome)
         }
     }
 
+    #[cfg(test)]
     fn pending_command_recovery_waiter_outcome(
         &self,
         pg_id: PgId,
@@ -1553,24 +1640,44 @@ impl StorageCluster {
         )
     }
 
+    #[cfg(test)]
     fn pending_command_recovery_waiter_outcome_with_route_mode(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         route_mode: MetadataCommandRouteMode,
     ) -> Result<MetadataCommandRecoveryWaiterOutcome, ObjectPgActionError> {
-        let pending = self.pending_metadata_command_for_bucket_with_route_mode(
+        let deadline = Instant::now()
+            .checked_add(request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET)
+            .unwrap_or_else(Instant::now);
+        self.pending_command_recovery_waiter_outcome_with_route_mode_until(
+            pg_id, command, route_mode, deadline,
+        )
+    }
+
+    fn pending_command_recovery_waiter_outcome_with_route_mode_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Instant,
+    ) -> Result<MetadataCommandRecoveryWaiterOutcome, ObjectPgActionError> {
+        let pending = self.pending_metadata_command_for_bucket_with_route_mode_until(
             pg_id,
             command.bucket_name(),
             route_mode,
             command.id().cluster_epoch(),
+            deadline,
         )?;
         if pending.as_ref() == Some(command) {
             return Ok(MetadataCommandRecoveryWaiterOutcome::StillPending);
         }
         if self
-            .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
-                pg_id, command, route_mode,
+            .metadata_command_is_applied_on_all_acting_nodes_with_route_mode_and_deadline(
+                pg_id,
+                command,
+                route_mode,
+                Some(deadline),
             )
             .map_err(bucket_snapshot_error_to_object_pg_action_error)?
         {
@@ -1607,8 +1714,11 @@ impl StorageCluster {
             command,
             &mut work_budget,
             self,
-            MetadataCommandExecutionRoute::normal(),
-            ObjectPendingCommandFinishPolicy::Standard,
+            ObjectPendingCommandFinishContext {
+                execution_route: MetadataCommandExecutionRoute::normal(),
+                recovery_guard: None,
+                finish_policy: ObjectPendingCommandFinishPolicy::Standard,
+            },
         )
         .map(PendingObjectMetadataCommandCompletion::into_outcome)
     }
@@ -1619,9 +1729,13 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         work_budget: &mut RequestWorkBudget,
         reservation_authority: &StorageCluster,
-        mut execution_route: MetadataCommandExecutionRoute<'_>,
-        finish_policy: ObjectPendingCommandFinishPolicy,
+        finish_context: ObjectPendingCommandFinishContext<'_>,
     ) -> Result<PendingObjectMetadataCommandCompletion, ObjectPgActionError> {
+        let ObjectPendingCommandFinishContext {
+            mut execution_route,
+            recovery_guard,
+            finish_policy,
+        } = finish_context;
         execution_route
             .require_command(pg_id, command)
             .map_err(ObjectPgActionError::Store)?;
@@ -1683,6 +1797,7 @@ impl StorageCluster {
                     reservation_authority,
                     execution_route,
                     work_budget,
+                    recovery_guard,
                 )?;
                 return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
             }
@@ -1832,11 +1947,13 @@ impl StorageCluster {
                         && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
                 {
                     let reissued = match self
-                        .reissue_pending_metadata_command_outcome_with_route_mode(
+                        .reissue_pending_metadata_command_outcome_with_route_mode_until(
                             pg_id,
                             &command,
                             execution_route,
                             command.payload(),
+                            recovery_guard,
+                            work_budget.deadline(),
                         ) {
                         Ok(ReissuePendingMetadataCommandOutcome::Reissued(reissued)
                         | ReissuePendingMetadataCommandOutcome::MatchingCurrent(reissued)) => {
@@ -1937,6 +2054,7 @@ impl StorageCluster {
                         reservation_authority,
                         execution_route,
                         work_budget,
+                        recovery_guard,
                     )?;
                     return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
                 }
@@ -1956,6 +2074,7 @@ impl StorageCluster {
         reservation_authority: &StorageCluster,
         execution_route: MetadataCommandExecutionRoute<'_>,
         work_budget: &mut RequestWorkBudget,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
     ) -> Result<(), ObjectPgActionError> {
         reservation_authority
             .release_metadata_command_bucket_write_reservation(command)
@@ -1971,7 +2090,7 @@ impl StorageCluster {
             command.payload().abandoned_recovery_follow_up(),
         ) {
             let Some(follow_up) = self
-                .reissue_pending_metadata_command_with_route_mode(
+                .reissue_pending_metadata_command_with_route_mode_and_recovery_guard_until(
                     pg_id,
                     command,
                     MetadataCommandExecutionRoute::recovery(
@@ -1980,6 +2099,8 @@ impl StorageCluster {
                         Some(command),
                     ),
                     &follow_up_payload,
+                    recovery_guard,
+                    work_budget.deadline(),
                 )
                 .map_err(bucket_snapshot_error_to_object_pg_action_error)?
             else {
@@ -1999,8 +2120,11 @@ impl StorageCluster {
                 &follow_up,
                 work_budget,
                 reservation_authority,
-                follow_up_route,
-                ObjectPendingCommandFinishPolicy::Standard,
+                ObjectPendingCommandFinishContext {
+                    execution_route: follow_up_route,
+                    recovery_guard,
+                    finish_policy: ObjectPendingCommandFinishPolicy::Standard,
+                },
             )? {
                 PendingObjectMetadataCommandCompletion::Applied => {
                     self.after_object_metadata_command_abandoned_payload_cleanup(command);
@@ -2236,7 +2360,11 @@ impl StorageCluster {
                             ) =>
                     {
                         let Some(reissued) = self
-                            .reissue_pending_metadata_command(pg_id, &command)
+                            .reissue_pending_metadata_command_until(
+                                pg_id,
+                                &command,
+                                work_budget.deadline(),
+                            )
                             .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                         else {
                             break;
@@ -2302,6 +2430,25 @@ impl StorageCluster {
             return Ok(());
         };
         self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;
+        Ok(())
+    }
+
+    fn drain_one_pending_object_metadata_command_with_work_budget(
+        &self,
+        publisher: impl crate::metadata_command::MetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        work_budget: &mut RequestWorkBudget,
+    ) -> Result<(), ObjectPgActionError> {
+        let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? else {
+            return Ok(());
+        };
+        let _ = self.drain_pending_object_metadata_command_with_work_budget(
+            publisher,
+            pg_id,
+            &command,
+            work_budget,
+        )?;
         Ok(())
     }
 
@@ -2549,90 +2696,21 @@ impl StorageCluster {
         pg_id: PgId,
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
-        segment_record: &StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, WriteAck)],
+        work_budget: &mut RequestWorkBudget,
     ) -> Result<StreamAppendCommandApplyOutcome, ObjectPgActionError> {
-        let mut command = command.clone();
-        loop {
-            match self.apply_metadata_command_to_acting_set(&command) {
-                Ok(outcome) => {
-                    if outcome == request_ops::MetadataCommandApplyOutcome::Converged {
-                        self.remove_pending_metadata_command_for_bucket(
-                            pg_id,
-                            command.bucket_name(),
-                            &command,
-                        )
-                        .map_err(ObjectPgActionError::from)?;
-                    }
-                    return Ok(StreamAppendCommandApplyOutcome::Applied);
-                }
-                Err(error)
-                    if matches!(
-                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
-                            pg_id,
-                            &command,
-                            error.applied_nodes,
-                            &error.source,
-                        )
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
-                        Some(true)
-                    ) =>
-                {
-                    self.remove_pending_metadata_command_for_bucket(
-                        pg_id,
-                        command.bucket_name(),
-                        &command,
-                    )
-                    .map_err(ObjectPgActionError::from)?;
-                    return Ok(StreamAppendCommandApplyOutcome::Applied);
-                }
-                Err(error)
-                    if matches!(
-                        self.retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes(
-                            pg_id,
-                            &command,
-                            error.applied_nodes,
-                            &error.source,
-                        )
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?,
-                        Some(false)
-                    ) =>
-                {
-                    return Err(conflicting_pending_object_metadata_command(
-                        "retryable partial stream append command conflict",
-                    ));
-                }
-                Err(error)
-                    if error.progress.is_abortable()
-                        && error.applied_nodes == 0
-                        && Self::metadata_command_log_conflict_matches(&command, &error.source) =>
-                {
-                    let Some(reissued) = self
-                        .reissue_pending_metadata_command(pg_id, &command)
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
-                    else {
-                        return Ok(StreamAppendCommandApplyOutcome::RetryFromFreshSnapshot);
-                    };
-                    command = reissued;
-                }
-                Err(error) => {
-                    if error.progress.is_abortable() && error.applied_nodes == 0 {
-                        self.record_abandoned_metadata_command_to_acting_set(&command)
-                            .map_err(|error| {
-                                bucket_snapshot_error_to_object_pg_action_error(error.source)
-                            })?;
-                        self.remove_pending_metadata_command_for_bucket(pg_id, bucket, &command)
-                            .map_err(ObjectPgActionError::from)?;
-                        self.delete_stream_segment_payload_shard_keys_best_effort(
-                            segment_record,
-                            shard_batch.iter().map(|(key, _)| (*key).clone()),
-                        );
-                    }
-                    return Err(bucket_snapshot_error_to_object_pg_action_error(
-                        error.source,
-                    ));
-                }
+        match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
+            pg_id,
+            bucket,
+            command,
+            work_budget,
+        )? {
+            request_ops::NewObjectMetadataCommandApplyOutcome::Applied => {
+                Ok(StreamAppendCommandApplyOutcome::Applied)
             }
+            request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
+                Ok(StreamAppendCommandApplyOutcome::RetryFromFreshSnapshot)
+            }
+            request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => Err(error),
         }
     }
 
@@ -2861,17 +2939,29 @@ impl StorageCluster {
                             ) =>
                     {
                         let Some(reissued) = self
-                            .reissue_pending_metadata_command(pg_id, &command)
+                            .reissue_pending_metadata_command_until(
+                                pg_id,
+                                &command,
+                                work_budget.deadline(),
+                            )
                             .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                         else {
                             break;
                         };
-                        work_budget
-                            .sleep_after_contention(
-                                "object generation release reissue retry budget exhausted",
-                            )
-                            .map_err(ObjectPgActionError::Store)?;
                         command = reissued;
+                        if let Err(error) = work_budget.sleep_after_contention(
+                            "object generation release reissue retry budget exhausted",
+                        ) {
+                            self.record_abandoned_metadata_command_to_acting_set(&command)
+                                .map_err(|error| {
+                                    bucket_snapshot_error_to_object_pg_action_error(error.source)
+                                })?;
+                            self.remove_pending_metadata_command_for_bucket(
+                                pg_id, bucket, &command,
+                            )
+                            .map_err(ObjectPgActionError::from)?;
+                            return Err(ObjectPgActionError::Store(error));
+                        }
                     }
                     Err(error) => {
                         if error.progress.is_abortable() && error.applied_nodes == 0 {
@@ -3355,6 +3445,12 @@ impl StorageCluster {
                     SnapshotSensitiveInstallOutcome::Installed => {
                         payload_ownership = DirectPutPayloadOwnership::DurableCommand;
                         disarm_payload_cleanup();
+                        #[cfg(test)]
+                        request_ops::maybe_run_direct_put_pending_installed_hook(
+                            self.metadata_command_apply_test_hook_scope_id(),
+                            &command,
+                            &mut work_budget,
+                        );
                     }
                     SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         sleep_direct_put_before_command_ownership_after_contention!(
@@ -3367,12 +3463,18 @@ impl StorageCluster {
             break (command, new_pending_command);
         };
 
+        let mut command = command;
+        let mut apply_as_new = new_pending_command;
         let command = loop {
             let recovery = self
                 .local_map
                 .runtime_state()
-                .join_metadata_command_recovery(pg_id, &command);
-            let _recovery_guard = match recovery {
+                .join_metadata_command_recovery_until(
+                    pg_id,
+                    &command,
+                    work_budget.deadline(),
+                );
+            let recovery_guard = match recovery {
                 MetadataCommandRecoveryAdmission::Leader(guard) => {
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
@@ -3382,7 +3484,12 @@ impl StorageCluster {
                     );
                     guard
                 }
-                MetadataCommandRecoveryAdmission::Waited { wait_us } => {
+                MetadataCommandRecoveryAdmission::Waited {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
+                    apply_as_new = false;
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
                         &command,
@@ -3390,8 +3497,24 @@ impl StorageCluster {
                         wait_us,
                     );
                     self.emit_pending_slot_action_for_command(pg_id, &command, "drain_wait");
-                    let waiter_outcome =
-                        self.pending_command_recovery_waiter_outcome(pg_id, &command)?;
+                    if let Err(error) =
+                        work_budget.check("direct PUT pending recovery wait budget exhausted")
+                    {
+                        break self.finish_direct_put_after_pending_command_uncertainty(
+                            pg_id,
+                            req,
+                            written_shards,
+                            &command,
+                            ObjectPgActionError::Store(error),
+                        )?;
+                    }
+                    let waiter_outcome = self
+                        .pending_command_recovery_waiter_outcome_with_route_mode_until(
+                            pg_id,
+                            &command,
+                            MetadataCommandRouteMode::Normal,
+                            work_budget.deadline(),
+                        )?;
                     match waiter_outcome {
                         MetadataCommandRecoveryWaiterOutcome::Applied => {
                             self.emit_metadata_command_recovery_outcome_for_command(
@@ -3428,16 +3551,27 @@ impl StorageCluster {
                                 &command,
                                 waiter_outcome.metric_label(),
                             );
-                            work_budget
-                                .sleep_after_contention(
-                                    "direct PUT pending recovery retry budget exhausted",
-                                )
-                                .map_err(ObjectPgActionError::Store)?;
+                            if let Err(error) = work_budget.sleep_after_contention(
+                                "direct PUT pending recovery retry budget exhausted",
+                            ) {
+                                break self.finish_direct_put_after_pending_command_uncertainty(
+                                    pg_id,
+                                    req,
+                                    written_shards,
+                                    &command,
+                                    ObjectPgActionError::Store(error),
+                                )?;
+                            }
                             continue;
                         }
                     }
                 }
-                MetadataCommandRecoveryAdmission::TimedOut { wait_us } => {
+                MetadataCommandRecoveryAdmission::TimedOut {
+                    wait_us,
+                    lineage_tip,
+                } => {
+                    command = lineage_tip;
+                    apply_as_new = false;
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
                         &command,
@@ -3450,28 +3584,36 @@ impl StorageCluster {
                         "timed_out",
                     );
                     self.emit_pending_slot_action_for_command(pg_id, &command, "drain_timeout");
-                    work_budget
-                        .sleep_after_contention(
-                            "direct PUT pending recovery retry budget exhausted",
-                        )
-                        .map_err(ObjectPgActionError::Store)?;
+                    if let Err(error) = work_budget.sleep_after_contention(
+                        "direct PUT pending recovery retry budget exhausted",
+                    ) {
+                        break self.finish_direct_put_after_pending_command_uncertainty(
+                            pg_id,
+                            req,
+                            written_shards,
+                            &command,
+                            ObjectPgActionError::Store(error),
+                        )?;
+                    }
                     continue;
                 }
             };
 
-            let apply = if new_pending_command {
-                self.apply_new_object_metadata_command_for_bucket_or_reinspect(
+            let apply = if apply_as_new {
+                self.apply_new_object_metadata_command_for_bucket_or_reinspect_with_recovery_guard(
                     pg_id,
                     &req.bucket,
                     &command,
                     &mut work_budget,
+                    &recovery_guard,
                 )
             } else {
-                self.apply_recovered_pending_object_metadata_command_for_bucket_or_reinspect(
+                self.apply_recovered_pending_object_metadata_command_for_bucket_or_reinspect_with_recovery_guard(
                     pg_id,
                     &req.bucket,
                     &command,
                     &mut work_budget,
+                    &recovery_guard,
                 )
             }?;
             match apply {
@@ -4672,8 +4814,7 @@ impl StorageCluster {
                 pg_id,
                 bucket,
                 &command,
-                segment_record,
-                shard_batch,
+                &mut work_budget,
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {

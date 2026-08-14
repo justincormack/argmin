@@ -1319,7 +1319,7 @@ fn direct_put_budget_expiry_after_pending_install_abandons_and_cleans_staging() 
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_guard =
-        cluster.test_install_before_object_metadata_command_apply_hook(Arc::new(move |command| {
+        cluster.test_install_direct_put_pending_installed_hook(Arc::new(move |command| {
             matches!(
                 command.payload(),
                 MetadataCommandPayload::CommitDirectPutObject(commit)
