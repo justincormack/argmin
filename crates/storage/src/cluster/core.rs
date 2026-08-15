@@ -409,6 +409,12 @@ impl RequestWorkBudget {
             .unwrap_or(self.started);
     }
 
+    #[cfg(test)]
+    pub(super) fn reset_for_test(&mut self, budget: Duration) {
+        self.started = Instant::now();
+        self.budget = budget;
+    }
+
     fn check(&mut self, context: &'static str) -> Result<(), StoreError> {
         if self.started.elapsed() >= self.budget
             || self
@@ -852,6 +858,12 @@ fn object_pg_action_error_to_bucket_snapshot_error(
             BucketSnapshotLoadError::Store(StoreError::Io {
                 context: "object PG action failed during bucket snapshot operation",
                 source: std::io::Error::other("stale stream finalize snapshot"),
+            })
+        }
+        ObjectPgActionError::SnapshotReinspectionConflict => {
+            BucketSnapshotLoadError::Store(StoreError::Io {
+                context: "object PG action failed during bucket snapshot operation",
+                source: std::io::Error::other("snapshot reinspection conflict"),
             })
         }
         ObjectPgActionError::StaleMultipartCompletionSnapshot => {

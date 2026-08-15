@@ -195,7 +195,8 @@ fn composite_checksum_value_from_complete_parts(
 impl Coordinator {
     pub(super) fn map_stream_upload_failure(error: storage::StreamUploadFailure) -> ServerError {
         match error.kind() {
-            storage::StreamUploadFailureKind::ResourceExhausted
+            storage::StreamUploadFailureKind::SnapshotReinspectionConflict
+            | storage::StreamUploadFailureKind::ResourceExhausted
             | storage::StreamUploadFailureKind::MetadataCommandContention
             | storage::StreamUploadFailureKind::RetryableConvergence => ServerError::SlowDown,
             storage::StreamUploadFailureKind::NoSuchUpload => {

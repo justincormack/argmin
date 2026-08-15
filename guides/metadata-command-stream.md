@@ -142,9 +142,14 @@ state may return `SlowDown`, and a command that provably did not cross that
 marker may be abandoned according to its command-family rules. Snapshot-sensitive
 conditional mutations must distinguish that safe abandonment from uncertain
 publication: while their request budget remains, they discard the stale computed
-result and re-evaluate the condition against a fresh snapshot. Only exhaustion of
-that outer budget may return `SlowDown` for repeated, definitively unpublished
-contention. Direct and streamed PutObject and conditional delete-marker exact
+result and re-evaluate the condition against a fresh snapshot. If a conditional
+PutObject has already encountered and safely abandoned an overlapping command
+when the budget expires, it returns `ConditionalRequestConflict` without starting
+a post-deadline snapshot read. The reinspection read itself uses that absolute
+deadline for local PG acquisition and remote transport; deadline exhaustion maps
+to the same conflict outcome. Other repeated, definitively unpublished contention
+may return `SlowDown` when that outer budget is exhausted. Direct and streamed
+PutObject and conditional delete-marker exact
 replays, pending-command drains, waiter observations, pending-slot installs, and
 stale-snapshot retries consume this same outer operation budget; they must not use
 a shorter or fresh nested budget that can expose internal PG churn as `SlowDown`

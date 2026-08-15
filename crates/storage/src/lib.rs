@@ -3169,6 +3169,7 @@ pub mod test_support {
                 | ObjectPgActionError::StaleObjectReadSubject
                 | ObjectPgActionError::StaleDirectPutCommitSnapshot
                 | ObjectPgActionError::StaleStreamFinalizeSnapshot
+                | ObjectPgActionError::SnapshotReinspectionConflict
                 | ObjectPgActionError::StaleMultipartCompletionSnapshot
                 | ObjectPgActionError::MultipartConditionalRequestConflict => {
                     StoreFailure::from(StoreError::RouteCapabilitySubjectMismatch {

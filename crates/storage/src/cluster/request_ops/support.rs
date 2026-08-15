@@ -183,6 +183,7 @@ pub(super) fn object_pg_action_error_is_retryable_command_observation(
         | ObjectPgActionError::StaleObjectReadSubject
         | ObjectPgActionError::StaleDirectPutCommitSnapshot
         | ObjectPgActionError::StaleStreamFinalizeSnapshot
+        | ObjectPgActionError::SnapshotReinspectionConflict
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
         | ObjectPgActionError::MultipartConditionalRequestConflict => false,
     }
@@ -670,6 +671,12 @@ type DirectPutPendingInstalledTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
 #[cfg(test)]
+type SnapshotReinspectionTestHook = Arc<dyn Fn() -> Duration + Send + Sync>;
+
+#[cfg(test)]
+type BeforeSnapshotReinspectionActionTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
 type BeforeObjectMetadataCommandReissueTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
 
@@ -853,6 +860,15 @@ static DIRECT_PUT_PENDING_INSTALLED_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static SNAPSHOT_REINSPECTION_HOOKS: OnceLock<Mutex<HashMap<usize, SnapshotReinspectionTestHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_SNAPSHOT_REINSPECTION_ACTION_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BeforeSnapshotReinspectionActionTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static BEFORE_OBJECT_METADATA_COMMAND_REISSUE_HOOKS: OnceLock<
     Mutex<HashMap<usize, BeforeObjectMetadataCommandReissueTestHook>>,
 > = OnceLock::new();
@@ -1019,6 +1035,16 @@ pub(crate) struct BeforeObjectMetadataCommandApplyTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct DirectPutPendingInstalledTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct SnapshotReinspectionTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BeforeSnapshotReinspectionActionTestHookGuard {
     scope_id: usize,
 }
 
@@ -1350,6 +1376,29 @@ impl Drop for BeforeObjectMetadataCommandApplyTestHookGuard {
 impl Drop for DirectPutPendingInstalledTestHookGuard {
     fn drop(&mut self) {
         let hooks = DIRECT_PUT_PENDING_INSTALLED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for SnapshotReinspectionTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = SNAPSHOT_REINSPECTION_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for BeforeSnapshotReinspectionActionTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BEFORE_SNAPSHOT_REINSPECTION_ACTION_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -1897,6 +1946,35 @@ pub(super) fn maybe_run_direct_put_pending_installed_hook(
         .cloned();
     if hook.is_some_and(|hook| hook(command)) {
         work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_snapshot_reinspection_hook(
+    scope_id: usize,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = SNAPSHOT_REINSPECTION_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        work_budget.reset_for_test(hook());
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_before_snapshot_reinspection_action_hook(scope_id: usize) {
+    let hook = BEFORE_SNAPSHOT_REINSPECTION_ACTION_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 

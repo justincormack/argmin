@@ -29,7 +29,7 @@ impl PendingObjectMetadataCommandCompletion {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExactPendingObjectMetadataCommandOutcome {
+pub(super) enum ExactPendingObjectMetadataCommandOutcome {
     Applied,
     Reinspect,
 }
@@ -1111,7 +1111,7 @@ impl StorageCluster {
         )
     }
 
-    fn apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
+    pub(super) fn apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
         &self,
         pg_id: PgId,
         command: ExactPendingObjectMetadataCommand<'_>,
@@ -1548,37 +1548,16 @@ impl StorageCluster {
     fn finish_direct_put_after_pending_command_uncertainty(
         &self,
         pg_id: PgId,
-        req: &CommitDirectPutObjectReq,
-        written_shards: &[WrittenShardAck],
+        bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         fallback_error: ObjectPgActionError,
-    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
-        match self
-            .finish_new_object_metadata_command_after_uncertainty(
-                pg_id,
-                &req.bucket,
-                command,
-                fallback_error,
-            )?
-        {
-            request_ops::NewObjectMetadataCommandApplyOutcome::Applied => Ok(command.clone()),
-            request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(error)
-            | request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
-                self.release_object_generation_reservation(
-                    &req.bucket,
-                    &req.key,
-                    &req.generation_reservation_id,
-                )?;
-                self.delete_direct_put_segment_payload_shards(
-                    req.data_pg_id,
-                    req.ec,
-                    &req.segment_okh,
-                    req.segment_vid,
-                    written_shards,
-                );
-                Err(error)
-            }
-        }
+    ) -> Result<request_ops::NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
+        self.finish_new_object_metadata_command_after_uncertainty(
+            pg_id,
+            bucket,
+            command,
+            fallback_error,
+        )
     }
 
     fn finish_pending_metadata_command_with_recovery_leader(
@@ -3162,6 +3141,129 @@ impl StorageCluster {
                 return Err(error);
             }
         };
+        macro_rules! finish_direct_put_after_safe_abandonment {
+            () => {{
+                #[cfg(test)]
+                request_ops::maybe_run_snapshot_reinspection_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    &mut work_budget,
+                );
+                let reinspection_deadline = work_budget.deadline();
+                if work_budget
+                    .check("direct PUT snapshot reinspection budget exhausted")
+                    .is_err()
+                {
+                    self.release_object_generation_reservation_best_effort(
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+                }
+                let snapshot = match direct_put_metadata_route
+                    .load_direct_put_commit_snapshot_until(
+                        &req.generation_reservation_id,
+                        req.generation_id,
+                        reinspection_deadline,
+                    ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.release_object_generation_reservation_best_effort(
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        );
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        if error.is_operation_deadline_exhaustion() {
+                            return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+                        }
+                        return Err(error);
+                    }
+                };
+                if let Some(outcome) = Self::committed_direct_put_retry_outcome(req, &snapshot)? {
+                    return Ok(Ok(outcome));
+                }
+                #[cfg(test)]
+                request_ops::maybe_run_before_snapshot_reinspection_action_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                );
+                if Instant::now() >= reinspection_deadline {
+                    self.release_object_generation_reservation_best_effort(
+                        &req.bucket,
+                        &req.key,
+                        &req.generation_reservation_id,
+                    );
+                    self.delete_direct_put_segment_payload_shards(
+                        req.data_pg_id,
+                        req.ec,
+                        &req.segment_okh,
+                        req.segment_vid,
+                        written_shards,
+                    );
+                    return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+                }
+                let action_result = action(snapshot.auth_snapshot);
+                self.release_object_generation_reservation_best_effort(
+                    &req.bucket,
+                    &req.key,
+                    &req.generation_reservation_id,
+                );
+                self.delete_direct_put_segment_payload_shards(
+                    req.data_pg_id,
+                    req.ec,
+                    &req.segment_okh,
+                    req.segment_vid,
+                    written_shards,
+                );
+                match action_result {
+                    Err(error) => return Ok(Err(error)),
+                    Ok(()) => return Err(ObjectPgActionError::SnapshotReinspectionConflict),
+                }
+            }};
+        }
+        macro_rules! finish_direct_put_after_pending_uncertainty {
+            ($command:ident, $error:expr) => {{
+                match self.finish_direct_put_after_pending_command_uncertainty(
+                    pg_id,
+                    &req.bucket,
+                    &$command,
+                    $error,
+                )? {
+                    request_ops::NewObjectMetadataCommandApplyOutcome::Applied => break $command,
+                    request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
+                        finish_direct_put_after_safe_abandonment!();
+                    }
+                    request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
+                        self.release_object_generation_reservation(
+                            &req.bucket,
+                            &req.key,
+                            &req.generation_reservation_id,
+                        )?;
+                        self.delete_direct_put_segment_payload_shards(
+                            req.data_pg_id,
+                            req.ec,
+                            &req.segment_okh,
+                            req.segment_vid,
+                            written_shards,
+                        );
+                        return Err(error);
+                    }
+                }
+            }};
+        }
 
         let (command, new_pending_command) = loop {
             require_direct_put_route_before_command_ownership!();
@@ -3371,10 +3473,7 @@ impl StorageCluster {
                                     )
                                 }
                                 Ok(PendingObjectMetadataCommandCompletion::Abandoned) => {
-                                    cleanup_direct_put_attempt_before_command_ownership!();
-                                    return Err(conflicting_pending_object_metadata_command(
-                                        "abandoned pending command for direct put commit",
-                                    ));
+                                    finish_direct_put_after_safe_abandonment!();
                                 }
                                 Ok(
                                     PendingObjectMetadataCommandCompletion::RetryPartialExactConflict(
@@ -3548,13 +3647,10 @@ impl StorageCluster {
                     if let Err(error) =
                         work_budget.check("direct PUT pending recovery wait budget exhausted")
                     {
-                        break self.finish_direct_put_after_pending_command_uncertainty(
-                            pg_id,
-                            req,
-                            written_shards,
-                            &command,
-                            ObjectPgActionError::Store(error),
-                        )?;
+                        finish_direct_put_after_pending_uncertainty!(
+                            command,
+                            ObjectPgActionError::Store(error)
+                        );
                     }
                     let waiter_outcome = self
                         .pending_command_recovery_waiter_outcome_with_route_mode_until(
@@ -3573,7 +3669,15 @@ impl StorageCluster {
                             break command;
                         }
                         MetadataCommandRecoveryWaiterOutcome::MissingNotApplied
-                        | MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
+                        => {
+                            self.emit_metadata_command_recovery_outcome_for_command(
+                                pg_id,
+                                &command,
+                                waiter_outcome.metric_label(),
+                            );
+                            finish_direct_put_after_safe_abandonment!();
+                        }
+                        MetadataCommandRecoveryWaiterOutcome::ReplacedNotApplied => {
                             let outcome = match (new_pending_command, waiter_outcome) {
                                 (true, MetadataCommandRecoveryWaiterOutcome::MissingNotApplied) => {
                                     "cleanup_suppressed_waiter_missing_not_applied"
@@ -3602,13 +3706,10 @@ impl StorageCluster {
                             if let Err(error) = work_budget.sleep_after_contention(
                                 "direct PUT pending recovery retry budget exhausted",
                             ) {
-                                break self.finish_direct_put_after_pending_command_uncertainty(
-                                    pg_id,
-                                    req,
-                                    written_shards,
-                                    &command,
-                                    ObjectPgActionError::Store(error),
-                                )?;
+                                finish_direct_put_after_pending_uncertainty!(
+                                    command,
+                                    ObjectPgActionError::Store(error)
+                                );
                             }
                             continue;
                         }
@@ -3635,13 +3736,10 @@ impl StorageCluster {
                     if let Err(error) = work_budget.sleep_after_contention(
                         "direct PUT pending recovery retry budget exhausted",
                     ) {
-                        break self.finish_direct_put_after_pending_command_uncertainty(
-                            pg_id,
-                            req,
-                            written_shards,
-                            &command,
-                            ObjectPgActionError::Store(error),
-                        )?;
+                        finish_direct_put_after_pending_uncertainty!(
+                            command,
+                            ObjectPgActionError::Store(error)
+                        );
                     }
                     continue;
                 }
@@ -3671,8 +3769,10 @@ impl StorageCluster {
                     );
                     break command;
                 }
-                request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(error)
-                | request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
+                request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(_error) => {
+                    finish_direct_put_after_safe_abandonment!();
+                }
+                request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
                     self.release_object_generation_reservation(
                         &req.bucket,
                         &req.key,

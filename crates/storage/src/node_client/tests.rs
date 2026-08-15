@@ -3772,6 +3772,67 @@ fn local_partial_conflict_state_and_reservation_checks_bound_pg_lock_wait() {
 }
 
 #[test]
+fn local_conditional_put_reinspection_snapshots_bound_pg_lock_wait() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let bucket = crate::tests::bucket_name("conditional-reinspection-lock-bucket");
+    let key = crate::tests::object_key("conditional-reinspection-lock-key");
+    let session_id = crate::tests::stream_session_id("cond-lock");
+    let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+    let direct_route = client
+        .open_direct_put_metadata_route(ClusterEpoch::INITIAL, pg_id, &bucket, &key)
+        .unwrap();
+    let stream_route = client
+        .open_stream_put_finalization_metadata_route(
+            ClusterEpoch::INITIAL,
+            pg_id,
+            &bucket,
+            &key,
+            &session_id,
+        )
+        .unwrap();
+    let pg_guard = storage_node.get_pg(0).unwrap();
+
+    for (operation, result) in [
+        (
+            "direct PUT",
+            direct_route
+                .load_direct_put_commit_snapshot_until(
+                    &session_id,
+                    GenerationId::MIN,
+                    Instant::now() + Duration::from_millis(20),
+                )
+                .map(|_| ()),
+        ),
+        (
+            "stream PUT",
+            stream_route
+                .load_snapshot_until(Instant::now() + Duration::from_millis(20))
+                .map(|_| ()),
+        ),
+    ] {
+        let error = result.expect_err("held PG lock must exhaust the snapshot deadline");
+        assert!(
+            matches!(
+                error,
+                ObjectPgActionError::Store(StoreError::OperationDeadlineExceeded { .. })
+            ),
+            "{operation} reinspection returned {error:?}"
+        );
+        assert!(error.is_operation_deadline_exhaustion());
+    }
+    drop(pg_guard);
+}
+
+#[test]
 fn unix_endpoint_absence_is_retryable_convergence() {
     let client = test_unix_storage_node_client();
     let error = client

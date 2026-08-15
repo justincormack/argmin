@@ -297,6 +297,7 @@ fn object_payload_reclaim_worker_should_defer(
             | ObjectPgActionError::StaleObjectReadSubject
             | ObjectPgActionError::StaleDirectPutCommitSnapshot
             | ObjectPgActionError::StaleStreamFinalizeSnapshot
+            | ObjectPgActionError::SnapshotReinspectionConflict
             | ObjectPgActionError::StaleMultipartCompletionSnapshot
             | ObjectPgActionError::MultipartConditionalRequestConflict,
         ) => false,

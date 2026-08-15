@@ -665,13 +665,65 @@ impl super::StorageCluster {
             break (command, new_pending_command, prepared);
         };
 
-        if new_pending_command {
-            self.apply_new_object_metadata_command_for_bucket(pg_id, bucket, &command)?;
+        let apply_outcome = if new_pending_command {
+            match self.apply_new_object_metadata_command_for_bucket_or_reinspect(
+                pg_id,
+                bucket,
+                &command,
+                &mut finalization_work_budget,
+            )? {
+                NewObjectMetadataCommandApplyOutcome::Applied => {
+                    super::ExactPendingObjectMetadataCommandOutcome::Applied
+                }
+                NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
+                    super::ExactPendingObjectMetadataCommandOutcome::Reinspect
+                }
+                NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
+                    return Err(error);
+                }
+            }
         } else {
-            self.apply_exact_pending_object_metadata_command(
+            self.apply_exact_pending_object_metadata_command_or_reinspect_with_work_budget(
                 pg_id,
                 super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
-            )?;
+                &mut finalization_work_budget,
+            )?
+        };
+        if apply_outcome == super::ExactPendingObjectMetadataCommandOutcome::Reinspect {
+            #[cfg(test)]
+            maybe_run_snapshot_reinspection_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                &mut finalization_work_budget,
+            );
+            let reinspection_deadline = finalization_work_budget.deadline();
+            if finalization_work_budget
+                .check("stream PUT snapshot reinspection budget exhausted")
+                .is_err()
+            {
+                return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+            }
+            let storage_snapshot = match finalization_route.load_snapshot_until(reinspection_deadline)
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) if error.is_operation_deadline_exhaustion() => {
+                    return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+                }
+                Err(error) => return Err(error),
+            };
+            #[cfg(test)]
+            maybe_run_before_snapshot_reinspection_action_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+            );
+            if Instant::now() >= reinspection_deadline {
+                return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+            }
+            match action(StreamPutFinalizeSnapshot {
+                session: storage_snapshot.session,
+                existing_etag: storage_snapshot.existing_etag,
+            }) {
+                Err(error) => return Ok(Err(error)),
+                Ok(_) => return Err(ObjectPgActionError::SnapshotReinspectionConflict),
+            }
         }
 
         let MetadataCommandPayload::CommitDirectPutObject(commit) = command.payload() else {

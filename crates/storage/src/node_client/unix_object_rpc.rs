@@ -2679,6 +2679,46 @@ impl DirectPutMetadataRoute for UnixDirectPutMetadataRoute<'_> {
         Ok(response.snapshot)
     }
 
+    fn load_direct_put_commit_snapshot_until(
+        &self,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+        deadline: Instant,
+    ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
+        let request = StorageRpcDirectPutCommitSnapshotRequest {
+            object: StorageRpcObjectRequest {
+                node_id: self.client.node_id,
+                cluster_epoch: self.route_cluster_epoch,
+                pg_id: self.pg_id.pg_id(),
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+            },
+            reservation_id: reservation_id.clone(),
+            generation_id,
+        };
+        let payload = encode_direct_put_commit_snapshot_request(&request);
+        let response = self
+            .client
+            .rpc_request_until(
+                StorageRpcMessageKind::DirectPutCommitSnapshotLoad,
+                payload,
+                deadline,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response = decode_direct_put_commit_snapshot_response(&response).map_err(|error| {
+            ObjectPgActionError::Store(self.client.rpc_payload_error(
+                "decode direct PUT commit snapshot response",
+                error.to_string(),
+            ))
+        })?;
+        self.client.validate_direct_put_commit_snapshot_response(
+            &response.snapshot,
+            &self.bucket,
+            &self.key,
+        )?;
+        Ok(response.snapshot)
+    }
+
     fn build_direct_put_commit_command(
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
@@ -4673,6 +4713,41 @@ impl StreamPutFinalizationMetadataRoute for UnixStreamPutFinalizationMetadataRou
             .rpc_request(
                 StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad,
                 payload,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        let response =
+            decode_stream_put_finalize_snapshot_response(&response).map_err(|error| {
+                ObjectPgActionError::Store(self.client.rpc_payload_error(
+                    "decode stream PUT finalize snapshot response",
+                    error.to_string(),
+                ))
+            })?;
+        self.client.validate_stream_put_finalize_snapshot_response(
+            &response.snapshot,
+            &self.bucket,
+            &self.key,
+            &self.session_id,
+        )?;
+        Ok(response.snapshot)
+    }
+
+    fn load_snapshot_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
+        let request = StorageRpcStreamPutFinalizeSnapshotRequest {
+            object: self
+                .client
+                .object_request(self.pg_id.pg_id(), &self.bucket, &self.key),
+            session_id: self.session_id.clone(),
+        };
+        let payload = encode_stream_put_finalize_snapshot_request(&request);
+        let response = self
+            .client
+            .rpc_request_until(
+                StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad,
+                payload,
+                deadline,
             )
             .map_err(ObjectPgActionError::Store)?;
         let response =

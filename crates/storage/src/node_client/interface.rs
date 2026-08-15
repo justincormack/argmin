@@ -444,6 +444,13 @@ pub(crate) trait DirectPutMetadataRoute: Send {
         generation_id: GenerationId,
     ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError>;
 
+    fn load_direct_put_commit_snapshot_until(
+        &self,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+        deadline: Instant,
+    ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError>;
+
     fn build_direct_put_commit_command(
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
@@ -708,6 +715,11 @@ pub(crate) trait StreamUploadSessionMetadataRoute: Send {
 
 pub(crate) trait StreamPutFinalizationMetadataRoute: Send {
     fn load_snapshot(&self) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
+
+    fn load_snapshot_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError>;
 
     fn build_commit_command(
         &self,

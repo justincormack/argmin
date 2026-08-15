@@ -71,11 +71,58 @@ impl StreamPutFinalizationRoute for storage::ActivePutObjectRoute<'_> {
 impl Coordinator {
     pub(super) fn map_direct_put_failure(error: storage::DirectPutFailure) -> ServerError {
         match error.kind() {
-            storage::DirectPutFailureKind::ResourceExhausted
+            storage::DirectPutFailureKind::SnapshotReinspectionConflict
+            | storage::DirectPutFailureKind::ResourceExhausted
             | storage::DirectPutFailureKind::MetadataCommandContention
             | storage::DirectPutFailureKind::RetryableConvergence => ServerError::SlowDown,
             storage::DirectPutFailureKind::InternalError => ServerError::DirectPut(error),
         }
+    }
+
+    fn conditional_write_conflict(
+        key: &str,
+        condition: &crate::conditional::WriteCondition,
+    ) -> ServerError {
+        let condition = match condition {
+            crate::conditional::WriteCondition::IfMatch(_) => "If-Match",
+            crate::conditional::WriteCondition::IfNoneMatchStar => "If-None-Match",
+            crate::conditional::WriteCondition::None => {
+                return ServerError::InternalError {
+                    reason: "unconditional PutObject reported a snapshot reinspection conflict"
+                        .to_string(),
+                };
+            }
+        };
+        ServerError::ConditionalRequestConflict {
+            key: key.to_string(),
+            condition,
+        }
+    }
+
+    pub(super) fn map_put_object_direct_failure(
+        key: &str,
+        condition: &crate::conditional::WriteCondition,
+        error: storage::DirectPutFailure,
+    ) -> ServerError {
+        if !condition.is_empty()
+            && error.kind() == storage::DirectPutFailureKind::SnapshotReinspectionConflict
+        {
+            return Self::conditional_write_conflict(key, condition);
+        }
+        Self::map_direct_put_failure(error)
+    }
+
+    pub(super) fn map_put_object_stream_failure(
+        key: &str,
+        condition: &crate::conditional::WriteCondition,
+        error: storage::StreamUploadFailure,
+    ) -> ServerError {
+        if !condition.is_empty()
+            && error.kind() == storage::StreamUploadFailureKind::SnapshotReinspectionConflict
+        {
+            return Self::conditional_write_conflict(key, condition);
+        }
+        Self::map_stream_upload_failure(error)
     }
 
     /// Put an object, using a direct single-segment commit when possible.
@@ -367,7 +414,13 @@ impl Coordinator {
                                     Ok(())
                                 },
                             )
-                            .map_err(Coordinator::map_direct_put_failure)??;
+                            .map_err(|error| {
+                                Coordinator::map_put_object_direct_failure(
+                                    authorized.key(),
+                                    req.cond,
+                                    error,
+                                )
+                            })??;
                         let lifecycle_expiration =
                             Self::current_object_write_lifecycle_expiration_for_config(
                                 lifecycle.as_ref(),
@@ -834,7 +887,7 @@ impl Coordinator {
             };
             let outcome = route
                 .finalize(session_id, total_size, &mut prepare)
-                .map_err(Coordinator::map_stream_upload_failure)??;
+                .map_err(|error| Coordinator::map_put_object_stream_failure(key, cond, error))??;
             let lifecycle_expiration = Self::current_object_write_lifecycle_expiration_for_config(
                 lifecycle.as_ref(),
                 key,

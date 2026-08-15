@@ -1405,7 +1405,7 @@ fn direct_put_committed_response_loss_retry_returns_existing_commit() {
 }
 
 #[test]
-fn direct_put_budget_expiry_after_pending_install_abandons_and_cleans_staging() {
+fn direct_put_budget_expiry_after_pending_install_returns_snapshot_conflict_and_cleans_staging() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1465,19 +1465,32 @@ fn direct_put_budget_expiry_after_pending_install_abandons_and_cleans_staging() 
                 MetadataCommandPayload::CommitDirectPutObject(commit)
                     if commit.object.bucket == hook_bucket
                         && commit.object.key == hook_key
-                        && !expired_hook.swap(true, Ordering::SeqCst)
+                && !expired_hook.swap(true, Ordering::SeqCst)
             )
         }));
+    let reinspection_hook =
+        cluster.test_install_snapshot_reinspection_hook(Arc::new(|| Duration::from_millis(250)));
+    let before_action_hook =
+        cluster.test_install_before_snapshot_reinspection_action_hook(Arc::new(|| {
+            thread::sleep(Duration::from_millis(300))
+        }));
+    let action_calls = AtomicUsize::new(0);
     let error = route
-        .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
+        .commit_direct_object(payload, &prepared, |_| {
+            action_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<(), ()>(())
+        })
         .unwrap_err();
+    drop(before_action_hook);
+    drop(reinspection_hook);
     drop(hook_guard);
 
     assert!(expired.load(Ordering::SeqCst));
     assert_eq!(
         error.kind(),
-        crate::DirectPutFailureKind::MetadataCommandContention
+        crate::DirectPutFailureKind::SnapshotReinspectionConflict
     );
+    assert_eq!(action_calls.load(Ordering::SeqCst), 1);
     assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
     assert_bucket_write_reservations_released(&map, &bucket);
     assert_direct_payload_staging_cleaned(

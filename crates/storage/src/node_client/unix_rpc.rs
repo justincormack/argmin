@@ -1873,7 +1873,7 @@ impl UnixStorageNodeClient {
             .map_err(StorageRpcRequestDispatchFailure::into_source)
     }
 
-    fn rpc_request_until(
+    pub(super) fn rpc_request_until(
         &self,
         kind: StorageRpcMessageKind,
         payload: Vec<u8>,

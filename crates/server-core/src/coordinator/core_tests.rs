@@ -10597,10 +10597,53 @@ fn direct_put_failure_kinds_map_exhaustively_to_s3_outcomes() {
         assert!(matches!(map(kind), ServerError::SlowDown));
     }
     assert!(matches!(
+        map(storage::DirectPutFailureKind::SnapshotReinspectionConflict),
+        ServerError::SlowDown
+    ));
+    assert!(matches!(
         map(storage::DirectPutFailureKind::InternalError),
         ServerError::DirectPut(error)
             if error.diagnostic_cause_label() == "store_internal_failure"
     ));
+}
+
+#[test]
+fn conditional_put_maps_safe_abandonment_reinspection_to_conflict() {
+    let key = "conditional-key";
+    for condition in [
+        WriteCondition::IfMatch(SpecificEtag::new("\"etag\"".to_string()).unwrap()),
+        WriteCondition::IfNoneMatchStar,
+    ] {
+        let direct = Coordinator::map_put_object_direct_failure(
+            key,
+            &condition,
+            storage::test_support::direct_put_failure_for_kind(
+                storage::DirectPutFailureKind::SnapshotReinspectionConflict,
+            ),
+        );
+        let stream = Coordinator::map_put_object_stream_failure(
+            key,
+            &condition,
+            storage::test_support::stream_upload_failure_for_kind(
+                storage::StreamUploadFailureKind::SnapshotReinspectionConflict,
+            ),
+        );
+        let expected_condition = match condition {
+            WriteCondition::IfMatch(_) => "If-Match",
+            WriteCondition::IfNoneMatchStar => "If-None-Match",
+            WriteCondition::None => unreachable!(),
+        };
+        assert!(matches!(
+            direct,
+            ServerError::ConditionalRequestConflict { key: mapped_key, condition }
+                if mapped_key == key && condition == expected_condition
+        ));
+        assert!(matches!(
+            stream,
+            ServerError::ConditionalRequestConflict { key: mapped_key, condition }
+                if mapped_key == key && condition == expected_condition
+        ));
+    }
 }
 
 #[test]
@@ -10701,6 +10744,7 @@ fn stream_upload_failure_kinds_map_exhaustively_to_s3_outcomes() {
     };
 
     for kind in [
+        storage::StreamUploadFailureKind::SnapshotReinspectionConflict,
         storage::StreamUploadFailureKind::ResourceExhausted,
         storage::StreamUploadFailureKind::MetadataCommandContention,
         storage::StreamUploadFailureKind::RetryableConvergence,

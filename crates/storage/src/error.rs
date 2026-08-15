@@ -773,6 +773,18 @@ pub(crate) enum StoreError {
 }
 
 impl StoreError {
+    #[must_use]
+    pub(crate) fn is_operation_deadline_exhaustion(&self) -> bool {
+        match self {
+            Self::OperationDeadlineExceeded { .. } => true,
+            Self::StorageRpc { failure, .. } => {
+                failure.wire_code() == StorageRpcWireErrorCode::TransportTimeout
+            }
+            Self::ShardStore { source, .. } => source.is_operation_deadline_exhaustion(),
+            _ => false,
+        }
+    }
+
     /// Classify this failure for a higher-layer request operation.
     ///
     /// The match is intentionally exhaustive. Storage owns recursive adapter and
@@ -2337,11 +2349,17 @@ pub(crate) enum ObjectPgActionError {
     StaleObjectReadSubject,
     StaleDirectPutCommitSnapshot,
     StaleStreamFinalizeSnapshot,
+    SnapshotReinspectionConflict,
     StaleMultipartCompletionSnapshot,
     MultipartConditionalRequestConflict,
 }
 
 impl ObjectPgActionError {
+    #[must_use]
+    pub(crate) fn is_operation_deadline_exhaustion(&self) -> bool {
+        matches!(self, Self::Store(error) if error.is_operation_deadline_exhaustion())
+    }
+
     /// Return a bounded storage-owned label for operator diagnostics.
     #[must_use]
     pub fn diagnostic_cause_label(&self) -> &'static str {
@@ -2352,6 +2370,7 @@ impl ObjectPgActionError {
             Self::StaleObjectReadSubject => "stale_object_read_subject",
             Self::StaleDirectPutCommitSnapshot => "stale_direct_put_commit_snapshot",
             Self::StaleStreamFinalizeSnapshot => "stale_stream_finalize_snapshot",
+            Self::SnapshotReinspectionConflict => "snapshot_reinspection_conflict",
             Self::StaleMultipartCompletionSnapshot => "stale_multipart_completion_snapshot",
             Self::MultipartConditionalRequestConflict => "multipart_conditional_request_conflict",
         }
@@ -2372,6 +2391,7 @@ impl ObjectPgActionError {
             | Self::StaleObjectReadSubject
             | Self::StaleDirectPutCommitSnapshot
             | Self::StaleStreamFinalizeSnapshot
+            | Self::SnapshotReinspectionConflict
             | Self::StaleMultipartCompletionSnapshot
             | Self::MultipartConditionalRequestConflict => false,
         }
@@ -2428,6 +2448,7 @@ enum ObjectOperationFailureDiagnosticCategory {
     StaleObjectReadSubject,
     StaleMultipartCompletionSnapshot,
     MultipartConditionalRequestConflict,
+    SnapshotReinspectionConflict,
     UnexpectedObjectOperationOutcome,
 }
 
@@ -2439,6 +2460,7 @@ impl ObjectOperationFailureDiagnosticCategory {
             Self::StaleObjectReadSubject => "stale_object_read_subject",
             Self::StaleMultipartCompletionSnapshot => "stale_multipart_completion_snapshot",
             Self::MultipartConditionalRequestConflict => "multipart_conditional_request_conflict",
+            Self::SnapshotReinspectionConflict => "snapshot_reinspection_conflict",
             Self::UnexpectedObjectOperationOutcome => "unexpected_object_operation_outcome",
         }
     }
@@ -2467,6 +2489,9 @@ fn object_pg_action_diagnostic_category(
         }
         ObjectPgActionError::MultipartConditionalRequestConflict => {
             ObjectOperationFailureDiagnosticCategory::MultipartConditionalRequestConflict
+        }
+        ObjectPgActionError::SnapshotReinspectionConflict => {
+            ObjectOperationFailureDiagnosticCategory::SnapshotReinspectionConflict
         }
         ObjectPgActionError::StaleDirectPutCommitSnapshot
         | ObjectPgActionError::StaleStreamFinalizeSnapshot => {
@@ -2515,6 +2540,7 @@ fn classify_object_pg_action(
         | ObjectPgActionError::StaleObjectReadSubject
         | ObjectPgActionError::StaleDirectPutCommitSnapshot
         | ObjectPgActionError::StaleStreamFinalizeSnapshot
+        | ObjectPgActionError::SnapshotReinspectionConflict
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
         | ObjectPgActionError::MultipartConditionalRequestConflict => {
             ObjectOperationFailureKind::InternalError
@@ -3142,6 +3168,7 @@ impl std::error::Error for ObjectMetadataMutationFailure {}
 /// storage.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirectPutFailureKind {
+    SnapshotReinspectionConflict,
     ResourceExhausted,
     MetadataCommandContention,
     RetryableConvergence,
@@ -3166,6 +3193,13 @@ impl DirectPutFailure {
     }
 
     pub(crate) fn from_object_pg_action(error: ObjectPgActionError) -> Self {
+        if matches!(error, ObjectPgActionError::SnapshotReinspectionConflict) {
+            return Self {
+                kind: DirectPutFailureKind::SnapshotReinspectionConflict,
+                diagnostic_category:
+                    ObjectOperationFailureDiagnosticCategory::SnapshotReinspectionConflict,
+            };
+        }
         let (operation_kind, diagnostic_category) = classify_object_pg_action(error);
         let kind = match operation_kind {
             ObjectOperationFailureKind::ResourceExhausted => {
@@ -3193,6 +3227,13 @@ impl DirectPutFailure {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) const fn for_test(kind: DirectPutFailureKind) -> Self {
         let operation_kind = match kind {
+            DirectPutFailureKind::SnapshotReinspectionConflict => {
+                return Self {
+                    kind,
+                    diagnostic_category:
+                        ObjectOperationFailureDiagnosticCategory::SnapshotReinspectionConflict,
+                };
+            }
             DirectPutFailureKind::ResourceExhausted => {
                 ObjectMetadataMutationFailureKind::ResourceExhausted
             }
@@ -3287,6 +3328,7 @@ impl MultipartManagementFailure {
             | ObjectPgActionError::StaleObjectReadSubject
             | ObjectPgActionError::StaleDirectPutCommitSnapshot
             | ObjectPgActionError::StaleStreamFinalizeSnapshot
+            | ObjectPgActionError::SnapshotReinspectionConflict
             | ObjectPgActionError::StaleMultipartCompletionSnapshot
             | ObjectPgActionError::MultipartConditionalRequestConflict => {
                 MultipartManagementFailureKind::InternalError
@@ -3456,7 +3498,8 @@ impl MultipartCompletionFailure {
             | ObjectPgActionError::InvalidRequest { .. }
             | ObjectPgActionError::StaleObjectReadSubject
             | ObjectPgActionError::StaleDirectPutCommitSnapshot
-            | ObjectPgActionError::StaleStreamFinalizeSnapshot => {
+            | ObjectPgActionError::StaleStreamFinalizeSnapshot
+            | ObjectPgActionError::SnapshotReinspectionConflict => {
                 MultipartCompletionFailureOutcome::InternalError
             }
         };
@@ -3549,6 +3592,7 @@ pub enum StreamUploadFailureKind {
     SessionNotFound,
     SessionNotInProgress,
     SegmentConflict,
+    SnapshotReinspectionConflict,
     ResourceExhausted,
     MetadataCommandContention,
     RetryableConvergence,
@@ -3562,6 +3606,7 @@ enum StreamUploadFailureOutcome {
     SessionNotFound,
     SessionNotInProgress,
     SegmentConflict,
+    SnapshotReinspectionConflict,
     ResourceExhausted,
     MetadataCommandContention,
     RetryableConvergence,
@@ -3586,6 +3631,9 @@ impl StreamUploadFailure {
                 StreamUploadFailureKind::SessionNotInProgress
             }
             StreamUploadFailureOutcome::SegmentConflict => StreamUploadFailureKind::SegmentConflict,
+            StreamUploadFailureOutcome::SnapshotReinspectionConflict => {
+                StreamUploadFailureKind::SnapshotReinspectionConflict
+            }
             StreamUploadFailureOutcome::ResourceExhausted => {
                 StreamUploadFailureKind::ResourceExhausted
             }
@@ -3647,6 +3695,9 @@ impl StreamUploadFailure {
             | ObjectPgActionError::MultipartConditionalRequestConflict => {
                 ObjectOperationFailureDiagnosticCategory::UnexpectedObjectOperationOutcome
             }
+            ObjectPgActionError::SnapshotReinspectionConflict => {
+                ObjectOperationFailureDiagnosticCategory::SnapshotReinspectionConflict
+            }
         };
         let outcome = match error {
             ObjectPgActionError::Store(error) => match error.operation_failure_class() {
@@ -3678,6 +3729,9 @@ impl StreamUploadFailure {
             }
             ObjectPgActionError::InvalidRequest { reason } => {
                 StreamUploadFailureOutcome::InvalidRequest { reason }
+            }
+            ObjectPgActionError::SnapshotReinspectionConflict => {
+                StreamUploadFailureOutcome::SnapshotReinspectionConflict
             }
             ObjectPgActionError::Metadata(_)
             | ObjectPgActionError::StaleObjectReadSubject
@@ -3716,6 +3770,9 @@ impl StreamUploadFailure {
                 ObjectPgActionError::Metadata(MetadataError::StreamSegmentConflict {
                     segment_index: 11,
                 })
+            }
+            StreamUploadFailureKind::SnapshotReinspectionConflict => {
+                ObjectPgActionError::SnapshotReinspectionConflict
             }
             StreamUploadFailureKind::ResourceExhausted => ObjectPgActionError::Store(
                 StoreError::storage_node_resource_exhausted(7, "private test operation"),
@@ -4375,7 +4432,6 @@ mod tests {
                 expected
             );
         }
-
         assert_eq!(
             convert(ObjectPgActionError::Metadata(MetadataError::ObjectNotFound)),
             ObjectReadFailureKind::ObjectNotFound
@@ -4922,6 +4978,14 @@ mod tests {
             );
             assert_eq!(DirectPutFailure::for_test(expected).kind(), expected);
         }
+        assert_eq!(
+            convert(ObjectPgActionError::SnapshotReinspectionConflict),
+            DirectPutFailureKind::SnapshotReinspectionConflict
+        );
+        assert_eq!(
+            DirectPutFailure::for_test(DirectPutFailureKind::SnapshotReinspectionConflict).kind(),
+            DirectPutFailureKind::SnapshotReinspectionConflict
+        );
 
         assert_eq!(
             convert(ObjectPgActionError::Store(
@@ -5183,6 +5247,7 @@ mod tests {
             StreamUploadFailureKind::SessionNotFound,
             StreamUploadFailureKind::SessionNotInProgress,
             StreamUploadFailureKind::SegmentConflict,
+            StreamUploadFailureKind::SnapshotReinspectionConflict,
             StreamUploadFailureKind::ResourceExhausted,
             StreamUploadFailureKind::MetadataCommandContention,
             StreamUploadFailureKind::RetryableConvergence,
@@ -5205,6 +5270,10 @@ mod tests {
         assert_eq!(
             convert(ObjectPgActionError::StaleStreamFinalizeSnapshot),
             StreamUploadFailureKind::InternalError
+        );
+        assert_eq!(
+            convert(ObjectPgActionError::SnapshotReinspectionConflict),
+            StreamUploadFailureKind::SnapshotReinspectionConflict
         );
     }
 

@@ -1263,6 +1263,127 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
 }
 
 #[test]
+fn stream_put_finalize_budget_expiry_after_safe_abandonment_returns_snapshot_conflict() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec = EcShape { k: 2, m: 1 };
+    let map = Arc::new(LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec).unwrap());
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let session_id = crate::tests::stream_session_id("put-safe-abandon");
+    cluster
+        .create_put_object_stream_session_record(
+            &bucket,
+            &key,
+            &session_id,
+            crate::ObjectEncryption::None,
+        )
+        .unwrap();
+    let payload = b"stream PUT safe abandonment reinspection";
+    let payload_crc64 = checksum::crc64::checksum(payload);
+    let (_target, segment) = cluster
+        .prepare_stream_segment_append(
+            &bucket,
+            &key,
+            &crate::PrepareStreamUploadSegmentAppendReq {
+                session_id: session_id.clone(),
+                segment_index: 0,
+                size: payload.len() as u64,
+                segment_crc64: payload_crc64,
+                payload_crc64,
+                segment_okh: [0xb2; 16],
+            },
+        )
+        .unwrap();
+    let written = cluster
+        .write_stream_segment_payload_shards(&segment, payload)
+        .unwrap();
+    let shard_batch = written
+        .iter()
+        .map(|written| (&written.key, written.ack))
+        .collect::<Vec<_>>();
+    cluster
+        .commit_stream_segment_append(
+            &bucket,
+            &key,
+            &session_id,
+            segment.segment_index,
+            &segment,
+            &shard_batch,
+        )
+        .unwrap();
+
+    let expired = Arc::new(AtomicBool::new(false));
+    let hook_expired = Arc::clone(&expired);
+    let hook_bucket = bucket.clone();
+    let hook_key = key.clone();
+    let hook_session = session_id.clone();
+    let _hook =
+        cluster.test_install_before_object_metadata_command_apply_hook(Arc::new(move |command| {
+            matches!(
+                command.payload(),
+                MetadataCommandPayload::CommitDirectPutObject(commit)
+                    if commit.matches_stream_session(&hook_bucket, &hook_key, &hook_session)
+                && !hook_expired.swap(true, Ordering::SeqCst)
+            )
+        }));
+    let _reinspection_hook =
+        cluster.test_install_snapshot_reinspection_hook(Arc::new(|| Duration::from_millis(250)));
+    let _before_action_hook =
+        cluster.test_install_before_snapshot_reinspection_action_hook(Arc::new(|| {
+            thread::sleep(Duration::from_millis(300))
+        }));
+    let action_calls = AtomicUsize::new(0);
+    let error = cluster
+        .finalize_put_object_stream(&bucket, &key, &session_id, payload.len() as u64, |_| {
+            action_calls.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, ()>(crate::PreparedStreamPutCommit {
+                value: (),
+                versioning: crate::BucketVersioningState::Enabled,
+                owner: crate::OwnerIdentity::from_principal("owner"),
+                acl_grants: crate::AclGrants::default(),
+                public_read: false,
+                etag_crc64: payload_crc64,
+                tags: None,
+                metadata_blob: crate::SerializedMetadataBlob::default(),
+                system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                object_lock: crate::ObjectLockState::default(),
+                encryption: crate::ObjectEncryption::None,
+            })
+        })
+        .unwrap_err();
+    assert!(expired.load(Ordering::SeqCst));
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::SnapshotReinspectionConflict
+    ));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+}
+
+#[test]
 fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_replica() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

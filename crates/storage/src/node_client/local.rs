@@ -2785,6 +2785,26 @@ impl DirectPutMetadataRoute for LocalDirectPutMetadataRoute<'_> {
         )
     }
 
+    fn load_direct_put_commit_snapshot_until(
+        &self,
+        reservation_id: &SessionId,
+        generation_id: GenerationId,
+        deadline: Instant,
+    ) -> Result<DirectPutCommitStorageSnapshot, ObjectPgActionError> {
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        load_direct_put_commit_snapshot_from_pg(
+            &pg,
+            self.client.node_id,
+            &self.bucket,
+            &self.key,
+            reservation_id,
+            generation_id,
+        )
+    }
+
     fn build_direct_put_commit_command(
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
@@ -3768,6 +3788,17 @@ impl StreamPutFinalizationMetadataRoute for LocalStreamPutFinalizationMetadataRo
             &self.key,
             &self.session_id,
         )
+    }
+
+    fn load_snapshot_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<StreamPutFinalizeStorageSnapshot, ObjectPgActionError> {
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        load_stream_put_finalize_snapshot_from_pg(&pg, &self.bucket, &self.key, &self.session_id)
     }
 
     fn build_commit_command(

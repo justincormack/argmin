@@ -8,12 +8,13 @@
     };
     use crate::node_client::{
         BucketMetadataNodeClient, BuildCompleteMultipartObjectCommandReq,
-        BuildStreamPartCommitCommandReq,
+        BuildStreamPartCommitCommandReq, DirectPutMetadataNodeClient,
         LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
         MetadataCommandInspectionNodeClient, MetadataCommandRecoveryNodeClient,
         ObjectMutationMetadataNodeClient, PlacedShardNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
+    use crate::storage_rpc::StorageRpcWireErrorCode;
     use crate::{
         BucketAclSummary, LocalClusterMap, LocalUnixStorageNodeClientConfig, StorageCluster,
         StorageRpcClientAuthConfig,
@@ -309,10 +310,21 @@
         max_connections: usize,
     ) -> crate::StorageRpcTransportLimits {
         let defaults = crate::StorageRpcTransportLimits::DEFAULT;
+        storage_rpc_test_transport_limits_with_io_timeout(
+            max_connections,
+            defaults.io_timeout(),
+        )
+    }
+
+    fn storage_rpc_test_transport_limits_with_io_timeout(
+        max_connections: usize,
+        io_timeout: Duration,
+    ) -> crate::StorageRpcTransportLimits {
+        let defaults = crate::StorageRpcTransportLimits::DEFAULT;
         crate::StorageRpcTransportLimits::new(
             defaults.max_frame_bytes(),
             max_connections,
-            defaults.io_timeout(),
+            io_timeout,
         )
         .unwrap()
     }
@@ -5208,6 +5220,207 @@
     #[test]
     fn authenticated_tls_tcp_metadata_apply_response_auth_failure_is_may_have_applied() {
         authenticated_metadata_apply_response_auth_failure_is_may_have_applied(true);
+    }
+
+    #[derive(Clone, Copy)]
+    enum AuthenticatedConditionalSnapshotKind {
+        DirectPut,
+        StreamPut,
+    }
+
+    fn authenticated_conditional_snapshot_read_honors_deadline(
+        tcp: bool,
+        snapshot_kind: AuthenticatedConditionalSnapshotKind,
+    ) {
+        const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+        const TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+        const RESULT_GRACE: Duration = Duration::from_secs(5);
+        assert!(OPERATION_TIMEOUT + RESULT_GRACE < TRANSPORT_TIMEOUT);
+
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let transport_limits = storage_rpc_test_transport_limits_with_io_timeout(
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+            TRANSPORT_TIMEOUT,
+        );
+        let server_auth = StorageRpcServerAuthConfig::new(
+            credential.cluster_id(),
+            ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap(),
+            9,
+            STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+        )
+        .unwrap()
+        .with_transport_limits(transport_limits);
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(server_auth);
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let delayed_kind = match snapshot_kind {
+            AuthenticatedConditionalSnapshotKind::DirectPut => {
+                StorageRpcMessageKind::DirectPutCommitSnapshotLoad
+            }
+            AuthenticatedConditionalSnapshotKind::StreamPut => {
+                StorageRpcMessageKind::ObjectStreamPutFinalizeSnapshotLoad
+            }
+        };
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        server.set_response_frame_test_hook(Arc::new(move |kind, _response| {
+            if kind == delayed_kind {
+                arrived_tx.send(()).unwrap();
+                release_rx
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv()
+                    .unwrap();
+            }
+        }));
+        let server_join = thread::spawn(move || {
+            let _ = server.accept_one();
+        });
+        let (deadline_tx, deadline_rx) = mpsc::sync_channel(1);
+        let (client_result_tx, client_result_rx) = mpsc::sync_channel(1);
+        let client_join = thread::spawn(move || {
+            let client_auth = Arc::new(
+                crate::FrontendStorageRpcClientCapability::new_with_transport_limits(
+                    credential,
+                    9,
+                    STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                    transport_limits,
+                )
+                .unwrap()
+                .into(),
+            );
+            let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                config.node_id,
+                config.cluster_epoch,
+                endpoint,
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(client_auth),
+            );
+            let bucket = crate::tests::bucket_name("authenticated-reinspection-deadline-bucket");
+            let key = crate::tests::object_key("authenticated-reinspection-deadline-key");
+            let session_id = crate::tests::stream_session_id("auth-reinspect");
+            let pg_id = ObjectMetadataPgId::new_for_test(PgId::new(0));
+            let deadline = Instant::now() + OPERATION_TIMEOUT;
+            deadline_tx.send(deadline).unwrap();
+            let result = match snapshot_kind {
+                AuthenticatedConditionalSnapshotKind::DirectPut => client
+                    .open_direct_put_metadata_route(
+                        ClusterEpoch::INITIAL,
+                        pg_id,
+                        &bucket,
+                        &key,
+                    )
+                    .unwrap()
+                    .load_direct_put_commit_snapshot_until(
+                        &session_id,
+                        GenerationId::MIN,
+                        deadline,
+                    )
+                    .map(|_| ()),
+                AuthenticatedConditionalSnapshotKind::StreamPut => client
+                    .open_stream_put_finalization_metadata_route(
+                        ClusterEpoch::INITIAL,
+                        pg_id,
+                        &bucket,
+                        &key,
+                        &session_id,
+                    )
+                    .unwrap()
+                    .load_snapshot_until(deadline)
+                    .map(|_| ()),
+            };
+            let _ = client_result_tx.send(result);
+        });
+
+        let deadline = deadline_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("authenticated snapshot client did not publish its deadline");
+        arrived_rx
+            .recv_timeout(OPERATION_TIMEOUT + RESULT_GRACE)
+            .expect("authenticated snapshot request did not reach the response gate");
+        let client_result_before_release = client_result_rx.recv_timeout(
+            deadline.saturating_duration_since(Instant::now()) + RESULT_GRACE,
+        );
+        release_tx.send(()).unwrap();
+        server_join.join().unwrap();
+        let client_result = match client_result_before_release {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let late_result = client_result_rx.recv_timeout(Duration::from_secs(2));
+                if late_result.is_ok() {
+                    client_join.join().unwrap();
+                }
+                panic!(
+                    "authenticated snapshot client had not returned before the delayed response was released: {late_result:?}"
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                client_join.join().unwrap();
+                panic!("authenticated snapshot client exited without reporting a result");
+            }
+        };
+        client_join.join().unwrap();
+        let error = client_result
+            .expect_err("withheld snapshot response must exhaust the absolute deadline");
+
+        assert!(
+            matches!(
+                error,
+                ObjectPgActionError::Store(StoreError::StorageRpc {
+                    failure,
+                    ..
+                }) if failure.wire_code() == StorageRpcWireErrorCode::TransportTimeout
+            ),
+            "delayed authenticated snapshot returned {error:?}"
+        );
+        assert!(error.is_operation_deadline_exhaustion());
+    }
+
+    #[test]
+    fn authenticated_unix_conditional_snapshot_reads_honor_deadline() {
+        for snapshot_kind in [
+            AuthenticatedConditionalSnapshotKind::DirectPut,
+            AuthenticatedConditionalSnapshotKind::StreamPut,
+        ] {
+            authenticated_conditional_snapshot_read_honors_deadline(false, snapshot_kind);
+        }
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_conditional_snapshot_reads_honor_deadline() {
+        for snapshot_kind in [
+            AuthenticatedConditionalSnapshotKind::DirectPut,
+            AuthenticatedConditionalSnapshotKind::StreamPut,
+        ] {
+            authenticated_conditional_snapshot_read_honors_deadline(true, snapshot_kind);
+        }
     }
 
     #[derive(Clone, Copy)]
