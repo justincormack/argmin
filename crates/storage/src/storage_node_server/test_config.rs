@@ -6865,6 +6865,263 @@
         authenticated_object_command_contention_is_abandoned_before_return(true);
     }
 
+    #[derive(Clone, Copy)]
+    enum DirectPutPendingInstallResponseLossFollowup {
+        ExpireBudget,
+        IntegrityFailure,
+    }
+
+    fn authenticated_direct_put_pending_install_response_loss_preserves_resources(
+        tcp: bool,
+        followup: DirectPutPendingInstallResponseLossFollowup,
+    ) {
+        let namespace = match (tcp, followup) {
+            (true, DirectPutPendingInstallResponseLossFollowup::ExpireBudget) => {
+                "tls-direct-put-install-loss"
+            }
+            (false, DirectPutPendingInstallResponseLossFollowup::ExpireBudget) => {
+                "unix-direct-put-install-loss"
+            }
+            (true, DirectPutPendingInstallResponseLossFollowup::IntegrityFailure) => {
+                "tls-direct-put-install-loss-integrity-failure"
+            }
+            (false, DirectPutPendingInstallResponseLossFollowup::IntegrityFailure) => {
+                "unix-direct-put-install-loss-integrity-failure"
+            }
+        };
+        let (_tmp, server_set, cluster) = authenticated_fanout_cluster(tcp, namespace);
+        let bucket = crate::tests::bucket_name("authenticated-direct-put-install-loss-bucket");
+        let key = crate::tests::object_key("key");
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        cluster
+            .create_bucket_with_config_and_load_info(&CreateBucketConfig {
+                name: bucket.as_str(),
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &AclGrants::default(),
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Suspended,
+                object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
+            })
+            .unwrap();
+
+        let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+        let admission = handle.admit_current_route().unwrap();
+        let route = admission.active_put_object_route(&bucket, &key).unwrap();
+        let generation_reservation_id = crate::tests::stream_session_id("install-loss");
+        let generation_id = route
+            .reserve_generation(&generation_reservation_id)
+            .unwrap();
+        let data = b"authenticated direct PUT pending install response loss";
+        let payload = route
+            .write_direct_object_payload(
+                &generation_reservation_id,
+                generation_id,
+                data.len() as u64,
+                data,
+            )
+            .unwrap();
+        let data_pg_id = payload.written.data_pg_id;
+        let written_shards = payload.written.written_shards.clone();
+
+        let primary = server_set
+            .servers
+            .iter()
+            .find(|server| server.config_snapshot().node_id == NodeId::new(1))
+            .cloned()
+            .unwrap();
+        let proof = {
+            let pg = primary._node.get_pg(0).unwrap();
+            let now = crate::clock::current_time_millis();
+            let reservation = PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: namespace,
+                    owner_token: namespace,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    operation_kind:
+                        crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+                    created_at: now,
+                    lease_deadline: now.saturating_add(60_000),
+                    target_context: Some(key.as_str()),
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            BucketWriteReservationProof::from(&reservation)
+        };
+        let prepared = crate::PreparedDirectPutObjectCommit {
+            versioning: BucketVersioningState::Suspended,
+            owner,
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            etag_crc64: checksum::crc64::checksum(data),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            object_lock: crate::ObjectLockState::default(),
+            encryption: crate::ObjectEncryption::None,
+            bucket_write_reservation: proof,
+        };
+
+        let response_lost = Arc::new(AtomicBool::new(false));
+        let response_lost_for_hook = Arc::clone(&response_lost);
+        primary.set_response_envelope_test_hook(Arc::new(move |kind, envelope| {
+            if kind == StorageRpcMessageKind::MetadataCommandPendingSlotInsert
+                && !response_lost_for_hook.swap(true, Ordering::AcqRel)
+            {
+                *envelope
+                    .last_mut()
+                    .expect("authenticated response envelope must not be empty") ^= 1;
+            }
+        }));
+        let integrity_failure = Arc::new(AtomicBool::new(false));
+        if matches!(
+            followup,
+            DirectPutPendingInstallResponseLossFollowup::IntegrityFailure
+        ) {
+            let integrity_failure_for_hook = Arc::clone(&integrity_failure);
+            let response_lost_for_frame_hook = Arc::clone(&response_lost);
+            primary.set_response_frame_test_hook(Arc::new(move |kind, frame| {
+                if kind == StorageRpcMessageKind::MetadataCommandPendingEnvelope
+                    && response_lost_for_frame_hook.load(Ordering::Acquire)
+                    && !integrity_failure_for_hook.swap(true, Ordering::AcqRel)
+                {
+                    frame.payload = encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::MetadataCommandIntegrity,
+                        message: "injected metadata command integrity failure".to_owned(),
+                    })
+                    .unwrap();
+                }
+            }));
+        }
+        let budget_expired = Arc::new(AtomicBool::new(false));
+        let _uncertainty_hook = if matches!(
+            followup,
+            DirectPutPendingInstallResponseLossFollowup::ExpireBudget
+        ) {
+            let budget_expired_for_hook = Arc::clone(&budget_expired);
+            Some(
+                cluster.test_install_direct_put_pending_install_uncertainty_hook(Arc::new(
+                    move || !budget_expired_for_hook.swap(true, Ordering::AcqRel),
+                )),
+            )
+        } else {
+            None
+        };
+
+        let error = route
+            .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(() ))
+            .expect_err("ambiguous pending installation must not report direct PUT success");
+        assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+        assert_eq!(
+            error.diagnostic_cause_label(),
+            match followup {
+                DirectPutPendingInstallResponseLossFollowup::ExpireBudget => {
+                    "store_metadata_consistency_failure"
+                }
+                DirectPutPendingInstallResponseLossFollowup::IntegrityFailure => {
+                    "store_integrity_failure"
+                }
+            }
+        );
+        assert!(response_lost.load(Ordering::Acquire));
+        assert_eq!(
+            budget_expired.load(Ordering::Acquire),
+            matches!(
+                followup,
+                DirectPutPendingInstallResponseLossFollowup::ExpireBudget
+            )
+        );
+        assert_eq!(
+            integrity_failure.load(Ordering::Acquire),
+            matches!(
+                followup,
+                DirectPutPendingInstallResponseLossFollowup::IntegrityFailure
+            )
+        );
+
+        let primary_pg = primary._node.get_pg(0).unwrap();
+        let pending = primary_pg
+            .pending_metadata_command_slot(1, ClusterEpoch::INITIAL)
+            .unwrap()
+            .expect("response loss must preserve the durably inserted pending command");
+        assert_eq!(pending.scope_bucket.as_ref(), Some(&bucket));
+        assert!(!pending.publication_started);
+        assert_eq!(
+            PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
+                .unwrap()
+                .len(),
+            1,
+            "the pending command's bucket-write reservation must remain durable"
+        );
+        drop(primary_pg);
+
+        for server in &server_set.servers {
+            let pg = server._node.get_pg(0).unwrap();
+            assert!(PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &generation_reservation_id,
+            )
+            .is_ok());
+            assert!(matches!(
+                PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+                Err(crate::MetadataError::ObjectNotFound)
+            ));
+        }
+        for written in &written_shards {
+            let node_id = NodeId::new(u32::from(written.key.shard_index().get()));
+            let server = server_set
+                .servers
+                .iter()
+                .find(|server| server.config_snapshot().node_id == node_id)
+                .unwrap();
+            assert!(server
+                ._node
+                .read_shard_file(data_pg_id, &written.key)
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn authenticated_unix_direct_put_pending_install_response_loss_preserves_resources() {
+        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+            false,
+            DirectPutPendingInstallResponseLossFollowup::ExpireBudget,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_direct_put_pending_install_response_loss_preserves_resources() {
+        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+            true,
+            DirectPutPendingInstallResponseLossFollowup::ExpireBudget,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_direct_put_pending_install_response_loss_preserves_integrity_failure() {
+        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+            false,
+            DirectPutPendingInstallResponseLossFollowup::IntegrityFailure,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_direct_put_pending_install_response_loss_preserves_integrity_failure() {
+        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+            true,
+            DirectPutPendingInstallResponseLossFollowup::IntegrityFailure,
+        );
+    }
+
     #[test]
     fn tls_tcp_ordinary_pool_reserves_single_connection_limit_for_stateful_session() {
         let tmp = test_util::tempdir();

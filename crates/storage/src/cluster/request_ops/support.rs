@@ -189,6 +189,32 @@ pub(super) fn object_pg_action_error_is_retryable_command_observation(
     }
 }
 
+pub(super) fn object_pg_action_error_is_retryable_pending_drain(
+    error: &ObjectPgActionError,
+) -> bool {
+    match error {
+        ObjectPgActionError::Store(
+            StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+            | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+            | StoreError::MetadataCommandDependencyConvergencePending { .. },
+        ) => true,
+        ObjectPgActionError::Store(error) => matches!(
+            error.operation_failure_class(),
+            StoreOperationFailureClass::ResourceExhausted
+                | StoreOperationFailureClass::MetadataCommandContention
+                | StoreOperationFailureClass::RetryableConvergence
+        ),
+        ObjectPgActionError::Metadata(error) => error.is_command_contention(),
+        ObjectPgActionError::InvalidRequest { .. }
+        | ObjectPgActionError::StaleObjectReadSubject
+        | ObjectPgActionError::StaleDirectPutCommitSnapshot
+        | ObjectPgActionError::StaleStreamFinalizeSnapshot
+        | ObjectPgActionError::SnapshotReinspectionConflict
+        | ObjectPgActionError::StaleMultipartCompletionSnapshot
+        | ObjectPgActionError::MultipartConditionalRequestConflict => false,
+    }
+}
+
 fn store_error_is_retryable_command_observation(error: &StoreError) -> bool {
     match error {
         StoreError::ClusterMapHistoryReferenceLimitExceeded { .. }
@@ -604,6 +630,9 @@ type StreamPutPendingDrainTestHook =
 type DirectPutPendingDrainTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[cfg(test)]
+type DirectPutPendingInstallUncertaintyTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[cfg(test)]
 type PendingObjectMetadataCommandDrainAttemptTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), ObjectPgActionError> + Send + Sync>;
 
@@ -777,6 +806,11 @@ static STREAM_PUT_PENDING_DRAIN_HOOKS: OnceLock<
 #[cfg(test)]
 static DIRECT_PUT_PENDING_DRAIN_HOOKS: OnceLock<
     Mutex<HashMap<usize, DirectPutPendingDrainTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static DIRECT_PUT_PENDING_INSTALL_UNCERTAINTY_HOOKS: OnceLock<
+    Mutex<HashMap<usize, DirectPutPendingInstallUncertaintyTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -955,6 +989,11 @@ pub(crate) struct StreamPutPendingDrainTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct DirectPutPendingDrainTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectPutPendingInstallUncertaintyTestHookGuard {
     scope_id: usize,
 }
 
@@ -1185,6 +1224,18 @@ impl Drop for StreamPutPendingDrainTestHookGuard {
 impl Drop for DirectPutPendingDrainTestHookGuard {
     fn drop(&mut self) {
         let hooks = DIRECT_PUT_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutPendingInstallUncertaintyTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = DIRECT_PUT_PENDING_INSTALL_UNCERTAINTY_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1677,6 +1728,22 @@ pub(super) fn maybe_run_direct_put_pending_drain_hook(
     work_budget: &mut super::RequestWorkBudget,
 ) {
     let expire = DIRECT_PUT_PENDING_DRAIN_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .is_some_and(|hook| hook());
+    if expire {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_direct_put_pending_install_uncertainty_hook(
+    scope_id: usize,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let expire = DIRECT_PUT_PENDING_INSTALL_UNCERTAINTY_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())

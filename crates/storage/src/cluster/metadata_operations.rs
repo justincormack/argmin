@@ -4526,6 +4526,13 @@ impl StorageCluster {
             {
                 *install_may_have_applied |=
                     error.kind() == MetadataCommandApplyErrorKind::MayHaveApplied;
+                #[cfg(test)]
+                if *install_may_have_applied {
+                    request_ops::maybe_run_direct_put_pending_install_uncertainty_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        work_budget,
+                    );
+                }
                 if self
                     .metadata_command_candidate_has_exact_applied_entry_until(
                         pg_id,
@@ -4537,6 +4544,20 @@ impl StorageCluster {
                     return Ok(SnapshotSensitiveInstallOutcome::Installed);
                 }
                 if *install_may_have_applied {
+                    if self
+                        .pending_metadata_command_for_bucket_with_route_mode_until(
+                            pg_id,
+                            bucket,
+                            MetadataCommandRouteMode::Normal,
+                            command.id().cluster_epoch(),
+                            work_budget.deadline(),
+                        )
+                        .map_err(ObjectPgActionError::Store)?
+                        .as_ref()
+                        == Some(command)
+                    {
+                        return Ok(SnapshotSensitiveInstallOutcome::Installed);
+                    }
                     return Err(error.into_source().into());
                 }
                 self.drain_one_pending_object_metadata_command_with_work_budget(
@@ -4559,6 +4580,30 @@ impl StorageCluster {
                 {
                     return Ok(SnapshotSensitiveInstallOutcome::Installed);
                 }
+                if *install_may_have_applied {
+                    if self
+                        .pending_metadata_command_for_bucket_with_route_mode_until(
+                            pg_id,
+                            bucket,
+                            MetadataCommandRouteMode::Normal,
+                            command.id().cluster_epoch(),
+                            work_budget.deadline(),
+                        )
+                        .map_err(ObjectPgActionError::Store)?
+                        .as_ref()
+                        == Some(command)
+                    {
+                        return Ok(SnapshotSensitiveInstallOutcome::Installed);
+                    }
+                    let id = command.id();
+                    return Err(ObjectPgActionError::Store(
+                        StoreError::MetadataCommandOutcomeUnconfirmed {
+                            pg_id: id.pg_id().get(),
+                            cluster_epoch: id.cluster_epoch(),
+                            log_index: id.log_index().get(),
+                        },
+                    ));
+                }
                 self.drain_one_pending_object_metadata_command_with_work_budget(
                     publisher,
                     pg_id,
@@ -4570,6 +4615,28 @@ impl StorageCluster {
             Err(error) => {
                 *install_may_have_applied |=
                     error.kind() == MetadataCommandApplyErrorKind::MayHaveApplied;
+                #[cfg(test)]
+                if *install_may_have_applied {
+                    request_ops::maybe_run_direct_put_pending_install_uncertainty_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        work_budget,
+                    );
+                }
+                if *install_may_have_applied
+                    && self
+                        .pending_metadata_command_for_bucket_with_route_mode_until(
+                            pg_id,
+                            bucket,
+                            MetadataCommandRouteMode::Normal,
+                            command.id().cluster_epoch(),
+                            work_budget.deadline(),
+                        )
+                        .map_err(ObjectPgActionError::Store)?
+                        .as_ref()
+                        == Some(command)
+                {
+                    return Ok(SnapshotSensitiveInstallOutcome::Installed);
+                }
                 Err(error.into_source().into())
             }
         }

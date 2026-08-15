@@ -3492,6 +3492,7 @@ fn direct_put_publish_validation_rejects_truncated_shard_batch() {
 
 #[test]
 fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
+    let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let pg_ids = [0, 1, 2, 3];
@@ -3619,6 +3620,27 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
             .unwrap();
         }));
 
+    let transient_drain_failure = Arc::new(AtomicBool::new(true));
+    let transient_drain_failure_for_hook = Arc::clone(&transient_drain_failure);
+    let _drain_hook = first_cluster
+        .test_install_pending_object_metadata_command_drain_attempt_hook(Arc::new(
+            move |command| {
+                if matches!(
+                    command.payload(),
+                    MetadataCommandPayload::CommitDirectPutObject(commit)
+                        if commit.object.generation_id == winner_generation_id
+                ) && transient_drain_failure_for_hook.swap(false, Ordering::SeqCst)
+                {
+                    return Err(crate::ObjectPgActionError::Store(
+                        StoreError::MetadataCommandContention {
+                            context: "injected direct PUT contender drain contention",
+                        },
+                    ));
+                }
+                Ok(())
+            },
+        ));
+
     let calls_for_action = Arc::clone(&action_calls);
     let result = first_cluster
         .commit_direct_put_object_from_payload_shards(
@@ -3636,6 +3658,7 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
         .unwrap();
     assert!(matches!(result, Err("object already exists")));
     assert!(hook_ran.load(Ordering::SeqCst));
+    assert!(!transient_drain_failure.load(Ordering::SeqCst));
     assert_eq!(
         action_calls.load(Ordering::SeqCst),
         2,

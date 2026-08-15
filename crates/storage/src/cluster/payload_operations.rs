@@ -3111,6 +3111,15 @@ impl StorageCluster {
                 }
             }};
         }
+        macro_rules! retry_direct_put_pending_drain_error {
+            ($error:ident, $context:literal) => {{
+                if work_budget.sleep_after_contention($context).is_err() {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err($error);
+                }
+                continue;
+            }};
+        }
         macro_rules! require_direct_put_route_before_command_ownership {
             () => {{
                 if let Err(error) = require_valid_route() {
@@ -3382,6 +3391,14 @@ impl StorageCluster {
                                     &mut work_budget,
                                 );
                             if let Err(error) = drain_result {
+                                if request_ops::object_pg_action_error_is_retryable_pending_drain(
+                                    &error,
+                                ) {
+                                    retry_direct_put_pending_drain_error!(
+                                        error,
+                                        "direct PUT command log conflict drain retry budget exhausted"
+                                    );
+                                }
                                 cleanup_direct_put_attempt_before_command_ownership!();
                                 return Err(error);
                             }
@@ -3495,6 +3512,12 @@ impl StorageCluster {
                         &command,
                         &mut work_budget,
                     ) {
+                        if request_ops::object_pg_action_error_is_retryable_pending_drain(&error) {
+                            retry_direct_put_pending_drain_error!(
+                                error,
+                                "direct PUT abandoned pending drain retry budget exhausted"
+                            );
+                        }
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
@@ -3512,6 +3535,12 @@ impl StorageCluster {
                     &command,
                     &mut work_budget,
                 ) {
+                    if request_ops::object_pg_action_error_is_retryable_pending_drain(&error) {
+                        retry_direct_put_pending_drain_error!(
+                            error,
+                            "direct PUT unrelated pending drain retry budget exhausted"
+                        );
+                    }
                     cleanup_direct_put_attempt_before_command_ownership!();
                     return Err(error);
                 }
@@ -3573,19 +3602,60 @@ impl StorageCluster {
                     "direct PUT command install retry budget exhausted"
                 );
                 self.maybe_run_before_metadata_command_pending_install_hook();
-                let install = match self
-                    .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget(
-                        publisher,
-                        pg_id,
-                        &req.bucket,
-                        &command,
-                        Some(effect_fence),
-                        &mut work_budget,
-                    ) {
-                    Ok(install) => install,
-                    Err(error) => {
-                        cleanup_direct_put_attempt_before_command_ownership!();
-                        return Err(error);
+                let mut install_may_have_applied = false;
+                let install = loop {
+                    match self
+                        .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
+                            publisher,
+                            pg_id,
+                            &req.bucket,
+                            &command,
+                            Some(effect_fence),
+                            &mut work_budget,
+                            &mut install_may_have_applied,
+                        ) {
+                        Ok(install) => break install,
+                        Err(error) => {
+                            if install_may_have_applied {
+                                bucket_write_proof_command_owned = true;
+                                payload_ownership = DirectPutPayloadOwnership::DurableCommand;
+                                disarm_payload_cleanup();
+                            }
+                            let retryable = if install_may_have_applied {
+                                request_ops::object_pg_action_error_is_retryable_command_observation(
+                                    &error,
+                                )
+                            } else {
+                                request_ops::object_pg_action_error_is_retryable_pending_drain(
+                                    &error,
+                                )
+                            };
+                            if retryable {
+                                if work_budget
+                                    .sleep_after_contention(
+                                        "direct PUT pending install drain retry budget exhausted",
+                                    )
+                                    .is_ok()
+                                {
+                                    continue;
+                                }
+                                if install_may_have_applied {
+                                    let id = command.id();
+                                    return Err(ObjectPgActionError::Store(
+                                        StoreError::MetadataCommandOutcomeUnconfirmed {
+                                            pg_id: id.pg_id().get(),
+                                            cluster_epoch: id.cluster_epoch(),
+                                            log_index: id.log_index().get(),
+                                        },
+                                    ));
+                                }
+                            }
+                            if install_may_have_applied {
+                                return Err(error);
+                            }
+                            cleanup_direct_put_attempt_before_command_ownership!();
+                            return Err(error);
+                        }
                     }
                 };
                 match install {

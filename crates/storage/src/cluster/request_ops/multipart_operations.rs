@@ -460,7 +460,7 @@ impl super::StorageCluster {
                     match drain {
                         Ok(_) => {}
                         Err(error)
-                            if Self::stream_put_pending_drain_error_is_retryable(&error) =>
+                            if object_pg_action_error_is_retryable_pending_drain(&error) =>
                         {
                             finalization_work_budget
                                 .sleep_after_contention(
@@ -615,9 +615,7 @@ impl super::StorageCluster {
                             match drain {
                                 Ok(()) => {}
                                 Err(error)
-                                    if Self::stream_put_pending_drain_error_is_retryable(
-                                        &error,
-                                    ) =>
+                                    if object_pg_action_error_is_retryable_pending_drain(&error) =>
                                 {
                                     finalization_work_budget
                                         .sleep_after_contention(
@@ -1063,24 +1061,6 @@ impl super::StorageCluster {
                 Ok(Attempt::Retry) => continue,
                 Err(error) => return Ok(Err(error)),
             }
-        }
-    }
-
-    fn stream_put_pending_drain_error_is_retryable(error: &ObjectPgActionError) -> bool {
-        match error {
-            ObjectPgActionError::Store(
-                StoreError::MetadataCommandOutcomeUnconfirmed { .. }
-                | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-                | StoreError::MetadataCommandDependencyConvergencePending { .. },
-            ) => true,
-            ObjectPgActionError::Store(error) => matches!(
-                error.operation_failure_class(),
-                StoreOperationFailureClass::ResourceExhausted
-                    | StoreOperationFailureClass::MetadataCommandContention
-                    | StoreOperationFailureClass::RetryableConvergence
-            ),
-            ObjectPgActionError::Metadata(error) => error.is_command_contention(),
-            _ => false,
         }
     }
 
