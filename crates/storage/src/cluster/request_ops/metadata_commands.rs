@@ -3022,19 +3022,24 @@ impl super::StorageCluster {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
+        work_budget.check("install bucket-control pending metadata command")?;
+        let deadline = work_budget.deadline();
         self.maybe_run_before_metadata_command_pending_install_hook();
         let insert = match effect_fence {
             Some(effect_fence) => primary
                 .metadata_command_client()
-                .try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+                .try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
                     pg_id,
                     command,
                     bucket,
                     effect_fence,
+                    deadline,
                 ),
             None => primary
                 .metadata_command_client()
-                .try_insert_bucket_control_pending_metadata_command_slot(pg_id, command, bucket),
+                .try_insert_bucket_control_pending_metadata_command_slot_until(
+                    pg_id, command, bucket, deadline,
+                ),
         };
         match insert {
             Ok(true) => Ok(true),

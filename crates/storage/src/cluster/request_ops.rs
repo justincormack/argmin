@@ -60,7 +60,7 @@ use crate::node_client::{
     InsertDeleteMarkerStalePayload, MarkBucketDeletingCommandBuild, MetadataCommandApplyError,
     MetadataCommandApplyErrorKind, MetadataReadAuthorization,
 };
-use crate::storage_rpc::StorageRpcErrorCode;
+use crate::storage_rpc::{StorageRpcErrorCode, StorageRpcWireErrorCode};
 use crate::traits::DurableBucketWriteReservationAcquire;
 #[cfg(any(test, feature = "test-hooks"))]
 use crate::traits::PgMetadataStore;

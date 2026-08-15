@@ -61,6 +61,13 @@ pub(crate) fn encode_metadata_command_pending_slot_request(
             put_u64(&mut out, deadline.portable_wall_valid_until_ms);
         }
     }
+    match request.operation_deadline {
+        None => put_u8(&mut out, 0),
+        Some(deadline) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, deadline.portable_wall_valid_until_ms);
+        }
+    }
     Ok(out)
 }
 
@@ -113,6 +120,19 @@ pub(crate) fn decode_metadata_command_pending_slot_request(
             ),
         );
     }
+    let operation_deadline = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(StorageRpcOperationDeadline {
+            portable_wall_valid_until_ms: decoder.read_u64()?,
+        }),
+        _ => {
+            return Err(
+                StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(
+                    "invalid optional operation deadline tag",
+                ),
+            );
+        }
+    };
     decoder.finish()?;
     Ok(StorageRpcMetadataCommandPendingSlotRequest {
         node_id,
@@ -121,6 +141,7 @@ pub(crate) fn decode_metadata_command_pending_slot_request(
         command,
         scope_bucket,
         effect_deadline,
+        operation_deadline,
     })
 }
 

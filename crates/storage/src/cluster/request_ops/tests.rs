@@ -348,6 +348,32 @@ mod pending_command_terminal_cleanup_tests {
     }
 
     #[test]
+    fn command_observation_retries_transient_contention_but_not_log_integrity_failures() {
+        assert!(object_pg_action_error_is_retryable_command_observation(
+            &ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                context: "test command observation contention",
+            })
+        ));
+        assert!(!object_pg_action_error_is_retryable_command_observation(
+            &ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            })
+        ));
+        assert!(!object_pg_action_error_is_retryable_command_observation(
+            &ObjectPgActionError::Store(StoreError::MetadataCommandLogGap {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 4,
+                expected_log_index: 3,
+            })
+        ));
+    }
+
+    #[test]
     fn auxiliary_multipart_reservation_accepts_only_exact_not_found_identity() {
         let proof = BucketWriteReservationProof {
             bucket: BucketName::try_from("cleanup-identity-bucket").unwrap(),

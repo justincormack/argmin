@@ -67,6 +67,26 @@ impl StorageNodeMetadataCommandLocks {
         self.acquire_with_timeout(node_id, pg_id, context, METADATA_COMMAND_LOCK_WAIT_TIMEOUT)
     }
 
+    fn acquire_until(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        context: Option<StorageNodeMetadataCommandLockContext>,
+        deadline: Instant,
+    ) -> Result<StorageNodeMetadataCommandGuard, StorageRpcErrorResponse> {
+        let now = Instant::now();
+        let lock_deadline = now
+            .checked_add(METADATA_COMMAND_LOCK_WAIT_TIMEOUT)
+            .map_or(deadline, |default_deadline| default_deadline.min(deadline));
+        self.acquire_with_deadline(
+            node_id,
+            pg_id,
+            context,
+            lock_deadline,
+            true,
+        )
+    }
+
     fn acquire_with_timeout(
         &self,
         node_id: NodeId,
@@ -75,9 +95,31 @@ impl StorageNodeMetadataCommandLocks {
         wait_timeout: Duration,
     ) -> Result<StorageNodeMetadataCommandGuard, StorageRpcErrorResponse> {
         let started_at = Instant::now();
+        let deadline = started_at.checked_add(wait_timeout).unwrap_or(started_at);
+        self.acquire_with_deadline(node_id, pg_id, context, deadline, false)
+    }
+
+    fn acquire_with_deadline(
+        &self,
+        node_id: NodeId,
+        pg_id: PgId,
+        context: Option<StorageNodeMetadataCommandLockContext>,
+        deadline: Instant,
+        require_live_deadline_on_acquire: bool,
+    ) -> Result<StorageNodeMetadataCommandGuard, StorageRpcErrorResponse> {
+        let started_at = Instant::now();
         let mut next_diagnostic_at = started_at + METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_AFTER;
         let mut waited = false;
         let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
+        if started_at >= deadline {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::MetadataCommandContention,
+                message: format!(
+                    "metadata command lock deadline for PG {} has expired",
+                    pg_id.get()
+                ),
+            });
+        }
         while let Some(holder) = held.get(&pg_id).copied() {
             waited = true;
             #[cfg(test)]
@@ -89,7 +131,7 @@ impl StorageNodeMetadataCommandLocks {
                 .clone();
             let now = Instant::now();
             let waited_for = now.saturating_duration_since(started_at);
-            if waited_for >= wait_timeout {
+            if now >= deadline {
                 drop(held);
                 emit_metadata_command_lock_wait_diagnostic(
                     node_id,
@@ -102,9 +144,9 @@ impl StorageNodeMetadataCommandLocks {
                 return Err(StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::MetadataCommandContention,
                     message: format!(
-                        "metadata command lock wait for PG {} exceeded {}ms",
+                        "metadata command lock wait for PG {} exceeded its {}ms deadline",
                         pg_id.get(),
-                        wait_timeout.as_millis()
+                        waited_for.as_millis()
                     ),
                 });
             }
@@ -131,9 +173,7 @@ impl StorageNodeMetadataCommandLocks {
             if !held.contains_key(&pg_id) {
                 continue;
             }
-            let remaining = wait_timeout
-                .checked_sub(Instant::now().saturating_duration_since(started_at))
-                .unwrap_or_default();
+            let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 continue;
             }
@@ -144,6 +184,15 @@ impl StorageNodeMetadataCommandLocks {
                 .wait_timeout(held, wait_interval)
                 .unwrap_or_else(|e| e.into_inner());
             held = next_held;
+        }
+        if require_live_deadline_on_acquire && Instant::now() >= deadline {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::MetadataCommandContention,
+                message: format!(
+                    "metadata command lock deadline for PG {} has expired",
+                    pg_id.get()
+                ),
+            });
         }
         if waited {
             let _ = observability::emit_metadata_command_session_wait(

@@ -413,7 +413,8 @@ storage node revalidates the request's original epoch and clock health
 immediately before inserting the durable row. Embedded calls retain the exact
 conservatively bound monotonic deadline. RPC requests contain no monotonic
 timestamp: they carry a portable wall-clock upper bound which Unix and TLS/TCP
-receivers shorten for inter-host skew and bind to their own monotonic clock.
+clients derive with the cross-process skew allowance removed. Every receiving
+process binds that same representation to its own monotonic clock.
 The authority timestamp remains available for diagnostics, but is not used as
 the later cutoff. A same-epoch route renewal therefore cannot extend authority
 already handed to a request. Once the

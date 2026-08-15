@@ -122,8 +122,10 @@ impl AdmittedRouteEffectFence {
         authority_valid_until_ms: u64,
         portable_wall_valid_until_ms: u64,
     ) -> Self {
-        let local_wall_ms = crate::clock::current_time_millis();
+        // Sample monotonic time first so descheduling before the wall sample
+        // can only shorten the locally bound deadline.
         let local_monotonic_ms = crate::clock::monotonic_time_millis();
+        let local_wall_ms = crate::clock::current_time_millis();
         // The sender derives this portable deadline from a process-local
         // monotonic lease that already subtracts the authority clock-skew
         // budget. Subtracting that budget again here would make the minimum

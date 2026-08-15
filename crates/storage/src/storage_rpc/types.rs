@@ -1,6 +1,8 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::{Duration, Instant};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub(crate) enum StorageRpcMessageKind {
@@ -2229,12 +2231,153 @@ pub(crate) struct StorageRpcMetadataCommandPendingSlotRequest {
     pub(crate) command: crate::metadata_command::MetadataCommandEnvelope,
     pub(crate) scope_bucket: Option<BucketName>,
     pub(crate) effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+    pub(crate) operation_deadline: Option<StorageRpcOperationDeadline>,
+}
+
+/// A transport-independent operation deadline for another process.
+///
+/// Monotonic clocks are process-local and never cross the RPC boundary. The
+/// sender projects its local deadline onto this conservative wall deadline;
+/// the receiver binds it once to its own monotonic clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StorageRpcOperationDeadline {
+    pub(crate) portable_wall_valid_until_ms: u64,
+}
+
+impl StorageRpcOperationDeadline {
+    pub(crate) fn from_instant(operation_deadline: Instant) -> Self {
+        // Sample wall time before Instant. Descheduling between the samples
+        // therefore shortens, rather than extends, the projected deadline.
+        let sender_wall_ms = crate::clock::current_time_millis();
+        let sender_instant = Instant::now();
+        let remaining = operation_deadline.saturating_duration_since(sender_instant);
+        let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        Self::from_clock_samples(sender_wall_ms, remaining_ms)
+    }
+
+    fn from_clock_samples(sender_wall_ms: u64, remaining_ms: u64) -> Self {
+        Self {
+            portable_wall_valid_until_ms: sender_wall_ms
+                .saturating_add(remaining_ms)
+                .saturating_sub(
+                    crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+                ),
+        }
+    }
+
+    pub(crate) fn local_deadline(self) -> Instant {
+        // Sample monotonic time before wall time. Descheduling between the
+        // samples therefore shortens the receiver's local deadline.
+        let local_instant = Instant::now();
+        let remaining_ms = self.remaining_on_receiver(crate::clock::current_time_millis());
+        local_instant
+            .checked_add(Duration::from_millis(remaining_ms))
+            .unwrap_or(local_instant)
+    }
+
+    fn remaining_on_receiver(self, receiver_wall_ms: u64) -> u64 {
+        self.portable_wall_valid_until_ms
+            .saturating_sub(receiver_wall_ms)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StorageRpcAdmittedRouteEffectDeadline {
     pub(crate) authority_valid_until_ms: u64,
     pub(crate) portable_wall_valid_until_ms: u64,
+}
+
+impl StorageRpcAdmittedRouteEffectDeadline {
+    pub(crate) fn bounded_by_operation_deadline(
+        existing: Option<Self>,
+        operation_deadline: Instant,
+    ) -> Self {
+        Self::bounded_by_operation_deadline_with_clock_skew(
+            existing,
+            operation_deadline,
+            crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+    }
+
+    fn bounded_by_operation_deadline_with_clock_skew(
+        existing: Option<Self>,
+        operation_deadline: Instant,
+        clock_skew_budget_ms: u64,
+    ) -> Self {
+        // Sample wall time first. A deschedule before the monotonic sample then
+        // shortens the portable deadline instead of extending it.
+        let sender_wall_ms = crate::clock::current_time_millis();
+        let sender_monotonic_now = Instant::now();
+        let remaining = operation_deadline.saturating_duration_since(sender_monotonic_now);
+        Self::bounded_by_operation_remaining_with_clock_skew(
+            existing,
+            sender_wall_ms,
+            remaining,
+            clock_skew_budget_ms,
+        )
+    }
+
+    pub(crate) fn bounded_by_operation_remaining(
+        existing: Option<Self>,
+        sender_wall_ms: u64,
+        remaining: Duration,
+    ) -> Self {
+        Self::bounded_by_operation_remaining_with_clock_skew(
+            existing,
+            sender_wall_ms,
+            remaining,
+            crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS,
+        )
+    }
+
+    fn bounded_by_operation_remaining_with_clock_skew(
+        existing: Option<Self>,
+        sender_wall_ms: u64,
+        remaining: Duration,
+        clock_skew_budget_ms: u64,
+    ) -> Self {
+        // The receiving host may be behind the sender by the supported skew.
+        // Subtract it here so rebinding the portable wall deadline cannot grant
+        // more monotonic time than remained on the caller.
+        let operation_wall_deadline = sender_wall_ms
+            .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX))
+            .saturating_sub(clock_skew_budget_ms);
+        Self::intersect_existing_operation_deadline(existing, operation_wall_deadline)
+    }
+
+    pub(crate) fn intersect_existing_operation_deadline(
+        existing: Option<Self>,
+        operation_wall_deadline: u64,
+    ) -> Self {
+        match existing {
+            Some(existing) => Self {
+                authority_valid_until_ms: existing.authority_valid_until_ms,
+                portable_wall_valid_until_ms: existing
+                    .portable_wall_valid_until_ms
+                    .min(operation_wall_deadline),
+            },
+            None => Self {
+                authority_valid_until_ms: u64::MAX,
+                portable_wall_valid_until_ms: operation_wall_deadline,
+            },
+        }
+    }
+
+    pub(crate) fn local_operation_deadline(self) -> Instant {
+        // Sample monotonic time before wall time so descheduling between the
+        // samples can only shorten the receiver-side deadline.
+        let local_monotonic_now = Instant::now();
+        let local_wall_ms = crate::clock::current_time_millis();
+        let remaining_ms = self.remaining_on_receiver_wall(local_wall_ms);
+        local_monotonic_now
+            .checked_add(Duration::from_millis(remaining_ms))
+            .unwrap_or(local_monotonic_now)
+    }
+
+    pub(crate) fn remaining_on_receiver_wall(self, receiver_wall_ms: u64) -> u64 {
+        self.portable_wall_valid_until_ms
+            .saturating_sub(receiver_wall_ms)
+    }
 }
 
 fn admitted_route_effect_deadline_is_conservative(

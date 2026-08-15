@@ -21,6 +21,38 @@ mod tests {
     }
 
     #[test]
+    fn operation_deadline_projection_is_conservative_across_independent_clocks() {
+        let skew = crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS;
+        let sender_wall_ms = 10_000;
+        let receiver_wall_ms = sender_wall_ms - skew;
+        let remaining = std::time::Duration::from_secs(5);
+
+        let deadline = StorageRpcAdmittedRouteEffectDeadline::bounded_by_operation_remaining(
+            None,
+            sender_wall_ms,
+            remaining,
+        );
+
+        assert_eq!(
+            deadline.remaining_on_receiver_wall(receiver_wall_ms),
+            u64::try_from(remaining.as_millis()).unwrap()
+        );
+
+        // A delay between the sender's wall and monotonic samples is reflected
+        // by the shorter remaining duration and cannot be added back remotely.
+        let after_sampling_delay =
+            StorageRpcAdmittedRouteEffectDeadline::bounded_by_operation_remaining(
+                None,
+                sender_wall_ms,
+                std::time::Duration::from_secs(4),
+            );
+        assert_eq!(
+            after_sampling_delay.remaining_on_receiver_wall(receiver_wall_ms),
+            4_000
+        );
+    }
+
+    #[test]
     fn bucket_subresource_get_outcomes_round_trip_without_conflating_missing_states() {
         let bucket = BucketName::try_from("missing-subresource-bucket").unwrap();
         for outcome in [
@@ -749,6 +781,9 @@ mod tests {
                 authority_valid_until_ms: 5_000,
                 portable_wall_valid_until_ms: 4_000,
             }),
+            operation_deadline: Some(StorageRpcOperationDeadline {
+                portable_wall_valid_until_ms: 4_000,
+            }),
         };
 
         let bytes = encode_metadata_command_pending_slot_request(&request).unwrap();
@@ -772,8 +807,13 @@ mod tests {
             Err(StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(_))
         ));
         let mut nonconservative_wire = bytes;
-        let wire_len = nonconservative_wire.len();
-        nonconservative_wire[wire_len - 8..].copy_from_slice(&4_001_u64.to_be_bytes());
+        let encoded_effect_deadline = [5_000_u64.to_le_bytes(), 4_000_u64.to_le_bytes()].concat();
+        let effect_deadline_offset = nonconservative_wire
+            .windows(encoded_effect_deadline.len())
+            .position(|window| window == encoded_effect_deadline)
+            .expect("effect deadline bytes must be present");
+        nonconservative_wire[effect_deadline_offset + 8..effect_deadline_offset + 16]
+            .copy_from_slice(&4_001_u64.to_le_bytes());
         assert!(matches!(
             decode_metadata_command_pending_slot_request(
                 &nonconservative_wire,
@@ -781,6 +821,34 @@ mod tests {
             ),
             Err(StorageRpcPayloadError::InvalidMetadataCommandPendingSlotRequest(_))
         ));
+    }
+
+    #[test]
+    fn metadata_command_pending_slot_request_limit_matches_maximum_encoded_envelope() {
+        let bucket = "a".repeat(STORAGE_RPC_MAX_BUCKET_NAME_LEN);
+        let command = test_metadata_command_for_bucket_name(&bucket);
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: command.id().pg_id(),
+            command: command.clone(),
+            scope_bucket: Some(BucketName::try_from(bucket).unwrap()),
+            effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
+                authority_valid_until_ms: 5_000,
+                portable_wall_valid_until_ms: 4_000,
+            }),
+            operation_deadline: Some(StorageRpcOperationDeadline {
+                portable_wall_valid_until_ms: 4_000,
+            }),
+        };
+
+        let encoded = encode_metadata_command_pending_slot_request(&request).unwrap();
+        let envelope_overhead = encoded.len() - command.command_bytes().len();
+        assert_eq!(
+            STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN,
+            STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN + envelope_overhead,
+            "the registered frame cap must include the largest encoded deadline envelope"
+        );
     }
 
     #[test]
@@ -5318,11 +5386,15 @@ mod tests {
     }
 
     fn test_metadata_command() -> MetadataCommandEnvelope {
+        test_metadata_command_for_bucket_name("bucket")
+    }
+
+    fn test_metadata_command_for_bucket_name(name: &str) -> MetadataCommandEnvelope {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
         let command = CreateBucketCommand::from_config_for_test(
             &CreateBucketConfig {
-                name: "bucket",
+                name,
                 owner_principal: "owner",
                 owner_canonical_id: &owner,
                 acl_grants: &acl_grants,
@@ -5480,5 +5552,40 @@ mod tests {
             lease_deadline: 43,
             target_context: Some("key/context".to_string()),
         }
+    }
+
+    #[test]
+    fn operation_deadline_is_conservative_across_independent_process_clocks() {
+        let deadline = StorageRpcOperationDeadline::from_clock_samples(50_000, 2_000);
+
+        assert_eq!(deadline.portable_wall_valid_until_ms, 51_000);
+        assert_eq!(
+            deadline.remaining_on_receiver(49_000),
+            2_000,
+            "maximum supported receiver lag must not extend sender authority"
+        );
+        assert_eq!(
+            deadline.remaining_on_receiver(50_000),
+            1_000,
+            "equal wall clocks conservatively spend the skew allowance"
+        );
+        assert_eq!(
+            deadline.remaining_on_receiver(50_900),
+            100,
+            "a receiver clock ahead of the sender must shorten authority"
+        );
+    }
+
+    #[test]
+    fn expired_portable_operation_deadline_never_grants_receiver_authority() {
+        let deadline = StorageRpcOperationDeadline::from_clock_samples(50_000, 500);
+
+        assert_eq!(
+            deadline.remaining_on_receiver(49_499),
+            1,
+            "only a receiver lag within the supported skew may retain authority"
+        );
+        assert_eq!(deadline.remaining_on_receiver(49_500), 0);
+        assert_eq!(deadline.remaining_on_receiver(50_000), 0);
     }
 }

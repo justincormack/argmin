@@ -751,6 +751,11 @@ impl StorageNodeServer {
         Self::bind_with_rpc_auth(config, None, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_storage_node(&self) -> Arc<SharedStorageNode> {
+        Arc::clone(&self._node)
+    }
+
     fn bind_with_rpc_auth(
         config: StorageNodeProcessConfig,
         rpc_auth: Option<Arc<StorageRpcServerAuthConfig>>,

@@ -14,6 +14,7 @@ const METADATA_CANONICAL_PG_STATE_DOMAIN: &[u8] = b"argmin.metadata.pg-state";
 const METADATA_COMMAND_CHECKPOINT_DOMAIN: &[u8] = b"argmin.metadata.command-checkpoint";
 const METADATA_COMMAND_CHECKPOINT_RETAIN_PER_EPOCH: usize = 8;
 const METADATA_COMMAND_CHECKPOINT_RETAIN_EPOCHS: usize = 4;
+const METADATA_COMMAND_TERMINAL_RECEIPT_RETAIN_PER_EPOCH: u64 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum MetadataDigestFilter {
@@ -937,6 +938,15 @@ struct MetadataCommandLogEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct MetadataCommandTerminalReceipt {
+    command_checksum: u64,
+    command_sha256: [u8; 32],
+    abandoned: bool,
+    previous_log_hash: u64,
+    log_hash: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PendingMetadataCommandSlot {
     pub(crate) id: MetadataCommandId,
     pub(crate) command_checksum: u64,
@@ -1013,6 +1023,39 @@ impl PgStore {
             Err(error) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(error)
+            }
+        }
+    }
+
+    fn with_pending_slot_insert_transaction<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, StoreError>,
+    ) -> Result<T, PendingMetadataCommandSlotInsertError> {
+        if !self.conn.is_autocommit() {
+            return operation().map_err(PendingMetadataCommandSlotInsertError::definitive);
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| StoreError::Db {
+                context: "begin pending metadata command slot transaction",
+                source: source.into(),
+            })
+            .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
+        match operation() {
+            Ok(value) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map(|()| value)
+                .map_err(|source| {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    PendingMetadataCommandSlotInsertError::may_have_applied(StoreError::Db {
+                        context: "commit pending metadata command slot transaction",
+                        source: source.into(),
+                    })
+                }),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(PendingMetadataCommandSlotInsertError::definitive(error))
             }
         }
     }
@@ -1636,6 +1679,17 @@ impl PgStore {
         {
             return Ok(false);
         }
+        if self
+            .query_row_cached_optional(
+                "SELECT 1 FROM metadata_command_terminal_receipts LIMIT 1",
+                [],
+                "check compacted metadata command receipt emptiness",
+                |_| Ok(()),
+            )?
+            .is_some()
+        {
+            return Ok(false);
+        }
 
         for table in METADATA_DIGEST_TABLES {
             if table.name == "pg_counters" {
@@ -2236,7 +2290,11 @@ impl PgStore {
             command.id().log_index(),
         )?
         else {
-            return Ok(false);
+            return Ok(self
+                .metadata_command_terminal_receipt_matches(node_id, command, false)?
+                .is_some_and(|(previous_log_hash, _)| {
+                    previous_log_hash == expected_previous_log_hash
+                }));
         };
         if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
             return Ok(false);
@@ -2264,6 +2322,22 @@ impl PgStore {
             command.id().log_index(),
         )?
         else {
+            if let Some(hashes) =
+                self.metadata_command_terminal_receipt_matches(node_id, command, false)?
+            {
+                return Ok(Some(hashes));
+            }
+            if self
+                .load_metadata_command_terminal_receipt(
+                    "load divergent compacted metadata command terminal receipt",
+                    command.id().cluster_epoch(),
+                    command.id().pg_id(),
+                    command.id().log_index(),
+                )?
+                .is_some()
+            {
+                return Err(self.metadata_command_log_conflict(node_id, command));
+            }
             return Ok(None);
         };
         if !self.metadata_command_log_entry_matches(node_id, command, &entry, false)? {
@@ -2793,6 +2867,14 @@ impl PgStore {
                 slot.id.log_index(),
             )?
             .is_some()
+            || self
+                .load_metadata_command_terminal_receipt(
+                    "check compacted pending metadata command terminal receipt",
+                    slot.id.cluster_epoch(),
+                    slot.id.pg_id(),
+                    slot.id.log_index(),
+                )?
+                .is_some()
         {
             return Err(StoreError::MetadataCommandLogConflict {
                 node_id,
@@ -2861,13 +2943,25 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
     ) -> Result<(), StoreError> {
+        self.try_insert_pending_metadata_command_slot_classified(node_id, command, scope_bucket)
+            .map_err(PendingMetadataCommandSlotInsertError::into_source)
+    }
+
+    pub(crate) fn try_insert_pending_metadata_command_slot_classified(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<(), PendingMetadataCommandSlotInsertError> {
         if command.id().pg_id().get() != self.pg_id {
-            return Err(StoreError::MetadataCommandWrongPg {
-                node_id,
-                command_pg_id: command.id().pg_id().get(),
-                target_pg_id: self.pg_id,
-                cluster_epoch: command.id().cluster_epoch(),
-            });
+            return Err(PendingMetadataCommandSlotInsertError::definitive(
+                StoreError::MetadataCommandWrongPg {
+                    node_id,
+                    command_pg_id: command.id().pg_id().get(),
+                    target_pg_id: self.pg_id,
+                    cluster_epoch: command.id().cluster_epoch(),
+                },
+            ));
         }
         if self
             .load_metadata_command_log_entry(
@@ -2875,14 +2969,30 @@ impl PgStore {
                 command.id().cluster_epoch(),
                 command.id().pg_id(),
                 command.id().log_index(),
-            )?
+            )
+            .map_err(PendingMetadataCommandSlotInsertError::definitive)?
             .is_some()
+            || self
+                .load_metadata_command_terminal_receipt(
+                    "check compacted pending metadata command terminal receipt",
+                    command.id().cluster_epoch(),
+                    command.id().pg_id(),
+                    command.id().log_index(),
+                )
+                .map_err(PendingMetadataCommandSlotInsertError::definitive)?
+                .is_some()
+            || self
+                .metadata_command_index_is_checkpoint_covered(command.id())
+                .map_err(PendingMetadataCommandSlotInsertError::definitive)?
         {
-            return Err(self.metadata_command_log_conflict(node_id, command));
+            return Err(PendingMetadataCommandSlotInsertError::definitive(
+                self.metadata_command_log_conflict(node_id, command),
+            ));
         }
-        let (reference_count, pages) =
-            self.encode_pending_placed_segment_reference_pages(command)?;
-        self.with_pending_slot_transaction(|| {
+        let (reference_count, pages) = self
+            .encode_pending_placed_segment_reference_pages(command)
+            .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
+        self.with_pending_slot_insert_transaction(|| {
             let inserted = self.execute_cached(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
@@ -2947,6 +3057,15 @@ impl PgStore {
                 command.id().log_index(),
             )?
             .is_some()
+            || self
+                .load_metadata_command_terminal_receipt(
+                    "check compacted bucket-control pending metadata command receipt",
+                    command.id().cluster_epoch(),
+                    command.id().pg_id(),
+                    command.id().log_index(),
+                )?
+                .is_some()
+            || self.metadata_command_index_is_checkpoint_covered(command.id())?
         {
             return Err(self.metadata_command_log_conflict(node_id, command));
         }
@@ -3553,6 +3672,21 @@ impl PgStore {
                 context: "prune metadata command checkpoint epochs",
                 source: source.into(),
             })?;
+        self.conn
+            .execute(
+                "DELETE FROM metadata_command_terminal_receipts \
+                 WHERE pg_id = ?1 \
+                   AND cluster_epoch NOT IN ( \
+                     SELECT DISTINCT cluster_epoch \
+                     FROM metadata_command_checkpoints \
+                     WHERE pg_id = ?1 \
+                   )",
+                rusqlite::params![self.pg_id as i64],
+            )
+            .map_err(|source| StoreError::Db {
+                context: "prune metadata command terminal receipt epochs",
+                source: source.into(),
+            })?;
         Ok(())
     }
 
@@ -4001,6 +4135,133 @@ impl PgStore {
         )
     }
 
+    fn load_metadata_command_terminal_receipt(
+        &self,
+        context: &'static str,
+        cluster_epoch: ClusterEpoch,
+        pg_id: PgId,
+        log_index: MetadataCommandLogIndex,
+    ) -> Result<Option<MetadataCommandTerminalReceipt>, StoreError> {
+        self.query_row_cached_optional(
+            "SELECT command_checksum, command_sha256, abandoned, previous_log_hash, log_hash \
+             FROM metadata_command_terminal_receipts \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![
+                cluster_epoch.get() as i64,
+                pg_id.get() as i64,
+                log_index.get() as i64,
+            ],
+            context,
+            |row| {
+                let command_sha256 = row.get::<_, Vec<u8>>(1)?;
+                let command_sha256 = command_sha256.try_into().map_err(|bytes: Vec<u8>| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Blob,
+                        format!(
+                            "metadata command terminal receipt SHA-256 has invalid length {}",
+                            bytes.len()
+                        )
+                        .into(),
+                    )
+                })?;
+                Ok(MetadataCommandTerminalReceipt {
+                    command_checksum: row.get::<_, i64>(0)? as u64,
+                    command_sha256,
+                    abandoned: row.get::<_, i64>(2)? != 0,
+                    previous_log_hash: row.get::<_, i64>(3)? as u64,
+                    log_hash: row.get::<_, i64>(4)? as u64,
+                })
+            },
+        )
+    }
+
+    fn metadata_command_index_is_checkpoint_covered(
+        &self,
+        command_id: MetadataCommandId,
+    ) -> Result<bool, StoreError> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS( \
+                   SELECT 1 FROM metadata_command_checkpoints \
+                   WHERE cluster_epoch = ?1 AND pg_id = ?2 AND applied_log_index >= ?3 \
+                 )",
+                params![
+                    command_id.cluster_epoch().get() as i64,
+                    command_id.pg_id().get() as i64,
+                    command_id.log_index().get() as i64,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|covered| covered != 0)
+            .map_err(|source| StoreError::Db {
+                context: "check metadata command checkpoint-covered index",
+                source: source.into(),
+            })
+    }
+
+    fn verify_metadata_command_terminal_receipt(
+        &self,
+        node_id: u32,
+        command_id: MetadataCommandId,
+        receipt: &MetadataCommandTerminalReceipt,
+    ) -> Result<(), StoreError> {
+        let expected_log_hash = metadata_command_log_hash(
+            command_id.cluster_epoch(),
+            command_id.pg_id(),
+            command_id.log_index(),
+            receipt.previous_log_hash,
+            receipt.command_checksum,
+        )
+        .value();
+        if receipt.log_hash != expected_log_hash {
+            return Err(StoreError::MetadataCommandLogHashMismatch {
+                node_id,
+                pg_id: self.pg_id,
+                cluster_epoch: command_id.cluster_epoch(),
+                log_index: command_id.log_index().get(),
+                expected_previous_log_hash: receipt.previous_log_hash,
+                actual_previous_log_hash: receipt.previous_log_hash,
+                expected_log_hash,
+                actual_log_hash: receipt.log_hash,
+            });
+        }
+        Ok(())
+    }
+
+    fn metadata_command_terminal_receipt_matches(
+        &self,
+        node_id: u32,
+        command: &MetadataCommandEnvelope,
+        abandoned: bool,
+    ) -> Result<Option<(u64, u64)>, StoreError> {
+        let Some(receipt) = self.load_metadata_command_terminal_receipt(
+            "load compacted metadata command terminal receipt",
+            command.id().cluster_epoch(),
+            command.id().pg_id(),
+            command.id().log_index(),
+        )?
+        else {
+            return Ok(None);
+        };
+        self.verify_metadata_command_terminal_receipt(node_id, command.id(), &receipt)?;
+        let (expected_checksum, expected_bytes) = if abandoned {
+            (
+                command.abandoned_log_checksum_crc64(),
+                command.abandoned_log_bytes(),
+            )
+        } else {
+            (command.checksum_crc64(), command.command_bytes())
+        };
+        if receipt.abandoned != abandoned
+            || receipt.command_checksum != expected_checksum
+            || receipt.command_sha256 != checksum::sha256::digest(&expected_bytes)
+        {
+            return Ok(None);
+        }
+        Ok(Some((receipt.previous_log_hash, receipt.log_hash)))
+    }
+
     fn verify_metadata_command_log_entry(
         &self,
         node_id: u32,
@@ -4112,6 +4373,31 @@ impl PgStore {
             && entry.command_bytes == slot.command_bytes)
     }
 
+    fn pending_slot_terminal_receipt_matches(
+        &self,
+        node_id: u32,
+        slot: &PendingMetadataCommandSlot,
+    ) -> Result<bool, StoreError> {
+        let Some(receipt) = self.load_metadata_command_terminal_receipt(
+            "load compacted terminal receipt for pending slot",
+            slot.id.cluster_epoch(),
+            slot.id.pg_id(),
+            slot.id.log_index(),
+        )?
+        else {
+            return Ok(false);
+        };
+        self.verify_metadata_command_terminal_receipt(node_id, slot.id, &receipt)?;
+        let (expected_checksum, expected_bytes) = if receipt.abandoned {
+            let bytes = abandoned_command_log_bytes(slot.id, slot.command_checksum);
+            (checksum::crc64::checksum(&bytes), bytes)
+        } else {
+            (slot.command_checksum, slot.command_bytes.clone())
+        };
+        Ok(receipt.command_checksum == expected_checksum
+            && receipt.command_sha256 == checksum::sha256::digest(&expected_bytes))
+    }
+
     fn validate_pending_metadata_command_slot_relation(
         &self,
         node_id: u32,
@@ -4163,6 +4449,10 @@ impl PgStore {
             slot.id.log_index(),
         )?
         else {
+            if self.pending_slot_terminal_receipt_matches(node_id, slot)? {
+                self.validate_pending_slot_scope_provenance(node_id, state.cluster_epoch, slot)?;
+                return Ok(PendingMetadataCommandSlotAction::CleanTerminal);
+            }
             return Err(StoreError::MetadataCommandLogConflict {
                 node_id,
                 pg_id: self.pg_id,
@@ -4293,6 +4583,12 @@ impl PgStore {
         )?
         else {
             if !Self::metadata_command_is_next_record_position(command, &state) {
+                if self
+                    .metadata_command_terminal_receipt_matches(node_id, command, false)?
+                    .is_some()
+                {
+                    return Ok(MetadataCommandAcceptance::AlreadyApplied);
+                }
                 return Err(self.metadata_command_log_conflict(node_id, command));
             }
             return Ok(MetadataCommandAcceptance::Apply);
@@ -4337,6 +4633,12 @@ impl PgStore {
         )?
         else {
             if !Self::metadata_command_is_next_record_position(command, &state) {
+                if self
+                    .metadata_command_terminal_receipt_matches(node_id, command, true)?
+                    .is_some()
+                {
+                    return Ok(MetadataCommandAcceptance::AlreadyApplied);
+                }
                 return Err(self.metadata_command_log_conflict(node_id, command));
             }
             return Ok(MetadataCommandAcceptance::Apply);
@@ -4362,7 +4664,9 @@ impl PgStore {
             command.id().log_index(),
         )?
         else {
-            return Ok(false);
+            return Ok(self
+                .metadata_command_terminal_receipt_matches(node_id, command, true)?
+                .is_some());
         };
         self.metadata_command_log_entry_matches(node_id, command, &entry, true)
     }
@@ -4457,6 +4761,15 @@ impl PgStore {
                 )?
                 .is_none()
         {
+            if self
+                .metadata_command_terminal_receipt_matches(node_id, command, false)?
+                .is_some()
+            {
+                return Ok(MetadataCommandRecordResult {
+                    state,
+                    digest_revision: self.metadata_digest_revision()?,
+                });
+            }
             return Err(self.metadata_command_log_conflict(node_id, command));
         }
         let command_bytes = command.command_bytes();
@@ -4557,6 +4870,15 @@ impl PgStore {
                 )?
                 .is_none()
         {
+            if self
+                .metadata_command_terminal_receipt_matches(node_id, command, true)?
+                .is_some()
+            {
+                return Ok(MetadataCommandRecordResult {
+                    state,
+                    digest_revision: self.metadata_digest_revision()?,
+                });
+            }
             return Err(self.metadata_command_log_conflict(node_id, command));
         }
         let command_bytes = command.abandoned_log_bytes();
@@ -4678,6 +5000,18 @@ impl PgStore {
         &self,
         cluster_epoch: ClusterEpoch,
     ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        self.compact_metadata_command_log_with_receipt_retention(
+            cluster_epoch,
+            METADATA_COMMAND_TERMINAL_RECEIPT_RETAIN_PER_EPOCH,
+        )
+    }
+
+    pub(super) fn compact_metadata_command_log_with_receipt_retention(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        receipt_retention: u64,
+    ) -> Result<MetadataCommandLogCompactionStatus, StoreError> {
+        assert!(receipt_retention > 0, "receipt retention must not be zero");
         let stats = self.metadata_command_log_stats(cluster_epoch)?;
         let Some(compactable_before) = stats.compactable_before else {
             return Ok(MetadataCommandLogCompactionStatus::NoCheckpoint {
@@ -4694,24 +5028,231 @@ impl PgStore {
             });
         }
 
-        self.validate_metadata_command_checkpoint_state_read_only(0, cluster_epoch)?;
         let max_compacted_log_index = compactable_before
             .checked_sub(1)
             .expect("compactable bound is exclusive and non-zero");
-        let deleted = self.execute_cached(
-            "DELETE FROM metadata_command_log \
-             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index <= ?3",
-            params![
-                cluster_epoch.get() as i64,
-                self.pg_id as i64,
-                max_compacted_log_index as i64,
-            ],
-            "compact metadata command log through checkpoint",
-        )?;
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|source| StoreError::Db {
+                context: "begin metadata command log compaction",
+                source: source.into(),
+            })?;
+        let result = (|| {
+            self.validate_metadata_command_checkpoint_state_read_only(0, cluster_epoch)?;
+            let first_retained_receipt = max_compacted_log_index
+                .saturating_sub(receipt_retention - 1)
+                .max(1);
+            let receipts = self.metadata_command_terminal_receipts_in_range(
+                cluster_epoch,
+                first_retained_receipt,
+                max_compacted_log_index,
+            )?;
+            for (log_index, receipt) in receipts {
+                self.insert_metadata_command_terminal_receipt(cluster_epoch, log_index, &receipt)?;
+            }
+            let deleted = self.execute_cached(
+                "DELETE FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index <= ?3",
+                params![
+                    cluster_epoch.get() as i64,
+                    self.pg_id as i64,
+                    max_compacted_log_index as i64,
+                ],
+                "compact metadata command log through checkpoint",
+            )?;
+            self.prune_metadata_command_terminal_receipts(cluster_epoch, first_retained_receipt)?;
+            Ok(deleted)
+        })();
+        let deleted = match result {
+            Ok(deleted) => {
+                if let Err(source) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(StoreError::Db {
+                        context: "commit metadata command log compaction",
+                        source: source.into(),
+                    });
+                }
+                deleted
+            }
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        };
         Ok(MetadataCommandLogCompactionStatus::Compacted {
             deleted_entries: deleted as u64,
             compacted_before: compactable_before,
         })
+    }
+
+    fn metadata_command_terminal_receipts_in_range(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        min_log_index: u64,
+        max_log_index: u64,
+    ) -> Result<Vec<(MetadataCommandLogIndex, MetadataCommandTerminalReceipt)>, StoreError> {
+        let mut stmt = self
+            .conn
+            .prepare_cached(
+                "SELECT log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
+                 FROM metadata_command_log \
+                 WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index <= ?3 \
+                 ORDER BY log_index",
+            )
+            .map_err(|source| StoreError::Db {
+                context: "prepare compacted metadata command receipt scan",
+                source: source.into(),
+            })?;
+        let rows = stmt
+            .query_map(
+                params![
+                    cluster_epoch.get() as i64,
+                    self.pg_id as i64,
+                    max_log_index as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        MetadataCommandLogEntry {
+                            command_checksum: row.get::<_, i64>(1)? as u64,
+                            command_bytes: row.get(2)?,
+                            abandoned: row.get::<_, i64>(3)? != 0,
+                            previous_log_hash: row.get::<_, Option<i64>>(4)?.map(|v| v as u64),
+                            log_hash: row.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                            pre_state_digest: None,
+                            post_state_digest: None,
+                        },
+                    ))
+                },
+            )
+            .map_err(|source| StoreError::Db {
+                context: "scan compacted metadata command receipts",
+                source: source.into(),
+            })?;
+        let mut receipts = Vec::new();
+        for row in rows {
+            let (raw_log_index, entry) = row.map_err(|source| StoreError::Db {
+                context: "decode compacted metadata command receipt row",
+                source: source.into(),
+            })?;
+            let log_index = decode_nonnegative_u64(
+                "decode compacted metadata command receipt log index",
+                raw_log_index,
+            )?;
+            let log_index = MetadataCommandLogIndex::new(log_index).ok_or({
+                StoreError::MetadataCommandLogConflict {
+                    node_id: 0,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index,
+                }
+            })?;
+            self.verify_metadata_command_log_entry(
+                0,
+                cluster_epoch,
+                PgId::new(self.pg_id),
+                log_index,
+                &entry,
+            )?;
+            let Some(previous_log_hash) = entry.previous_log_hash else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id: 0,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: log_index.get(),
+                });
+            };
+            let Some(log_hash) = entry.log_hash else {
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id: 0,
+                    pg_id: self.pg_id,
+                    cluster_epoch,
+                    log_index: log_index.get(),
+                });
+            };
+            if log_index.get() >= min_log_index {
+                receipts.push((
+                    log_index,
+                    MetadataCommandTerminalReceipt {
+                        command_checksum: entry.command_checksum,
+                        command_sha256: checksum::sha256::digest(&entry.command_bytes),
+                        abandoned: entry.abandoned,
+                        previous_log_hash,
+                        log_hash,
+                    },
+                ));
+            }
+        }
+        Ok(receipts)
+    }
+
+    fn prune_metadata_command_terminal_receipts(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        first_retained_log_index: u64,
+    ) -> Result<(), StoreError> {
+        self.execute_cached(
+            "DELETE FROM metadata_command_terminal_receipts \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index < ?3",
+            params![
+                cluster_epoch.get() as i64,
+                self.pg_id as i64,
+                first_retained_log_index as i64,
+            ],
+            "prune compacted metadata command terminal receipts",
+        )?;
+        Ok(())
+    }
+
+    fn insert_metadata_command_terminal_receipt(
+        &self,
+        cluster_epoch: ClusterEpoch,
+        log_index: MetadataCommandLogIndex,
+        receipt: &MetadataCommandTerminalReceipt,
+    ) -> Result<(), StoreError> {
+        let inserted = self.execute_cached(
+            "INSERT INTO metadata_command_terminal_receipts \
+             (cluster_epoch, pg_id, log_index, command_checksum, command_sha256, abandoned, previous_log_hash, log_hash) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(cluster_epoch, pg_id, log_index) DO NOTHING",
+            params![
+                cluster_epoch.get() as i64,
+                self.pg_id as i64,
+                log_index.get() as i64,
+                receipt.command_checksum as i64,
+                receipt.command_sha256.as_slice(),
+                i64::from(receipt.abandoned),
+                receipt.previous_log_hash as i64,
+                receipt.log_hash as i64,
+            ],
+            "insert compacted metadata command terminal receipt",
+        )?;
+        if inserted == 1 {
+            return Ok(());
+        }
+        let existing = self
+            .load_metadata_command_terminal_receipt(
+                "load existing compacted metadata command terminal receipt",
+                cluster_epoch,
+                PgId::new(self.pg_id),
+                log_index,
+            )?
+            .ok_or_else(|| StoreError::MetadataCommandLogConflict {
+                node_id: 0,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: log_index.get(),
+            })?;
+        if existing == *receipt {
+            Ok(())
+        } else {
+            Err(StoreError::MetadataCommandLogConflict {
+                node_id: 0,
+                pg_id: self.pg_id,
+                cluster_epoch,
+                log_index: log_index.get(),
+            })
+        }
     }
 
     pub(crate) fn refresh_metadata_command_state_digest(&self) -> Result<(), StoreError> {
@@ -5284,6 +5825,11 @@ impl PgStore {
             "DELETE FROM metadata_command_log",
             [],
             "clear stale metadata transfer command log",
+        )?;
+        self.execute_cached(
+            "DELETE FROM metadata_command_terminal_receipts",
+            [],
+            "clear stale compacted metadata command receipts",
         )?;
         self.execute_cached(
             "DELETE FROM metadata_command_checkpoints",

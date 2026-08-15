@@ -184,13 +184,17 @@ pub fn current_time_millis() -> u64 {
 }
 
 pub fn monotonic_time_millis() -> u64 {
+    try_monotonic_time_millis().unwrap_or(u64::MAX)
+}
+
+pub(crate) fn try_monotonic_time_millis() -> Option<u64> {
     if let Some(now_millis) = MONOTONIC_TIME_OVERRIDE_MILLIS.with(Cell::get) {
-        return now_millis;
+        return Some(now_millis);
     }
     if let Some(now_millis) = override_time_millis() {
-        return now_millis;
+        return Some(now_millis);
     }
-    lease_time_millis().unwrap_or(u64::MAX)
+    lease_time_millis()
 }
 
 /// Monotonic sample used to distinguish wall-clock steps from normal elapsed time.

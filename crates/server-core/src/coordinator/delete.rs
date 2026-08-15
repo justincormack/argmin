@@ -23,6 +23,15 @@ impl Coordinator {
     pub(super) fn map_delete_object_pg_action_error(
         error: storage::ObjectMetadataMutationFailure,
     ) -> ServerError {
+        let _ = observability::emit_flight_event(
+            TRACE_TARGET,
+            "delete_object_metadata_mutation_error",
+            format!(
+                "kind={:?} cause_label={}",
+                error.kind(),
+                error.diagnostic_cause_label()
+            ),
+        );
         match error.kind() {
             storage::ObjectMetadataMutationFailureKind::ResourceExhausted
             | storage::ObjectMetadataMutationFailureKind::MetadataCommandContention

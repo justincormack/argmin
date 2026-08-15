@@ -144,10 +144,42 @@ conditional mutations must distinguish that safe abandonment from uncertain
 publication: while their request budget remains, they discard the stale computed
 result and re-evaluate the condition against a fresh snapshot. Only exhaustion of
 that outer budget may return `SlowDown` for repeated, definitively unpublished
-contention. Direct and streamed PutObject pending-command drains and stale-snapshot
-retries consume this same outer operation budget; they must not use a shorter or
-fresh nested budget that can expose internal PG churn as `SlowDown` before the
-condition is re-evaluated or extend work beyond the operation deadline.
+contention. Direct and streamed PutObject and conditional delete-marker exact
+replays, pending-command drains, waiter observations, pending-slot installs, and
+stale-snapshot retries consume this same outer operation budget; they must not use
+a shorter or fresh nested budget that can expose internal PG churn as `SlowDown`
+before the condition is re-evaluated or extend work beyond the operation deadline.
+Pending-slot installation checks the deadline while holding the frontend PG lock,
+and remote requests carry the same bound to a storage-side check under the storage
+PG lock, so an RPC that times out cannot install its slot later. This includes
+bucket-control slot installation for versioning, ACL, property, and subresource
+commands. The portable operation deadline is a conservative wall-clock upper
+bound with the supported cross-process skew removed. Unix and TCP RPC use the
+same representation and never compare monotonic timestamps from different
+processes. The receiver binds the wall deadline once to its own monotonic clock;
+all subsequent admission, lock waiting, and mutation checks use that local
+deadline. The storage worker derives both command-admission and PG-lock
+deadlines from that bound and retains the post-lock validity check. Insert
+transport outcomes remain
+typed as `NotSent`, `Definitive`, or `MayHaveApplied`: definitive budget
+exhaustion releases request-owned reservation authority, while ambiguous
+dispatch retains it for exact-command recovery. If a lost insert response is
+followed by recovery applying and clearing the command, a same-index conflict is
+certified against exact terminal rows and resumes that command's outcome; a
+different checksum, bytes, or hash chain remains a fatal conflict. Transient
+exact-command drain and waiter-observation failures retry within the shared
+budget; integrity and protocol failures still fail closed.
+
+Checkpoint compaction may delete full terminal command rows, but it must first
+persist an exact terminal receipt containing the command checksum, SHA-256,
+terminal disposition, and hash-chain links. Pending-slot insertion, exact
+terminal inspection, and replay consult this receipt. A compacted exact replay
+therefore returns the original terminal state; a same-index command with
+different bytes or hashes remains a fatal conflict. Receipts retain a fixed
+per-epoch replay window. The checkpoint catalogue remains the compacted-through
+watermark, so a command older than that window is rejected fail-closed and can
+never be reinstalled; it is not reported as an exact replay once its receipt has
+aged out.
 
 The request enters **irrevocable convergence** as soon as either:
 
@@ -293,13 +325,12 @@ precondition was used before the pending slot was installed.
 For frontend-admitted publishers, checking admission before calling the
 installer is insufficient: lock waits and RPC transport can cross the captured
 deadline while the raw same-epoch route is renewed. Their immutable
-`AdmittedRouteEffectFence`, including the admission's conservatively bound
-monotonic deadline, is therefore carried to the effect boundary. Monotonic
-timestamps are never serialized: RPC requests carry a portable wall-clock
-upper bound, and the receiving host subtracts the inter-host skew budget before
-binding it to its own monotonic clock. Embedded and RPC nodes revalidate clock
-health and their local effective deadline immediately before the durable
-pending-slot insert.
+`AdmittedRouteEffectFence`, including the admission's conservatively bounded
+deadline, is therefore carried to the effect boundary. Operation RPCs serialize
+only the portable wall-clock upper bound; each receiving process rebinds it to
+its own monotonic clock. Embedded and RPC nodes revalidate clock health and
+their local effective deadline immediately before the durable pending-slot
+insert.
 
 Publisher classes:
 

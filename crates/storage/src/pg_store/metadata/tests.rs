@@ -6366,12 +6366,113 @@ fn metadata_command_log_compaction_preserves_next_index_when_checkpoint_is_curre
         2
     );
 
+    assert!(matches!(
+        store.try_insert_pending_metadata_command_slot(0, &first, Some(first.bucket_name())),
+        Err(StoreError::MetadataCommandLogConflict { log_index: 1, .. })
+    ));
+    assert_eq!(
+        store
+            .applied_metadata_command_log_entry_hashes(0, &first)
+            .unwrap(),
+        Some((
+            0,
+            metadata_command_log_hash(
+                ClusterEpoch::INITIAL,
+                PgId::new(1),
+                first.id().log_index(),
+                0,
+                first.checksum_crc64(),
+            )
+            .value()
+        ))
+    );
+    assert_eq!(
+        store.record_metadata_command_applied(0, &first).unwrap(),
+        store.metadata_command_replica_state().unwrap(),
+        "an exact retry after checkpoint compaction must use its terminal receipt"
+    );
+    let divergent_first = create_bucket_probe_command(
+        1,
+        1,
+        trusted_bucket_name("compact-current-divergent-first"),
+        9,
+    );
+    assert!(matches!(
+        store.applied_metadata_command_log_entry_hashes(0, &divergent_first),
+        Err(StoreError::MetadataCommandLogConflict { log_index: 1, .. })
+    ));
+    assert!(matches!(
+        store.record_metadata_command_applied(0, &divergent_first),
+        Err(StoreError::MetadataCommandLogConflict { log_index: 1, .. })
+    ));
+
+    drop(store);
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    assert!(store
+        .has_matching_applied_metadata_command_log_entry(0, &first, 0)
+        .unwrap());
+    store
+        .conn
+        .execute(
+            "DELETE FROM metadata_command_terminal_receipts \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2 AND log_index = ?3",
+            params![ClusterEpoch::INITIAL.get() as i64, 1_i64, 1_i64],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            store.try_insert_pending_metadata_command_slot(0, &first, Some(first.bucket_name())),
+            Err(StoreError::MetadataCommandLogConflict { log_index: 1, .. })
+        ),
+        "a checkpoint-covered command outside the receipt window must fail closed"
+    );
+
     let third = create_bucket_probe_command(1, 3, trusted_bucket_name("compact-current-third"), 3);
     store.record_metadata_command_applied(0, &third).unwrap();
     let final_state = store
         .validate_metadata_command_replay_state(0, ClusterEpoch::INITIAL)
         .unwrap();
     assert_eq!(final_state.applied_log_index, 3);
+}
+
+#[test]
+fn metadata_command_terminal_receipt_retention_is_bounded_within_one_epoch() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    let first = create_bucket_probe_command(1, 1, trusted_bucket_name("receipt-first"), 1);
+    let second = create_bucket_probe_command(1, 2, trusted_bucket_name("receipt-second"), 2);
+    let third = create_bucket_probe_command(1, 3, trusted_bucket_name("receipt-third"), 3);
+    store.record_metadata_command_applied(0, &first).unwrap();
+    store.record_metadata_command_applied(0, &second).unwrap();
+    store.record_metadata_command_applied(0, &third).unwrap();
+    store
+        .record_current_metadata_command_checkpoint(0, ClusterEpoch::INITIAL)
+        .unwrap();
+    assert_eq!(
+        store
+            .compact_metadata_command_log_with_receipt_retention(ClusterEpoch::INITIAL, 2)
+            .unwrap(),
+        MetadataCommandLogCompactionStatus::Compacted {
+            deleted_entries: 3,
+            compacted_before: 4,
+        }
+    );
+
+    let (count, minimum): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT COUNT(*), MIN(log_index) FROM metadata_command_terminal_receipts \
+             WHERE cluster_epoch = ?1 AND pg_id = ?2",
+            params![ClusterEpoch::INITIAL.get() as i64, 1_i64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(minimum, 2);
+    assert!(matches!(
+        store.try_insert_pending_metadata_command_slot(0, &first, Some(first.bucket_name())),
+        Err(StoreError::MetadataCommandLogConflict { log_index: 1, .. })
+    ));
 }
 
 #[test]

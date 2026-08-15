@@ -1398,26 +1398,44 @@ impl StorageCluster {
                         )?;
                         return Err(ObjectPgActionError::Store(error));
                     }
-                    let waiter_outcome = match self
-                        .pending_command_recovery_waiter_outcome_with_route_mode_until(
+                    let waiter_outcome = loop {
+                        match self.pending_command_recovery_waiter_outcome_with_route_mode_until(
                             pg_id,
                             &command,
                             route_mode,
                             authority.work_budget().deadline(),
                         ) {
-                        Ok(outcome) => outcome,
-                        Err(waiter_error) => {
-                            if let Err(error) = authority
-                                .work_budget()
-                                .check("pending command recovery wait budget exhausted")
-                            {
-                                let error = self
-                                    .classify_pending_metadata_command_budget_exhaustion(
-                                        pg_id, &command, route_mode, error,
-                                    )?;
-                                return Err(ObjectPgActionError::Store(error));
+                            Ok(outcome) => break outcome,
+                            Err(waiter_error) => {
+                                if let Err(error) = authority
+                                    .work_budget()
+                                    .check("pending command recovery wait budget exhausted")
+                                {
+                                    let error = self
+                                        .classify_pending_metadata_command_budget_exhaustion(
+                                            pg_id, &command, route_mode, error,
+                                        )?;
+                                    return Err(ObjectPgActionError::Store(error));
+                                }
+                                if request_ops::object_pg_action_error_is_retryable_command_observation(
+                                    &waiter_error,
+                                ) {
+                                    if let Err(error) = authority
+                                        .work_budget()
+                                        .sleep_after_contention(
+                                            "pending command recovery waiter observation budget exhausted",
+                                        )
+                                    {
+                                        let error = self
+                                            .classify_pending_metadata_command_budget_exhaustion(
+                                                pg_id, &command, route_mode, error,
+                                            )?;
+                                        return Err(ObjectPgActionError::Store(error));
+                                    }
+                                    continue;
+                                }
+                                return Err(waiter_error);
                             }
-                            return Err(waiter_error);
                         }
                     };
                     self.emit_metadata_command_recovery_outcome_for_command(
@@ -1472,6 +1490,11 @@ impl StorageCluster {
                 }
             };
             self.emit_pending_slot_action_for_command(pg_id, &command, "drain_attempt");
+            #[cfg(test)]
+            request_ops::maybe_run_pending_object_metadata_command_drain_attempt_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                &command,
+            )?;
             let mut leader = authority
                 .admit_leader(recovery_guard, pg_id, &command)
                 .map_err(ObjectPgActionError::Store)?;
@@ -1879,6 +1902,15 @@ impl StorageCluster {
                                     pg_id, &command, route_mode,
                                 )
                                 .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                            || self
+                                .metadata_command_log_conflict_actor_has_exact_entry(
+                                    pg_id,
+                                    &command,
+                                    &error.source,
+                                    route_mode,
+                                    Some(work_budget.deadline()),
+                                )
+                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                             || (!error.progress.is_abortable()
                                 && self
                                     .partial_exact_metadata_command_conflict_is_retryable_with_route_mode(
@@ -1924,6 +1956,8 @@ impl StorageCluster {
                         self.after_object_metadata_command_applied(&command);
                         return Ok(PendingObjectMetadataCommandCompletion::Applied);
                     }
+                    apply_progress = apply_progress
+                        .merge(request_ops::MetadataCommandApplyProgress::PublicationUnconfirmed);
                     #[cfg(test)]
                     if request_ops::maybe_force_pending_object_metadata_partial_conflict_hook(
                         self.metadata_command_apply_test_hook_scope_id(),

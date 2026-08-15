@@ -3885,6 +3885,26 @@
     }
 
     #[test]
+    fn metadata_command_lock_wait_honors_operation_deadline() {
+        let locks = StorageNodeMetadataCommandLocks::default();
+        let pg_id = PgId::new(0);
+        let _first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
+        let _stderr_guard = locks.suppress_lock_wait_stderr();
+        let deadline = Instant::now() + Duration::from_millis(25);
+        let err = match locks.acquire_until(NodeId::new(7), pg_id, None, deadline) {
+            Ok(_) => panic!("metadata-command lock acquisition should honor operation deadline"),
+            Err(error) => error,
+        };
+
+        assert!(
+            Instant::now() < deadline + Duration::from_millis(250),
+            "metadata-command lock wait should not use its independent default timeout"
+        );
+        assert_eq!(err.code, StorageRpcErrorCode::MetadataCommandContention);
+        assert!(err.message.contains("metadata command lock wait"));
+    }
+
+    #[test]
     fn metadata_command_lock_wait_emits_blocked_holder_diagnostic() {
         let locks = StorageNodeMetadataCommandLocks::default();
         let pg_id = PgId::new(0);
@@ -3999,6 +4019,7 @@
             command: command.clone(),
             scope_bucket: Some(command.bucket_name().clone()),
             effect_deadline: None,
+            operation_deadline: None,
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();

@@ -67,9 +67,11 @@ use crate::node::BucketMutationReceipt;
 use crate::node::SharedStorageNode;
 use crate::node_client::{
     BucketMetadataRoute, BuildCreateStreamUploadCommandReq, BuildDirectPutCommitCommandReq,
-    CreateStreamUploadPrecondition, MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
-    MetadataCommandPeeringNodeClient, MetadataReadAuthorization, ObjectListingMetadataRoute,
-    ObjectPayloadLeaseNodeLease, RetainedShardAckNodeClient, ShardAckRoute,
+    CreateStreamUploadPrecondition, MetadataCommandApplyErrorKind,
+    MetadataCommandInspectionNodeClient, MetadataCommandNodeClient,
+    MetadataCommandPeeringNodeClient, MetadataCommandPendingSlotInsertError,
+    MetadataReadAuthorization, ObjectListingMetadataRoute, ObjectPayloadLeaseNodeLease,
+    RetainedShardAckNodeClient, ShardAckRoute,
 };
 pub(crate) use crate::peering::PgMetadataTransferArtifact;
 use crate::peering::{

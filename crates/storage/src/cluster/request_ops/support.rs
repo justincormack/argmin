@@ -171,6 +171,62 @@ pub(super) fn metadata_command_apply_error_can_reinspect_after_abandonment(
     }
 }
 
+pub(super) fn object_pg_action_error_is_retryable_command_observation(
+    error: &ObjectPgActionError,
+) -> bool {
+    match error {
+        ObjectPgActionError::Store(error) => {
+            store_error_is_retryable_command_observation(error)
+        }
+        ObjectPgActionError::Metadata(error) => error.is_command_contention(),
+        ObjectPgActionError::InvalidRequest { .. }
+        | ObjectPgActionError::StaleObjectReadSubject
+        | ObjectPgActionError::StaleDirectPutCommitSnapshot
+        | ObjectPgActionError::StaleStreamFinalizeSnapshot
+        | ObjectPgActionError::StaleMultipartCompletionSnapshot
+        | ObjectPgActionError::MultipartConditionalRequestConflict => false,
+    }
+}
+
+fn store_error_is_retryable_command_observation(error: &StoreError) -> bool {
+    match error {
+        StoreError::ClusterMapHistoryReferenceLimitExceeded { .. }
+        | StoreError::StorageRpcResourceExhausted { .. }
+        | StoreError::MetadataCommandPendingConflict { .. }
+        | StoreError::MetadataCommandContention { .. }
+        | StoreError::StalePayloadOperation { .. }
+        | StoreError::StaleMetadataPrimaryBridge { .. }
+        | StoreError::StaleMetadataOperation { .. }
+        | StoreError::StaleMetadataRoute { .. }
+        | StoreError::StaleMetadataReadProof { .. }
+        | StoreError::RouteMapExpired { .. }
+        | StoreError::RouteAdmissionClusterMismatch { .. }
+        | StoreError::StaleMetadataCommand { .. }
+        | StoreError::StaleShardOperation { .. }
+        | StoreError::StaleShardLocation { .. }
+        | StoreError::PgNotActive { .. }
+        | StoreError::ShardPgNotActive { .. }
+        | StoreError::MetadataCommandTerminalEntryPending { .. }
+        | StoreError::OperationDeadlineExceeded { .. } => true,
+        StoreError::ShardStore { source, .. } => {
+            store_error_is_retryable_command_observation(source)
+        }
+        StoreError::StorageRpc { failure, .. } => matches!(
+            failure.wire_code(),
+            StorageRpcWireErrorCode::ResourceExhausted
+                | StorageRpcWireErrorCode::MetadataCommandContention
+                | StorageRpcWireErrorCode::StaleShardLocation
+                | StorageRpcWireErrorCode::InactivePgRoute
+                | StorageRpcWireErrorCode::NonActingSetAccess
+                | StorageRpcWireErrorCode::WrongClusterEpoch
+                | StorageRpcWireErrorCode::TransportTimeout
+                | StorageRpcWireErrorCode::TransportClosed
+                | StorageRpcWireErrorCode::MetadataCommandMutationUncertain
+        ),
+        _ => false,
+    }
+}
+
 pub(super) fn metadata_command_apply_error_requires_exact_confirmation(
     error: &BucketSnapshotLoadError,
 ) -> bool {
@@ -547,6 +603,10 @@ type StreamPutPendingDrainTestHook =
 type DirectPutPendingDrainTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[cfg(test)]
+type PendingObjectMetadataCommandDrainAttemptTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(test)]
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -713,6 +773,11 @@ static DIRECT_PUT_PENDING_DRAIN_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static PENDING_OBJECT_METADATA_COMMAND_DRAIN_ATTEMPT_HOOKS: OnceLock<
+    Mutex<HashMap<usize, PendingObjectMetadataCommandDrainAttemptTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteCommandIdTestHook>>,
 > = OnceLock::new();
@@ -874,6 +939,11 @@ pub(crate) struct StreamPutPendingDrainTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct DirectPutPendingDrainTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct PendingObjectMetadataCommandDrainAttemptTestHookGuard {
     scope_id: usize,
 }
 
@@ -1089,6 +1159,18 @@ impl Drop for StreamPutPendingDrainTestHookGuard {
 impl Drop for DirectPutPendingDrainTestHookGuard {
     fn drop(&mut self) {
         let hooks = DIRECT_PUT_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for PendingObjectMetadataCommandDrainAttemptTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = PENDING_OBJECT_METADATA_COMMAND_DRAIN_ATTEMPT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1553,6 +1635,23 @@ pub(super) fn maybe_run_direct_put_pending_drain_hook(
         .is_some_and(|hook| hook());
     if expire {
         work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_pending_object_metadata_command_drain_attempt_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), ObjectPgActionError> {
+    let hook = PENDING_OBJECT_METADATA_COMMAND_DRAIN_ATTEMPT_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    match hook {
+        Some(hook) => hook(command),
+        None => Ok(()),
     }
 }
 

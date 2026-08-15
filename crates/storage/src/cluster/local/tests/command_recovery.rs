@@ -1870,6 +1870,17 @@ fn recovery_waiter_drain_treats_missing_unapplied_command_as_abandoned() {
         "waiter should block while another request owns command recovery"
     );
 
+    let inspection_failed = Arc::new(AtomicBool::new(false));
+    let inspection_failed_for_hook = Arc::clone(&inspection_failed);
+    let inspection_guard =
+        cluster.test_install_post_budget_metadata_command_inspection_hook(Arc::new(move |_, _| {
+            (!inspection_failed_for_hook.swap(true, Ordering::SeqCst)).then_some(Err(
+                StoreError::MetadataCommandContention {
+                    context: "injected recovery waiter observation contention",
+                },
+            ))
+        }));
+
     let primary = map
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
@@ -1880,6 +1891,8 @@ fn recovery_waiter_drain_treats_missing_unapplied_command_as_abandoned() {
 
     let outcome = outcome_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     assert_eq!(outcome, PendingMetadataCommandOutcome::Abandoned);
+    assert!(inspection_failed.load(Ordering::SeqCst));
+    drop(inspection_guard);
     waiter.join().unwrap();
     assert_clean_metadata_command_stream(&map, &[1]);
 }

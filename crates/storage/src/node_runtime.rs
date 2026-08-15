@@ -510,8 +510,9 @@ pub(super) mod pg_store_facade {
         MAX_PG_CLUSTER_MAP_HISTORY_ROUTE_REFERENCES, MAX_PG_DURABLE_IDENTITY_BYTES,
     };
     pub(crate) use super::pg_store::{
-        MetadataProofStorageIssuer, PendingMetadataCommandSlotReplaceError, ScavengerShardFile,
-        ScavengerShardFileScan, ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
+        MetadataProofStorageIssuer, PendingMetadataCommandSlotInsertError,
+        PendingMetadataCommandSlotReplaceError, ScavengerShardFile, ScavengerShardFileScan,
+        ScavengerShardRow, METADATA_COMMAND_CHECKPOINT_ENCODING_VERSION,
         METADATA_COMMAND_CHECKPOINT_MAGIC,
     };
 }

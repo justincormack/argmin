@@ -461,6 +461,98 @@ impl StorageCluster {
         )
     }
 
+    fn metadata_command_has_exact_applied_entry_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
+        let mut expected_hashes = None;
+        let mut exact = false;
+        for node in nodes {
+            let hashes = node
+                .metadata_command_inspection_client()
+                .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline)?;
+            let Some(hashes) = hashes else {
+                continue;
+            };
+            exact = true;
+            match expected_hashes {
+                None => expected_hashes = Some(hashes),
+                Some(expected) if expected == hashes => {}
+                Some(_) => {
+                    return Err(self
+                        .metadata_command_conflict(
+                            node.node_id(),
+                            pg_id,
+                            command.id().log_index().get(),
+                        )
+                        .into());
+                }
+            }
+        }
+        Ok(exact)
+    }
+
+    fn metadata_command_candidate_has_exact_applied_entry_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let nodes = self
+            .local_map
+            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
+        let mut expected_hashes = None;
+        let mut exact = false;
+        let mut different_node_id = None;
+        for node in nodes {
+            let hashes = node
+                .metadata_command_inspection_client()
+                .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline);
+            match hashes {
+                Ok(Some(hashes)) => {
+                    exact = true;
+                    match expected_hashes {
+                        None => expected_hashes = Some(hashes),
+                        Some(expected) if expected == hashes => {}
+                        Some(_) => {
+                            return Err(MetadataError::InvariantViolation {
+                                context: "certify snapshot-sensitive command installation",
+                                reason: format!(
+                                    "exact command has inconsistent hashes on node {}",
+                                    node.node_id().as_u32()
+                                ),
+                            }
+                            .into());
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(StoreError::MetadataCommandLogConflict { .. }) => {
+                    different_node_id = Some(node.node_id());
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if exact {
+            if let Some(node_id) = different_node_id {
+                return Err(MetadataError::InvariantViolation {
+                    context: "certify snapshot-sensitive command installation",
+                    reason: format!(
+                        "exact command and a different command occupy the same index; different command observed on node {}",
+                        node_id.as_u32()
+                    ),
+                }
+                .into());
+            }
+        }
+        Ok(exact)
+    }
+
     fn metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
         &self,
         pg_id: PgId,
@@ -886,18 +978,31 @@ impl StorageCluster {
         applied_nodes: usize,
         source: &BucketSnapshotLoadError,
     ) -> Result<Option<bool>, BucketSnapshotLoadError> {
-        if !Self::metadata_command_log_conflict_matches(command, source)
-            || !self.partial_exact_metadata_command_conflict_is_retryable(
-                pg_id,
-                command,
-                applied_nodes,
-                source,
-            )?
+        if !Self::metadata_command_log_conflict_matches(command, source) {
+            return Ok(None);
+        }
+        if self.metadata_command_is_applied_on_all_acting_nodes(pg_id, command)? {
+            return Ok(Some(true));
+        }
+        if self.metadata_command_log_conflict_actor_has_exact_entry(
+            pg_id,
+            command,
+            source,
+            MetadataCommandRouteMode::Normal,
+            None,
+        )? {
+            return Ok(Some(false));
+        }
+        if !self.partial_exact_metadata_command_conflict_is_retryable(
+            pg_id,
+            command,
+            applied_nodes,
+            source,
+        )? && !self.exact_metadata_command_conflict_is_retryable(pg_id, command, source)?
         {
             return Ok(None);
         }
-        self.metadata_command_is_applied_on_all_acting_nodes(pg_id, command)
-            .map(Some)
+        Ok(Some(false))
     }
 
     fn retryable_partial_exact_metadata_command_conflict_applied_on_all_nodes_until(
@@ -908,20 +1013,83 @@ impl StorageCluster {
         source: &BucketSnapshotLoadError,
         deadline: Instant,
     ) -> Result<Option<bool>, BucketSnapshotLoadError> {
-        if !Self::metadata_command_log_conflict_matches(command, source)
-            || !self.partial_exact_metadata_command_conflict_is_retryable_with_route_mode_until(
-                pg_id,
-                command,
-                applied_nodes,
-                source,
-                MetadataCommandRouteMode::Normal,
-                deadline,
-            )?
-        {
+        if !Self::metadata_command_log_conflict_matches(command, source) {
             return Ok(None);
         }
-        self.metadata_command_is_applied_on_all_acting_nodes_until(pg_id, command, deadline)
-            .map(Some)
+        if self.metadata_command_is_applied_on_all_acting_nodes_until(pg_id, command, deadline)? {
+            return Ok(Some(true));
+        }
+        if self.metadata_command_log_conflict_actor_has_exact_entry(
+            pg_id,
+            command,
+            source,
+            MetadataCommandRouteMode::Normal,
+            Some(deadline),
+        )? {
+            return Ok(Some(false));
+        }
+        if !self.partial_exact_metadata_command_conflict_is_retryable_with_route_mode_until(
+            pg_id,
+            command,
+            applied_nodes,
+            source,
+            MetadataCommandRouteMode::Normal,
+            deadline,
+        )? && !self.exact_metadata_command_conflict_is_retryable_until(
+            pg_id, command, source, deadline,
+        )? {
+            return Ok(None);
+        }
+        Ok(Some(false))
+    }
+
+    fn metadata_command_log_conflict_actor_has_exact_entry(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        source: &BucketSnapshotLoadError,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Option<Instant>,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+            node_id: conflict_node_id,
+            ..
+        }) = source
+        else {
+            return Ok(false);
+        };
+        if !Self::metadata_command_log_conflict_matches(command, source) {
+            return Ok(false);
+        }
+        let nodes = match route_mode {
+            MetadataCommandRouteMode::Normal => self
+                .local_map
+                .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id),
+            MetadataCommandRouteMode::Recovery => self
+                .local_map
+                .metadata_pg_acting_nodes_for_metadata_command_recovery(
+                    command.id().cluster_epoch(),
+                    pg_id,
+                ),
+        }?;
+        let Some(node) = nodes
+            .into_iter()
+            .find(|node| node.node_id().as_u32() == *conflict_node_id)
+        else {
+            return Ok(false);
+        };
+        let client = node.metadata_command_inspection_client();
+        let result = match deadline {
+            Some(deadline) => {
+                client.applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline)
+            }
+            None => client.applied_metadata_command_log_entry_hashes(pg_id, command),
+        };
+        match result {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) | Err(StoreError::MetadataCommandLogConflict { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn exact_metadata_command_conflict_is_retryable(
@@ -929,6 +1097,33 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         source: &BucketSnapshotLoadError,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.exact_metadata_command_conflict_is_retryable_with_deadline(
+            pg_id, command, source, None,
+        )
+    }
+
+    fn exact_metadata_command_conflict_is_retryable_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        source: &BucketSnapshotLoadError,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        self.exact_metadata_command_conflict_is_retryable_with_deadline(
+            pg_id,
+            command,
+            source,
+            Some(deadline),
+        )
+    }
+
+    fn exact_metadata_command_conflict_is_retryable_with_deadline(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        source: &BucketSnapshotLoadError,
+        deadline: Option<Instant>,
     ) -> Result<bool, BucketSnapshotLoadError> {
         let BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
             node_id: conflict_node_id,
@@ -967,12 +1162,23 @@ impl StorageCluster {
             return Ok(false);
         };
 
-        self.partial_exact_metadata_command_conflict_is_retryable(
-            pg_id,
-            command,
-            applied_nodes,
-            source,
-        )
+        match deadline {
+            Some(deadline) => self
+                .partial_exact_metadata_command_conflict_is_retryable_with_route_mode_until(
+                    pg_id,
+                    command,
+                    applied_nodes,
+                    source,
+                    MetadataCommandRouteMode::Normal,
+                    deadline,
+                ),
+            None => self.partial_exact_metadata_command_conflict_is_retryable(
+                pg_id,
+                command,
+                applied_nodes,
+                source,
+            ),
+        }
     }
 
     #[cfg(test)]
@@ -3956,6 +4162,27 @@ impl StorageCluster {
             .is_some())
     }
 
+    fn try_install_pending_metadata_command_for_bucket_with_effect_fence_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        deadline: Instant,
+    ) -> Result<bool, MetadataCommandPendingSlotInsertError> {
+        self.maybe_run_before_metadata_command_pending_install_hook();
+        Ok(self
+            .try_set_pending_metadata_command_for_bucket_with_effect_fence_until(
+                pg_id,
+                bucket,
+                command,
+                effect_fence,
+                deadline,
+            )
+            ?
+            .is_some())
+    }
+
     #[cfg(test)]
     fn try_set_pending_metadata_command_for_bucket(
         &self,
@@ -3988,6 +4215,34 @@ impl StorageCluster {
         )
     }
 
+    fn try_set_pending_metadata_command_for_bucket_with_effect_fence_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        deadline: Instant,
+    ) -> Result<Option<()>, MetadataCommandPendingSlotInsertError> {
+        let pg_lock = self
+            .local_map
+            .runtime_state()
+            .metadata_command_pg_lock(pg_id);
+        let _pg_guard = lock_metadata_command_pg_until(&pg_lock, deadline).ok_or_else(|| {
+            MetadataCommandPendingSlotInsertError::not_sent(
+                crate::node_client::storage_rpc_deadline_expired(
+                    "acquire metadata command PG for pending-slot installation",
+                ),
+            )
+        })?;
+        self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence_until(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            deadline,
+        )
+    }
+
     fn try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
         &self,
         pg_id: PgId,
@@ -3995,22 +4250,101 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         effect_fence: Option<AdmittedRouteEffectFence>,
     ) -> Result<Option<()>, StoreError> {
+        self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence_and_deadline(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            None,
+        )
+    }
+
+    fn try_set_pending_metadata_command_for_bucket_locked_with_effect_fence_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        deadline: Instant,
+    ) -> Result<Option<()>, MetadataCommandPendingSlotInsertError> {
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(self.operation_epoch(), pg_id)
+            .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
+        let metadata_client = primary.metadata_command_client();
+        let result = match effect_fence {
+            Some(effect_fence) => metadata_client
+                .try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
+                    pg_id,
+                    command,
+                    Some(bucket),
+                    effect_fence,
+                    deadline,
+                ),
+            None => metadata_client.try_insert_pending_metadata_command_slot_classified_until(
+                pg_id,
+                command,
+                Some(bucket),
+                deadline,
+            ),
+        };
+        match result {
+            Ok(()) => Ok(Some(())),
+            Err(error)
+                if matches!(
+                    error.source(),
+                    StoreError::MetadataCommandPendingConflict { .. }
+                ) =>
+            {
+                self.emit_metadata_command_conflict(
+                    Some(primary.node_id()),
+                    pg_id,
+                    Some(command.id().log_index().get()),
+                    "pending_slot_conflict",
+                    Some(command.payload().kind_name()),
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn try_set_pending_metadata_command_for_bucket_locked_with_effect_fence_and_deadline(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<()>, StoreError> {
         let primary = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let metadata_client = primary.metadata_command_client();
-        let result = match effect_fence {
-            Some(effect_fence) => metadata_client
+        let result = match (effect_fence, deadline) {
+            (Some(effect_fence), Some(deadline)) => metadata_client
+                .try_insert_pending_metadata_command_slot_with_effect_fence_until(
+                    pg_id,
+                    command,
+                    Some(bucket),
+                    effect_fence,
+                    deadline,
+                ),
+            (Some(effect_fence), None) => metadata_client
                 .try_insert_pending_metadata_command_slot_with_effect_fence(
                     pg_id,
                     command,
                     Some(bucket),
                     effect_fence,
                 ),
-            None => metadata_client.try_insert_pending_metadata_command_slot(
+            (None, Some(deadline)) => metadata_client.try_insert_pending_metadata_command_slot_until(
                 pg_id,
                 command,
                 Some(bucket),
+                deadline,
+            ),
+            (None, None) => metadata_client.try_insert_pending_metadata_command_slot(
+                pg_id, command, Some(bucket),
             ),
         };
         match result {
@@ -4153,15 +4487,58 @@ impl StorageCluster {
         effect_fence: Option<AdmittedRouteEffectFence>,
         work_budget: &mut RequestWorkBudget,
     ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
-        match self.try_install_pending_metadata_command_for_bucket_with_effect_fence(
+        let mut ignored_may_have_applied = false;
+        self.install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
+            publisher,
             pg_id,
             bucket,
             command,
             effect_fence,
+            work_budget,
+            &mut ignored_may_have_applied,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
+        &self,
+        publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut RequestWorkBudget,
+        install_may_have_applied: &mut bool,
+    ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
+        match self.try_install_pending_metadata_command_for_bucket_with_effect_fence_until(
+            pg_id,
+            bucket,
+            command,
+            effect_fence,
+            work_budget.deadline(),
         ) {
             Ok(true) => Ok(SnapshotSensitiveInstallOutcome::Installed),
-            Ok(false)
-            | Err(ObjectPgActionError::Store(StoreError::MetadataCommandLogConflict { .. })) => {
+            Err(error)
+                if matches!(
+                    error.source(),
+                    StoreError::MetadataCommandLogConflict { .. }
+                ) =>
+            {
+                *install_may_have_applied |=
+                    error.kind() == MetadataCommandApplyErrorKind::MayHaveApplied;
+                if self
+                    .metadata_command_candidate_has_exact_applied_entry_until(
+                        pg_id,
+                        command,
+                        work_budget.deadline(),
+                    )
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                {
+                    return Ok(SnapshotSensitiveInstallOutcome::Installed);
+                }
+                if *install_may_have_applied {
+                    return Err(error.into_source().into());
+                }
                 self.drain_one_pending_object_metadata_command_with_work_budget(
                     publisher,
                     pg_id,
@@ -4170,7 +4547,31 @@ impl StorageCluster {
                 )?;
                 Ok(SnapshotSensitiveInstallOutcome::ContenderDrained)
             }
-            Err(error) => Err(error),
+            Ok(false) => {
+                if *install_may_have_applied
+                    && self
+                        .metadata_command_has_exact_applied_entry_until(
+                            pg_id,
+                            command,
+                            work_budget.deadline(),
+                        )
+                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                {
+                    return Ok(SnapshotSensitiveInstallOutcome::Installed);
+                }
+                self.drain_one_pending_object_metadata_command_with_work_budget(
+                    publisher,
+                    pg_id,
+                    bucket,
+                    work_budget,
+                )?;
+                Ok(SnapshotSensitiveInstallOutcome::ContenderDrained)
+            }
+            Err(error) => {
+                *install_may_have_applied |=
+                    error.kind() == MetadataCommandApplyErrorKind::MayHaveApplied;
+                Err(error.into_source().into())
+            }
         }
     }
 

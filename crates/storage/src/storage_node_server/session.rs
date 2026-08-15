@@ -730,6 +730,10 @@ fn store_error_response(error: StoreError) -> StorageRpcErrorResponse {
             code: StorageRpcErrorCode::MetadataCommandContention,
             message: format!("metadata command contention during {context}"),
         },
+        error @ StoreError::OperationDeadlineExceeded { .. } => StorageRpcErrorResponse {
+            code: StorageRpcErrorCode::TransportTimeout,
+            message: error.to_string(),
+        },
         error @ StoreError::ClusterMapHistoryReferenceLimitExceeded { .. } => {
             StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::ResourceExhausted,

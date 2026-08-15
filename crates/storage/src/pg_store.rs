@@ -63,6 +63,28 @@ pub(crate) enum PendingMetadataCommandSlotReplaceError {
     MayHaveApplied(StoreError),
 }
 
+#[derive(Debug)]
+pub(crate) enum PendingMetadataCommandSlotInsertError {
+    Definitive(StoreError),
+    MayHaveApplied(StoreError),
+}
+
+impl PendingMetadataCommandSlotInsertError {
+    pub(crate) fn definitive(source: StoreError) -> Self {
+        Self::Definitive(source)
+    }
+
+    pub(crate) fn may_have_applied(source: StoreError) -> Self {
+        Self::MayHaveApplied(source)
+    }
+
+    pub(crate) fn into_source(self) -> StoreError {
+        match self {
+            Self::Definitive(source) | Self::MayHaveApplied(source) => source,
+        }
+    }
+}
+
 impl PendingMetadataCommandSlotReplaceError {
     pub(crate) fn definitive(source: StoreError) -> Self {
         Self::Definitive(source)

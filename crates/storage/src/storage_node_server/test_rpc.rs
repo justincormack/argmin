@@ -1597,6 +1597,7 @@
                     command: command.clone(),
                     scope_bucket: Some(command.bucket_name().clone()),
                     effect_deadline: None,
+                    operation_deadline: None,
                 },
             )
             .unwrap(),
@@ -3231,6 +3232,7 @@
             command: command.clone(),
             scope_bucket: Some(command.bucket_name().clone()),
             effect_deadline: None,
+            operation_deadline: None,
         };
         let pg_guard = server
             .metadata_command_locks
@@ -3660,6 +3662,7 @@
                         authority_valid_until_ms: 5_000,
                         portable_wall_valid_until_ms: 4_000,
                     }),
+                    operation_deadline: None,
                 },
             )
             .unwrap(),
@@ -3683,6 +3686,7 @@
                         authority_valid_until_ms: 5_000,
                         portable_wall_valid_until_ms: 4_000,
                     }),
+                    operation_deadline: None,
                 },
             )
             .unwrap(),
@@ -3723,6 +3727,7 @@
             command: command.clone(),
             scope_bucket: Some(crate::tests::bucket_name("metadata-rpc-bucket")),
             effect_deadline: None,
+            operation_deadline: None,
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();
@@ -3817,6 +3822,7 @@
             command: test_metadata_command(0, 1),
             scope_bucket: Some(crate::tests::bucket_name("wrong-scope-bucket")),
             effect_deadline: None,
+            operation_deadline: None,
         };
         let server = StorageNodeServer::bind(config.clone()).unwrap();
         let socket_path = config.socket_path.clone();

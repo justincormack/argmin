@@ -6,7 +6,7 @@ use rusqlite::Connection;
 
 use crate::error::StoreError;
 
-const CURRENT_PG_SCHEMA_VERSION: u32 = 2;
+const CURRENT_PG_SCHEMA_VERSION: u32 = 3;
 
 /// Per-PG shard tracking table.
 const CREATE_SHARDS_TABLE: &str = "\
@@ -699,6 +699,21 @@ CREATE TABLE metadata_command_log (
     PRIMARY KEY (cluster_epoch, pg_id, log_index)
 ) STRICT";
 
+/// Compact exact-identity proof for a terminal command whose full log row was
+/// deleted through a verified checkpoint.
+const CREATE_METADATA_COMMAND_TERMINAL_RECEIPTS_TABLE: &str = "\
+CREATE TABLE metadata_command_terminal_receipts (
+    cluster_epoch    INTEGER NOT NULL CHECK (cluster_epoch > 0),
+    pg_id            INTEGER NOT NULL CHECK (pg_id >= 0),
+    log_index        INTEGER NOT NULL CHECK (log_index > 0),
+    command_checksum INTEGER NOT NULL,
+    command_sha256   BLOB NOT NULL CHECK (length(command_sha256) = 32),
+    abandoned        INTEGER NOT NULL CHECK (abandoned IN (0, 1)),
+    previous_log_hash INTEGER NOT NULL,
+    log_hash         INTEGER NOT NULL,
+    PRIMARY KEY (cluster_epoch, pg_id, log_index)
+) STRICT";
+
 /// Per-PG unresolved metadata command slot.
 ///
 /// Each PG database owns at most one slot. The command bytes are the canonical
@@ -961,6 +976,7 @@ fn create_current_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_PG_COUNTERS_TABLE, [])?;
     conn.execute(CREATE_PG_DURABLE_IDENTITY_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_LOG_TABLE, [])?;
+    conn.execute(CREATE_METADATA_COMMAND_TERMINAL_RECEIPTS_TABLE, [])?;
     conn.execute(CREATE_METADATA_COMMAND_PENDING_SLOT_TABLE, [])?;
     conn.execute(
         CREATE_METADATA_COMMAND_PENDING_PLACED_REFERENCE_PAGES_TABLE,
@@ -1239,15 +1255,15 @@ mod tests {
 
     #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
-        for version in [1, 3] {
+        for version in [1, 2, 4] {
             let conn = Connection::open_in_memory().unwrap();
             conn.pragma_update(None, "user_version", version).unwrap();
 
             let error = init_pg_schema(&conn).unwrap_err();
             assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
-            assert!(error
-                .to_string()
-                .contains(&format!("unsupported version {version}; expected 2")));
+            assert!(error.to_string().contains(&format!(
+                "unsupported version {version}; expected {CURRENT_PG_SCHEMA_VERSION}"
+            )));
         }
     }
 

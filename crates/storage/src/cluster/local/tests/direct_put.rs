@@ -987,6 +987,146 @@ fn snapshot_sensitive_install_drains_only_the_observed_contender() {
 }
 
 #[test]
+fn snapshot_sensitive_install_recognizes_its_exact_terminal_command() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "snapshot-install-terminal-");
+    let key = key_for_object_pg(topology, &bucket, 2, "terminal-");
+    let contender_key = key_for_object_pg(topology, &bucket, 2, "contender-");
+    let candidate_key = key_for_object_pg(topology, &bucket, 2, "candidate-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    // Put the primary after the deterministic witness in publication order.
+    // Terminal replay must not depend on which actor reports the conflict.
+    set_route_primary(&mut map, 2, NodeId::new(0));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(2);
+    let command = MetadataCommandEnvelope::new(
+        cluster.next_object_metadata_command_id(pg_id).unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key,
+            crate::SessionId::try_from("64".repeat(16)).unwrap(),
+            GenerationId::new(104).unwrap(),
+            crate::clock::current_time_millis(),
+        )),
+    );
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &command)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        pg.record_current_metadata_command_checkpoint(node_id.as_u32(), ClusterEpoch::INITIAL)
+            .unwrap();
+        assert!(matches!(
+            pg.compact_metadata_command_log(ClusterEpoch::INITIAL)
+                .unwrap(),
+            crate::pg_store::MetadataCommandLogCompactionStatus::Compacted {
+                deleted_entries: 1,
+                ..
+            }
+        ));
+        assert_eq!(
+            pg.metadata_command_log_stats(ClusterEpoch::INITIAL)
+                .unwrap()
+                .retained_entries,
+            0
+        );
+    }
+
+    let outcome = cluster
+        .install_snapshot_sensitive_metadata_command_or_drain(
+            crate::metadata_command::metadata_command_publisher!(
+                CommitDirectPutObjectFromPayloadShards
+            ),
+            pg_id,
+            &bucket,
+            &command,
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        crate::cluster::SnapshotSensitiveInstallOutcome::Installed,
+        "an exact command applied while its insert response was lost must not be treated as a contender"
+    );
+    let mut work_budget = crate::cluster::RequestWorkBudget::new(Duration::from_secs(1), None)
+        .for_operation("test_exact_terminal_pending_install")
+        .for_pg(pg_id);
+    assert!(matches!(
+        cluster
+            .apply_new_object_metadata_command_for_bucket_or_reinspect(
+                pg_id,
+                &bucket,
+                &command,
+                &mut work_budget,
+            )
+            .unwrap(),
+        crate::cluster::request_ops::NewObjectMetadataCommandApplyOutcome::Applied
+    ));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+
+    let contender_id = cluster.next_object_metadata_command_id(pg_id).unwrap();
+    let contender = MetadataCommandEnvelope::new(
+        contender_id,
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            contender_key,
+            crate::SessionId::try_from("65".repeat(16)).unwrap(),
+            GenerationId::new(105).unwrap(),
+            crate::clock::current_time_millis(),
+        )),
+    );
+    cluster
+        .test_apply_metadata_command_to_acting_set_from_origin(NodeId::new(0), &contender)
+        .unwrap();
+    let candidate = MetadataCommandEnvelope::new(
+        contender_id,
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            candidate_key,
+            crate::SessionId::try_from("66".repeat(16)).unwrap(),
+            GenerationId::new(106).unwrap(),
+            crate::clock::current_time_millis(),
+        )),
+    );
+    assert_eq!(
+        cluster
+            .install_snapshot_sensitive_metadata_command_or_drain(
+                crate::metadata_command::metadata_command_publisher!(
+                    CommitDirectPutObjectFromPayloadShards
+                ),
+                pg_id,
+                &bucket,
+                &candidate,
+                None,
+            )
+            .unwrap(),
+        crate::cluster::SnapshotSensitiveInstallOutcome::ContenderDrained,
+        "a different terminal command at the candidate index must trigger reinspection"
+    );
+    assert_clean_metadata_command_stream(&map, &[2]);
+}
+
+#[test]
 fn direct_put_pending_install_race_keeps_bucket_write_proof_for_retry() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

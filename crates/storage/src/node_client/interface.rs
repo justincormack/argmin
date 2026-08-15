@@ -1951,6 +1951,30 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         bucket: Option<&BucketName>,
     ) -> Result<(), StoreError>;
 
+    fn try_insert_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.try_insert_pending_metadata_command_slot(pg_id, command, bucket)
+    }
+
+    fn try_insert_pending_metadata_command_slot_classified_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandPendingSlotInsertError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
+        self.try_insert_pending_metadata_command_slot_until(pg_id, command, bucket, deadline)
+            .map_err(MetadataCommandPendingSlotInsertError::may_have_applied)
+    }
+
     fn try_insert_pending_metadata_command_slot_with_effect_fence(
         &self,
         pg_id: PgId,
@@ -1958,6 +1982,43 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         bucket: Option<&BucketName>,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<(), StoreError>;
+
+    fn try_insert_pending_metadata_command_slot_with_effect_fence_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.try_insert_pending_metadata_command_slot_with_effect_fence(
+            pg_id,
+            command,
+            bucket,
+            effect_fence,
+        )
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandPendingSlotInsertError> {
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
+        self.try_insert_pending_metadata_command_slot_with_effect_fence_until(
+            pg_id,
+            command,
+            bucket,
+            effect_fence,
+            deadline,
+        )
+        .map_err(MetadataCommandPendingSlotInsertError::may_have_applied)
+    }
 
     fn try_insert_bucket_control_pending_metadata_command_slot(
         &self,
@@ -1973,6 +2034,34 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         bucket: &BucketName,
         effect_fence: AdmittedRouteEffectFence,
     ) -> Result<bool, StoreError>;
+
+    fn try_insert_bucket_control_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.try_insert_bucket_control_pending_metadata_command_slot(pg_id, command, bucket)
+    }
+
+    fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_fence: AdmittedRouteEffectFence,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence(
+            pg_id,
+            command,
+            bucket,
+            effect_fence,
+        )
+    }
 
     fn remove_pending_metadata_command_slot(
         &self,
@@ -2157,6 +2246,47 @@ pub(crate) enum MetadataCommandApplyErrorKind {
     NotSent,
     Definitive,
     MayHaveApplied,
+}
+
+#[derive(Debug)]
+pub(crate) struct MetadataCommandPendingSlotInsertError {
+    kind: MetadataCommandApplyErrorKind,
+    source: StoreError,
+}
+
+impl MetadataCommandPendingSlotInsertError {
+    pub(crate) fn not_sent(source: StoreError) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::NotSent,
+            source,
+        }
+    }
+
+    pub(crate) fn definitive(source: StoreError) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::Definitive,
+            source,
+        }
+    }
+
+    pub(crate) fn may_have_applied(source: StoreError) -> Self {
+        Self {
+            kind: MetadataCommandApplyErrorKind::MayHaveApplied,
+            source,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> MetadataCommandApplyErrorKind {
+        self.kind
+    }
+
+    pub(crate) fn source(&self) -> &StoreError {
+        &self.source
+    }
+
+    pub(crate) fn into_source(self) -> StoreError {
+        self.source
+    }
 }
 
 #[derive(Debug)]

@@ -230,7 +230,8 @@ use crate::storage_rpc::{
     StorageRpcObjectPayloadReclaimCommandBuildRequest, StorageRpcObjectPayloadReclaimExistsRequest,
     StorageRpcObjectReadAuthSubjectOutcome, StorageRpcObjectReadAuthSubjectRequest,
     StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
-    StorageRpcObjectRequest, StorageRpcPlacedSegmentBackfillReferencePageRequest,
+    StorageRpcObjectRequest, StorageRpcOperationDeadline,
+    StorageRpcPlacedSegmentBackfillReferencePageRequest,
     StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
     StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
     StorageRpcPlacedSegmentShardBackfillClaimRecordRequest,
@@ -1403,6 +1404,17 @@ impl StorageRpcRequestDispatchFailure {
             Self::NotSent(source) => MetadataCommandPendingSlotReplaceError::not_sent(source),
             Self::MayHaveApplied(source) => {
                 MetadataCommandPendingSlotReplaceError::may_have_applied(source)
+            }
+        }
+    }
+
+    fn into_metadata_command_pending_slot_insert_error(
+        self,
+    ) -> MetadataCommandPendingSlotInsertError {
+        match self {
+            Self::NotSent(source) => MetadataCommandPendingSlotInsertError::not_sent(source),
+            Self::MayHaveApplied(source) => {
+                MetadataCommandPendingSlotInsertError::may_have_applied(source)
             }
         }
     }

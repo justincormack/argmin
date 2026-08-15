@@ -3244,6 +3244,50 @@ impl UnixStorageNodeClient {
         bucket: Option<&BucketName>,
         effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
     ) -> Result<(), StoreError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline_until(
+            pg_id,
+            command,
+            bucket,
+            effect_deadline,
+            None,
+        )
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_deadline_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+        deadline: Option<Instant>,
+    ) -> Result<(), StoreError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline_classified_until(
+            pg_id,
+            command,
+            bucket,
+            effect_deadline,
+            deadline,
+        )
+        .map_err(MetadataCommandPendingSlotInsertError::into_source)
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_deadline_classified_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+        deadline: Option<Instant>,
+    ) -> Result<(), MetadataCommandPendingSlotInsertError> {
+        let operation_deadline = deadline.map(StorageRpcOperationDeadline::from_instant);
+        let effect_deadline = operation_deadline.map_or(effect_deadline, |operation_deadline| {
+            Some(
+                StorageRpcAdmittedRouteEffectDeadline::intersect_existing_operation_deadline(
+                    effect_deadline,
+                    operation_deadline.portable_wall_valid_until_ms,
+                ),
+            )
+        });
         let request = StorageRpcMetadataCommandPendingSlotRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -3251,24 +3295,46 @@ impl UnixStorageNodeClient {
             command: command.clone(),
             scope_bucket: bucket.cloned(),
             effect_deadline,
+            operation_deadline,
         };
-        let payload = encode_metadata_command_pending_slot_request(&request).map_err(|error| {
-            self.rpc_payload_error(
-                "encode metadata command pending slot request",
-                error.to_string(),
-            )
-        })?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandPendingSlotInsert,
-            payload,
-        )?;
-        let response =
-            decode_metadata_command_pending_slot_insert_response(&response).map_err(|error| {
+        let payload = encode_metadata_command_pending_slot_request(&request)
+            .map_err(|error| {
+                self.rpc_payload_error(
+                    "encode metadata command pending slot request",
+                    error.to_string(),
+                )
+            })
+            .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
+        let kind = StorageRpcMessageKind::MetadataCommandPendingSlotInsert;
+        let response = match deadline {
+            Some(deadline) => self.rpc_request_result_until(kind, payload, deadline),
+            None => self
+                .rpc_request_result(kind, payload)
+                .map_err(StorageRpcRequestDispatchFailure::MayHaveApplied),
+        };
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                let uncertain = error.code == StorageRpcErrorCode::MetadataCommandMutationUncertain;
+                let source = self.rpc_response_error(kind, error);
+                return Err(if uncertain {
+                    MetadataCommandPendingSlotInsertError::may_have_applied(source)
+                } else {
+                    MetadataCommandPendingSlotInsertError::definitive(source)
+                });
+            }
+            Err(error) => {
+                return Err(error.into_metadata_command_pending_slot_insert_error());
+            }
+        };
+        let response = decode_metadata_command_pending_slot_insert_response(&response)
+            .map_err(|error| {
                 self.rpc_payload_error(
                     "decode metadata command pending slot insert response",
                     error.to_string(),
                 )
-            })?;
+            })
+            .map_err(MetadataCommandPendingSlotInsertError::may_have_applied)?;
         match response.outcome {
             StorageRpcMetadataCommandPendingSlotInsertOutcome::Inserted => Ok(()),
             StorageRpcMetadataCommandPendingSlotInsertOutcome::PendingConflict {
@@ -3276,12 +3342,14 @@ impl UnixStorageNodeClient {
                 cluster_epoch,
                 existing_log_index,
                 candidate_log_index,
-            } => Err(StoreError::MetadataCommandPendingConflict {
-                pg_id,
-                cluster_epoch,
-                existing_log_index,
-                candidate_log_index,
-            }),
+            } => Err(MetadataCommandPendingSlotInsertError::definitive(
+                StoreError::MetadataCommandPendingConflict {
+                    pg_id,
+                    cluster_epoch,
+                    existing_log_index,
+                    candidate_log_index,
+                },
+            )),
             StorageRpcMetadataCommandPendingSlotInsertOutcome::LogConflict {
                 node_id,
                 pg_id: conflict_pg_id,
@@ -3289,23 +3357,29 @@ impl UnixStorageNodeClient {
                 log_index,
             } => {
                 if cluster_epoch != self.cluster_epoch || conflict_pg_id != pg_id.get() {
-                    return Err(self.rpc_payload_error(
-                        "decode metadata command pending slot insert response",
-                        "metadata command log conflict route mismatch".to_string(),
+                    return Err(MetadataCommandPendingSlotInsertError::may_have_applied(
+                        self.rpc_payload_error(
+                            "decode metadata command pending slot insert response",
+                            "metadata command log conflict route mismatch".to_string(),
+                        ),
                     ));
                 }
                 if MetadataCommandLogIndex::new(log_index).is_none() {
-                    return Err(self.rpc_payload_error(
-                        "decode metadata command pending slot insert response",
-                        "metadata command log conflict index must not be zero".to_string(),
+                    return Err(MetadataCommandPendingSlotInsertError::may_have_applied(
+                        self.rpc_payload_error(
+                            "decode metadata command pending slot insert response",
+                            "metadata command log conflict index must not be zero".to_string(),
+                        ),
                     ));
                 }
-                Err(StoreError::MetadataCommandLogConflict {
-                    node_id,
-                    pg_id: conflict_pg_id,
-                    cluster_epoch,
-                    log_index,
-                })
+                Err(MetadataCommandPendingSlotInsertError::definitive(
+                    StoreError::MetadataCommandLogConflict {
+                        node_id,
+                        pg_id: conflict_pg_id,
+                        cluster_epoch,
+                        log_index,
+                    },
+                ))
             }
         }
     }
@@ -3328,6 +3402,32 @@ impl UnixStorageNodeClient {
         bucket: &BucketName,
         effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
     ) -> Result<bool, StoreError> {
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_deadline_until(
+            pg_id,
+            command,
+            bucket,
+            effect_deadline,
+            None,
+        )
+    }
+
+    fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_deadline_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_deadline: Option<StorageRpcAdmittedRouteEffectDeadline>,
+        deadline: Option<Instant>,
+    ) -> Result<bool, StoreError> {
+        let operation_deadline = deadline.map(StorageRpcOperationDeadline::from_instant);
+        let effect_deadline = operation_deadline.map_or(effect_deadline, |operation_deadline| {
+            Some(
+                StorageRpcAdmittedRouteEffectDeadline::intersect_existing_operation_deadline(
+                    effect_deadline,
+                    operation_deadline.portable_wall_valid_until_ms,
+                ),
+            )
+        });
         let request = StorageRpcMetadataCommandPendingSlotRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
@@ -3335,6 +3435,7 @@ impl UnixStorageNodeClient {
             command: command.clone(),
             scope_bucket: Some(bucket.clone()),
             effect_deadline,
+            operation_deadline,
         };
         let payload = encode_metadata_command_pending_slot_request(&request).map_err(|error| {
             self.rpc_payload_error(
@@ -3342,10 +3443,17 @@ impl UnixStorageNodeClient {
                 error.to_string(),
             )
         })?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert,
-            payload,
-        )?;
+        let response = match deadline {
+            Some(deadline) => self.rpc_request_until(
+                StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert,
+                payload,
+                deadline,
+            )?,
+            None => self.rpc_request(
+                StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert,
+                payload,
+            )?,
+        };
         let response =
             decode_metadata_command_bool_outcome_response(&response).map_err(|error| {
                 self.rpc_payload_error(
@@ -4333,6 +4441,38 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         )
     }
 
+    fn try_insert_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline_until(
+            pg_id,
+            command,
+            bucket,
+            None,
+            Some(deadline),
+        )
+    }
+
+    fn try_insert_pending_metadata_command_slot_classified_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandPendingSlotInsertError> {
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline_classified_until(
+            pg_id,
+            command,
+            bucket,
+            None,
+            Some(deadline),
+        )
+    }
+
     fn try_insert_pending_metadata_command_slot_with_effect_fence(
         &self,
         pg_id: PgId,
@@ -4351,6 +4491,54 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
                     authority_valid_until_ms: deadline.authority_valid_until_ms(),
                     portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
                 }),
+        )
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_fence_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+        deadline: Instant,
+    ) -> Result<(), StoreError> {
+        effect_fence.require_valid_for(command.id().cluster_epoch())?;
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline_until(
+            pg_id,
+            command,
+            bucket,
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }),
+            Some(deadline),
+        )
+    }
+
+    fn try_insert_pending_metadata_command_slot_with_effect_fence_classified_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: Option<&BucketName>,
+        effect_fence: AdmittedRouteEffectFence,
+        deadline: Instant,
+    ) -> Result<(), MetadataCommandPendingSlotInsertError> {
+        effect_fence
+            .require_valid_for(command.id().cluster_epoch())
+            .map_err(MetadataCommandPendingSlotInsertError::not_sent)?;
+        self.try_insert_pending_metadata_command_slot_with_effect_deadline_classified_until(
+            pg_id,
+            command,
+            bucket,
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }),
+            Some(deadline),
         )
     }
 
@@ -4383,6 +4571,45 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
                     authority_valid_until_ms: deadline.authority_valid_until_ms(),
                     portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
                 }),
+        )
+    }
+
+    fn try_insert_bucket_control_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_deadline_until(
+            pg_id,
+            command,
+            bucket,
+            None,
+            Some(deadline),
+        )
+    }
+
+    fn try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        bucket: &BucketName,
+        effect_fence: AdmittedRouteEffectFence,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        effect_fence.require_valid_for(command.id().cluster_epoch())?;
+        self.try_insert_bucket_control_pending_metadata_command_slot_with_effect_deadline_until(
+            pg_id,
+            command,
+            bucket,
+            effect_fence
+                .deadline()
+                .map(|deadline| StorageRpcAdmittedRouteEffectDeadline {
+                    authority_valid_until_ms: deadline.authority_valid_until_ms(),
+                    portable_wall_valid_until_ms: deadline.portable_wall_valid_until_ms(),
+                }),
+            Some(deadline),
         )
     }
 

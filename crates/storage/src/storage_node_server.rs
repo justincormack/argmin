@@ -305,7 +305,8 @@ use crate::storage_rpc::{
     StorageRpcObjectReadAuthSubjectRequest, StorageRpcObjectReadAuthSubjectResponse,
     StorageRpcObjectReadSnapshotOutcome, StorageRpcObjectReadSnapshotRequest,
     StorageRpcObjectReadSnapshotResponse, StorageRpcObjectRequest, StorageRpcObjectVersionResponse,
-    StorageRpcPayloadReclaimRootResponse, StorageRpcPlacedSegmentBackfillReferencePageRequest,
+    StorageRpcOperationDeadline, StorageRpcPayloadReclaimRootResponse,
+    StorageRpcPlacedSegmentBackfillReferencePageRequest,
     StorageRpcPlacedSegmentShardBackfillClaimAcquireRequest,
     StorageRpcPlacedSegmentShardBackfillClaimErrorRequest,
     StorageRpcPlacedSegmentShardBackfillClaimOptionalRecordResponse,
@@ -624,6 +625,32 @@ impl StorageNodeConnectionHandler {
                 pg_id,
                 session.current_rpc_context(),
             )?))
+        }
+    }
+
+    fn metadata_command_pg_guard_until(
+        &self,
+        session: &StorageNodeSession,
+        pg_id: PgId,
+        deadline: Option<Instant>,
+    ) -> Result<Option<StorageNodeMetadataCommandGuard>, StorageRpcErrorResponse> {
+        if session.holds_metadata_command_pg_lock(pg_id) {
+            Ok(None)
+        } else {
+            let guard = match deadline {
+                Some(deadline) => self.metadata_command_locks.acquire_until(
+                    self.config.node_id,
+                    pg_id,
+                    session.current_rpc_context(),
+                    deadline,
+                ),
+                None => self.metadata_command_locks.acquire(
+                    self.config.node_id,
+                    pg_id,
+                    session.current_rpc_context(),
+                ),
+            }?;
+            Ok(Some(guard))
         }
     }
 
@@ -8715,21 +8742,36 @@ impl StorageNodeConnectionHandler {
             }
         }
         let canonical_scope_bucket = request.command.bucket_name().clone();
-        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
+        let wire_operation_deadline = request.operation_deadline;
+        let operation_deadline =
+            wire_operation_deadline.map(StorageRpcOperationDeadline::local_deadline);
+        let _pg_guard = match self.metadata_command_pg_guard_until(
+            session,
+            request.pg_id,
+            operation_deadline,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         metadata_mutation_route_guard_or_return!(self);
-        if let Err(error) =
-            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline)
-                .require_valid_for(request.command.id().cluster_epoch())
-        {
-            return encode_storage_rpc_error_response(&store_error_response(error));
-        }
-        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
-            pg.try_insert_pending_metadata_command_slot(
-                self.config.node_id.as_u32(),
-                &request.command,
-                Some(&canonical_scope_bucket),
-            )
-        }) {
+        let effect_fence =
+            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline);
+        let pg = match operation_deadline {
+            Some(deadline) => self.node.get_pg_until(request.pg_id.get(), deadline),
+            None => self.node.get_pg(request.pg_id.get()),
+        };
+        let response = match pg
+            .map_err(crate::pg_store::PendingMetadataCommandSlotInsertError::definitive)
+            .and_then(|pg| {
+                effect_fence
+                    .require_valid_for(request.command.id().cluster_epoch())
+                    .map_err(crate::pg_store::PendingMetadataCommandSlotInsertError::definitive)?;
+                pg.try_insert_pending_metadata_command_slot_classified(
+                    self.config.node_id.as_u32(),
+                    &request.command,
+                    Some(&canonical_scope_bucket),
+                )
+            }) {
             Ok(()) => {
                 let payload = encode_metadata_command_pending_slot_insert_response(
                     &StorageRpcMetadataCommandPendingSlotInsertResponse {
@@ -8738,12 +8780,14 @@ impl StorageNodeConnectionHandler {
                 );
                 encode_storage_rpc_success_response(&payload)
             }
-            Err(StoreError::MetadataCommandPendingConflict {
-                pg_id,
-                cluster_epoch,
-                existing_log_index,
-                candidate_log_index,
-            }) => {
+            Err(crate::pg_store::PendingMetadataCommandSlotInsertError::Definitive(
+                StoreError::MetadataCommandPendingConflict {
+                    pg_id,
+                    cluster_epoch,
+                    existing_log_index,
+                    candidate_log_index,
+                },
+            )) => {
                 emit_storage_node_metadata_command_pending_conflict(
                     self.config.node_id.as_u32(),
                     pg_id,
@@ -8764,12 +8808,14 @@ impl StorageNodeConnectionHandler {
                 );
                 encode_storage_rpc_success_response(&payload)
             }
-            Err(StoreError::MetadataCommandLogConflict {
-                node_id,
-                pg_id,
-                cluster_epoch,
-                log_index,
-            }) => {
+            Err(crate::pg_store::PendingMetadataCommandSlotInsertError::Definitive(
+                StoreError::MetadataCommandLogConflict {
+                    node_id,
+                    pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )) => {
                 emit_storage_node_metadata_command_log_conflict(
                     node_id,
                     pg_id,
@@ -8789,7 +8835,15 @@ impl StorageNodeConnectionHandler {
                 );
                 encode_storage_rpc_success_response(&payload)
             }
-            Err(error) => encode_storage_rpc_error_response(&store_error_response(error))?,
+            Err(crate::pg_store::PendingMetadataCommandSlotInsertError::Definitive(error)) => {
+                encode_storage_rpc_error_response(&store_error_response(error))?
+            }
+            Err(crate::pg_store::PendingMetadataCommandSlotInsertError::MayHaveApplied(error)) => {
+                encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::MetadataCommandMutationUncertain,
+                    message: error.to_string(),
+                })?
+            }
         };
         Ok(response)
     }
@@ -8820,15 +8874,26 @@ impl StorageNodeConnectionHandler {
             });
         }
         let canonical_scope_bucket = request.command.bucket_name().clone();
-        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
+        let wire_operation_deadline = request.operation_deadline;
+        let operation_deadline =
+            wire_operation_deadline.map(StorageRpcOperationDeadline::local_deadline);
+        let _pg_guard = match self.metadata_command_pg_guard_until(
+            session,
+            request.pg_id,
+            operation_deadline,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         metadata_mutation_route_guard_or_return!(self);
-        if let Err(error) =
-            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline)
-                .require_valid_for(request.command.id().cluster_epoch())
-        {
-            return encode_storage_rpc_error_response(&store_error_response(error));
-        }
-        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+        let effect_fence =
+            admitted_route_effect_fence(request.cluster_epoch, request.effect_deadline);
+        let pg = match operation_deadline {
+            Some(deadline) => self.node.get_pg_until(request.pg_id.get(), deadline),
+            None => self.node.get_pg(request.pg_id.get()),
+        };
+        let response = match pg.and_then(|pg| {
+            effect_fence.require_valid_for(request.command.id().cluster_epoch())?;
             let inserted = pg.try_insert_bucket_control_pending_metadata_command_slot(
                 self.config.node_id.as_u32(),
                 &request.command,

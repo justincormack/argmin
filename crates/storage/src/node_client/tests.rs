@@ -16,9 +16,9 @@ use crate::metadata_command::{
 };
 use crate::storage_node_server::{StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer};
 use crate::storage_rpc::{
-    encode_metadata_command_acceptance_response, encode_metadata_command_applied_hashes_response,
-    encode_metadata_command_bool_outcome_response, encode_metadata_command_next_id_response,
-    encode_metadata_command_pending_slot_insert_response,
+    decode_metadata_command_pending_slot_request, encode_metadata_command_acceptance_response,
+    encode_metadata_command_applied_hashes_response, encode_metadata_command_bool_outcome_response,
+    encode_metadata_command_next_id_response, encode_metadata_command_pending_slot_insert_response,
     encode_metadata_command_state_outcome_response,
     encode_placed_segment_shard_backfill_claim_optional_record_response,
     encode_placed_segment_shard_repair_claim_optional_record_response,

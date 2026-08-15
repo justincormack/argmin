@@ -3,6 +3,8 @@
 
 use super::*;
 use crate::node_runtime::clients::unix_sessions::UnixStorageNodeMetadataCommandSession;
+use crate::storage_node_server::StorageNodeServerError;
+use std::sync::mpsc;
 
 #[test]
 fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
@@ -2053,6 +2055,430 @@ fn unix_storage_node_client_preserves_pending_slot_log_conflict() {
             ..
         }
     ));
+}
+
+#[test]
+fn unix_pending_slot_install_carries_the_operation_deadline_to_storage() {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("sock").join("storage.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let frame = read_storage_rpc_frame_from(&mut stream).unwrap();
+        let request = decode_metadata_command_pending_slot_request(
+            &frame.payload,
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new(),
+        )
+        .unwrap();
+        request_tx.send(request).unwrap();
+        let payload = encode_metadata_command_pending_slot_insert_response(
+            &StorageRpcMetadataCommandPendingSlotInsertResponse {
+                outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::Inserted,
+            },
+        );
+        let response = StorageRpcFrame {
+            request_id: frame.request_id,
+            kind: frame.kind,
+            payload: encode_storage_rpc_success_response(&payload),
+        };
+        write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+    });
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+    let command = test_metadata_command(0, 1);
+    let bucket = command.bucket_name().clone();
+    let wall_before = crate::clock::current_time_millis();
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence_until(
+        &client,
+        PgId::new(0),
+        &command,
+        Some(&bucket),
+        AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+        deadline,
+    )
+    .unwrap();
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let effect_deadline = request
+        .effect_deadline
+        .expect("operation deadline must cross the RPC durable-effect boundary");
+    let operation_deadline = request
+        .operation_deadline
+        .expect("operation deadline must be encoded explicitly");
+    assert_eq!(
+        operation_deadline.portable_wall_valid_until_ms,
+        effect_deadline.portable_wall_valid_until_ms
+    );
+    assert_eq!(effect_deadline.authority_valid_until_ms, u64::MAX);
+    assert!(effect_deadline.portable_wall_valid_until_ms >= wall_before);
+    assert!(effect_deadline.portable_wall_valid_until_ms <= wall_before + 2_000);
+    join.join().unwrap();
+}
+
+#[test]
+fn unix_pending_slot_install_preserves_dispatch_certainty() {
+    let tmp = test_util::tempdir();
+    let missing_socket = tmp.path().join("missing").join("storage.sock");
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        missing_socket,
+    );
+    let command = test_metadata_command(0, 1);
+    let bucket = command.bucket_name().clone();
+    let not_sent =
+        MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_classified_until(
+            &client,
+            PgId::new(0),
+            &command,
+            Some(&bucket),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+    assert_eq!(not_sent.kind(), MetadataCommandApplyErrorKind::NotSent);
+
+    let response_lost_socket = tmp.path().join("lost").join("storage.sock");
+    private_socket_dir(response_lost_socket.parent().unwrap());
+    let listener = UnixListener::bind(&response_lost_socket).unwrap();
+    let lost_join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_storage_rpc_frame_from(&mut stream).unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        response_lost_socket,
+    );
+    let may_have_applied =
+        MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_classified_until(
+            &client,
+            PgId::new(0),
+            &command,
+            Some(&bucket),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+    assert_eq!(
+        may_have_applied.kind(),
+        MetadataCommandApplyErrorKind::MayHaveApplied
+    );
+    lost_join.join().unwrap();
+
+    let conflict_socket = tmp.path().join("conflict").join("storage.sock");
+    private_socket_dir(conflict_socket.parent().unwrap());
+    let listener = UnixListener::bind(&conflict_socket).unwrap();
+    let conflict_join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_storage_rpc_frame_from(&mut stream).unwrap();
+        let payload = encode_metadata_command_pending_slot_insert_response(
+            &StorageRpcMetadataCommandPendingSlotInsertResponse {
+                outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::PendingConflict {
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    existing_log_index: 2,
+                    candidate_log_index: 1,
+                },
+            },
+        );
+        write_storage_rpc_frame_to(
+            &mut stream,
+            &StorageRpcFrame {
+                request_id: request.request_id,
+                kind: request.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            },
+        )
+        .unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        NodeId::new(7),
+        ClusterEpoch::new(1).unwrap(),
+        conflict_socket,
+    );
+    let definitive =
+        MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_classified_until(
+            &client,
+            PgId::new(0),
+            &command,
+            Some(&bucket),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap_err();
+    assert_eq!(definitive.kind(), MetadataCommandApplyErrorKind::Definitive);
+    conflict_join.join().unwrap();
+}
+
+#[test]
+fn unix_metadata_session_pending_slot_uses_portable_operation_deadline() {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("sock").join("storage.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let (request_tx, request_rx) = mpsc::channel();
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let acquire = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            acquire.kind,
+            StorageRpcMessageKind::MetadataCommandPgLockAcquire
+        );
+        write_storage_rpc_frame_to(
+            &mut stream,
+            &StorageRpcFrame {
+                request_id: acquire.request_id,
+                kind: acquire.kind,
+                payload: encode_storage_rpc_success_response(&[]),
+            },
+        )
+        .unwrap();
+
+        let frame = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            frame.kind,
+            StorageRpcMessageKind::MetadataCommandPendingSlotInsert
+        );
+        let request = decode_metadata_command_pending_slot_request(
+            &frame.payload,
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new(),
+        )
+        .unwrap();
+        request_tx.send(request).unwrap();
+        let payload = encode_metadata_command_pending_slot_insert_response(
+            &StorageRpcMetadataCommandPendingSlotInsertResponse {
+                outcome: StorageRpcMetadataCommandPendingSlotInsertOutcome::Inserted,
+            },
+        );
+        write_storage_rpc_frame_to(
+            &mut stream,
+            &StorageRpcFrame {
+                request_id: frame.request_id,
+                kind: frame.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            },
+        )
+        .unwrap();
+
+        let frame = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            frame.kind,
+            StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
+        );
+        let request = decode_metadata_command_pending_slot_request(
+            &frame.payload,
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new(),
+        )
+        .unwrap();
+        request_tx.send(request).unwrap();
+        let payload = encode_metadata_command_bool_outcome_response(
+            &StorageRpcMetadataCommandBoolOutcomeResponse {
+                outcome: StorageRpcMetadataCommandBoolOutcome::Value(true),
+            },
+        );
+        write_storage_rpc_frame_to(
+            &mut stream,
+            &StorageRpcFrame {
+                request_id: frame.request_id,
+                kind: frame.kind,
+                payload: encode_storage_rpc_success_response(&payload),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            read_storage_rpc_frame_from(&mut stream),
+            Err(StorageRpcStreamError::Io(_))
+        ));
+    });
+
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+    let session = client
+        .open_metadata_command_critical_section(PgId::new(0))
+        .unwrap();
+    let command = test_metadata_command(0, 1);
+    let bucket = command.bucket_name().clone();
+    let wall_before = crate::clock::current_time_millis();
+    MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence_until(
+        &session,
+        PgId::new(0),
+        &command,
+        Some(&bucket),
+        AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(
+        MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
+            &session,
+            PgId::new(0),
+            &command,
+            &bucket,
+            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap()
+    );
+    drop(session);
+
+    for operation in ["ordinary", "bucket-control"] {
+        let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let operation_deadline = request.operation_deadline.unwrap_or_else(|| {
+            panic!("persistent metadata {operation} sessions must transmit the operation deadline")
+        });
+        assert!(operation_deadline.portable_wall_valid_until_ms >= wall_before);
+        assert!(operation_deadline.portable_wall_valid_until_ms <= wall_before + 2_000);
+    }
+    join.join().unwrap();
+}
+
+#[test]
+fn unix_pending_slot_install_cannot_commit_after_its_operation_deadline() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let storage_node = server.test_storage_node();
+    let pg_guard = storage_node.get_pg(0).unwrap();
+    let (server_done_tx, server_done_rx) = std::sync::mpsc::channel();
+    let server_thread = thread::spawn(move || {
+        server_done_tx.send(server.accept_one()).unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let command = test_metadata_command(0, 1);
+    let bucket = command.bucket_name().clone();
+
+    let error = MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence_until(
+        &client,
+        PgId::new(0),
+        &command,
+        Some(&bucket),
+        AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+        Instant::now() + Duration::from_millis(100),
+    )
+    .expect_err("client operation must expire while the storage PG is held");
+    assert!(
+        matches!(
+            &error,
+            StoreError::OperationDeadlineExceeded { .. }
+                | StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::TransportTimeout
+                        | StorageRpcErrorCode::MetadataCommandContention,
+                    ..
+                }
+        ),
+        "unexpected pending-slot deadline error: {error:?}"
+    );
+
+    server_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("storage worker must stop waiting for the held PG at the operation deadline")
+        .unwrap();
+
+    drop(pg_guard);
+    server_thread.join().unwrap();
+    let pg = storage_node.get_pg(0).unwrap();
+    assert!(pg
+        .pending_metadata_command_envelope(config.node_id.as_u32(), config.cluster_epoch)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
+fn unix_bucket_control_pending_slot_uses_portable_operation_deadline() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let server_thread = thread::spawn(move || server.accept_one());
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let command = test_metadata_command(0, 1);
+    let bucket = command.bucket_name().clone();
+
+    assert!(
+        MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
+            &client,
+            PgId::new(0),
+            &command,
+            &bucket,
+            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+            Instant::now() + Duration::from_secs(2),
+        )
+        .unwrap(),
+        "Unix RPC must use the same portable deadline policy as TCP RPC"
+    );
+    server_thread.join().unwrap().unwrap();
+}
+
+#[test]
+fn unix_bucket_control_pending_slot_cannot_commit_after_its_operation_deadline() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = StorageNodeServer::bind(config.clone()).unwrap();
+    let storage_node = server.test_storage_node();
+    let pg_guard = storage_node.get_pg(0).unwrap();
+    let (server_done_tx, server_done_rx) = std::sync::mpsc::channel();
+    let server_thread = thread::spawn(move || {
+        server_done_tx.send(server.accept_one()).unwrap();
+    });
+    let client = UnixStorageNodeClient::new(
+        config.node_id,
+        config.cluster_epoch,
+        config.socket_path.clone(),
+    );
+    let command = test_metadata_command(0, 1);
+    let bucket = command.bucket_name().clone();
+
+    let error = MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
+        &client,
+        PgId::new(0),
+        &command,
+        &bucket,
+        AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+        Instant::now() + Duration::from_millis(100),
+    )
+    .expect_err("bucket-control install must expire while the storage PG is held");
+    assert!(
+        matches!(
+            &error,
+            StoreError::OperationDeadlineExceeded { .. }
+                | StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::TransportTimeout
+                        | StorageRpcErrorCode::MetadataCommandContention,
+                    ..
+                }
+        ),
+        "unexpected bucket-control deadline error: {error:?}"
+    );
+
+    let server_result = server_done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("storage worker must stop waiting at the bucket-control operation deadline");
+    assert!(
+        server_result.is_ok()
+            || matches!(server_result, Err(StorageNodeServerError::RpcStream { .. })),
+        "unexpected storage worker result after client deadline: {server_result:?}"
+    );
+    drop(pg_guard);
+    server_thread.join().unwrap();
+    assert!(storage_node
+        .get_pg(0)
+        .unwrap()
+        .pending_metadata_command_envelope(config.node_id.as_u32(), config.cluster_epoch)
+        .unwrap()
+        .is_none());
 }
 
 fn metadata_command_session_result_from_fake_response<R>(
