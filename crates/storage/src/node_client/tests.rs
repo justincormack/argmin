@@ -3708,7 +3708,7 @@ fn local_metadata_command_hash_inspection_bounds_pg_lock_wait_by_deadline() {
 }
 
 #[test]
-fn local_partial_conflict_state_and_reservation_checks_bound_pg_lock_wait() {
+fn local_partial_conflict_state_abandonment_and_reservation_checks_bound_pg_lock_wait() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(
         crate::node::SharedStorageNode::open_with_default_ec_shape(
@@ -3729,9 +3729,10 @@ fn local_partial_conflict_state_and_reservation_checks_bound_pg_lock_wait() {
         )
         .unwrap();
     let proof = test_bucket_write_reservation_proof(bucket, &key);
+    let command = test_metadata_command(0, 1);
     let pg_guard = storage_node.get_pg(0).unwrap();
 
-    for operation in ["replica-state", "reservation"] {
+    for operation in ["replica-state", "abandoned", "reservation"] {
         let started = Instant::now();
         let deadline = started + Duration::from_millis(20);
         let error = match operation {
@@ -3744,6 +3745,14 @@ fn local_partial_conflict_state_and_reservation_checks_bound_pg_lock_wait() {
                 .map(|_| ())
                 .map_err(BucketSnapshotLoadError::Store)
             }
+            "abandoned" => MetadataCommandInspectionNodeClient::metadata_command_abandoned_until(
+                &client,
+                PgId::new(0),
+                &command,
+                deadline,
+            )
+            .map(|_| ())
+            .map_err(BucketSnapshotLoadError::Store),
             "reservation" => route.validate_bucket_write_reservation_proof_until(&proof, deadline),
             _ => unreachable!(),
         }

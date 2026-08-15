@@ -6137,6 +6137,7 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         )
     }
 
+    #[cfg(test)]
     fn metadata_command_abandoned(
         &self,
         pg_id: PgId,
@@ -6144,6 +6145,18 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
     ) -> Result<bool, StoreError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.metadata_command_abandoned(self.node_id.as_u32(), command)
+    }
+
+    fn metadata_command_abandoned_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let abandoned = pg.metadata_command_abandoned(self.node_id.as_u32(), command)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(abandoned)
     }
 }
 

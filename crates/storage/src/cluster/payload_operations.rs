@@ -1759,14 +1759,18 @@ impl StorageCluster {
             let abandoned_on_acting_set = if apply_progress.is_abortable() {
                 match route_mode {
                     MetadataCommandRouteMode::Normal => {
-                        self.metadata_command_has_abandoned_log_on_acting_set(&command)
+                        self.metadata_command_has_abandoned_log_on_acting_set_until(
+                            &command,
+                            work_budget.deadline(),
+                        )
                     }
                     MetadataCommandRouteMode::Recovery => self
-                        .metadata_command_has_abandoned_log_on_acting_set_for_recovery(
+                        .metadata_command_has_abandoned_log_on_acting_set_for_recovery_until(
                             execution_route.recovery_proof(),
                             &command,
                             recovery_authorized_source.as_ref(),
                             recovery_abandoned_source.as_ref(),
+                            work_budget.deadline(),
                         ),
                 }
             } else {
@@ -1875,12 +1879,35 @@ impl StorageCluster {
                     continue;
                 }
                 Err(error)
+                    if error.progress.is_abortable()
+                        && Self::metadata_command_log_conflict_matches(&command, &error.source)
+                        && self
+                            .metadata_command_log_conflict_actor_has_exact_abandonment(
+                                pg_id,
+                                &command,
+                                &error.source,
+                                route_mode,
+                                work_budget.deadline(),
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)? =>
+                {
+                    self.propagate_and_complete_abandoned_object_metadata_command(
+                        pg_id,
+                        &command,
+                        reservation_authority,
+                        execution_route,
+                        work_budget,
+                        recovery_guard,
+                    )?;
+                    return Ok(PendingObjectMetadataCommandCompletion::Abandoned);
+                }
+                Err(error)
                     if Self::metadata_command_log_conflict_matches(&command, &error.source)
                         && (self
-                                .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
-                                    pg_id, &command, route_mode,
-                                )
-                                .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                            .metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
+                                pg_id, &command, route_mode,
+                            )
+                            .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                             || self
                                 .metadata_command_log_conflict_actor_has_exact_entry(
                                     pg_id,
@@ -2078,6 +2105,43 @@ impl StorageCluster {
                 }
             }
         }
+    }
+
+    fn propagate_and_complete_abandoned_object_metadata_command(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        reservation_authority: &StorageCluster,
+        execution_route: MetadataCommandExecutionRoute<'_>,
+        work_budget: &mut RequestWorkBudget,
+        recovery_guard: Option<&MetadataCommandRecoveryGuard>,
+    ) -> Result<(), ObjectPgActionError> {
+        let record_result = match execution_route.mode {
+            MetadataCommandRouteMode::Normal => self
+                .record_abandoned_metadata_command_to_acting_set_until(
+                    command,
+                    work_budget.deadline(),
+                ),
+            MetadataCommandRouteMode::Recovery => self
+                .record_abandoned_metadata_command_to_acting_set_for_recovery_until(
+                    execution_route.recovery_proof(),
+                    command,
+                    execution_route.recovery_authorized_source,
+                    execution_route.recovery_abandoned_source,
+                    work_budget.deadline(),
+                ),
+        };
+        record_result
+            .map_err(|error| bucket_snapshot_error_to_object_pg_action_error(error.source))?;
+        self.complete_abandoned_object_metadata_command(
+            pg_id,
+            command,
+            reservation_authority,
+            execution_route,
+            work_budget,
+            recovery_guard,
+        )?;
+        Ok(())
     }
 
     fn complete_abandoned_object_metadata_command(
@@ -3524,7 +3588,10 @@ impl StorageCluster {
                     }
                 }
                 let has_abandoned_log = match self
-                    .metadata_command_has_abandoned_log_on_acting_set(&command)
+                    .metadata_command_has_abandoned_log_on_acting_set_until(
+                        &command,
+                        work_budget.deadline(),
+                    )
                 {
                     Ok(has_abandoned_log) => has_abandoned_log,
                     Err(error) => {

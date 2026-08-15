@@ -1638,10 +1638,18 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         expected_previous_log_hash: u64,
     ) -> Result<bool, StoreError>;
 
+    #[cfg(test)]
     fn metadata_command_abandoned(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
+    ) -> Result<bool, StoreError>;
+
+    fn metadata_command_abandoned_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
     ) -> Result<bool, StoreError>;
 }
 

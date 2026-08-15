@@ -4219,6 +4219,163 @@ fn suspended_delete_marker_retries_transient_recovery_waiter_observation() {
 }
 
 #[test]
+fn recovery_drain_bounds_initial_abandonment_scan_by_work_deadline() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let map = Arc::new(
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap(),
+    );
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let bucket = crate::BucketName::try_from("abandonment-scan-deadline".to_string()).unwrap();
+    let key = crate::ObjectKey::try_from("subject".to_string()).unwrap();
+    ensure_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(0);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key,
+            crate::SessionId::try_from("7e".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let storage_nodes: Vec<_> = node_ids
+        .into_iter()
+        .map(|node_id| map.node(node_id).unwrap().storage_node())
+        .collect();
+    let pg_guards: Vec<_> = storage_nodes
+        .iter()
+        .map(|node| node.get_pg(pg_id.get()).unwrap())
+        .collect();
+    let started = Instant::now();
+    let mut work_budget = RequestWorkBudget::new(Duration::from_millis(20), None)
+        .for_operation("test_initial_abandonment_scan_deadline")
+        .for_pg(pg_id);
+
+    let error = cluster
+        .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
+            pg_id,
+            &command,
+            &mut work_budget,
+        )
+        .expect_err("the initial abandonment scan must stop at the shared deadline");
+
+    assert!(
+        matches!(
+            error,
+            crate::ObjectPgActionError::Store(StoreError::OperationDeadlineExceeded { .. })
+        ),
+        "unexpected initial abandonment scan error: {error:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "initial abandonment scan ignored the shared deadline"
+    );
+    drop(pg_guards);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket).as_ref(),
+        Some(&command),
+        "an inconclusive abandonment scan must retain the pending command"
+    );
+}
+
+#[test]
+fn recovery_drain_converges_abandonment_recorded_after_initial_inspection() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap();
+    let (bucket, key, object_pg, _) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    ensure_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(object_pg);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            crate::SessionId::try_from("7d".repeat(16)).unwrap(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let tombstone_once = Arc::new(AtomicBool::new(true));
+    let tombstone_once_for_hook = Arc::clone(&tombstone_once);
+    let hook_map = Arc::clone(&map);
+    let command_id = command.id();
+    let _hook = cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(
+        move |applying_command| {
+            if applying_command.id() != command_id
+                || !tombstone_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                return Ok(());
+            }
+            let node_id = NodeId::new(0);
+            let pg = hook_map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            pg.record_metadata_command_abandoned(node_id.as_u32(), applying_command)
+                .unwrap();
+            Ok(())
+        },
+    ));
+
+    let outcome = cluster
+        .drain_pending_metadata_command_with_recovery_gate(pg_id, &command)
+        .expect("an exact abandonment racing the first apply must converge");
+
+    assert_eq!(outcome, PendingMetadataCommandOutcome::Abandoned);
+    assert!(!tombstone_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .metadata_command_abandoned(node_id.as_u32(), &command)
+            .unwrap());
+        assert!(matches!(
+            crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+            Err(crate::MetadataError::ObjectNotFound)
+        ));
+    }
+    assert_clean_metadata_command_stream(&map, &[object_pg]);
+}
+
+#[test]
 fn suspended_delete_marker_retries_transient_contender_drain_admission() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

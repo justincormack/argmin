@@ -1092,6 +1092,46 @@ impl StorageCluster {
         }
     }
 
+    fn metadata_command_log_conflict_actor_has_exact_abandonment(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        source: &BucketSnapshotLoadError,
+        route_mode: MetadataCommandRouteMode,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        let BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+            node_id: conflict_node_id,
+            ..
+        }) = source
+        else {
+            return Ok(false);
+        };
+        if !Self::metadata_command_log_conflict_matches(command, source) {
+            return Ok(false);
+        }
+        let nodes = match route_mode {
+            MetadataCommandRouteMode::Normal => self
+                .local_map
+                .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id),
+            MetadataCommandRouteMode::Recovery => self
+                .local_map
+                .metadata_pg_acting_nodes_for_metadata_command_recovery(
+                    command.id().cluster_epoch(),
+                    pg_id,
+                ),
+        }?;
+        let Some(node) = nodes
+            .into_iter()
+            .find(|node| node.node_id().as_u32() == *conflict_node_id)
+        else {
+            return Ok(false);
+        };
+        node.metadata_command_inspection_client()
+            .metadata_command_abandoned_until(pg_id, command, deadline)
+            .map_err(Into::into)
+    }
+
     fn exact_metadata_command_conflict_is_retryable(
         &self,
         pg_id: PgId,

@@ -1922,37 +1922,42 @@ impl super::StorageCluster {
         Ok(())
     }
 
-    pub(super) fn metadata_command_has_abandoned_log_on_acting_set(
+    pub(super) fn metadata_command_has_abandoned_log_on_acting_set_until(
         &self,
         command: &MetadataCommandEnvelope,
+        deadline: Instant,
     ) -> Result<bool, MetadataCommandApplyFailure> {
-        self.metadata_command_has_abandoned_log_on_acting_set_with_route_mode(
+        self.metadata_command_has_abandoned_log_on_acting_set_with_route_mode_until(
             command,
             MetadataCommandExecutionRoute::normal(),
+            deadline,
         )
     }
 
-    pub(super) fn metadata_command_has_abandoned_log_on_acting_set_for_recovery(
+    pub(super) fn metadata_command_has_abandoned_log_on_acting_set_for_recovery_until(
         &self,
         recovery_proof: MetadataCommandRecoveryProof<'_>,
         command: &MetadataCommandEnvelope,
         authorized_source: Option<&MetadataCommandEnvelope>,
         abandoned_source: Option<&MetadataCommandEnvelope>,
+        deadline: Instant,
     ) -> Result<bool, MetadataCommandApplyFailure> {
-        self.metadata_command_has_abandoned_log_on_acting_set_with_route_mode(
+        self.metadata_command_has_abandoned_log_on_acting_set_with_route_mode_until(
             command,
             MetadataCommandExecutionRoute::recovery(
                 recovery_proof,
                 authorized_source,
                 abandoned_source,
             ),
+            deadline,
         )
     }
 
-    fn metadata_command_has_abandoned_log_on_acting_set_with_route_mode(
+    fn metadata_command_has_abandoned_log_on_acting_set_with_route_mode_until(
         &self,
         command: &MetadataCommandEnvelope,
         execution_route: MetadataCommandExecutionRoute<'_>,
+        deadline: Instant,
     ) -> Result<bool, MetadataCommandApplyFailure> {
         execution_route
             .require_command(command.id().pg_id(), command)
@@ -1999,7 +2004,7 @@ impl super::StorageCluster {
         for (applied_nodes, node) in nodes.into_iter().enumerate() {
             if node
                 .metadata_command_inspection_client()
-                .metadata_command_abandoned(pg_id, command)
+                .metadata_command_abandoned_until(pg_id, command, deadline)
                 .map_err(|source| MetadataCommandApplyFailure {
                     applied_nodes,
                     progress: MetadataCommandApplyProgress::Abortable,
@@ -2427,14 +2432,18 @@ impl super::StorageCluster {
             let abandoned_on_acting_set = if apply_progress.is_abortable() {
                 match route_mode {
                     MetadataCommandRouteMode::Normal => {
-                        self.metadata_command_has_abandoned_log_on_acting_set(&command)
+                        self.metadata_command_has_abandoned_log_on_acting_set_until(
+                            &command,
+                            work_budget.deadline(),
+                        )
                     }
                     MetadataCommandRouteMode::Recovery => self
-                        .metadata_command_has_abandoned_log_on_acting_set_for_recovery(
+                        .metadata_command_has_abandoned_log_on_acting_set_for_recovery_until(
                             execution_route.recovery_proof(),
                             &command,
                             recovery_authorized_source.as_ref(),
                             recovery_abandoned_source.as_ref(),
+                            work_budget.deadline(),
                         ),
                 }
             } else {

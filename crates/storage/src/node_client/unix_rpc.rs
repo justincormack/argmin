@@ -2937,14 +2937,28 @@ impl UnixStorageNodeClient {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn metadata_command_abandoned(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
+        let deadline = Instant::now() + storage_rpc_io_timeout(self.rpc_auth.as_deref());
+        self.metadata_command_abandoned_until(pg_id, command, deadline)
+    }
+
+    fn metadata_command_abandoned_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
         let payload = self.encode_metadata_command_request(pg_id, command)?;
-        let response =
-            self.rpc_request(StorageRpcMessageKind::MetadataCommandAbandoned, payload)?;
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandAbandoned,
+            payload,
+            deadline,
+        )?;
         let response =
             decode_metadata_command_bool_outcome_response(&response).map_err(|error| {
                 self.rpc_payload_error(
@@ -3941,12 +3955,22 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         )
     }
 
+    #[cfg(test)]
     fn metadata_command_abandoned(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
         UnixStorageNodeClient::metadata_command_abandoned(self, pg_id, command)
+    }
+
+    fn metadata_command_abandoned_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        UnixStorageNodeClient::metadata_command_abandoned_until(self, pg_id, command, deadline)
     }
 }
 
