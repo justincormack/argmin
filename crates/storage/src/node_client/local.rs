@@ -2811,8 +2811,34 @@ impl DirectPutMetadataRoute for LocalDirectPutMetadataRoute<'_> {
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         self.require_request_subject(&request)?;
         let pg = self.client.storage_node.get_pg(self.pg_id.get())?;
+        self.build_direct_put_commit_command_from_pg(request, &pg)
+    }
+
+    fn build_direct_put_commit_command_until(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.require_request_subject(&request)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        let command = self.build_direct_put_commit_command_from_pg(request, &pg)?;
+        require_metadata_command_operation_deadline(deadline)
+            .map_err(ObjectPgActionError::Store)?;
+        Ok(command)
+    }
+}
+
+impl LocalDirectPutMetadataRoute<'_> {
+    fn build_direct_put_commit_command_from_pg(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+        pg: &crate::node_runtime::pg_store::PgStore,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         let current = load_direct_put_commit_snapshot_from_pg(
-            &pg,
+            pg,
             self.client.node_id,
             &request.request.bucket,
             &request.request.key,
@@ -2844,7 +2870,7 @@ impl DirectPutMetadataRoute for LocalDirectPutMetadataRoute<'_> {
         )?;
         let stale_payload = if request.version_id.is_null() {
             snapshot_direct_put_stale_payload_command(
-                &pg,
+                pg,
                 &request.request.bucket,
                 &request.request.key,
                 last_modified_millis,
@@ -2888,7 +2914,7 @@ impl DirectPutMetadataRoute for LocalDirectPutMetadataRoute<'_> {
         let command_id = self.client.next_metadata_command_id_from_locked_pg(
             self.pg_id.pg_id(),
             self.route_cluster_epoch,
-            &pg,
+            pg,
         )?;
         Ok(MetadataCommandEnvelope::new(
             command_id,
@@ -5961,6 +5987,18 @@ impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
         cluster_epoch: ClusterEpoch,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
         MetadataCommandNodeClient::pending_metadata_command_envelope(self, pg_id, cluster_epoch)
+    }
+
+    fn pending_metadata_command_envelope_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        let pending = pg.pending_metadata_command_envelope(self.node_id.as_u32(), cluster_epoch)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(pending)
     }
 
     fn metadata_command_replica_state(

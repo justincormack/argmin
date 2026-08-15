@@ -3363,7 +3363,7 @@ fn direct_put_publish_validation_fails_closed_when_acknowledged_shard_file_is_mi
     let hook_ran_for_closure = Arc::clone(&hook_ran);
     let _hook_guard = cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
         if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
         hook_map
             .node(missing_location.node_id())
@@ -3371,6 +3371,7 @@ fn direct_put_publish_validation_fails_closed_when_acknowledged_shard_file_is_mi
             .storage_node()
             .delete_shard_file(missing_location.data_pg_id().get(), &hook_missing_shard)
             .unwrap();
+        Ok(())
     }));
 
     let commit_req = direct_put_commit_req(
@@ -3491,6 +3492,183 @@ fn direct_put_publish_validation_rejects_truncated_shard_batch() {
 }
 
 #[test]
+fn direct_put_retries_transient_precommand_observation_within_shared_budget() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut local_map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap();
+    let topology = local_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-observation-retry-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut local_map, 1, NodeId::new(1));
+    set_route_primary(&mut local_map, 2, NodeId::new(1));
+    let map = Arc::new(local_map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("67676767676767676767676767676767".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"direct put transient observation retry";
+    let segment_okh = [0xd7; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_closure = Arc::clone(&hook_calls);
+    let _hook = cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
+        if hook_calls_for_closure.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(crate::ObjectPgActionError::Store(
+                StoreError::MetadataCommandContention {
+                    context: "injected direct PUT pre-command observation contention",
+                },
+            ));
+        }
+        Ok(())
+    }));
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let outcome = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            move |_| {
+                action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(outcome.live_size, payload.len() as u64);
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(action_calls.load(Ordering::SeqCst), 2);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[2]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+}
+
+#[test]
+fn direct_put_does_not_evaluate_condition_after_local_snapshot_crosses_deadline() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut local_map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], EcShape { k: 2, m: 1 })
+            .unwrap();
+    let topology = local_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-local-snapshot-deadline-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    set_route_primary(&mut local_map, 1, NodeId::new(1));
+    set_route_primary(&mut local_map, 2, NodeId::new(1));
+    let map = Arc::new(local_map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("68686868686868686868686868686868".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"direct put local snapshot deadline";
+    let segment_okh = [0xd8; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let mut commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    commit_req.versioning = crate::BucketVersioningState::Enabled;
+
+    let _snapshot_hook =
+        cluster.test_install_after_direct_put_snapshot_loaded_hook(Arc::new(|| true));
+    let allocator_calls = Arc::new(AtomicUsize::new(0));
+    let allocator_calls_for_hook = Arc::clone(&allocator_calls);
+    let _allocator_hook =
+        cluster.test_install_before_object_version_command_id_hook(Arc::new(move || {
+            allocator_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let error = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            move |_| {
+                action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::SnapshotReinspectionConflict
+    ));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(allocator_calls.load(Ordering::SeqCst), 0);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(2), &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[2]);
+    assert_bucket_write_reservations_released(&map, &bucket);
+    let object_pg = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(2))
+        .unwrap()
+        .storage_node()
+        .get_pg(2)
+        .unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*object_pg, &bucket, &key),
+        Err(crate::MetadataError::ObjectNotFound)
+    ));
+}
+
+#[test]
 fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
@@ -3589,7 +3767,7 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
     let _hook_guard =
         first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
             if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
-                return;
+                return Ok(());
             }
             let pg_id = PgId::new(2);
             let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_written_shards
@@ -3618,6 +3796,7 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
                 Some(&hook_bucket),
             )
             .unwrap();
+            Ok(())
         }));
 
     let transient_drain_failure = Arc::new(AtomicBool::new(true));
@@ -3739,11 +3918,12 @@ fn direct_put_log_conflict_pending_visibility_error_cleans_new_payload() {
     let hook_ran_for_closure = Arc::clone(&hook_ran);
     let _hook_guard = cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
         if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
-            return;
+            return Ok(());
         }
         let pg_id = PgId::new(2);
         let command = create_bucket_metadata_command(pg_id, 2, hook_wrong_scope_bucket.clone());
         force_insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
+        Ok(())
     }));
 
     let err = cluster
@@ -3842,7 +4022,7 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
         first_cluster.test_install_before_direct_put_command_id_hook(Arc::new(move || {
             let call = hook_calls_for_closure.fetch_add(1, Ordering::SeqCst);
             if call >= STALE_SNAPSHOTS {
-                return;
+                return Ok(());
             }
             if call == 0 {
                 // The conditional mutation owns a ten-second operation budget. Crossing the
@@ -3879,6 +4059,7 @@ fn direct_put_stale_commit_snapshot_reruns_precondition_action() {
             )
             .unwrap();
             pg.refresh_metadata_command_state_digest().unwrap();
+            Ok(())
         }));
 
     let calls_for_action = Arc::clone(&action_calls);
@@ -4033,10 +4214,10 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
                 )
                 .unwrap();
                 pg.refresh_metadata_command_state_digest().unwrap();
-                return;
+                return Ok(());
             }
             if call != 1 {
-                return;
+                return Ok(());
             }
             let shard_batch: Vec<(&ShardKey, WriteAck)> = hook_contender_shards
                 .iter()
@@ -4062,6 +4243,7 @@ fn direct_put_stale_retry_and_pending_drain_share_operation_budget() {
             )
             .unwrap();
             pending_installed_for_closure.store(true, Ordering::SeqCst);
+            Ok(())
         }));
 
     let drain_hook_ran = Arc::new(AtomicBool::new(false));

@@ -3757,6 +3757,46 @@ impl MetadataCommandInspectionNodeClient for UnixStorageNodeClient {
         MetadataCommandNodeClient::pending_metadata_command_envelope(self, pg_id, cluster_epoch)
     }
 
+    fn pending_metadata_command_envelope_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        if cluster_epoch != self.cluster_epoch {
+            return Err(StoreError::StalePayloadOperation {
+                pg_id: pg_id.get(),
+                operation_epoch: cluster_epoch,
+                current_epoch: self.cluster_epoch,
+            });
+        }
+        let payload = self.encode_metadata_command_state_request(pg_id);
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandPendingEnvelope,
+            payload,
+            deadline,
+        )?;
+        let response = decode_metadata_command_pending_envelope_response(
+            &response,
+            &MetadataCommandDecodeAuthority::new(),
+        )
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "decode metadata command pending envelope response",
+                error.to_string(),
+            )
+        })?;
+        if let Some(command) = response.command.as_ref() {
+            if command.id().cluster_epoch() != cluster_epoch || command.id().pg_id() != pg_id {
+                return Err(self.rpc_payload_error(
+                    "decode metadata command pending envelope response",
+                    "metadata command pending envelope route mismatch".to_string(),
+                ));
+            }
+        }
+        Ok(response.command)
+    }
+
     fn metadata_command_replica_state(
         &self,
         pg_id: PgId,

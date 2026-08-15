@@ -3103,12 +3103,37 @@ impl StorageCluster {
                 }
             }};
         }
+        macro_rules! reject_expired_direct_put_snapshot_before_command_ownership {
+            () => {{
+                if Instant::now() >= work_budget.deadline() {
+                    cleanup_direct_put_attempt_before_command_ownership!();
+                    return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+                }
+            }};
+        }
         macro_rules! sleep_direct_put_before_command_ownership_after_contention {
             ($context:literal) => {{
                 if let Err(error) = work_budget.sleep_after_contention($context) {
                     cleanup_direct_put_attempt_before_command_ownership!();
                     return Err(ObjectPgActionError::Store(error));
                 }
+            }};
+        }
+        macro_rules! retry_direct_put_observation_before_command_ownership {
+            ($error:expr, $context:literal) => {{
+                let error = $error;
+                let pending_subject_conflict = matches!(
+                    &error,
+                    ObjectPgActionError::Store(StoreError::MetadataCommandPendingConflict { .. })
+                );
+                if !pending_subject_conflict
+                    && request_ops::object_pg_action_error_is_retryable_command_observation(&error)
+                    && work_budget.sleep_after_contention($context).is_ok()
+                {
+                    continue;
+                }
+                cleanup_direct_put_attempt_before_command_ownership!();
+                return Err(error);
             }};
         }
         macro_rules! retry_direct_put_pending_drain_error {
@@ -3285,22 +3310,32 @@ impl StorageCluster {
                     "direct PUT metadata pending retry budget exhausted"
                 );
                 let Some(command) =
-                    (match self.pending_metadata_command_for_bucket(pg_id, &req.bucket) {
+                    (match self.pending_metadata_command_for_bucket_until(
+                        pg_id,
+                        &req.bucket,
+                        work_budget.deadline(),
+                    ) {
                         Ok(command) => command,
                         Err(error) => {
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(error.into());
+                            retry_direct_put_observation_before_command_ownership!(
+                                ObjectPgActionError::Store(error),
+                                "direct PUT pending command observation retry budget exhausted"
+                            );
                         }
                     })
                 else {
-                    let snapshot = match direct_put_metadata_route.load_direct_put_commit_snapshot(
-                        &req.generation_reservation_id,
-                        req.generation_id,
-                    ) {
+                    let snapshot = match direct_put_metadata_route
+                        .load_direct_put_commit_snapshot_until(
+                            &req.generation_reservation_id,
+                            req.generation_id,
+                            work_budget.deadline(),
+                        ) {
                         Ok(snapshot) => snapshot,
                         Err(error) => {
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(error);
+                            retry_direct_put_observation_before_command_ownership!(
+                                error,
+                                "direct PUT commit snapshot retry budget exhausted"
+                            );
                         }
                     };
                     if snapshot.committed_segments.is_some() {
@@ -3314,8 +3349,15 @@ impl StorageCluster {
                     {
                         return Ok(Ok(outcome));
                     }
+                    #[cfg(test)]
+                    self.maybe_expire_direct_put_budget_after_snapshot_load(&mut work_budget);
+                    reject_expired_direct_put_snapshot_before_command_ownership!();
                     match action(snapshot.auth_snapshot.clone()) {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            #[cfg(test)]
+                            self.maybe_expire_direct_put_budget_after_action(&mut work_budget);
+                            reject_expired_direct_put_snapshot_before_command_ownership!();
+                        }
                         Err(error) => {
                             cleanup_direct_put_attempt_before_command_ownership!();
                             return Ok(Err(error));
@@ -3339,25 +3381,34 @@ impl StorageCluster {
                     } else {
                         VersionId::Null
                     };
-                    self.maybe_run_before_direct_put_command_id_hook();
+                    reject_expired_direct_put_snapshot_before_command_ownership!();
+                    if let Err(error) = self.maybe_run_before_direct_put_command_id_hook() {
+                        retry_direct_put_observation_before_command_ownership!(
+                            error,
+                            "direct PUT pre-command observation retry budget exhausted"
+                        );
+                    }
                     if let Err(error) = require_valid_route() {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(ObjectPgActionError::Store(error));
                     }
+                    reject_expired_direct_put_snapshot_before_command_ownership!();
                     if let Err(error) =
                         self.register_payload_shard_acks(req.data_pg_id, &shard_batch)
                     {
                         cleanup_direct_put_attempt_before_command_ownership!();
                         return Err(error);
                     }
-                    let command = match direct_put_metadata_route.build_direct_put_commit_command(
-                        BuildDirectPutCommitCommandReq {
-                            request: req,
-                            version_id,
-                            expected_snapshot: &snapshot,
-                            bucket_write_reservation: &effective_bucket_write_reservation,
-                        },
-                    ) {
+                    let command = match direct_put_metadata_route
+                        .build_direct_put_commit_command_until(
+                            BuildDirectPutCommitCommandReq {
+                                request: req,
+                                version_id,
+                                expected_snapshot: &snapshot,
+                                bucket_write_reservation: &effective_bucket_write_reservation,
+                            },
+                            work_budget.deadline(),
+                        ) {
                         Ok(command) => command,
                         Err(ObjectPgActionError::StaleDirectPutCommitSnapshot) => {
                             sleep_direct_put_before_command_ownership_after_contention!(
@@ -3369,12 +3420,18 @@ impl StorageCluster {
                             StoreError::MetadataCommandLogConflict { .. },
                         )) => {
                             let pending_visible = match self
-                                .pending_metadata_command_for_bucket(pg_id, &req.bucket)
+                                .pending_metadata_command_for_bucket_until(
+                                    pg_id,
+                                    &req.bucket,
+                                    work_budget.deadline(),
+                                )
                             {
                                 Ok(pending) => pending.is_some(),
                                 Err(error) => {
-                                    cleanup_direct_put_attempt_before_command_ownership!();
-                                    return Err(error.into());
+                                    retry_direct_put_observation_before_command_ownership!(
+                                        ObjectPgActionError::Store(error),
+                                        "direct PUT log conflict observation retry budget exhausted"
+                                    );
                                 }
                             };
                             #[cfg(test)]
@@ -3408,8 +3465,10 @@ impl StorageCluster {
                             continue;
                         }
                         Err(error) => {
-                            cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(error);
+                            retry_direct_put_observation_before_command_ownership!(
+                                error,
+                                "direct PUT command build retry budget exhausted"
+                            );
                         }
                     };
                     break (command, true, true);

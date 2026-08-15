@@ -369,13 +369,15 @@ fn unix_storage_node_client_reads_metadata_command_state_and_acceptance() {
         ClusterEpoch::new(1).unwrap(),
     )
     .unwrap();
-    let pending_read = MetadataCommandInspectionNodeClient::pending_metadata_command_envelope(
-        &client,
-        PgId::new(0),
-        ClusterEpoch::new(1).unwrap(),
-    )
-    .unwrap()
-    .unwrap();
+    let pending_read =
+        MetadataCommandInspectionNodeClient::pending_metadata_command_envelope_until(
+            &client,
+            PgId::new(0),
+            ClusterEpoch::new(1).unwrap(),
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap()
+        .unwrap();
     let peering = MetadataCommandPeeringNodeClient::open_metadata_command_peering_route(
         &client,
         PgId::new(0),

@@ -2,10 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::control_plane_auth::{
+    ControlPlaneAuthPrincipal, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneScopedCredentialStore,
+};
 use crate::node_client::{
     ObjectPayloadLeaseKind, ObjectPayloadLeaseRoute, PlacedShardRoute, RetainedPlacedShardRoute,
     RetainedShardAckRoute, ShardAckRoute,
 };
+use crate::storage_node_server::PreparedStorageNodeServer;
 use crate::storage_rpc::StorageRpcErrorCode;
 use crate::types::{
     AdmittedRouteEffectFence, PlacedSegmentShardRepairClaimAcquire,
@@ -5686,6 +5691,148 @@ fn direct_put_publishes_after_remote_shard_io_and_ack_validation() {
             .validate_written_shard_ack(&written.key, written.ack)
             .unwrap();
     }
+}
+
+#[test]
+fn authenticated_unix_direct_put_does_not_allocate_version_after_action_crosses_deadline() {
+    const TOPOLOGY_DIGEST: &str =
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    let (_unix_client_test_guard, tmp) = unix_client_tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map =
+        LocalClusterMap::open(&tmp.path().join("frontend"), &node_ids, &pg_ids, ec_shape).unwrap();
+    for pg_id in pg_ids {
+        set_route_primary(&mut map, pg_id, NodeId::new(1));
+    }
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "authenticated-direct-put-action-deadline-");
+    let key = key_for_object_pg(topology, &bucket, 2, "object-");
+
+    let credential = ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+        cluster_id: "direct-put-deadline-test".to_owned(),
+        credential_id: "frontend-1".to_owned(),
+        credential_version: 1,
+        principal: ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        },
+        secret: b"direct-put-deadline-secret".to_vec(),
+    })
+    .unwrap();
+    let server_auth = crate::StorageRpcServerAuthConfig::new(
+        credential.cluster_id(),
+        ControlPlaneScopedCredentialStore::new(vec![credential.clone()]).unwrap(),
+        9,
+        TOPOLOGY_DIGEST,
+    )
+    .unwrap();
+    let client_auth =
+        crate::FrontendStorageRpcClientCapability::new(credential, 9, TOPOLOGY_DIGEST).unwrap();
+    let socket_path = tmp.path().join("sockets").join("node-1.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let server_config = StorageNodeProcessConfig {
+        node_id: NodeId::new(1),
+        cluster_epoch: ClusterEpoch::INITIAL,
+        route_map_validity: RouteMapValidity::Forever,
+        data_dir: tmp.path().join("remote-node-1"),
+        default_ec_shape: ec_shape,
+        pg_ids: pg_ids.to_vec(),
+        socket_path: socket_path.clone(),
+        pg_routes: pg_ids
+            .iter()
+            .map(|pg_id| StorageNodePgRoute {
+                pg_id: *pg_id,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                state: PgState::Active,
+                primary_node_id: NodeId::new(1),
+                metadata_transfer_destination_epoch: None,
+                metadata_read_route: None,
+                acting_set: node_ids.to_vec(),
+            })
+            .collect(),
+        pending_metadata_command_recoveries: Vec::new(),
+        historical_pg_routes: Vec::new(),
+    };
+    let server = Arc::new(
+        PreparedStorageNodeServer::new(server_config)
+            .with_rpc_auth(server_auth)
+            .bind()
+            .unwrap(),
+    );
+    let _server_guard = spawn_shared_storage_node_server_pool(server, 4);
+    map.install_unix_storage_node_clients([LocalUnixStorageNodeClientConfig::new(
+        NodeId::new(1),
+        socket_path,
+    )
+    .with_frontend_rpc_auth(client_auth)])
+        .unwrap();
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id =
+        crate::SessionId::try_from("69696969696969696969696969696969".to_string()).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let payload = b"authenticated direct put action deadline";
+    let segment_okh = [0xd9; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            payload,
+        )
+        .unwrap();
+    let mut commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload,
+            segment_okh,
+            written: &written,
+        },
+    );
+    commit_req.versioning = crate::BucketVersioningState::Enabled;
+
+    let _action_hook = cluster.test_install_after_direct_put_action_hook(Arc::new(|| true));
+    let allocator_calls = Arc::new(AtomicUsize::new(0));
+    let allocator_calls_for_hook = Arc::clone(&allocator_calls);
+    let _allocator_hook =
+        cluster.test_install_before_object_version_command_id_hook(Arc::new(move || {
+            allocator_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+    let action_calls = Arc::new(AtomicUsize::new(0));
+    let action_calls_for_closure = Arc::clone(&action_calls);
+    let error = cluster
+        .commit_direct_put_object_from_payload_shards(
+            &commit_req,
+            &written.written_shards,
+            move |_| {
+                action_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::SnapshotReinspectionConflict
+    ));
+    assert_eq!(action_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(allocator_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]

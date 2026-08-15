@@ -3128,20 +3128,49 @@ impl StorageCluster {
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
-    fn maybe_run_before_direct_put_command_id_hook(&self) {
+    fn maybe_run_before_direct_put_command_id_hook(&self) -> Result<(), ObjectPgActionError> {
         let hook = self
             .test_hooks
             .lock()
             .unwrap()
             .before_direct_put_command_id
             .clone();
-        if let Some(hook) = hook {
-            hook();
+        hook.map_or(Ok(()), |hook| hook())
+    }
+
+    #[cfg(test)]
+    fn maybe_expire_direct_put_budget_after_snapshot_load(
+        &self,
+        work_budget: &mut RequestWorkBudget,
+    ) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_direct_put_snapshot_loaded
+            .clone();
+        if hook.is_some_and(|hook| hook()) {
+            work_budget.expire_for_test();
+        }
+    }
+
+    #[cfg(test)]
+    fn maybe_expire_direct_put_budget_after_action(&self, work_budget: &mut RequestWorkBudget) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .after_direct_put_action
+            .clone();
+        if hook.is_some_and(|hook| hook()) {
+            work_budget.expire_for_test();
         }
     }
 
     #[cfg(not(any(test, feature = "test-hooks")))]
-    fn maybe_run_before_direct_put_command_id_hook(&self) {}
+    fn maybe_run_before_direct_put_command_id_hook(&self) -> Result<(), ObjectPgActionError> {
+        Ok(())
+    }
 
     #[cfg(test)]
     fn maybe_run_before_direct_put_abandoned_log_inspection_hook(
@@ -4823,6 +4852,22 @@ impl StorageCluster {
         )
     }
 
+    fn pending_metadata_command_for_bucket_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        deadline: Instant,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError> {
+        let _ = bucket;
+        let route_epoch = self.operation_epoch();
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(route_epoch, pg_id)?;
+        primary
+            .metadata_command_inspection_client()
+            .pending_metadata_command_envelope_until(pg_id, route_epoch, deadline)
+    }
+
     fn pending_metadata_command_for_bucket_with_route_mode(
         &self,
         pg_id: PgId,
@@ -6187,10 +6232,35 @@ impl StorageCluster {
     #[cfg(test)]
     pub(crate) fn test_install_before_direct_put_command_id_hook(
         &self,
-        hook: Arc<dyn Fn() + Send + Sync>,
+        hook: DirectPutCommandIdHook,
     ) -> DirectPutCommandIdHookGuard {
         self.test_hooks.lock().unwrap().before_direct_put_command_id = Some(hook);
         DirectPutCommandIdHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_after_direct_put_snapshot_loaded_hook(
+        &self,
+        hook: DirectPutDeadlineExpiryHook,
+    ) -> DirectPutSnapshotLoadedHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .after_direct_put_snapshot_loaded = Some(hook);
+        DirectPutSnapshotLoadedHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_after_direct_put_action_hook(
+        &self,
+        hook: DirectPutDeadlineExpiryHook,
+    ) -> DirectPutActionHookGuard {
+        self.test_hooks.lock().unwrap().after_direct_put_action = Some(hook);
+        DirectPutActionHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
     }

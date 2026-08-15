@@ -970,7 +970,10 @@ type MultipartCreateUploadIdPreparedTestHook = Arc<dyn Fn(&UploadId) + Send + Sy
 type MultipartCreateCommandInstallTestHook = Arc<dyn Fn(&MetadataCommandEnvelope) + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
-type DirectPutCommandIdHook = Arc<dyn Fn() + Send + Sync>;
+type DirectPutCommandIdHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(test)]
+type DirectPutDeadlineExpiryHook = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 type ObjectGenerationCommandIdHook = Arc<dyn Fn() + Send + Sync>;
@@ -1028,6 +1031,10 @@ struct StorageClusterTestHooks {
     #[cfg(test)]
     before_multipart_create_command_install: Option<MultipartCreateCommandInstallTestHook>,
     before_direct_put_command_id: Option<DirectPutCommandIdHook>,
+    #[cfg(test)]
+    after_direct_put_snapshot_loaded: Option<DirectPutDeadlineExpiryHook>,
+    #[cfg(test)]
+    after_direct_put_action: Option<DirectPutDeadlineExpiryHook>,
     #[cfg(test)]
     before_direct_put_abandoned_log_inspection: Option<DirectPutAbandonedLogInspectionHook>,
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
@@ -1089,6 +1096,16 @@ pub(crate) struct MultipartCreateCommandInstallTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct DirectPutCommandIdHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectPutSnapshotLoadedHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectPutActionHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1241,6 +1258,20 @@ impl Drop for MultipartCreateCommandInstallTestHookGuard {
 impl Drop for DirectPutCommandIdHookGuard {
     fn drop(&mut self) {
         self.hooks.lock().unwrap().before_direct_put_command_id = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutSnapshotLoadedHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().after_direct_put_snapshot_loaded = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutActionHookGuard {
+    fn drop(&mut self) {
+        self.hooks.lock().unwrap().after_direct_put_action = None;
     }
 }
 

@@ -455,6 +455,12 @@ pub(crate) trait DirectPutMetadataRoute: Send {
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
+
+    fn build_direct_put_commit_command_until(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError>;
 }
 
 pub(crate) trait ObjectListingMetadataNodeClient: Send + Sync {
@@ -1516,6 +1522,13 @@ pub(crate) trait MetadataCommandInspectionNodeClient: Send + Sync {
         &self,
         pg_id: PgId,
         cluster_epoch: ClusterEpoch,
+    ) -> Result<Option<MetadataCommandEnvelope>, StoreError>;
+
+    fn pending_metadata_command_envelope_until(
+        &self,
+        pg_id: PgId,
+        cluster_epoch: ClusterEpoch,
+        deadline: Instant,
     ) -> Result<Option<MetadataCommandEnvelope>, StoreError>;
 
     fn metadata_command_replica_state(

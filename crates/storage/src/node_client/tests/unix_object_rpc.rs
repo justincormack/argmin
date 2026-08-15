@@ -5406,12 +5406,15 @@ fn unix_direct_put_metadata_client_builds_commit_command() {
         .unwrap();
 
     let command = route
-        .build_direct_put_commit_command(BuildDirectPutCommitCommandReq {
-            request: &request,
-            version_id: VersionId::Null,
-            expected_snapshot: &snapshot,
-            bucket_write_reservation: &proof,
-        })
+        .build_direct_put_commit_command_until(
+            BuildDirectPutCommitCommandReq {
+                request: &request,
+                version_id: VersionId::Null,
+                expected_snapshot: &snapshot,
+                bucket_write_reservation: &proof,
+            },
+            Instant::now() + Duration::from_secs(5),
+        )
         .unwrap();
 
     assert_eq!(command.id().pg_id(), PgId::new(0));

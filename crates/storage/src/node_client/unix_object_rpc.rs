@@ -2723,6 +2723,24 @@ impl DirectPutMetadataRoute for UnixDirectPutMetadataRoute<'_> {
         &self,
         request: BuildDirectPutCommitCommandReq<'_>,
     ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.build_direct_put_commit_command_inner(request, None)
+    }
+
+    fn build_direct_put_commit_command_until(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+        deadline: Instant,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
+        self.build_direct_put_commit_command_inner(request, Some(deadline))
+    }
+}
+
+impl UnixDirectPutMetadataRoute<'_> {
+    fn build_direct_put_commit_command_inner(
+        &self,
+        request: BuildDirectPutCommitCommandReq<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<MetadataCommandEnvelope, ObjectPgActionError> {
         self.require_request_subject(&request)?;
         let rpc_request = StorageRpcDirectPutCommandBuildRequest {
             object: StorageRpcObjectRequest {
@@ -2743,10 +2761,17 @@ impl DirectPutMetadataRoute for UnixDirectPutMetadataRoute<'_> {
                 error.to_string(),
             ))
         })?;
-        let response = self
-            .client
-            .rpc_request(StorageRpcMessageKind::DirectPutCommitCommandBuild, payload)
-            .map_err(ObjectPgActionError::Store)?;
+        let response = match deadline {
+            Some(deadline) => self.client.rpc_request_until(
+                StorageRpcMessageKind::DirectPutCommitCommandBuild,
+                payload,
+                deadline,
+            ),
+            None => self
+                .client
+                .rpc_request(StorageRpcMessageKind::DirectPutCommitCommandBuild, payload),
+        }
+        .map_err(ObjectPgActionError::Store)?;
         let response = decode_direct_put_command_build_response(
             &response,
             &MetadataCommandDecodeAuthority::new(),
