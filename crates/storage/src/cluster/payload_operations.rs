@@ -1560,6 +1560,146 @@ impl StorageCluster {
         )
     }
 
+    fn finish_direct_put_after_pending_install_uncertainty(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &mut MetadataCommandEnvelope,
+        fallback_error: ObjectPgActionError,
+    ) -> Result<
+        (
+            request_ops::NewObjectMetadataCommandApplyOutcome,
+            bool,
+        ),
+        ObjectPgActionError,
+    > {
+        let confirmation_deadline =
+            Instant::now() + request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+        let publication = match self.metadata_command_publication_state_on_acting_set_until(
+            pg_id,
+            command,
+            MetadataCommandRouteMode::Normal,
+            confirmation_deadline,
+        ) {
+            Ok(publication) => publication,
+            Err(error) => {
+                return Err(Self::direct_put_pending_install_confirmation_error(
+                    command,
+                    bucket_snapshot_error_to_object_pg_action_error(error),
+                ));
+            }
+        };
+        match publication {
+            MetadataCommandPublicationState::Published => Ok((
+                request_ops::NewObjectMetadataCommandApplyOutcome::Applied,
+                true,
+            )),
+            MetadataCommandPublicationState::PublicationStarted
+            | MetadataCommandPublicationState::Witnessed
+            | MetadataCommandPublicationState::PublicationUnconfirmed
+            | MetadataCommandPublicationState::IrrevocableUnconfirmed => {
+                let id = command.id();
+                Err(ObjectPgActionError::Store(
+                    StoreError::MetadataCommandIrrevocableConvergencePending {
+                        pg_id: id.pg_id().get(),
+                        cluster_epoch: id.cluster_epoch(),
+                        log_index: id.log_index().get(),
+                    },
+                ))
+            }
+            MetadataCommandPublicationState::NotPublished => {
+                // Re-read the slot after publication inspection. The inspection
+                // serializes with pending installation on the primary; an insert
+                // that was already in flight must therefore be visible here.
+                let pending = self
+                    .pending_metadata_command_for_bucket_with_route_mode_until(
+                        pg_id,
+                        bucket,
+                        MetadataCommandRouteMode::Normal,
+                        command.id().cluster_epoch(),
+                        confirmation_deadline,
+                    )
+                    .map_err(|error| {
+                        Self::direct_put_pending_install_confirmation_error(
+                            command,
+                            ObjectPgActionError::Store(error),
+                        )
+                    })?;
+                if pending.as_ref() == Some(&*command) {
+                    let outcome = self
+                        .finish_new_object_metadata_command_after_uncertainty_until(
+                            pg_id,
+                            bucket,
+                            command,
+                            fallback_error,
+                            confirmation_deadline,
+                        )
+                        .map_err(|error| {
+                            Self::direct_put_pending_install_confirmation_error(command, error)
+                        })?;
+                    return Ok((outcome, true));
+                }
+                let Some(current) = pending else {
+                    return Ok((
+                        request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(
+                            fallback_error,
+                        ),
+                        false,
+                    ));
+                };
+                let certified_reissue = self
+                    .pending_metadata_command_is_certified_reissue_until(
+                        pg_id,
+                        command,
+                        &current,
+                        confirmation_deadline,
+                    )
+                    .map_err(|error| {
+                        Self::direct_put_pending_install_confirmation_error(
+                            command,
+                            bucket_snapshot_error_to_object_pg_action_error(error),
+                        )
+                    })?;
+                if !certified_reissue {
+                    return Ok((
+                        request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(
+                            fallback_error,
+                        ),
+                        false,
+                    ));
+                }
+                *command = current;
+                let outcome = self
+                    .finish_new_object_metadata_command_after_uncertainty_until(
+                        pg_id,
+                        bucket,
+                        command,
+                        fallback_error,
+                        confirmation_deadline,
+                    )
+                    .map_err(|error| {
+                        Self::direct_put_pending_install_confirmation_error(command, error)
+                    })?;
+                Ok((outcome, true))
+            }
+        }
+    }
+
+    fn direct_put_pending_install_confirmation_error(
+        command: &MetadataCommandEnvelope,
+        error: ObjectPgActionError,
+    ) -> ObjectPgActionError {
+        if !request_ops::object_pg_action_error_is_retryable_command_observation(&error) {
+            return error;
+        }
+        let id = command.id();
+        ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed {
+            pg_id: id.pg_id().get(),
+            cluster_epoch: id.cluster_epoch(),
+            log_index: id.log_index().get(),
+        })
+    }
+
     fn finish_pending_metadata_command_with_recovery_leader(
         &self,
         pg_id: PgId,
@@ -3368,7 +3508,7 @@ impl StorageCluster {
             check_direct_put_work_before_command_ownership!(
                 "direct PUT metadata retry budget exhausted"
             );
-            let (command, new_pending_command, payload_acks_registered) = loop {
+            let (mut command, new_pending_command, payload_acks_registered) = loop {
                 require_direct_put_route_before_command_ownership!();
                 check_direct_put_work_before_command_ownership!(
                     "direct PUT metadata pending retry budget exhausted"
@@ -3729,6 +3869,7 @@ impl StorageCluster {
                 );
                 self.maybe_run_before_metadata_command_pending_install_hook();
                 let mut install_may_have_applied = false;
+                let mut install_confirmation_found_applied = false;
                 let install = loop {
                     match self
                         .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
@@ -3757,23 +3898,58 @@ impl StorageCluster {
                                 )
                             };
                             if retryable {
-                                if work_budget
-                                    .sleep_after_contention(
-                                        "direct PUT pending install drain retry budget exhausted",
-                                    )
-                                    .is_ok()
-                                {
-                                    continue;
-                                }
-                                if install_may_have_applied {
-                                    let id = command.id();
-                                    return Err(ObjectPgActionError::Store(
-                                        StoreError::MetadataCommandOutcomeUnconfirmed {
-                                            pg_id: id.pg_id().get(),
-                                            cluster_epoch: id.cluster_epoch(),
-                                            log_index: id.log_index().get(),
-                                        },
-                                    ));
+                                match work_budget.sleep_after_contention(
+                                    "direct PUT pending install drain retry budget exhausted",
+                                ) {
+                                    Ok(()) => continue,
+                                    Err(budget_error) if install_may_have_applied => {
+                                        let (outcome, command_owned) = self
+                                            .finish_direct_put_after_pending_install_uncertainty(
+                                                pg_id,
+                                                &req.bucket,
+                                                &mut command,
+                                                ObjectPgActionError::Store(budget_error),
+                                            )?;
+                                        match outcome {
+                                            request_ops::NewObjectMetadataCommandApplyOutcome::Applied => {
+                                                install_confirmation_found_applied = true;
+                                                break SnapshotSensitiveInstallOutcome::Installed;
+                                            }
+                                            request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(_) => {
+                                                if !command_owned {
+                                                    bucket_write_proof_command_owned = false;
+                                                    payload_ownership =
+                                                        DirectPutPayloadOwnership::Caller;
+                                                    cleanup_direct_put_attempt_before_command_ownership!();
+                                                    return Err(ObjectPgActionError::SnapshotReinspectionConflict);
+                                                }
+                                                finish_direct_put_after_safe_abandonment!();
+                                            }
+                                            request_ops::NewObjectMetadataCommandApplyOutcome::Abandoned(error) => {
+                                                if !command_owned {
+                                                    bucket_write_proof_command_owned = false;
+                                                    payload_ownership =
+                                                        DirectPutPayloadOwnership::Caller;
+                                                    cleanup_direct_put_attempt_before_command_ownership!();
+                                                    return Err(error);
+                                                }
+                                                self.release_object_generation_reservation(
+                                                    &req.bucket,
+                                                    &req.key,
+                                                    &req.generation_reservation_id,
+                                                )?;
+                                                self.delete_direct_put_segment_payload_shards(
+                                                    req.data_pg_id,
+                                                    req.ec,
+                                                    &req.segment_okh,
+                                                    req.segment_vid,
+                                                    written_shards,
+                                                );
+                                                return Err(error);
+                                            }
+                                        }
+                                    }
+                                    Err(_) => {}
                                 }
                             }
                             if install_may_have_applied {
@@ -3789,11 +3965,13 @@ impl StorageCluster {
                         payload_ownership = DirectPutPayloadOwnership::DurableCommand;
                         disarm_payload_cleanup();
                         #[cfg(test)]
-                        request_ops::maybe_run_direct_put_pending_installed_hook(
-                            self.metadata_command_apply_test_hook_scope_id(),
-                            &command,
-                            &mut work_budget,
-                        );
+                        if !install_confirmation_found_applied {
+                            request_ops::maybe_run_direct_put_pending_installed_hook(
+                                self.metadata_command_apply_test_hook_scope_id(),
+                                &command,
+                                &mut work_budget,
+                            );
+                        }
                     }
                     SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         sleep_direct_put_before_command_ownership_after_contention!(
@@ -3801,6 +3979,9 @@ impl StorageCluster {
                         );
                         continue;
                     }
+                }
+                if install_confirmation_found_applied {
+                    break (command, false);
                 }
             }
             break (command, new_pending_command);

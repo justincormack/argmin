@@ -3658,7 +3658,10 @@ fn assert_insert_delete_marker_witness_survives_expired_authority(
                 )
                 && !delayed_witness_hook.swap(true, Ordering::SeqCst)
             {
-                std::thread::sleep(Duration::from_millis(1_050));
+                std::thread::sleep(
+                    crate::cluster::request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET
+                        + Duration::from_millis(50),
+                );
                 *witnessed_command_for_hook
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(command.clone());

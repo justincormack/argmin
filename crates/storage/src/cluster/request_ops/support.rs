@@ -21,7 +21,12 @@ const LIFECYCLE_SWEEP_ROOT_SCAN_LIMIT_PER_PG: usize = 1_024;
 const OBJECT_READ_SNAPSHOT_STALE_RETRY_BUDGET: std::time::Duration =
     std::time::Duration::from_secs(10);
 pub(super) const METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS: u64 = 10_000;
-pub(super) const METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET: Duration = Duration::from_secs(1);
+// Cross-process operation deadlines subtract the supported wall-clock skew.
+// Include that allowance so a remote actor still receives one usable second
+// for bounded publication confirmation and terminal cleanup.
+pub(crate) const METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET: Duration = Duration::from_millis(
+    crate::control_plane_lease::CONTROL_PLANE_CLOCK_SKEW_BUDGET_MS + 1_000,
+);
 const BUCKET_WRITE_RESERVATION_LEASE_MILLIS: u64 = 15_000;
 // HTTP streaming PutObject heartbeats active sessions every 10s. Keep the
 // durable create reservation only slightly longer than that so abandoned

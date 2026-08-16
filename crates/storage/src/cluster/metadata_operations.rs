@@ -1221,6 +1221,56 @@ impl StorageCluster {
         }
     }
 
+    fn pending_metadata_command_is_certified_reissue_until(
+        &self,
+        pg_id: PgId,
+        stale_command: &MetadataCommandEnvelope,
+        current: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, BucketSnapshotLoadError> {
+        if current.id().pg_id() != pg_id
+            || current.id().cluster_epoch() != stale_command.id().cluster_epoch()
+            || current.id().log_index().get() <= stale_command.id().log_index().get()
+            || current.payload() != stale_command.payload()
+        {
+            return Ok(false);
+        }
+        let route_epoch = stale_command.id().cluster_epoch();
+        let primary = self
+            .local_map
+            .metadata_pg_primary_node(route_epoch, pg_id)?;
+        let primary_client = primary.metadata_command_inspection_client();
+        let primary_max_log_index =
+            primary_client.max_metadata_command_log_index_until(pg_id, route_epoch, deadline)?;
+        let acting_set_max_log_index = self
+            .max_metadata_command_log_index_on_acting_set_with_route_mode_until(
+                pg_id,
+                MetadataCommandRouteMode::Normal,
+                route_epoch,
+                deadline,
+            )?;
+        match self.matching_reissued_pending_command_outcome_with_route_mode(
+            pg_id,
+            primary.node_id(),
+            primary_client.as_ref(),
+            primary_max_log_index,
+            acting_set_max_log_index,
+            stale_command.payload(),
+            current.clone(),
+            MetadataCommandRouteMode::Normal,
+            deadline,
+        )? {
+            ReissuePendingMetadataCommandOutcome::Reissued(command)
+            | ReissuePendingMetadataCommandOutcome::MatchingCurrent(command) => {
+                Ok(command == *current)
+            }
+            ReissuePendingMetadataCommandOutcome::Missing => Ok(false),
+            ReissuePendingMetadataCommandOutcome::MatchingCurrentConflict { source, .. } => {
+                Err(source.into())
+            }
+        }
+    }
+
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn matching_reissued_pending_command_if_safe(
@@ -5007,6 +5057,29 @@ impl StorageCluster {
         )
     }
 
+    fn remove_pending_metadata_command_for_bucket_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<request_ops::PendingMetadataCommandTerminalCleanup, StoreError> {
+        let _ = bucket;
+        let mut work_budget = RequestWorkBudget::ending_at(deadline)
+            .for_operation("metadata command terminal cleanup")
+            .for_pg(pg_id);
+        request_ops::remove_pending_metadata_command_slot_after_terminal_outcome(
+            pg_id,
+            Some(&mut work_budget),
+            || {
+                self.local_map
+                    .metadata_pg_primary_node(self.operation_epoch(), pg_id)?
+                    .metadata_command_client()
+                    .remove_pending_metadata_command_slot_until(pg_id, command, deadline)
+            },
+        )
+    }
+
     fn remove_pending_metadata_command_for_bucket_inner(
         &self,
         pg_id: PgId,
@@ -5894,6 +5967,20 @@ impl StorageCluster {
         self.release_bucket_write_reservation_proof(proof)
     }
 
+    fn release_metadata_command_bucket_write_reservation_until(
+        &self,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let Some(proof) = Self::metadata_command_bucket_write_reservation_proof(command) else {
+            return Ok(());
+        };
+        if !Self::metadata_command_bucket_write_reservation_subject_matches(command, proof) {
+            return Ok(());
+        }
+        self.release_bucket_write_reservation_proof_until(proof, deadline)
+    }
+
     fn release_applied_metadata_command_bucket_write_reservations(
         &self,
         command: &MetadataCommandEnvelope,
@@ -5985,6 +6072,26 @@ impl StorageCluster {
                 &proof.bucket,
             )?
             .release_metadata_command_bucket_write_reservation(proof)?;
+        Ok(())
+    }
+
+    fn release_bucket_write_reservation_proof_until(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        crate::node_client::require_metadata_command_operation_deadline(deadline)?;
+        let pg_id = self.bucket_metadata_pg_id(&proof.bucket);
+        let node = self
+            .local_map
+            .metadata_pg_primary_node_for_retained_cleanup(proof.cluster_epoch, PgId::new(pg_id))?;
+        node.retained_bucket_write_reservation_client()
+            .open_retained_bucket_write_reservation_route_until(
+                self.validated_bucket_metadata_pg(PgId::new(pg_id)),
+                &proof.bucket,
+                deadline,
+            )?
+            .release_metadata_command_bucket_write_reservation_until(proof, deadline)?;
         Ok(())
     }
 

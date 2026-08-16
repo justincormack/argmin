@@ -1574,6 +1574,13 @@ pub(crate) fn encode_proof_release_request(
     put_u64(&mut out, request.route_cluster_epoch.get());
     put_u32(&mut out, request.pg_id.get());
     put_bucket_write_reservation_proof(&mut out, &request.proof);
+    match request.operation_deadline {
+        None => put_u8(&mut out, 0),
+        Some(deadline) => {
+            put_u8(&mut out, 1);
+            put_u64(&mut out, deadline.portable_wall_valid_until_ms);
+        }
+    }
     Ok(out)
 }
 
@@ -1585,6 +1592,17 @@ pub(crate) fn decode_proof_release_request(
     let route_cluster_epoch = decoder.read_cluster_epoch()?;
     let pg_id = PgId::new(decoder.read_u32()?);
     let proof = decoder.read_bucket_write_reservation_proof()?;
+    let operation_deadline = match decoder.read_u8()? {
+        0 => None,
+        1 => Some(StorageRpcOperationDeadline {
+            portable_wall_valid_until_ms: decoder.read_u64()?,
+        }),
+        _ => {
+            return Err(StorageRpcPayloadError::InvalidBucketWriteReservationProof(
+                "invalid optional operation deadline tag",
+            ));
+        }
+    };
     decoder.finish()?;
     validate_bucket_write_reservation_proof(&proof)?;
     Ok(StorageRpcProofReleaseRequest {
@@ -1592,6 +1610,7 @@ pub(crate) fn decode_proof_release_request(
         route_cluster_epoch,
         pg_id,
         proof,
+        operation_deadline,
     })
 }
 
@@ -1714,23 +1733,30 @@ pub(crate) fn decode_bucket_write_reservation_acquire_request(
 pub(crate) fn encode_bucket_write_reservation_proof_request(
     request: &StorageRpcBucketWriteReservationProofRequest,
 ) -> Result<Vec<u8>, StorageRpcPayloadError> {
-    encode_proof_release_request(&StorageRpcProofReleaseRequest {
-        node_id: request.node_id,
-        route_cluster_epoch: request.route_cluster_epoch,
-        pg_id: request.pg_id,
-        proof: request.proof.clone(),
-    })
+    validate_bucket_write_reservation_proof(&request.proof)?;
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.route_cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_bucket_write_reservation_proof(&mut out, &request.proof);
+    Ok(out)
 }
 
 pub(crate) fn decode_bucket_write_reservation_proof_request(
     bytes: &[u8],
 ) -> Result<StorageRpcBucketWriteReservationProofRequest, StorageRpcPayloadError> {
-    let request = decode_proof_release_request(bytes)?;
+    let mut decoder = StorageRpcDecoder::new(bytes);
+    let node_id = NodeId::new(decoder.read_u32()?);
+    let route_cluster_epoch = decoder.read_cluster_epoch()?;
+    let pg_id = PgId::new(decoder.read_u32()?);
+    let proof = decoder.read_bucket_write_reservation_proof()?;
+    decoder.finish()?;
+    validate_bucket_write_reservation_proof(&proof)?;
     Ok(StorageRpcBucketWriteReservationProofRequest {
-        node_id: request.node_id,
-        route_cluster_epoch: request.route_cluster_epoch,
-        pg_id: request.pg_id,
-        proof: request.proof,
+        node_id,
+        route_cluster_epoch,
+        pg_id,
+        proof,
     })
 }
 

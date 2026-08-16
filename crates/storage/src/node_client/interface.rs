@@ -361,6 +361,16 @@ pub(crate) trait RetainedBucketWriteReservationNodeClient: Send + Sync {
         pg_id: BucketPgId,
         bucket: &BucketName,
     ) -> Result<Box<dyn RetainedBucketWriteReservationRoute + '_>, BucketSnapshotLoadError>;
+
+    fn open_retained_bucket_write_reservation_route_until(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        deadline: Instant,
+    ) -> Result<Box<dyn RetainedBucketWriteReservationRoute + '_>, BucketSnapshotLoadError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.open_retained_bucket_write_reservation_route(pg_id, bucket)
+    }
 }
 
 pub(crate) trait RetainedBucketWriteReservationRoute: Send {
@@ -373,6 +383,15 @@ pub(crate) trait RetainedBucketWriteReservationRoute: Send {
         &self,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError>;
+
+    fn release_metadata_command_bucket_write_reservation_until(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.release_metadata_command_bucket_write_reservation(proof)
+    }
 
     fn clear_durable_bucket_write_drain(
         &self,
@@ -2101,6 +2120,16 @@ pub(crate) trait MetadataCommandNodeClient: Send + Sync {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError>;
+
+    fn remove_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        require_metadata_command_operation_deadline(deadline)?;
+        self.remove_pending_metadata_command_slot(pg_id, command)
+    }
 
     fn metadata_command_replica_state(
         &self,

@@ -11,7 +11,8 @@
         BuildStreamPartCommitCommandReq, DirectPutMetadataNodeClient,
         LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
         MetadataCommandInspectionNodeClient, MetadataCommandRecoveryNodeClient,
-        ObjectMutationMetadataNodeClient, PlacedShardNodeClient, UnixStorageNodeClient,
+        ObjectMutationMetadataNodeClient, PlacedShardNodeClient,
+        RetainedBucketWriteReservationNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::storage_rpc::StorageRpcWireErrorCode;
@@ -5975,6 +5976,134 @@
         authenticated_pending_slot_remove_preserves_terminal_state(true, false, None);
     }
 
+    fn authenticated_proof_release_honors_operation_deadline_while_pg_locked(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let bucket = crate::tests::bucket_name("proof-release-deadline-bucket");
+        let reservation = {
+            let pg = server._node.get_pg(0).unwrap();
+            PgMetadataStore::create_bucket(
+                &*pg,
+                &bucket,
+                "owner",
+                &crate::CanonicalUserId::from_principal("owner"),
+                &crate::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+            let created_at = crate::clock::current_time_millis();
+            PgMetadataStore::acquire_durable_bucket_write_reservation(
+                &*pg,
+                crate::node_runtime::traits::DurableBucketWriteReservationAcquire {
+                    name: &bucket,
+                    reservation_id: "proof-release-deadline-reservation",
+                    owner_token: "proof-release-deadline-owner",
+                    cluster_epoch: config.cluster_epoch,
+                    operation_kind: "put-object",
+                    created_at,
+                    lease_deadline: created_at + 60_000,
+                    target_context: Some("key=object"),
+                },
+            )
+            .unwrap()
+        };
+        let proof = BucketWriteReservationProof::from(&reservation);
+        let storage_node = Arc::clone(&server._node);
+        let held_pg = storage_node.get_pg(0).unwrap();
+        let (server_done_tx, server_done_rx) = mpsc::channel();
+        let server_thread = thread::spawn(move || {
+            server_done_tx.send(server.accept_one()).unwrap();
+        });
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let route = RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route_until(
+            &client,
+            BucketPgId::new_for_test(PgId::new(0)),
+            &bucket,
+            deadline,
+        )
+        .unwrap();
+        let error = route
+            .release_metadata_command_bucket_write_reservation_until(&proof, deadline)
+            .expect_err("proof release must expire while the bucket PG is held");
+        assert!(
+            matches!(
+                error,
+                BucketSnapshotLoadError::Store(StoreError::OperationDeadlineExceeded { .. })
+                    | BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                        failure: StorageRpcErrorCode::TransportTimeout,
+                        ..
+                    })
+            ),
+            "unexpected proof-release deadline error: {error:?}"
+        );
+        server_done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("storage worker must stop waiting for the held PG at the operation deadline")
+            .unwrap();
+
+        drop(route);
+        drop(client);
+        drop(held_pg);
+        server_thread.join().unwrap();
+        let pg = storage_node.get_pg(0).unwrap();
+        assert_eq!(
+            PgMetadataStore::durable_bucket_write_reservation(
+                &*pg,
+                &bucket,
+                &proof.reservation_id,
+            )
+            .unwrap(),
+            Some(reservation),
+            "deadline expiry must retain the exact bucket-write reservation"
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_proof_release_honors_operation_deadline_while_pg_locked() {
+        authenticated_proof_release_honors_operation_deadline_while_pg_locked(false);
+    }
+
+    #[test]
+    fn authenticated_tls_proof_release_honors_operation_deadline_while_pg_locked() {
+        authenticated_proof_release_honors_operation_deadline_while_pg_locked(true);
+    }
+
     #[test]
     fn authenticated_unix_pending_slot_remove_preserves_log_divergence() {
         authenticated_pending_slot_remove_preserves_terminal_state(false, true, None);
@@ -6869,9 +6998,10 @@
     enum DirectPutPendingInstallResponseLossFollowup {
         ExpireBudget,
         IntegrityFailure,
+        UnrelatedContender,
     }
 
-    fn authenticated_direct_put_pending_install_response_loss_preserves_resources(
+    fn authenticated_direct_put_pending_install_response_loss_classifies_terminal_state(
         tcp: bool,
         followup: DirectPutPendingInstallResponseLossFollowup,
     ) {
@@ -6887,6 +7017,12 @@
             }
             (false, DirectPutPendingInstallResponseLossFollowup::IntegrityFailure) => {
                 "unix-direct-put-install-loss-integrity-failure"
+            }
+            (true, DirectPutPendingInstallResponseLossFollowup::UnrelatedContender) => {
+                "tls-direct-put-install-loss-unrelated-contender"
+            }
+            (false, DirectPutPendingInstallResponseLossFollowup::UnrelatedContender) => {
+                "unix-direct-put-install-loss-unrelated-contender"
             }
         };
         let (_tmp, server_set, cluster) = authenticated_fanout_cluster(tcp, namespace);
@@ -6980,6 +7116,58 @@
                     .expect("authenticated response envelope must not be empty") ^= 1;
             }
         }));
+        let unrelated_contender = Arc::new(Mutex::new(None));
+        let unrelated_contender_installed = Arc::new(AtomicBool::new(false));
+        let _pending_install_hook = if matches!(
+            followup,
+            DirectPutPendingInstallResponseLossFollowup::UnrelatedContender
+        ) {
+            let primary = Arc::clone(&primary);
+            let bucket = bucket.clone();
+            let contender_slot = Arc::clone(&unrelated_contender);
+            let installed = Arc::clone(&unrelated_contender_installed);
+            Some(
+                cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(
+                    move || {
+                        if installed.swap(true, Ordering::AcqRel) {
+                            return;
+                        }
+                        let pg = primary._node.get_pg(0).unwrap();
+                        let log_index = MetadataCommandLogIndex::new(
+                            pg.max_metadata_command_log_index(ClusterEpoch::INITIAL)
+                                .unwrap()
+                                + 1,
+                        )
+                        .unwrap();
+                        let contender = MetadataCommandEnvelope::new(
+                            MetadataCommandId::new(
+                                ClusterEpoch::INITIAL,
+                                PgId::new(0),
+                                log_index,
+                            ),
+                            MetadataCommandPayload::ReserveObjectGeneration(
+                                ReserveObjectGenerationCommand::new(
+                                    bucket.clone(),
+                                    crate::tests::object_key("unrelated-contender"),
+                                    crate::tests::stream_session_id("other"),
+                                    GenerationId::new(1).unwrap(),
+                                    crate::clock::current_time_millis(),
+                                ),
+                            ),
+                        );
+                        pg.try_insert_pending_metadata_command_slot(
+                            primary.config_snapshot().node_id.as_u32(),
+                            &contender,
+                            Some(&bucket),
+                        )
+                        .unwrap();
+                        *contender_slot.lock().unwrap() = Some(contender);
+                    },
+                )),
+            )
+        } else {
+            None
+        };
         let integrity_failure = Arc::new(AtomicBool::new(false));
         if matches!(
             followup,
@@ -7004,6 +7192,7 @@
         let _uncertainty_hook = if matches!(
             followup,
             DirectPutPendingInstallResponseLossFollowup::ExpireBudget
+                | DirectPutPendingInstallResponseLossFollowup::UnrelatedContender
         ) {
             let budget_expired_for_hook = Arc::clone(&budget_expired);
             Some(
@@ -7018,12 +7207,30 @@
         let error = route
             .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(() ))
             .expect_err("ambiguous pending installation must not report direct PUT success");
-        assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+        assert_eq!(
+            error.kind(),
+            match followup {
+                DirectPutPendingInstallResponseLossFollowup::ExpireBudget => {
+                    crate::DirectPutFailureKind::SnapshotReinspectionConflict
+                }
+                DirectPutPendingInstallResponseLossFollowup::UnrelatedContender => {
+                    crate::DirectPutFailureKind::SnapshotReinspectionConflict
+                }
+                DirectPutPendingInstallResponseLossFollowup::IntegrityFailure => {
+                    crate::DirectPutFailureKind::InternalError
+                }
+            },
+            "unexpected direct PUT failure classification: {}",
+            error.diagnostic_cause_label(),
+        );
         assert_eq!(
             error.diagnostic_cause_label(),
             match followup {
                 DirectPutPendingInstallResponseLossFollowup::ExpireBudget => {
-                    "store_metadata_consistency_failure"
+                    "snapshot_reinspection_conflict"
+                }
+                DirectPutPendingInstallResponseLossFollowup::UnrelatedContender => {
+                    "snapshot_reinspection_conflict"
                 }
                 DirectPutPendingInstallResponseLossFollowup::IntegrityFailure => {
                     "store_integrity_failure"
@@ -7036,6 +7243,7 @@
             matches!(
                 followup,
                 DirectPutPendingInstallResponseLossFollowup::ExpireBudget
+                    | DirectPutPendingInstallResponseLossFollowup::UnrelatedContender
             )
         );
         assert_eq!(
@@ -7045,32 +7253,85 @@
                 DirectPutPendingInstallResponseLossFollowup::IntegrityFailure
             )
         );
+        assert_eq!(
+            unrelated_contender_installed.load(Ordering::Acquire),
+            matches!(
+                followup,
+                DirectPutPendingInstallResponseLossFollowup::UnrelatedContender
+            )
+        );
 
         let primary_pg = primary._node.get_pg(0).unwrap();
         let pending = primary_pg
             .pending_metadata_command_slot(1, ClusterEpoch::INITIAL)
-            .unwrap()
-            .expect("response loss must preserve the durably inserted pending command");
-        assert_eq!(pending.scope_bucket.as_ref(), Some(&bucket));
-        assert!(!pending.publication_started);
+            .unwrap();
+        match followup {
+            DirectPutPendingInstallResponseLossFollowup::ExpireBudget => {
+                assert!(
+                    pending.is_none(),
+                    "budget exhaustion must abandon the exact unpublished command"
+                );
+            }
+            DirectPutPendingInstallResponseLossFollowup::IntegrityFailure => {
+                let pending = pending
+                    .as_ref()
+                    .expect("integrity failure must preserve the durably inserted command");
+                assert_eq!(pending.scope_bucket.as_ref(), Some(&bucket));
+                assert!(!pending.publication_started);
+            }
+            DirectPutPendingInstallResponseLossFollowup::UnrelatedContender => {
+                let contender = unrelated_contender
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("the unrelated contender must have been installed");
+                if let Some(pending) = pending.as_ref() {
+                    assert_eq!(pending.id, contender.id());
+                    assert_eq!(pending.command_bytes, contender.command_bytes());
+                    assert_eq!(pending.scope_bucket.as_ref(), Some(&bucket));
+                } else {
+                    assert!(primary_pg
+                        .applied_metadata_command_log_entry_hashes(
+                            primary.config_snapshot().node_id.as_u32(),
+                            &contender,
+                        )
+                        .unwrap()
+                        .is_some());
+                }
+            }
+        }
         assert_eq!(
             PgMetadataStore::durable_bucket_write_reservations(&*primary_pg, &bucket)
                 .unwrap()
                 .len(),
-            1,
-            "the pending command's bucket-write reservation must remain durable"
+            match followup {
+                DirectPutPendingInstallResponseLossFollowup::ExpireBudget => 0,
+                DirectPutPendingInstallResponseLossFollowup::IntegrityFailure => 1,
+                DirectPutPendingInstallResponseLossFollowup::UnrelatedContender => 0,
+            },
+            "bucket-write reservation ownership must follow the terminal classification"
         );
         drop(primary_pg);
 
         for server in &server_set.servers {
             let pg = server._node.get_pg(0).unwrap();
-            assert!(PgMetadataStore::get_object_generation_reservation(
+            let generation_reservation = PgMetadataStore::get_object_generation_reservation(
                 &*pg,
                 &bucket,
                 &key,
                 &generation_reservation_id,
-            )
-            .is_ok());
+            );
+            match followup {
+                DirectPutPendingInstallResponseLossFollowup::ExpireBudget => {
+                    assert!(generation_reservation.is_err());
+                }
+                DirectPutPendingInstallResponseLossFollowup::UnrelatedContender => {
+                    assert!(generation_reservation.is_err());
+                }
+                DirectPutPendingInstallResponseLossFollowup::IntegrityFailure => {
+                    assert!(generation_reservation.is_ok());
+                }
+            }
             assert!(matches!(
                 PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
                 Err(crate::MetadataError::ObjectNotFound)
@@ -7083,24 +7344,32 @@
                 .iter()
                 .find(|server| server.config_snapshot().node_id == node_id)
                 .unwrap();
-            assert!(server
-                ._node
-                .read_shard_file(data_pg_id, &written.key)
-                .is_ok());
+            let shard = server._node.read_shard_file(data_pg_id, &written.key);
+            match followup {
+                DirectPutPendingInstallResponseLossFollowup::ExpireBudget => {
+                    assert!(shard.is_err());
+                }
+                DirectPutPendingInstallResponseLossFollowup::UnrelatedContender => {
+                    assert!(shard.is_err());
+                }
+                DirectPutPendingInstallResponseLossFollowup::IntegrityFailure => {
+                    assert!(shard.is_ok());
+                }
+            }
         }
     }
 
     #[test]
-    fn authenticated_unix_direct_put_pending_install_response_loss_preserves_resources() {
-        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+    fn authenticated_unix_direct_put_pending_install_response_loss_cleans_unpublished_command() {
+        authenticated_direct_put_pending_install_response_loss_classifies_terminal_state(
             false,
             DirectPutPendingInstallResponseLossFollowup::ExpireBudget,
         );
     }
 
     #[test]
-    fn authenticated_tls_direct_put_pending_install_response_loss_preserves_resources() {
-        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+    fn authenticated_tls_direct_put_pending_install_response_loss_cleans_unpublished_command() {
+        authenticated_direct_put_pending_install_response_loss_classifies_terminal_state(
             true,
             DirectPutPendingInstallResponseLossFollowup::ExpireBudget,
         );
@@ -7108,7 +7377,7 @@
 
     #[test]
     fn authenticated_unix_direct_put_pending_install_response_loss_preserves_integrity_failure() {
-        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+        authenticated_direct_put_pending_install_response_loss_classifies_terminal_state(
             false,
             DirectPutPendingInstallResponseLossFollowup::IntegrityFailure,
         );
@@ -7116,9 +7385,25 @@
 
     #[test]
     fn authenticated_tls_direct_put_pending_install_response_loss_preserves_integrity_failure() {
-        authenticated_direct_put_pending_install_response_loss_preserves_resources(
+        authenticated_direct_put_pending_install_response_loss_classifies_terminal_state(
             true,
             DirectPutPendingInstallResponseLossFollowup::IntegrityFailure,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_direct_put_lost_pending_conflict_cleans_uninstalled_candidate() {
+        authenticated_direct_put_pending_install_response_loss_classifies_terminal_state(
+            false,
+            DirectPutPendingInstallResponseLossFollowup::UnrelatedContender,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_direct_put_lost_pending_conflict_cleans_uninstalled_candidate() {
+        authenticated_direct_put_pending_install_response_loss_classifies_terminal_state(
+            true,
+            DirectPutPendingInstallResponseLossFollowup::UnrelatedContender,
         );
     }
 

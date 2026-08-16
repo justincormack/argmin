@@ -2323,12 +2323,17 @@
             &mut client,
             7,
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
-            encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
-                node_id: NodeId::new(7),
-                cluster_epoch: source_route_epoch,
-                pg_id: PgId::new(0),
-                command: cleanup,
-            })
+            crate::storage_rpc::encode_metadata_command_pending_slot_request(
+                &StorageRpcMetadataCommandPendingSlotRequest {
+                    node_id: NodeId::new(7),
+                    cluster_epoch: source_route_epoch,
+                    pg_id: PgId::new(0),
+                    command: cleanup,
+                    scope_bucket: None,
+                    effect_deadline: None,
+                    operation_deadline: None,
+                },
+            )
             .unwrap(),
         );
         let release_response = send_frame(
@@ -4032,11 +4037,14 @@
             .unwrap();
         pg.record_metadata_command_abandoned(7, &command).unwrap();
         drop(pg);
-        let request = StorageRpcMetadataCommandRequest {
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
             node_id: NodeId::new(7),
             cluster_epoch: ClusterEpoch::new(1).unwrap(),
             pg_id: PgId::new(0),
             command: command.clone(),
+            scope_bucket: None,
+            effect_deadline: None,
+            operation_deadline: None,
         };
         let socket_path = config.socket_path.clone();
         let join = thread::spawn(move || server.accept_one().unwrap());
@@ -4047,7 +4055,7 @@
                 &mut client,
                 request_id,
                 StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
-                encode_metadata_command_request(&request).unwrap(),
+                crate::storage_rpc::encode_metadata_command_pending_slot_request(&request).unwrap(),
             );
             let payload = decode_storage_rpc_response_payload(&response.payload)
                 .unwrap()

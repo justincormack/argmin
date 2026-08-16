@@ -2123,7 +2123,10 @@ impl StorageNodeConnectionHandler {
                 }
             }
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
-                match decode_metadata_command_request(&frame.payload, &command_decode_authority) {
+                match decode_metadata_command_pending_slot_request(
+                    &frame.payload,
+                    &command_decode_authority,
+                ) {
                     Ok(request) => {
                         self.metadata_command_pending_slot_remove_response(session, request)
                     }
@@ -2831,7 +2834,14 @@ impl StorageNodeConnectionHandler {
             Ok(route) => route,
             Err(error) => return encode_storage_rpc_error_response(&error),
         };
-        match route.release() {
+        let operation_deadline = request
+            .operation_deadline
+            .map(StorageRpcOperationDeadline::local_deadline);
+        let release = match operation_deadline {
+            Some(deadline) => route.release_until(deadline),
+            None => route.release(),
+        };
+        match release {
             Ok(()) => Ok(encode_storage_rpc_success_response(&[])),
             Err(StorageNodeBucketRouteError::Route(error)) => {
                 encode_storage_rpc_error_response(&error)
@@ -8981,7 +8991,7 @@ impl StorageNodeConnectionHandler {
     fn metadata_command_pending_slot_remove_response(
         &self,
         session: &StorageNodeSession,
-        request: StorageRpcMetadataCommandRequest,
+        request: StorageRpcMetadataCommandPendingSlotRequest,
     ) -> Result<Vec<u8>, crate::storage_rpc::StorageRpcPayloadError> {
         if let Err(error) = self.validate_pg_route_for_metadata_command_recovery(
             request.node_id,
@@ -8990,8 +9000,32 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
-        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+        if request.scope_bucket.is_some() || request.effect_deadline.is_some() {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command pending slot remove carried insert-only fields"
+                    .to_string(),
+            });
+        }
+        let operation_deadline = request
+            .operation_deadline
+            .map(StorageRpcOperationDeadline::local_deadline);
+        let _pg_guard = match self.metadata_command_pg_guard_until(
+            session,
+            request.pg_id,
+            operation_deadline,
+        ) {
+            Ok(guard) => guard,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
+        let pg = match operation_deadline {
+            Some(deadline) => self.node.get_pg_until(request.pg_id.get(), deadline),
+            None => self.node.get_pg(request.pg_id.get()),
+        };
+        let response = match pg.and_then(|pg| {
+            if let Some(deadline) = operation_deadline {
+                crate::node_client::require_metadata_command_operation_deadline(deadline)?;
+            }
             pg.remove_pending_metadata_command_slot(self.config.node_id.as_u32(), &request.command)
         }) {
             Ok(removed) => {

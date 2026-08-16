@@ -1413,7 +1413,7 @@ fn local_recovery_critical_section_rejects_future_epoch_command_without_mutation
 }
 
 #[test]
-fn local_recovery_abandonment_operations_honor_absolute_deadline_while_pg_locked() {
+fn local_recovery_abandonment_and_cleanup_operations_honor_absolute_deadline_while_pg_locked() {
     let tmp = test_util::tempdir();
     let storage_node = Arc::new(
         crate::node::SharedStorageNode::open_with_default_ec_shape(
@@ -1432,6 +1432,11 @@ fn local_recovery_abandonment_operations_honor_absolute_deadline_while_pg_locked
         )
         .unwrap();
     let command = test_metadata_command(0, 1);
+    storage_node
+        .get_pg(0)
+        .unwrap()
+        .try_insert_pending_metadata_command_slot(7, &command, Some(command.bucket_name()))
+        .unwrap();
     let storage_node_for_holder = Arc::clone(&storage_node);
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1443,7 +1448,7 @@ fn local_recovery_abandonment_operations_honor_absolute_deadline_while_pg_locked
     });
     locked_rx.recv().unwrap();
 
-    for operation in ["acceptance", "record"] {
+    for operation in ["acceptance", "record", "remove"] {
         let deadline = Instant::now() + Duration::from_millis(50);
         let error = match operation {
             "acceptance" => recovery
@@ -1452,6 +1457,13 @@ fn local_recovery_abandonment_operations_honor_absolute_deadline_while_pg_locked
             "record" => recovery
                 .record_metadata_command_abandoned_until(&command, deadline)
                 .map(|_| ()),
+            "remove" => MetadataCommandNodeClient::remove_pending_metadata_command_slot_until(
+                &client,
+                PgId::new(0),
+                &command,
+                deadline,
+            )
+            .map(|_| ()),
             _ => unreachable!(),
         }
         .unwrap_err();
@@ -1472,6 +1484,15 @@ fn local_recovery_abandonment_operations_honor_absolute_deadline_while_pg_locked
             .unwrap(),
         0,
         "deadline expiry must not record an abandonment"
+    );
+    assert!(
+        storage_node
+            .get_pg(0)
+            .unwrap()
+            .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+            .is_some(),
+        "deadline expiry must not remove the pending slot"
     );
 }
 

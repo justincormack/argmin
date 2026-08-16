@@ -892,6 +892,61 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
 }
 
 #[test]
+fn direct_put_pending_install_uncertainty_without_durable_command_reinspects() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-install-uncertain-no-slot-");
+    let key = key_for_object_pg(topology, &bucket, 2, "candidate-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(2);
+    let mut command = MetadataCommandEnvelope::new(
+        cluster.next_object_metadata_command_id(pg_id).unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key,
+            crate::SessionId::try_from("67".repeat(16)).unwrap(),
+            GenerationId::new(101).unwrap(),
+            crate::clock::current_time_millis().saturating_add(60_000),
+        )),
+    );
+
+    let (outcome, command_owned) = cluster
+        .finish_direct_put_after_pending_install_uncertainty(
+            pg_id,
+            &bucket,
+            &mut command,
+            crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+                context: "test pending install uncertainty",
+            }),
+        )
+        .unwrap();
+
+    assert!(!command_owned);
+    assert!(matches!(
+        outcome,
+        crate::cluster::request_ops::NewObjectMetadataCommandApplyOutcome::Reinspect(
+            crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. })
+        )
+    ));
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+}
+
+#[test]
 fn snapshot_sensitive_install_drains_only_the_observed_contender() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();

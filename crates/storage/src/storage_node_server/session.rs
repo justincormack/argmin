@@ -832,6 +832,9 @@ fn bucket_snapshot_error_response(error: BucketSnapshotLoadError) -> StorageRpcE
                 message: format!("metadata command contention during {context}"),
             }
         }
+        BucketSnapshotLoadError::Store(error @ StoreError::OperationDeadlineExceeded { .. }) => {
+            store_error_response(error)
+        }
         BucketSnapshotLoadError::Store(error @ StoreError::RouteMapExpired { .. }) => {
             store_error_response(error)
         }

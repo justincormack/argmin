@@ -388,6 +388,19 @@ impl RequestWorkBudget {
         }
     }
 
+    fn ending_at(deadline: Instant) -> Self {
+        let started = Instant::now();
+        Self {
+            started,
+            budget: deadline.saturating_duration_since(started),
+            attempts: 0,
+            contention_retries: 0,
+            max_attempts: None,
+            operation: "unknown",
+            pg_id: None,
+        }
+    }
+
     fn for_operation(mut self, operation: &'static str) -> Self {
         self.operation = operation;
         self

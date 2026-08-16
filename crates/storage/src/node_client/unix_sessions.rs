@@ -445,6 +445,85 @@ impl UnixStorageNodeMetadataCommandSession {
         })
     }
 
+    fn encode_metadata_command_pending_slot_operation_request(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<u8>, StoreError> {
+        encode_metadata_command_pending_slot_request(&StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: self.node_id,
+            cluster_epoch: self.cluster_epoch,
+            pg_id,
+            command: command.clone(),
+            scope_bucket: None,
+            effect_deadline: None,
+            operation_deadline: deadline.map(StorageRpcOperationDeadline::from_instant),
+        })
+        .map_err(|error| {
+            self.rpc_payload_error(
+                "encode metadata command pending slot operation request",
+                error.to_string(),
+            )
+        })
+    }
+
+    fn decode_pending_metadata_command_slot_cleanup_response(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        response: &[u8],
+    ) -> Result<bool, StoreError> {
+        let response =
+            decode_metadata_command_pending_slot_cleanup_response(response).map_err(|error| {
+                self.rpc_payload_error(
+                    "decode metadata command pending slot remove response",
+                    error.to_string(),
+                )
+            })?;
+        match response.outcome {
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(removed) => Ok(removed),
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
+                node_id,
+                pg_id: pending_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_terminal_entry_pending_error(
+                self.node_id,
+                command.id().cluster_epoch(),
+                pg_id,
+                command.id().log_index(),
+                "decode metadata command pending slot remove response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: pending_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+            StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
+                node_id,
+                pg_id: conflict_pg_id,
+                cluster_epoch,
+                log_index,
+            } => Err(metadata_command_terminal_log_conflict_error(
+                self.node_id,
+                command.id().cluster_epoch(),
+                pg_id,
+                command.id().log_index(),
+                "decode metadata command pending slot remove response",
+                |operation, message| self.rpc_payload_error(operation, message),
+                MetadataCommandLogConflictRpcFields {
+                    node_id,
+                    pg_id: conflict_pg_id,
+                    cluster_epoch,
+                    log_index,
+                },
+            )),
+        }
+    }
+
     fn applied_metadata_command_log_entry_hashes_request_until(
         &self,
         command: &MetadataCommandEnvelope,
@@ -1969,59 +2048,32 @@ impl MetadataCommandNodeClient for UnixStorageNodeMetadataCommandSession {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
-        let payload = self.encode_metadata_command_request(pg_id, command)?;
+        let payload =
+            self.encode_metadata_command_pending_slot_operation_request(pg_id, command, None)?;
         let response = self.rpc_request(
             StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
             payload,
         )?;
-        let response =
-            decode_metadata_command_pending_slot_cleanup_response(&response).map_err(|error| {
-                self.rpc_payload_error(
-                    "decode metadata command pending slot remove response",
-                    error.to_string(),
-                )
-            })?;
-        match response.outcome {
-            StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(removed) => Ok(removed),
-            StorageRpcMetadataCommandPendingSlotCleanupOutcome::TerminalEntryPending {
-                node_id,
-                pg_id: pending_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(metadata_command_terminal_entry_pending_error(
-                self.node_id,
-                command.id().cluster_epoch(),
-                pg_id,
-                command.id().log_index(),
-                "decode metadata command pending slot remove response",
-                |operation, message| self.rpc_payload_error(operation, message),
-                MetadataCommandLogConflictRpcFields {
-                    node_id,
-                    pg_id: pending_pg_id,
-                    cluster_epoch,
-                    log_index,
-                },
-            )),
-            StorageRpcMetadataCommandPendingSlotCleanupOutcome::LogConflict {
-                node_id,
-                pg_id: conflict_pg_id,
-                cluster_epoch,
-                log_index,
-            } => Err(metadata_command_terminal_log_conflict_error(
-                self.node_id,
-                command.id().cluster_epoch(),
-                pg_id,
-                command.id().log_index(),
-                "decode metadata command pending slot remove response",
-                |operation, message| self.rpc_payload_error(operation, message),
-                MetadataCommandLogConflictRpcFields {
-                    node_id,
-                    pg_id: conflict_pg_id,
-                    cluster_epoch,
-                    log_index,
-                },
-            )),
-        }
+        self.decode_pending_metadata_command_slot_cleanup_response(pg_id, command, &response)
+    }
+
+    fn remove_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        let payload = self.encode_metadata_command_pending_slot_operation_request(
+            pg_id,
+            command,
+            Some(deadline),
+        )?;
+        let response = self.rpc_request_until(
+            StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+            payload,
+            deadline,
+        )?;
+        self.decode_pending_metadata_command_slot_cleanup_response(pg_id, command, &response)
     }
 
     fn metadata_command_replica_state(

@@ -1554,19 +1554,46 @@ impl UnixStorageNodeClient {
         pg_id: BucketPgId,
         proof: &BucketWriteReservationProof,
     ) -> Result<(), BucketSnapshotLoadError> {
+        self.release_metadata_command_bucket_write_reservation_inner(pg_id, proof, None)
+    }
+
+    fn release_metadata_command_bucket_write_reservation_until(
+        &self,
+        pg_id: BucketPgId,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.release_metadata_command_bucket_write_reservation_inner(pg_id, proof, Some(deadline))
+    }
+
+    fn release_metadata_command_bucket_write_reservation_inner(
+        &self,
+        pg_id: BucketPgId,
+        proof: &BucketWriteReservationProof,
+        deadline: Option<Instant>,
+    ) -> Result<(), BucketSnapshotLoadError> {
         let request = StorageRpcProofReleaseRequest {
             node_id: self.node_id,
             route_cluster_epoch: proof.cluster_epoch,
             pg_id: pg_id.pg_id(),
             proof: proof.clone(),
+            operation_deadline: deadline.map(StorageRpcOperationDeadline::from_instant),
         };
         let payload = encode_proof_release_request(&request).map_err(|error| {
             BucketSnapshotLoadError::Store(
                 self.rpc_payload_error("encode proof release request", error.to_string()),
             )
         })?;
-        let response =
-            self.rpc_request_bucket_snapshot(StorageRpcMessageKind::ProofRelease, payload)?;
+        let response = match deadline {
+            Some(deadline) => self.rpc_request_bucket_snapshot_until(
+                StorageRpcMessageKind::ProofRelease,
+                payload,
+                deadline,
+            )?,
+            None => {
+                self.rpc_request_bucket_snapshot(StorageRpcMessageKind::ProofRelease, payload)?
+            }
+        };
         self.validate_proof_release_response(&response)?;
         Ok(())
     }
@@ -2227,6 +2254,19 @@ impl RetainedBucketWriteReservationRoute for UnixRetainedBucketWriteReservationR
         )?;
         self.client
             .release_metadata_command_bucket_write_reservation(self.pg_id, proof)
+    }
+
+    fn release_metadata_command_bucket_write_reservation_until(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_subject(
+            &proof.bucket,
+            "release metadata command bucket write reservation",
+        )?;
+        self.client
+            .release_metadata_command_bucket_write_reservation_until(self.pg_id, proof, deadline)
     }
 
     fn clear_durable_bucket_write_drain(

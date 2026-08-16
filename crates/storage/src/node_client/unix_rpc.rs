@@ -3527,22 +3527,41 @@ impl UnixStorageNodeClient {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
-        let request = StorageRpcMetadataCommandRequest {
+        self.remove_pending_metadata_command_slot_until_inner(pg_id, command, None)
+    }
+
+    fn remove_pending_metadata_command_slot_until_inner(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Option<Instant>,
+    ) -> Result<bool, StoreError> {
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
             node_id: self.node_id,
             cluster_epoch: self.cluster_epoch,
             pg_id,
             command: command.clone(),
+            scope_bucket: None,
+            effect_deadline: None,
+            operation_deadline: deadline.map(StorageRpcOperationDeadline::from_instant),
         };
-        let payload = encode_metadata_command_request(&request).map_err(|error| {
+        let payload = encode_metadata_command_pending_slot_request(&request).map_err(|error| {
             self.rpc_payload_error(
                 "encode metadata command pending slot remove request",
                 error.to_string(),
             )
         })?;
-        let response = self.rpc_request(
-            StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
-            payload,
-        )?;
+        let response = match deadline {
+            Some(deadline) => self.rpc_request_until(
+                StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+                payload,
+                deadline,
+            )?,
+            None => self.rpc_request(
+                StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
+                payload,
+            )?,
+        };
         let response =
             decode_metadata_command_pending_slot_cleanup_response(&response).map_err(|error| {
                 self.rpc_payload_error(
@@ -4700,6 +4719,15 @@ impl MetadataCommandNodeClient for UnixStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
         UnixStorageNodeClient::remove_pending_metadata_command_slot(self, pg_id, command)
+    }
+
+    fn remove_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        self.remove_pending_metadata_command_slot_until_inner(pg_id, command, Some(deadline))
     }
 
     fn metadata_command_replica_state(

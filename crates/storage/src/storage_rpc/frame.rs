@@ -297,13 +297,13 @@ fn message_kind_request_max_payload_len(
         StorageRpcMessageKind::ClaimRelease => STORAGE_RPC_MAX_CLAIM_RELEASE_PAYLOAD_LEN,
         StorageRpcMessageKind::ProofRelease => {
             STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN
+                + STORAGE_RPC_MAX_OPERATION_DEADLINE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandReplicaState => {
             STORAGE_RPC_MAX_METADATA_COMMAND_STATE_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandAcceptance
         | StorageRpcMessageKind::MetadataCommandAbandonAcceptance
-        | StorageRpcMessageKind::MetadataCommandPendingSlotRemove
         | StorageRpcMessageKind::MetadataCommandAppliedLogHashes
         | StorageRpcMessageKind::MetadataCommandPublicationStart
         | StorageRpcMessageKind::MetadataCommandAbandoned
@@ -319,7 +319,8 @@ fn message_kind_request_max_payload_len(
             STORAGE_RPC_MAX_METADATA_COMMAND_RECOVERY_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandPendingSlotInsert
-        | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert => {
+        | StorageRpcMessageKind::MetadataCommandBucketControlPendingSlotInsert
+        | StorageRpcMessageKind::MetadataCommandPendingSlotRemove => {
             STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN
         }
         StorageRpcMessageKind::MetadataCommandPendingSlotReplace => {

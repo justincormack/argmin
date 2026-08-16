@@ -4,6 +4,10 @@
 use super::*;
 use crate::node_runtime::clients::unix_sessions::UnixStorageNodeMetadataCommandSession;
 use crate::storage_node_server::StorageNodeServerError;
+use crate::storage_rpc::{
+    encode_metadata_command_pending_slot_cleanup_response,
+    StorageRpcMetadataCommandPendingSlotCleanupResponse,
+};
 use std::sync::mpsc;
 
 fn append_stream_segment_command_for_rpc_test(
@@ -2213,6 +2217,65 @@ fn unix_pending_slot_install_carries_the_operation_deadline_to_storage() {
     assert_eq!(effect_deadline.authority_valid_until_ms, u64::MAX);
     assert!(effect_deadline.portable_wall_valid_until_ms >= wall_before);
     assert!(effect_deadline.portable_wall_valid_until_ms <= wall_before + 2_000);
+    join.join().unwrap();
+}
+
+#[test]
+fn unix_pending_slot_remove_carries_the_operation_deadline_to_storage() {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("sock").join("storage.sock");
+    private_socket_dir(socket_path.parent().unwrap());
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let join = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let frame = read_storage_rpc_frame_from(&mut stream).unwrap();
+        assert_eq!(
+            frame.kind,
+            StorageRpcMessageKind::MetadataCommandPendingSlotRemove
+        );
+        let request = decode_metadata_command_pending_slot_request(
+            &frame.payload,
+            &crate::node_runtime::MetadataCommandDecodeAuthority::new(),
+        )
+        .unwrap();
+        request_tx.send(request).unwrap();
+        let payload = encode_metadata_command_pending_slot_cleanup_response(
+            &StorageRpcMetadataCommandPendingSlotCleanupResponse {
+                outcome: StorageRpcMetadataCommandPendingSlotCleanupOutcome::Value(false),
+            },
+        );
+        let response = StorageRpcFrame {
+            request_id: frame.request_id,
+            kind: frame.kind,
+            payload: encode_storage_rpc_success_response(&payload),
+        };
+        write_storage_rpc_frame_to(&mut stream, &response).unwrap();
+    });
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), ClusterEpoch::new(1).unwrap(), socket_path);
+    let command = test_metadata_command(0, 1);
+    let wall_before = crate::clock::current_time_millis();
+    let deadline = Instant::now() + Duration::from_secs(2);
+
+    assert!(
+        !MetadataCommandNodeClient::remove_pending_metadata_command_slot_until(
+            &client,
+            PgId::new(0),
+            &command,
+            deadline,
+        )
+        .unwrap()
+    );
+
+    let request = request_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(request.scope_bucket.is_none());
+    assert!(request.effect_deadline.is_none());
+    let operation_deadline = request
+        .operation_deadline
+        .expect("pending-slot removal must carry its absolute operation deadline");
+    assert!(operation_deadline.portable_wall_valid_until_ms >= wall_before);
+    assert!(operation_deadline.portable_wall_valid_until_ms <= wall_before + 2_000);
     join.join().unwrap();
 }
 

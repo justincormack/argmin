@@ -750,6 +750,48 @@ impl super::StorageCluster {
         Ok(())
     }
 
+    fn abandon_definitively_unapplied_object_metadata_command_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<(), ObjectPgActionError> {
+        self.record_abandoned_metadata_command_to_acting_set_until(command, deadline)
+            .map_err(|error| {
+                super::bucket_snapshot_error_to_object_pg_action_error(error.source)
+            })?;
+        let pending = self
+            .pending_metadata_command_for_bucket_with_route_mode_until(
+                pg_id,
+                bucket,
+                MetadataCommandRouteMode::Normal,
+                command.id().cluster_epoch(),
+                deadline,
+            )
+            .map_err(ObjectPgActionError::Store)?;
+        if pending.as_ref() != Some(command) {
+            return Err(super::conflicting_pending_object_metadata_command(
+                "pending object metadata command changed before abandoned cleanup",
+            ));
+        }
+        self.release_metadata_command_bucket_write_reservation_until(command, deadline)
+            .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+        crate::node_client::require_metadata_command_operation_deadline(deadline)
+            .map_err(ObjectPgActionError::Store)?;
+        let cleanup = self
+            .remove_pending_metadata_command_for_bucket_until(pg_id, bucket, command, deadline)
+            .map_err(ObjectPgActionError::Store)?;
+        if cleanup == PendingMetadataCommandTerminalCleanup::Deferred {
+            return Err(ObjectPgActionError::Store(
+                StoreError::OperationDeadlineExceeded {
+                    context: "remove abandoned object metadata command pending slot",
+                },
+            ));
+        }
+        Ok(())
+    }
+
     fn apply_new_object_metadata_command_for_bucket_inner(
         &self,
         pg_id: PgId,
@@ -1160,6 +1202,23 @@ impl super::StorageCluster {
     ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         let confirmation_deadline =
             Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
+        self.finish_new_object_metadata_command_after_uncertainty_until(
+            pg_id,
+            bucket,
+            command,
+            fallback_error,
+            confirmation_deadline,
+        )
+    }
+
+    pub(super) fn finish_new_object_metadata_command_after_uncertainty_until(
+        &self,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        fallback_error: ObjectPgActionError,
+        confirmation_deadline: Instant,
+    ) -> Result<NewObjectMetadataCommandApplyOutcome, ObjectPgActionError> {
         match self
             .metadata_command_publication_state_on_acting_set_until(
                 pg_id,
@@ -1183,12 +1242,21 @@ impl super::StorageCluster {
                 Err(Self::object_metadata_command_irrevocable_error(command))
             }
             MetadataCommandPublicationState::NotPublished => {
-                self.abandon_definitively_unapplied_object_metadata_command(
-                    pg_id,
-                    bucket,
-                    command,
-                    None,
-                )?;
+                if let Err(error) = self
+                    .abandon_definitively_unapplied_object_metadata_command_until(
+                        pg_id,
+                        bucket,
+                        command,
+                        confirmation_deadline,
+                    )
+                {
+                    if object_pg_action_error_is_retryable_command_observation(&error) {
+                        return Err(Self::object_metadata_command_outcome_unconfirmed_error(
+                            command,
+                        ));
+                    }
+                    return Err(error);
+                }
                 Ok(NewObjectMetadataCommandApplyOutcome::Reinspect(fallback_error))
             }
         }
@@ -1199,6 +1267,17 @@ impl super::StorageCluster {
     ) -> ObjectPgActionError {
         let id = command.id();
         ObjectPgActionError::Store(StoreError::MetadataCommandIrrevocableConvergencePending {
+            pg_id: id.pg_id().get(),
+            cluster_epoch: id.cluster_epoch(),
+            log_index: id.log_index().get(),
+        })
+    }
+
+    fn object_metadata_command_outcome_unconfirmed_error(
+        command: &MetadataCommandEnvelope,
+    ) -> ObjectPgActionError {
+        let id = command.id();
+        ObjectPgActionError::Store(StoreError::MetadataCommandOutcomeUnconfirmed {
             pg_id: id.pg_id().get(),
             cluster_epoch: id.cluster_epoch(),
             log_index: id.log_index().get(),

@@ -3262,6 +3262,27 @@ impl StorageNodeRetainedMetadataCommandProofRoute<'_> {
             .release_metadata_command_bucket_write_reservation(self.proof)
             .map_err(StorageNodeBucketRouteError::Bucket)
     }
+
+    fn release_until(self, deadline: Instant) -> Result<(), StorageNodeBucketRouteError> {
+        self.require_valid_now()?;
+        crate::node_client::require_metadata_command_operation_deadline(deadline)
+            .map_err(BucketSnapshotLoadError::Store)
+            .map_err(StorageNodeBucketRouteError::Bucket)?;
+        let local_client = LocalStorageNodeClient::new(
+            self.handler.config.node_id,
+            Arc::clone(&self.handler.node),
+        );
+        let route = RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route_until(
+            &local_client,
+            self.pg_id,
+            &self.proof.bucket,
+            deadline,
+        )
+        .map_err(StorageNodeBucketRouteError::Bucket)?;
+        route
+            .release_metadata_command_bucket_write_reservation_until(self.proof, deadline)
+            .map_err(StorageNodeBucketRouteError::Bucket)
+    }
 }
 
 impl StorageNodeRetainedBucketWriteDrainRoute<'_> {

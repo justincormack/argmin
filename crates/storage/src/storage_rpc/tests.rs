@@ -218,6 +218,11 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 18, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 51, 51, 144, 52, 159, 41, 132, 0, 97, 98, 99,
         ];
+        const V19_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 19, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 34, 192, 175, 160, 164, 153, 253, 247, 97, 98, 99,
+        ];
         let bytes = encode_storage_rpc_frame(
             0x0102_0304_0506_0708,
             StorageRpcMessageKind::ShardWrite,
@@ -225,10 +230,14 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bytes, V18_FRAME);
+        assert_eq!(bytes, V19_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(V18_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(18))
         );
     }
 
@@ -275,8 +284,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(17))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(19)),
-            Err(StorageRpcFrameError::UnsupportedVersion(19))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(18)),
+            Err(StorageRpcFrameError::UnsupportedVersion(18))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(20)),
+            Err(StorageRpcFrameError::UnsupportedVersion(20))
         );
     }
 
@@ -880,6 +893,52 @@ mod tests {
             STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN,
             STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN + envelope_overhead,
             "the registered frame cap must include the largest encoded deadline envelope"
+        );
+    }
+
+    #[test]
+    fn storage_rpc_v19_pending_slot_remove_deadline_payload_is_stable() {
+        const V19_PENDING_SLOT_REMOVE_PAYLOAD: &[u8] = &[
+            7, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 201, 112, 67, 123, 254, 81, 94,
+            45, 69, 0, 0, 0, 23, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 109, 101, 116, 97,
+            100, 97, 116, 97, 45, 99, 111, 109, 109, 97, 110, 100, 8, 0, 1, 0, 0, 0, 0, 0,
+            0, 0, 3, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 21, 0, 6, 0, 0, 0, 98, 117, 99,
+            107, 101, 116, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 8, 7, 6, 5, 4, 3, 2, 1,
+        ];
+        let command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::INITIAL,
+                PgId::new(3),
+                MetadataCommandLogIndex::new(9).unwrap(),
+            ),
+            MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                AdvanceMultipartCompletionBarrierCommand {
+                    bucket: BucketName::try_from("bucket").unwrap(),
+                    barrier_sequence: 11,
+                },
+            ),
+        );
+        let request = StorageRpcMetadataCommandPendingSlotRequest {
+            node_id: NodeId::new(7),
+            cluster_epoch: command.id().cluster_epoch(),
+            pg_id: command.id().pg_id(),
+            command,
+            scope_bucket: None,
+            effect_deadline: None,
+            operation_deadline: Some(StorageRpcOperationDeadline {
+                portable_wall_valid_until_ms: 0x0102_0304_0506_0708,
+            }),
+        };
+
+        let encoded = encode_metadata_command_pending_slot_request(&request).unwrap();
+        assert_eq!(encoded, V19_PENDING_SLOT_REMOVE_PAYLOAD);
+        assert_eq!(
+            decode_metadata_command_pending_slot_request(
+                V19_PENDING_SLOT_REMOVE_PAYLOAD,
+                &metadata_command_decode_authority_for_test(),
+            )
+            .unwrap(),
+            request
         );
     }
 
@@ -3188,8 +3247,11 @@ mod tests {
             ),
             (
                 StorageRpcMessageKind::ProofRelease,
-                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN + 1,
-                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN
+                    + STORAGE_RPC_MAX_OPERATION_DEADLINE_PAYLOAD_LEN
+                    + 1,
+                STORAGE_RPC_MAX_BUCKET_WRITE_RESERVATION_PROOF_PAYLOAD_LEN
+                    + STORAGE_RPC_MAX_OPERATION_DEADLINE_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::MetadataCommandReplicaState,
@@ -3213,8 +3275,8 @@ mod tests {
             ),
             (
                 StorageRpcMessageKind::MetadataCommandPendingSlotRemove,
-                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN + 1,
-                STORAGE_RPC_MAX_METADATA_COMMAND_REQUEST_PAYLOAD_LEN,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN + 1,
+                STORAGE_RPC_MAX_METADATA_COMMAND_PENDING_SLOT_REQUEST_PAYLOAD_LEN,
             ),
             (
                 StorageRpcMessageKind::MetadataCommandAppliedLogHashes,
@@ -3957,15 +4019,28 @@ mod tests {
     }
 
     #[test]
-    fn proof_release_request_carries_full_reservation_identity() {
+    fn storage_rpc_v19_proof_release_deadline_payload_is_stable() {
+        const V19_PROOF_RELEASE_PAYLOAD: &[u8] = &[
+            7, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 12, 0, 0, 0, 98, 117, 99,
+            107, 101, 116, 45, 112, 114, 111, 111, 102, 14, 0, 0, 0, 114, 101, 115, 101, 114,
+            118, 97, 116, 105, 111, 110, 45, 105, 100, 11, 0, 0, 0, 111, 119, 110, 101, 114,
+            45, 116, 111, 107, 101, 110, 1, 0, 0, 0, 0, 0, 0, 0, 31, 0, 0, 0, 0, 0, 0, 0,
+            37, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 112, 117, 116, 45, 111, 98, 106, 101, 99,
+            116, 41, 0, 0, 0, 0, 0, 0, 0, 43, 0, 0, 0, 0, 0, 0, 0, 1, 11, 0, 0, 0, 107,
+            101, 121, 47, 99, 111, 110, 116, 101, 120, 116, 1, 8, 7, 6, 5, 4, 3, 2, 1,
+        ];
         let request = StorageRpcProofReleaseRequest {
             node_id: NodeId::new(7),
             route_cluster_epoch: ClusterEpoch::new(2).unwrap(),
             pg_id: PgId::new(3),
             proof: test_bucket_write_reservation_proof(),
+            operation_deadline: Some(StorageRpcOperationDeadline {
+                portable_wall_valid_until_ms: 0x0102_0304_0506_0708,
+            }),
         };
 
         let bytes = encode_proof_release_request(&request).unwrap();
+        assert_eq!(bytes, V19_PROOF_RELEASE_PAYLOAD);
         let decoded = decode_proof_release_request(&bytes).unwrap();
 
         assert_eq!(decoded, request);

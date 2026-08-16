@@ -2979,6 +2979,7 @@ pub(crate) struct StorageRpcProofReleaseRequest {
     pub(crate) route_cluster_epoch: ClusterEpoch,
     pub(crate) pg_id: PgId,
     pub(crate) proof: BucketWriteReservationProof,
+    pub(crate) operation_deadline: Option<StorageRpcOperationDeadline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

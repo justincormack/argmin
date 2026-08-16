@@ -185,7 +185,10 @@ fn witnessed_confirmation_deadline_does_not_start_primary_apply_after_oversleep(
     let hook = cluster.test_install_after_metadata_command_apply_hook(Arc::new(
         move |node_id, _command| {
             if node_id == NodeId::new(0) && !overslept_hook.swap(true, Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(1_050));
+                std::thread::sleep(
+                    crate::cluster::request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET
+                        + Duration::from_millis(50),
+                );
             }
             Ok(())
         },

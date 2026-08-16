@@ -2547,6 +2547,27 @@ impl RetainedBucketWriteReservationNodeClient for LocalStorageNodeClient {
             bucket: bucket.clone(),
         }))
     }
+
+    fn open_retained_bucket_write_reservation_route_until(
+        &self,
+        pg_id: BucketPgId,
+        bucket: &BucketName,
+        deadline: Instant,
+    ) -> Result<Box<dyn RetainedBucketWriteReservationRoute + '_>, BucketSnapshotLoadError> {
+        if self.storage_node.bucket_metadata_pg_for(bucket) != pg_id {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "open retained bucket write reservation route",
+            }
+            .into());
+        }
+        self.storage_node.require_open_pg(pg_id.get())?;
+        require_metadata_command_operation_deadline(deadline)?;
+        Ok(Box::new(LocalRetainedBucketWriteReservationRoute {
+            client: self,
+            pg_id,
+            bucket: bucket.clone(),
+        }))
+    }
 }
 
 impl RetainedBucketWriteReservationRoute for LocalRetainedBucketWriteReservationRoute<'_> {
@@ -2582,6 +2603,35 @@ impl RetainedBucketWriteReservationRoute for LocalRetainedBucketWriteReservation
                 .into());
             }
         }
+        Ok(PgMetadataStore::release_metadata_command_bucket_write_reservation(&*pg, proof)?)
+    }
+
+    fn release_metadata_command_bucket_write_reservation_until(
+        &self,
+        proof: &BucketWriteReservationProof,
+        deadline: Instant,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        self.require_subject(
+            &proof.bucket,
+            "release metadata command bucket write reservation",
+        )?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)?;
+        if let Some(record) = PgMetadataStore::durable_bucket_write_reservation(
+            &*pg,
+            &proof.bucket,
+            &proof.reservation_id,
+        )? {
+            if !proof.matches_record(&record) {
+                return Err(MetadataError::BucketWriteReservationConflict {
+                    reservation_id: proof.reservation_id.clone(),
+                }
+                .into());
+            }
+        }
+        require_metadata_command_operation_deadline(deadline)?;
         Ok(PgMetadataStore::release_metadata_command_bucket_write_reservation(&*pg, proof)?)
     }
 
@@ -5958,6 +6008,17 @@ impl LocalStorageNodeClient {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         pg.remove_pending_metadata_command_slot(self.node_id.as_u32(), command)
     }
+
+    fn remove_pending_metadata_command_slot_inner_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        let pg = self.storage_node.get_pg_until(pg_id.get(), deadline)?;
+        require_metadata_command_operation_deadline(deadline)?;
+        pg.remove_pending_metadata_command_slot(self.node_id.as_u32(), command)
+    }
 }
 
 impl MetadataCommandInspectionNodeClient for LocalStorageNodeClient {
@@ -7154,6 +7215,15 @@ impl MetadataCommandNodeClient for LocalStorageNodeClient {
         command: &MetadataCommandEnvelope,
     ) -> Result<bool, StoreError> {
         self.remove_pending_metadata_command_slot_inner(pg_id, command)
+    }
+
+    fn remove_pending_metadata_command_slot_until(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        deadline: Instant,
+    ) -> Result<bool, StoreError> {
+        self.remove_pending_metadata_command_slot_inner_until(pg_id, command, deadline)
     }
 
     fn metadata_command_replica_state(
