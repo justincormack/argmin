@@ -9,7 +9,6 @@ use crate::control_plane::{
     PendingMetadataCommandRecoveryTask,
 };
 use crate::BucketSnapshotLoadError;
-use crate::ObjectPgActionError;
 use crate::StorageClusterRouteHandle;
 
 struct UnrelatedFullMapFailureSource<S> {
@@ -762,6 +761,248 @@ fn refresh_recovery_clears_zero_apply_fully_applied_bucket_command() {
 }
 
 #[test]
+fn refresh_recovery_does_not_count_published_command_with_trailing_gap_as_recovered() {
+    let tmp = test_util::tempdir();
+    let mut fixture = HistoricalRouteRecoveryFixture::open(
+        tmp.path(),
+        "historical-published-pending-recovery-count",
+    );
+    let first_bucket = BucketName::new("historical-pending-gap-first").unwrap();
+    let pending_bucket = BucketName::new("historical-pending-gap-second").unwrap();
+    let first = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        1,
+        first_bucket,
+    );
+    let command = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        2,
+        pending_bucket.clone(),
+    );
+
+    for node_id in [NodeId::new(1), NodeId::new(0)] {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &first)
+            .unwrap();
+    }
+    let primary = fixture
+        .active_map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .get_pg(fixture.pg_id.get())
+        .unwrap();
+    primary
+        .try_insert_pending_metadata_command_slot(
+            NodeId::new(0).as_u32(),
+            &command,
+            Some(&pending_bucket),
+        )
+        .unwrap();
+    drop(primary);
+    for node_id in [NodeId::new(1), NodeId::new(0)] {
+        let pg = fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+    }
+
+    let pending = fixture.authorize_pending_recovery(&command);
+    assert_eq!(fixture.recover(pending), 0);
+    assert_eq!(
+        fixture
+            .cluster
+            .drain_pending_metadata_commands_for_current_map()
+            .unwrap(),
+        0,
+        "fallback recovery must not count a retained published command as drained"
+    );
+    let primary = fixture
+        .active_map
+        .metadata_pg_primary_node(fixture.active_epoch, fixture.pg_id)
+        .unwrap();
+    assert_eq!(
+        primary
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap()
+            .pending_metadata_command_envelope(primary.node_id().as_u32(), fixture.active_epoch,)
+            .unwrap(),
+        Some(command),
+        "published command with a trailing gap must remain reported as pending"
+    );
+}
+
+fn seed_fully_applied_pending_bucket_command(
+    fixture: &HistoricalRouteRecoveryFixture,
+    bucket: BucketName,
+) -> MetadataCommandEnvelope {
+    let command = create_bucket_metadata_command_at_epoch(
+        fixture.active_epoch,
+        fixture.pg_id,
+        1,
+        bucket.clone(),
+    );
+    let primary = fixture
+        .active_map
+        .metadata_pg_primary_node(fixture.active_epoch, fixture.pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(fixture.pg_id.get())
+        .unwrap()
+        .try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            &command,
+            Some(&bucket),
+        )
+        .unwrap();
+    for node_id in [NodeId::new(1), NodeId::new(0), NodeId::new(2)] {
+        fixture
+            .active_map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(fixture.pg_id.get())
+            .unwrap()
+            .apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+    }
+    command
+}
+
+fn assert_fixture_pending_command(
+    fixture: &HistoricalRouteRecoveryFixture,
+    expected: Option<&MetadataCommandEnvelope>,
+) {
+    let primary = fixture
+        .active_map
+        .metadata_pg_primary_node(fixture.active_epoch, fixture.pg_id)
+        .unwrap();
+    let pending = primary
+        .storage_node()
+        .get_pg(fixture.pg_id.get())
+        .unwrap()
+        .pending_metadata_command_envelope(primary.node_id().as_u32(), fixture.active_epoch)
+        .unwrap();
+    assert_eq!(pending.as_ref(), expected);
+}
+
+#[test]
+fn recovery_accounting_does_not_count_applied_command_with_reservation_cleanup_deferred() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let mut fixture = HistoricalRouteRecoveryFixture::open(
+        tmp.path(),
+        "historical-reservation-cleanup-pending-count",
+    );
+    let command = seed_fully_applied_pending_bucket_command(
+        &fixture,
+        BucketName::new("historical-reservation-cleanup-pending").unwrap(),
+    );
+    let checksum = command.checksum_crc64();
+    let hook = fixture
+        .cluster
+        .test_install_global_metadata_command_terminal_reservation_release_hook(Arc::new(
+            move |candidate| {
+                if candidate.checksum_crc64() == checksum {
+                    return Err(BucketSnapshotLoadError::Store(StoreError::Io {
+                        context: "injected terminal reservation cleanup deferral",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "injected terminal reservation cleanup deferral",
+                        ),
+                    }));
+                }
+                Ok(())
+            },
+        ));
+
+    let pending = fixture.authorize_pending_recovery(&command);
+    assert_eq!(
+        fixture.recover(pending),
+        0,
+        "reported recovery must not count a command whose reservation cleanup was deferred"
+    );
+    assert_eq!(
+        fixture
+            .cluster
+            .drain_pending_metadata_commands_for_current_map()
+            .unwrap(),
+        0,
+        "recovery must not count a command whose reservation cleanup was deferred"
+    );
+    assert_fixture_pending_command(&fixture, Some(&command));
+
+    drop(hook);
+    assert_eq!(
+        fixture
+            .cluster
+            .drain_pending_metadata_commands_for_current_map()
+            .unwrap(),
+        1
+    );
+    assert_fixture_pending_command(&fixture, None);
+}
+
+#[test]
+fn recovery_accounting_does_not_count_applied_command_with_slot_removal_deferred() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let mut fixture =
+        HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-slot-removal-pending-count");
+    let command = seed_fully_applied_pending_bucket_command(
+        &fixture,
+        BucketName::new("historical-slot-removal-pending").unwrap(),
+    );
+    let checksum = command.checksum_crc64();
+    let hook = fixture
+        .cluster
+        .test_install_global_metadata_command_terminal_slot_removal_hook(Arc::new(
+            move |candidate| candidate.checksum_crc64() == checksum,
+        ));
+
+    let pending = fixture.authorize_pending_recovery(&command);
+    assert_eq!(
+        fixture.recover(pending),
+        0,
+        "reported recovery must not count a command whose pending-slot removal was deferred"
+    );
+    assert_eq!(
+        fixture
+            .cluster
+            .drain_pending_metadata_commands_for_current_map()
+            .unwrap(),
+        0,
+        "recovery must not count a command whose pending-slot removal was deferred"
+    );
+    assert_fixture_pending_command(&fixture, Some(&command));
+
+    drop(hook);
+    assert_eq!(
+        fixture
+            .cluster
+            .drain_pending_metadata_commands_for_current_map()
+            .unwrap(),
+        1
+    );
+    assert_fixture_pending_command(&fixture, None);
+}
+
+#[test]
 fn refresh_recovery_reissues_zero_apply_bucket_command_from_historical_active_route() {
     let tmp = test_util::tempdir();
     let mut fixture = HistoricalRouteRecoveryFixture::open(tmp.path(), "historical-bucket-reissue");
@@ -1274,21 +1515,23 @@ fn reissued_bucket_command_waiter_preserves_published_lineage_after_budget_expir
         .for_operation("test_reissued_bucket_command_waiter")
         .for_pg(pg_id);
     waiter_budget.expire_for_test();
-    let error = cluster
+    let outcome = cluster
         .finish_pending_metadata_command_to_acting_set_with_work_budget(
             pg_id,
             &stale,
             false,
             &mut waiter_budget,
         )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        BucketSnapshotLoadError::Store(StoreError::MetadataCommandIrrevocableConvergencePending {
-            log_index: 2,
-            ..
-        })
-    ));
+        .unwrap();
+    assert_eq!(
+        outcome,
+        PendingMetadataCommandOutcome::PublishedPendingRecovery
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &second_bucket),
+        Some(replacement),
+        "published success must retain the slot for trailing recovery"
+    );
 
     trailing_release_tx.send(()).unwrap();
     assert_eq!(
@@ -1395,20 +1638,22 @@ fn reissued_object_command_transfers_owner_and_stale_waiter_lineage() {
         .for_operation("test_reissued_object_command_stale_waiter")
         .for_pg(pg_id);
     waiter_budget.expire_for_test();
-    let error = cluster
+    let outcome = cluster
         .drain_pending_metadata_command_with_recovery_gate_and_work_budget(
             pg_id,
             &stale,
             &mut waiter_budget,
         )
-        .unwrap_err();
-    assert!(matches!(
-        error,
-        ObjectPgActionError::Store(StoreError::MetadataCommandIrrevocableConvergencePending {
-            log_index,
-            ..
-        }) if log_index == replacement_index
-    ));
+        .unwrap();
+    assert_eq!(
+        outcome,
+        PendingMetadataCommandOutcome::PublishedPendingRecovery
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(replacement),
+        "published success must retain the object-command slot for trailing recovery"
+    );
 
     trailing_release_tx.send(()).unwrap();
     assert_eq!(

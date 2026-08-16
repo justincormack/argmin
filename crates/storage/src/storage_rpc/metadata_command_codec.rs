@@ -1164,6 +1164,20 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
             put_string(&mut out, session_id.as_str());
             put_string(&mut out, upload_id.as_str());
         }
+        StorageRpcMetadataCommandStateOutcome::LogGap {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+            expected_log_index,
+        } => {
+            put_u8(&mut out, 8);
+            put_u32(&mut out, node_id);
+            put_u32(&mut out, pg_id);
+            put_u64(&mut out, cluster_epoch.get());
+            put_u64(&mut out, log_index);
+            put_u64(&mut out, expected_log_index);
+        }
     }
     out
 }
@@ -1240,6 +1254,13 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
         7 => StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
             session_id: decoder.read_session_id()?,
             upload_id: decoder.read_upload_id()?,
+        },
+        8 => StorageRpcMetadataCommandStateOutcome::LogGap {
+            node_id: decoder.read_u32()?,
+            pg_id: decoder.read_u32()?,
+            cluster_epoch: decoder.read_cluster_epoch()?,
+            log_index: decoder.read_u64()?,
+            expected_log_index: decoder.read_u64()?,
         },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(

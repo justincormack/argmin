@@ -648,15 +648,47 @@ fn conflicting_pending_object_metadata_command(context: &'static str) -> ObjectP
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PendingMetadataCommandOutcome {
     Applied,
+    PublishedPendingRecovery,
     Abandoned,
+    TerminalCleanupPending { applied: bool },
     RetryPartialExactConflict,
 }
 
 impl PendingMetadataCommandOutcome {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Applied | Self::Abandoned)
+    }
+
+    fn is_logically_applied(self) -> bool {
+        matches!(
+            self,
+            Self::Applied
+                | Self::PublishedPendingRecovery
+                | Self::TerminalCleanupPending { applied: true }
+        )
+    }
+
+    fn is_logically_abandoned(self) -> bool {
+        matches!(
+            self,
+            Self::Abandoned | Self::TerminalCleanupPending { applied: false }
+        )
+    }
+
+    fn retains_pending_slot(self) -> bool {
+        matches!(
+            self,
+            Self::PublishedPendingRecovery | Self::TerminalCleanupPending { .. }
+        )
+    }
+
     fn metric_label(self) -> &'static str {
         match self {
             Self::Applied => "applied",
+            Self::PublishedPendingRecovery => "published_pending_recovery",
             Self::Abandoned => "abandoned",
+            Self::TerminalCleanupPending { applied: true } => "applied_cleanup_pending",
+            Self::TerminalCleanupPending { applied: false } => "abandoned_cleanup_pending",
             Self::RetryPartialExactConflict => "retry_partial_exact_conflict",
         }
     }

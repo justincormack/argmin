@@ -421,6 +421,36 @@ impl super::StorageCluster {
         MetadataCommandTerminalReservationReleaseTestHookGuard { scope_id }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_global_metadata_command_terminal_reservation_release_hook(
+        &self,
+        hook: MetadataCommandTerminalReservationReleaseTestHook,
+    ) -> MetadataCommandTerminalReservationReleaseTestHookGuard {
+        let slot = METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(GLOBAL_METADATA_COMMAND_TEST_HOOK_SCOPE_ID, hook);
+        MetadataCommandTerminalReservationReleaseTestHookGuard {
+            scope_id: GLOBAL_METADATA_COMMAND_TEST_HOOK_SCOPE_ID,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_global_metadata_command_terminal_slot_removal_hook(
+        &self,
+        hook: MetadataCommandTerminalSlotRemovalTestHook,
+    ) -> MetadataCommandTerminalSlotRemovalTestHookGuard {
+        let slot = METADATA_COMMAND_TERMINAL_SLOT_REMOVAL_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(GLOBAL_METADATA_COMMAND_TEST_HOOK_SCOPE_ID, hook);
+        MetadataCommandTerminalSlotRemovalTestHookGuard {
+            scope_id: GLOBAL_METADATA_COMMAND_TEST_HOOK_SCOPE_ID,
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_install_before_metadata_command_apply_context_hook(
         &self,
@@ -668,13 +698,20 @@ impl super::StorageCluster {
                     &mut work_budget,
                 )?;
             match outcome {
-                FinishPendingMetadataCommandResult::Applied => {}
+                FinishPendingMetadataCommandResult::Applied
+                | FinishPendingMetadataCommandResult::PublishedPendingRecovery => {}
+                FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                    applied: true,
+                } => {}
                 FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
                     return Err(conflicting_pending_metadata_command(
                         "retryable partial pending create bucket command",
                     ));
                 }
-                FinishPendingMetadataCommandResult::Abandoned => continue,
+                FinishPendingMetadataCommandResult::Abandoned
+                | FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                    applied: false,
+                } => continue,
             }
 
             let MetadataCommandPayload::CreateBucket(create) = command.payload() else {
@@ -1054,12 +1091,21 @@ impl super::StorageCluster {
                                 deadline,
                             )
                             .unwrap_or(false);
+                    let exact_dependency_gap = progress
+                        == MetadataCommandApplyProgress::Published
+                        && Self::metadata_command_log_gap_matches(
+                            command,
+                            &error.failure.source,
+                        );
                     let definitive_apply_failure =
                         apply_error_kind == Some(MetadataCommandApplyErrorKind::Definitive)
                             && !can_handoff
-                            && !exact_conflict_retryable;
+                            && !exact_conflict_retryable
+                            && !exact_dependency_gap;
                     if progress == MetadataCommandApplyProgress::Published
-                        && (can_handoff || publication_may_have_applied)
+                        && (can_handoff
+                            || publication_may_have_applied
+                            || exact_dependency_gap)
                         && !definitive_apply_failure
                     {
                         self.emit_metadata_command_recovery_outcome_for_command(
@@ -2136,9 +2182,15 @@ impl super::StorageCluster {
             FinishPendingMetadataCommandResult::Applied => {
                 Ok(super::PendingMetadataCommandOutcome::Applied)
             }
+            FinishPendingMetadataCommandResult::PublishedPendingRecovery => Ok(
+                super::PendingMetadataCommandOutcome::PublishedPendingRecovery,
+            ),
             FinishPendingMetadataCommandResult::Abandoned => {
                 Ok(super::PendingMetadataCommandOutcome::Abandoned)
             }
+            FinishPendingMetadataCommandResult::TerminalCleanupPending { applied } => Ok(
+                super::PendingMetadataCommandOutcome::TerminalCleanupPending { applied },
+            ),
             FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
                 unreachable!("partial exact conflict retry is disabled for this caller")
             }
@@ -2172,9 +2224,15 @@ impl super::StorageCluster {
             FinishPendingMetadataCommandResult::Applied => {
                 Ok(super::PendingMetadataCommandOutcome::Applied)
             }
+            FinishPendingMetadataCommandResult::PublishedPendingRecovery => Ok(
+                super::PendingMetadataCommandOutcome::PublishedPendingRecovery,
+            ),
             FinishPendingMetadataCommandResult::Abandoned => {
                 Ok(super::PendingMetadataCommandOutcome::Abandoned)
             }
+            FinishPendingMetadataCommandResult::TerminalCleanupPending { applied } => Ok(
+                super::PendingMetadataCommandOutcome::TerminalCleanupPending { applied },
+            ),
             FinishPendingMetadataCommandResult::RetryPartialExactConflict => Ok(
                 super::PendingMetadataCommandOutcome::RetryPartialExactConflict,
             ),
@@ -2296,7 +2354,16 @@ impl super::StorageCluster {
                         &command,
                         match outcome {
                             FinishPendingMetadataCommandResult::Applied => "applied",
+                            FinishPendingMetadataCommandResult::PublishedPendingRecovery => {
+                                "published_pending_recovery"
+                            }
                             FinishPendingMetadataCommandResult::Abandoned => "abandoned",
+                            FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                                applied: true,
+                            } => "applied_cleanup_pending",
+                            FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                                applied: false,
+                            } => "abandoned_cleanup_pending",
                             FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
                                 "retry_partial_exact_conflict"
                             }
@@ -2320,14 +2387,21 @@ impl super::StorageCluster {
                     if let Err(error) =
                         work_budget.check("metadata command recovery waiter budget exhausted")
                     {
-                        return Err(self
+                        return match self
                             .classify_bucket_metadata_command_budget_exhaustion(
                                 pg_id,
                                 &command,
                                 policy.convergence_requirement,
                                 error,
                             )?
-                            .into());
+                        {
+                            MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
+                                Ok(FinishPendingMetadataCommandResult::PublishedPendingRecovery)
+                            }
+                            MetadataCommandBudgetExhaustionOutcome::Error(error) => {
+                                Err(error.into())
+                            }
+                        };
                     }
                     let waiter_outcome = self
                         .pending_command_recovery_waiter_outcome_with_route_mode_until(
@@ -2374,14 +2448,21 @@ impl super::StorageCluster {
                     if let Err(error) = work_budget.sleep_after_contention(
                         "metadata command recovery gate retry budget exhausted",
                     ) {
-                        return Err(self
+                        return match self
                             .classify_bucket_metadata_command_budget_exhaustion(
                                 pg_id,
                                 &command,
                                 policy.convergence_requirement,
                                 error,
                             )?
-                            .into());
+                        {
+                            MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
+                                Ok(FinishPendingMetadataCommandResult::PublishedPendingRecovery)
+                            }
+                            MetadataCommandBudgetExhaustionOutcome::Error(error) => {
+                                Err(error.into())
+                            }
+                        };
                     }
                 }
             }
@@ -2394,20 +2475,39 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         convergence_requirement: MetadataCommandConvergenceRequirement,
         budget_error: StoreError,
-    ) -> Result<StoreError, BucketSnapshotLoadError> {
+    ) -> Result<MetadataCommandBudgetExhaustionOutcome, BucketSnapshotLoadError> {
         let confirmation_deadline =
             Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
-        if self.metadata_command_publication_state_on_acting_set_until(
+        let state = self.metadata_command_publication_state_on_acting_set_until(
             pg_id,
             command,
             MetadataCommandRouteMode::Normal,
             confirmation_deadline,
-        )? == MetadataCommandPublicationState::NotPublished
+        )?;
+        Ok(Self::metadata_command_budget_exhaustion_outcome(
+            command,
+            convergence_requirement,
+            state,
+            budget_error,
+        ))
+    }
+
+    fn metadata_command_budget_exhaustion_outcome(
+        command: &MetadataCommandEnvelope,
+        convergence_requirement: MetadataCommandConvergenceRequirement,
+        state: MetadataCommandPublicationState,
+        budget_error: StoreError,
+    ) -> MetadataCommandBudgetExhaustionOutcome {
+        if state == MetadataCommandPublicationState::NotPublished {
+            return MetadataCommandBudgetExhaustionOutcome::Error(budget_error);
+        }
+        if state == MetadataCommandPublicationState::Published
+            && convergence_requirement == MetadataCommandConvergenceRequirement::AllowRecoveryHandoff
         {
-            return Ok(budget_error);
+            return MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery;
         }
         let id = command.id();
-        Ok(match convergence_requirement {
+        MetadataCommandBudgetExhaustionOutcome::Error(match convergence_requirement {
             MetadataCommandConvergenceRequirement::AllowRecoveryHandoff => {
                 StoreError::MetadataCommandIrrevocableConvergencePending {
                     pg_id: id.pg_id().get(),
@@ -2445,35 +2545,26 @@ impl super::StorageCluster {
             if let Err(error) = work_budget.check("metadata command apply retry budget exhausted") {
                 let confirmation_deadline =
                     Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
-                if self
+                let state = self
                     .metadata_command_publication_state_on_acting_set_until(
                         pg_id,
                         &command,
                         route_mode,
                         confirmation_deadline,
-                    )?
-                    != MetadataCommandPublicationState::NotPublished
-                {
-                    let id = command.id();
-                    return Err(match policy.convergence_requirement {
-                        MetadataCommandConvergenceRequirement::AllowRecoveryHandoff => {
-                            StoreError::MetadataCommandIrrevocableConvergencePending {
-                                pg_id: id.pg_id().get(),
-                                cluster_epoch: id.cluster_epoch(),
-                                log_index: id.log_index().get(),
-                            }
-                        }
-                        MetadataCommandConvergenceRequirement::RequireAllReplicas => {
-                            StoreError::MetadataCommandDependencyConvergencePending {
-                                pg_id: id.pg_id().get(),
-                                cluster_epoch: id.cluster_epoch(),
-                                log_index: id.log_index().get(),
-                            }
-                        }
+                    )?;
+                match Self::metadata_command_budget_exhaustion_outcome(
+                    &command,
+                    policy.convergence_requirement,
+                    state,
+                    error,
+                ) {
+                    MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
+                        return Ok(FinishPendingMetadataCommandResult::PublishedPendingRecovery);
                     }
-                    .into());
+                    MetadataCommandBudgetExhaustionOutcome::Error(error) => {
+                        return Err(error.into());
+                    }
                 }
-                return Err(error.into());
             }
             let command_bucket = command.bucket_name();
             let abandoned_on_acting_set = if apply_progress.is_abortable() {
@@ -2515,7 +2606,7 @@ impl super::StorageCluster {
                 }
                 .map_err(|error| error.source)?;
                 self.release_metadata_command_bucket_write_reservation(&command)?;
-                match route_mode {
+                let cleanup = match route_mode {
                     MetadataCommandRouteMode::Normal => self
                         .remove_pending_metadata_command_for_bucket_with_work_budget(
                             pg_id,
@@ -2532,7 +2623,11 @@ impl super::StorageCluster {
                             work_budget,
                         ),
                 }?;
-                return Ok(FinishPendingMetadataCommandResult::Abandoned);
+                return Ok(if cleanup == PendingMetadataCommandTerminalCleanup::Deferred {
+                    FinishPendingMetadataCommandResult::TerminalCleanupPending { applied: false }
+                } else {
+                    FinishPendingMetadataCommandResult::Abandoned
+                });
             }
             let apply_result = self.apply_metadata_command_to_acting_set_with_route_mode_until_inner(
                 &command,
@@ -2559,13 +2654,24 @@ impl super::StorageCluster {
                         }
                         .into());
                     }
-                    if outcome == MetadataCommandApplyOutcome::Converged
-                        && self
-                        .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
-                            pg_id, &command,
-                        )?
-                    {
-                        match route_mode {
+                    if outcome == MetadataCommandApplyOutcome::PublishedPendingRecovery {
+                        return Ok(
+                            FinishPendingMetadataCommandResult::PublishedPendingRecovery,
+                        );
+                    }
+                    if outcome == MetadataCommandApplyOutcome::Converged {
+                        if !self
+                            .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
+                                pg_id, &command,
+                            )?
+                        {
+                            return Ok(
+                                FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                                    applied: true,
+                                },
+                            );
+                        }
+                        let cleanup = match route_mode {
                             MetadataCommandRouteMode::Normal => self
                                 .remove_pending_metadata_command_for_bucket_with_work_budget(
                                     pg_id,
@@ -2582,6 +2688,13 @@ impl super::StorageCluster {
                                     work_budget,
                                 ),
                         }?;
+                        if cleanup == PendingMetadataCommandTerminalCleanup::Deferred {
+                            return Ok(
+                                FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                                    applied: true,
+                                },
+                            );
+                        }
                     }
                     return Ok(FinishPendingMetadataCommandResult::Applied);
                 }
@@ -2610,12 +2723,18 @@ impl super::StorageCluster {
                                 pg_id, &command, route_mode,
                             )?;
                         if applied_on_all {
-                            if self
+                            if !self
                                 .release_applied_metadata_command_bucket_write_reservations_for_terminal_cleanup(
                                     pg_id, &command,
                                 )?
                             {
-                                match route_mode {
+                                return Ok(
+                                    FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                                        applied: true,
+                                    },
+                                );
+                            }
+                            let cleanup = match route_mode {
                                     MetadataCommandRouteMode::Normal => self
                                         .remove_pending_metadata_command_for_bucket_with_work_budget(
                                             pg_id,
@@ -2631,7 +2750,13 @@ impl super::StorageCluster {
                                             &command,
                                             work_budget,
                                         ),
-                                }?;
+                            }?;
+                            if cleanup == PendingMetadataCommandTerminalCleanup::Deferred {
+                                return Ok(
+                                    FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                                        applied: true,
+                                    },
+                                );
                             }
                             return Ok(FinishPendingMetadataCommandResult::Applied);
                         }
@@ -2827,7 +2952,9 @@ impl super::StorageCluster {
                 )?;
             return match outcome {
                 FinishPendingMetadataCommandResult::Applied
-                | FinishPendingMetadataCommandResult::Abandoned => Ok(()),
+                | FinishPendingMetadataCommandResult::PublishedPendingRecovery
+                | FinishPendingMetadataCommandResult::Abandoned
+                | FinishPendingMetadataCommandResult::TerminalCleanupPending { .. } => Ok(()),
                 FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
                     Err(conflicting_pending_metadata_command(
                         "retryable partial pending metadata command drain",

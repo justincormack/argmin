@@ -5429,6 +5429,7 @@
         PreSendDeadline,
         ResponseAuthentication,
         DefinitiveConflict,
+        ExactLogGap,
     }
 
     fn authenticated_metadata_session_classifies_apply_failure(
@@ -5467,8 +5468,7 @@
         };
         let node = Arc::clone(&server._node);
         let applied = test_metadata_command(0, 1);
-        let command = if matches!(failure, AuthenticatedMetadataSessionFailure::DefinitiveConflict)
-        {
+        let command = if matches!(failure, AuthenticatedMetadataSessionFailure::DefinitiveConflict) {
             node.get_pg(0)
                 .unwrap()
                 .apply_metadata_command_and_record(config.node_id.as_u32(), &applied)
@@ -5485,6 +5485,8 @@
                     ),
                 ),
             )
+        } else if matches!(failure, AuthenticatedMetadataSessionFailure::ExactLogGap) {
+            test_metadata_command(0, 2)
         } else {
             applied
         };
@@ -5519,7 +5521,8 @@
         let deadline = match failure {
             AuthenticatedMetadataSessionFailure::PreSendDeadline => Instant::now(),
             AuthenticatedMetadataSessionFailure::ResponseAuthentication
-            | AuthenticatedMetadataSessionFailure::DefinitiveConflict => {
+            | AuthenticatedMetadataSessionFailure::DefinitiveConflict
+            | AuthenticatedMetadataSessionFailure::ExactLogGap => {
                 Instant::now() + Duration::from_secs(2)
             }
         };
@@ -5534,7 +5537,8 @@
             AuthenticatedMetadataSessionFailure::ResponseAuthentication => {
                 MetadataCommandApplyErrorKind::MayHaveApplied
             }
-            AuthenticatedMetadataSessionFailure::DefinitiveConflict => {
+            AuthenticatedMetadataSessionFailure::DefinitiveConflict
+            | AuthenticatedMetadataSessionFailure::ExactLogGap => {
                 MetadataCommandApplyErrorKind::Definitive
             }
         };
@@ -5549,6 +5553,17 @@
                     log_index: 1,
                 }) if node_id == config.node_id.as_u32()
             ));
+        } else if matches!(failure, AuthenticatedMetadataSessionFailure::ExactLogGap) {
+            assert!(matches!(
+                error.into_source(),
+                BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogGap {
+                    node_id,
+                    pg_id: 0,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 2,
+                    expected_log_index: 1,
+                }) if node_id == config.node_id.as_u32()
+            ));
         }
         let applied_log_index = node
             .get_pg(0)
@@ -5558,7 +5573,11 @@
             .applied_log_index;
         assert_eq!(
             applied_log_index,
-            if matches!(failure, AuthenticatedMetadataSessionFailure::PreSendDeadline) {
+            if matches!(
+                failure,
+                AuthenticatedMetadataSessionFailure::PreSendDeadline
+                    | AuthenticatedMetadataSessionFailure::ExactLogGap
+            ) {
                 0
             } else {
                 1
@@ -5614,6 +5633,22 @@
         authenticated_metadata_session_classifies_apply_failure(
             true,
             AuthenticatedMetadataSessionFailure::DefinitiveConflict,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_session_preserves_exact_log_gap() {
+        authenticated_metadata_session_classifies_apply_failure(
+            false,
+            AuthenticatedMetadataSessionFailure::ExactLogGap,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_tcp_metadata_session_preserves_exact_log_gap() {
+        authenticated_metadata_session_classifies_apply_failure(
+            true,
+            AuthenticatedMetadataSessionFailure::ExactLogGap,
         );
     }
 

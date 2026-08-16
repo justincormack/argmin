@@ -3774,7 +3774,11 @@ impl super::StorageCluster {
                 format!("iteration={} outcome={outcome:?}", loop_iteration),
             );
             match outcome {
-                FinishPendingMetadataCommandResult::Applied => {}
+                FinishPendingMetadataCommandResult::Applied
+                | FinishPendingMetadataCommandResult::PublishedPendingRecovery => {}
+                FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                    applied: true,
+                } => {}
                 FinishPendingMetadataCommandResult::RetryPartialExactConflict => {
                     return Err(bucket_snapshot_error_to_bucket_write_drain_error(
                         conflicting_pending_metadata_command(
@@ -3782,7 +3786,10 @@ impl super::StorageCluster {
                         ),
                     ));
                 }
-                FinishPendingMetadataCommandResult::Abandoned => {
+                FinishPendingMetadataCommandResult::Abandoned
+                | FinishPendingMetadataCommandResult::TerminalCleanupPending {
+                    applied: false,
+                } => {
                     super::sleep_after_metadata_contention_retry_for(
                         "bucket_delete_begin",
                         Some(pg_id),

@@ -230,7 +230,7 @@ impl super::StorageCluster {
                 clear_pending_on_zero_apply,
                 &mut work_budget,
             )?;
-            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+            if outcome.is_logically_abandoned() {
                 continue;
             }
 
@@ -543,7 +543,7 @@ impl super::StorageCluster {
                 clear_pending_on_zero_apply,
                 &mut work_budget,
             )?;
-            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+            if outcome.is_logically_abandoned() {
                 continue;
             }
 
@@ -687,7 +687,7 @@ impl super::StorageCluster {
                 clear_pending_on_zero_apply,
                 &mut work_budget,
             )?;
-            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+            if outcome.is_logically_abandoned() {
                 continue;
             }
 
@@ -914,7 +914,7 @@ impl super::StorageCluster {
                 clear_pending_on_zero_apply,
                 &mut work_budget,
             )?;
-            if outcome == super::PendingMetadataCommandOutcome::Abandoned {
+            if outcome.is_logically_abandoned() {
                 continue;
             }
 

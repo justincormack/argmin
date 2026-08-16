@@ -409,6 +409,19 @@ fn metadata_command_state_result_response(
                 log_index,
             }
         }
+        Err(BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogGap {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+            expected_log_index,
+        })) => StorageRpcMetadataCommandStateOutcome::LogGap {
+            node_id,
+            pg_id,
+            cluster_epoch,
+            log_index,
+            expected_log_index,
+        },
         Err(BucketSnapshotLoadError::Store(error)) => {
             return encode_storage_rpc_error_response(&store_error_response(error));
         }

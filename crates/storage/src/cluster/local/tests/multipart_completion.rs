@@ -2702,16 +2702,14 @@ fn identical_multipart_completions_help_partial_barrier_without_contention() {
         .expect("recovery waiter did not classify its expired wait budget");
     drop(timeout_hook);
     assert!(timeout_observed.load(Ordering::SeqCst));
-    assert!(matches!(
-        recovery_waiter_result,
-        Err(crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-        ))
-    ));
+    assert_eq!(
+        recovery_waiter_result.unwrap(),
+        crate::cluster::PendingMetadataCommandOutcome::PublishedPendingRecovery
+    );
     assert_eq!(
         cluster.test_take_metadata_command_recovery_wait_hook_observation(),
         (1, 0),
-        "expired recovery wait must classify publication uncertainty without retrying"
+        "expired recovery wait must classify confirmed publication without retrying"
     );
 
     let owner_release_selected = Arc::new(Barrier::new(2));
@@ -2753,16 +2751,14 @@ fn identical_multipart_completions_help_partial_barrier_without_contention() {
         .expect("waited recovery did not classify its expired budget");
     drop(waited_hook);
     assert!(waited_observed.load(Ordering::SeqCst));
-    assert!(matches!(
-        waited_result,
-        Err(crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-        ))
-    ));
+    assert_eq!(
+        waited_result.unwrap(),
+        crate::cluster::PendingMetadataCommandOutcome::PublishedPendingRecovery
+    );
     assert_eq!(
         cluster.test_take_metadata_command_recovery_wait_hook_observation(),
         (1, 0),
-        "owner completion after budget expiry must classify before route inspection"
+        "owner completion after budget expiry must retain published recovery state"
     );
     first.join().unwrap();
     second.join().unwrap();
@@ -3163,15 +3159,13 @@ fn multipart_completion_races_classify_published_pending_command_by_manifest() {
     drop(typed_timeout_hook);
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-        )
+        crate::ObjectPgActionError::Metadata(MetadataError::NoSuchUpload { .. })
     ));
     assert!(typed_timeout_observed.load(Ordering::SeqCst));
     assert_eq!(
         reservation_ids(),
         reservations_before_typed_timeout,
-        "typed convergence timeout must release the retry's auxiliary reservation"
+        "terminal replay classification must release the retry's auxiliary reservation"
     );
 
     let auxiliary_release_observed = Arc::new(AtomicBool::new(false));

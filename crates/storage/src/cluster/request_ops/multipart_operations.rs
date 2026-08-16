@@ -195,7 +195,7 @@ impl super::StorageCluster {
                     .matching_stream_upload_exists(
                         &create,
                         super::applied_stream_create_command(
-                            &applied_commands,
+                            applied_commands.commands(),
                             &create,
                             cleanup_after,
                         ),
@@ -204,6 +204,9 @@ impl super::StorageCluster {
                 {
                     return Ok(Ok(Attempt::Complete(value)));
                 }
+                applied_commands
+                    .require_drained_for_unmatched_request()
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
                 self.reserve_put_object_generation_with_route_validation(
                     route,
                     &create.session_id,
@@ -940,7 +943,7 @@ impl super::StorageCluster {
                 }
                 require_valid_route()?;
                 let applied_create =
-                    super::applied_multipart_create_command(&applied_commands, &create);
+                    super::applied_multipart_create_command(applied_commands.commands(), &create);
                 if let Some(initiated_at) = multipart_creation_route
                     .matching_multipart_upload_initiated_at(&create, applied_create)
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
@@ -954,6 +957,9 @@ impl super::StorageCluster {
                         initiated_at,
                     })));
                 }
+                applied_commands
+                    .require_drained_for_unmatched_request()
+                    .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
 
                 let mut command = match multipart_creation_route
                     .build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
@@ -1181,7 +1187,11 @@ impl super::StorageCluster {
             };
             match stream_creation_route.matching_stream_upload_exists(
                 &create,
-                super::applied_stream_create_command(&applied_commands, &create, cleanup_after),
+                super::applied_stream_create_command(
+                    applied_commands.commands(),
+                    &create,
+                    cleanup_after,
+                ),
             ) {
                 Ok(true) => {
                     release_caller_bucket_write_proof!()?;
@@ -1194,6 +1204,12 @@ impl super::StorageCluster {
                         error,
                     ));
                 }
+            }
+            if let Err(error) = applied_commands.require_drained_for_unmatched_request() {
+                release_caller_bucket_write_proof!()?;
+                return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                    error,
+                ));
             }
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
@@ -1399,7 +1415,11 @@ impl super::StorageCluster {
             }
             match stream_creation_route.matching_stream_upload_exists(
                 &create,
-                super::applied_stream_create_command(&applied_commands, &create, cleanup_after),
+                super::applied_stream_create_command(
+                    applied_commands.commands(),
+                    &create,
+                    cleanup_after,
+                ),
             ) {
                 Ok(true) => {
                     release_caller_bucket_write_proof!()?;
@@ -1410,6 +1430,10 @@ impl super::StorageCluster {
                     release_caller_bucket_write_proof!()?;
                     return Err(error);
                 }
+            }
+            if let Err(error) = applied_commands.require_drained_for_unmatched_request() {
+                release_caller_bucket_write_proof!()?;
+                return Err(error);
             }
             if let Err(error) = require_valid_route() {
                 release_caller_bucket_write_proof!()?;
@@ -1698,6 +1722,14 @@ impl super::StorageCluster {
                     };
                     match outcome {
                         super::PendingMetadataCommandOutcome::Applied => continue,
+                        super::PendingMetadataCommandOutcome::PublishedPendingRecovery => {
+                            unreachable!(
+                                "multipart barrier drain requiring convergence retained a published command"
+                            )
+                        }
+                        super::PendingMetadataCommandOutcome::TerminalCleanupPending { .. } => {
+                            continue;
+                        }
                         super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                             Self::retry_irrevocable_multipart_command(
                                 work_budget,
@@ -1730,6 +1762,14 @@ impl super::StorageCluster {
                 };
                 match outcome {
                     super::PendingMetadataCommandOutcome::Applied => continue,
+                    super::PendingMetadataCommandOutcome::PublishedPendingRecovery => {
+                        unreachable!(
+                            "multipart barrier drain requiring convergence retained a published command"
+                        )
+                    }
+                    super::PendingMetadataCommandOutcome::TerminalCleanupPending { .. } => {
+                        continue;
+                    }
                     super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                         Self::retry_irrevocable_multipart_command(
                             work_budget,
@@ -1816,9 +1856,20 @@ impl super::StorageCluster {
                 work_budget,
             ) {
                 Ok(super::PendingMetadataCommandOutcome::Applied) => return Ok(barrier_sequence),
+                Ok(super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                    applied: true,
+                }) => return Ok(barrier_sequence),
+                Ok(super::PendingMetadataCommandOutcome::PublishedPendingRecovery) => {
+                    unreachable!(
+                        "multipart barrier apply requiring convergence retained a published command"
+                    )
+                }
                 Ok(
                     super::PendingMetadataCommandOutcome::Abandoned
-                    | super::PendingMetadataCommandOutcome::RetryPartialExactConflict,
+                    | super::PendingMetadataCommandOutcome::RetryPartialExactConflict
+                    | super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                        applied: false,
+                    },
                 ) => continue,
                 Err(error @ BucketSnapshotLoadError::Store(
                     StoreError::MetadataCommandDependencyConvergencePending { .. }
@@ -2875,7 +2926,13 @@ impl super::StorageCluster {
                         &command,
                         &mut work_budget,
                     ) {
-                        Ok(super::PendingMetadataCommandOutcome::Applied) => {
+                        Ok(
+                            super::PendingMetadataCommandOutcome::Applied
+                            | super::PendingMetadataCommandOutcome::PublishedPendingRecovery
+                            | super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                applied: true,
+                            },
+                        ) => {
                             if same_upload_completion {
                                 // The installed command consumed this upload. Reauthorization at
                                 // the coordinator distinguishes an exact terminal replay from a
@@ -2892,6 +2949,17 @@ impl super::StorageCluster {
                             break;
                         }
                         Ok(super::PendingMetadataCommandOutcome::Abandoned) => break,
+                        Ok(super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                            applied: false,
+                        }) => {
+                            self.release_auxiliary_multipart_completion_reservation(
+                                pg_id,
+                                &bucket_write_reservation,
+                            )?;
+                            return Err(super::conflicting_pending_object_metadata_command(
+                                "terminal multipart command cleanup remains pending",
+                            ));
+                        }
                         Ok(super::PendingMetadataCommandOutcome::RetryPartialExactConflict) => {
                             exact_command_is_irrevocable = true;
                             if let Err(error) = Self::retry_irrevocable_multipart_command(
@@ -3994,6 +4062,8 @@ impl super::StorageCluster {
                 )? {
                     super::PendingMetadataCommandOutcome::Applied
                     | super::PendingMetadataCommandOutcome::Abandoned => {}
+                    super::PendingMetadataCommandOutcome::PublishedPendingRecovery => break,
+                    super::PendingMetadataCommandOutcome::TerminalCleanupPending { .. } => break,
                     super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                         return Err(super::conflicting_pending_object_metadata_command(
                             "retryable partial pending multipart management lookup command",
@@ -4529,6 +4599,8 @@ impl super::StorageCluster {
             )? {
                 super::PendingMetadataCommandOutcome::Applied
                 | super::PendingMetadataCommandOutcome::Abandoned => {}
+                super::PendingMetadataCommandOutcome::PublishedPendingRecovery => break,
+                super::PendingMetadataCommandOutcome::TerminalCleanupPending { .. } => break,
                 super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                     return Err(super::conflicting_pending_object_metadata_command(
                         "retryable partial pending lifecycle multipart abort command",

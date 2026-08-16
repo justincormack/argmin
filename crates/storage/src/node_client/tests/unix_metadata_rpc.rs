@@ -3217,6 +3217,54 @@ fn unix_storage_node_client_preserves_apply_metadata_command_log_conflict() {
         })
     ));
 
+    let gap_command = test_metadata_command(0, 2);
+    let gap = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::LogGap {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 2,
+            expected_log_index: 1,
+        },
+        gap_command.clone(),
+    );
+    assert!(matches!(
+        gap,
+        BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogGap {
+            node_id: 7,
+            pg_id: 0,
+            log_index: 2,
+            expected_log_index: 1,
+            ..
+        })
+    ));
+
+    for malformed in [
+        StorageRpcMetadataCommandStateOutcome::LogGap {
+            node_id: 8,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 2,
+            expected_log_index: 1,
+        },
+        StorageRpcMetadataCommandStateOutcome::LogGap {
+            node_id: 7,
+            pg_id: 0,
+            cluster_epoch: ClusterEpoch::new(1).unwrap(),
+            log_index: 2,
+            expected_log_index: 2,
+        },
+    ] {
+        let error = apply_error_from_fake_response_for_command(malformed, gap_command.clone());
+        assert!(matches!(
+            error,
+            BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                failure: StorageRpcErrorCode::PayloadDecode,
+                ..
+            })
+        ));
+    }
+
     let wrong_route =
         apply_error_from_fake_response(StorageRpcMetadataCommandStateOutcome::LogConflict {
             node_id: 7,

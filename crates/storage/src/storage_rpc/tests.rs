@@ -223,6 +223,11 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 19, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 34, 192, 175, 160, 164, 153, 253, 247, 97, 98, 99,
         ];
+        const V20_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 20, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 131, 63, 63, 253, 160, 197, 35, 90, 97, 98, 99,
+        ];
         let bytes = encode_storage_rpc_frame(
             0x0102_0304_0506_0708,
             StorageRpcMessageKind::ShardWrite,
@@ -230,7 +235,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bytes, V19_FRAME);
+        assert_eq!(bytes, V20_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -238,6 +243,10 @@ mod tests {
         assert_eq!(
             decode_storage_rpc_frame(V18_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(18))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(V19_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(19))
         );
     }
 
@@ -274,6 +283,34 @@ mod tests {
     }
 
     #[test]
+    fn storage_rpc_v20_metadata_command_log_gap_payload_is_stable() {
+        const V20_METADATA_COMMAND_LOG_GAP_PAYLOAD: &[u8] = b"\
+            \x08\x07\x00\x00\x00\x0b\x00\x00\x00\
+            \x03\x00\x00\x00\x00\x00\x00\x00\
+            \x0c\x00\x00\x00\x00\x00\x00\x00\
+            \x0b\x00\x00\x00\x00\x00\x00\x00";
+        let response = StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::LogGap {
+                node_id: 7,
+                pg_id: 11,
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                log_index: 12,
+                expected_log_index: 11,
+            },
+        };
+        let payload = encode_metadata_command_state_outcome_response(&response);
+
+        assert_eq!(payload, V20_METADATA_COMMAND_LOG_GAP_PAYLOAD);
+        assert_eq!(
+            decode_metadata_command_state_outcome_response(
+                V20_METADATA_COMMAND_LOG_GAP_PAYLOAD
+            )
+            .unwrap(),
+            response
+        );
+    }
+
+    #[test]
     fn storage_rpc_frame_rejects_resealed_old_and_new_version_fixtures() {
         assert_eq!(
             decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(16)),
@@ -288,8 +325,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(18))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(20)),
-            Err(StorageRpcFrameError::UnsupportedVersion(20))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(19)),
+            Err(StorageRpcFrameError::UnsupportedVersion(19))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(21)),
+            Err(StorageRpcFrameError::UnsupportedVersion(21))
         );
     }
 
@@ -1907,6 +1948,15 @@ mod tests {
                 outcome: StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
                     session_id: SessionId::try_from("11".repeat(16)).unwrap(),
                     upload_id: UploadId::for_test("missing-append-upload"),
+                },
+            },
+            StorageRpcMetadataCommandStateOutcomeResponse {
+                outcome: StorageRpcMetadataCommandStateOutcome::LogGap {
+                    node_id: 7,
+                    pg_id: 11,
+                    cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                    log_index: 12,
+                    expected_log_index: 11,
                 },
             },
         ] {

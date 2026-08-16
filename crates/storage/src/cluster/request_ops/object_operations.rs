@@ -3441,7 +3441,11 @@ impl super::StorageCluster {
                     pg_id,
                     super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                 )? {
-                    super::PendingMetadataCommandOutcome::Applied => {
+                    super::PendingMetadataCommandOutcome::Applied
+                    | super::PendingMetadataCommandOutcome::PublishedPendingRecovery
+                    | super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                        applied: true,
+                    } => {
                         self.local_map.clear_object_payload_reclaim_fence(
                             bucket,
                             key,
@@ -3457,7 +3461,10 @@ impl super::StorageCluster {
                             "retryable partial pending payload reclaim command",
                         ));
                     }
-                    super::PendingMetadataCommandOutcome::Abandoned => {
+                    super::PendingMetadataCommandOutcome::Abandoned
+                    | super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                        applied: false,
+                    } => {
                         emit_outcome("deferred_abandoned_pending");
                         return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
                     }
@@ -3608,7 +3615,11 @@ impl super::StorageCluster {
                             pg_id,
                             super::ExactPendingObjectMetadataCommand::for_checked_request(&command),
                         )? {
-                            super::PendingMetadataCommandOutcome::Applied => {
+                            super::PendingMetadataCommandOutcome::Applied
+                            | super::PendingMetadataCommandOutcome::PublishedPendingRecovery
+                            | super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                applied: true,
+                            } => {
                                 return Ok(super::ObjectPayloadReclaimAttempt::Completed);
                             }
                             super::PendingMetadataCommandOutcome::RetryPartialExactConflict => {
@@ -3616,7 +3627,10 @@ impl super::StorageCluster {
                                     "retryable partial pending payload reclaim command",
                                 ));
                             }
-                            super::PendingMetadataCommandOutcome::Abandoned => continue,
+                            super::PendingMetadataCommandOutcome::Abandoned
+                            | super::PendingMetadataCommandOutcome::TerminalCleanupPending {
+                                applied: false,
+                            } => continue,
                         }
                     }
                     self.drain_pending_object_metadata_command(publisher, pg_id, &command)?;

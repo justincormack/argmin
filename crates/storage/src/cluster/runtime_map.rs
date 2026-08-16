@@ -820,10 +820,10 @@ impl StorageClusterRouteHandle {
                 },
             );
         }
-        let _ = recovery_cluster.drain_pending_metadata_command_with_authorized_recovery_route(
+        let outcome = recovery_cluster.drain_pending_metadata_command_with_authorized_recovery_route(
             pg_id, &command, &current,
         )?;
-        Ok(1)
+        Ok(usize::from(outcome.is_terminal()))
     }
 
     fn recover_authorized_pending_metadata_commands<F>(

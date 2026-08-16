@@ -1787,6 +1787,36 @@ fn metadata_command_log_conflict_error(
     }
 }
 
+fn metadata_command_log_gap_error(
+    expected_node_id: NodeId,
+    expected_cluster_epoch: ClusterEpoch,
+    expected_pg_id: PgId,
+    expected_log_index: MetadataCommandLogIndex,
+    decode_context: &'static str,
+    rpc_payload_error: impl FnOnce(&'static str, String) -> StoreError,
+    gap: MetadataCommandLogGapRpcFields,
+) -> StoreError {
+    if gap.node_id != expected_node_id.as_u32()
+        || gap.cluster_epoch != expected_cluster_epoch
+        || gap.pg_id != expected_pg_id.get()
+        || gap.log_index != expected_log_index.get()
+        || gap.expected_log_index == 0
+        || gap.expected_log_index >= gap.log_index
+    {
+        return rpc_payload_error(
+            decode_context,
+            "metadata command log gap subject mismatch".to_string(),
+        );
+    }
+    StoreError::MetadataCommandLogGap {
+        node_id: gap.node_id,
+        pg_id: gap.pg_id,
+        cluster_epoch: gap.cluster_epoch,
+        log_index: gap.log_index,
+        expected_log_index: gap.expected_log_index,
+    }
+}
+
 fn metadata_command_terminal_entry_pending_error(
     expected_node_id: NodeId,
     expected_cluster_epoch: ClusterEpoch,
@@ -2002,6 +2032,15 @@ struct MetadataCommandLogConflictRpcFields {
     pg_id: u32,
     cluster_epoch: ClusterEpoch,
     log_index: u64,
+}
+
+#[derive(Clone, Copy)]
+struct MetadataCommandLogGapRpcFields {
+    node_id: u32,
+    pg_id: u32,
+    cluster_epoch: ClusterEpoch,
+    log_index: u64,
+    expected_log_index: u64,
 }
 
 #[cfg(test)]

@@ -2592,6 +2592,13 @@ pub(crate) enum StorageRpcMetadataCommandStateOutcome {
         session_id: SessionId,
         upload_id: UploadId,
     },
+    LogGap {
+        node_id: u32,
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        log_index: u64,
+        expected_log_index: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

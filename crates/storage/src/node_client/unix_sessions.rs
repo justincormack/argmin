@@ -983,6 +983,29 @@ impl UnixStorageNodeMetadataCommandSession {
                     },
                 )),
             )),
+            StorageRpcMetadataCommandStateOutcome::LogGap {
+                node_id,
+                pg_id: gap_pg_id,
+                cluster_epoch,
+                log_index,
+                expected_log_index,
+            } => Err(MetadataCommandApplyError::definitive(
+                BucketSnapshotLoadError::Store(metadata_command_log_gap_error(
+                    self.node_id,
+                    self.cluster_epoch,
+                    pg_id,
+                    command.id().log_index(),
+                    decode_context,
+                    |operation, message| self.rpc_payload_error(operation, message),
+                    MetadataCommandLogGapRpcFields {
+                        node_id,
+                        pg_id: gap_pg_id,
+                        cluster_epoch,
+                        log_index,
+                        expected_log_index,
+                    },
+                )),
+            )),
             StorageRpcMetadataCommandStateOutcome::ObjectGenerationReservationConflict {
                 reservation_id,
                 generation_id,

@@ -773,6 +773,13 @@ type MetadataCommandTerminalReservationReleaseTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), BucketSnapshotLoadError> + Send + Sync>;
 
 #[cfg(test)]
+type MetadataCommandTerminalSlotRemovalTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
+const GLOBAL_METADATA_COMMAND_TEST_HOOK_SCOPE_ID: usize = 0;
+
+#[cfg(test)]
 static BEFORE_METADATA_COMMAND_APPLY_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandApplyTestHook>>,
 > = OnceLock::new();
@@ -954,6 +961,11 @@ static MULTIPART_COMPLETION_AUXILIARY_RESERVATION_HOOKS: OnceLock<
 #[cfg(test)]
 static METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS: OnceLock<
     Mutex<HashMap<usize, MetadataCommandTerminalReservationReleaseTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static METADATA_COMMAND_TERMINAL_SLOT_REMOVAL_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MetadataCommandTerminalSlotRemovalTestHook>>,
 > = OnceLock::new();
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -1143,6 +1155,11 @@ pub(crate) struct MultipartCompletionAuxiliaryReservationTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct MetadataCommandTerminalReservationReleaseTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MetadataCommandTerminalSlotRemovalTestHookGuard {
     scope_id: usize,
 }
 
@@ -1577,6 +1594,18 @@ impl Drop for MultipartCompletionAuxiliaryReservationTestHookGuard {
 impl Drop for MetadataCommandTerminalReservationReleaseTestHookGuard {
     fn drop(&mut self) {
         let hooks = METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCommandTerminalSlotRemovalTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = METADATA_COMMAND_TERMINAL_SLOT_REMOVAL_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -2219,16 +2248,34 @@ pub(super) fn maybe_run_metadata_command_terminal_reservation_release_hook(
     scope_id: usize,
     command: &MetadataCommandEnvelope,
 ) -> Result<(), BucketSnapshotLoadError> {
-    let hook = METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS
+    let hooks = METADATA_COMMAND_TERMINAL_RESERVATION_RELEASE_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or_else(|e| e.into_inner());
+    let hook = hooks
         .get(&scope_id)
+        .or_else(|| hooks.get(&GLOBAL_METADATA_COMMAND_TEST_HOOK_SCOPE_ID))
         .cloned();
     match hook {
         Some(hook) => hook(command),
         None => Ok(()),
     }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_metadata_command_terminal_slot_removal_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) -> bool {
+    let hooks = METADATA_COMMAND_TERMINAL_SLOT_REMOVAL_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hook = hooks
+        .get(&scope_id)
+        .or_else(|| hooks.get(&GLOBAL_METADATA_COMMAND_TEST_HOOK_SCOPE_ID))
+        .cloned();
+    hook.is_some_and(|hook| hook(command))
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -2613,6 +2660,11 @@ pub(super) enum MetadataCommandConvergenceRequirement {
     RequireAllReplicas,
 }
 
+pub(super) enum MetadataCommandBudgetExhaustionOutcome {
+    PublishedPendingRecovery,
+    Error(StoreError),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct MetadataCommandFinishPolicy {
     pub(super) clear_pending_on_zero_apply: bool,
@@ -2687,7 +2739,9 @@ impl MetadataCommandApplyAttemptFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FinishPendingMetadataCommandResult {
     Applied,
+    PublishedPendingRecovery,
     Abandoned,
+    TerminalCleanupPending { applied: bool },
     RetryPartialExactConflict,
 }
 

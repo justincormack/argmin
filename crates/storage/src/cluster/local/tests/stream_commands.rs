@@ -948,7 +948,7 @@ fn stream_abort_missing_session_does_not_succeed_after_unrelated_pending_command
 }
 
 #[test]
-fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
+fn stream_put_append_published_log_gap_keeps_payload_for_pending_retry() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -1012,11 +1012,12 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
                         && node_id == NodeId::new(2)
                         && fail_once_hook.swap(false, Ordering::SeqCst) =>
                 {
-                    return Err(StoreError::Io {
-                        context: "injected stream append metadata command replica apply failure",
-                        source: std::io::Error::other(
-                            "injected stream append metadata command replica apply failure",
-                        ),
+                    return Err(StoreError::MetadataCommandLogGap {
+                        node_id: node_id.as_u32(),
+                        pg_id: command.id().pg_id().get(),
+                        cluster_epoch: command.id().cluster_epoch(),
+                        log_index: command.id().log_index().get(),
+                        expected_log_index: command.id().log_index().get() - 1,
                     });
                 }
                 _ => {}
@@ -1057,6 +1058,72 @@ fn stream_put_append_partial_apply_keeps_payload_for_pending_retry() {
             vec![segment.clone()]
         );
     }
+
+    let pending_command = pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket)
+        .expect("partial stream append command must remain pending");
+    let drain_attempts = Arc::new(AtomicUsize::new(0));
+    let drain_attempts_for_hook = Arc::clone(&drain_attempts);
+    let pending_command_id = pending_command.id();
+    let drain_hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if node_id != NodeId::new(2) || command.id() != pending_command_id {
+                return Ok(());
+            }
+            let attempt = drain_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                return Err(StoreError::MetadataCommandLogGap {
+                    node_id: node_id.as_u32(),
+                    pg_id: command.id().pg_id().get(),
+                    cluster_epoch: command.id().cluster_epoch(),
+                    log_index: command.id().log_index().get(),
+                    expected_log_index: command.id().log_index().get() - 1,
+                });
+            }
+            Err(StoreError::MetadataCommandLogChecksumMismatch {
+                node_id: node_id.as_u32(),
+                pg_id: command.id().pg_id().get(),
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+                stored_checksum: 1,
+                computed_checksum: 2,
+            })
+        },
+    ));
+    let create = crate::CreateMultipartUploadReq {
+        upload_id: upload_id_from_label("publishedappendgap"),
+        bucket: bucket.clone(),
+        key: key.clone(),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        initiator: crate::OwnerIdentity::from_principal("initiator"),
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        object_lock: crate::ObjectLockState::default(),
+        checksum: None,
+        encryption: crate::ObjectEncryption::None,
+    };
+    let error = cluster
+        .create_multipart_upload(
+            &bucket,
+            &key,
+            crate::BucketSnapshotRequest::default(),
+            |_snapshot, _existing_object| Ok::<_, ()>(((), create.clone())),
+        )
+        .expect_err("unrelated published command must defer multipart creation");
+    drop(drain_hook);
+    assert_eq!(drain_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        crate::BucketSnapshotLoadFailure::from(error).into_kind(),
+        crate::BucketSnapshotLoadFailureKind::MetadataCommandContention,
+        "unrelated published work must map through the bucket snapshot boundary as retryable contention"
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, PgId::new(object_pg), &bucket),
+        Some(pending_command),
+        "published command must remain pending for trailing recovery"
+    );
 
     let mut readback = Vec::new();
     cluster

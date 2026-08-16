@@ -1229,6 +1229,95 @@ fn put_bucket_versioning_command_applies_to_all_acting_pg_nodes() {
 }
 
 #[test]
+fn put_bucket_versioning_retries_abandoned_command_with_slot_cleanup_deferred() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "abandoned-versioning-cleanup-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let _serial = lock_metadata_command_apply_hook_test();
+    let captured = Arc::new(Mutex::new(None));
+    let hook_bucket = bucket.clone();
+    let captured_hook = Arc::clone(&captured);
+    let apply_hook = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::PutBucketVersioning(versioning)
+                    if versioning.bucket.name == hook_bucket
+            ) && node_id == NodeId::new(0)
+            {
+                *captured_hook.lock().unwrap() = Some(command.clone());
+                return Err(StoreError::Io {
+                    context: "injected zero-apply bucket versioning failure",
+                    source: std::io::Error::other("injected zero-apply bucket versioning failure"),
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let err = cluster
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::BucketSnapshotLoadError::Store(StoreError::Io {
+            context: "injected zero-apply bucket versioning failure",
+            ..
+        })
+    ));
+    drop(apply_hook);
+    let abandoned = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("versioning apply hook should capture the abandoned command");
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+    force_insert_pending_metadata_command_for_test(&map, PgId::new(1), &bucket, &abandoned);
+
+    let checksum = abandoned.checksum_crc64();
+    let defer_once = Arc::new(AtomicBool::new(true));
+    let defer_once_hook = Arc::clone(&defer_once);
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |command| {
+            command.checksum_crc64() == checksum && defer_once_hook.swap(false, Ordering::SeqCst)
+        }),
+    );
+
+    let updated = cluster
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
+        .unwrap();
+    assert_eq!(updated.versioning, crate::BucketVersioningState::Enabled);
+    assert!(!defer_once.load(Ordering::SeqCst));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+    drop(cleanup_hook);
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .versioning,
+            crate::BucketVersioningState::Enabled
+        );
+    }
+}
+
+#[test]
 fn put_bucket_versioning_command_retry_reuses_pending_partial_replica_command() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

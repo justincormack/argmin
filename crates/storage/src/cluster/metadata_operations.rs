@@ -177,6 +177,26 @@ impl StorageCluster {
         )
     }
 
+    fn metadata_command_log_gap_matches(
+        command: &MetadataCommandEnvelope,
+        error: &BucketSnapshotLoadError,
+    ) -> bool {
+        matches!(
+            error,
+            BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogGap {
+                pg_id,
+                cluster_epoch,
+                log_index,
+                expected_log_index,
+                ..
+            }) if *pg_id == command.id().pg_id().get()
+                && *cluster_epoch == command.id().cluster_epoch()
+                && *log_index == command.id().log_index().get()
+                && *expected_log_index > 0
+                && *expected_log_index < *log_index
+        )
+    }
+
     fn reserve_object_generation_conflict_matches(
         command: &MetadataCommandEnvelope,
         error: &BucketSnapshotLoadError,
@@ -5026,9 +5046,9 @@ impl StorageCluster {
             else {
                 continue;
             };
-            let _outcome =
+            let outcome =
                 self.drain_pending_metadata_command_with_local_recovery_route(pg_id, &command)?;
-            drained += 1;
+            drained += usize::from(outcome.is_terminal());
         }
         Ok(drained)
     }
@@ -5068,6 +5088,13 @@ impl StorageCluster {
         let mut work_budget = RequestWorkBudget::ending_at(deadline)
             .for_operation("metadata command terminal cleanup")
             .for_pg(pg_id);
+        #[cfg(test)]
+        if request_ops::maybe_run_metadata_command_terminal_slot_removal_hook(
+            Arc::as_ptr(&self.local_map) as usize,
+            command,
+        ) {
+            return Ok(request_ops::PendingMetadataCommandTerminalCleanup::Deferred);
+        }
         request_ops::remove_pending_metadata_command_slot_after_terminal_outcome(
             pg_id,
             Some(&mut work_budget),
@@ -5088,6 +5115,13 @@ impl StorageCluster {
         work_budget: Option<&mut RequestWorkBudget>,
     ) -> Result<request_ops::PendingMetadataCommandTerminalCleanup, StoreError> {
         let _ = bucket;
+        #[cfg(test)]
+        if request_ops::maybe_run_metadata_command_terminal_slot_removal_hook(
+            Arc::as_ptr(&self.local_map) as usize,
+            command,
+        ) {
+            return Ok(request_ops::PendingMetadataCommandTerminalCleanup::Deferred);
+        }
         request_ops::remove_pending_metadata_command_slot_after_terminal_outcome(
             pg_id,
             work_budget,
@@ -5111,6 +5145,13 @@ impl StorageCluster {
         execution_route.require_command(pg_id, command)?;
         execution_route.require_recovery_predecessor(pg_id)?;
         let _ = bucket;
+        #[cfg(test)]
+        if request_ops::maybe_run_metadata_command_terminal_slot_removal_hook(
+            Arc::as_ptr(&self.local_map) as usize,
+            command,
+        ) {
+            return Ok(request_ops::PendingMetadataCommandTerminalCleanup::Deferred);
+        }
         request_ops::remove_pending_metadata_command_slot_after_terminal_outcome(
             pg_id,
             Some(work_budget),
