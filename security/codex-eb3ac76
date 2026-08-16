@@ -1,0 +1,300 @@
+Bucket deletion can ignore pending object metadata recovery
+Link: https://chatgpt.com/codex/cloud/security/findings/6efb92a3354481919939f2a0a4ff7f0d?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sort=date_desc
+Criticality: medium (attack path: medium)
+Status: fixed
+Fixed in: 7860ad36 (Require terminal convergence before bucket delete)
+
+# Metadata
+Repo: justincormack/argmin
+Commit: eb3ac76
+Author: justin@specialbusservice.com
+Created: 16/08/2026, 19:14:49
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed in commit `7860ad36` (`Require terminal convergence before bucket delete`).
+
+The exact-bucket object-command drain used after DeleteBucket acquires its durable
+write drain is a destructive cross-PG barrier. It now requires
+`MetadataCommandConvergenceRequirement::RequireAllReplicas`, and that requirement
+is carried through recovery-flight admission, waiter adoption, retries, reissues,
+and both bucket- and object-command finishers. A witness-plus-primary publication
+can still be handed to background recovery in ordinary request paths, but it can
+no longer satisfy this bucket-deletion barrier.
+
+The frontier advances only after the command reaches a terminal `Applied` or
+`Abandoned` outcome. `PublishedPendingRecovery` and
+`TerminalCleanupPending { .. }` remain retryable within the caller's existing
+bounded work budget. If convergence or terminal cleanup cannot finish in that
+budget, the drain returns typed contention and retains both the pending slot and
+the durable frontier position; DeleteBucket therefore cannot proceed to its final
+visibility scan.
+
+Regression coverage in
+`crates/storage/src/cluster/local/tests/bucket_delete.rs` includes:
+
+- `post_reservation_exact_bucket_frontier_waits_for_published_replica_convergence`:
+  applies an exact command to the deterministic witness and primary while leaving
+  a trailing replica unconverged, then proves the durable frontier does not
+  advance and the pending command remains owned by recovery.
+- `post_reservation_exact_bucket_frontier_waits_for_terminal_slot_cleanup`:
+  starts with the exact command fully applied on every actor, injects terminal
+  pending-slot removal deferral, and uses an atomic counter to prove the cleanup
+  hook was reached. The frontier remains unchanged while cleanup is deferred,
+  then advances only after the fault is removed and slot cleanup succeeds. This
+  test fails if `TerminalCleanupPending` is treated as successful drain completion.
+
+The metadata-command stream guide now documents that DeleteBucket's
+post-reservation exact scan requires complete acting-set convergence and terminal
+slot cleanup before recording frontier progress.
+
+Verification for the fixing commit and final regression revision:
+
+- `cargo nextest run`: 8,380 tests passed, 0 skipped.
+- `cargo clippy --all-targets --all-features -- -D warnings`: passed.
+- `cargo fmt --all`: passed.
+- `git diff --check`: passed.
+
+# Summary
+Introduced bug: the new PublishedPendingRecovery outcome is nonterminal and retains the pending slot, but the exact-bucket object drain used by bucket deletion treats it as a successful drain instead of blocking/retrying or returning contention.
+PendingMetadataCommandOutcome::PublishedPendingRecovery explicitly means the pending slot is retained and recovery is still required. However, drain_pending_object_metadata_commands_for_exact_bucket_inner now returns Ok(()) when it sees PublishedPendingRecovery. Bucket deletion calls this helper to ensure all object-PG metadata commands for the target bucket have drained before it performs the final visible-data scan. Because the helper can return success while an object-PG command is still pending, the bucket delete flow can proceed to the final visibility check, which only lists currently visible object versions/uploads and does not account for the retained pending object command. Under a recovery/log-gap or publication-handoff condition, a committed object mutation can therefore be skipped by the emptiness check, risking deletion/finalization of a bucket while a pending object write or metadata mutation for that bucket still exists.
+
+# Validation
+## Rubric
+- [x] Confirm `PublishedPendingRecovery` is semantically non-terminal and retains the pending slot.
+- [x] Confirm normal recovery paths can produce `PublishedPendingRecovery` for published-but-not-converged commands.
+- [x] Confirm exact-bucket object drain treats `PublishedPendingRecovery` as successful `Ok(())` rather than contention/retry.
+- [x] Confirm bucket deletion relies on that drain before the final visible-data check and does not recheck object-PG pending slots afterward.
+- [x] Dynamically demonstrate an exact-bucket drain returning `Ok(())` while a same-bucket object pending command remains retained.
+## Report
+Validated the finding with a targeted Rust unit-test PoC added to the real storage test suite. Code review showed the relevant invariant mismatch: `PendingMetadataCommandOutcome::PublishedPendingRecovery` is explicitly non-terminal and `retains_pending_slot()` returns true for it in `crates/storage/src/cluster/core.rs:648-682`; recovery budget exhaustion for an already-published command can return `PublishedPendingRecovery` in `crates/storage/src/cluster/request_ops/metadata_commands.rs:2495-2508` and `crates/storage/src/cluster/payload_operations.rs:1567-1569`; but `drain_pending_object_metadata_commands_for_exact_bucket_inner` returns `Ok(())` on `PublishedPendingRecovery` in `crates/storage/src/cluster/payload_operations.rs:3002-3006`. Bucket deletion depends on that exact-bucket drain before moving forward in `crates/storage/src/cluster/request_ops/bucket_delete.rs:3315-3355`, then only rechecks the bucket metadata PG pending slot and performs visible-data scanning in `crates/storage/src/cluster/request_ops/bucket_delete.rs:3498-3564`.
+
+Dynamic PoC: the added test constructs a pending object metadata command, forces recovery to publish a replacement while retaining the object-PG pending slot, then invokes the existing bucket-delete exact-bucket drain wrapper. The vulnerable run prints `PoC exact-bucket drain result=Ok(()), pending_after_retained=true` and `PoC recovery owner outcome=PublishedPendingRecovery`, then panics because successful drain returned while the pending command remained. Command exited with code 101. LLDB was also run non-interactively and stopped at the PoC assertion with a backtrace. Valgrind was attempted but is not installed in the container (`exit_code=127`).
+
+# Evidence
+crates/storage/src/cluster/core.rs (L648 to 682)
+  Note: Defines PublishedPendingRecovery as a distinct nonterminal outcome and marks it as retaining the pending slot.
+```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingMetadataCommandOutcome {
+    Applied,
+    PublishedPendingRecovery,
+    Abandoned,
+    TerminalCleanupPending { applied: bool },
+    RetryPartialExactConflict,
+}
+
+impl PendingMetadataCommandOutcome {
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Applied | Self::Abandoned)
+    }
+
+    fn is_logically_applied(self) -> bool {
+        matches!(
+            self,
+            Self::Applied
+                | Self::PublishedPendingRecovery
+                | Self::TerminalCleanupPending { applied: true }
+        )
+    }
+
+    fn is_logically_abandoned(self) -> bool {
+        matches!(
+            self,
+            Self::Abandoned | Self::TerminalCleanupPending { applied: false }
+        )
+    }
+
+    fn retains_pending_slot(self) -> bool {
+        matches!(
+            self,
+            Self::PublishedPendingRecovery | Self::TerminalCleanupPending { .. }
+        )
+```
+
+crates/storage/src/cluster/payload_operations.rs (L2991 to 3006)
+  Note: The exact-bucket object metadata drain returns Ok(()) on PublishedPendingRecovery even though that outcome leaves the command pending.
+```
+            let outcome = self.drain_pending_metadata_command_with_recovery_authority(
+                &mut recovery_authority,
+                pg_id,
+                &command,
+            )?;
+            Self::emit_exact_bucket_object_drain_step(
+                bucket,
+                pg_id,
+                "apply_done",
+                format!("iteration={} outcome={outcome:?}", drain_iteration),
+            );
+            match outcome {
+                PendingMetadataCommandOutcome::Applied
+                | PendingMetadataCommandOutcome::Abandoned => {}
+                PendingMetadataCommandOutcome::PublishedPendingRecovery => return Ok(()),
+                PendingMetadataCommandOutcome::TerminalCleanupPending { .. } => return Ok(()),
+```
+
+crates/storage/src/cluster/request_ops/bucket_delete.rs (L3315 to 3355)
+  Note: Bucket deletion relies on the exact-bucket object drain succeeding before progressing toward final bucket visibility checks.
+```
+                            match self
+                                .drain_pending_object_metadata_commands_for_exact_bucket_on_all_pgs_with_budget(
+                                    bucket,
+                                    Some(started),
+                                    &mut work_budget,
+                                    Some(BucketDeleteExactDrainProgress {
+                                        client: node_store.bucket_write_reservation_client().as_ref(),
+                                        drain: &durable_drain,
+                                        phase: BucketDeleteAttemptPhase::PostReservationObjectDrain,
+                                    }),
+                                ) {
+                                Ok(()) => {}
+                                Err(error @ BucketWriteDrainError::Store(
+                                    StoreError::MetadataCommandContention {
+                                        context:
+                                            BUCKET_DELETE_EXACT_BUCKET_DRAIN_BUDGET_EXHAUSTED_CONTEXT,
+                                    },
+                                )) => return Err(error),
+                                Err(BucketWriteDrainError::Store(
+                                    StoreError::MetadataCommandContention { .. },
+                                )) => {
+                                    super::sleep_after_metadata_contention_retry_for(
+                                        "bucket_delete_begin",
+                                        Some(pg_id),
+                                        "bucket delete exact bucket object drain after reservation wait contention",
+                                        &mut metadata_contention_retries,
+                                    );
+                                    continue;
+                                }
+                                Err(error) => return Err(error),
+                            }
+                            Self::emit_bucket_delete_begin_loop_step(
+                                bucket,
+                                pg_id,
+                                started,
+                                "drain_exact_bucket_object_commands_done",
+                                format!(
+                                    "iteration={} command_kind=none pass=after_reservation_wait",
+                                    loop_iteration
+                                ),
+                            );
+```
+
+crates/storage/src/cluster/request_ops/bucket_delete.rs (L3498 to 3564)
+  Note: Before the final visibility check, the code only rechecks the bucket metadata PG pending slot and then scans visible data; it does not detect object-PG pending commands that the earlier drain reported as Ok despite PublishedPendingRecovery.
+```
+                        let pending_before_visibility_check =
+                            self.pending_metadata_command_for_bucket(pg_id, bucket)?;
+                        Self::emit_bucket_delete_begin_loop_step(
+                            bucket,
+                            pg_id,
+                            started,
+                            "pending_command_recheck_done",
+                            format!(
+                                "iteration={} pass=before_visibility_check has_pending={} command_kind={}",
+                                loop_iteration,
+                                pending_before_visibility_check.is_some(),
+                                pending_before_visibility_check
+                                    .as_ref()
+                                    .map_or("none", |command| command.payload().kind_name())
+                            ),
+                        );
+                        if pending_before_visibility_check.is_some() {
+                            super::sleep_after_metadata_contention_retry_for(
+                                "bucket_delete_begin",
+                                Some(pg_id),
+                                "bucket delete pending command remained before visibility check",
+                                &mut metadata_contention_retries,
+                            );
+                            continue;
+                        }
+                    }
+                    attempt_phase = BucketDeleteAttemptPhase::FinalVisibilityCheck;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_before_visibility_check_start",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "heartbeat_before_visibility_check_done",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    Self::emit_bucket_delete_begin_loop_step(
+                        bucket,
+                        pg_id,
+                        started,
+                        "visibility_check_start",
+                        format!("iteration={loop_iteration}"),
+                    );
+                    self.record_bucket_delete_attempt_outcome_for_drain_with_client(
+                        node_store.bucket_write_reservation_client().as_ref(),
+                        &durable_drain,
+                        BucketDeleteAttemptOutcomeKind::Retryable,
+                        BucketDeleteAttemptPhase::FinalVisibilityCheck,
+                        "final visibility check started".to_string(),
+                    );
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    maybe_run_before_bucket_delete_final_visibility_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                    )
+                    .map_err(BucketWriteDrainError::from)?;
+                    if let Some(source) = self.bucket_visible_data_source(
+                        bucket,
+                        true,
+                        node_store.bucket_write_reservation_client().as_ref(),
+                        &durable_drain,
+                    )? {
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Kept at medium. The code evidence and executable unit-test PoC support that the bug is real and in a main runtime path: PublishedPendingRecovery retains a pending slot, exact-bucket drain returns Ok on it, and DeleteBucket then performs a visible-only final emptiness check. However, high/critical severity is not justified because the path is not unauthenticated, requires DeleteBucket/bucket owner-account-admin authority, depends on uncommon recovery/timing conditions, and does not demonstrate cross-tenant compromise, auth bypass, code execution, or secret exposure. The credible consequence is data integrity/availability loss within the authorized bucket scope.
+## Likelihood
+low - Reachability is through a normal HTTP S3 DeleteBucket path, but exploitation is low-likelihood because it requires authenticated bucket owner/admin privileges plus a narrow recovery/log-gap or publication-handoff condition that causes PublishedPendingRecovery while the object-PG pending slot is retained.
+## Impact
+medium - The direct impact is integrity/availability loss for bucket data: a bucket can be finalized as deleted while a committed or logically applied object metadata mutation remains pending and is omitted from visible-only emptiness checks. The impact is bounded by requiring DeleteBucket authority for the affected bucket/account and no cross-tenant bypass was demonstrated.
+## Assumptions
+- The affected argmin-s3 frontend/storage code is deployed as the main S3-compatible object storage service.
+- A realistic attacker has valid S3 credentials with DeleteBucket authority for the target bucket, or is a bucket/account administrator racing concurrent writers.
+- The recovery/log-gap or publication-handoff condition required to produce PublishedPendingRecovery can occur in production failure/recovery paths, not only tests.
+- No repository deployment manifests were present, so public internet exposure cannot be confirmed from IaC.
+- valid SigV4-authenticated request or equivalent configured credential
+- DeleteBucket/bucket owner-account-admin authority for the target bucket
+- a same-bucket object metadata command remains pending on an object metadata PG
+- metadata recovery reaches PublishedPendingRecovery after publication/recovery handoff or budget exhaustion
+- the final visible-data scan sees no currently visible object versions, multipart uploads, or stream uploads
+## Path
+Client DELETE Bucket -> HTTP listener -> SigV4 auth -> DeleteBucket authz -> exact object metadata drain -> PublishedPendingRecovery treated as Ok -> final visible-data scan -> bucket deletion despite retained pending object command
+## Path evidence
+- `crates/storage/src/cluster/core.rs:648-682` - Defines PublishedPendingRecovery and shows only Applied/Abandoned are terminal; retains_pending_slot() includes PublishedPendingRecovery.
+- `crates/storage/src/cluster/payload_operations.rs:1560-1569` - Recovery budget exhaustion can classify a command as PublishedPendingRecovery and return that PendingMetadataCommandOutcome.
+- `crates/storage/src/cluster/payload_operations.rs:2991-3006` - The exact-bucket object metadata drain returns Ok(()) on PublishedPendingRecovery even though that outcome retains a pending slot.
+- `crates/storage/src/cluster/request_ops/bucket_delete.rs:3315-3355` - Bucket deletion treats successful exact-bucket object command drain as complete and proceeds after Ok(()).
+- `crates/storage/src/cluster/request_ops/bucket_delete.rs:3498-3564` - Before final visibility checking, the code rechecks only the bucket metadata pending slot and then calls bucket_visible_data_source.
+- `crates/storage/src/cluster/request_ops/bucket_delete.rs:4703-4795` - The final visible-data source check scans visible object versions, multipart uploads, and stream uploads; it does not directly account for a retained object-PG pending metadata command.
+- `crates/server-http/src/http/mod.rs:1833-1840` - Normal S3 DeleteBucket HTTP operation dispatches to coordinator.delete_bucket_on_admitted_route.
+- `crates/server-http/src/http/mod.rs:3721-3734` - Requests are authenticated through authenticate_request before operation handling.
+- `crates/server-core/src/coordinator/authz/bucket.rs:127-132` - DeleteBucket authorization is enforced for PolicyAction::DeleteBucket with bucket owner/account-admin predicate.
+- `crates/argmin-s3/src/config.rs:637-665` - Runtime credentials and listen address are environment-configured; default listen address is 127.0.0.1:9000.
+- `crates/argmin-s3/src/main.rs:3839-3920` - The main frontend binds the configured TCP listener and starts plain HTTP or TLS HTTP serving with connection/in-flight limits.
+## Narrative
+The finding is a real in-scope runtime storage bug. PublishedPendingRecovery is explicitly not terminal and retains the pending metadata slot, yet the exact-bucket object metadata drain returns Ok for that outcome. DeleteBucket relies on that drain before its final emptiness check, then only scans currently visible object versions/uploads/stream uploads. Under recovery/log-gap conditions, an authenticated bucket owner/admin can therefore race bucket deletion past a pending object metadata command. This is security-relevant for object data integrity/availability, but exploitation requires high privileges and uncommon recovery timing, so medium severity is appropriate rather than high or critical.
+## Controls
+- SigV4 authentication via authenticate_request
+- DeleteBucket authorization requires bucket owner/account-admin authority
+- default listen address is 127.0.0.1:9000 unless ARGMIN_LISTEN_ADDR is changed
+- optional TLS via ARGMIN_TLS_CERT_PATH and ARGMIN_TLS_KEY_PATH
+- max_connections and max_inflight_requests backpressure in HTTP serve layer
+- configuration secret Debug output is redacted
+## Blindspots
+- No Kubernetes, Terraform, Docker Compose, or other deployment manifests were present to prove internet exposure or load-balancer type.
+- The validation PoC was a targeted Rust unit-test path rather than a full end-to-end HTTP exploit.
+- Static review cannot quantify how often PublishedPendingRecovery occurs under real production recovery/log-gap conditions.
+- No repository evidence established multi-tenant isolation boundaries beyond configured credentials and bucket/account authorization.
