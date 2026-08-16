@@ -3296,6 +3296,36 @@ impl StorageCluster {
         hook.map_or(Ok(()), |hook| hook(command))
     }
 
+    #[cfg(test)]
+    pub(super) fn maybe_expire_direct_put_budget_after_abandonment_observation(
+        &self,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut RequestWorkBudget,
+    ) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .expire_direct_put_budget_after_abandonment_observation
+            .clone();
+        if hook.is_some_and(|hook| hook(command)) {
+            work_budget.expire_for_test();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn maybe_run_before_direct_put_payload_ack_registration_hook(
+        &self,
+    ) -> Result<(), ObjectPgActionError> {
+        let hook = self
+            .test_hooks
+            .lock()
+            .unwrap()
+            .before_direct_put_payload_ack_registration
+            .clone();
+        hook.map_or(Ok(()), |hook| hook())
+    }
+
     #[cfg(not(test))]
     fn maybe_run_before_direct_put_abandoned_log_inspection_hook(
         &self,
@@ -6465,6 +6495,42 @@ impl StorageCluster {
         DirectPutAbandonedLogInspectionHookGuard {
             hooks: Arc::clone(&self.test_hooks),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_direct_put_abandonment_observation_budget_hook(
+        &self,
+        hook: DirectPutAbandonmentObservationBudgetHook,
+    ) -> DirectPutAbandonmentObservationBudgetHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .expire_direct_put_budget_after_abandonment_observation = Some(hook);
+        DirectPutAbandonmentObservationBudgetHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_direct_put_payload_ack_registration_hook(
+        &self,
+        hook: DirectPutPayloadAckRegistrationHook,
+    ) -> DirectPutPayloadAckRegistrationHookGuard {
+        self.test_hooks
+            .lock()
+            .unwrap()
+            .before_direct_put_payload_ack_registration = Some(hook);
+        DirectPutPayloadAckRegistrationHookGuard {
+            hooks: Arc::clone(&self.test_hooks),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_metadata_command_abandoned_log_inspection_hook(
+        &self,
+        hook: DirectPutAbandonedLogInspectionHook,
+    ) -> DirectPutAbandonedLogInspectionHookGuard {
+        self.test_install_before_direct_put_abandoned_log_inspection_hook(hook)
     }
 
     #[cfg(test)]

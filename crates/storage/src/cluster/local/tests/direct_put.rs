@@ -316,7 +316,7 @@ fn dropping_armed_direct_put_payload_cleans_issuer_staging() {
 }
 
 #[test]
-fn matching_pending_direct_put_preserves_payload_when_abandoned_log_inspection_fails() {
+fn matching_pending_direct_put_retries_transient_abandonment_scan_and_preserves_fatal_error() {
     let tmp = test_util::tempdir();
     let map = Arc::new(
         LocalClusterMap::open(
@@ -397,28 +397,42 @@ fn matching_pending_direct_put_preserves_payload_when_abandoned_log_inspection_f
     drop(pg);
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
-    let hook_guard =
-        cluster.test_install_before_direct_put_abandoned_log_inspection_hook(Arc::new(|command| {
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let hook_guard = cluster.test_install_before_direct_put_abandoned_log_inspection_hook(
+        Arc::new(move |command| {
             assert!(matches!(
                 command.payload(),
                 MetadataCommandPayload::CommitDirectPutObject(_)
             ));
-            Err(StoreError::MetadataCommandContention {
-                context: "injected abandoned-log inspection failure",
+            if hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(StoreError::StorageRpc {
+                    node_id: 2,
+                    operation: "injected direct PUT abandonment observation",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "transient response loss before fatal observation",
+                    ),
+                }
+                .into());
+            }
+            Err(StoreError::MetadataCommandLogChecksumMismatch {
+                node_id: 2,
+                pg_id: command.id().pg_id().get(),
+                cluster_epoch: command.id().cluster_epoch(),
+                log_index: command.id().log_index().get(),
+                stored_checksum: 1,
+                computed_checksum: 2,
             }
             .into())
-        }));
+        }),
+    );
     let error = route
         .commit_direct_object(payload, &prepared, |_| Ok::<(), ()>(()))
         .unwrap_err();
-    assert_eq!(
-        error.kind(),
-        crate::DirectPutFailureKind::MetadataCommandContention
-    );
-    assert_eq!(
-        error.diagnostic_cause_label(),
-        "store_metadata_command_contention"
-    );
+    assert_eq!(error.kind(), crate::DirectPutFailureKind::InternalError);
+    assert_eq!(error.diagnostic_cause_label(), "store_integrity_failure");
+    assert!(hook_calls.load(Ordering::SeqCst) >= 2);
 
     let retained = pending_metadata_command_for_test(&map, pg_id, &bucket)
         .expect("matching durable command must remain pending");
@@ -445,6 +459,164 @@ fn matching_pending_direct_put_preserves_payload_when_abandoned_log_inspection_f
     }
 
     drop(hook_guard);
+}
+
+#[test]
+fn matching_published_direct_put_returns_before_trailing_payload_ack_work() {
+    let tmp = test_util::tempdir();
+    let node_ids = trace_node_ids();
+    let map = Arc::new(
+        LocalClusterMap::open(
+            tmp.path(),
+            &node_ids,
+            &[0],
+            SharedStorageNode::DEFAULT_EC_SHAPE,
+        )
+        .unwrap(),
+    );
+    let cluster = current_cluster(&map);
+    let bucket = crate::tests::bucket_name("direct-put-published-handoff");
+    let key = crate::tests::object_key("pending-command");
+    create_test_bucket(&cluster, &bucket);
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(Arc::clone(&cluster));
+    let admission = handle.admit_current_route().unwrap();
+    let route = admission.active_put_object_route(&bucket, &key).unwrap();
+    let reservation_id = crate::tests::stream_session_id("published");
+    let generation_id = route.reserve_generation(&reservation_id).unwrap();
+    let data = b"payload owned by a published pending command";
+    let payload = route
+        .write_direct_object_payload(&reservation_id, generation_id, data.len() as u64, data)
+        .unwrap();
+    let prepared = crate::PreparedDirectPutObjectCommit {
+        versioning: crate::BucketVersioningState::Disabled,
+        owner: crate::OwnerIdentity::from_principal("owner"),
+        acl_grants: crate::AclGrants::default(),
+        public_read: false,
+        etag_crc64: checksum::crc64::checksum(data),
+        tags: None,
+        metadata_blob: crate::SerializedMetadataBlob::default(),
+        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+        object_lock: crate::ObjectLockState::default(),
+        encryption: crate::ObjectEncryption::None,
+        bucket_write_reservation: acquire_test_bucket_write_proof(
+            &cluster,
+            &bucket,
+            crate::metadata_command::PUT_OBJECT_DIRECT_COMMIT_BUCKET_WRITE_OPERATION_KIND,
+            Some(key.as_str()),
+        ),
+    };
+    let request = direct_put_commit_req_with_bucket_write_proof(
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload: data,
+            segment_okh: payload.segment_okh,
+            written: &payload.written,
+        },
+        prepared.bucket_write_reservation.clone(),
+    );
+    let pg_id = cluster.object_metadata_pg(&bucket, &key).pg_id();
+    let primary = map
+        .metadata_pg_primary_node(cluster.operation_epoch(), pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let command = cluster
+        .prepare_commit_direct_put_object_command(
+            pg_id,
+            &primary_pg,
+            &request,
+            crate::VersionId::Null,
+            request.bucket_write_reservation.clone(),
+        )
+        .unwrap();
+    drop(primary_pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .mark_pending_metadata_command_publication_started(primary.node_id().as_u32(), &command)
+        .unwrap();
+    let witness = node_ids
+        .iter()
+        .copied()
+        .find(|node_id| *node_id != primary.node_id())
+        .unwrap();
+    for node_id in [witness, primary.node_id()] {
+        map.node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+    }
+    let trailing = node_ids
+        .iter()
+        .copied()
+        .find(|node_id| *node_id != witness && *node_id != primary.node_id())
+        .unwrap();
+
+    let scan_hook =
+        cluster.test_install_before_direct_put_abandoned_log_inspection_hook(Arc::new(|_| {
+            Err(StoreError::StorageRpc {
+                node_id: 2,
+                operation: "injected published direct PUT abandonment observation",
+                failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "injected response loss after direct PUT publication",
+                ),
+            }
+            .into())
+        }));
+    let budget_command = command.clone();
+    let budget_hook = cluster.test_install_direct_put_abandonment_observation_budget_hook(
+        Arc::new(move |command| command == &budget_command),
+    );
+    let ack_registration_calls = Arc::new(AtomicUsize::new(0));
+    let ack_registration_calls_for_hook = Arc::clone(&ack_registration_calls);
+    let ack_registration_hook = cluster
+        .test_install_before_direct_put_payload_ack_registration_hook(Arc::new(move || {
+            ack_registration_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            Err(crate::ObjectPgActionError::InvalidRequest {
+                reason: "published direct PUT continued into payload acknowledgement registration"
+                    .to_owned(),
+            })
+        }));
+    let outcome = route
+        .commit_direct_object(payload, &prepared, |_| -> Result<(), ()> {
+            panic!("matching published direct PUT must not rerun its precondition")
+        })
+        .unwrap()
+        .unwrap();
+    drop(ack_registration_hook);
+    drop(budget_hook);
+    drop(scan_hook);
+
+    assert_eq!(
+        ack_registration_calls.load(Ordering::SeqCst),
+        0,
+        "confirmed publication must return before payload acknowledgement work"
+    );
+    assert_eq!(outcome.version_id, crate::VersionId::Null);
+    assert_eq!(outcome.live_size, data.len() as u64);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command.clone()),
+        "confirmed publication must leave trailing convergence to recovery"
+    );
+    let trailing_pg = map
+        .node(trailing)
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*trailing_pg, &bucket, &key),
+        Err(crate::MetadataError::ObjectNotFound)
+    ));
 }
 
 #[test]

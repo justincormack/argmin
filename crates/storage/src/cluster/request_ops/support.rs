@@ -194,6 +194,17 @@ pub(super) fn object_pg_action_error_is_retryable_command_observation(
     }
 }
 
+pub(super) fn metadata_command_abandonment_observation_error_is_retryable(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    match error {
+        BucketSnapshotLoadError::Store(error) => {
+            store_error_is_retryable_command_observation(error)
+        }
+        BucketSnapshotLoadError::Metadata(error) => error.is_command_contention(),
+    }
+}
+
 pub(super) fn object_pg_action_error_is_retryable_pending_drain(
     error: &ObjectPgActionError,
 ) -> bool {
@@ -2663,6 +2674,12 @@ pub(super) enum MetadataCommandConvergenceRequirement {
 pub(super) enum MetadataCommandBudgetExhaustionOutcome {
     PublishedPendingRecovery,
     Error(StoreError),
+}
+
+pub(super) enum MetadataCommandAbandonmentObservation {
+    Observed(bool),
+    Retry,
+    PublishedPendingRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

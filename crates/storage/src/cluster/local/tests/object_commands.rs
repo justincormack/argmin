@@ -1212,6 +1212,81 @@ fn multipart_completion_barrier_drains_same_pg_object_command_with_cleanup_hooks
 }
 
 #[test]
+fn multipart_completion_barrier_requires_object_command_replica_convergence() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "mpu-barrier-object-convergence-");
+    let key = key_for_object_pg(topology, &bucket, 1, "object-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let pg_id = PgId::new(1);
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::ReserveObjectVersion(ReserveObjectVersionCommand::new(
+            bucket.clone(),
+            key,
+            crate::VersionId::from_u64(1),
+        )),
+    );
+    force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let primary = map
+        .metadata_pg_primary_node(cluster.operation_epoch(), pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .mark_pending_metadata_command_publication_started(primary.node_id().as_u32(), &command)
+        .unwrap();
+    for node_id in [NodeId::new(0), NodeId::new(1)] {
+        map.node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap()
+            .apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+    }
+
+    let mut work_budget = RequestWorkBudget::new(Duration::from_millis(20), None)
+        .for_operation("test_multipart_barrier_object_convergence")
+        .for_pg(pg_id);
+    work_budget.expire_for_test();
+    let error = cluster
+        .test_finish_pending_command_for_multipart_completion_barrier(
+            pg_id,
+            &command,
+            &mut work_budget,
+        )
+        .expect_err("multipart barrier must not hand an object command to recovery");
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(
+            StoreError::MetadataCommandDependencyConvergencePending { .. }
+        )
+    ));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command),
+        "barrier dependency must remain pending for full replica convergence"
+    );
+}
+
+#[test]
 fn multipart_completion_barrier_drains_other_bucket_sequence_without_stealing_order() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4222,7 +4297,7 @@ fn suspended_delete_marker_retries_transient_recovery_waiter_observation() {
 }
 
 #[test]
-fn recovery_drain_bounds_initial_abandonment_scan_by_work_deadline() {
+fn recovery_drain_classifies_publication_started_when_abandonment_scan_exhausts_deadline() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let map = Arc::new(
@@ -4250,9 +4325,19 @@ fn recovery_drain_bounds_initial_abandonment_scan_by_work_deadline() {
         )),
     );
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    primary
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap()
+        .mark_pending_metadata_command_publication_started(primary.node_id().as_u32(), &command)
+        .unwrap();
 
     let storage_nodes: Vec<_> = node_ids
         .into_iter()
+        .filter(|node_id| *node_id != primary.node_id())
         .map(|node_id| map.node(node_id).unwrap().storage_node())
         .collect();
     let pg_guards: Vec<_> = storage_nodes
@@ -4270,24 +4355,28 @@ fn recovery_drain_bounds_initial_abandonment_scan_by_work_deadline() {
             &command,
             &mut work_budget,
         )
-        .expect_err("the initial abandonment scan must stop at the shared deadline");
+        .expect_err("the blocked abandonment scan must classify durable publication");
 
     assert!(
         matches!(
             error,
-            crate::ObjectPgActionError::Store(StoreError::OperationDeadlineExceeded { .. })
+            crate::ObjectPgActionError::Store(
+                StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+            )
         ),
-        "unexpected initial abandonment scan error: {error:?}"
+        "publication-started command regressed to a retryable observation error: {error:?}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(1),
-        "initial abandonment scan ignored the shared deadline"
+        started.elapsed()
+            < crate::cluster::request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET
+                + Duration::from_secs(1),
+        "abandonment classification exceeded its work and confirmation deadlines"
     );
     drop(pg_guards);
     assert_eq!(
         pending_metadata_command_for_test(&map, pg_id, &bucket).as_ref(),
         Some(&command),
-        "an inconclusive abandonment scan must retain the pending command"
+        "publication uncertainty must retain the pending command"
     );
 }
 

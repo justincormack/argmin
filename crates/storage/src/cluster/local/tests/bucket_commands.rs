@@ -932,6 +932,74 @@ fn newly_installed_bucket_command_reconstructs_progress_after_recovery_timeout_a
 }
 
 #[test]
+fn create_bucket_retries_transient_abandonment_observation_for_unmarked_pending_command() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let bucket = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, pg_id.get(), "create-abandonment-observation-")
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let hook_bucket = bucket.clone();
+    let _hook = cluster.test_install_before_metadata_command_abandoned_log_inspection_hook(
+        Arc::new(move |command| {
+            if command.bucket_name() == &hook_bucket
+                && hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Err(StoreError::StorageRpc {
+                    node_id: 2,
+                    operation: "injected abandonment observation",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "transient response loss while inspecting unmarked command",
+                    ),
+                }
+                .into());
+            }
+            Ok(())
+        }),
+    );
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl_grants = crate::AclGrants::default();
+    let result = cluster
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .unwrap();
+
+    assert!(matches!(
+        result,
+        crate::BucketCreateAttemptOutcome::Created(receipt) if receipt.name() == &bucket
+    ));
+    assert!(hook_calls.load(Ordering::SeqCst) >= 2);
+    assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+}
+
+#[test]
 fn create_bucket_retries_partial_exact_command_conflict() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

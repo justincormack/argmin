@@ -2476,12 +2476,29 @@ impl super::StorageCluster {
         convergence_requirement: MetadataCommandConvergenceRequirement,
         budget_error: StoreError,
     ) -> Result<MetadataCommandBudgetExhaustionOutcome, BucketSnapshotLoadError> {
+        self.classify_metadata_command_budget_exhaustion_with_route_mode(
+            pg_id,
+            command,
+            MetadataCommandRouteMode::Normal,
+            convergence_requirement,
+            budget_error,
+        )
+    }
+
+    pub(super) fn classify_metadata_command_budget_exhaustion_with_route_mode(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        convergence_requirement: MetadataCommandConvergenceRequirement,
+        budget_error: StoreError,
+    ) -> Result<MetadataCommandBudgetExhaustionOutcome, BucketSnapshotLoadError> {
         let confirmation_deadline =
             Instant::now() + METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
         let state = self.metadata_command_publication_state_on_acting_set_until(
             pg_id,
             command,
-            MetadataCommandRouteMode::Normal,
+            route_mode,
             confirmation_deadline,
         )?;
         Ok(Self::metadata_command_budget_exhaustion_outcome(
@@ -2490,6 +2507,42 @@ impl super::StorageCluster {
             state,
             budget_error,
         ))
+    }
+
+    pub(super) fn resolve_metadata_command_abandonment_observation(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        route_mode: MetadataCommandRouteMode,
+        convergence_requirement: MetadataCommandConvergenceRequirement,
+        observation: Result<bool, MetadataCommandApplyFailure>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<MetadataCommandAbandonmentObservation, BucketSnapshotLoadError> {
+        match observation {
+            Ok(abandoned) => Ok(MetadataCommandAbandonmentObservation::Observed(abandoned)),
+            Err(error)
+                if metadata_command_abandonment_observation_error_is_retryable(&error.source) =>
+            {
+                let Err(budget_error) = work_budget.sleep_after_contention(
+                    "metadata command abandonment observation retry budget exhausted",
+                ) else {
+                    return Ok(MetadataCommandAbandonmentObservation::Retry);
+                };
+                match self.classify_metadata_command_budget_exhaustion_with_route_mode(
+                    pg_id,
+                    command,
+                    route_mode,
+                    convergence_requirement,
+                    budget_error,
+                )? {
+                    MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => Ok(
+                        MetadataCommandAbandonmentObservation::PublishedPendingRecovery,
+                    ),
+                    MetadataCommandBudgetExhaustionOutcome::Error(error) => Err(error.into()),
+                }
+            }
+            Err(error) => Err(error.source),
+        }
     }
 
     fn metadata_command_budget_exhaustion_outcome(
@@ -2586,8 +2639,23 @@ impl super::StorageCluster {
                 }
             } else {
                 Ok(false)
-            }
-            .map_err(|error| error.source)?;
+            };
+            let abandoned_on_acting_set = match self
+                .resolve_metadata_command_abandonment_observation(
+                    pg_id,
+                    &command,
+                    route_mode,
+                    policy.convergence_requirement,
+                    abandoned_on_acting_set,
+                    work_budget,
+                )?
+            {
+                MetadataCommandAbandonmentObservation::Observed(abandoned) => abandoned,
+                MetadataCommandAbandonmentObservation::Retry => continue,
+                MetadataCommandAbandonmentObservation::PublishedPendingRecovery => {
+                    return Ok(FinishPendingMetadataCommandResult::PublishedPendingRecovery);
+                }
+            };
             if abandoned_on_acting_set {
                 match route_mode {
                     MetadataCommandRouteMode::Normal => self
@@ -3314,7 +3382,11 @@ impl super::StorageCluster {
             | MetadataCommandPayload::CreateMultipartUpload(_)
             | MetadataCommandPayload::AbortMultipartUpload(_)
             | MetadataCommandPayload::DeleteObjectPayloadReclaim(_) => {
-                self.finish_object_pg_pending_slot(pg_id, command)
+                self.finish_object_pg_pending_slot_requiring_convergence_with_work_budget(
+                    pg_id,
+                    command,
+                    work_budget,
+                )
             }
             MetadataCommandPayload::CreateBucket(_)
             | MetadataCommandPayload::PutBucketVersioning(_)
@@ -3332,6 +3404,20 @@ impl super::StorageCluster {
                 )
                 .map_err(super::bucket_snapshot_error_to_object_pg_action_error),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_finish_pending_command_for_multipart_completion_barrier(
+        &self,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<super::PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.finish_pending_command_for_multipart_completion_barrier(
+            pg_id,
+            command,
+            work_budget,
+        )
     }
 
 

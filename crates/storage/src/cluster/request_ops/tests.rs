@@ -349,6 +349,27 @@ mod pending_command_terminal_cleanup_tests {
 
     #[test]
     fn command_observation_retries_transient_contention_but_not_log_integrity_failures() {
+        assert!(
+            metadata_command_abandonment_observation_error_is_retryable(
+                &BucketSnapshotLoadError::Store(StoreError::OperationDeadlineExceeded {
+                    context: "test abandonment observation deadline",
+                })
+            )
+        );
+        assert!(
+            metadata_command_abandonment_observation_error_is_retryable(
+                &BucketSnapshotLoadError::Store(StoreError::RouteMapExpired {
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    valid_until_ms: 1,
+                    now_ms: 2,
+                })
+            )
+        );
+        assert!(
+            metadata_command_abandonment_observation_error_is_retryable(&remote_failure(
+                StorageRpcErrorCode::TransportClosed,
+            ))
+        );
         assert!(object_pg_action_error_is_retryable_command_observation(
             &ObjectPgActionError::Store(StoreError::MetadataCommandContention {
                 context: "test command observation contention",
@@ -362,6 +383,16 @@ mod pending_command_terminal_cleanup_tests {
                 log_index: 3,
             })
         ));
+        assert!(
+            !metadata_command_abandonment_observation_error_is_retryable(
+                &BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                    node_id: 1,
+                    pg_id: 2,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index: 3,
+                })
+            )
+        );
         assert!(!object_pg_action_error_is_retryable_command_observation(
             &ObjectPgActionError::Store(StoreError::MetadataCommandLogGap {
                 node_id: 1,

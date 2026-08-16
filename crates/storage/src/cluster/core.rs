@@ -1040,6 +1040,14 @@ type ObjectMetadataReservationAcquiredHook =
 type DirectPutAbandonedLogInspectionHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), BucketSnapshotLoadError> + Send + Sync>;
 
+#[cfg(test)]
+type DirectPutAbandonmentObservationBudgetHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
+type DirectPutPayloadAckRegistrationHook =
+    Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
 #[cfg(any(test, feature = "test-hooks"))]
 type MetadataListingPgCompleteHook = Arc<dyn Fn(u32) + Send + Sync>;
 
@@ -1082,6 +1090,11 @@ struct StorageClusterTestHooks {
     after_direct_put_action: Option<DirectPutDeadlineExpiryHook>,
     #[cfg(test)]
     before_direct_put_abandoned_log_inspection: Option<DirectPutAbandonedLogInspectionHook>,
+    #[cfg(test)]
+    expire_direct_put_budget_after_abandonment_observation:
+        Option<DirectPutAbandonmentObservationBudgetHook>,
+    #[cfg(test)]
+    before_direct_put_payload_ack_registration: Option<DirectPutPayloadAckRegistrationHook>,
     before_object_generation_command_id: Option<ObjectGenerationCommandIdHook>,
     before_object_version_command_id: Option<ObjectVersionCommandIdHook>,
     before_stream_append_command_id: Option<StreamAppendCommandIdHook>,
@@ -1156,6 +1169,16 @@ pub(crate) struct DirectPutActionHookGuard {
 
 #[cfg(test)]
 pub struct DirectPutAbandonedLogInspectionHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub struct DirectPutAbandonmentObservationBudgetHookGuard {
+    hooks: Arc<Mutex<StorageClusterTestHooks>>,
+}
+
+#[cfg(test)]
+pub struct DirectPutPayloadAckRegistrationHookGuard {
     hooks: Arc<Mutex<StorageClusterTestHooks>>,
 }
 
@@ -1327,6 +1350,26 @@ impl Drop for DirectPutAbandonedLogInspectionHookGuard {
             .lock()
             .unwrap()
             .before_direct_put_abandoned_log_inspection = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutAbandonmentObservationBudgetHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .expire_direct_put_budget_after_abandonment_observation = None;
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutPayloadAckRegistrationHookGuard {
+    fn drop(&mut self) {
+        self.hooks
+            .lock()
+            .unwrap()
+            .before_direct_put_payload_ack_registration = None;
     }
 }
 

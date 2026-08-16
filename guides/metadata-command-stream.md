@@ -154,7 +154,12 @@ replays, pending-command drains, waiter observations, pending-slot installs, and
 stale-snapshot retries consume this same outer operation budget; they must not use
 a shorter or fresh nested budget that can expose internal PG churn as `SlowDown`
 before the condition is re-evaluated or extend work beyond the operation deadline.
-Pending-slot installation checks the deadline while holding the frontend PG lock,
+Initial acting-set abandonment observation and pending-slot installation both
+consume the same operation deadline. Bucket, object, and direct-PUT finishers use
+one observation policy: retryable local, route, convergence, and transport failures
+retry within that budget, then receive exact publication classification on exhaustion;
+fatal integrity and protocol failures still fail closed. Pending-slot installation checks
+the deadline while holding the frontend PG lock,
 and remote requests carry the same bound to a storage-side check under the storage
 PG lock, so an RPC that times out cannot install its slot later. This includes
 bucket-control slot installation for versioning, ACL, property, and subresource
@@ -246,6 +251,10 @@ a create command publishes. Object operations must parse stored lifecycle
 configuration and resolve every other fallible response input before publishing
 object metadata. After publication, only infallible projection of the
 already-validated inputs and command outcome is permitted.
+For direct PUT, exact witness-plus-primary publication returns the response
+projected from `CommitDirectPutObject` immediately. It must not re-enter payload
+ack registration or validation; the retained pending slot owns trailing
+replica convergence and terminal cleanup.
 
 Cross-PG dependency commands are stricter. Publishing a dependency command on
 its witness and primary is irrevocable, but does not authorize publication of
@@ -613,7 +622,7 @@ outcome is only valid after an exact matching predicate has succeeded.
 | `begin_bucket_delete_if_current_with_route_validation` | bucket PG | After publication-start, partial exact-command conflicts are retryable only after validating exact command bytes plus matching `previous_log_hash` and `log_hash`; divergent same-index rows fail closed. | Once the primary publishes `Deleting`, a recoverable trailing error returns the committed outcome and retains the slot for recovery. |
 | `establish_multipart_completion_barrier` | bucket PG | Abort only before publication-start; after publication-start, retain the exact command and require complete acting-set convergence. | A published but unconverged barrier returns an internal dependency-pending outcome and must not publish the object-PG command. The returned idempotence sequence comes only from the exact fully converged barrier. |
 | `drain_pending_metadata_command_pg_slot` and `drain_pending_multipart_completion_barrier_command` | bucket PG drain | Fail closed on unsafe finish conflicts. | These are generic drain helpers; they must not hide divergent command-log state from the caller. |
-| `finish_pending_command_for_multipart_completion_barrier` | bucket/object PG drain | Follows the command family finisher. | Multi-PG MPU completion must not hold ambiguous pending state across PGs; Phase 9.3 pins the multipart serialization rules. |
+| `finish_pending_command_for_multipart_completion_barrier` | bucket/object PG drain | Requires complete acting-set convergence for both bucket and object commands, using the barrier caller's existing absolute work budget. | Multi-PG MPU completion must not hand a published object command to recovery and then publish its dependent barrier; bounded trailing failure remains dependency-pending. |
 
 Pre-publish conflict handling belongs to the compiler-classified publisher.
 Every registered publisher token implements exactly one sealed class trait,

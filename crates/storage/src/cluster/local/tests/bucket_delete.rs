@@ -1633,6 +1633,95 @@ fn begin_bucket_delete_reissues_stale_duplicate_mark_deleting_index() {
 }
 
 #[test]
+fn begin_bucket_delete_retries_transient_abandonment_observation_after_publication_started() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let bucket = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, pg_id.get(), "delete-abandonment-observation-")
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let command_id = cluster.next_bucket_metadata_command_id(pg_id).unwrap();
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let current = crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        command_id,
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            current.with_execution_generation(
+                primary_pg
+                    .next_bucket_execution_generation_candidate()
+                    .unwrap(),
+            ),
+        )),
+    );
+    drop(primary_pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    primary_pg
+        .mark_pending_metadata_command_publication_started(primary.node_id().as_u32(), &command)
+        .unwrap();
+    drop(primary_pg);
+
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let hook_bucket = bucket.clone();
+    let _hook = cluster.test_install_before_metadata_command_abandoned_log_inspection_hook(
+        Arc::new(move |command| {
+            if command.bucket_name() == &hook_bucket
+                && hook_calls_for_hook.fetch_add(1, Ordering::SeqCst) == 0
+            {
+                return Err(StoreError::StorageRpc {
+                    node_id: 2,
+                    operation: "injected abandonment observation",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "transient response loss after publication started",
+                    ),
+                }
+                .into());
+            }
+            Ok(())
+        }),
+    );
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap();
+
+    assert!(hook_calls.load(Ordering::SeqCst) >= 2);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Deleting
+        );
+    }
+    assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+}
+
+#[test]
 fn begin_bucket_delete_reissue_waits_for_post_primary_replica_apply_window() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
