@@ -41,6 +41,36 @@ enum CollectedPendingObjectMetadataCommands {
     PendingRecovery(Vec<MetadataCommandEnvelope>),
 }
 
+#[derive(Clone, Copy)]
+struct PendingMetadataCommandDrainContext<'a> {
+    route_mode: MetadataCommandRouteMode,
+    recovery_authorized_source: Option<&'a MetadataCommandEnvelope>,
+    convergence_requirement: request_ops::MetadataCommandConvergenceRequirement,
+}
+
+impl<'a> PendingMetadataCommandDrainContext<'a> {
+    fn normal(
+        convergence_requirement: request_ops::MetadataCommandConvergenceRequirement,
+    ) -> Self {
+        Self {
+            route_mode: MetadataCommandRouteMode::Normal,
+            recovery_authorized_source: None,
+            convergence_requirement,
+        }
+    }
+
+    fn recovery(
+        recovery_authorized_source: Option<&'a MetadataCommandEnvelope>,
+        convergence_requirement: request_ops::MetadataCommandConvergenceRequirement,
+    ) -> Self {
+        Self {
+            route_mode: MetadataCommandRouteMode::Recovery,
+            recovery_authorized_source,
+            convergence_requirement,
+        }
+    }
+}
+
 impl CollectedPendingObjectMetadataCommands {
     fn commands(&self) -> &[MetadataCommandEnvelope] {
         match self {
@@ -1310,8 +1340,9 @@ impl StorageCluster {
             command,
             &mut authority,
             self,
-            MetadataCommandRouteMode::Normal,
-            None,
+            PendingMetadataCommandDrainContext::normal(
+                request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+            ),
         )?;
         self.maybe_run_after_metadata_command_drain_hook();
         Ok(outcome)
@@ -1347,8 +1378,9 @@ impl StorageCluster {
             command,
             &mut authority,
             self,
-            MetadataCommandRouteMode::Normal,
-            None,
+            PendingMetadataCommandDrainContext::normal(
+                request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+            ),
         )?;
         self.maybe_run_after_metadata_command_drain_hook();
         Ok(outcome)
@@ -1360,14 +1392,28 @@ impl StorageCluster {
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        self.drain_pending_metadata_command_with_recovery_authority_and_requirement(
+            authority,
+            pg_id,
+            command,
+            request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+        )
+    }
+
+    fn drain_pending_metadata_command_with_recovery_authority_and_requirement(
+        &self,
+        authority: &mut MetadataCommandRecoveryDrainAuthority<'_>,
+        pg_id: PgId,
+        command: &MetadataCommandEnvelope,
+        convergence_requirement: request_ops::MetadataCommandConvergenceRequirement,
+    ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
         let mut drain_authority = MetadataCommandDrainAuthority::for_recovery(authority);
         let outcome = self.drain_pending_metadata_command_with_authority_inner(
             pg_id,
             command,
             &mut drain_authority,
             self,
-            MetadataCommandRouteMode::Normal,
-            None,
+            PendingMetadataCommandDrainContext::normal(convergence_requirement),
         )?;
         self.maybe_run_after_metadata_command_drain_hook();
         Ok(outcome)
@@ -1388,8 +1434,10 @@ impl StorageCluster {
             command,
             &mut authority,
             self,
-            MetadataCommandRouteMode::Recovery,
-            None,
+            PendingMetadataCommandDrainContext::recovery(
+                None,
+                request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+            ),
         )
     }
 
@@ -1409,8 +1457,10 @@ impl StorageCluster {
             command,
             &mut authority,
             reservation_authority,
-            MetadataCommandRouteMode::Recovery,
-            Some(command),
+            PendingMetadataCommandDrainContext::recovery(
+                Some(command),
+                request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+            ),
         )
     }
 
@@ -1420,9 +1470,13 @@ impl StorageCluster {
         initial_command: &MetadataCommandEnvelope,
         authority: &mut MetadataCommandDrainAuthority<'_>,
         reservation_authority: &StorageCluster,
-        route_mode: MetadataCommandRouteMode,
-        recovery_authorized_source: Option<&MetadataCommandEnvelope>,
+        context: PendingMetadataCommandDrainContext<'_>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        let PendingMetadataCommandDrainContext {
+            route_mode,
+            convergence_requirement,
+            ..
+        } = context;
         let mut command = initial_command.clone();
         loop {
             let recovery = self
@@ -1465,8 +1519,12 @@ impl StorageCluster {
                         .work_budget()
                         .check("pending command recovery wait budget exhausted")
                     {
-                        match self.classify_pending_metadata_command_budget_exhaustion(
-                            pg_id, &command, route_mode, error,
+                        match self.classify_pending_metadata_command_budget_exhaustion_with_requirement(
+                            pg_id,
+                            &command,
+                            route_mode,
+                            convergence_requirement,
+                            error,
                         )? {
                             request_ops::MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
                                 return Ok(PendingMetadataCommandOutcome::PublishedPendingRecovery);
@@ -1490,8 +1548,12 @@ impl StorageCluster {
                                     .check("pending command recovery wait budget exhausted")
                                 {
                                     match self
-                                        .classify_pending_metadata_command_budget_exhaustion(
-                                            pg_id, &command, route_mode, error,
+                                        .classify_pending_metadata_command_budget_exhaustion_with_requirement(
+                                            pg_id,
+                                            &command,
+                                            route_mode,
+                                            convergence_requirement,
+                                            error,
                                         )?
                                     {
                                         request_ops::MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
@@ -1512,8 +1574,12 @@ impl StorageCluster {
                                         )
                                     {
                                         match self
-                                            .classify_pending_metadata_command_budget_exhaustion(
-                                                pg_id, &command, route_mode, error,
+                                            .classify_pending_metadata_command_budget_exhaustion_with_requirement(
+                                                pg_id,
+                                                &command,
+                                                route_mode,
+                                                convergence_requirement,
+                                                error,
                                             )?
                                         {
                                             request_ops::MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
@@ -1573,8 +1639,12 @@ impl StorageCluster {
                         .work_budget()
                         .sleep_after_contention("pending command recovery retry budget exhausted")
                     {
-                        match self.classify_pending_metadata_command_budget_exhaustion(
-                            pg_id, &command, route_mode, error,
+                        match self.classify_pending_metadata_command_budget_exhaustion_with_requirement(
+                            pg_id,
+                            &command,
+                            route_mode,
+                            convergence_requirement,
+                            error,
                         )? {
                             request_ops::MetadataCommandBudgetExhaustionOutcome::PublishedPendingRecovery => {
                                 return Ok(PendingMetadataCommandOutcome::PublishedPendingRecovery);
@@ -1601,8 +1671,7 @@ impl StorageCluster {
                 &command,
                 &mut leader,
                 reservation_authority,
-                route_mode,
-                recovery_authorized_source,
+                context,
             )?;
             self.emit_metadata_command_recovery_outcome_for_command(
                 pg_id,
@@ -1808,9 +1877,13 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         leader: &mut MetadataCommandRecoveryLeader<'_>,
         reservation_authority: &StorageCluster,
-        route_mode: MetadataCommandRouteMode,
-        recovery_authorized_source: Option<&MetadataCommandEnvelope>,
+        context: PendingMetadataCommandDrainContext<'_>,
     ) -> Result<PendingMetadataCommandOutcome, ObjectPgActionError> {
+        let PendingMetadataCommandDrainContext {
+            route_mode,
+            recovery_authorized_source,
+            convergence_requirement,
+        } = context;
         if Self::metadata_command_is_bucket_pg_command(command) {
             let outcome = match route_mode {
                     MetadataCommandRouteMode::Normal => self
@@ -1819,6 +1892,7 @@ impl StorageCluster {
                             command,
                             false,
                             leader,
+                            convergence_requirement,
                         ),
                     MetadataCommandRouteMode::Recovery => {
                         self.finish_pending_metadata_command_to_acting_set_for_recovery_with_work_budget(
@@ -1827,6 +1901,7 @@ impl StorageCluster {
                             false,
                             recovery_authorized_source,
                             leader,
+                            convergence_requirement,
                         )
                     }
                 }
@@ -1871,8 +1946,7 @@ impl StorageCluster {
                     recovery_guard: Some(recovery_guard),
                     finish_policy:
                         ObjectPendingCommandFinishPolicy::AbandonZeroApplyStaleReservation,
-                    convergence_requirement:
-                        request_ops::MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                    convergence_requirement,
                 },
             )
             .map(PendingObjectMetadataCommandCompletion::into_outcome)
@@ -3049,11 +3123,25 @@ impl StorageCluster {
                     command.payload().kind_name()
                 ),
             );
-            let outcome = self.drain_pending_metadata_command_with_recovery_authority(
-                &mut recovery_authority,
-                pg_id,
-                &command,
-            )?;
+            let outcome = match self
+                .drain_pending_metadata_command_with_recovery_authority_and_requirement(
+                    &mut recovery_authority,
+                    pg_id,
+                    &command,
+                    request_ops::MetadataCommandConvergenceRequirement::RequireAllReplicas,
+                ) {
+                Ok(outcome) => outcome,
+                Err(ObjectPgActionError::Store(
+                    StoreError::MetadataCommandDependencyConvergencePending { .. }
+                    | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
+                )) => {
+                    recovery_authority.sleep_after_contention(
+                        "exact bucket object command convergence budget exhausted",
+                    )?;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             Self::emit_exact_bucket_object_drain_step(
                 bucket,
                 pg_id,
@@ -3063,8 +3151,13 @@ impl StorageCluster {
             match outcome {
                 PendingMetadataCommandOutcome::Applied
                 | PendingMetadataCommandOutcome::Abandoned => {}
-                PendingMetadataCommandOutcome::PublishedPendingRecovery => return Ok(()),
-                PendingMetadataCommandOutcome::TerminalCleanupPending { .. } => return Ok(()),
+                PendingMetadataCommandOutcome::PublishedPendingRecovery
+                | PendingMetadataCommandOutcome::TerminalCleanupPending { .. } => {
+                    recovery_authority.sleep_after_contention(
+                        "exact bucket object command terminal cleanup budget exhausted",
+                    )?;
+                    continue;
+                }
                 PendingMetadataCommandOutcome::RetryPartialExactConflict => {
                     return Err(conflicting_pending_object_metadata_command(
                         "retryable partial pending object metadata drain",

@@ -2177,13 +2177,27 @@ impl super::StorageCluster {
         bucket: &BucketName,
         drain: &super::DurableBucketWriteDrain,
     ) -> Result<(), BucketWriteDrainError> {
+        self.test_drain_pending_object_metadata_commands_for_exact_bucket_after_reservation_with_max_attempts(
+            bucket,
+            drain,
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_drain_pending_object_metadata_commands_for_exact_bucket_after_reservation_with_max_attempts(
+        &self,
+        bucket: &BucketName,
+        drain: &super::DurableBucketWriteDrain,
+        max_attempts: Option<usize>,
+    ) -> Result<(), BucketWriteDrainError> {
         let pg_id = PgId::new(drain.pg_id);
         let node = self
             .local_map
             .metadata_pg_primary_node(self.operation_epoch(), pg_id)?;
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS),
-            None,
+            max_attempts,
         )
         .for_operation("bucket_delete_begin")
         .for_pg(pg_id);

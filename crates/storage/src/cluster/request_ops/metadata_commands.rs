@@ -2271,6 +2271,7 @@ impl super::StorageCluster {
         command: &MetadataCommandEnvelope,
         clear_pending_on_zero_apply: bool,
         leader: &mut MetadataCommandRecoveryLeader<'_>,
+        convergence_requirement: MetadataCommandConvergenceRequirement,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
         let (work_budget, _proof, recovery_guard) = leader.parts_with_guard();
         self.finish_pending_metadata_command_to_acting_set_inner(
@@ -2279,8 +2280,7 @@ impl super::StorageCluster {
             MetadataCommandFinishPolicy {
                 clear_pending_on_zero_apply,
                 retry_partial_exact_conflict: true,
-                convergence_requirement:
-                    MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                convergence_requirement,
                 progress_provenance: MetadataCommandApplyProgressProvenance::RecoveredPending,
             },
             MetadataCommandExecutionRoute::normal(),
@@ -2296,6 +2296,7 @@ impl super::StorageCluster {
         clear_pending_on_zero_apply: bool,
         recovery_authorized_source: Option<&MetadataCommandEnvelope>,
         leader: &mut MetadataCommandRecoveryLeader<'_>,
+        convergence_requirement: MetadataCommandConvergenceRequirement,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
         let (work_budget, recovery_proof, recovery_guard) = leader.parts_with_guard();
         self.finish_pending_metadata_command_to_acting_set_inner(
@@ -2304,8 +2305,7 @@ impl super::StorageCluster {
             MetadataCommandFinishPolicy {
                 clear_pending_on_zero_apply,
                 retry_partial_exact_conflict: true,
-                convergence_requirement:
-                    MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                convergence_requirement,
                 progress_provenance: MetadataCommandApplyProgressProvenance::RecoveredPending,
             },
             MetadataCommandExecutionRoute::recovery(

@@ -266,6 +266,12 @@ and reservation durable for recovery, and does not publish the dependent
 command. This outcome is not metadata contention and must not map to
 caller-visible `SlowDown`.
 
+DeleteBucket's post-reservation exact-bucket scan is also a destructive cross-PG
+barrier. It must converge each same-bucket pending command on the complete
+acting set and complete terminal slot cleanup before advancing the durable
+object-PG frontier. Published recovery handoff or deferred cleanup may be
+retried within the shared delete budget, but neither is a completed drain.
+
 An ambiguous witness or primary response is different from a confirmed
 publication. The request retries the exact command under a short absolute
 confirmation deadline. If it still cannot distinguish applied from not

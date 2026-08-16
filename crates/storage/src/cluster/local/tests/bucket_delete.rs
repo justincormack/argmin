@@ -5306,6 +5306,243 @@ fn post_reservation_exact_bucket_frontier_resumes_after_recorded_pg() {
 }
 
 #[test]
+fn post_reservation_exact_bucket_frontier_waits_for_published_replica_convergence() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let (bucket, key) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "delete-published-frontier-");
+        let key = key_for_object_pg(topology, &bucket, 2, "pending-");
+        (bucket, key)
+    };
+    let object_pg_id = PgId::new(2);
+    set_route_primary(&mut map, object_pg_id.get(), NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::SessionId::try_from("83".repeat(16)).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        cluster
+            .next_object_metadata_command_id(object_pg_id)
+            .unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            reservation_id.clone(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, object_pg_id, &bucket, &command);
+    for node_id in [NodeId::new(0), NodeId::new(2)] {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg_id.get())
+            .unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .unwrap(),
+            crate::GenerationId::MIN,
+            "witness and primary must contain exact publication evidence"
+        );
+    }
+    let trailing_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg_id.get())
+        .unwrap();
+    assert!(crate::PgMetadataStore::get_object_generation_reservation(
+        &*trailing_pg,
+        &bucket,
+        &key,
+        &reservation_id,
+    )
+    .is_err());
+    drop(trailing_pg);
+
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+    let error = cluster
+        .test_drain_pending_object_metadata_commands_for_exact_bucket_after_reservation_with_max_attempts(
+            &bucket,
+            &drain,
+            Some(1),
+        )
+        .expect_err("published command must not advance the exact-bucket drain frontier");
+    assert!(matches!(
+        error,
+        crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert_eq!(
+        cluster
+            .test_bucket_delete_post_reservation_next_object_pg_id(&drain)
+            .unwrap(),
+        None,
+        "incomplete replica convergence must not advance durable drain progress"
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, object_pg_id, &bucket),
+        Some(command),
+        "published command must remain owned by recovery until every replica converges"
+    );
+    assert_eq!(
+        cluster.test_bucket_presence(&bucket).unwrap(),
+        crate::test_support::TestBucketPresence::Active
+    );
+}
+
+#[test]
+fn post_reservation_exact_bucket_frontier_waits_for_terminal_slot_cleanup() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let (bucket, key, pg_count) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        let bucket = bucket_for_pg(topology, 1, "delete-cleanup-frontier-");
+        let key = key_for_object_pg(topology, &bucket, 2, "pending-");
+        (bucket, key, topology.pg_count())
+    };
+    let object_pg_id = PgId::new(2);
+    set_route_primary(&mut map, object_pg_id.get(), NodeId::new(2));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::SessionId::try_from("84".repeat(16)).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        cluster
+            .next_object_metadata_command_id(object_pg_id)
+            .unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            key.clone(),
+            reservation_id.clone(),
+            crate::GenerationId::MIN,
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, object_pg_id, &bucket, &command);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg_id.get())
+            .unwrap();
+        pg.apply_metadata_command_and_record(node_id.as_u32(), &command)
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::get_object_generation_reservation(
+                &*pg,
+                &bucket,
+                &key,
+                &reservation_id,
+            )
+            .unwrap(),
+            crate::GenerationId::MIN,
+            "every actor must contain the exact applied command before cleanup is deferred"
+        );
+    }
+
+    let checksum = command.checksum_crc64();
+    let cleanup_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook_cleanup_attempts = Arc::clone(&cleanup_attempts);
+    let cleanup_hook = cluster.test_install_global_metadata_command_terminal_slot_removal_hook(
+        Arc::new(move |candidate| {
+            if candidate.checksum_crc64() != checksum {
+                return false;
+            }
+            hook_cleanup_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
+        }),
+    );
+    let drain = match cluster.begin_durable_bucket_delete_drain(&bucket).unwrap() {
+        crate::cluster::DurableBucketDeleteDrainBegin::Acquired(drain) => drain,
+        crate::cluster::DurableBucketDeleteDrainBegin::AlreadyDeleting => {
+            panic!("fresh active bucket should acquire delete drain")
+        }
+    };
+
+    let error = cluster
+        .test_drain_pending_object_metadata_commands_for_exact_bucket_after_reservation_with_max_attempts(
+            &bucket,
+            &drain,
+            Some(8),
+        )
+        .expect_err("deferred terminal cleanup must not advance the exact-bucket drain frontier");
+    assert!(matches!(
+        error,
+        crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
+    ));
+    assert!(
+        cleanup_attempts.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "the bounded drain must reach deferred pending-slot removal"
+    );
+    assert_eq!(
+        cluster
+            .test_bucket_delete_post_reservation_next_object_pg_id(&drain)
+            .unwrap(),
+        None,
+        "deferred pending-slot removal must not advance durable drain progress"
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, object_pg_id, &bucket),
+        Some(command.clone()),
+        "fully applied command must remain pending until terminal cleanup succeeds"
+    );
+
+    drop(cleanup_hook);
+    cluster
+        .test_drain_pending_object_metadata_commands_for_exact_bucket_after_reservation(
+            &bucket, &drain,
+        )
+        .unwrap();
+    assert_eq!(
+        cluster
+            .test_bucket_delete_post_reservation_next_object_pg_id(&drain)
+            .unwrap(),
+        Some(pg_count),
+        "successful terminal cleanup should allow the exact-bucket frontier to complete"
+    );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, object_pg_id, &bucket),
+        None,
+        "successful terminal cleanup must remove the pending command"
+    );
+
+    cluster.clear_durable_bucket_delete_drain(&drain).unwrap();
+}
+
+#[test]
 fn begin_bucket_delete_adopts_completed_post_reservation_frontier_without_rescan() {
     let _serial = lock_bucket_scoped_hook_test();
     let tmp = test_util::tempdir();
