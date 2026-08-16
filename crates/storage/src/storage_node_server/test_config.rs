@@ -6294,7 +6294,9 @@
         for node_id in node_ids {
             let socket_path = tmp
                 .path()
-                .join(format!("{namespace}-sockets"))
+                // Keep the AF_UNIX path independent of the descriptive test
+                // namespace so it fits Darwin's 104-byte `sun_path`.
+                .join("s")
                 .join(format!("node-{}.sock", node_id.as_u32()));
             private_socket_dir(socket_path.parent().unwrap());
             let config = StorageNodeProcessConfig {
