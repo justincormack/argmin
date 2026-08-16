@@ -595,6 +595,10 @@ type MetadataCommandApplyAttemptTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(test)]
+type MetadataCommandProgressReconstructionTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
+
+#[cfg(test)]
 type AbortMultipartPendingInstallTestHook = Arc<dyn Fn() + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -779,6 +783,11 @@ static METADATA_COMMAND_APPLY_ATTEMPT_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static METADATA_COMMAND_PROGRESS_RECONSTRUCTION_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MetadataCommandProgressReconstructionTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static BEFORE_ABORT_MULTIPART_PENDING_INSTALL_HOOKS: OnceLock<
     Mutex<HashMap<usize, AbortMultipartPendingInstallTestHook>>,
 > = OnceLock::new();
@@ -959,6 +968,11 @@ pub struct MetadataCommandAfterApplyTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct MetadataCommandApplyAttemptTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MetadataCommandProgressReconstructionTestHookGuard {
     scope_id: usize,
 }
 
@@ -1154,6 +1168,18 @@ impl Drop for MetadataCommandApplyAttemptTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             METADATA_COMMAND_APPLY_ATTEMPT_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MetadataCommandProgressReconstructionTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = METADATA_COMMAND_PROGRESS_RECONSTRUCTION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1625,6 +1651,25 @@ fn maybe_run_metadata_command_apply_attempt_hook(
     #[cfg(test)]
     {
         let hook = METADATA_COMMAND_APPLY_ATTEMPT_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&_scope_id)
+            .cloned();
+        if let Some(hook) = hook {
+            hook(_command)?;
+        }
+    }
+    Ok(())
+}
+
+fn maybe_run_metadata_command_progress_reconstruction_hook(
+    _scope_id: usize,
+    _command: &MetadataCommandEnvelope,
+) -> Result<(), StoreError> {
+    #[cfg(test)]
+    {
+        let hook = METADATA_COMMAND_PROGRESS_RECONSTRUCTION_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2568,6 +2613,7 @@ pub(super) struct MetadataCommandFinishPolicy {
     pub(super) clear_pending_on_zero_apply: bool,
     pub(super) retry_partial_exact_conflict: bool,
     pub(super) convergence_requirement: MetadataCommandConvergenceRequirement,
+    pub(super) progress_provenance: MetadataCommandApplyProgressProvenance,
 }
 
 #[derive(Debug)]

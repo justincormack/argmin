@@ -465,6 +465,31 @@ fn metadata_command_state_result_response(
         Err(BucketSnapshotLoadError::Metadata(crate::MetadataError::StreamSegmentConflict {
             segment_index,
         })) => StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict { segment_index },
+        Err(BucketSnapshotLoadError::Metadata(crate::MetadataError::NoSuchUpload {
+            upload_id,
+        })) => {
+            let Some((session_id, expected_upload_id)) =
+                command.payload().stream_upload_no_such_upload_subject()
+            else {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::Internal,
+                    message:
+                        "metadata command returned NoSuchUpload for an unsupported command subject"
+                            .to_string(),
+                });
+            };
+            if upload_id != expected_upload_id.as_str() {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::Internal,
+                    message: "metadata command returned NoSuchUpload for a different upload"
+                        .to_string(),
+                });
+            }
+            StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id: session_id.clone(),
+                upload_id: expected_upload_id.clone(),
+            }
+        }
         Err(BucketSnapshotLoadError::Metadata(error)) => {
             return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::Internal,

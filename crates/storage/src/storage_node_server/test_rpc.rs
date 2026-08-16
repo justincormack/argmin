@@ -1046,6 +1046,169 @@
     }
 
     #[test]
+    fn metadata_command_apply_encodes_bound_stream_no_such_upload() {
+        let session_id = SessionId::try_from("16".repeat(16)).unwrap();
+        let upload_id = UploadId::for_test("server-missing-append-upload");
+        let bucket = crate::tests::bucket_name("server-append-rpc-bucket");
+        let key = crate::tests::object_key("server-append-rpc-key");
+        let append_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            MetadataCommandPayload::AppendStreamSegment(Box::new(
+                crate::metadata_command::AppendStreamSegmentCommand {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target: StreamUploadTarget::UploadPart {
+                        upload_id: upload_id.clone(),
+                        part_number: 1,
+                    },
+                    segment: StreamUploadSegmentRecord {
+                        session_id: session_id.clone(),
+                        segment_index: 0,
+                        size: 1,
+                        segment_crc64: 2,
+                        payload_crc64: 3,
+                        segment_okh: [4; 16],
+                        segment_vid: GenerationId::MIN,
+                        data_pg_id: 0,
+                        placement_cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                        ec_k: 1,
+                        ec_m: 0,
+                    },
+                },
+            )),
+        );
+        let create_session_id = SessionId::try_from("17".repeat(16)).unwrap();
+        let create_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(2).unwrap(),
+            ),
+            MetadataCommandPayload::CreateStreamUpload(Box::new(
+                CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                    CreateStreamUploadReq {
+                        session_id: create_session_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        target: StreamUploadTarget::UploadPart {
+                            upload_id: upload_id.clone(),
+                            part_number: 1,
+                        },
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                    1,
+                    test_bucket_write_reservation_proof(bucket.clone(), &key),
+                ),
+            )),
+        );
+        let upload = crate::MultipartUploadRecord {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            initiated_at: 1,
+            state: crate::UploadState::InProgress,
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: crate::OwnerIdentity::from_principal("owner"),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_generation_id: GenerationId::new(1).unwrap(),
+            initiated_object_identity: None,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        let commit_session_id = SessionId::try_from("18".repeat(16)).unwrap();
+        let commit_command = MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(0),
+                MetadataCommandLogIndex::new(3).unwrap(),
+            ),
+            MetadataCommandPayload::CommitStreamPart(Box::new(
+                crate::metadata_command::CommitStreamPartCommand {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    session_id: commit_session_id.clone(),
+                    upload,
+                    part: crate::MultipartPartRecord {
+                        upload_id: upload_id.clone(),
+                        part_number: 1,
+                        generation: 0,
+                        size: 0,
+                        payload_crc64: 0,
+                        etag: vec![0; 8],
+                        etag_kind: crate::EtagKind::Crc64,
+                        part_vid: GenerationId::new(2).unwrap(),
+                        placement_cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                        ec_k: 1,
+                        ec_m: 0,
+                        last_modified: 1,
+                        checksum: None,
+                    },
+                    segments: Vec::new(),
+                    existing_part: None,
+                    displaced_segments: Vec::new(),
+                    bucket_write_reservation: test_bucket_write_reservation_proof(
+                        bucket.clone(),
+                        &key,
+                    ),
+                },
+            )),
+        );
+
+        for (command, expected_session_id) in [
+            (append_command, session_id),
+            (create_command.clone(), create_session_id),
+            (commit_command, commit_session_id),
+        ] {
+            let response = metadata_command_state_result_response(
+                &command,
+                Err(BucketSnapshotLoadError::Metadata(
+                    MetadataError::NoSuchUpload {
+                        upload_id: upload_id.as_str().to_string(),
+                    },
+                )),
+            )
+            .unwrap();
+            let payload = decode_storage_rpc_response_payload(&response)
+                .unwrap()
+                .unwrap();
+            let decoded = decode_metadata_command_state_outcome_response(&payload).unwrap();
+            assert_eq!(
+                decoded.outcome,
+                StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                    session_id: expected_session_id,
+                    upload_id: upload_id.clone(),
+                }
+            );
+        }
+
+        let response = metadata_command_state_result_response(
+            &create_command,
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::NoSuchUpload {
+                    upload_id: "different-server-upload".to_string(),
+                },
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_storage_rpc_response_payload(&response)
+                .unwrap()
+                .unwrap_err()
+                .code,
+            StorageRpcErrorCode::Internal
+        );
+    }
+
+    #[test]
     fn storage_node_server_allows_peering_metadata_transfer_destination_checks() {
         let tmp = test_util::tempdir();
         let mut config = test_config(&tmp);

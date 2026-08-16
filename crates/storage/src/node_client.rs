@@ -1964,6 +1964,38 @@ fn stale_object_write_command_error(
     })
 }
 
+fn stream_upload_no_such_upload_error(
+    command: &MetadataCommandEnvelope,
+    session_id: SessionId,
+    upload_id: UploadId,
+    decode_context: &'static str,
+    rpc_payload_error: impl FnOnce(&'static str, String) -> StoreError,
+) -> Result<MetadataError, StoreError> {
+    let Some((expected_session_id, expected_upload_id)) =
+        command.payload().stream_upload_no_such_upload_subject()
+    else {
+        return Err(rpc_payload_error(
+            decode_context,
+            "stream upload NoSuchUpload outcome is impossible for command subject".to_string(),
+        ));
+    };
+    if &session_id != expected_session_id {
+        return Err(rpc_payload_error(
+            decode_context,
+            "stream upload NoSuchUpload session identity mismatch".to_string(),
+        ));
+    }
+    if &upload_id != expected_upload_id {
+        return Err(rpc_payload_error(
+            decode_context,
+            "stream upload NoSuchUpload upload identity mismatch".to_string(),
+        ));
+    }
+    Ok(MetadataError::NoSuchUpload {
+        upload_id: expected_upload_id.as_str().to_string(),
+    })
+}
+
 #[derive(Clone, Copy)]
 struct MetadataCommandLogConflictRpcFields {
     node_id: u32,

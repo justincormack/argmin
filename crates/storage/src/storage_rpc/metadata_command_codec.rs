@@ -1156,6 +1156,14 @@ pub(crate) fn encode_metadata_command_state_outcome_response(
             put_u8(&mut out, 6);
             put_u32(&mut out, segment_index);
         }
+        StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+            ref session_id,
+            ref upload_id,
+        } => {
+            put_u8(&mut out, 7);
+            put_string(&mut out, session_id.as_str());
+            put_string(&mut out, upload_id.as_str());
+        }
     }
     out
 }
@@ -1228,6 +1236,10 @@ pub(crate) fn decode_metadata_command_state_outcome_response(
         }
         6 => StorageRpcMetadataCommandStateOutcome::StreamSegmentConflict {
             segment_index: decoder.read_u32()?,
+        },
+        7 => StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+            session_id: decoder.read_session_id()?,
+            upload_id: decoder.read_upload_id()?,
         },
         _ => {
             return Err(StorageRpcPayloadError::InvalidResponseEnvelope(

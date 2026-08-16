@@ -2917,7 +2917,7 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
         )
         .unwrap();
     let payload = b"stream append duplicate index reissue";
-    let (_target, segment) = cluster
+    let (target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
@@ -2948,6 +2948,7 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
         MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
             bucket: bucket.clone(),
             key: key.clone(),
+            target: target.clone(),
             segment: segment.clone(),
         })),
     );

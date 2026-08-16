@@ -208,32 +208,60 @@ mod tests {
 
     #[test]
     fn storage_rpc_frame_encoding_is_stable() {
-        let payload = b"abc";
+        const V17_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 17, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 107, 181, 71, 208, 128, 223, 215, 45, 97, 98, 99,
+        ];
+        const V18_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 18, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 51, 51, 144, 52, 159, 41, 132, 0, 97, 98, 99,
+        ];
         let bytes = encode_storage_rpc_frame(
             0x0102_0304_0506_0708,
             StorageRpcMessageKind::ShardWrite,
-            payload,
+            b"abc",
         )
         .unwrap();
-        let expected_checksum = storage_rpc_frame_checksum(
-            STORAGE_RPC_FRAME_ENCODING_VERSION,
-            0x0102_0304_0506_0708,
-            StorageRpcMessageKind::ShardWrite as u16,
-            3,
-            payload,
+
+        assert_eq!(bytes, V18_FRAME);
+        assert_eq!(
+            decode_storage_rpc_frame(V17_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(17))
         );
+    }
 
-        let mut expected = Vec::new();
-        expected.extend_from_slice(&24u32.to_le_bytes());
-        expected.extend_from_slice(STORAGE_RPC_FRAME_MAGIC);
-        expected.extend_from_slice(&17u16.to_le_bytes());
-        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
-        expected.extend_from_slice(&(StorageRpcMessageKind::ShardWrite as u16).to_le_bytes());
-        expected.extend_from_slice(&3u32.to_le_bytes());
-        expected.extend_from_slice(&expected_checksum.to_le_bytes());
-        expected.extend_from_slice(payload);
+    #[test]
+    fn storage_rpc_v18_stream_upload_no_such_upload_payload_is_stable() {
+        const V18_STREAM_UPLOAD_NO_SUCH_UPLOAD_PAYLOAD: &[u8] = b"\
+            \x07\x20\x00\x00\x00\
+            0123456789abcdef0123456789abcdef\
+            \x80\x00\x00\x00\
+            0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\
+            0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let response = StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id: SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
+                upload_id: UploadId::try_from(concat!(
+                    "0123456789abcdef0123456789abcdef",
+                    "0123456789abcdef0123456789abcdef",
+                    "0123456789abcdef0123456789abcdef",
+                    "0123456789abcdef0123456789abcdef",
+                ))
+                .unwrap(),
+            },
+        };
+        let payload = encode_metadata_command_state_outcome_response(&response);
 
-        assert_eq!(bytes, expected);
+        assert_eq!(payload, V18_STREAM_UPLOAD_NO_SUCH_UPLOAD_PAYLOAD);
+        assert_eq!(
+            decode_metadata_command_state_outcome_response(
+                V18_STREAM_UPLOAD_NO_SUCH_UPLOAD_PAYLOAD
+            )
+            .unwrap(),
+            response
+        );
     }
 
     #[test]
@@ -243,8 +271,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(16))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(18)),
-            Err(StorageRpcFrameError::UnsupportedVersion(18))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(17)),
+            Err(StorageRpcFrameError::UnsupportedVersion(17))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(19)),
+            Err(StorageRpcFrameError::UnsupportedVersion(19))
         );
     }
 
@@ -1810,6 +1842,12 @@ mod tests {
                     pg_id: 11,
                     cluster_epoch: ClusterEpoch::new(3).unwrap(),
                     log_index: 12,
+                },
+            },
+            StorageRpcMetadataCommandStateOutcomeResponse {
+                outcome: StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                    session_id: SessionId::try_from("11".repeat(16)).unwrap(),
+                    upload_id: UploadId::for_test("missing-append-upload"),
                 },
             },
         ] {

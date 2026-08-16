@@ -785,6 +785,153 @@ fn create_bucket_command_retry_reuses_pending_partial_replica_command() {
 }
 
 #[test]
+fn newly_installed_create_bucket_does_not_reconstruct_recovered_progress() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let pg_id = PgId::new(1);
+    let bucket = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, pg_id.get(), "authoritative-create-")
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let _serial = lock_metadata_command_apply_hook_test();
+    let reconstruction_called = Arc::new(AtomicBool::new(false));
+    let reconstruction_called_for_hook = Arc::clone(&reconstruction_called);
+    let hook_bucket = bucket.clone();
+    let _hook = cluster.test_install_metadata_command_progress_reconstruction_hook(Arc::new(
+        move |command| {
+            if command.bucket_name() == &hook_bucket {
+                reconstruction_called_for_hook.store(true, Ordering::SeqCst);
+                return Err(StoreError::StorageRpc {
+                    node_id: 2,
+                    operation: "injected recovered progress inspection",
+                    failure: crate::storage_rpc::StorageRpcErrorCode::PayloadDecode,
+                    detail: crate::StorageNodeFailureDetail::new(
+                        "newly installed command must not reconstruct recovered progress",
+                    ),
+                });
+            }
+            Ok(())
+        },
+    ));
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl_grants = crate::AclGrants::default();
+    let created = cluster
+        .create_bucket_with_config_and_load_info_raw(&crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .unwrap();
+
+    assert!(matches!(
+        created,
+        crate::BucketCreateAttemptOutcome::Created(info) if info.name() == &bucket
+    ));
+    assert!(!reconstruction_called.load(Ordering::SeqCst));
+    assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+}
+
+#[test]
+fn newly_installed_bucket_command_reconstructs_progress_after_recovery_timeout_and_wait() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], ec_shape).unwrap();
+    let pg_id = PgId::new(1);
+    let bucket = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, pg_id.get(), "adopted-create-")
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let command = create_bucket_metadata_command(pg_id, 1, bucket.clone());
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+    let MetadataCommandRecoveryAdmission::Leader(owner) = map
+        .runtime_state()
+        .join_metadata_command_recovery(pg_id, &command)
+    else {
+        panic!("injected recovery owner must lead the command flight");
+    };
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let reconstruction_called = Arc::new(AtomicBool::new(false));
+    let reconstruction_called_for_hook = Arc::clone(&reconstruction_called);
+    let _hook =
+        cluster.test_install_metadata_command_progress_reconstruction_hook(Arc::new(move |_| {
+            reconstruction_called_for_hook.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+    let timeout_selected = Arc::new(Barrier::new(2));
+    let retry_selected = Arc::new(Barrier::new(2));
+    cluster.test_install_metadata_command_recovery_wait_hook(
+        pg_id,
+        &command,
+        Arc::clone(&timeout_selected),
+        Arc::clone(&retry_selected),
+    );
+    let waiter_cluster = cluster.clone();
+    let waiter_bucket = bucket.clone();
+    let waiter_command = command.clone();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let waiter = thread::spawn(move || {
+        result_tx
+            .send(
+                waiter_cluster.finish_pending_metadata_command_to_acting_set(
+                    pg_id,
+                    &waiter_bucket,
+                    &waiter_command,
+                    true,
+                ),
+            )
+            .unwrap();
+    });
+    timeout_selected.wait();
+    retry_selected.wait();
+    drop(owner);
+
+    assert_eq!(
+        result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("fresh finisher did not adopt the released recovery flight")
+            .unwrap(),
+        PendingMetadataCommandOutcome::Applied
+    );
+    waiter.join().unwrap();
+    assert!(
+        reconstruction_called.load(Ordering::SeqCst),
+        "recovery timeout and wait must downgrade authoritative progress provenance"
+    );
+    assert_eq!(
+        cluster.test_take_metadata_command_recovery_wait_hook_observation(),
+        (2, 0),
+        "fresh finisher must time out once, then wait for the existing recovery owner"
+    );
+    assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
+}
+
+#[test]
 fn create_bucket_retries_partial_exact_command_conflict() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

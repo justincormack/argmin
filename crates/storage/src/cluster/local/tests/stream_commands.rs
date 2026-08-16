@@ -1241,7 +1241,7 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
         )
         .unwrap();
     let payload = b"stream append command id race";
-    let (_target, segment) = cluster
+    let (target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
@@ -1271,6 +1271,7 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_segment = segment.clone();
+    let hook_target = target.clone();
     let hook_once = Arc::new(AtomicBool::new(true));
     let hook_once_for_closure = Arc::clone(&hook_once);
     let _guard = cluster.test_install_before_stream_append_command_id_hook(Arc::new(move || {
@@ -1291,6 +1292,7 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
             MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                 bucket: hook_bucket.clone(),
                 key: hook_key.clone(),
+                target: hook_target.clone(),
                 segment: hook_segment.clone(),
             })),
         );
@@ -1454,7 +1456,7 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
         )
         .unwrap();
     let payload = b"stream append competing publish timeout";
-    let (_target, segment) = cluster
+    let (target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
@@ -1484,6 +1486,7 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_segment = segment.clone();
+    let hook_target = target.clone();
     let hook_once = Arc::new(AtomicBool::new(true));
     let hook_once_for_closure = Arc::clone(&hook_once);
     let _command_guard =
@@ -1505,6 +1508,7 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
                 MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                     bucket: hook_bucket.clone(),
                     key: hook_key.clone(),
+                    target: hook_target.clone(),
                     segment: hook_segment.clone(),
                 })),
             );
@@ -1620,7 +1624,7 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
         )
         .unwrap();
     let payload = b"stream append cleared-slot install collision";
-    let (_target, segment) = cluster
+    let (target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
@@ -1645,6 +1649,7 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_segment = segment.clone();
+    let hook_target = target.clone();
     let hook_map = Arc::clone(&map);
     let hook_once = Arc::new(AtomicBool::new(true));
     let hook_once_for_closure = Arc::clone(&hook_once);
@@ -1659,6 +1664,7 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
                 MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                     bucket: hook_bucket.clone(),
                     key: hook_key.clone(),
+                    target: hook_target.clone(),
                     segment: hook_segment.clone(),
                 })),
             );
@@ -2466,7 +2472,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
         .unwrap();
 
     let second_payload = b"raced stream append before abort install";
-    let (_target, second_segment) = cluster
+    let (second_target, second_segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
             &key,
@@ -2491,6 +2497,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
     let hook_bucket = bucket.clone();
     let hook_key = key.clone();
     let hook_segment = second_segment.clone();
+    let hook_target = second_target.clone();
     let hook_shards = second_shards.clone();
     let _hook_guard =
         cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
@@ -2522,6 +2529,7 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                 MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                     bucket: hook_bucket.clone(),
                     key: hook_key.clone(),
+                    target: hook_target.clone(),
                     segment: hook_segment.clone(),
                 })),
             );

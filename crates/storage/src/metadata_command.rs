@@ -40,7 +40,7 @@ impl MetadataCommandLogHashIssuer {
 }
 
 const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
-const METADATA_COMMAND_ENCODING_VERSION: u16 = 7;
+const METADATA_COMMAND_ENCODING_VERSION: u16 = 8;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
@@ -819,6 +819,25 @@ impl MetadataCommandPayload {
             Self::AbortMultipartUpload(abort) => &abort.bucket,
             Self::DeleteObjectPayloadReclaim(reclaim) => &reclaim.bucket,
             Self::AdvanceMultipartCompletionBarrier(advance) => &advance.bucket,
+        }
+    }
+
+    pub(crate) fn stream_upload_no_such_upload_subject(&self) -> Option<(&SessionId, &UploadId)> {
+        match self {
+            Self::CreateStreamUpload(create) => match &create.session.target {
+                StreamUploadTarget::UploadPart { upload_id, .. } => {
+                    Some((&create.session.session_id, upload_id))
+                }
+                StreamUploadTarget::PutObject => None,
+            },
+            Self::AppendStreamSegment(append) => match &append.target {
+                StreamUploadTarget::UploadPart { upload_id, .. } => {
+                    Some((&append.segment.session_id, upload_id))
+                }
+                StreamUploadTarget::PutObject => None,
+            },
+            Self::CommitStreamPart(commit) => Some((&commit.session_id, &commit.upload.upload_id)),
+            _ => None,
         }
     }
 
@@ -1642,6 +1661,7 @@ impl CreateStreamUploadCommand {
 pub(crate) struct AppendStreamSegmentCommand {
     pub(crate) bucket: BucketName,
     pub(crate) key: ObjectKey,
+    pub(crate) target: StreamUploadTarget,
     pub(crate) segment: StreamUploadSegmentRecord,
 }
 
@@ -2351,6 +2371,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             METADATA_COMMAND_APPEND_STREAM_SEGMENT => {
                 self.skip_str()?;
                 self.skip_str()?;
+                self.skip_stream_upload_target()?;
                 self.skip_stream_upload_segment()
             }
             METADATA_COMMAND_ABORT_STREAM_UPLOAD => {
@@ -2570,6 +2591,7 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
                 MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                     bucket: self.read_bucket_name()?,
                     key: self.read_object_key()?,
+                    target: self.read_stream_upload_target()?,
                     segment: self.read_stream_upload_segment()?,
                 })),
             ),
@@ -4123,6 +4145,7 @@ fn encode_create_stream_upload(out: &mut Vec<u8>, command: &CreateStreamUploadCo
 fn encode_append_stream_segment(out: &mut Vec<u8>, command: &AppendStreamSegmentCommand) {
     put_str(out, command.bucket.as_str());
     put_str(out, command.key.as_str());
+    encode_stream_upload_target(out, &command.target);
     encode_stream_upload_segment(out, &command.segment);
 }
 
@@ -5544,7 +5567,7 @@ mod tests {
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
-        assert_eq!(envelope.checksum_crc64(), 0x033ce07ca9fccc9c);
+        assert_eq!(envelope.checksum_crc64(), 0x328ff7137ea3be2a);
     }
 
     #[test]
@@ -5597,7 +5620,7 @@ mod tests {
         assert_eq!(applied_header.command_kind_name(), Some("CreateBucket"));
 
         let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
-        for version in [6_u16, 8_u16] {
+        for version in [6_u16, 7_u16, 9_u16] {
             let mut unsupported_version = envelope.command_bytes();
             unsupported_version[version_offset..version_offset + 2]
                 .copy_from_slice(&version.to_le_bytes());
@@ -5673,7 +5696,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x549508689aa0cd6b);
+        assert_eq!(envelope.checksum_crc64(), 0x65261f074dffbfdd);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5701,7 +5724,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0xd98216712f651f07);
+        assert_eq!(envelope.checksum_crc64(), 0xe831011ef83a6db1);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5766,7 +5789,7 @@ mod tests {
 
         assert_eq!(envelope.canonical_bytes(), duplicate.canonical_bytes());
         assert_eq!(envelope.checksum_crc64(), duplicate.checksum_crc64());
-        assert_eq!(envelope.checksum_crc64(), 0x81f66585cb9ca27c);
+        assert_eq!(envelope.checksum_crc64(), 0xb04572ea1cc3d0ca);
         assert!(envelope.verify_checksum());
         assert_applied_log_decoder_accepts(&envelope);
         assert_full_envelope_decoder_round_trips(&envelope);
@@ -5847,13 +5870,13 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x578f54ecc63f42f5,
-                0x252a29cab39aec56,
-                0x0e3466a491f5a39e,
-                0x7f7d249a9a5e1792,
-                0xabb78f6479e90df6,
-                0x326ac53b91d5b0a7,
-                0x00f2339101624ed7,
+                0xf70e404a89d91598,
+                0x755df7dfe3db5f5b,
+                0x8f0e46bd03e32f95,
+                0x5bbe010b382a95ab,
+                0x8f74aaf5db9d8fcf,
+                0x03d9d254468ac211,
+                0x24311600a316ccee,
             ]
         );
     }
@@ -5924,14 +5947,14 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0xb53cd25cecbd0570,
-                0xdfc60af5d1267105,
-                0xca63cc08bab0036d,
-                0x835d761568eb54ca,
-                0x2c8b54e64b5aad86,
-                0x109ad75bac279d54,
-                0x80926a83504a1143,
-                0xeefc4ad4419b62aa,
+                0xffd8c35832d7b06e,
+                0xf21830fe61ba0a46,
+                0xed4d0bc49b68701f,
+                0xae834c1ed8772f89,
+                0xd7d22787168b5a1d,
+                0x3d44ed501cbbe617,
+                0x460a2616c108e19a,
+                0xc32270dff10719e9,
             ]
         );
     }
@@ -6435,6 +6458,7 @@ mod tests {
             MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
                 bucket: bucket.clone(),
                 key: key.clone(),
+                target: StreamUploadTarget::PutObject,
                 segment: stream_segment.clone(),
             })),
             MetadataCommandPayload::AbortStreamUpload(Box::new(AbortStreamUploadCommand {
@@ -6517,37 +6541,62 @@ mod tests {
         assert_eq!(
             checksums,
             [
-                0x8e0f0b43425a408c,
-                0x0033051f779c165c,
-                0xc882464002ae9414,
-                0x251ac3992a5ab6dd,
-                0x28fb52f032859fef,
-                0xcfeeea7e6e5a62c1,
-                0xe6f2c6d933674b79,
-                0x5c47f9ad25245c90,
-                0x7db813712dbfefd7,
-                0x5a6c6e5c7d88b3cd,
-                0xaa157ce251b36369,
-                0xee31cdc6bae8727c,
-                0xa1d35543551884dc,
-                0x74cd663b34668700,
-                0x89f297cfe13726c1,
-                0xc9f3aeaa7bccfa6d,
-                0xb511399ff42fff6f,
-                0xbf453478b5248910,
-                0xec3aa3091d8de6c0,
-                0x220e9f497896da04,
-                0xab06995d986c8153,
-                0x204d07d53958d1fe,
-                0x90918496a8aa4bc2,
-                0x01c97d43c8255c55,
-                0x1e49d34d6ec643a6,
-                0x16e92b0591fa5617,
-                0xc51f41563754fd0a,
-                0x9151f963011e62b8,
-                0x4da0caa9ff2baa13,
-                0xfa2ccf795f9c8530,
+                0x71a9bbc9ce6a4fd0,
+                0x8697ef94149db4bc,
+                0x61e7f8e2afd78c9f,
+                0x0412af3aa90e32ca,
+                0xc4a86c877b1c0c2c,
+                0x66d202f5d9712865,
+                0xaa66d925e5636dad,
+                0x8d57d9e2b7f4a004,
+                0x6a3fdd87a4c32dc6,
+                0xa7e13d241790dd39,
+                0x21cafc8ba2f6aeec,
+                0x58de2febf2be7113,
+                0x5557a041275887df,
+                0xb4670776e325241e,
+                0x1ec1fe03d7650627,
+                0x0959cfe7ac8f5973,
+                0x9d60968757eaf6b3,
+                0x28f9b55e7857054b,
+                0x23e3a99024fcc267,
+                0x47e5a0e3e83cb014,
+                0x6b109e9e9ffa40f0,
+                0x79e56095cf71ee33,
+                0x161da0cc5f64396a,
+                0x3ab8eb397b567b2c,
+                0x826e52beae0fedb3,
+                0x444848e146e7aa8f,
+                0xa6b95fe10fa3193c,
+                0x51fb982ed65dc1a6,
+                0xf0cac1d2c9877f40,
+                0xe3f90eee6e075dbd,
             ]
+        );
+
+        let append_id = MetadataCommandId::new(
+            id.cluster_epoch(),
+            id.pg_id(),
+            MetadataCommandLogIndex::new(id.log_index().get() + 22).unwrap(),
+        );
+        let mut v7_append = Vec::new();
+        put_bytes(&mut v7_append, METADATA_COMMAND_MAGIC);
+        put_u16(&mut v7_append, 7);
+        put_u64(&mut v7_append, append_id.cluster_epoch().get());
+        put_u32(&mut v7_append, append_id.pg_id().get());
+        put_u64(&mut v7_append, append_id.log_index().get());
+        put_u16(&mut v7_append, METADATA_COMMAND_APPEND_STREAM_SEGMENT);
+        put_str(&mut v7_append, bucket.as_str());
+        put_str(&mut v7_append, key.as_str());
+        encode_stream_upload_segment(&mut v7_append, &stream_segment);
+        assert_eq!(checksum::crc64::checksum(&v7_append), 0x90918496a8aa4bc2);
+        assert_eq!(
+            decode_metadata_command_envelope_for_test(&v7_append),
+            Err("unsupported metadata command encoding version 7".to_string())
+        );
+        assert_eq!(
+            decode_metadata_command_log_entry_header(&v7_append),
+            Err("unsupported metadata command encoding version 7".to_string())
         );
     }
 }

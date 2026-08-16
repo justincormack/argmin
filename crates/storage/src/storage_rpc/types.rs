@@ -2588,6 +2588,10 @@ pub(crate) enum StorageRpcMetadataCommandStateOutcome {
     StreamSegmentConflict {
         segment_index: u32,
     },
+    StreamUploadNoSuchUpload {
+        session_id: SessionId,
+        upload_id: UploadId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

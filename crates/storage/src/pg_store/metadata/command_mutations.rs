@@ -279,6 +279,12 @@ impl PgStore {
                         reason: "metadata state does not satisfy the operation invariant".into(),
                     });
                 }
+                if session.target != command.target {
+                    return Err(MetadataError::InvariantViolation {
+                        context: "append stream segment command target binding mismatch",
+                        reason: "metadata state does not satisfy the operation invariant".into(),
+                    });
+                }
                 if session.state != StreamUploadState::InProgress {
                     return Err(MetadataError::StreamSessionNotInProgress {
                         state: session.state as u8,

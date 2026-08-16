@@ -4750,12 +4750,18 @@ impl StorageCluster {
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect::<Vec<_>>();
+        let request = StreamAppendCommitRequest {
+            bucket: route.bucket,
+            key: route.key,
+            session_id: input.session_id,
+            segment_index: input.segment_index,
+            segment_record: &segment_record,
+            shard_batch: &shard_batch,
+        };
         self.commit_stream_segment_append_with_route_validation(
             route,
-            input.session_id,
-            input.segment_index,
-            &segment_record,
-            &shard_batch,
+            request,
+            &target,
             require_valid_route,
         )
         .map_err(E::from)?;
@@ -4897,6 +4903,7 @@ impl StorageCluster {
                 effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             },
             request,
+            None,
             || Ok(()),
             RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, None)
                 .for_operation("commit_stream_segment_append")
@@ -4907,23 +4914,14 @@ impl StorageCluster {
     fn commit_stream_segment_append_with_route_validation(
         &self,
         route: PutObjectMutationEffectRoute<'_>,
-        session_id: &SessionId,
-        segment_index: u32,
-        segment_record: &StreamUploadSegmentRecord,
-        shard_batch: &[(&ShardKey, WriteAck)],
+        request: StreamAppendCommitRequest<'_>,
+        target: &StreamUploadTarget,
         require_valid_route: impl FnMut() -> Result<(), StoreError>,
     ) -> Result<(), ObjectPgActionError> {
-        let request = StreamAppendCommitRequest {
-            bucket: route.bucket,
-            key: route.key,
-            session_id,
-            segment_index,
-            segment_record,
-            shard_batch,
-        };
         self.commit_stream_segment_append_with_work_budget(
             route,
             request,
+            Some(target),
             require_valid_route,
             RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, None)
                 .for_operation("commit_stream_segment_append")
@@ -4947,6 +4945,7 @@ impl StorageCluster {
                 effect_fence: AdmittedRouteEffectFence::unbounded(self.operation_epoch()),
             },
             request,
+            None,
             || Ok(()),
             RequestWorkBudget::new(STREAM_SEGMENT_APPEND_RETRY_BUDGET, Some(max_attempts))
                 .for_operation("commit_stream_segment_append")
@@ -4958,6 +4957,7 @@ impl StorageCluster {
         &self,
         route: PutObjectMutationEffectRoute<'_>,
         request: StreamAppendCommitRequest<'_>,
+        target: Option<&StreamUploadTarget>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         mut work_budget: RequestWorkBudget,
     ) -> Result<(), ObjectPgActionError> {
@@ -5021,6 +5021,20 @@ impl StorageCluster {
                 cleanup_stream_append_payload!();
                 return Err(error);
             }
+        };
+        let loaded_target;
+        let target = match target {
+            Some(target) => target,
+            None => match stream_route.load_session() {
+                Ok(session) => {
+                    loaded_target = session.target;
+                    &loaded_target
+                }
+                Err(error) => {
+                    cleanup_stream_append_payload!();
+                    return Err(error);
+                }
+            },
         };
         loop {
             if let Err(error) = require_valid_route() {
@@ -5124,6 +5138,7 @@ impl StorageCluster {
                             AppendStreamSegmentCommand {
                                 bucket: bucket.clone(),
                                 key: key.clone(),
+                                target: target.clone(),
                                 segment: segment_record.clone(),
                             },
                         )),

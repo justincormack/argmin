@@ -965,6 +965,23 @@ impl UnixStorageNodeMetadataCommandSession {
                     MetadataError::StreamSegmentConflict { segment_index },
                 )),
             ),
+            StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id,
+                upload_id,
+            } => match stream_upload_no_such_upload_error(
+                command,
+                session_id,
+                upload_id,
+                decode_context,
+                |operation, message| self.rpc_payload_error(operation, message),
+            ) {
+                Ok(error) => Err(MetadataCommandApplyError::definitive(
+                    BucketSnapshotLoadError::Metadata(error),
+                )),
+                Err(error) => Err(MetadataCommandApplyError::definitive(
+                    BucketSnapshotLoadError::Store(error),
+                )),
+            },
         }
     }
 

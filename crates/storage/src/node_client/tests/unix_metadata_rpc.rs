@@ -6,6 +6,101 @@ use crate::node_runtime::clients::unix_sessions::UnixStorageNodeMetadataCommandS
 use crate::storage_node_server::StorageNodeServerError;
 use std::sync::mpsc;
 
+fn append_stream_segment_command_for_rpc_test(
+    session_id: SessionId,
+    target: StreamUploadTarget,
+) -> MetadataCommandEnvelope {
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::AppendStreamSegment(Box::new(
+            crate::metadata_command::AppendStreamSegmentCommand {
+                bucket: crate::tests::bucket_name("append-rpc-bucket"),
+                key: crate::tests::object_key("append-rpc-key"),
+                target,
+                segment: StreamUploadSegmentRecord {
+                    session_id,
+                    segment_index: 0,
+                    size: 1,
+                    segment_crc64: 2,
+                    payload_crc64: 3,
+                    segment_okh: [4; 16],
+                    segment_vid: GenerationId::MIN,
+                    data_pg_id: 0,
+                    placement_cluster_epoch: ClusterEpoch::new(1).unwrap(),
+                    ec_k: 1,
+                    ec_m: 0,
+                },
+            },
+        )),
+    )
+}
+
+fn create_stream_upload_command_for_rpc_test(
+    session_id: SessionId,
+    target: StreamUploadTarget,
+) -> MetadataCommandEnvelope {
+    let bucket = crate::tests::bucket_name("create-stream-rpc-bucket");
+    let key = crate::tests::object_key("create-stream-rpc-key");
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                CreateStreamUploadReq {
+                    session_id,
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    target,
+                    encryption: ObjectEncryption::None,
+                },
+                1,
+                test_bucket_write_reservation_proof(bucket, &key),
+            ),
+        )),
+    )
+}
+
+fn commit_stream_part_command_for_rpc_test(
+    session_id: SessionId,
+    upload_id: UploadId,
+) -> MetadataCommandEnvelope {
+    let bucket = crate::tests::bucket_name("commit-stream-rpc-bucket");
+    let key = crate::tests::object_key("commit-stream-rpc-key");
+    let upload = test_multipart_upload_record(
+        bucket.clone(),
+        key.clone(),
+        upload_id.clone(),
+        UploadState::InProgress,
+    );
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(0),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::CommitStreamPart(Box::new(
+            crate::metadata_command::CommitStreamPartCommand {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                session_id,
+                upload,
+                part: test_multipart_part_record(upload_id, 1),
+                segments: Vec::new(),
+                existing_part: None,
+                displaced_segments: Vec::new(),
+                bucket_write_reservation: test_bucket_write_reservation_proof(bucket, &key),
+            },
+        )),
+    )
+}
+
 #[test]
 fn unix_storage_node_client_writes_deletes_and_validates_ack_rows() {
     let tmp = test_util::tempdir();
@@ -2738,6 +2833,118 @@ fn unix_storage_node_session_rejects_malformed_log_conflicts() {
 }
 
 #[test]
+fn unix_storage_node_session_preserves_bound_stream_no_such_upload() {
+    let session_id = SessionId::try_from("12".repeat(16)).unwrap();
+    let upload_id = UploadId::for_test("session-missing-append-upload");
+    let command = append_stream_segment_command_for_rpc_test(
+        session_id.clone(),
+        StreamUploadTarget::UploadPart {
+            upload_id: upload_id.clone(),
+            part_number: 1,
+        },
+    );
+    let payload = encode_metadata_command_state_outcome_response(
+        &StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id,
+                upload_id: upload_id.clone(),
+            },
+        },
+    );
+    let error = metadata_command_session_result_from_fake_response(payload, |session| {
+        MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &session,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap_err()
+    });
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { upload_id: actual })
+            if actual == upload_id.as_str()
+    ));
+
+    let wrong_session_payload = encode_metadata_command_state_outcome_response(
+        &StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id: SessionId::try_from("13".repeat(16)).unwrap(),
+                upload_id: upload_id.clone(),
+            },
+        },
+    );
+    let error =
+        metadata_command_session_result_from_fake_response(wrong_session_payload, |session| {
+            MetadataCommandNodeClient::apply_metadata_command_and_record(
+                &session,
+                PgId::new(0),
+                &command,
+            )
+            .unwrap_err()
+        });
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let wrong_upload_payload = encode_metadata_command_state_outcome_response(
+        &StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id: SessionId::try_from("12".repeat(16)).unwrap(),
+                upload_id: UploadId::for_test("wrong-session-upload"),
+            },
+        },
+    );
+    let error =
+        metadata_command_session_result_from_fake_response(wrong_upload_payload, |session| {
+            MetadataCommandNodeClient::apply_metadata_command_and_record(
+                &session,
+                PgId::new(0),
+                &command,
+            )
+            .unwrap_err()
+        });
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+
+    let put_object_command = append_stream_segment_command_for_rpc_test(
+        SessionId::try_from("17".repeat(16)).unwrap(),
+        StreamUploadTarget::PutObject,
+    );
+    let put_object_payload = encode_metadata_command_state_outcome_response(
+        &StorageRpcMetadataCommandStateOutcomeResponse {
+            outcome: StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id: SessionId::try_from("17".repeat(16)).unwrap(),
+                upload_id,
+            },
+        },
+    );
+    let error = metadata_command_session_result_from_fake_response(put_object_payload, |session| {
+        MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &session,
+            PgId::new(0),
+            &put_object_command,
+        )
+        .unwrap_err()
+    });
+    assert!(matches!(
+        error,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn unix_storage_node_client_preserves_applied_hash_log_conflict() {
     fn applied_hashes_error_from_fake_response(
         outcome: StorageRpcMetadataCommandAppliedHashesOutcome,
@@ -2987,6 +3194,77 @@ fn unix_storage_node_client_preserves_apply_metadata_command_log_conflict() {
         BucketSnapshotLoadError::Metadata(MetadataError::ObjectVersionReservationConflict {
             version_id
         }) if version_id == VersionId::from_u64(7)
+    ));
+
+    let append_session_id = SessionId::try_from("14".repeat(16)).unwrap();
+    let missing_upload_id = UploadId::for_test("unary-missing-append-upload");
+    let append_no_such_upload = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+            session_id: append_session_id.clone(),
+            upload_id: missing_upload_id.clone(),
+        },
+        append_stream_segment_command_for_rpc_test(
+            append_session_id,
+            StreamUploadTarget::UploadPart {
+                upload_id: missing_upload_id.clone(),
+                part_number: 1,
+            },
+        ),
+    );
+    assert!(matches!(
+        append_no_such_upload,
+        BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { upload_id })
+            if upload_id == missing_upload_id.as_str()
+    ));
+
+    let create_session_id = SessionId::try_from("18".repeat(16)).unwrap();
+    let create_upload_id = UploadId::for_test("unary-missing-create-upload");
+    let create_no_such_upload = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+            session_id: create_session_id.clone(),
+            upload_id: create_upload_id.clone(),
+        },
+        create_stream_upload_command_for_rpc_test(
+            create_session_id,
+            StreamUploadTarget::UploadPart {
+                upload_id: create_upload_id.clone(),
+                part_number: 2,
+            },
+        ),
+    );
+    assert!(matches!(
+        create_no_such_upload,
+        BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { upload_id })
+            if upload_id == create_upload_id.as_str()
+    ));
+
+    let commit_session_id = SessionId::try_from("19".repeat(16)).unwrap();
+    let commit_upload_id = UploadId::for_test("unary-missing-commit-upload");
+    let commit_no_such_upload = apply_error_from_fake_response_for_command(
+        StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+            session_id: commit_session_id.clone(),
+            upload_id: commit_upload_id.clone(),
+        },
+        commit_stream_part_command_for_rpc_test(commit_session_id, commit_upload_id.clone()),
+    );
+    assert!(matches!(
+        commit_no_such_upload,
+        BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { upload_id })
+            if upload_id == commit_upload_id.as_str()
+    ));
+
+    let impossible_append_no_such_upload = apply_error_from_fake_response(
+        StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+            session_id: SessionId::try_from("15".repeat(16)).unwrap(),
+            upload_id: missing_upload_id,
+        },
+    );
+    assert!(matches!(
+        impossible_append_no_such_upload,
+        BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+            failure: StorageRpcErrorCode::PayloadDecode,
+            ..
+        })
     ));
 
     let bucket = crate::tests::bucket_name("stale-bucket-rpc");

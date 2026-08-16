@@ -73,6 +73,20 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_metadata_command_progress_reconstruction_hook(
+        &self,
+        hook: MetadataCommandProgressReconstructionTestHook,
+    ) -> MetadataCommandProgressReconstructionTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = METADATA_COMMAND_PROGRESS_RECONSTRUCTION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MetadataCommandProgressReconstructionTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_before_abort_multipart_pending_install_hook(
         &self,
         hook: AbortMultipartPendingInstallTestHook,
@@ -1339,6 +1353,17 @@ impl super::StorageCluster {
             && attempt_context.provenance
                 == MetadataCommandApplyProgressProvenance::RecoveredPending
         {
+            maybe_run_metadata_command_progress_reconstruction_hook(
+                self.metadata_command_apply_test_hook_scope_id(),
+                command,
+            )
+            .map_err(|source| {
+                MetadataCommandApplyAttemptFailure::before_apply_with_progress(
+                    0,
+                    MetadataCommandApplyProgress::PublicationUnconfirmed,
+                    source,
+                )
+            })?;
             let primary_observation = primary_section
                 .applied_metadata_command_log_entry_hashes_until(command, deadline);
             let primary_abandonment =
@@ -2099,6 +2124,11 @@ impl super::StorageCluster {
                 retry_partial_exact_conflict: false,
                 convergence_requirement:
                     MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                progress_provenance: if clear_pending_on_zero_apply {
+                    MetadataCommandApplyProgressProvenance::Authoritative
+                } else {
+                    MetadataCommandApplyProgressProvenance::RecoveredPending
+                },
             },
             MetadataCommandExecutionRoute::normal(),
             work_budget,
@@ -2129,6 +2159,11 @@ impl super::StorageCluster {
                 clear_pending_on_zero_apply,
                 retry_partial_exact_conflict: true,
                 convergence_requirement: MetadataCommandConvergenceRequirement::RequireAllReplicas,
+                progress_provenance: if clear_pending_on_zero_apply {
+                    MetadataCommandApplyProgressProvenance::Authoritative
+                } else {
+                    MetadataCommandApplyProgressProvenance::RecoveredPending
+                },
             },
             MetadataCommandExecutionRoute::normal(),
             work_budget,
@@ -2161,6 +2196,11 @@ impl super::StorageCluster {
                 retry_partial_exact_conflict: true,
                 convergence_requirement:
                     MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                progress_provenance: if clear_pending_on_zero_apply {
+                    MetadataCommandApplyProgressProvenance::Authoritative
+                } else {
+                    MetadataCommandApplyProgressProvenance::RecoveredPending
+                },
             },
             MetadataCommandExecutionRoute::normal(),
             work_budget,
@@ -2183,6 +2223,7 @@ impl super::StorageCluster {
                 retry_partial_exact_conflict: true,
                 convergence_requirement:
                     MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                progress_provenance: MetadataCommandApplyProgressProvenance::RecoveredPending,
             },
             MetadataCommandExecutionRoute::normal(),
             work_budget,
@@ -2207,6 +2248,7 @@ impl super::StorageCluster {
                 retry_partial_exact_conflict: true,
                 convergence_requirement:
                     MetadataCommandConvergenceRequirement::AllowRecoveryHandoff,
+                progress_provenance: MetadataCommandApplyProgressProvenance::RecoveredPending,
             },
             MetadataCommandExecutionRoute::recovery(
                 recovery_proof,
@@ -2222,7 +2264,7 @@ impl super::StorageCluster {
         &self,
         pg_id: PgId,
         initial_command: &MetadataCommandEnvelope,
-        policy: MetadataCommandFinishPolicy,
+        mut policy: MetadataCommandFinishPolicy,
         execution_route: MetadataCommandExecutionRoute<'_>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<FinishPendingMetadataCommandResult, BucketSnapshotLoadError> {
@@ -2267,6 +2309,8 @@ impl super::StorageCluster {
                     lineage_tip,
                 } => {
                     command = lineage_tip;
+                    policy.progress_provenance =
+                        MetadataCommandApplyProgressProvenance::RecoveredPending;
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
                         &command,
@@ -2314,6 +2358,8 @@ impl super::StorageCluster {
                     lineage_tip,
                 } => {
                     command = lineage_tip;
+                    policy.progress_provenance =
+                        MetadataCommandApplyProgressProvenance::RecoveredPending;
                     self.emit_metadata_command_recovery_admission_for_command(
                         pg_id,
                         &command,
@@ -2394,6 +2440,7 @@ impl super::StorageCluster {
         let recovery_abandoned_source = execution_route.recovery_abandoned_source.cloned();
         let mut command = command.clone();
         let mut apply_progress = MetadataCommandApplyProgress::Abortable;
+        let mut progress_provenance = policy.progress_provenance;
         loop {
             if let Err(error) = work_budget.check("metadata command apply retry budget exhausted") {
                 let confirmation_deadline =
@@ -2487,12 +2534,13 @@ impl super::StorageCluster {
                 }?;
                 return Ok(FinishPendingMetadataCommandResult::Abandoned);
             }
-            let apply_result = self.apply_metadata_command_to_acting_set_with_route_mode_until(
+            let apply_result = self.apply_metadata_command_to_acting_set_with_route_mode_until_inner(
                 &command,
                 execution_route,
                 self,
                 apply_progress,
                 work_budget.deadline(),
+                progress_provenance,
             );
             if let Err(error) = &apply_result {
                 apply_progress = apply_progress.merge(error.progress);
@@ -2623,6 +2671,8 @@ impl super::StorageCluster {
                             execution_route.for_reissued_command(pg_id, &command, &reissued)?;
                         command = reissued;
                         apply_progress = MetadataCommandApplyProgress::Abortable;
+                        progress_provenance =
+                            MetadataCommandApplyProgressProvenance::Authoritative;
                         continue;
                     }
                     if policy.clear_pending_on_zero_apply
