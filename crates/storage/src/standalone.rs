@@ -1161,10 +1161,7 @@ mod tests {
             }
             let path_bytes = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
             // SAFETY: `path_bytes` is a valid NUL-terminated path for the call.
-            assert_eq!(
-                unsafe { libc::mkfifo(path_bytes.as_ptr(), PRIVATE_FILE_MODE) },
-                0
-            );
+            assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
 
             assert!(matches!(
                 StandaloneRouteIdentityPreparation::acquire(&data_dir),
