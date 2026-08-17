@@ -294,6 +294,11 @@ Version 1 has no per-node PG list. The manifest defines eligible storage nodes
 and deterministic initial placement. Current acting sets and later placement
 changes are control-plane state.
 
+In version 1, `failure_domain` is applied during manifest validation and
+certified initial placement only. It is not yet stored as an active
+control-plane policy or rechecked for later acting-set changes; persistent
+enforcement is part of the planned dynamic-topology work.
+
 ### Endpoint and transport rules
 
 Endpoint URIs use one of these forms:
