@@ -231,6 +231,19 @@ pub(super) fn object_pg_action_error_is_retryable_pending_drain(
     }
 }
 
+pub(super) fn bucket_snapshot_error_is_deferred_pending_drain(
+    error: &BucketSnapshotLoadError,
+) -> bool {
+    matches!(
+        error,
+        BucketSnapshotLoadError::Store(
+            StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+                | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+                | StoreError::MetadataCommandDependencyConvergencePending { .. }
+        )
+    )
+}
+
 fn store_error_is_retryable_command_observation(error: &StoreError) -> bool {
     match error {
         StoreError::ClusterMapHistoryReferenceLimitExceeded { .. }

@@ -405,6 +405,50 @@ mod pending_command_terminal_cleanup_tests {
     }
 
     #[test]
+    fn unrelated_pending_drain_defers_only_publication_uncertainty() {
+        for error in [
+            StoreError::MetadataCommandOutcomeUnconfirmed {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            },
+            StoreError::MetadataCommandIrrevocableConvergencePending {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            },
+            StoreError::MetadataCommandDependencyConvergencePending {
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            },
+        ] {
+            assert!(bucket_snapshot_error_is_deferred_pending_drain(
+                &BucketSnapshotLoadError::Store(error)
+            ));
+        }
+
+        assert!(!bucket_snapshot_error_is_deferred_pending_drain(
+            &BucketSnapshotLoadError::Store(StoreError::MetadataCommandLogConflict {
+                node_id: 1,
+                pg_id: 2,
+                cluster_epoch: ClusterEpoch::INITIAL,
+                log_index: 3,
+            })
+        ));
+        assert!(!bucket_snapshot_error_is_deferred_pending_drain(
+            &BucketSnapshotLoadError::Store(StoreError::StorageRpc {
+                node_id: 1,
+                operation: "test malformed pending-drain response",
+                failure: StorageRpcErrorCode::PayloadDecode,
+                detail: crate::StorageNodeFailureDetail::new(
+                    "authenticated protocol failure must remain fatal",
+                ),
+            })
+        ));
+    }
+
+    #[test]
     fn auxiliary_multipart_reservation_accepts_only_exact_not_found_identity() {
         let proof = BucketWriteReservationProof {
             bucket: BucketName::try_from("cleanup-identity-bucket").unwrap(),

@@ -2836,6 +2836,112 @@ fn bucket_subresource_command_retry_reuses_pending_partial_replica_command() {
 }
 
 #[test]
+fn bucket_subresource_reports_contention_when_unrelated_pending_outcome_is_unconfirmed() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let (bucket, deleting_bucket) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        (
+            bucket_for_pg(topology, pg_id.get(), "subresource-unrelated-drain-"),
+            bucket_for_pg(topology, pg_id.get(), "subresource-unrelated-delete-"),
+        )
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    create_test_bucket(&cluster, &deleting_bucket);
+
+    let initial_generation = cluster
+        .head_bucket_info(&bucket)
+        .unwrap()
+        .bucket_execution_generation;
+    let command_id = cluster.next_bucket_metadata_command_id(pg_id).unwrap();
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let deleting =
+        crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &deleting_bucket).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        command_id,
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            deleting.with_execution_generation(
+                primary_pg
+                    .next_bucket_execution_generation_candidate()
+                    .unwrap(),
+            ),
+        )),
+    );
+    drop(primary_pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &deleting_bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let hook_command = command.clone();
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate == &hook_command {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                let id = candidate.id();
+                return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        }));
+
+    let tags = crate::SerializedBucketTagSet::new(
+        "<Tagging><TagSet><Tag><Key>key</Key><Value>value</Value></Tag></TagSet></Tagging>"
+            .to_string(),
+    );
+    let error = cluster
+        .put_bucket_subresource_and_load_info(&bucket, crate::PutBucketSubresource::tagging(&tags))
+        .expect_err("an unrelated unconfirmed command must block with retryable contention");
+
+    assert_eq!(
+        error.kind(),
+        &crate::BucketSnapshotLoadFailureKind::MetadataCommandContention
+    );
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &deleting_bucket),
+        Some(command),
+        "the unrelated uncertain command must remain available for recovery"
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+        assert_eq!(info.bucket_execution_generation, initial_generation);
+        assert!(
+            crate::PgMetadataStore::get_bucket_subresource(
+                &*pg,
+                &bucket,
+                crate::BucketSubresourceKind::Tagging,
+            )
+            .unwrap()
+            .is_none(),
+            "the blocked request must not mutate its target bucket"
+        );
+    }
+}
+
+#[test]
 fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

@@ -2981,13 +2981,20 @@ impl super::StorageCluster {
         if pending_bucket == *bucket {
             return Ok(false);
         }
-        self.drain_pending_metadata_command_pg_slot_with_work_budget(
+        match self.drain_pending_metadata_command_pg_slot_with_work_budget(
             pg_id,
             &pending_bucket,
             command,
             work_budget,
-        )?;
-        Ok(true)
+        ) {
+            Ok(()) => Ok(true),
+            Err(error) if bucket_snapshot_error_is_deferred_pending_drain(&error) => {
+                Err(conflicting_pending_metadata_command(
+                    "unrelated pending metadata command convergence deferred",
+                ))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[cfg(test)]
