@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::cluster::request_ops::MetadataCommandApplyProgress;
 use crate::cluster::{segment_payload_placement_key, StreamAppendCommitRequest};
 use crate::metadata_command::ReleaseObjectGenerationCommand;
 use crate::test_support::StorageClusterFailureTestSupport as _;
+use crate::BucketSnapshotLoadError;
 
 struct StreamPayloadCleanupFixture {
     _tmp: test_util::TempDir,
@@ -5575,6 +5577,385 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
         );
     }
     assert_clean_metadata_command_stream(&reopened_map, &[object_pg]);
+}
+
+#[test]
+fn upload_part_stream_create_does_not_expose_foreign_terminal_pending_upload() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, foreign_key, object_pg, data_pg) = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+    let target_key = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        key_for_object_pg(topology, &bucket, object_pg, "foreign-terminal-target-")
+    };
+    assert_ne!(foreign_key, target_key);
+    set_route_primary(&mut map, object_pg, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let create_upload = |key: &ObjectKey, upload_id: crate::UploadId| {
+        let request = crate::CreateMultipartUploadReq {
+            upload_id: upload_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            tags: None,
+            metadata_blob: crate::SerializedMetadataBlob::default(),
+            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+            initiator: crate::OwnerIdentity::from_principal("initiator"),
+            owner: crate::OwnerIdentity::from_principal("owner"),
+            acl_grants: crate::AclGrants::default(),
+            public_read: false,
+            object_lock: crate::ObjectLockState::default(),
+            checksum: None,
+            encryption: crate::ObjectEncryption::None,
+        };
+        cluster
+            .create_multipart_upload(
+                &bucket,
+                key,
+                crate::BucketSnapshotRequest::default(),
+                |_snapshot, existing_object| {
+                    assert!(existing_object.is_none());
+                    Ok::<_, ()>(((), request.clone()))
+                },
+            )
+            .unwrap()
+            .unwrap();
+        upload_id
+    };
+    let foreign_upload_id = create_upload(
+        &foreign_key,
+        upload_id_from_label("foreignterminalpendingupload"),
+    );
+    let target_upload_id = create_upload(
+        &target_key,
+        upload_id_from_label("foreignterminaltargetupload"),
+    );
+    assert!(cluster
+        .abort_multipart_upload(&bucket, &foreign_key, &foreign_upload_id)
+        .unwrap());
+
+    let stale_session_id = crate::SessionId::try_from("8a".repeat(16)).unwrap();
+    let stale_proof = acquire_test_bucket_write_proof(
+        &cluster,
+        &bucket,
+        crate::metadata_command::UPLOAD_PART_STREAM_CREATE_BUCKET_WRITE_OPERATION_KIND,
+        Some(foreign_key.as_str()),
+    );
+    let pg_id = PgId::new(object_pg);
+    let stale = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::CreateStreamUpload(Box::new(
+            crate::metadata_command::CreateStreamUploadCommand::from_request_with_bucket_write_reservation(
+                crate::CreateStreamUploadReq {
+                    session_id: stale_session_id.clone(),
+                    bucket: bucket.clone(),
+                    key: foreign_key.clone(),
+                    target: crate::StreamUploadTarget::UploadPart {
+                        upload_id: foreign_upload_id.clone(),
+                        part_number: 1,
+                    },
+                    encryption: crate::ObjectEncryption::None,
+                },
+                123,
+                stale_proof.clone(),
+            ),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &stale);
+
+    #[derive(Clone, Copy, Debug)]
+    enum RejectedTerminalEvidence {
+        PublicationStarted,
+        Witnessed,
+        Applied,
+        AmbiguousDispatch,
+        MismatchedUpload,
+        IntegrityFailure,
+    }
+
+    for evidence in [
+        RejectedTerminalEvidence::PublicationStarted,
+        RejectedTerminalEvidence::Witnessed,
+        RejectedTerminalEvidence::Applied,
+        RejectedTerminalEvidence::AmbiguousDispatch,
+        RejectedTerminalEvidence::MismatchedUpload,
+        RejectedTerminalEvidence::IntegrityFailure,
+    ] {
+        let hook_stale = stale.clone();
+        let hook_guard = cluster.test_install_terminal_stream_apply_failure_hook(Arc::new(
+            move |command, failure| {
+                if command != &hook_stale {
+                    return;
+                }
+                match evidence {
+                    RejectedTerminalEvidence::PublicationStarted => {
+                        failure.progress = MetadataCommandApplyProgress::PublicationStarted;
+                    }
+                    RejectedTerminalEvidence::Witnessed => {
+                        failure.progress = MetadataCommandApplyProgress::Witnessed;
+                    }
+                    RejectedTerminalEvidence::Applied => {
+                        failure.applied_nodes = 1;
+                    }
+                    RejectedTerminalEvidence::AmbiguousDispatch => {
+                        failure.may_have_applied = true;
+                    }
+                    RejectedTerminalEvidence::MismatchedUpload => {
+                        failure.source =
+                            BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload {
+                                upload_id: "different-upload".to_owned(),
+                            });
+                    }
+                    RejectedTerminalEvidence::IntegrityFailure => {
+                        failure.source =
+                            BucketSnapshotLoadError::Metadata(MetadataError::InvariantViolation {
+                                context:
+                                    "injected terminal stream classification integrity failure",
+                                reason: "test integrity evidence must remain fail-closed"
+                                    .to_owned(),
+                            });
+                    }
+                }
+            },
+        ));
+        cluster
+            .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+            .expect_err("non-definitive terminal evidence must remain fail-closed");
+        drop(hook_guard);
+
+        assert_eq!(
+            pending_metadata_command_for_test(&map, pg_id, &bucket),
+            Some(stale.clone()),
+            "{evidence:?} must retain the exact pending command"
+        );
+        for node_id in node_ids {
+            let pg = map
+                .node(node_id)
+                .unwrap()
+                .storage_node()
+                .get_pg(object_pg)
+                .unwrap();
+            assert!(
+                !pg.metadata_command_abandoned(node_id.as_u32(), &stale)
+                    .unwrap(),
+                "{evidence:?} must not record an abandonment tombstone"
+            );
+        }
+        let bucket_pg_id = PgId::new(
+            map.node(NodeId::new(0))
+                .unwrap()
+                .storage_node()
+                .pg_topology()
+                .bucket_pg_for(&bucket),
+        );
+        let bucket_primary = map
+            .metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+            .unwrap();
+        let bucket_pg = bucket_primary
+            .storage_node()
+            .get_pg(bucket_pg_id.get())
+            .unwrap();
+        let reservations =
+            crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket)
+                .unwrap();
+        assert!(
+            reservations.iter().any(|record| {
+                crate::metadata_command::BucketWriteReservationProof::from(record) == stale_proof
+            }),
+            "{evidence:?} must retain the pending command reservation"
+        );
+    }
+
+    let target_upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &target_key, &target_upload_id)
+        .unwrap();
+    let target_session_id = crate::SessionId::try_from("8b".repeat(16)).unwrap();
+    let created_session = cluster
+        .create_upload_part_stream_session(
+            &crate::AuthorizedMultipartUploadRecord::assume_authorized(target_upload),
+            1,
+            &target_session_id,
+        )
+        .unwrap();
+
+    assert_eq!(created_session, target_session_id);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .metadata_command_abandoned(node_id.as_u32(), &stale)
+            .unwrap());
+        assert!(matches!(
+            crate::PgMetadataStore::get_multipart_upload(&*pg, &foreign_upload_id),
+            Err(crate::MetadataError::NoSuchUpload { .. })
+        ));
+        assert!(matches!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &stale_session_id),
+            Err(crate::MetadataError::StreamSessionNotFound { .. })
+        ));
+        assert_eq!(
+            crate::PgMetadataStore::get_stream_upload(&*pg, &target_session_id)
+                .unwrap()
+                .target,
+            crate::StreamUploadTarget::UploadPart {
+                upload_id: target_upload_id.clone(),
+                part_number: 1,
+            }
+        );
+    }
+    assert_bucket_write_reservations_released(&map, &bucket);
+
+    let terminal_session_id = crate::SessionId::try_from("8c".repeat(16)).unwrap();
+    let terminal_target = crate::StreamUploadTarget::UploadPart {
+        upload_id: target_upload_id.clone(),
+        part_number: 2,
+    };
+    let terminal_segment = crate::StreamUploadSegmentRecord {
+        session_id: terminal_session_id.clone(),
+        segment_index: 0,
+        size: 1,
+        segment_crc64: 1,
+        payload_crc64: 1,
+        segment_okh: [0x8c; 16],
+        segment_vid: crate::GenerationId::MIN,
+        data_pg_id: data_pg,
+        placement_cluster_epoch: ClusterEpoch::INITIAL,
+        ec_k: ec_shape.k,
+        ec_m: ec_shape.m,
+    };
+    let terminal_append = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+            bucket: bucket.clone(),
+            key: target_key.clone(),
+            target: terminal_target.clone(),
+            segment: terminal_segment.clone(),
+        })),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &terminal_append);
+
+    let mismatched_append = terminal_append.clone();
+    let mismatch_guard = cluster.test_install_terminal_stream_apply_failure_hook(Arc::new(
+        move |command, failure| {
+            if command == &mismatched_append {
+                failure.source =
+                    BucketSnapshotLoadError::Metadata(MetadataError::StreamSessionNotFound {
+                        session_id: "different-session".to_owned(),
+                    });
+            }
+        },
+    ));
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .expect_err("a mismatched terminal session must remain fail-closed");
+    drop(mismatch_guard);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(terminal_append.clone()),
+        "a mismatched terminal session must retain the exact pending command"
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(!pg
+            .metadata_command_abandoned(node_id.as_u32(), &terminal_append)
+            .unwrap());
+    }
+
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .expect("the matching terminal session must authorize abandonment");
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .metadata_command_abandoned(node_id.as_u32(), &terminal_append)
+            .unwrap());
+    }
+
+    let terminal_state_session_id = crate::SessionId::try_from("8d".repeat(16)).unwrap();
+    let terminal_state_append = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            cluster.operation_epoch(),
+            pg_id,
+            map.test_next_metadata_command_log_index(pg_id),
+        ),
+        MetadataCommandPayload::AppendStreamSegment(Box::new(AppendStreamSegmentCommand {
+            bucket: bucket.clone(),
+            key: target_key,
+            target: terminal_target,
+            segment: crate::StreamUploadSegmentRecord {
+                session_id: terminal_state_session_id,
+                ..terminal_segment
+            },
+        })),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &terminal_state_append);
+    let hooked_terminal_state_append = terminal_state_append.clone();
+    let terminal_state_guard = cluster.test_install_terminal_stream_apply_failure_hook(Arc::new(
+        move |command, failure| {
+            if command == &hooked_terminal_state_append {
+                failure.source =
+                    BucketSnapshotLoadError::Metadata(MetadataError::StreamSessionNotInProgress {
+                        state: 1,
+                    });
+            }
+        },
+    ));
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .expect("a terminal stream-session state must authorize abandonment");
+    drop(terminal_state_guard);
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        assert!(pg
+            .metadata_command_abandoned(node_id.as_u32(), &terminal_state_append)
+            .unwrap());
+    }
 }
 
 #[test]

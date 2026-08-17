@@ -36,6 +36,80 @@ impl PendingObjectMetadataCommandCompletion {
     }
 }
 
+fn metadata_command_apply_failure_is_definitive_terminal_stream_outcome(
+    command: &MetadataCommandEnvelope,
+    failure: &request_ops::MetadataCommandApplyFailure,
+) -> bool {
+    if !failure.progress.is_abortable()
+        || failure.applied_nodes != 0
+        || failure.may_have_applied
+    {
+        return false;
+    }
+    match &failure.source {
+        BucketSnapshotLoadError::Metadata(MetadataError::NoSuchUpload { upload_id }) => command
+            .payload()
+            .stream_upload_no_such_upload_subject()
+            .is_some_and(|(_, expected_upload_id)| expected_upload_id.as_str() == upload_id),
+        BucketSnapshotLoadError::Metadata(MetadataError::StreamSessionNotFound {
+            session_id,
+        }) => command
+            .payload()
+            .stream_upload_terminal_session_subject()
+            .is_some_and(|(expected_session_id, _)| expected_session_id.as_str() == session_id),
+        BucketSnapshotLoadError::Metadata(MetadataError::StreamSessionNotInProgress { .. }) => {
+            command
+                .payload()
+                .stream_upload_terminal_session_subject()
+                .is_some()
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+pub(in crate::cluster) type TerminalStreamApplyFailureTestHook = Arc<
+    dyn Fn(&MetadataCommandEnvelope, &mut request_ops::MetadataCommandApplyFailure) + Send + Sync,
+>;
+
+#[cfg(test)]
+static TERMINAL_STREAM_APPLY_FAILURE_TEST_HOOKS: std::sync::OnceLock<
+    Mutex<HashMap<usize, TerminalStreamApplyFailureTestHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(in crate::cluster) struct TerminalStreamApplyFailureTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+impl Drop for TerminalStreamApplyFailureTestHookGuard {
+    fn drop(&mut self) {
+        TERMINAL_STREAM_APPLY_FAILURE_TEST_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_terminal_stream_apply_failure_test_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+    failure: &mut request_ops::MetadataCommandApplyFailure,
+) {
+    let hook = TERMINAL_STREAM_APPLY_FAILURE_TEST_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(command, failure);
+    }
+}
+
 enum CollectedPendingObjectMetadataCommands {
     Drained(Vec<MetadataCommandEnvelope>),
     PendingRecovery(Vec<MetadataCommandEnvelope>),
@@ -128,6 +202,20 @@ impl ObjectPendingCommandFinishPolicy {
 }
 
 impl StorageCluster {
+    #[cfg(test)]
+    pub(in crate::cluster) fn test_install_terminal_stream_apply_failure_hook(
+        &self,
+        hook: TerminalStreamApplyFailureTestHook,
+    ) -> TerminalStreamApplyFailureTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        TERMINAL_STREAM_APPLY_FAILURE_TEST_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(scope_id, hook);
+        TerminalStreamApplyFailureTestHookGuard { scope_id }
+    }
+
     pub(crate) fn place_payload_shards(
         &self,
         data_pg_id: DataPgId,
@@ -2546,6 +2634,41 @@ impl StorageCluster {
                     });
                 }
                 Err(error) => {
+                    #[cfg(test)]
+                    let error = {
+                        let mut error = error;
+                        maybe_run_terminal_stream_apply_failure_test_hook(
+                            self.metadata_command_apply_test_hook_scope_id(),
+                            &command,
+                            &mut error,
+                        );
+                        error
+                    };
+                    if metadata_command_apply_failure_is_definitive_terminal_stream_outcome(
+                        &command, &error,
+                    ) {
+                        let cleanup =
+                            self.propagate_and_complete_abandoned_object_metadata_command(
+                                pg_id,
+                                &command,
+                                reservation_authority,
+                                work_budget,
+                                ObjectPendingCommandCleanupContext {
+                                    execution_route,
+                                    recovery_guard,
+                                    convergence_requirement,
+                                },
+                            )?;
+                        return Ok(if cleanup
+                            == request_ops::PendingMetadataCommandTerminalCleanup::Deferred
+                        {
+                            PendingObjectMetadataCommandCompletion::TerminalCleanupPending {
+                                applied: false,
+                            }
+                        } else {
+                            PendingObjectMetadataCommandCompletion::Abandoned
+                        });
+                    }
                     return Err(bucket_snapshot_error_to_object_pg_action_error(
                         error.source,
                     ));
