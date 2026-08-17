@@ -20,6 +20,9 @@ struct StorageNodeConnectionHandler {
     #[cfg(test)]
     metadata_command_before_commit_test_hook:
         Arc<Mutex<Option<MetadataCommandBeforeCommitTestHook>>>,
+    #[cfg(test)]
+    metadata_checkpoint_rows_captured_test_hook:
+        Arc<Mutex<Option<MetadataCheckpointRowsCapturedTestHook>>>,
 }
 #[derive(Debug)]
 enum StorageNodeBucketRouteError {

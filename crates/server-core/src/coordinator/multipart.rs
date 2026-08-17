@@ -260,6 +260,7 @@ impl Coordinator {
             storage::MultipartCompletionFailureKind::StaleSnapshot => ServerError::OperationAborted,
             storage::MultipartCompletionFailureKind::ResourceExhausted
             | storage::MultipartCompletionFailureKind::MetadataCommandContention
+            | storage::MultipartCompletionFailureKind::PrepublicationBarrierExhausted
             | storage::MultipartCompletionFailureKind::RetryableConvergence => {
                 // Snapshot/preflight contention is retryable as SlowDown. The
                 // commit path overrides metadata-command contention to

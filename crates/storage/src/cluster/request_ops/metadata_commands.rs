@@ -324,6 +324,20 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_multipart_completion_barrier_drained_hook(
+        &self,
+        hook: MultipartCompletionBarrierDrainedTestHook,
+    ) -> MultipartCompletionBarrierDrainedTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = MULTIPART_COMPLETION_BARRIER_DRAINED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        MultipartCompletionBarrierDrainedTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_pending_object_metadata_partial_conflict_hook(
         &self,
         hook: PendingObjectMetadataPartialConflictTestHook,

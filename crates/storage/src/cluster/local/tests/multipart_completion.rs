@@ -2546,9 +2546,7 @@ fn identical_multipart_completions_help_partial_barrier_without_contention() {
         .expect("second completion did not classify the expired partial barrier");
     assert!(matches!(
         second_result,
-        Err(crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandDependencyConvergencePending { .. }
-        ))
+        Err(crate::ObjectPgActionError::MultipartPrepublicationBarrierExhausted)
     ));
     let confirmation_deadlines = confirmation_deadlines
         .lock()
@@ -2636,9 +2634,7 @@ fn identical_multipart_completions_help_partial_barrier_without_contention() {
     assert!(expired_route_observed.load(Ordering::SeqCst));
     assert!(matches!(
         expired_route_result,
-        Err(crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandDependencyConvergencePending { .. }
-        ))
+        Err(crate::ObjectPgActionError::MultipartPrepublicationBarrierExhausted)
     ));
 
     let recovery_owner_cluster = Arc::clone(&cluster);
@@ -4658,6 +4654,114 @@ fn multipart_completion_barrier_command_id_race_drains_winner_and_retries() {
         let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
         let info = crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
         assert_eq!(info.multipart_completion_barrier_sequence, 2);
+    }
+    assert_clean_metadata_command_stream(&map, &[1]);
+}
+
+#[test]
+fn multipart_completion_barrier_drain_crossing_deadline_is_prepublication_exhaustion() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "mpu-order-drain-deadline-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let contender = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let install_once = Arc::new(AtomicBool::new(true));
+    let install_once_for_hook = Arc::clone(&install_once);
+    let _command_id_hook = cluster
+        .test_install_before_multipart_completion_barrier_command_id_hook(Arc::new(move || {
+            if !install_once_for_hook.swap(false, Ordering::SeqCst) {
+                return;
+            }
+            let pg_id = PgId::new(1);
+            let command = MetadataCommandEnvelope::new(
+                contender.next_metadata_command_id(pg_id).unwrap(),
+                MetadataCommandPayload::AdvanceMultipartCompletionBarrier(
+                    AdvanceMultipartCompletionBarrierCommand {
+                        bucket: hook_bucket.clone(),
+                        barrier_sequence: 1,
+                    },
+                ),
+            );
+            insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
+        }));
+    let drained = Arc::new(AtomicUsize::new(0));
+    let drained_for_hook = Arc::clone(&drained);
+    let _drained_hook =
+        cluster.test_install_multipart_completion_barrier_drained_hook(Arc::new(move || {
+            drained_for_hook.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+
+    let error = cluster
+        .test_establish_multipart_completion_barrier(&bucket)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+    ));
+    assert!(!install_once.load(Ordering::SeqCst));
+    assert_eq!(drained.load(Ordering::SeqCst), 1);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let info = crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+        assert_eq!(info.multipart_completion_barrier_sequence, 1);
+    }
+    assert_clean_metadata_command_stream(&map, &[1]);
+}
+
+#[test]
+fn multipart_completion_barrier_boundary_maps_generic_contention() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "mpu-order-contention-boundary-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let error = cluster
+        .test_establish_multipart_completion_barrier_with_route_error(
+            &bucket,
+            crate::StoreError::MetadataCommandContention {
+                context: "injected multipart prepublication contention",
+            },
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+    ));
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let info = crate::traits::PgMetadataStore::head_bucket_record_raw(&*pg, &bucket).unwrap();
+        assert_eq!(info.multipart_completion_barrier_sequence, 0);
     }
     assert_clean_metadata_command_stream(&map, &[1]);
 }

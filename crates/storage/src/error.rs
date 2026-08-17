@@ -2352,6 +2352,7 @@ pub(crate) enum ObjectPgActionError {
     SnapshotReinspectionConflict,
     StaleMultipartCompletionSnapshot,
     MultipartConditionalRequestConflict,
+    MultipartPrepublicationBarrierExhausted,
 }
 
 impl ObjectPgActionError {
@@ -2373,6 +2374,9 @@ impl ObjectPgActionError {
             Self::SnapshotReinspectionConflict => "snapshot_reinspection_conflict",
             Self::StaleMultipartCompletionSnapshot => "stale_multipart_completion_snapshot",
             Self::MultipartConditionalRequestConflict => "multipart_conditional_request_conflict",
+            Self::MultipartPrepublicationBarrierExhausted => {
+                "multipart_prepublication_barrier_exhausted"
+            }
         }
     }
 
@@ -2393,7 +2397,8 @@ impl ObjectPgActionError {
             | Self::StaleStreamFinalizeSnapshot
             | Self::SnapshotReinspectionConflict
             | Self::StaleMultipartCompletionSnapshot
-            | Self::MultipartConditionalRequestConflict => false,
+            | Self::MultipartConditionalRequestConflict
+            | Self::MultipartPrepublicationBarrierExhausted => false,
         }
     }
 }
@@ -2449,6 +2454,7 @@ enum ObjectOperationFailureDiagnosticCategory {
     StaleMultipartCompletionSnapshot,
     MultipartConditionalRequestConflict,
     SnapshotReinspectionConflict,
+    MultipartPrepublicationBarrierExhausted,
     UnexpectedObjectOperationOutcome,
 }
 
@@ -2461,6 +2467,9 @@ impl ObjectOperationFailureDiagnosticCategory {
             Self::StaleMultipartCompletionSnapshot => "stale_multipart_completion_snapshot",
             Self::MultipartConditionalRequestConflict => "multipart_conditional_request_conflict",
             Self::SnapshotReinspectionConflict => "snapshot_reinspection_conflict",
+            Self::MultipartPrepublicationBarrierExhausted => {
+                "multipart_prepublication_barrier_exhausted"
+            }
             Self::UnexpectedObjectOperationOutcome => "unexpected_object_operation_outcome",
         }
     }
@@ -2492,6 +2501,9 @@ fn object_pg_action_diagnostic_category(
         }
         ObjectPgActionError::SnapshotReinspectionConflict => {
             ObjectOperationFailureDiagnosticCategory::SnapshotReinspectionConflict
+        }
+        ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
+            ObjectOperationFailureDiagnosticCategory::MultipartPrepublicationBarrierExhausted
         }
         ObjectPgActionError::StaleDirectPutCommitSnapshot
         | ObjectPgActionError::StaleStreamFinalizeSnapshot => {
@@ -2542,7 +2554,8 @@ fn classify_object_pg_action(
         | ObjectPgActionError::StaleStreamFinalizeSnapshot
         | ObjectPgActionError::SnapshotReinspectionConflict
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
-        | ObjectPgActionError::MultipartConditionalRequestConflict => {
+        | ObjectPgActionError::MultipartConditionalRequestConflict
+        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
             ObjectOperationFailureKind::InternalError
         }
     };
@@ -3330,7 +3343,8 @@ impl MultipartManagementFailure {
             | ObjectPgActionError::StaleStreamFinalizeSnapshot
             | ObjectPgActionError::SnapshotReinspectionConflict
             | ObjectPgActionError::StaleMultipartCompletionSnapshot
-            | ObjectPgActionError::MultipartConditionalRequestConflict => {
+            | ObjectPgActionError::MultipartConditionalRequestConflict
+            | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
                 MultipartManagementFailureKind::InternalError
             }
         };
@@ -3397,6 +3411,7 @@ pub enum MultipartCompletionFailureKind {
     ConditionalRequestConflict,
     ResourceExhausted,
     MetadataCommandContention,
+    PrepublicationBarrierExhausted,
     RetryableConvergence,
     InternalError,
 }
@@ -3408,6 +3423,7 @@ enum MultipartCompletionFailureOutcome {
     ConditionalRequestConflict,
     ResourceExhausted,
     MetadataCommandContention,
+    PrepublicationBarrierExhausted,
     RetryableConvergence,
     InternalError,
 }
@@ -3439,6 +3455,9 @@ impl MultipartCompletionFailure {
             }
             MultipartCompletionFailureOutcome::MetadataCommandContention => {
                 MultipartCompletionFailureKind::MetadataCommandContention
+            }
+            MultipartCompletionFailureOutcome::PrepublicationBarrierExhausted => {
+                MultipartCompletionFailureKind::PrepublicationBarrierExhausted
             }
             MultipartCompletionFailureOutcome::RetryableConvergence => {
                 MultipartCompletionFailureKind::RetryableConvergence
@@ -3494,6 +3513,9 @@ impl MultipartCompletionFailure {
             ObjectPgActionError::MultipartConditionalRequestConflict => {
                 MultipartCompletionFailureOutcome::ConditionalRequestConflict
             }
+            ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
+                MultipartCompletionFailureOutcome::PrepublicationBarrierExhausted
+            }
             ObjectPgActionError::Metadata(_)
             | ObjectPgActionError::InvalidRequest { .. }
             | ObjectPgActionError::StaleObjectReadSubject
@@ -3530,6 +3552,9 @@ impl MultipartCompletionFailure {
             MultipartCompletionFailureKind::MetadataCommandContention => {
                 MultipartCompletionFailureOutcome::MetadataCommandContention
             }
+            MultipartCompletionFailureKind::PrepublicationBarrierExhausted => {
+                MultipartCompletionFailureOutcome::PrepublicationBarrierExhausted
+            }
             MultipartCompletionFailureKind::RetryableConvergence => {
                 MultipartCompletionFailureOutcome::RetryableConvergence
             }
@@ -3543,6 +3568,9 @@ impl MultipartCompletionFailure {
             }
             MultipartCompletionFailureKind::MetadataCommandContention => {
                 MultipartManagementFailureKind::MetadataCommandContention
+            }
+            MultipartCompletionFailureKind::PrepublicationBarrierExhausted => {
+                MultipartManagementFailureKind::RetryableConvergence
             }
             MultipartCompletionFailureKind::RetryableConvergence => {
                 MultipartManagementFailureKind::RetryableConvergence
@@ -3692,7 +3720,8 @@ impl StreamUploadFailure {
             ObjectPgActionError::StaleDirectPutCommitSnapshot
             | ObjectPgActionError::StaleStreamFinalizeSnapshot
             | ObjectPgActionError::StaleMultipartCompletionSnapshot
-            | ObjectPgActionError::MultipartConditionalRequestConflict => {
+            | ObjectPgActionError::MultipartConditionalRequestConflict
+            | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
                 ObjectOperationFailureDiagnosticCategory::UnexpectedObjectOperationOutcome
             }
             ObjectPgActionError::SnapshotReinspectionConflict => {
@@ -3738,7 +3767,8 @@ impl StreamUploadFailure {
             | ObjectPgActionError::StaleDirectPutCommitSnapshot
             | ObjectPgActionError::StaleStreamFinalizeSnapshot
             | ObjectPgActionError::StaleMultipartCompletionSnapshot
-            | ObjectPgActionError::MultipartConditionalRequestConflict => {
+            | ObjectPgActionError::MultipartConditionalRequestConflict
+            | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
                 StreamUploadFailureOutcome::InternalError
             }
         };
@@ -4539,6 +4569,7 @@ mod tests {
             ObjectPgActionError::StaleStreamFinalizeSnapshot,
             ObjectPgActionError::StaleMultipartCompletionSnapshot,
             ObjectPgActionError::MultipartConditionalRequestConflict,
+            ObjectPgActionError::MultipartPrepublicationBarrierExhausted,
         ] {
             assert_eq!(convert(error), BucketListingFailureKind::InternalError);
         }
@@ -5125,6 +5156,7 @@ mod tests {
             }),
             ObjectPgActionError::StaleMultipartCompletionSnapshot,
             ObjectPgActionError::MultipartConditionalRequestConflict,
+            ObjectPgActionError::MultipartPrepublicationBarrierExhausted,
         ] {
             assert_eq!(
                 convert(error),
@@ -5160,6 +5192,10 @@ mod tests {
             (
                 ObjectPgActionError::MultipartConditionalRequestConflict,
                 MultipartCompletionFailureKind::ConditionalRequestConflict,
+            ),
+            (
+                ObjectPgActionError::MultipartPrepublicationBarrierExhausted,
+                MultipartCompletionFailureKind::PrepublicationBarrierExhausted,
             ),
             (
                 ObjectPgActionError::Metadata(MetadataError::ObjectGenerationReservationConflict {

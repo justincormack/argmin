@@ -190,7 +190,8 @@ pub(super) fn object_pg_action_error_is_retryable_command_observation(
         | ObjectPgActionError::StaleStreamFinalizeSnapshot
         | ObjectPgActionError::SnapshotReinspectionConflict
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
-        | ObjectPgActionError::MultipartConditionalRequestConflict => false,
+        | ObjectPgActionError::MultipartConditionalRequestConflict
+        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => false,
     }
 }
 
@@ -227,7 +228,8 @@ pub(super) fn object_pg_action_error_is_retryable_pending_drain(
         | ObjectPgActionError::StaleStreamFinalizeSnapshot
         | ObjectPgActionError::SnapshotReinspectionConflict
         | ObjectPgActionError::StaleMultipartCompletionSnapshot
-        | ObjectPgActionError::MultipartConditionalRequestConflict => false,
+        | ObjectPgActionError::MultipartConditionalRequestConflict
+        | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => false,
     }
 }
 
@@ -717,6 +719,9 @@ type MultipartCompletionPendingBarrierObservedTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
 #[cfg(test)]
+type MultipartCompletionBarrierDrainedTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[cfg(test)]
 type PendingObjectMetadataPartialConflictTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
 
@@ -919,6 +924,11 @@ static MULTIPART_COMPLETION_PENDING_BARRIER_OBSERVED_HOOKS: OnceLock<
 > = OnceLock::new();
 
 #[cfg(test)]
+static MULTIPART_COMPLETION_BARRIER_DRAINED_HOOKS: OnceLock<
+    Mutex<HashMap<usize, MultipartCompletionBarrierDrainedTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
 static PENDING_OBJECT_METADATA_PARTIAL_CONFLICT_HOOKS: OnceLock<
     Mutex<HashMap<usize, PendingObjectMetadataPartialConflictTestHook>>,
 > = OnceLock::new();
@@ -1109,6 +1119,11 @@ pub(crate) struct MultipartCompletionBarrierCommandIdTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct MultipartCompletionPendingBarrierObservedTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct MultipartCompletionBarrierDrainedTestHookGuard {
     scope_id: usize,
 }
 
@@ -1451,6 +1466,18 @@ impl Drop for MultipartCompletionBarrierCommandIdTestHookGuard {
 impl Drop for MultipartCompletionPendingBarrierObservedTestHookGuard {
     fn drop(&mut self) {
         let hooks = MULTIPART_COMPLETION_PENDING_BARRIER_OBSERVED_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for MultipartCompletionBarrierDrainedTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = MULTIPART_COMPLETION_BARRIER_DRAINED_HOOKS
             .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
@@ -2049,6 +2076,22 @@ fn maybe_run_multipart_completion_pending_barrier_observed_hook(
         .get(&scope_id)
         .cloned();
     if hook.is_some_and(|hook| hook(command)) {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_multipart_completion_barrier_drained_hook(
+    scope_id: usize,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let hook = MULTIPART_COMPLETION_BARRIER_DRAINED_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    if hook.is_some_and(|hook| hook()) {
         work_budget.expire_for_test();
     }
 }

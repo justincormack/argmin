@@ -4275,7 +4275,7 @@
     }
 
     #[test]
-    fn metadata_checkpoint_candidates_for_frame_skips_oversized_newest_candidate() {
+    fn metadata_checkpoint_candidates_for_frame_skips_oversized_candidates_anywhere() {
         let tmp = test_util::tempdir();
         let node = crate::node::SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         let pg = node.get_pg(0).unwrap();
@@ -4285,51 +4285,203 @@
         let small = pg
             .record_current_metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
             .unwrap();
-
-        let large_body = format!(
-            "<LifecycleConfiguration>{}</LifecycleConfiguration>",
-            "x".repeat(4096)
-        );
         pg.put_bucket_subresource(
             &bucket,
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Lifecycle,
-                body: &large_body,
+                body: "<LifecycleConfiguration/>",
                 aux: BucketSubresourceAux::None,
             },
         )
         .unwrap();
         pg.refresh_metadata_command_state_digest().unwrap();
-        let large = pg
+        let second_small = pg
             .record_current_metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
             .unwrap();
 
+        let mut large_checkpoints = Vec::new();
+        for suffix in
+            0..crate::storage_rpc::STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES
+        {
+            let large_body = format!(
+                "<LifecycleConfiguration>{}{suffix}</LifecycleConfiguration>",
+                "x".repeat(64 * 1024)
+            );
+            pg.put_bucket_subresource(
+                &bucket,
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body: &large_body,
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+            pg.refresh_metadata_command_state_digest().unwrap();
+            large_checkpoints.push(
+                pg.record_current_metadata_command_checkpoint(7, ClusterEpoch::INITIAL)
+                    .unwrap(),
+            );
+        }
+
         let small_payload = encode_metadata_command_checkpoint_candidates_response(
             &StorageRpcMetadataCommandCheckpointCandidatesResponse {
-                checkpoints: vec![small.clone()],
-            },
-        )
-        .unwrap();
-        let large_payload = encode_metadata_command_checkpoint_candidates_response(
-            &StorageRpcMetadataCommandCheckpointCandidatesResponse {
-                checkpoints: vec![large],
+                checkpoints: vec![small.clone(), second_small.clone()],
             },
         )
         .unwrap();
         let small_response_len = encode_storage_rpc_success_response(&small_payload).len();
-        let large_response_len = encode_storage_rpc_success_response(&large_payload).len();
-        assert!(large_response_len > small_response_len);
+        for large in &large_checkpoints {
+            let large_payload = encode_metadata_command_checkpoint_candidates_response(
+                &StorageRpcMetadataCommandCheckpointCandidatesResponse {
+                    checkpoints: vec![large.clone()],
+                },
+            )
+            .unwrap();
+            assert!(
+                encode_storage_rpc_success_response(&large_payload).len() > small_response_len
+            );
+        }
 
+        let rows = pg
+            .metadata_command_checkpoint_candidate_rows(ClusterEpoch::INITIAL, u64::MAX)
+            .unwrap();
+        drop(pg);
+        let row_for = |expected: &MetadataCommandCheckpoint| {
+            rows
+                .iter()
+                .find(|row| {
+                    decode_metadata_command_checkpoint_candidate_rows(
+                        vec![(*row).clone()],
+                        ClusterEpoch::INITIAL,
+                        PgId::new(0),
+                        1,
+                    ) == vec![expected.clone()]
+                })
+                .unwrap()
+                .clone()
+        };
+        let mut oversized_prefix = large_checkpoints
+            .iter()
+            .map(&row_for)
+            .collect::<Vec<_>>();
+        oversized_prefix.push(row_for(&small));
         let candidates = metadata_command_checkpoint_candidates_for_frame(
-            &pg,
+            oversized_prefix,
             ClusterEpoch::INITIAL,
-            u64::MAX,
+            PgId::new(0),
             1,
             small_response_len,
+        );
+
+        assert_eq!(candidates, vec![small.clone()]);
+
+        let candidates = metadata_command_checkpoint_candidates_for_frame(
+            vec![
+                row_for(&small),
+                row_for(&large_checkpoints[0]),
+                row_for(&second_small),
+            ],
+            ClusterEpoch::INITIAL,
+            PgId::new(0),
+            2,
+            small_response_len,
+        );
+
+        assert_eq!(candidates, vec![small, second_small]);
+    }
+
+    #[test]
+    fn checkpoint_candidate_frame_selection_releases_pg_serialization_after_capture() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let server = StorageNodeServer::bind(config.clone()).unwrap();
+        let node_id = config.node_id;
+        let pg_id = PgId::new(0);
+        let pg = server._node.get_pg(pg_id.get()).unwrap();
+        let bucket = crate::tests::bucket_name("checkpoint-capture-lock-lifetime");
+        create_probe_bucket_direct(&pg, &bucket);
+        pg.refresh_metadata_command_state_digest().unwrap();
+        pg.record_current_metadata_command_checkpoint(
+            node_id.as_u32(),
+            ClusterEpoch::INITIAL,
         )
         .unwrap();
+        drop(pg);
 
-        assert_eq!(candidates, vec![small]);
+        let gate = Arc::new(MetadataCommandCommitGate::default());
+        let _release = MetadataCommandCommitGateRelease(Arc::clone(&gate));
+        let hook_gate = Arc::clone(&gate);
+        server.set_metadata_checkpoint_rows_captured_test_hook(Arc::new(move || {
+            hook_gate.block_until_released();
+        }));
+        let handler = server.connection_handler();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+        let checkpoint_handler = handler.clone();
+        let checkpoint_join = thread::spawn(move || {
+            let session = StorageNodeSession::new(
+                Arc::clone(&checkpoint_handler.read_handles),
+                Arc::clone(&checkpoint_handler.node),
+            );
+            let response = checkpoint_handler
+                .metadata_command_checkpoint_candidates_response(
+                    &session,
+                    StorageRpcMetadataCommandCheckpointCandidatesRequest {
+                        node_id,
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        pg_id,
+                        max_applied_log_index: u64::MAX,
+                        limit: 1,
+                    },
+                )
+                .unwrap();
+            checkpoint_tx.send(response).unwrap();
+        });
+
+        gate.wait_until_arrived();
+        let (read_tx, read_rx) = mpsc::channel();
+        let read_handler = handler.clone();
+        let read_join = thread::spawn(move || {
+            let session = StorageNodeSession::new(
+                Arc::clone(&read_handler.read_handles),
+                Arc::clone(&read_handler.node),
+            );
+            let response = read_handler
+                .metadata_command_max_log_index_response(
+                    &session,
+                    StorageRpcMetadataCommandStateRequest {
+                        node_id,
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        pg_id,
+                    },
+                )
+                .unwrap();
+            read_tx.send(response).unwrap();
+        });
+
+        let read_response = read_rx.recv_timeout(Duration::from_secs(2));
+        gate.release();
+        let checkpoint_response = checkpoint_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        checkpoint_join.join().unwrap();
+        let eventual_read_response = match read_response {
+            Ok(response) => response,
+            Err(error) => {
+                let response = read_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                read_join.join().unwrap();
+                panic!(
+                    "metadata read remained blocked during checkpoint frame selection: {error:?}; response={response:?}"
+                );
+            }
+        };
+        read_join.join().unwrap();
+
+        decode_storage_rpc_response_payload(&checkpoint_response)
+            .unwrap()
+            .unwrap();
+        let read_payload = decode_storage_rpc_response_payload(&eventual_read_response)
+            .unwrap()
+            .unwrap();
+        decode_metadata_command_max_log_index_response(&read_payload).unwrap();
     }
 
     fn send_frame(

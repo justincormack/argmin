@@ -10723,6 +10723,7 @@ fn multipart_completion_failure_kinds_map_exhaustively_to_s3_outcomes() {
     for kind in [
         storage::MultipartCompletionFailureKind::ResourceExhausted,
         storage::MultipartCompletionFailureKind::MetadataCommandContention,
+        storage::MultipartCompletionFailureKind::PrepublicationBarrierExhausted,
         storage::MultipartCompletionFailureKind::RetryableConvergence,
     ] {
         assert!(matches!(map(kind), ServerError::SlowDown));
@@ -13280,6 +13281,58 @@ fn complete_multipart_upload_request_maps_command_log_conflict_to_operation_abor
         "expected CompleteMultipartUpload command conflict to map to OperationAborted, got {err:?}"
     );
     drop(hook_guard);
+}
+
+#[test]
+fn complete_multipart_upload_prepublication_barrier_exhaustion_is_slow_down() {
+    let tmp = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(tmp.path(), &[0]);
+    let coord = setup_direct_coordinator_with_storage_cluster(storage_cluster);
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1")]);
+    let failures = Arc::new(AtomicUsize::new(0));
+    let failures_hook = Arc::clone(&failures);
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some(("bucket".to_string(), "key".to_string())),
+        multipart_complete_commit_failure: Some(Arc::new(move || {
+            failures_hook.fetch_add(1, Ordering::SeqCst);
+            Some(storage::MultipartCompletionFailureKind::PrepublicationBarrierExhausted)
+        })),
+        ..ReclamationTestHooks::default()
+    });
+
+    let error = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ),
+            parts: &parts,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+
+    assert!(matches!(error, ServerError::SlowDown));
+    assert_eq!(error.http_status(), 503);
+    assert_eq!(error.s3_error_code(), "SlowDown");
+    assert_eq!(
+        failures.load(Ordering::SeqCst),
+        1,
+        "pre-publication exhaustion must not enter terminal reauthorization"
+    );
 }
 
 #[test]

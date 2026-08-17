@@ -1639,6 +1639,26 @@ impl super::StorageCluster {
         completion_target_context: &str,
         bucket_write_reservation: &BucketWriteReservationProof,
         effect_fence: Option<AdmittedRouteEffectFence>,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+        work_budget: &mut super::RequestWorkBudget,
+    ) -> Result<u64, ObjectPgActionError> {
+        self.establish_multipart_completion_barrier_inner(
+            bucket,
+            completion_target_context,
+            bucket_write_reservation,
+            effect_fence,
+            require_valid_route,
+            work_budget,
+        )
+        .map_err(Self::multipart_prepublication_barrier_error)
+    }
+
+    fn establish_multipart_completion_barrier_inner(
+        &self,
+        bucket: &BucketName,
+        completion_target_context: &str,
+        bucket_write_reservation: &BucketWriteReservationProof,
+        effect_fence: Option<AdmittedRouteEffectFence>,
         mut require_valid_route: impl FnMut() -> Result<(), StoreError>,
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<u64, ObjectPgActionError> {
@@ -1661,15 +1681,15 @@ impl super::StorageCluster {
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
-                if self
+                let unrelated_drained = self
                     .drain_unrelated_pending_metadata_command_for_bucket_with_work_budget(
                         pg_id,
                         bucket,
                         &command,
                         work_budget,
                     )
-                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?
-                {
+                    .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
+                if unrelated_drained {
                     continue;
                 }
                 if let MetadataCommandPayload::AdvanceMultipartCompletionBarrier(_) =
@@ -1690,13 +1710,12 @@ impl super::StorageCluster {
                         )
                     {
                         Ok(outcome) => outcome,
-                        Err(error @ BucketSnapshotLoadError::Store(
+                        Err(BucketSnapshotLoadError::Store(
                             StoreError::MetadataCommandDependencyConvergencePending { .. }
                             | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
                         )) => {
-                            Self::retry_multipart_convergence_error(
+                            Self::retry_multipart_dependency_convergence(
                                 work_budget,
-                                super::bucket_snapshot_error_to_object_pg_action_error(error),
                                 "published multipart completion barrier convergence budget exhausted",
                             )?;
                             continue;
@@ -1720,6 +1739,11 @@ impl super::StorageCluster {
                             ));
                         }
                     };
+                    #[cfg(test)]
+                    maybe_run_multipart_completion_barrier_drained_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        work_budget,
+                    );
                     match outcome {
                         super::PendingMetadataCommandOutcome::Applied => continue,
                         super::PendingMetadataCommandOutcome::PublishedPendingRecovery => {
@@ -1747,13 +1771,12 @@ impl super::StorageCluster {
                     work_budget,
                 ) {
                     Ok(outcome) => outcome,
-                    Err(error @ ObjectPgActionError::Store(
+                    Err(ObjectPgActionError::Store(
                         StoreError::MetadataCommandDependencyConvergencePending { .. }
                         | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
                     )) => {
-                        Self::retry_multipart_convergence_error(
+                        Self::retry_multipart_dependency_convergence(
                             work_budget,
-                            error,
                             "published multipart completion barrier dependency convergence budget exhausted",
                         )?;
                         continue;
@@ -1781,7 +1804,9 @@ impl super::StorageCluster {
                     super::PendingMetadataCommandOutcome::Abandoned => continue,
                 }
             }
-            work_budget.check("multipart completion barrier reservation budget exhausted")?;
+            work_budget
+                .check("multipart completion barrier reservation budget exhausted")
+                .map_err(ObjectPgActionError::Store)?;
 
             #[cfg(test)]
             maybe_run_before_multipart_completion_barrier_command_id_hook(
@@ -1795,14 +1820,20 @@ impl super::StorageCluster {
                     work_budget,
                 ) {
                 Ok(Some(command_id)) => command_id,
-                Ok(None) => continue,
-                Err(error @ BucketSnapshotLoadError::Store(
+                Ok(None) => {
+                    #[cfg(test)]
+                    maybe_run_multipart_completion_barrier_drained_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                        work_budget,
+                    );
+                    continue;
+                }
+                Err(BucketSnapshotLoadError::Store(
                     StoreError::MetadataCommandDependencyConvergencePending { .. }
                     | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
                 )) => {
-                    Self::retry_multipart_convergence_error(
+                    Self::retry_multipart_dependency_convergence(
                         work_budget,
-                        super::bucket_snapshot_error_to_object_pg_action_error(error),
                         "multipart completion barrier command-id dependency convergence budget exhausted",
                     )?;
                     continue;
@@ -1829,13 +1860,12 @@ impl super::StorageCluster {
                 )
             {
                 Ok(outcome) => outcome,
-                Err(error @ BucketSnapshotLoadError::Store(
+                Err(BucketSnapshotLoadError::Store(
                     StoreError::MetadataCommandDependencyConvergencePending { .. }
                     | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
                 )) => {
-                    Self::retry_multipart_convergence_error(
+                    Self::retry_multipart_dependency_convergence(
                         work_budget,
-                        super::bucket_snapshot_error_to_object_pg_action_error(error),
                         "multipart completion barrier install dependency convergence budget exhausted",
                     )?;
                     continue;
@@ -1871,13 +1901,12 @@ impl super::StorageCluster {
                         applied: false,
                     },
                 ) => continue,
-                Err(error @ BucketSnapshotLoadError::Store(
+                Err(BucketSnapshotLoadError::Store(
                     StoreError::MetadataCommandDependencyConvergencePending { .. }
                     | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
                 )) => {
-                    Self::retry_multipart_convergence_error(
+                    Self::retry_multipart_dependency_convergence(
                         work_budget,
-                        super::bucket_snapshot_error_to_object_pg_action_error(error),
                         "published multipart completion barrier convergence budget exhausted",
                     )?;
                     continue;
@@ -1907,6 +1936,29 @@ impl super::StorageCluster {
         &self,
         bucket: &BucketName,
     ) -> Result<u64, ObjectPgActionError> {
+        self.test_establish_multipart_completion_barrier_with_route_validation(bucket, || Ok(()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_establish_multipart_completion_barrier_with_route_error(
+        &self,
+        bucket: &BucketName,
+        error: StoreError,
+    ) -> Result<u64, ObjectPgActionError> {
+        let mut error = Some(error);
+        self.test_establish_multipart_completion_barrier_with_route_validation(bucket, move || {
+            Err(error
+                .take()
+                .expect("barrier establishment must stop after the injected route error"))
+        })
+    }
+
+    #[cfg(test)]
+    fn test_establish_multipart_completion_barrier_with_route_validation(
+        &self,
+        bucket: &BucketName,
+        require_valid_route: impl FnMut() -> Result<(), StoreError>,
+    ) -> Result<u64, ObjectPgActionError> {
         let mut work_budget = super::RequestWorkBudget::new(
             std::time::Duration::from_millis(METADATA_COMMAND_APPLY_RETRY_BUDGET_MILLIS),
             None,
@@ -1926,7 +1978,7 @@ impl super::StorageCluster {
             "test-completed-multipart-order",
             &proof,
             None,
-            || Ok(()),
+            require_valid_route,
             &mut work_budget,
         );
         let release = self
@@ -2685,15 +2737,31 @@ impl super::StorageCluster {
         }
     }
 
-    fn retry_multipart_convergence_error(
+    fn retry_multipart_dependency_convergence(
         work_budget: &mut super::RequestWorkBudget,
-        error: ObjectPgActionError,
         context: &'static str,
     ) -> Result<(), ObjectPgActionError> {
         match work_budget.sleep_after_contention(context) {
             Ok(()) => Ok(()),
-            Err(StoreError::MetadataCommandContention { .. }) => Err(error),
+            // The dependency/barrier may be irrevocable, but this completion's
+            // object mutation has not been installed. Keep this distinct from
+            // commit contention so the coordinator returns SlowDown directly
+            // instead of reauthorizing it as OperationAborted.
+            Err(StoreError::MetadataCommandContention { .. }) => {
+                Err(ObjectPgActionError::MultipartPrepublicationBarrierExhausted)
+            }
             Err(error) => Err(ObjectPgActionError::Store(error)),
+        }
+    }
+
+    fn multipart_prepublication_barrier_error(
+        error: ObjectPgActionError,
+    ) -> ObjectPgActionError {
+        match error {
+            ObjectPgActionError::Store(StoreError::MetadataCommandContention { .. }) => {
+                ObjectPgActionError::MultipartPrepublicationBarrierExhausted
+            }
+            error => error,
         }
     }
 
@@ -2831,13 +2899,12 @@ impl super::StorageCluster {
                         .map_err(super::bucket_snapshot_error_to_object_pg_action_error)?;
                     continue;
                 }
-                Err(error @ BucketSnapshotLoadError::Store(
+                Err(BucketSnapshotLoadError::Store(
                     StoreError::MetadataCommandDependencyConvergencePending { .. }
                     | StoreError::MetadataCommandIrrevocableConvergencePending { .. },
                 )) => {
-                    Self::retry_multipart_convergence_error(
+                    Self::retry_multipart_dependency_convergence(
                         &mut work_budget,
-                        super::bucket_snapshot_error_to_object_pg_action_error(error),
                         "multipart completion reservation blocked by published dependency",
                     )?;
                     continue;

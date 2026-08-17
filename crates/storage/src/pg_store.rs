@@ -148,6 +148,9 @@ use schema::{init_pg_schema, require_current_pg_schema};
 
 #[cfg(test)]
 pub(crate) use crate::control_plane::METADATA_CANONICAL_STATE_ENCODING_VERSION;
+pub(crate) use command_log::{
+    decode_metadata_command_checkpoint_candidate_rows, MetadataCommandCheckpointCandidateRow,
+};
 #[cfg(test)]
 use command_log::{digest_len_prefixed_bytes, MetadataDigestFilter, METADATA_DIGEST_TABLES};
 pub use command_log::{

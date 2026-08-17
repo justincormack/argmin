@@ -923,6 +923,12 @@ fn object_pg_action_error_to_bucket_snapshot_error(
                 source: std::io::Error::other("multipart conditional request conflict"),
             })
         }
+        ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
+            BucketSnapshotLoadError::Store(StoreError::Io {
+                context: "object PG action failed during bucket snapshot operation",
+                source: std::io::Error::other("multipart prepublication barrier exhausted"),
+            })
+        }
     }
 }
 

@@ -163,6 +163,9 @@ pub struct StorageNodeServer {
     #[cfg(test)]
     metadata_command_before_commit_test_hook:
         Arc<Mutex<Option<MetadataCommandBeforeCommitTestHook>>>,
+    #[cfg(test)]
+    metadata_checkpoint_rows_captured_test_hook:
+        Arc<Mutex<Option<MetadataCheckpointRowsCapturedTestHook>>>,
 }
 
 #[cfg(test)]
@@ -633,51 +636,42 @@ fn encode_metadata_command_checkpoint_success_response(
 }
 
 fn metadata_command_checkpoint_candidates_for_frame(
-    pg: &PgStore,
+    rows: Vec<MetadataCommandCheckpointCandidateRow>,
     cluster_epoch: ClusterEpoch,
-    mut max_applied_log_index: u64,
+    pg_id: PgId,
     limit: usize,
     max_payload_len: usize,
-) -> Result<Vec<MetadataCommandCheckpoint>, StoreError> {
+) -> Vec<MetadataCommandCheckpoint> {
+    if limit == 0 {
+        return Vec::new();
+    }
     let mut checkpoints = Vec::new();
-    while checkpoints.len() < limit {
-        let candidates = pg.metadata_command_checkpoint_candidates(
-            cluster_epoch,
-            max_applied_log_index,
-            STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES,
-        )?;
-        let Some(last_candidate) = candidates.last() else {
-            break;
+    let candidate_limit = rows.len();
+    let candidates = decode_metadata_command_checkpoint_candidate_rows(
+        rows,
+        cluster_epoch,
+        pg_id,
+        candidate_limit,
+    );
+    for candidate in candidates {
+        let mut next_checkpoints = checkpoints.clone();
+        next_checkpoints.push(candidate.clone());
+        let payload = match encode_metadata_command_checkpoint_candidates_response(
+            &StorageRpcMetadataCommandCheckpointCandidatesResponse {
+                checkpoints: next_checkpoints,
+            },
+        ) {
+            Ok(payload) => payload,
+            Err(_) => continue,
         };
-        let next_max_applied_log_index = last_candidate.applied_log_index.checked_sub(1);
-        for candidate in candidates {
-            let mut next_checkpoints = checkpoints.clone();
-            next_checkpoints.push(candidate.clone());
-            let payload = match encode_metadata_command_checkpoint_candidates_response(
-                &StorageRpcMetadataCommandCheckpointCandidatesResponse {
-                    checkpoints: next_checkpoints,
-                },
-            ) {
-                Ok(payload) => payload,
-                Err(_) => continue,
-            };
-            if encode_storage_rpc_success_response(&payload).len() <= max_payload_len {
-                checkpoints.push(candidate);
-                if checkpoints.len() == limit {
-                    return Ok(checkpoints);
-                }
-            } else if checkpoints.is_empty() {
-                continue;
-            } else {
-                return Ok(checkpoints);
+        if encode_storage_rpc_success_response(&payload).len() <= max_payload_len {
+            checkpoints.push(candidate);
+            if checkpoints.len() == limit {
+                return checkpoints;
             }
         }
-        let Some(next_max_applied_log_index) = next_max_applied_log_index else {
-            break;
-        };
-        max_applied_log_index = next_max_applied_log_index;
     }
-    Ok(checkpoints)
+    checkpoints
 }
 
 fn bind_storage_node_rpc_listeners(
@@ -811,6 +805,8 @@ impl StorageNodeServer {
             response_frame_test_hook: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             metadata_command_before_commit_test_hook: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            metadata_checkpoint_rows_captured_test_hook: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -1250,6 +1246,10 @@ impl StorageNodeServer {
             metadata_command_before_commit_test_hook: Arc::clone(
                 &self.metadata_command_before_commit_test_hook,
             ),
+            #[cfg(test)]
+            metadata_checkpoint_rows_captured_test_hook: Arc::clone(
+                &self.metadata_checkpoint_rows_captured_test_hook,
+            ),
         }
     }
 
@@ -1279,6 +1279,17 @@ impl StorageNodeServer {
     ) {
         *self
             .metadata_command_before_commit_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_metadata_checkpoint_rows_captured_test_hook(
+        &self,
+        hook: MetadataCheckpointRowsCapturedTestHook,
+    ) {
+        *self
+            .metadata_checkpoint_rows_captured_test_hook
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }

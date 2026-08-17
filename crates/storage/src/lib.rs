@@ -3171,7 +3171,8 @@ pub mod test_support {
                 | ObjectPgActionError::StaleStreamFinalizeSnapshot
                 | ObjectPgActionError::SnapshotReinspectionConflict
                 | ObjectPgActionError::StaleMultipartCompletionSnapshot
-                | ObjectPgActionError::MultipartConditionalRequestConflict => {
+                | ObjectPgActionError::MultipartConditionalRequestConflict
+                | ObjectPgActionError::MultipartPrepublicationBarrierExhausted => {
                     StoreFailure::from(StoreError::RouteCapabilitySubjectMismatch {
                         operation: "observe payload reclaim test outcome",
                     })

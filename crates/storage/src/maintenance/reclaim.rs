@@ -299,7 +299,8 @@ fn object_payload_reclaim_worker_should_defer(
             | ObjectPgActionError::StaleStreamFinalizeSnapshot
             | ObjectPgActionError::SnapshotReinspectionConflict
             | ObjectPgActionError::StaleMultipartCompletionSnapshot
-            | ObjectPgActionError::MultipartConditionalRequestConflict,
+            | ObjectPgActionError::MultipartConditionalRequestConflict
+            | ObjectPgActionError::MultipartPrepublicationBarrierExhausted,
         ) => false,
     }
 }

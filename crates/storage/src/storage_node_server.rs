@@ -68,8 +68,9 @@ use crate::node_client::{
     ShardScavengerObservationNodeClient,
 };
 use crate::node_runtime::pg_store::{
-    initialize_pg_durable_identity, inspect_pg_shard_inventory, sync_initialized_pg_store_layout,
-    verify_pg_durable_identity, MetadataCommandCheckpoint, PgStore,
+    decode_metadata_command_checkpoint_candidate_rows, initialize_pg_durable_identity,
+    inspect_pg_shard_inventory, sync_initialized_pg_store_layout, verify_pg_durable_identity,
+    MetadataCommandCheckpoint, MetadataCommandCheckpointCandidateRow, PgStore,
 };
 use crate::node_runtime::traits::{
     DurableBucketWriteReservationAcquire, PgMetadataStore, ShardStore,
@@ -338,8 +339,7 @@ use crate::storage_rpc::{
     StorageRpcStreamUploadSessionRequest, StorageRpcStreamUploadSessionResponse,
     StorageRpcStreamUploadsListRequest, StorageRpcStreamUploadsListResponse,
     StorageRpcStreamUploadsPgListRequest, STORAGE_RPC_FRAME_ENCODING_VERSION,
-    STORAGE_RPC_MAX_METADATA_COMMAND_CHECKPOINT_CANDIDATES, STORAGE_RPC_MAX_PAYLOAD_LEN,
-    STORAGE_RPC_SERVER_IDLE_TIMEOUT,
+    STORAGE_RPC_MAX_PAYLOAD_LEN, STORAGE_RPC_SERVER_IDLE_TIMEOUT,
 };
 use crate::storage_rpc_auth::{
     write_storage_rpc_auth_transport_frame_with_limit, StorageRpcResponseSigningContext,
@@ -382,6 +382,8 @@ type StorageRpcResponseFrameTestHook =
 #[cfg(test)]
 type MetadataCommandBeforeCommitTestHook =
     Arc<dyn Fn(NodeId, &MetadataCommandEnvelope) + Send + Sync>;
+#[cfg(test)]
+type MetadataCheckpointRowsCapturedTestHook = Arc<dyn Fn() + Send + Sync>;
 
 fn metadata_command_state_result_response(
     command: &MetadataCommandEnvelope,
@@ -7947,16 +7949,31 @@ impl StorageNodeConnectionHandler {
         ) {
             return encode_storage_rpc_error_response(&error);
         }
-        let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
-        let response = match self.node.get_pg(request.pg_id.get()).and_then(|pg| {
-            let checkpoints = metadata_command_checkpoint_candidates_for_frame(
-                &pg,
+        let pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
+        let rows = self.node.get_pg(request.pg_id.get()).and_then(|pg| {
+            pg.metadata_command_checkpoint_candidate_rows(
                 request.cluster_epoch,
                 request.max_applied_log_index,
+            )
+        });
+        drop(pg_guard);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .metadata_checkpoint_rows_captured_test_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
+        }
+        let response = match rows.map(|rows| {
+            metadata_command_checkpoint_candidates_for_frame(
+                rows,
+                request.cluster_epoch,
+                request.pg_id,
                 request.limit as usize,
                 STORAGE_RPC_MAX_PAYLOAD_LEN,
-            )?;
-            Ok(checkpoints)
+            )
         }) {
             Ok(checkpoints) => {
                 let payload = encode_metadata_command_checkpoint_candidates_response(
