@@ -682,6 +682,181 @@ fn bucket_write_drain_heartbeat_fences_stale_delete_owner() {
 }
 
 #[test]
+fn pending_bucket_command_atomically_protects_explicit_and_expired_drain_clear() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 12).unwrap();
+    let bucket = trusted_bucket_name("pending-command-protected-delete-drain");
+    create_probe_bucket_direct(&store, &bucket);
+    let now = crate::clock::current_time_millis();
+    let lease_deadline = now.saturating_add(60_000);
+    let drain = store
+        .begin_durable_bucket_write_drain(
+            &bucket,
+            "delete-drain",
+            "delete-owner",
+            ClusterEpoch::INITIAL,
+            now,
+            lease_deadline,
+        )
+        .unwrap();
+    let current = store.head_bucket_record_raw(&bucket).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(12),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            current.with_execution_generation(
+                store.next_bucket_execution_generation_candidate().unwrap(),
+            ),
+        )),
+    );
+    store
+        .record_bucket_delete_attempt_outcome(&BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket.clone(),
+            drain_id: drain.drain_id.clone(),
+            cluster_epoch: drain.cluster_epoch,
+            bucket_execution_generation: drain.bucket_execution_generation,
+            outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+            phase: BucketDeleteAttemptPhase::FinalVisibilityProven,
+            detail: "final visibility proven".to_string(),
+            post_reservation_next_object_pg_id: None,
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
+            finalizer_next_object_pg_id: None,
+            updated_at: 15,
+        })
+        .unwrap();
+    store
+        .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+        .unwrap();
+
+    store
+        .clear_durable_bucket_write_drain(
+            &bucket,
+            &drain.drain_id,
+            &drain.owner_token,
+            drain.cluster_epoch,
+            drain.bucket_execution_generation,
+            drain.lease_deadline,
+        )
+        .unwrap();
+    assert_eq!(
+        store.durable_bucket_write_drain(&bucket).unwrap(),
+        Some(drain.clone()),
+        "an explicit rollback must not clear a drain protected by a pending command"
+    );
+    assert!(
+        store
+            .clear_expired_durable_bucket_write_drain(&bucket, lease_deadline.saturating_add(1))
+            .unwrap()
+            .is_none(),
+        "lease expiry must not clear a drain protected by a pending command"
+    );
+    assert_eq!(
+        store.durable_bucket_write_drain(&bucket).unwrap(),
+        Some(drain.clone())
+    );
+
+    assert!(store.test_clear_pending_metadata_command_slot().unwrap());
+    store
+        .clear_durable_bucket_write_drain(
+            &bucket,
+            &drain.drain_id,
+            &drain.owner_token,
+            drain.cluster_epoch,
+            drain.bucket_execution_generation,
+            drain.lease_deadline,
+        )
+        .unwrap();
+    assert!(store.durable_bucket_write_drain(&bucket).unwrap().is_none());
+}
+
+#[test]
+fn cleared_bucket_drain_atomically_rejects_late_mark_pending_install() {
+    let tmp = test_util::tempdir();
+    let store = PgStore::open(tmp.path(), 12).unwrap();
+    let bucket = trusted_bucket_name("cleared-before-mark-install");
+    create_probe_bucket_direct(&store, &bucket);
+    let drain = store
+        .begin_durable_bucket_write_drain(
+            &bucket,
+            "delete-drain",
+            "delete-owner",
+            ClusterEpoch::INITIAL,
+            10,
+            crate::clock::current_time_millis().saturating_add(60_000),
+        )
+        .unwrap();
+    store
+        .record_bucket_delete_attempt_outcome(&BucketDeleteAttemptOutcomeRecord {
+            bucket: bucket.clone(),
+            drain_id: drain.drain_id.clone(),
+            cluster_epoch: drain.cluster_epoch,
+            bucket_execution_generation: drain.bucket_execution_generation,
+            outcome: BucketDeleteAttemptOutcomeKind::Retryable,
+            phase: BucketDeleteAttemptPhase::FinalVisibilityProven,
+            detail: "final visibility proven".to_string(),
+            post_reservation_next_object_pg_id: None,
+            stream_cleanup_next_object_pg_id: None,
+            stream_cleanup_next_session_id_marker: None,
+            stream_cleanup_aborted_uploads: false,
+            final_visibility_next_object_pg_id: None,
+            finalizer_next_object_pg_id: None,
+            updated_at: 15,
+        })
+        .unwrap();
+    let current = store.head_bucket_record_raw(&bucket).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(12),
+            MetadataCommandLogIndex::new(1).unwrap(),
+        ),
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            current.with_execution_generation(
+                store.next_bucket_execution_generation_candidate().unwrap(),
+            ),
+        )),
+    );
+
+    store
+        .clear_durable_bucket_write_drain(
+            &bucket,
+            &drain.drain_id,
+            &drain.owner_token,
+            drain.cluster_epoch,
+            drain.bucket_execution_generation,
+            drain.lease_deadline,
+        )
+        .unwrap();
+    let error = store
+        .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        StoreError::MetadataCommandContention {
+            context: "mark bucket deleting drain authorization changed before pending install"
+        }
+    ));
+    assert!(
+        store
+            .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+            .unwrap()
+            .is_none(),
+        "a mark command must not become recoverable after its drain was cleared"
+    );
+    assert_eq!(
+        store.head_bucket_record_raw(&bucket).unwrap().state,
+        BucketState::Active
+    );
+}
+
+#[test]
 fn lifecycle_sweep_roots_include_expired_claim_before_earlier_bucket() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 12).unwrap();
@@ -5541,13 +5716,21 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
     assert!(store
         .pending_metadata_command_publication_started(0, &first_command)
         .unwrap());
+    let reissued_first_command = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        first_command.payload().clone(),
+    );
     assert!(
         !store
             .replace_pending_metadata_command_slot_for_reissue(
                 0,
                 &first_command,
-                &second_command,
-                Some(&second_bucket),
+                &reissued_first_command,
+                Some(&first_bucket),
             )
             .unwrap(),
         "publication-started commands must not be replaced"
@@ -5582,6 +5765,43 @@ fn pending_metadata_command_slot_is_pg_scoped_and_persistent() {
             .is_none(),
         "slot should be empty after exact removal"
     );
+}
+
+#[test]
+fn pending_metadata_command_reissue_rejects_existing_unscoped_slot() {
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("pending-slot-unscoped");
+    let command = create_bucket_probe_command(1, 1, bucket.clone(), 1);
+    let replacement = MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            MetadataCommandLogIndex::new(2).unwrap(),
+        ),
+        command.payload().clone(),
+    );
+    let store = PgStore::open(tmp.path(), 1).unwrap();
+    store
+        .try_insert_pending_metadata_command_slot(0, &command, None)
+        .unwrap();
+
+    let error = store
+        .replace_pending_metadata_command_slot_for_reissue(0, &command, &replacement, Some(&bucket))
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::pg_store::PendingMetadataCommandSlotReplaceError::Definitive(
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "replace pending metadata command existing bucket scope"
+            }
+        )
+    ));
+    let slot = store
+        .pending_metadata_command_slot(0, ClusterEpoch::INITIAL)
+        .unwrap()
+        .unwrap();
+    assert_eq!(slot.command_bytes, command.command_bytes());
+    assert!(slot.scope_bucket.is_none());
 }
 
 #[test]

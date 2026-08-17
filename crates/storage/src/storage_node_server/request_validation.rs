@@ -29,6 +29,27 @@ impl StorageNodeConnectionHandler {
         Ok(())
     }
 
+    fn validate_metadata_command_replacement_scope<'a>(
+        scope_bucket: Option<&'a BucketName>,
+        replacement: &MetadataCommandEnvelope,
+    ) -> Result<&'a BucketName, StorageRpcErrorResponse> {
+        let Some(scope_bucket) = scope_bucket else {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command replacement requires canonical bucket scope"
+                    .to_string(),
+            });
+        };
+        if scope_bucket != replacement.bucket_name() {
+            return Err(StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command replacement scope bucket does not match command bucket"
+                    .to_string(),
+            });
+        }
+        Ok(scope_bucket)
+    }
+
     fn metadata_command_pending_slot_replace_response(
         &self,
         session: &StorageNodeSession,
@@ -39,20 +60,24 @@ impl StorageNodeConnectionHandler {
         {
             return encode_storage_rpc_error_response(&error);
         }
-        if let Some(scope_bucket) = request.scope_bucket.as_ref() {
-            if scope_bucket != request.replacement.bucket_name() {
-                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                    code: StorageRpcErrorCode::PayloadDecode,
-                    message:
-                        "metadata command replacement scope bucket does not match command bucket"
-                            .to_string(),
-                });
-            }
+        if !request
+            .replacement
+            .payload()
+            .is_ordinary_pending_slot_reissue_of(request.previous.payload())
+        {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command replacement is not an ordinary reissue of the pending command"
+                    .to_string(),
+            });
         }
-        let canonical_scope_bucket = request
-            .scope_bucket
-            .as_ref()
-            .map(|_| request.replacement.bucket_name().clone());
+        let scope_bucket = match Self::validate_metadata_command_replacement_scope(
+            request.scope_bucket.as_ref(),
+            &request.replacement,
+        ) {
+            Ok(scope_bucket) => scope_bucket,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         metadata_mutation_route_guard_or_return!(self);
         let response = match self.node.get_pg(request.pg_id.get()) {
@@ -60,7 +85,7 @@ impl StorageNodeConnectionHandler {
                 self.config.node_id.as_u32(),
                 &request.previous,
                 &request.replacement,
-                canonical_scope_bucket.as_ref(),
+                Some(scope_bucket),
             ) {
             Ok(removed) => {
                 let payload = encode_metadata_command_pending_slot_remove_response(
@@ -149,20 +174,13 @@ impl StorageNodeConnectionHandler {
                     .to_string(),
             });
         }
-        if let Some(scope_bucket) = request.scope_bucket.as_ref() {
-            if scope_bucket != request.replacement.bucket_name() {
-                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
-                    code: StorageRpcErrorCode::PayloadDecode,
-                    message:
-                        "metadata command replacement scope bucket does not match command bucket"
-                            .to_string(),
-                });
-            }
-        }
-        let canonical_scope_bucket = request
-            .scope_bucket
-            .as_ref()
-            .map(|_| request.replacement.bucket_name().clone());
+        let scope_bucket = match Self::validate_metadata_command_replacement_scope(
+            request.scope_bucket.as_ref(),
+            &request.replacement,
+        ) {
+            Ok(scope_bucket) => scope_bucket,
+            Err(error) => return encode_storage_rpc_error_response(&error),
+        };
         let _pg_guard = metadata_command_pg_guard_or_return!(self, session, request.pg_id);
         metadata_mutation_route_guard_or_return!(self);
         if let Err(error) = mutation_fence.validate_rpc_at(
@@ -201,11 +219,13 @@ impl StorageNodeConnectionHandler {
                 ),
             });
         }
-        let response = match pg.replace_pending_metadata_command_slot_for_reissue(
+        let response = match pg.replace_pending_metadata_command_slot_for_recovery(
             self.config.node_id.as_u32(),
+            &request.authorized_source,
+            request.abandoned_source.as_ref(),
             &request.previous,
             &request.replacement,
-            canonical_scope_bucket.as_ref(),
+            Some(scope_bucket),
         ) {
             Ok(removed) => {
                 let payload = encode_metadata_command_pending_slot_remove_response(

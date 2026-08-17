@@ -822,6 +822,31 @@ impl MetadataCommandPayload {
         }
     }
 
+    pub(crate) fn is_bucket_control_pending_slot_payload(&self) -> bool {
+        matches!(
+            self,
+            Self::PutBucketVersioning(_)
+                | Self::PutBucketAcl(_)
+                | Self::PutBucketProperty(_)
+                | Self::PutBucketSubresource(_)
+        )
+    }
+
+    pub(crate) fn is_ordinary_pending_slot_reissue_of(&self, source: &Self) -> bool {
+        if self.kind_id() != source.kind_id() || self.bucket_name() != source.bucket_name() {
+            return false;
+        }
+        if self == source {
+            return true;
+        }
+        match (self, source) {
+            (Self::CommitMultipartObject(replacement), Self::CommitMultipartObject(source)) => {
+                replacement.is_reservation_takeover_reissue_of(source)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn stream_upload_no_such_upload_subject(&self) -> Option<(&SessionId, &UploadId)> {
         match self {
             Self::CreateStreamUpload(create) => match &create.session.target {
@@ -1294,6 +1319,31 @@ pub(crate) struct CommitMultipartObjectCommand {
 }
 
 impl CommitMultipartObjectCommand {
+    fn is_reservation_takeover_reissue_of(&self, source: &Self) -> bool {
+        let replacement_proof = &self.bucket_write_reservation;
+        let source_proof = &source.bucket_write_reservation;
+        replacement_proof.bucket == source_proof.bucket
+            && replacement_proof.cluster_epoch == source_proof.cluster_epoch
+            && replacement_proof.bucket_execution_generation
+                == source_proof.bucket_execution_generation
+            && replacement_proof.bucket_incarnation_generation
+                == source_proof.bucket_incarnation_generation
+            && replacement_proof.operation_kind == source_proof.operation_kind
+            && replacement_proof.target_context == source_proof.target_context
+            && self.upload_id == source.upload_id
+            && self.completion_fingerprint == source.completion_fingerprint
+            && self.object == source.object
+            && self.parts == source.parts
+            && self.selected_streaming_segments == source.selected_streaming_segments
+            && self.omitted_parts == source.omitted_parts
+            && self.omitted_streaming_segments == source.omitted_streaming_segments
+            && self.stream_uploads == source.stream_uploads
+            && self.stream_upload_segments == source.stream_upload_segments
+            && self.write_sequence == source.write_sequence
+            && self.last_modified_millis == source.last_modified_millis
+            && self.stale_payload == source.stale_payload
+    }
+
     pub(crate) fn matches_request(
         &self,
         bucket: &BucketName,

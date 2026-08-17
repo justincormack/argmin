@@ -12,7 +12,7 @@ use crate::metadata_command::{
     MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex, MetadataCommandPayload,
     PutBucketAclCommand, PutBucketSubresourceCommand, PutBucketVersioningCommand,
     PutObjectMetadataCommand, PutObjectMetadataMutation, ReserveObjectGenerationCommand,
-    ReserveObjectVersionCommand,
+    ReserveObjectVersionCommand, COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::storage_node_server::{StorageNodePgRoute, StorageNodeProcessConfig, StorageNodeServer};
 use crate::StorageCluster;
@@ -684,8 +684,64 @@ fn insert_pending_metadata_command_for_test(
         .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
         .unwrap();
     let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
-    pg.try_insert_pending_metadata_command_slot(primary.node_id().as_u32(), command, Some(bucket))
+    if matches!(
+        command.payload(),
+        MetadataCommandPayload::MarkBucketDeleting(_)
+    ) {
+        let now = crate::clock::current_time_millis();
+        let drain = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, bucket)
+            .unwrap()
+            .unwrap_or_else(|| {
+                crate::PgMetadataStore::begin_durable_bucket_write_drain(
+                    &*pg,
+                    bucket,
+                    &format!("test-mark-drain-{}", command.id().log_index().get()),
+                    "test-mark-owner",
+                    command.id().cluster_epoch(),
+                    now,
+                    now.saturating_add(60_000),
+                )
+                .unwrap()
+            });
+        crate::PgMetadataStore::record_bucket_delete_attempt_outcome(
+            &*pg,
+            &crate::BucketDeleteAttemptOutcomeRecord {
+                bucket: bucket.clone(),
+                drain_id: drain.drain_id,
+                cluster_epoch: drain.cluster_epoch,
+                bucket_execution_generation: drain.bucket_execution_generation,
+                outcome: crate::BucketDeleteAttemptOutcomeKind::Retryable,
+                phase: crate::BucketDeleteAttemptPhase::FinalVisibilityProven,
+                detail: "test pending mark final visibility proof".to_string(),
+                post_reservation_next_object_pg_id: None,
+                stream_cleanup_next_object_pg_id: None,
+                stream_cleanup_next_session_id_marker: None,
+                stream_cleanup_aborted_uploads: false,
+                final_visibility_next_object_pg_id: None,
+                finalizer_next_object_pg_id: None,
+                updated_at: now,
+            },
+        )
         .unwrap();
+    }
+    if command.payload().is_bucket_control_pending_slot_payload() {
+        assert!(
+            pg.try_insert_bucket_control_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                command,
+                bucket,
+            )
+            .unwrap(),
+            "test bucket-control command must install through its dedicated endpoint"
+        );
+    } else {
+        pg.try_insert_pending_metadata_command_slot(
+            primary.node_id().as_u32(),
+            command,
+            Some(bucket),
+        )
+        .unwrap();
+    }
 }
 
 fn force_insert_pending_metadata_command_for_test(
@@ -1147,7 +1203,7 @@ fn pending_multipart_completion_command_for_test(
     let bucket_write_reservation = acquire_test_bucket_write_proof(
         cluster,
         &req.bucket,
-        "test-complete-multipart",
+        COMPLETE_MULTIPART_UPLOAD_BUCKET_WRITE_OPERATION_KIND,
         Some(req.key.as_str()),
     );
     (

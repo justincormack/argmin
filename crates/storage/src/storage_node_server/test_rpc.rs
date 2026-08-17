@@ -3922,7 +3922,7 @@
                     node_id: config.node_id,
                     cluster_epoch: config.cluster_epoch,
                     pg_id: PgId::new(0),
-                    command: command.clone(),
+                    command,
                     scope_bucket: Some(bucket.clone()),
                     effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
                         authority_valid_until_ms: 5_000,
@@ -3937,6 +3937,7 @@
             .unwrap()
             .unwrap_err();
         assert_eq!(pending_error.code, StorageRpcErrorCode::StaleShardLocation);
+        let bucket_control_command = test_bucket_control_metadata_command(0, 1);
         let bucket_control_response = send_frame(
             &mut client,
             3,
@@ -3946,7 +3947,7 @@
                     node_id: config.node_id,
                     cluster_epoch: config.cluster_epoch,
                     pg_id: PgId::new(0),
-                    command,
+                    command: bucket_control_command,
                     scope_bucket: Some(bucket.clone()),
                     effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
                         authority_valid_until_ms: 5_000,

@@ -49,6 +49,8 @@ use crate::metadata_command::{
     UPLOAD_PART_STREAM_FINALIZE_BUCKET_WRITE_OPERATION_KIND,
 };
 use crate::node::ReclaimQueueInsert;
+#[cfg(test)]
+use crate::node_client::MetadataCommandPendingSlotInsertError;
 use crate::node_client::{
     complete_multipart_expected_object_parts, AcquireObjectPayloadReclaimClaimReq,
     BucketWriteReservationNodeClient, BucketWriteReservationRoute, BucketWriteReservationScanRoute,

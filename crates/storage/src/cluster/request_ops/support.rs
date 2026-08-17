@@ -672,7 +672,15 @@ type PendingObjectMetadataCommandDrainAttemptTestHook =
     Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), ObjectPgActionError> + Send + Sync>;
 
 #[cfg(test)]
-type BucketDeleteCommandIdTestHook = Arc<dyn Fn() + Send + Sync>;
+type BucketDeleteCommandIdTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[cfg(test)]
+type BucketDeletePendingInstallResponseLossTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> bool + Send + Sync>;
+
+#[cfg(test)]
+type BucketDeleteAdoptedMarkValidationTestHook =
+    Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), StoreError> + Send + Sync>;
 
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) type BucketDeleteFinalVisibilityStartTestHook =
@@ -873,6 +881,16 @@ static BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteCommandIdTestHook>>,
 > = OnceLock::new();
 
+#[cfg(test)]
+static AFTER_BUCKET_DELETE_PENDING_INSTALL_RESPONSE_LOSS_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeletePendingInstallResponseLossTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static BEFORE_BUCKET_DELETE_ADOPTED_MARK_VALIDATION_HOOKS: OnceLock<
+    Mutex<HashMap<usize, BucketDeleteAdoptedMarkValidationTestHook>>,
+> = OnceLock::new();
+
 #[cfg(any(test, feature = "test-hooks"))]
 static BEFORE_BUCKET_DELETE_FINAL_VISIBILITY_HOOKS: OnceLock<
     Mutex<HashMap<usize, BucketDeleteFinalVisibilityStartTestHook>>,
@@ -1069,6 +1087,16 @@ pub(crate) struct PendingObjectMetadataCommandDrainAttemptTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct BucketDeleteCommandIdTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeletePendingInstallResponseLossTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct BucketDeleteAdoptedMarkValidationTestHookGuard {
     scope_id: usize,
 }
 
@@ -1347,6 +1375,30 @@ impl Drop for BucketDeleteCommandIdTestHookGuard {
     fn drop(&mut self) {
         let hooks =
             BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for BucketDeletePendingInstallResponseLossTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = AFTER_BUCKET_DELETE_PENDING_INSTALL_RESPONSE_LOSS_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for BucketDeleteAdoptedMarkValidationTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = BEFORE_BUCKET_DELETE_ADOPTED_MARK_VALIDATION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1902,15 +1954,48 @@ pub(super) fn maybe_run_pending_object_metadata_command_drain_attempt_hook(
 }
 
 #[cfg(test)]
-fn maybe_run_before_bucket_delete_command_id_hook(_scope_id: usize) {
-    let hook = BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS
+fn maybe_run_before_bucket_delete_command_id_hook(
+    scope_id: usize,
+    work_budget: &mut super::RequestWorkBudget,
+) {
+    let expire = BEFORE_BUCKET_DELETE_COMMAND_ID_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&_scope_id)
+        .get(&scope_id)
+        .is_some_and(|hook| hook());
+    if expire {
+        work_budget.expire_for_test();
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_after_bucket_delete_pending_install_response_loss_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) -> bool {
+    AFTER_BUCKET_DELETE_PENDING_INSTALL_RESPONSE_LOSS_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .is_some_and(|hook| hook(command))
+}
+
+#[cfg(test)]
+fn maybe_run_before_bucket_delete_adopted_mark_validation_hook(
+    scope_id: usize,
+    command: &MetadataCommandEnvelope,
+) -> Result<(), StoreError> {
+    let hook = BEFORE_BUCKET_DELETE_ADOPTED_MARK_VALIDATION_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
         .cloned();
-    if let Some(hook) = hook {
-        hook();
+    match hook {
+        Some(hook) => hook(command),
+        None => Ok(()),
     }
 }
 

@@ -3032,6 +3032,13 @@ impl PgStore {
         command: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
     ) -> Result<(), PendingMetadataCommandSlotInsertError> {
+        if command.payload().is_bucket_control_pending_slot_payload() {
+            return Err(PendingMetadataCommandSlotInsertError::definitive(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "insert generic pending metadata command",
+                },
+            ));
+        }
         if command.id().pg_id().get() != self.pg_id {
             return Err(PendingMetadataCommandSlotInsertError::definitive(
                 StoreError::MetadataCommandWrongPg {
@@ -3072,6 +3079,14 @@ impl PgStore {
             .encode_pending_placed_segment_reference_pages(command)
             .map_err(PendingMetadataCommandSlotInsertError::definitive)?;
         self.with_pending_slot_insert_transaction(|| {
+            // Drain clearing performs the inverse check under the same SQLite
+            // write serialization: either the mark slot protects its drain,
+            // or a clear that linearized first makes this insert impossible.
+            self.require_mark_bucket_deleting_install_authorization(
+                command,
+                scope_bucket,
+                crate::clock::current_time_millis(),
+            )?;
             let inserted = self.execute_cached(
                 "INSERT INTO metadata_command_pending_slot \
                  (singleton, cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
@@ -3114,12 +3129,76 @@ impl PgStore {
         })
     }
 
+    fn require_mark_bucket_deleting_install_authorization(
+        &self,
+        command: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+        now: u64,
+    ) -> Result<(), StoreError> {
+        let MetadataCommandPayload::MarkBucketDeleting(mark) = command.payload() else {
+            return Ok(());
+        };
+        let Some(scope_bucket) = scope_bucket.filter(|bucket| *bucket == mark.bucket_name()) else {
+            return Err(StoreError::MetadataCommandContention {
+                context: "mark bucket deleting pending install requires its bucket scope",
+            });
+        };
+        let now = i64::try_from(now).map_err(|source| StoreError::Db {
+            context: "validate mark bucket deleting drain authorization time",
+            source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
+        })?;
+        let authorized = self
+            .conn
+            .query_row(
+                "SELECT EXISTS( \
+                     SELECT 1 \
+                     FROM bucket_write_drains AS drain \
+                     JOIN bucket_delete_attempt_outcomes AS attempt \
+                       ON attempt.bucket_name = drain.bucket_name \
+                      AND attempt.drain_id = drain.drain_id \
+                      AND attempt.cluster_epoch = drain.cluster_epoch \
+                      AND attempt.bucket_execution_generation = \
+                          drain.bucket_execution_generation \
+                     WHERE drain.bucket_name = ?1 \
+                       AND drain.lease_deadline > ?2 \
+                       AND ( \
+                           (attempt.outcome = ?3 AND attempt.phase = ?4) \
+                           OR (attempt.outcome = ?5 AND attempt.phase = ?6) \
+                       ) \
+                 )",
+                params![
+                    scope_bucket.as_str(),
+                    now,
+                    BucketDeleteAttemptOutcomeKind::Retryable as u8,
+                    BucketDeleteAttemptPhase::FinalVisibilityProven as u8,
+                    BucketDeleteAttemptOutcomeKind::MarkDeleting as u8,
+                    BucketDeleteAttemptPhase::MarkDeleting as u8,
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|source| StoreError::Db {
+                context: "validate mark bucket deleting drain authorization",
+                source: source.into(),
+            })?;
+        if !authorized {
+            return Err(StoreError::MetadataCommandContention {
+                context: "mark bucket deleting drain authorization changed before pending install",
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn try_insert_bucket_control_pending_metadata_command_slot(
         &self,
         node_id: u32,
         command: &MetadataCommandEnvelope,
         bucket: &BucketName,
     ) -> Result<bool, StoreError> {
+        if !command.payload().is_bucket_control_pending_slot_payload() {
+            return Err(StoreError::RouteCapabilitySubjectMismatch {
+                operation: "insert bucket-control pending metadata command",
+            });
+        }
         if command.id().pg_id().get() != self.pg_id {
             return Err(StoreError::MetadataCommandWrongPg {
                 node_id,
@@ -3281,6 +3360,92 @@ impl PgStore {
         replacement: &MetadataCommandEnvelope,
         scope_bucket: Option<&BucketName>,
     ) -> Result<bool, PendingMetadataCommandSlotReplaceError> {
+        if !replacement
+            .payload()
+            .is_ordinary_pending_slot_reissue_of(expected.payload())
+        {
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "replace ordinary pending metadata command for reissue",
+                },
+            ));
+        }
+        self.replace_pending_metadata_command_slot_for_reissue_inner(
+            node_id,
+            expected,
+            replacement,
+            scope_bucket,
+        )
+    }
+
+    pub(crate) fn replace_pending_metadata_command_slot_for_recovery(
+        &self,
+        node_id: u32,
+        authorized_source: &MetadataCommandEnvelope,
+        abandoned_source: Option<&MetadataCommandEnvelope>,
+        expected: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<bool, PendingMetadataCommandSlotReplaceError> {
+        let cleanup_chain_matches = match abandoned_source {
+            None => true,
+            Some(abandoned_source) if expected.payload() == authorized_source.payload() => {
+                expected == abandoned_source
+            }
+            Some(abandoned_source) => {
+                expected.payload() == replacement.payload()
+                    && expected.id().log_index() > abandoned_source.id().log_index()
+            }
+        };
+        let relationship_is_valid =
+            crate::metadata_command::validate_metadata_command_recovery_certificate(
+                authorized_source,
+                abandoned_source,
+                replacement,
+            )
+            .is_ok()
+                && authorized_source.id().cluster_epoch() == expected.id().cluster_epoch()
+                && authorized_source.id().pg_id() == expected.id().pg_id()
+                && abandoned_source.is_none_or(|abandoned_source| {
+                    abandoned_source.id().cluster_epoch() == expected.id().cluster_epoch()
+                        && abandoned_source.id().pg_id() == expected.id().pg_id()
+                })
+                && expected
+                    .payload()
+                    .is_authorized_recovery_derivative_of(authorized_source.payload())
+                && expected.id().log_index() >= authorized_source.id().log_index()
+                && replacement.id().log_index() > expected.id().log_index()
+                && cleanup_chain_matches;
+        if !relationship_is_valid {
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "replace certified recovery pending metadata command",
+                },
+            ));
+        }
+        self.replace_pending_metadata_command_slot_for_reissue_inner(
+            node_id,
+            expected,
+            replacement,
+            scope_bucket,
+        )
+    }
+
+    fn replace_pending_metadata_command_slot_for_reissue_inner(
+        &self,
+        node_id: u32,
+        expected: &MetadataCommandEnvelope,
+        replacement: &MetadataCommandEnvelope,
+        scope_bucket: Option<&BucketName>,
+    ) -> Result<bool, PendingMetadataCommandSlotReplaceError> {
+        let Some(scope_bucket) = scope_bucket.filter(|scope| *scope == replacement.bucket_name())
+        else {
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "replace pending metadata command bucket scope",
+                },
+            ));
+        };
         if expected.id().pg_id().get() != self.pg_id {
             return Err(PendingMetadataCommandSlotReplaceError::definitive(
                 StoreError::MetadataCommandWrongPg {
@@ -3335,6 +3500,13 @@ impl PgStore {
         else {
             return Ok(false);
         };
+        if slot.scope_bucket.as_ref() != Some(scope_bucket) {
+            return Err(PendingMetadataCommandSlotReplaceError::definitive(
+                StoreError::RouteCapabilitySubjectMismatch {
+                    operation: "replace pending metadata command existing bucket scope",
+                },
+            ));
+        }
         if slot.id == replacement.id()
             && slot.command_checksum == replacement.checksum_crc64()
             && slot.command_bytes == replacement.command_bytes()
@@ -3362,13 +3534,14 @@ impl PgStore {
                  SET cluster_epoch = ?1, pg_id = ?2, log_index = ?3, \
                      command_checksum = ?4, command_bytes = ?5, \
                      publication_started = 0, \
-                     placed_segment_reference_count = ?6, scope_bucket = ?7 \
+                     placed_segment_reference_count = ?6 \
                  WHERE singleton = 0 \
-                   AND cluster_epoch = ?8 \
-                   AND pg_id = ?9 \
-                   AND log_index = ?10 \
-                   AND command_checksum = ?11 \
-                   AND command_bytes = ?12",
+                   AND cluster_epoch = ?7 \
+                   AND pg_id = ?8 \
+                   AND log_index = ?9 \
+                   AND command_checksum = ?10 \
+                   AND command_bytes = ?11 \
+                   AND scope_bucket = ?12",
                     params![
                         replacement.id().cluster_epoch().get() as i64,
                         replacement.id().pg_id().get() as i64,
@@ -3376,12 +3549,12 @@ impl PgStore {
                         replacement.checksum_crc64() as i64,
                         replacement_bytes,
                         reference_count as i64,
-                        scope_bucket.map(BucketName::as_str),
                         expected.id().cluster_epoch().get() as i64,
                         expected.id().pg_id().get() as i64,
                         expected.id().log_index().get() as i64,
                         expected.checksum_crc64() as i64,
                         expected_bytes,
+                        scope_bucket.as_str(),
                     ],
                     "replace metadata command pending slot for reissue",
                 )?;

@@ -930,6 +930,16 @@ impl StorageNodeConnectionHandler {
                     ),
                 );
             }
+            let response_deadline = Instant::now()
+                .checked_add(storage_node_rpc_io_timeout(self.rpc_auth.as_deref()))
+                .ok_or_else(|| StorageNodeServerError::RpcStream {
+                    message: "storage-node RPC response deadline overflowed".to_string(),
+                })?;
+            stream
+                .set_operation_deadline(response_deadline)
+                .map_err(|error| StorageNodeServerError::RpcStream {
+                    message: format!("set storage-node RPC response deadline: {error}"),
+                })?;
             if let Err(error) = self.write_response_frame(stream, request_auth.as_ref(), &response)
             {
                 session.clear_metadata_command_lock_context(&self.metadata_command_locks);
@@ -8848,6 +8858,17 @@ impl StorageNodeConnectionHandler {
                 });
             }
         }
+        if request
+            .command
+            .payload()
+            .is_bucket_control_pending_slot_payload()
+        {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "bucket-control command requires the bucket-control pending slot RPC"
+                    .to_string(),
+            });
+        }
         let canonical_scope_bucket = request.command.bucket_name().clone();
         let wire_operation_deadline = request.operation_deadline;
         let operation_deadline =
@@ -8978,6 +8999,17 @@ impl StorageNodeConnectionHandler {
                 message:
                     "metadata command bucket-control scope bucket does not match command bucket"
                         .to_string(),
+            });
+        }
+        if !request
+            .command
+            .payload()
+            .is_bucket_control_pending_slot_payload()
+        {
+            return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                code: StorageRpcErrorCode::PayloadDecode,
+                message: "metadata command bucket-control pending slot payload is not allowed"
+                    .to_string(),
             });
         }
         let canonical_scope_bucket = request.command.bucket_name().clone();

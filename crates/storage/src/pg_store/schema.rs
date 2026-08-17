@@ -629,7 +629,8 @@ CREATE TABLE bucket_write_drains (
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
 ) STRICT";
 
-/// Last durable DeleteBucket attempt outcome per bucket.
+/// Last durable DeleteBucket attempt outcome per bucket. The exact
+/// FinalVisibilityProven drain identity also authorizes pending mark install.
 const CREATE_BUCKET_DELETE_ATTEMPT_OUTCOMES_TABLE: &str = "\
 CREATE TABLE bucket_delete_attempt_outcomes (
     bucket_name      TEXT PRIMARY KEY,

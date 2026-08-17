@@ -3672,6 +3672,20 @@ fn test_unix_storage_node_client_with_rpc_admission_timeout(
 }
 
 fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
+    test_metadata_command_for_subject(
+        pg_id,
+        log_index,
+        crate::tests::bucket_name("metadata-rpc-bucket"),
+        crate::tests::object_key("object"),
+    )
+}
+
+fn test_metadata_command_for_subject(
+    pg_id: u32,
+    log_index: u64,
+    bucket: BucketName,
+    key: ObjectKey,
+) -> MetadataCommandEnvelope {
     MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             ClusterEpoch::new(1).unwrap(),
@@ -3680,14 +3694,293 @@ fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope 
         ),
         MetadataCommandPayload::ReserveObjectGeneration(
             crate::metadata_command::ReserveObjectGenerationCommand::new(
-                crate::tests::bucket_name("metadata-rpc-bucket"),
-                crate::tests::object_key("object"),
+                bucket,
+                key,
                 crate::tests::stream_session_id("metadata-rpc"),
                 GenerationId::new(1).unwrap(),
                 123,
             ),
         ),
     )
+}
+
+fn test_bucket_record(name: &str) -> crate::metadata_command::BucketRecord {
+    let owner = crate::OwnerIdentity::from_principal("owner");
+    crate::metadata_command::BucketRecord::from_create_config(
+        &CreateBucketConfig {
+            name,
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &s3_types::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        },
+        1,
+        1,
+    )
+    .unwrap()
+}
+
+fn test_bucket_control_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(pg_id),
+            MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        MetadataCommandPayload::PutBucketVersioning(
+            crate::metadata_command::PutBucketVersioningCommand::from_bucket(
+                test_bucket_record("metadata-rpc-bucket"),
+                s3_types::BucketVersioningState::Enabled,
+            ),
+        ),
+    )
+}
+
+fn test_mark_bucket_deleting_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
+    MetadataCommandEnvelope::new(
+        MetadataCommandId::new(
+            ClusterEpoch::new(1).unwrap(),
+            PgId::new(pg_id),
+            MetadataCommandLogIndex::new(log_index).unwrap(),
+        ),
+        MetadataCommandPayload::MarkBucketDeleting(
+            crate::metadata_command::MarkBucketDeletingCommand::from_bucket(test_bucket_record(
+                "metadata-rpc-bucket",
+            )),
+        ),
+    )
+}
+
+#[test]
+fn local_bucket_control_pending_slot_rejects_mark_bucket_deleting() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let command = test_mark_bucket_deleting_command(0, 1);
+    let bucket = command.bucket_name().clone();
+
+    let error = MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+        &client,
+        PgId::new(0),
+        &command,
+        &bucket,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "insert bucket-control pending metadata command"
+        }
+    ));
+    assert!(
+        storage_node
+            .get_pg(0)
+            .unwrap()
+            .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+            .is_none(),
+        "rejected delete mark must not create a pending slot"
+    );
+}
+
+#[test]
+fn local_generic_pending_slot_rejects_bucket_control_command_during_drain() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let command = test_bucket_control_metadata_command(0, 1);
+    let bucket = command.bucket_name().clone();
+    {
+        let pg = storage_node.get_pg(0).unwrap();
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        pg.create_bucket_with_config(&CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &s3_types::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .unwrap();
+        let now = crate::clock::current_time_millis();
+        <crate::pg_store::PgStore as crate::node_runtime::traits::PgMetadataStore>::begin_durable_bucket_write_drain(
+            &*pg,
+            &bucket,
+            "generic-domain-drain",
+            "generic-domain-owner",
+            ClusterEpoch::new(1).unwrap(),
+            now,
+            now + 60_000,
+        )
+        .unwrap();
+    }
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+
+    let error = MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
+        &client,
+        PgId::new(0),
+        &command,
+        Some(&bucket),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "insert generic pending metadata command"
+        }
+    ));
+    let pg = storage_node.get_pg(0).unwrap();
+    assert!(
+        pg.pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+            .unwrap()
+            .is_none(),
+        "generic endpoint rejection must not install the bucket-control command"
+    );
+    assert!(
+        <crate::pg_store::PgStore as crate::node_runtime::traits::PgMetadataStore>::durable_bucket_write_drain(&*pg, &bucket)
+            .unwrap()
+            .is_some(),
+        "generic endpoint rejection must preserve the live delete drain"
+    );
+}
+
+#[test]
+fn local_pending_slot_replacement_rejects_omitted_scope_and_cross_domain_commands_during_drain() {
+    let tmp = test_util::tempdir();
+    let storage_node = Arc::new(
+        crate::node::SharedStorageNode::open_with_default_ec_shape(
+            tmp.path(),
+            &[0],
+            EcShape { k: 4, m: 2 },
+        )
+        .unwrap(),
+    );
+    let previous = test_metadata_command(0, 1);
+    let bucket = previous.bucket_name().clone();
+    {
+        let pg = storage_node.get_pg(0).unwrap();
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        pg.create_bucket_with_config(&CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: &owner.principal,
+            owner_canonical_id: &owner.canonical_id,
+            acl_grants: &s3_types::AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .unwrap();
+        pg.try_insert_pending_metadata_command_slot(7, &previous, Some(&bucket))
+            .unwrap();
+        let now = crate::clock::current_time_millis();
+        <crate::pg_store::PgStore as crate::node_runtime::traits::PgMetadataStore>::begin_durable_bucket_write_drain(
+            &*pg,
+            &bucket,
+            "replacement-domain-drain",
+            "replacement-domain-owner",
+            ClusterEpoch::new(1).unwrap(),
+            now,
+            now + 60_000,
+        )
+        .unwrap();
+    }
+    let client = LocalStorageNodeClient::new(NodeId::new(7), Arc::clone(&storage_node));
+    let section =
+        MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+            &client,
+            PgId::new(0),
+            ClusterEpoch::new(1).unwrap(),
+        )
+        .unwrap();
+
+    let error = section
+        .replace_pending_metadata_command_slot_for_reissue(
+            &previous,
+            &test_metadata_command(0, 2),
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), MetadataCommandApplyErrorKind::Definitive);
+    assert!(matches!(
+        error.into_source(),
+        StoreError::RouteCapabilitySubjectMismatch {
+            operation: "replace pending metadata command bucket scope"
+        }
+    ));
+
+    for replacement in [
+        test_mark_bucket_deleting_command(0, 2),
+        test_bucket_control_metadata_command(0, 2),
+        test_metadata_command_for_subject(
+            0,
+            2,
+            crate::tests::bucket_name("foreign-replacement-bucket"),
+            crate::tests::object_key("object"),
+        ),
+        test_metadata_command_for_subject(
+            0,
+            2,
+            bucket.clone(),
+            crate::tests::object_key("different-object"),
+        ),
+    ] {
+        let error = section
+            .replace_pending_metadata_command_slot_for_reissue(
+                &previous,
+                &replacement,
+                Some(&bucket),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), MetadataCommandApplyErrorKind::Definitive);
+        assert!(matches!(
+            error.into_source(),
+            StoreError::RouteCapabilitySubjectMismatch {
+                operation: "replace ordinary pending metadata command for reissue"
+            }
+        ));
+    }
+    drop(section);
+
+    let pg = storage_node.get_pg(0).unwrap();
+    let pending = pg
+        .pending_metadata_command_slot(7, ClusterEpoch::new(1).unwrap())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.command_bytes, previous.command_bytes());
+    assert!(
+        <crate::pg_store::PgStore as crate::node_runtime::traits::PgMetadataStore>::durable_bucket_write_drain(&*pg, &bucket)
+            .unwrap()
+            .is_some(),
+        "cross-domain replacement rejection must preserve the live delete drain"
+    );
 }
 
 #[test]

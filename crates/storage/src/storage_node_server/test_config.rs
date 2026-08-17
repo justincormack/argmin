@@ -10,8 +10,8 @@
         BucketMetadataNodeClient, BuildCompleteMultipartObjectCommandReq,
         BuildStreamPartCommitCommandReq, DirectPutMetadataNodeClient,
         LocalUnixStorageNodeClientAdmissionSettings, MetadataCommandApplyErrorKind,
-        MetadataCommandInspectionNodeClient, MetadataCommandRecoveryNodeClient,
-        ObjectMutationMetadataNodeClient, PlacedShardNodeClient,
+        MetadataCommandInspectionNodeClient, MetadataCommandPendingSlotReplaceError,
+        MetadataCommandRecoveryNodeClient, ObjectMutationMetadataNodeClient, PlacedShardNodeClient,
         RetainedBucketWriteReservationNodeClient, UnixStorageNodeClient,
     };
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
@@ -4132,6 +4132,20 @@
     }
 
     fn test_metadata_command(pg_id: u32, log_index: u64) -> MetadataCommandEnvelope {
+        test_metadata_command_for_subject(
+            pg_id,
+            log_index,
+            crate::tests::bucket_name("metadata-rpc-bucket"),
+            crate::tests::object_key("object"),
+        )
+    }
+
+    fn test_metadata_command_for_subject(
+        pg_id: u32,
+        log_index: u64,
+        bucket: BucketName,
+        key: crate::ObjectKey,
+    ) -> MetadataCommandEnvelope {
         MetadataCommandEnvelope::new(
             MetadataCommandId::new(
                 ClusterEpoch::new(1).unwrap(),
@@ -4139,12 +4153,71 @@
                 MetadataCommandLogIndex::new(log_index).unwrap(),
             ),
             MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
-                crate::tests::bucket_name("metadata-rpc-bucket"),
-                crate::tests::object_key("object"),
+                bucket,
+                key,
                 crate::tests::stream_session_id("metadata-rpc"),
                 GenerationId::new(1).unwrap(),
                 123,
             )),
+        )
+    }
+
+    fn test_metadata_rpc_bucket_record() -> crate::metadata_command::BucketRecord {
+        let owner = crate::OwnerIdentity::from_principal("owner");
+        crate::metadata_command::BucketRecord::from_create_config(
+            &CreateBucketConfig {
+                name: "metadata-rpc-bucket",
+                owner_principal: &owner.principal,
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &AclGrants::default(),
+                public_read: false,
+                public_write: false,
+                versioning: BucketVersioningState::Disabled,
+                object_lock: BucketObjectLockConfig::default(),
+                ownership_controls: crate::BucketOwnershipControls {
+                    object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+                },
+            },
+            1,
+            1,
+        )
+        .unwrap()
+    }
+
+    fn test_bucket_control_metadata_command(
+        pg_id: u32,
+        log_index: u64,
+    ) -> MetadataCommandEnvelope {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(pg_id),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::PutBucketVersioning(
+                crate::metadata_command::PutBucketVersioningCommand::from_bucket(
+                    test_metadata_rpc_bucket_record(),
+                    BucketVersioningState::Enabled,
+                ),
+            ),
+        )
+    }
+
+    fn test_mark_bucket_deleting_command(
+        pg_id: u32,
+        log_index: u64,
+    ) -> MetadataCommandEnvelope {
+        MetadataCommandEnvelope::new(
+            MetadataCommandId::new(
+                ClusterEpoch::new(1).unwrap(),
+                PgId::new(pg_id),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            ),
+            MetadataCommandPayload::MarkBucketDeleting(
+                crate::metadata_command::MarkBucketDeletingCommand::from_bucket(
+                    test_metadata_rpc_bucket_record(),
+                ),
+            ),
         )
     }
 
@@ -5805,6 +5878,510 @@
     }
 
     #[derive(Clone, Copy)]
+    enum AuthenticatedPendingSlotDomainCase {
+        BucketControlRejectsMark,
+        GenericRejectsBucketControl,
+    }
+
+    fn authenticated_pending_slot_endpoint_domains_are_disjoint(
+        tcp: bool,
+        case: AuthenticatedPendingSlotDomainCase,
+    ) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let command = match case {
+            AuthenticatedPendingSlotDomainCase::BucketControlRejectsMark => {
+                test_mark_bucket_deleting_command(0, 1)
+            }
+            AuthenticatedPendingSlotDomainCase::GenericRejectsBucketControl => {
+                test_bucket_control_metadata_command(0, 1)
+            }
+        };
+        let bucket = command.bucket_name().clone();
+        if matches!(
+            case,
+            AuthenticatedPendingSlotDomainCase::GenericRejectsBucketControl
+        ) {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            let now = crate::clock::current_time_millis();
+            PgMetadataStore::begin_durable_bucket_write_drain(
+                &*pg,
+                &bucket,
+                "authenticated-generic-domain-drain",
+                "authenticated-generic-domain-owner",
+                config.cluster_epoch,
+                now,
+                now + 60_000,
+            )
+            .unwrap();
+        }
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let error = match case {
+            AuthenticatedPendingSlotDomainCase::BucketControlRejectsMark => {
+                MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
+                    &client,
+                    PgId::new(0),
+                    &command,
+                    &bucket,
+                )
+                .unwrap_err()
+            }
+            AuthenticatedPendingSlotDomainCase::GenericRejectsBucketControl => {
+                MetadataCommandNodeClient::try_insert_pending_metadata_command_slot(
+                    &client,
+                    PgId::new(0),
+                    &command,
+                    Some(&bucket),
+                )
+                .unwrap_err()
+            }
+        };
+        assert!(
+            matches!(
+                error,
+                StoreError::StorageRpc {
+                    failure: StorageRpcErrorCode::PayloadDecode,
+                    ..
+                }
+            ),
+            "unexpected pending-slot endpoint-domain rejection: {error:?}"
+        );
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .get_pg(0)
+                .unwrap()
+                .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
+                .unwrap()
+                .is_none(),
+            "authenticated endpoint-domain rejection must not install the command"
+        );
+        if matches!(
+            case,
+            AuthenticatedPendingSlotDomainCase::GenericRejectsBucketControl
+        ) {
+            assert!(
+                PgMetadataStore::durable_bucket_write_drain(
+                    &*reopened.get_pg(0).unwrap(),
+                    &bucket,
+                )
+                .unwrap()
+                .is_some(),
+                "generic endpoint rejection must preserve the live delete drain"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_unix_bucket_control_pending_slot_rejects_mark_bucket_deleting() {
+        authenticated_pending_slot_endpoint_domains_are_disjoint(
+            false,
+            AuthenticatedPendingSlotDomainCase::BucketControlRejectsMark,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_bucket_control_pending_slot_rejects_mark_bucket_deleting() {
+        authenticated_pending_slot_endpoint_domains_are_disjoint(
+            true,
+            AuthenticatedPendingSlotDomainCase::BucketControlRejectsMark,
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_generic_pending_slot_rejects_bucket_control_during_drain() {
+        authenticated_pending_slot_endpoint_domains_are_disjoint(
+            false,
+            AuthenticatedPendingSlotDomainCase::GenericRejectsBucketControl,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_generic_pending_slot_rejects_bucket_control_during_drain() {
+        authenticated_pending_slot_endpoint_domains_are_disjoint(
+            true,
+            AuthenticatedPendingSlotDomainCase::GenericRejectsBucketControl,
+        );
+    }
+
+    fn authenticated_pending_slot_replacement_rejects_omitted_scope_and_cross_domain_commands(
+        tcp: bool,
+    ) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let previous = test_metadata_command(0, 1);
+        let bucket = previous.bucket_name().clone();
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            pg.try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &previous,
+                Some(&bucket),
+            )
+            .unwrap();
+            let now = crate::clock::current_time_millis();
+            PgMetadataStore::begin_durable_bucket_write_drain(
+                &*pg,
+                &bucket,
+                "authenticated-replacement-domain-drain",
+                "authenticated-replacement-domain-owner",
+                config.cluster_epoch,
+                now,
+                now + 60_000,
+            )
+            .unwrap();
+        }
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let section =
+            MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+                &client,
+                PgId::new(0),
+                config.cluster_epoch,
+            )
+            .unwrap();
+        let replacement = test_metadata_command(0, 2);
+        let foreign_scope = crate::tests::bucket_name("foreign-replacement-scope");
+        for (scope_bucket, expected_detail) in [
+            (
+                None,
+                "metadata command replacement requires canonical bucket scope",
+            ),
+            (
+                Some(&foreign_scope),
+                "metadata command replacement scope bucket does not match command bucket",
+            ),
+        ] {
+            let error = section
+                .replace_pending_metadata_command_slot_for_reissue(
+                    &previous,
+                    &replacement,
+                    scope_bucket,
+                )
+                .unwrap_err();
+            assert_authenticated_pending_slot_replacement_scope_error(error, expected_detail);
+        }
+        for replacement in [
+            test_mark_bucket_deleting_command(0, 2),
+            test_bucket_control_metadata_command(0, 2),
+            test_metadata_command_for_subject(
+                0,
+                2,
+                crate::tests::bucket_name("foreign-replacement-bucket"),
+                crate::tests::object_key("object"),
+            ),
+            test_metadata_command_for_subject(
+                0,
+                2,
+                bucket.clone(),
+                crate::tests::object_key("different-object"),
+            ),
+        ] {
+            let error = section
+                .replace_pending_metadata_command_slot_for_reissue(
+                    &previous,
+                    &replacement,
+                    Some(&bucket),
+                )
+                .unwrap_err();
+            assert_eq!(error.kind(), MetadataCommandApplyErrorKind::Definitive);
+            assert!(
+                matches!(
+                    error.into_source(),
+                    StoreError::StorageRpc {
+                        failure: StorageRpcErrorCode::PayloadDecode,
+                        ..
+                    }
+                ),
+                "cross-domain replacement must be rejected by authenticated request validation"
+            );
+        }
+        drop(section);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = reopened.get_pg(0).unwrap();
+        let pending = pg
+            .pending_metadata_command_slot(config.node_id.as_u32(), config.cluster_epoch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.command_bytes, previous.command_bytes());
+        assert!(
+            PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+                .unwrap()
+                .is_some(),
+            "authenticated cross-domain rejection must preserve the live delete drain"
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_pending_slot_replacement_rejects_omitted_scope_and_cross_domain_commands()
+    {
+        authenticated_pending_slot_replacement_rejects_omitted_scope_and_cross_domain_commands(
+            false,
+        );
+    }
+
+    #[test]
+    fn authenticated_tls_pending_slot_replacement_rejects_omitted_scope_and_cross_domain_commands()
+    {
+        authenticated_pending_slot_replacement_rejects_omitted_scope_and_cross_domain_commands(
+            true,
+        );
+    }
+
+    fn assert_authenticated_pending_slot_replacement_scope_error(
+        error: MetadataCommandPendingSlotReplaceError,
+        expected_detail: &str,
+    ) {
+        assert_eq!(error.kind(), MetadataCommandApplyErrorKind::Definitive);
+        match error.into_source() {
+            StoreError::StorageRpc {
+                failure,
+                detail,
+                ..
+            } => {
+                assert_eq!(failure, StorageRpcErrorCode::PayloadDecode);
+                assert_eq!(detail.as_str(), expected_detail);
+            }
+            error => panic!("unexpected authenticated replacement scope error: {error:?}"),
+        }
+    }
+
+    fn authenticated_recovery_pending_slot_replacement_rejects_noncanonical_scope(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = bounded_runtime_refresh_config(test_config(&tmp));
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        let server = if tcp {
+            prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                "127.0.0.1:0".parse().unwrap(),
+                storage_rpc_tls_server_config(),
+            )])
+        } else {
+            prepared
+        }
+        .bind()
+        .unwrap();
+        let source_epoch = config.cluster_epoch;
+        let current_epoch = ClusterEpoch::new(source_epoch.get() + 1).unwrap();
+        let source_route = config.pg_routes[0].clone();
+        let previous = test_metadata_command(0, 1);
+        let replacement = test_metadata_command(0, 2);
+        let bucket = previous.bucket_name().clone();
+        {
+            let pg = server._node.get_pg(0).unwrap();
+            create_probe_bucket_direct(&pg, &bucket);
+            pg.try_insert_pending_metadata_command_slot(
+                config.node_id.as_u32(),
+                &previous,
+                Some(&bucket),
+            )
+            .unwrap();
+            let now = crate::clock::current_time_millis();
+            PgMetadataStore::begin_durable_bucket_write_drain(
+                &*pg,
+                &bucket,
+                "authenticated-recovery-replacement-scope-drain",
+                "authenticated-recovery-replacement-scope-owner",
+                source_epoch,
+                now,
+                now + 60_000,
+            )
+            .unwrap();
+        }
+        let mut next_config = bounded_runtime_refresh_config(config.clone());
+        next_config.cluster_epoch = current_epoch;
+        next_config.pg_routes[0].cluster_epoch = current_epoch;
+        next_config.pg_routes[0].state = PgState::Peering;
+        next_config.historical_pg_routes.push(source_route);
+        next_config.pending_metadata_command_recoveries.push((
+            PgId::new(0),
+            PendingMetadataCommandRecovery::new(
+                config.node_id,
+                PendingMetadataCommandObservation::new(
+                    source_epoch,
+                    std::num::NonZeroU64::new(previous.id().log_index().get()).unwrap(),
+                    previous.checksum_crc64(),
+                ),
+            ),
+        ));
+        server
+            .install_control_plane_runtime_config(next_config)
+            .unwrap();
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            source_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let section =
+            MetadataCommandRecoveryNodeClient::open_metadata_command_recovery_critical_section(
+                &client,
+                PgId::new(0),
+                source_epoch,
+            )
+            .unwrap();
+        let foreign_scope = crate::tests::bucket_name("foreign-recovery-replacement-scope");
+        for (scope_bucket, expected_detail) in [
+            (
+                None,
+                "metadata command replacement requires canonical bucket scope",
+            ),
+            (
+                Some(&foreign_scope),
+                "metadata command replacement scope bucket does not match command bucket",
+            ),
+        ] {
+            let error = section
+                .replace_pending_metadata_command_slot_for_recovery(
+                    &previous,
+                    None,
+                    &previous,
+                    &replacement,
+                    scope_bucket,
+                )
+                .unwrap_err();
+            assert_authenticated_pending_slot_replacement_scope_error(error, expected_detail);
+        }
+        drop(section);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+
+        let reopened = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = reopened.get_pg(0).unwrap();
+        let pending = pg
+            .pending_metadata_command_slot(config.node_id.as_u32(), source_epoch)
+            .unwrap()
+            .unwrap();
+        assert_eq!(pending.command_bytes, previous.command_bytes());
+        assert!(
+            PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+                .unwrap()
+                .is_some(),
+            "authenticated recovery scope rejection must preserve the live delete drain"
+        );
+    }
+
+    #[test]
+    fn authenticated_unix_recovery_pending_slot_replacement_rejects_noncanonical_scope() {
+        authenticated_recovery_pending_slot_replacement_rejects_noncanonical_scope(false);
+    }
+
+    #[test]
+    fn authenticated_tls_recovery_pending_slot_replacement_rejects_noncanonical_scope() {
+        authenticated_recovery_pending_slot_replacement_rejects_noncanonical_scope(true);
+    }
+
+    #[derive(Clone, Copy)]
     enum AuthenticatedPendingSlotReplaceFailure {
         SignedPreMutationRejection,
         SignedPostCommitFailure,
@@ -6170,8 +6747,15 @@
         let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
             instance_id: "frontend-1".to_owned(),
         });
+        let server_transport_limits = storage_rpc_test_transport_limits_with_io_timeout(
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+            Duration::from_millis(1_500),
+        );
         let prepared = PreparedStorageNodeServer::new(config.clone())
-            .with_rpc_auth(storage_rpc_server_auth(&credential));
+            .with_rpc_auth(
+                storage_rpc_server_auth(&credential)
+                    .with_transport_limits(server_transport_limits),
+            );
         let server = if tcp {
             prepared.with_rpc_listeners(vec![StorageNodeRpcListenerConfig::tls_tcp_with_config(
                 "127.0.0.1:0".parse().unwrap(),
@@ -6237,14 +6821,18 @@
             LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
             Some(storage_rpc_client_auth(credential, 9)),
         );
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let route_deadline = Instant::now() + Duration::from_secs(10);
         let route = RetainedBucketWriteReservationNodeClient::open_retained_bucket_write_reservation_route_until(
             &client,
             BucketPgId::new_for_test(PgId::new(0)),
             &bucket,
-            deadline,
+            route_deadline,
         )
         .unwrap();
+        // Cross-process projection reserves one second for clock skew. The
+        // server therefore waits for about two seconds, past the initial
+        // 1.5-second connection I/O deadline, before writing the response.
+        let deadline = Instant::now() + Duration::from_secs(3);
         let error = route
             .release_metadata_command_bucket_write_reservation_until(&proof, deadline)
             .expect_err("proof release must expire while the bucket PG is held");

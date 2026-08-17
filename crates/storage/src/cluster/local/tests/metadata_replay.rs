@@ -690,9 +690,9 @@ fn bucket_acl_rehydration_preserves_multipart_completion_barrier_sequence_after_
                 },
             )),
         );
-        primary_pg
-            .try_insert_pending_metadata_command_slot(0, &command, Some(&bucket))
-            .unwrap();
+        assert!(primary_pg
+            .try_insert_bucket_control_pending_metadata_command_slot(0, &command, &bucket)
+            .unwrap());
     }
     drop(map);
 
@@ -1568,13 +1568,13 @@ fn local_cluster_reopen_converges_inflight_primary_pending_before_snapshots() {
                 },
             )),
         );
-        primary_pg
-            .try_insert_pending_metadata_command_slot(
+        assert!(primary_pg
+            .try_insert_bucket_control_pending_metadata_command_slot(
                 NodeId::new(0).as_u32(),
                 &command,
-                Some(&bucket),
+                &bucket,
             )
-            .unwrap();
+            .unwrap());
         for node_id in [NodeId::new(1), NodeId::new(2)] {
             let pg = map
                 .node(node_id)
@@ -1674,13 +1674,13 @@ fn local_cluster_reopen_converges_primary_terminal_pending_before_slot_cleanup()
                     },
                 )),
             );
-            primary_pg
-                .try_insert_pending_metadata_command_slot(
+            assert!(primary_pg
+                .try_insert_bucket_control_pending_metadata_command_slot(
                     NodeId::new(0).as_u32(),
                     &command,
-                    Some(&bucket),
+                    &bucket,
                 )
-                .unwrap();
+                .unwrap());
             command
         };
         for node_id in [NodeId::new(1), NodeId::new(0)] {

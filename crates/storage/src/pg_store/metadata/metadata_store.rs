@@ -679,32 +679,77 @@ impl PgMetadataStore for PgStore {
             context: "clear durable bucket write drain lease deadline",
             source: crate::error::DatabaseError::to_sql_conversion_failure(Box::new(source)),
         })?;
-        let deleted = self
-            .conn
-            .execute(
-                "DELETE FROM bucket_write_drains \
-                 WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
-                   AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
-                   AND lease_deadline = ?6",
-                params![
-                    name.as_str(),
-                    drain_id,
-                    owner_token,
-                    cluster_epoch.get(),
-                    generation,
-                    lease_deadline
-                ],
-            )
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
             .map_err(|source| MetadataError::Db {
-                context: "clear durable bucket write drain",
+                context: "clear durable bucket write drain (begin txn)",
                 source: source.into(),
             })?;
-        if deleted == 0 {
-            return Err(MetadataError::BucketWriteDrainNotFound {
+        let result = (|| {
+            let deleted = self
+                .conn
+                .execute(
+                    "DELETE FROM bucket_write_drains \
+                     WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
+                       AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
+                       AND lease_deadline = ?6 \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM metadata_command_pending_slot \
+                           WHERE singleton = 0 AND scope_bucket = ?1 \
+                       )",
+                    params![
+                        name.as_str(),
+                        drain_id,
+                        owner_token,
+                        cluster_epoch.get(),
+                        generation,
+                        lease_deadline
+                    ],
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "clear durable bucket write drain",
+                    source: source.into(),
+                })?;
+            if deleted != 0 {
+                return Ok(());
+            }
+            let exact_drain_exists = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS( \
+                         SELECT 1 FROM bucket_write_drains \
+                         WHERE bucket_name = ?1 AND drain_id = ?2 AND owner_token = ?3 \
+                           AND cluster_epoch = ?4 AND bucket_execution_generation = ?5 \
+                           AND lease_deadline = ?6 \
+                     )",
+                    params![
+                        name.as_str(),
+                        drain_id,
+                        owner_token,
+                        cluster_epoch.get(),
+                        generation,
+                        lease_deadline
+                    ],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "check protected durable bucket write drain",
+                    source: source.into(),
+                })?;
+            if exact_drain_exists {
+                return Ok(());
+            }
+            Err(MetadataError::BucketWriteDrainNotFound {
                 drain_id: drain_id.to_string(),
-            });
+            })
+        })();
+        match result {
+            Ok(()) => self.commit_immediate_txn("clear durable bucket write drain (commit txn)"),
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     fn clear_expired_durable_bucket_write_drain(
@@ -756,6 +801,23 @@ impl PgMetadataStore for PgStore {
             if bucket.state != BucketState::Active
                 || bucket.bucket_execution_generation != record.bucket_execution_generation
             {
+                return Ok(None);
+            }
+            let pending_command_scoped_to_bucket = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS( \
+                         SELECT 1 FROM metadata_command_pending_slot \
+                         WHERE singleton = 0 AND scope_bucket = ?1 \
+                     )",
+                    params![name.as_str()],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(|source| MetadataError::Db {
+                    context: "check pending command before clearing expired bucket write drain",
+                    source: source.into(),
+                })?;
+            if pending_command_scoped_to_bucket {
                 return Ok(None);
             }
             let deleted = self

@@ -1714,7 +1714,7 @@ fn unix_storage_node_client_inserts_bucket_control_pending_slot_idempotently() {
         config.cluster_epoch,
         config.socket_path.clone(),
     );
-    let command = test_metadata_command(0, 1);
+    let command = test_bucket_control_metadata_command(0, 1);
     let bucket = crate::tests::bucket_name("metadata-rpc-bucket");
 
     assert!(
@@ -2461,6 +2461,7 @@ fn unix_metadata_session_pending_slot_uses_portable_operation_deadline() {
         .unwrap();
     let command = test_metadata_command(0, 1);
     let bucket = command.bucket_name().clone();
+    let bucket_control_command = test_bucket_control_metadata_command(0, 2);
     let wall_before = crate::clock::current_time_millis();
     MetadataCommandNodeClient::try_insert_pending_metadata_command_slot_with_effect_fence_until(
         &session,
@@ -2475,9 +2476,9 @@ fn unix_metadata_session_pending_slot_uses_portable_operation_deadline() {
         MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
             &session,
             PgId::new(0),
-            &command,
+            &bucket_control_command,
             &bucket,
-            AdmittedRouteEffectFence::unbounded(command.id().cluster_epoch()),
+            AdmittedRouteEffectFence::unbounded(bucket_control_command.id().cluster_epoch()),
             Instant::now() + Duration::from_secs(2),
         )
         .unwrap()
@@ -2563,7 +2564,7 @@ fn unix_bucket_control_pending_slot_uses_portable_operation_deadline() {
         config.cluster_epoch,
         config.socket_path.clone(),
     );
-    let command = test_metadata_command(0, 1);
+    let command = test_bucket_control_metadata_command(0, 1);
     let bucket = command.bucket_name().clone();
 
     assert!(
@@ -2598,7 +2599,7 @@ fn unix_bucket_control_pending_slot_cannot_commit_after_its_operation_deadline()
         config.cluster_epoch,
         config.socket_path.clone(),
     );
-    let command = test_metadata_command(0, 1);
+    let command = test_bucket_control_metadata_command(0, 1);
     let bucket = command.bucket_name().clone();
 
     let error = MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot_with_effect_fence_until(
@@ -3579,7 +3580,7 @@ fn unix_storage_node_client_preserves_bucket_control_pending_slot_log_conflict()
             MetadataCommandNodeClient::try_insert_bucket_control_pending_metadata_command_slot(
                 &client,
                 PgId::new(0),
-                &test_metadata_command(0, 1),
+                &test_bucket_control_metadata_command(0, 1),
                 &crate::tests::bucket_name("metadata-rpc-bucket"),
             )
             .unwrap_err();

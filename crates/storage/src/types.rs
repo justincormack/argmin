@@ -3420,6 +3420,10 @@ pub(crate) enum BucketDeleteAttemptPhase {
 }
 
 /// Last durable DeleteBucket attempt outcome for a bucket.
+///
+/// A `FinalVisibilityProven` record matching the live write drain is also the
+/// durable authorization consumed atomically when installing
+/// `MarkBucketDeleting`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BucketDeleteAttemptOutcomeRecord {
     pub bucket: BucketName,

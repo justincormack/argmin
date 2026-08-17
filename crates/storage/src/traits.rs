@@ -177,6 +177,9 @@ pub(crate) trait PgMetadataStore {
     ) -> Result<Option<BucketWriteDrainRecord>, MetadataError>;
 
     /// Clear a durable bucket write drain by exact identity.
+    ///
+    /// A pending metadata command scoped to the bucket atomically protects the
+    /// drain; in that case this operation succeeds without removing it.
     #[allow(dead_code)]
     fn clear_durable_bucket_write_drain(
         &self,
@@ -214,6 +217,7 @@ pub(crate) trait PgMetadataStore {
     ) -> Result<BucketWriteDrainRecord, MetadataError>;
 
     /// Record the last durable DeleteBucket attempt outcome for this bucket.
+    /// FinalVisibilityProven is also durable mark-install authorization.
     #[allow(dead_code)]
     fn record_bucket_delete_attempt_outcome(
         &self,

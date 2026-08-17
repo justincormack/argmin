@@ -2711,10 +2711,12 @@ impl super::StorageCluster {
         crate::node::maybe_run_after_begin_bucket_delete_drain_hook(bucket);
 
         let mut metadata_contention_retries = 0usize;
-        let mut work_budget = super::RequestWorkBudget::new(
-            std::time::Duration::from_millis(BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS),
-            None,
-        )
+        let work_deadline = started
+            .checked_add(std::time::Duration::from_millis(
+                BUCKET_DELETE_BEGIN_WORK_BUDGET_MILLIS,
+            ))
+            .unwrap_or(started);
+        let mut work_budget = super::RequestWorkBudget::ending_at(work_deadline)
         .for_operation("bucket_delete_begin")
         .for_pg(pg_id);
         let mut loop_iteration = 0u64;
@@ -2845,6 +2847,12 @@ impl super::StorageCluster {
                     MetadataCommandPayload::MarkBucketDeleting(mark)
                         if mark.bucket_name() == bucket =>
                     {
+                        attempt_phase = BucketDeleteAttemptPhase::MarkDeleting;
+                        #[cfg(test)]
+                        maybe_run_before_bucket_delete_adopted_mark_validation_hook(
+                            self.metadata_command_apply_test_hook_scope_id(),
+                            &command,
+                        )?;
                         Self::emit_bucket_delete_begin_loop_step(
                             bucket,
                             pg_id,
@@ -3615,6 +3623,21 @@ impl super::StorageCluster {
                         BucketDeleteAttemptPhase::FinalVisibilityProven,
                         "final visibility check proven".to_string(),
                     );
+                    let authorization = self.bucket_delete_matching_attempt_outcome(
+                        node_store.bucket_write_reservation_client().as_ref(),
+                        bucket_pg_id,
+                        &durable_drain,
+                    )?;
+                    if !authorization.is_some_and(|record| {
+                        record.outcome == BucketDeleteAttemptOutcomeKind::Retryable
+                            && record.phase == BucketDeleteAttemptPhase::FinalVisibilityProven
+                    }) {
+                        return Err(BucketWriteDrainError::Store(
+                            StoreError::MetadataCommandContention {
+                                context: "persist bucket delete mark-install authorization",
+                            },
+                        ));
+                    }
                     can_resume_at_mark_deleting = true;
                     #[cfg(any(test, feature = "test-hooks"))]
                     maybe_run_after_bucket_delete_final_visibility_proven_hook(
@@ -3629,7 +3652,14 @@ impl super::StorageCluster {
                     "heartbeat_before_build_mark_start",
                     format!("iteration={loop_iteration}"),
                 );
-                attempt_phase = BucketDeleteAttemptPhase::MarkDeleting;
+                self.check_bucket_delete_begin_work_budget(
+                    bucket,
+                    Some(started),
+                    "bucket delete mark-deleting admission budget exhausted",
+                )?;
+                work_budget
+                    .check("bucket delete mark-deleting admission budget exhausted")
+                    .map_err(BucketWriteDrainError::from)?;
                 durable_drain = self.heartbeat_durable_bucket_delete_drain(&durable_drain)?;
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
@@ -3641,7 +3671,16 @@ impl super::StorageCluster {
                 #[cfg(test)]
                 maybe_run_before_bucket_delete_command_id_hook(
                     self.metadata_command_apply_test_hook_scope_id(),
+                    &mut work_budget,
                 );
+                self.check_bucket_delete_begin_work_budget(
+                    bucket,
+                    Some(started),
+                    "bucket delete mark-deleting admission budget exhausted",
+                )?;
+                work_budget
+                    .check("bucket delete mark-deleting admission budget exhausted")
+                    .map_err(BucketWriteDrainError::from)?;
                 Self::emit_bucket_delete_begin_loop_step(
                     bucket,
                     pg_id,
@@ -3699,8 +3738,16 @@ impl super::StorageCluster {
                     "pending_install_start",
                     format!("iteration={loop_iteration} command_id={command_id:?}"),
                 );
+                self.check_bucket_delete_begin_work_budget(
+                    bucket,
+                    Some(started),
+                    "bucket delete mark-deleting install budget exhausted",
+                )?;
+                work_budget
+                    .check("bucket delete mark-deleting install budget exhausted")
+                    .map_err(BucketWriteDrainError::from)?;
                 require_valid_route()?;
-                match self
+                let install_result = self
                     .install_snapshot_sensitive_bucket_pg_command_or_drain(
                         publisher,
                         pg_id,
@@ -3709,9 +3756,19 @@ impl super::StorageCluster {
                         Some(effect_fence),
                         &mut work_budget,
                     )
-                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
-                {
-                    super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    .map_err(bucket_snapshot_error_to_bucket_write_drain_error);
+                if matches!(
+                    &install_result,
+                    Err(BucketWriteDrainError::Store(
+                        StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+                    ))
+                ) {
+                    attempt_phase = BucketDeleteAttemptPhase::MarkDeleting;
+                }
+                match install_result? {
+                    super::SnapshotSensitiveInstallOutcome::Installed => {
+                        attempt_phase = BucketDeleteAttemptPhase::MarkDeleting;
+                    }
                     super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         super::sleep_after_metadata_contention_retry_for(
                             "bucket_delete_begin",
@@ -3857,7 +3914,7 @@ impl super::StorageCluster {
                         error
                     ),
                 );
-                if Self::bucket_delete_begin_error_should_rollback_drain(&error) {
+                if Self::bucket_delete_begin_error_should_rollback_drain(&error, attempt_phase) {
                     self.rollback_durable_bucket_delete_drain(&durable_drain)?;
                 } else if matches!(
                     error,
@@ -3981,10 +4038,17 @@ impl super::StorageCluster {
         }
     }
 
-    fn bucket_delete_begin_error_should_rollback_drain(error: &BucketWriteDrainError) -> bool {
+    fn bucket_delete_begin_error_should_rollback_drain(
+        error: &BucketWriteDrainError,
+        attempt_phase: BucketDeleteAttemptPhase,
+    ) -> bool {
+        if attempt_phase == BucketDeleteAttemptPhase::MarkDeleting {
+            return false;
+        }
         match error {
             BucketWriteDrainError::Store(
                 StoreError::MetadataCommandContention { .. }
+                | StoreError::MetadataCommandOutcomeUnconfirmed { .. }
                 | StoreError::PgNotActive { .. }
                 | StoreError::RouteMapExpired { .. }
                 | StoreError::StaleMetadataOperation { .. }

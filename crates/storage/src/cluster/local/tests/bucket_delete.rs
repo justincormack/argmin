@@ -1317,7 +1317,7 @@ fn finalized_bucket_delete_preserves_unrelated_same_pg_pending_command() {
 }
 
 #[test]
-fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
+fn begin_bucket_delete_drain_blocks_bucket_control_slot_before_command_id() {
     let _serial = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1342,7 +1342,6 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
     );
 
     let pg_id = PgId::new(1);
-    let initial_bucket = cluster.test_head_bucket_raw(&bucket).unwrap();
     let hook_ran = Arc::new(AtomicBool::new(false));
     let hook_map = Arc::clone(&map);
     let hook_bucket = bucket.clone();
@@ -1350,7 +1349,7 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
     let _hook_guard =
         cluster.test_install_before_bucket_delete_command_id_hook(Arc::new(move || {
             if hook_ran_for_closure.swap(true, Ordering::SeqCst) {
-                return;
+                return false;
             }
             let primary = hook_map
                 .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
@@ -1370,55 +1369,20 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
                     ),
                 ),
             );
-            drop(pg);
-            insert_pending_metadata_command_for_test(&hook_map, pg_id, &hook_bucket, &command);
+            assert!(
+                !pg.try_insert_bucket_control_pending_metadata_command_slot(
+                    primary.node_id().as_u32(),
+                    &command,
+                    &hook_bucket,
+                )
+                .unwrap(),
+                "live delete drain must prevent the bucket-control command from winning the slot"
+            );
+            false
         }));
 
-    let err = cluster
-        .begin_bucket_delete_if_current(&bucket, bucket_identity)
-        .unwrap_err();
-    assert!(
-            matches!(
-                err,
-                crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention { .. })
-            ),
-            "bucket delete owner should return retryable contention after a winning pending slot advances the bucket generation, got {err:?}"
-        );
-    {
-        let pg = map
-            .node(NodeId::new(1))
-            .unwrap()
-            .storage_node()
-            .get_pg(pg_id.get())
-            .unwrap();
-        let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*pg, &bucket)
-            .unwrap()
-            .expect("retryable DeleteBucket begin should record an attempt outcome");
-        assert_eq!(
-            outcome.outcome,
-            crate::BucketDeleteAttemptOutcomeKind::Retryable
-        );
-        assert_eq!(
-            outcome.phase,
-            crate::BucketDeleteAttemptPhase::StreamCleanup
-        );
-    }
-    assert_eq!(
-        cluster.try_take_reclaim_work(),
-        Some(crate::ReclaimWorkItem::BucketDeleteBegin(
-            crate::BucketDeleteBeginRoot {
-                bucket: bucket.clone(),
-                bucket_execution_generation: initial_bucket.bucket_execution_generation,
-                bucket_incarnation_generation: initial_bucket.bucket_incarnation_generation,
-            }
-        )),
-        "retryable preserved DeleteBucket begin should queue background resume work"
-    );
-    let refreshed_bucket_identity = crate::cluster::BucketIdentityGenerations::from_bucket_info(
-        &cluster.head_bucket_info(&bucket).unwrap(),
-    );
     cluster
-        .begin_bucket_delete_if_current(&bucket, refreshed_bucket_identity)
+        .begin_bucket_delete_if_current(&bucket, bucket_identity)
         .unwrap();
     {
         let pg = map
@@ -1439,18 +1403,18 @@ fn begin_bucket_delete_retries_when_pending_slot_wins_before_command_id() {
 
     assert!(
         hook_ran.load(Ordering::SeqCst),
-        "test hook should install a contender before MarkBucketDeleting id allocation"
+        "test hook should attempt a bucket-control install before MarkBucketDeleting id allocation"
     );
     assert!(
         pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
-        "bucket delete should drain the winning pending slot before retrying"
+        "blocked bucket-control command must not leave a pending slot"
     );
     for node_id in node_ids {
         let node = map.node(node_id).unwrap().storage_node();
         let pg = node.get_pg(pg_id.get()).unwrap();
         let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
         assert_eq!(info.state, crate::BucketState::Deleting);
-        assert_eq!(info.versioning, crate::BucketVersioningState::Enabled);
+        assert_eq!(info.versioning, crate::BucketVersioningState::Disabled);
     }
     assert_clean_metadata_command_stream(&map, &[pg_id.get()]);
 }
@@ -2182,7 +2146,7 @@ fn begin_bucket_delete_partial_mark_deleting_reopens_and_converges() {
             .get_pg(pg_id.get())
             .unwrap();
         let now = crate::clock::current_time_millis();
-        crate::PgMetadataStore::begin_durable_bucket_write_drain(
+        let drain = crate::PgMetadataStore::begin_durable_bucket_write_drain(
             &*primary_pg,
             &bucket,
             "delete-mark-reopen-drain",
@@ -2190,6 +2154,26 @@ fn begin_bucket_delete_partial_mark_deleting_reopens_and_converges() {
             crate::ClusterEpoch::INITIAL,
             now,
             now.saturating_add(30_000),
+        )
+        .unwrap();
+        crate::PgMetadataStore::record_bucket_delete_attempt_outcome(
+            &*primary_pg,
+            &crate::BucketDeleteAttemptOutcomeRecord {
+                bucket: bucket.clone(),
+                drain_id: drain.drain_id.clone(),
+                cluster_epoch: drain.cluster_epoch,
+                bucket_execution_generation: drain.bucket_execution_generation,
+                outcome: crate::BucketDeleteAttemptOutcomeKind::Retryable,
+                phase: crate::BucketDeleteAttemptPhase::FinalVisibilityProven,
+                detail: "final visibility proven before partial mark".to_string(),
+                post_reservation_next_object_pg_id: None,
+                stream_cleanup_next_object_pg_id: None,
+                stream_cleanup_next_session_id_marker: None,
+                stream_cleanup_aborted_uploads: false,
+                final_visibility_next_object_pg_id: None,
+                finalizer_next_object_pg_id: None,
+                updated_at: now,
+            },
         )
         .unwrap();
         let current =
@@ -3564,6 +3548,7 @@ fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
                 Some(pg_count),
                 "final visibility progress should restore the terminal post-reservation frontier after stream cleanup"
             );
+            false
         }));
 
     cluster
@@ -3588,6 +3573,461 @@ fn begin_bucket_delete_records_final_visibility_phase_before_mark_command() {
         crate::BucketDeleteAttemptOutcomeKind::MarkDeleting
     );
     assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+}
+
+#[test]
+fn begin_bucket_delete_deadline_after_final_visibility_does_not_install_mark_command() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-final-visibility-deadline-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let hook_guard =
+        cluster.test_install_before_bucket_delete_command_id_hook(Arc::new(move || {
+            hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+
+    let error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            crate::BucketWriteDrainError::Store(StoreError::MetadataCommandContention {
+                context: "bucket delete mark-deleting admission budget exhausted"
+            })
+        ),
+        "deadline after final visibility should return retryable contention, got {error:?}"
+    );
+    assert_eq!(
+        hook_calls.load(Ordering::SeqCst),
+        1,
+        "test must expire the shared budget at the mark-command admission boundary"
+    );
+
+    let pg_id = PgId::new(cluster.bucket_metadata_pg_id(&bucket));
+    assert!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket).is_none(),
+        "an expired delete must not install MarkBucketDeleting"
+    );
+    let pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Active);
+    let drain = crate::PgMetadataStore::durable_bucket_write_drain(&*pg, &bucket)
+        .unwrap()
+        .expect("deadline exhaustion should preserve the durable delete drain");
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*pg, &bucket)
+        .unwrap()
+        .expect("deadline exhaustion should preserve resumable progress");
+    assert_eq!(outcome.drain_id, drain.drain_id);
+    assert_eq!(
+        outcome.phase,
+        crate::BucketDeleteAttemptPhase::FinalVisibilityProven
+    );
+    drop(pg);
+    drop(hook_guard);
+
+    let visibility_reran = Arc::new(AtomicBool::new(false));
+    let visibility_reran_for_hook = Arc::clone(&visibility_reran);
+    let _visibility_hook =
+        cluster.test_install_before_bucket_delete_final_visibility_hook(Arc::new(move || {
+            visibility_reran_for_hook.store(true, Ordering::SeqCst);
+            Ok(())
+        }));
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("retry should resume the proven visibility frontier and mark the bucket deleting");
+    assert!(
+        !visibility_reran.load(Ordering::SeqCst),
+        "retry must adopt the final-visibility proof rather than repeating the scan"
+    );
+    let pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(pg_id.get())
+        .unwrap();
+    let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+    assert_eq!(info.state, crate::BucketState::Deleting);
+}
+
+#[test]
+fn begin_bucket_delete_response_loss_after_mark_install_preserves_drain_and_exact_slot() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-mark-install-response-loss-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let installed_command = Arc::new(Mutex::new(None));
+    let installed_command_for_hook = Arc::clone(&installed_command);
+    let hook_bucket = bucket.clone();
+    let hook_guard = cluster.test_install_after_bucket_delete_pending_install_response_loss_hook(
+        Arc::new(move |command| {
+            let MetadataCommandPayload::MarkBucketDeleting(mark) = command.payload() else {
+                return false;
+            };
+            if mark.bucket_name() != &hook_bucket {
+                return false;
+            }
+            *installed_command_for_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(command.clone());
+            true
+        }),
+    );
+
+    let error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
+    let installed_command = installed_command
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("test must lose the response after the exact mark command is installed");
+    assert!(
+        matches!(
+            error,
+            crate::BucketWriteDrainError::Store(
+                StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index,
+                }
+            ) if log_index == installed_command.id().log_index().get()
+        ),
+        "post-install response loss should remain typed uncertainty, got {error:?}"
+    );
+
+    let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
+        .expect("response loss must retain the committed pending mark command");
+    assert_eq!(pending.id(), installed_command.id());
+    assert_eq!(pending.command_bytes(), installed_command.command_bytes());
+    let bucket_pg = map
+        .node(NodeId::new(1))
+        .unwrap()
+        .storage_node()
+        .get_pg(1)
+        .unwrap();
+    let drain = crate::PgMetadataStore::durable_bucket_write_drain(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("install uncertainty must preserve the durable delete fence");
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*bucket_pg, &bucket)
+        .unwrap()
+        .expect("install uncertainty must preserve resumable delete progress");
+    assert_eq!(outcome.drain_id, drain.drain_id);
+    assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+    drop(bucket_pg);
+    drop(hook_guard);
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("retry should converge the exact retained mark command");
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
+        "converged retry must clear the exact pending mark command"
+    );
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Deleting
+        );
+    }
+}
+
+#[test]
+fn concurrent_bucket_delete_adopters_preserve_drain_on_mark_validation_failure() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-mark-validation-failure-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
+    create_test_bucket(&cluster, &bucket);
+    let installed_command = Arc::new(Mutex::new(None));
+    let installed_command_for_hook = Arc::clone(&installed_command);
+    let hook_bucket = bucket.clone();
+    let install_hook = cluster.test_install_after_bucket_delete_pending_install_response_loss_hook(
+        Arc::new(move |command| {
+            let MetadataCommandPayload::MarkBucketDeleting(mark) = command.payload() else {
+                return false;
+            };
+            if mark.bucket_name() != &hook_bucket {
+                return false;
+            }
+            *installed_command_for_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(command.clone());
+            true
+        }),
+    );
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect_err("the setup must lose the response after mark installation");
+    drop(install_hook);
+    let installed_command = installed_command
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("the setup must retain the exact installed mark command");
+
+    let validation_calls = Arc::new(AtomicUsize::new(0));
+    let validation_calls_for_hook = Arc::clone(&validation_calls);
+    let expected_command = installed_command.clone();
+    let validation_hook = cluster.test_install_before_bucket_delete_adopted_mark_validation_hook(
+        Arc::new(move |command| {
+            if command == &expected_command {
+                validation_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                return Err(StoreError::MetadataCommandLogConflict {
+                    node_id: 1,
+                    pg_id: command.id().pg_id().get(),
+                    cluster_epoch: command.id().cluster_epoch(),
+                    log_index: command.id().log_index().get(),
+                });
+            }
+            Ok(())
+        }),
+    );
+    let start = Arc::new(std::sync::Barrier::new(3));
+    let mut adopters = Vec::new();
+    for _ in 0..2 {
+        let adopter_cluster = Arc::clone(&cluster);
+        let adopter_bucket = bucket.clone();
+        let adopter_start = Arc::clone(&start);
+        adopters.push(std::thread::spawn(move || {
+            adopter_start.wait();
+            adopter_cluster.test_begin_bucket_delete_if_current(&adopter_bucket)
+        }));
+    }
+    start.wait();
+    for adopter in adopters {
+        let error = adopter
+            .join()
+            .expect("delete-drain adopter must not panic")
+            .expect_err("injected mark validation failure must propagate");
+        assert!(
+            matches!(
+                error,
+                crate::BucketWriteDrainError::Store(
+                    StoreError::MetadataCommandLogConflict {
+                        pg_id: 1,
+                        cluster_epoch: ClusterEpoch::INITIAL,
+                        log_index,
+                        ..
+                    }
+                ) if log_index == installed_command.id().log_index().get()
+            ),
+            "adopted mark validation failure regressed to {error:?}"
+        );
+    }
+    assert!(validation_calls.load(Ordering::SeqCst) >= 2);
+    let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
+        .expect("validation failures must retain the exact pending mark command");
+    assert_eq!(pending.id(), installed_command.id());
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(1).unwrap();
+    assert!(
+        crate::PgMetadataStore::durable_bucket_write_drain(&*primary_pg, &bucket)
+            .unwrap()
+            .is_some(),
+        "concurrent adopters must not clear the command-protected drain"
+    );
+    drop(primary_pg);
+    drop(validation_hook);
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("retry should converge the retained mark command");
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+}
+
+#[test]
+fn begin_bucket_delete_marker_only_convergence_expiry_preserves_drain_and_exact_slot() {
+    let _serial = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "delete-mark-marker-only-expiry-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let installed_command = Arc::new(Mutex::new(None));
+    let installed_command_for_hook = Arc::clone(&installed_command);
+    let hook_bucket = bucket.clone();
+    let install_hook = cluster.test_install_after_bucket_delete_pending_install_response_loss_hook(
+        Arc::new(move |command| {
+            let MetadataCommandPayload::MarkBucketDeleting(mark) = command.payload() else {
+                return false;
+            };
+            if mark.bucket_name() != &hook_bucket {
+                return false;
+            }
+            *installed_command_for_hook
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(command.clone());
+            true
+        }),
+    );
+
+    let install_error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .unwrap_err();
+    assert!(matches!(
+        install_error,
+        crate::BucketWriteDrainError::Store(StoreError::MetadataCommandOutcomeUnconfirmed { .. })
+    ));
+    drop(install_hook);
+    let installed_command = installed_command
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .expect("test must retain the exact installed mark command");
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, PgId::new(1))
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(1).unwrap();
+    primary_pg
+        .mark_pending_metadata_command_publication_started(
+            primary.node_id().as_u32(),
+            &installed_command,
+        )
+        .unwrap();
+    drop(primary_pg);
+
+    let observation_calls = Arc::new(AtomicUsize::new(0));
+    let observation_calls_for_hook = Arc::clone(&observation_calls);
+    let expected_command = installed_command.clone();
+    let observation_hook = cluster
+        .test_install_before_metadata_command_abandoned_log_inspection_hook(Arc::new(
+            move |command| {
+                if command == &expected_command {
+                    observation_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                    return Err(StoreError::StorageRpc {
+                        node_id: 2,
+                        operation: "injected marker-only abandonment observation",
+                        failure: crate::storage_rpc::StorageRpcErrorCode::TransportClosed,
+                        detail: crate::StorageNodeFailureDetail::new(
+                            "persistent response loss after publication started",
+                        ),
+                    }
+                    .into());
+                }
+                Ok(())
+            },
+        ));
+
+    let error = cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect_err("marker-only confirmation expiry must remain typed convergence");
+    assert!(
+        matches!(
+            error,
+            crate::BucketWriteDrainError::Store(
+                StoreError::MetadataCommandIrrevocableConvergencePending {
+                    pg_id: 1,
+                    cluster_epoch: ClusterEpoch::INITIAL,
+                    log_index,
+                }
+            ) if log_index == installed_command.id().log_index().get()
+        ),
+        "marker-only convergence regressed to {error:?}"
+    );
+    assert!(observation_calls.load(Ordering::SeqCst) > 0);
+    let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
+        .expect("marker-only convergence must retain the exact pending mark command");
+    assert_eq!(pending.id(), installed_command.id());
+    assert_eq!(pending.command_bytes(), installed_command.command_bytes());
+    let primary_pg = primary.storage_node().get_pg(1).unwrap();
+    let drain = crate::PgMetadataStore::durable_bucket_write_drain(&*primary_pg, &bucket)
+        .unwrap()
+        .expect("irrevocable mark convergence must preserve the delete fence");
+    let outcome = crate::PgMetadataStore::bucket_delete_attempt_outcome(&*primary_pg, &bucket)
+        .unwrap()
+        .expect("irrevocable mark convergence must preserve resumable progress");
+    assert_eq!(outcome.drain_id, drain.drain_id);
+    assert_eq!(outcome.phase, crate::BucketDeleteAttemptPhase::MarkDeleting);
+    drop(primary_pg);
+    drop(observation_hook);
+
+    cluster
+        .test_begin_bucket_delete_if_current(&bucket)
+        .expect("retry should converge the marker-only pending mark command");
+    assert!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none(),
+        "converged retry must clear the exact pending mark command"
+    );
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Deleting
+        );
+    }
 }
 
 #[test]

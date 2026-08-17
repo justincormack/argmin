@@ -168,6 +168,34 @@ impl super::StorageCluster {
         BucketDeleteCommandIdTestHookGuard { scope_id }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_install_after_bucket_delete_pending_install_response_loss_hook(
+        &self,
+        hook: BucketDeletePendingInstallResponseLossTestHook,
+    ) -> BucketDeletePendingInstallResponseLossTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = AFTER_BUCKET_DELETE_PENDING_INSTALL_RESPONSE_LOSS_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeletePendingInstallResponseLossTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_install_before_bucket_delete_adopted_mark_validation_hook(
+        &self,
+        hook: BucketDeleteAdoptedMarkValidationTestHook,
+    ) -> BucketDeleteAdoptedMarkValidationTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = BEFORE_BUCKET_DELETE_ADOPTED_MARK_VALIDATION_HOOKS
+            .get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        BucketDeleteAdoptedMarkValidationTestHookGuard { scope_id }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn test_install_before_bucket_delete_final_visibility_hook(
         &self,
@@ -3139,12 +3167,35 @@ impl super::StorageCluster {
         if effect_fence.is_some() {
             self.maybe_run_before_metadata_command_pending_install_hook();
         }
-        match self.try_set_pending_metadata_command_for_bucket_with_effect_fence(
+        work_budget.check("bucket metadata pending install retry budget exhausted")?;
+        let install_result = self.try_set_pending_metadata_command_for_bucket_with_effect_fence_until(
             pg_id,
             bucket,
             command,
             effect_fence,
-        ) {
+            work_budget.deadline(),
+        );
+        #[cfg(test)]
+        let install_result = match install_result {
+            Ok(Some(()))
+                if maybe_run_after_bucket_delete_pending_install_response_loss_hook(
+                    self.metadata_command_apply_test_hook_scope_id(),
+                    command,
+                ) =>
+            {
+                Err(MetadataCommandPendingSlotInsertError::may_have_applied(
+                    StoreError::Io {
+                        context: "injected response loss after bucket pending-slot installation",
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::ConnectionReset,
+                            "injected response loss after durable pending-slot installation",
+                        ),
+                    },
+                ))
+            }
+            result => result,
+        };
+        match install_result {
             Ok(Some(())) => Ok(true),
             Ok(None) => {
                 if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
@@ -3158,7 +3209,13 @@ impl super::StorageCluster {
                 }
                 Ok(false)
             }
-            Err(StoreError::MetadataCommandLogConflict { .. }) => {
+            Err(error)
+                if error.kind() != MetadataCommandApplyErrorKind::MayHaveApplied
+                    && matches!(
+                        error.source(),
+                        StoreError::MetadataCommandLogConflict { .. }
+                    ) =>
+            {
                 if let Some(pending) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
                     let pending_bucket = Self::metadata_command_bucket_name(&pending).clone();
                     self.drain_pending_metadata_command_pg_slot_with_work_budget(
@@ -3170,7 +3227,16 @@ impl super::StorageCluster {
                 }
                 Ok(false)
             }
-            Err(error) => Err(error.into()),
+            Err(error) if error.kind() == MetadataCommandApplyErrorKind::MayHaveApplied => {
+                let id = command.id();
+                Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                }
+                .into())
+            }
+            Err(error) => Err(error.into_source().into()),
         }
     }
 

@@ -6768,15 +6768,22 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
         replacement: &MetadataCommandEnvelope,
         bucket: Option<&BucketName>,
     ) -> Result<bool, MetadataCommandPendingSlotReplaceError> {
-        self.validate_command_route(authorized_source)
-            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
-        self.validate_optional_command_route(abandoned_source)
-            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
-        MetadataCommandRecoveryCriticalSection::replace_pending_metadata_command_slot_for_reissue(
-            self,
+        let deadline = Instant::now()
+            .checked_add(STORAGE_RPC_CLIENT_RESPONSE_TIMEOUT)
+            .ok_or_else(|| {
+                MetadataCommandPendingSlotReplaceError::not_sent(
+                    crate::node_client::storage_rpc_deadline_expired(
+                        "set local metadata command recovery pending slot replace deadline",
+                    ),
+                )
+            })?;
+        self.replace_pending_metadata_command_slot_for_recovery_until(
+            authorized_source,
+            abandoned_source,
             previous,
             replacement,
             bucket,
+            deadline,
         )
     }
 
@@ -6793,13 +6800,38 @@ impl MetadataCommandRecoveryCriticalSection for LocalMetadataCommandRecoveryCrit
             .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
         self.validate_optional_command_route(abandoned_source)
             .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
-        MetadataCommandRecoveryCriticalSection::replace_pending_metadata_command_slot_for_reissue_until(
-            self,
+        self.validate_command_route(previous)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        self.validate_command_route(replacement)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        let pg = self
+            .client
+            .storage_node
+            .get_pg_until(self.pg_id.get(), deadline)
+            .map_err(MetadataCommandPendingSlotReplaceError::not_sent)?;
+        let result = pg.replace_pending_metadata_command_slot_for_recovery(
+            self.client.node_id.as_u32(),
+            authorized_source,
+            abandoned_source,
             previous,
             replacement,
             bucket,
-            deadline,
-        )
+        );
+        if Instant::now() >= deadline {
+            return Err(MetadataCommandPendingSlotReplaceError::may_have_applied(
+                crate::node_client::storage_rpc_deadline_expired(
+                    "local metadata command recovery pending slot replace deadline expired",
+                ),
+            ));
+        }
+        result.map_err(|error| match error {
+            crate::pg_store::PendingMetadataCommandSlotReplaceError::Definitive(source) => {
+                MetadataCommandPendingSlotReplaceError::definitive(source)
+            }
+            crate::pg_store::PendingMetadataCommandSlotReplaceError::MayHaveApplied(source) => {
+                MetadataCommandPendingSlotReplaceError::may_have_applied(source)
+            }
+        })
     }
 
     fn apply_metadata_command_and_record_for_recovery(
