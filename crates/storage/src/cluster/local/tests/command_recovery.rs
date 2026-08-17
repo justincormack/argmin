@@ -8786,7 +8786,7 @@ fn direct_put_commit_drains_unrelated_pending_command_before_publish() {
 }
 
 #[test]
-fn direct_put_preserves_irrevocable_outcome_after_partial_pending_conflict_budget_expiry() {
+fn direct_put_maps_irrevocable_unrelated_partial_pending_conflict_to_contention() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
     let ec_shape = EcShape { k: 2, m: 1 };
@@ -8868,6 +8868,7 @@ fn direct_put_preserves_irrevocable_outcome_after_partial_pending_conflict_budge
         crate::metadata_command::PUT_OBJECT_METADATA_BUCKET_WRITE_OPERATION_KIND,
         Some(pending_key.as_str()),
     );
+    let pending_reservation_id = proof.reservation_id.clone();
     let pending_command = MetadataCommandEnvelope::new(
         MetadataCommandId::new(
             ClusterEpoch::INITIAL,
@@ -8883,19 +8884,33 @@ fn direct_put_preserves_irrevocable_outcome_after_partial_pending_conflict_budge
         )),
     );
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &pending_command);
-    assert!(
-        pending_metadata_command_for_test(&map, pg_id, &bucket).is_some(),
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket).as_ref(),
+        Some(&pending_command),
         "unrelated object metadata command must start pending"
     );
+    let witness_node_id = NodeId::new(0);
+    map.node(witness_node_id)
+        .unwrap()
+        .storage_node()
+        .get_pg(object_pg)
+        .unwrap()
+        .apply_metadata_command_and_record(witness_node_id.as_u32(), &pending_command)
+        .unwrap();
 
-    let partial_conflict_observed = Arc::new(AtomicBool::new(false));
-    let partial_conflict_observed_for_hook = Arc::clone(&partial_conflict_observed);
+    let partial_conflict_attempts = Arc::new(AtomicUsize::new(0));
+    let partial_conflict_attempts_for_hook = Arc::clone(&partial_conflict_attempts);
     let partial_conflict_hook = cluster.test_install_pending_object_metadata_partial_conflict_hook(
         Arc::new(move |command| {
-            matches!(
+            let matches_pending = matches!(
                 command.payload(),
                 MetadataCommandPayload::PutObjectMetadata(_)
-            ) && !partial_conflict_observed_for_hook.swap(true, Ordering::SeqCst)
+            );
+            if !matches_pending {
+                return false;
+            }
+            let attempt = partial_conflict_attempts_for_hook.fetch_add(1, Ordering::SeqCst);
+            attempt < 2
         }),
     );
     let error = cluster
@@ -8905,12 +8920,89 @@ fn direct_put_preserves_irrevocable_outcome_after_partial_pending_conflict_budge
         .unwrap_err();
     assert!(matches!(
         error,
-        crate::ObjectPgActionError::Store(
-            StoreError::MetadataCommandIrrevocableConvergencePending { .. }
-        )
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+            context: "direct PUT blocked by pending command convergence"
+        })
     ));
-    assert!(partial_conflict_observed.load(Ordering::SeqCst));
+    assert_eq!(partial_conflict_attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket).as_ref(),
+        Some(&pending_command),
+        "the irrevocable unrelated command must remain available to recovery"
+    );
+    let bucket_pg_id = PgId::new(
+        map.node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology()
+            .bucket_pg_for(&bucket),
+    );
+    let bucket_primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, bucket_pg_id)
+        .unwrap();
+    let bucket_pg = bucket_primary
+        .storage_node()
+        .get_pg(bucket_pg_id.get())
+        .unwrap();
+    let reservations =
+        crate::PgMetadataStore::durable_bucket_write_reservations(&*bucket_pg, &bucket).unwrap();
+    assert_eq!(
+        reservations.len(),
+        1,
+        "the blocked direct PUT must release only its own reservation"
+    );
+    assert_eq!(
+        reservations[0].reservation_id, pending_reservation_id,
+        "the unrelated pending command must retain its exact reservation"
+    );
+    assert_eq!(
+        reservations[0].target_context.as_deref(),
+        Some(pending_key.as_str())
+    );
+    drop(bucket_pg);
+    for shard_index in 0..written.ec.k + written.ec.m {
+        assert!(!cluster
+            .test_payload_shard_file_exists(
+                written.data_pg_id,
+                written.ec,
+                &segment_okh,
+                generation_id,
+                shard_index,
+            )
+            .unwrap());
+    }
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(object_pg).unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+        Err(crate::MetadataError::ObjectNotFound)
+    ));
+    drop(pg);
     drop(partial_conflict_hook);
+
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
+    assert!(pending_metadata_command_for_test(&map, pg_id, &bucket).is_none());
+    assert_bucket_write_reservations_released(&map, &bucket);
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(object_pg)
+            .unwrap();
+        let stored = crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &pending_key)
+            .unwrap()
+            .into_live()
+            .unwrap();
+        assert_eq!(
+            stored.tags.as_ref().map(crate::SerializedTagSet::as_str),
+            Some(crate::tests::object_tags(tags).as_str())
+        );
+    }
 }
 
 #[test]

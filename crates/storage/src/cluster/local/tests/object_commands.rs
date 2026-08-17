@@ -4537,7 +4537,7 @@ fn suspended_delete_marker_retries_transient_contender_drain_admission() {
     let fail_once_for_hook = Arc::clone(&fail_once);
     let contender_id = contender.id();
     let _hook = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(Arc::new(
-        move |command| {
+        move |command, _work_budget| {
             if command.id() == contender_id && fail_once_for_hook.swap(false, Ordering::SeqCst) {
                 return Err(crate::ObjectPgActionError::Store(
                     StoreError::MetadataCommandContention {

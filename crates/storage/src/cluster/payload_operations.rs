@@ -9,6 +9,21 @@ fn object_version_allocator_command_contention(error: &ObjectPgActionError) -> b
     )
 }
 
+fn direct_put_uninstalled_pending_drain_error(
+    error: ObjectPgActionError,
+) -> ObjectPgActionError {
+    match error {
+        ObjectPgActionError::Store(
+            StoreError::MetadataCommandOutcomeUnconfirmed { .. }
+            | StoreError::MetadataCommandIrrevocableConvergencePending { .. }
+            | StoreError::MetadataCommandDependencyConvergencePending { .. },
+        ) => ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+            context: "direct PUT blocked by pending command convergence",
+        }),
+        error => error,
+    }
+}
+
 #[derive(Debug)]
 enum PendingObjectMetadataCommandCompletion {
     Applied,
@@ -1750,6 +1765,7 @@ impl StorageCluster {
             request_ops::maybe_run_pending_object_metadata_command_drain_attempt_hook(
                 self.metadata_command_apply_test_hook_scope_id(),
                 &command,
+                authority.work_budget(),
             )?;
             let mut leader = authority
                 .admit_leader(recovery_guard, pg_id, &command)
@@ -3827,7 +3843,7 @@ impl StorageCluster {
             ($error:ident, $context:literal) => {{
                 if work_budget.sleep_after_contention($context).is_err() {
                     cleanup_direct_put_attempt_before_command_ownership!();
-                    return Err($error);
+                    return Err(direct_put_uninstalled_pending_drain_error($error));
                 }
                 continue;
             }};
@@ -4488,7 +4504,7 @@ impl StorageCluster {
                                 return Err(error);
                             }
                             cleanup_direct_put_attempt_before_command_ownership!();
-                            return Err(error);
+                            return Err(direct_put_uninstalled_pending_drain_error(error));
                         }
                     }
                 };

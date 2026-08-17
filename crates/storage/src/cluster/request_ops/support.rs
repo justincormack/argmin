@@ -669,7 +669,12 @@ type DirectPutPendingInstallUncertaintyTestHook = Arc<dyn Fn() -> bool + Send + 
 
 #[cfg(test)]
 type PendingObjectMetadataCommandDrainAttemptTestHook =
-    Arc<dyn Fn(&MetadataCommandEnvelope) -> Result<(), ObjectPgActionError> + Send + Sync>;
+    Arc<
+        dyn Fn(&MetadataCommandEnvelope, &mut super::RequestWorkBudget)
+                -> Result<(), ObjectPgActionError>
+            + Send
+            + Sync,
+    >;
 
 #[cfg(test)]
 type BucketDeleteCommandIdTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -1940,6 +1945,7 @@ pub(super) fn maybe_run_direct_put_pending_install_uncertainty_hook(
 pub(super) fn maybe_run_pending_object_metadata_command_drain_attempt_hook(
     scope_id: usize,
     command: &MetadataCommandEnvelope,
+    work_budget: &mut super::RequestWorkBudget,
 ) -> Result<(), ObjectPgActionError> {
     let hook = PENDING_OBJECT_METADATA_COMMAND_DRAIN_ATTEMPT_HOOKS
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -1948,7 +1954,7 @@ pub(super) fn maybe_run_pending_object_metadata_command_drain_attempt_hook(
         .get(&scope_id)
         .cloned();
     match hook {
-        Some(hook) => hook(command),
+        Some(hook) => hook(command, work_budget),
         None => Ok(()),
     }
 }

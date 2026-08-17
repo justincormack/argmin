@@ -1064,6 +1064,150 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
 }
 
 #[test]
+fn direct_put_uninstalled_candidate_maps_contender_convergence_to_contention() {
+    let _guard = lock_metadata_command_apply_hook_test();
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let pg_ids = [0, 1, 2, 3];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &pg_ids, ec_shape).unwrap();
+    let topology = map
+        .node(NodeId::new(0))
+        .unwrap()
+        .storage_node()
+        .pg_topology();
+    let bucket = bucket_for_pg(topology, 1, "direct-put-contender-convergence-");
+    let key = key_for_object_pg(topology, &bucket, 2, "candidate-");
+    let contender_key = key_for_object_pg(topology, &bucket, 2, "contender-");
+    set_route_primary(&mut map, 1, NodeId::new(1));
+    set_route_primary(&mut map, 2, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let reservation_id = crate::SessionId::try_from("23".repeat(16)).unwrap();
+    let generation_id = cluster
+        .reserve_put_object_generation(&bucket, &key, &reservation_id)
+        .unwrap();
+    let segment_okh = [0x93; 16];
+    let written = cluster
+        .write_direct_put_segment_payload_shards(
+            &bucket,
+            &key,
+            generation_id,
+            0,
+            &segment_okh,
+            b"uninstalled direct PUT candidate",
+        )
+        .unwrap();
+    let commit_req = direct_put_commit_req(
+        &cluster,
+        DirectPutCommitReqFixture {
+            bucket: &bucket,
+            key: &key,
+            reservation_id,
+            generation_id,
+            payload: b"uninstalled direct PUT candidate",
+            segment_okh,
+            written: &written,
+        },
+    );
+
+    let pg_id = PgId::new(2);
+    let contender = MetadataCommandEnvelope::new(
+        cluster.next_object_metadata_command_id(pg_id).unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            contender_key,
+            crate::SessionId::try_from("24".repeat(16)).unwrap(),
+            GenerationId::new(24).unwrap(),
+            crate::clock::current_time_millis(),
+        )),
+    );
+    let contender_id = contender.id();
+    let install_ran = Arc::new(AtomicBool::new(false));
+    let install_ran_for_hook = Arc::clone(&install_ran);
+    let hook_map = Arc::clone(&map);
+    let hook_bucket = bucket.clone();
+    let hook_contender = contender.clone();
+    let _install_hook =
+        cluster.test_install_before_metadata_command_pending_install_hook(Arc::new(move || {
+            if install_ran_for_hook.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let primary = hook_map
+                .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+                .unwrap();
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+            pg.try_insert_pending_metadata_command_slot(
+                primary.node_id().as_u32(),
+                &hook_contender,
+                Some(&hook_bucket),
+            )
+            .unwrap();
+        }));
+
+    let drain_ran = Arc::new(AtomicBool::new(false));
+    let drain_ran_for_hook = Arc::clone(&drain_ran);
+    let _drain_hook = cluster.test_install_pending_object_metadata_command_drain_attempt_hook(
+        Arc::new(move |command, work_budget| {
+            if command.id() == contender_id {
+                drain_ran_for_hook.store(true, Ordering::SeqCst);
+                work_budget.expire_for_test();
+                return Err(crate::ObjectPgActionError::Store(
+                    StoreError::MetadataCommandDependencyConvergencePending {
+                        pg_id: pg_id.get(),
+                        cluster_epoch: contender_id.cluster_epoch(),
+                        log_index: contender_id.log_index().get(),
+                    },
+                ));
+            }
+            Ok(())
+        }),
+    );
+
+    let error = cluster
+        .commit_direct_put_object_from_payload_shards(&commit_req, &written.written_shards, |_| {
+            Ok::<(), ()>(())
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
+            context: "direct PUT blocked by pending command convergence"
+        })
+    ));
+    assert!(install_ran.load(Ordering::SeqCst));
+    assert!(drain_ran.load(Ordering::SeqCst));
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(contender),
+        "the unrelated converging command must remain available to recovery"
+    );
+    assert_bucket_write_reservations_released(&map, &bucket);
+    for shard_index in 0..written.ec.k + written.ec.m {
+        assert!(!cluster
+            .test_payload_shard_file_exists(
+                written.data_pg_id,
+                written.ec,
+                &segment_okh,
+                generation_id,
+                shard_index,
+            )
+            .unwrap());
+    }
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    assert!(matches!(
+        crate::PgMetadataStore::get_object_meta(&*pg, &bucket, &key),
+        Err(crate::MetadataError::ObjectNotFound)
+    ));
+}
+
+#[test]
 fn direct_put_pending_install_uncertainty_without_durable_command_reinspects() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -4030,7 +4174,7 @@ fn direct_put_command_id_race_drains_winner_and_reruns_precondition_action() {
     let transient_drain_failure_for_hook = Arc::clone(&transient_drain_failure);
     let _drain_hook = first_cluster
         .test_install_pending_object_metadata_command_drain_attempt_hook(Arc::new(
-            move |command| {
+            move |command, _work_budget| {
                 if matches!(
                     command.payload(),
                     MetadataCommandPayload::CommitDirectPutObject(commit)
