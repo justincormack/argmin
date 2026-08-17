@@ -1046,7 +1046,7 @@
     }
 
     #[test]
-    fn metadata_command_apply_encodes_bound_stream_no_such_upload() {
+    fn metadata_command_apply_encodes_bound_stream_terminal_outcomes_as_no_such_upload() {
         let session_id = SessionId::try_from("16".repeat(16)).unwrap();
         let upload_id = UploadId::for_test("server-missing-append-upload");
         let bucket = crate::tests::bucket_name("server-append-rpc-bucket");
@@ -1164,9 +1164,9 @@
         );
 
         for (command, expected_session_id) in [
-            (append_command, session_id),
-            (create_command.clone(), create_session_id),
-            (commit_command, commit_session_id),
+            (append_command.clone(), session_id.clone()),
+            (create_command.clone(), create_session_id.clone()),
+            (commit_command.clone(), commit_session_id.clone()),
         ] {
             let response = metadata_command_state_result_response(
                 &command,
@@ -1187,6 +1187,104 @@
                     session_id: expected_session_id,
                     upload_id: upload_id.clone(),
                 }
+            );
+        }
+
+        for (command, expected_session_id) in [
+            (&append_command, &session_id),
+            (&commit_command, &commit_session_id),
+        ] {
+            for terminal_error in [
+                MetadataError::StreamSessionNotFound {
+                    session_id: expected_session_id.as_str().to_string(),
+                },
+                MetadataError::StreamSessionNotInProgress { state: 2 },
+            ] {
+                let response = metadata_command_state_result_response(
+                    command,
+                    Err(BucketSnapshotLoadError::Metadata(terminal_error)),
+                )
+                .unwrap();
+                let payload = decode_storage_rpc_response_payload(&response)
+                    .unwrap()
+                    .unwrap();
+                let decoded = decode_metadata_command_state_outcome_response(&payload).unwrap();
+                assert_eq!(
+                    decoded.outcome,
+                    StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                        session_id: expected_session_id.clone(),
+                        upload_id: upload_id.clone(),
+                    }
+                );
+            }
+        }
+
+        let response = metadata_command_state_result_response(
+            &append_command,
+            Err(BucketSnapshotLoadError::Metadata(
+                MetadataError::StreamSessionNotFound {
+                    session_id: "different-server-session".to_string(),
+                },
+            )),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_storage_rpc_response_payload(&response)
+                .unwrap()
+                .unwrap_err()
+                .code,
+            StorageRpcErrorCode::Internal
+        );
+
+        let put_object_command = match append_command.payload() {
+            MetadataCommandPayload::AppendStreamSegment(append) => MetadataCommandEnvelope::new(
+                append_command.id(),
+                MetadataCommandPayload::AppendStreamSegment(Box::new(
+                    crate::metadata_command::AppendStreamSegmentCommand {
+                        target: StreamUploadTarget::PutObject,
+                        ..append.as_ref().clone()
+                    },
+                )),
+            ),
+            _ => unreachable!(),
+        };
+        for terminal_error in [
+            MetadataError::StreamSessionNotFound {
+                session_id: session_id.as_str().to_string(),
+            },
+            MetadataError::StreamSessionNotInProgress { state: 2 },
+        ] {
+            let response = metadata_command_state_result_response(
+                &put_object_command,
+                Err(BucketSnapshotLoadError::Metadata(terminal_error)),
+            )
+            .unwrap();
+            assert_eq!(
+                decode_storage_rpc_response_payload(&response)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                StorageRpcErrorCode::Internal
+            );
+        }
+
+        for terminal_error in [
+            MetadataError::StreamSessionNotFound {
+                session_id: create_session_id.as_str().to_string(),
+            },
+            MetadataError::StreamSessionNotInProgress { state: 2 },
+        ] {
+            let response = metadata_command_state_result_response(
+                &create_command,
+                Err(BucketSnapshotLoadError::Metadata(terminal_error)),
+            )
+            .unwrap();
+            assert_eq!(
+                decode_storage_rpc_response_payload(&response)
+                    .unwrap()
+                    .unwrap_err()
+                    .code,
+                StorageRpcErrorCode::Internal
             );
         }
 

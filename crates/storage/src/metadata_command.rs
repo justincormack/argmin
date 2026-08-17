@@ -841,6 +841,19 @@ impl MetadataCommandPayload {
         }
     }
 
+    pub(crate) fn stream_upload_terminal_session_subject(&self) -> Option<(&SessionId, &UploadId)> {
+        match self {
+            Self::AppendStreamSegment(append) => match &append.target {
+                StreamUploadTarget::UploadPart { upload_id, .. } => {
+                    Some((&append.segment.session_id, upload_id))
+                }
+                StreamUploadTarget::PutObject => None,
+            },
+            Self::CommitStreamPart(commit) => Some((&commit.session_id, &commit.upload.upload_id)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn abandoned_recovery_follow_up(&self) -> Option<Self> {
         let release = match self {
             Self::CommitDirectPutObject(commit) => ReleaseObjectGenerationCommand::new(

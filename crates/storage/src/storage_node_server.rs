@@ -503,6 +503,48 @@ fn metadata_command_state_result_response(
                 upload_id: expected_upload_id.clone(),
             }
         }
+        Err(BucketSnapshotLoadError::Metadata(crate::MetadataError::StreamSessionNotFound {
+            session_id,
+        })) => {
+            let Some((expected_session_id, upload_id)) =
+                command.payload().stream_upload_terminal_session_subject()
+            else {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::Internal,
+                    message: "metadata command returned StreamSessionNotFound for an unsupported command subject"
+                        .to_string(),
+                });
+            };
+            if session_id != expected_session_id.as_str() {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::Internal,
+                    message:
+                        "metadata command returned StreamSessionNotFound for a different session"
+                            .to_string(),
+                });
+            }
+            StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id: expected_session_id.clone(),
+                upload_id: upload_id.clone(),
+            }
+        }
+        Err(BucketSnapshotLoadError::Metadata(
+            crate::MetadataError::StreamSessionNotInProgress { .. },
+        )) => {
+            let Some((session_id, upload_id)) =
+                command.payload().stream_upload_terminal_session_subject()
+            else {
+                return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
+                    code: StorageRpcErrorCode::Internal,
+                    message: "metadata command returned StreamSessionNotInProgress for an unsupported command subject"
+                        .to_string(),
+                });
+            };
+            StorageRpcMetadataCommandStateOutcome::StreamUploadNoSuchUpload {
+                session_id: session_id.clone(),
+                upload_id: upload_id.clone(),
+            }
+        }
         Err(BucketSnapshotLoadError::Metadata(error)) => {
             return encode_storage_rpc_error_response(&StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::Internal,
