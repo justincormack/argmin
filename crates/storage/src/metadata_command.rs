@@ -432,7 +432,7 @@ define_metadata_command_publishers! {
         SnapshotSensitive
     ),
     EstablishMultipartCompletionBarrier => (
-        "establish_multipart_completion_barrier",
+        "establish_multipart_completion_barrier_inner",
         "AdvanceMultipartCompletionBarrier",
         AllocatorCleanup
     ),
