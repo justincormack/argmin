@@ -7466,7 +7466,7 @@ fn stream_put_multiple_segments_correct_manifest() {
     }
     assert!(coord
         .storage_node()
-        .test_object_payload_snapshot_uses_generation_layout(&committed)
+        .test_object_payload_snapshot_uses_stream_session_layout(&committed, &session_id)
         .unwrap());
 }
 

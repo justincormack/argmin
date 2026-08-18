@@ -1462,22 +1462,20 @@ fn upload_streamed_test_multipart_part(
     key: &crate::ObjectKey,
     upload_id: &crate::UploadId,
     part_number: u32,
-    segment_okh: [u8; 16],
+    session_seed: [u8; 16],
     payload: &[u8],
 ) -> (
     Vec<ShardKey>,
     crate::MultipartPartRecord,
     crate::MultipartPartSegmentRecord,
 ) {
-    let session_seed = segment_okh[0];
+    let session_seed = session_seed[0];
     let session_nonce = STREAMED_MULTIPART_PART_SESSION_NONCE.fetch_add(1, Ordering::SeqCst);
     let session_id = crate::SessionId::try_from(format!(
         "{session_nonce:016x}{:014x}{session_seed:02x}",
         u64::from(part_number),
     ))
     .unwrap();
-    let mut effective_segment_okh = segment_okh;
-    effective_segment_okh[..8].copy_from_slice(&session_nonce.to_be_bytes());
     let upload = cluster
         .load_in_progress_multipart_upload(bucket, key, upload_id)
         .unwrap();
@@ -1496,10 +1494,13 @@ fn upload_streamed_test_multipart_part(
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: effective_segment_okh,
             },
         )
         .unwrap();
+    assert_eq!(
+        segment.segment_okh,
+        crate::stream_segment_key_hash(&session_id, segment.segment_index)
+    );
     let written_shards = cluster
         .write_stream_segment_payload_shards(&segment, payload)
         .unwrap();

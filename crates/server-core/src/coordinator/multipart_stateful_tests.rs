@@ -31,6 +31,8 @@ const MULTIPART_COMPLETE_TERMINAL_REAUTHORIZATION_TOKEN: DeterministicFaultToken
     DeterministicFaultToken::new("multipart-complete-terminal-reauthorization");
 const MULTIPART_COMPLETE_CONTENTION_INJECTION_TOKEN: DeterministicFaultToken =
     DeterministicFaultToken::new("multipart-complete-contention-injection");
+const STALE_STREAM_APPEND_AFTER_PREPARE_TOKEN: DeterministicFaultToken =
+    DeterministicFaultToken::new("stale-stream-append-after-prepare");
 
 fn test_sse_s3_provider() -> StaticManagedKeyProvider {
     StaticManagedKeyProvider::single(
@@ -885,6 +887,111 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
         "{invariant}: finalized object body did not match the winning duplicate append"
     );
     state.assert_no_active_stream_sessions_for("bucket", &key, invariant);
+}
+
+#[test]
+fn aborted_stream_put_stale_append_cannot_corrupt_reused_generation() {
+    let dir = test_util::tempdir();
+    let storage_cluster = open_test_storage_cluster(dir.path(), &[0]);
+    let admin = setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let stale_writer =
+        setup_same_process_coordinator_with_storage_cluster(Arc::clone(&storage_cluster));
+    let retry_writer = setup_same_process_coordinator_with_storage_cluster(storage_cluster);
+    let invariant = "a stale append from an aborted stream must not share retry shard identity";
+
+    admin
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let stale_session = begin_stream_put_test(&admin, "bucket", "key").unwrap();
+
+    let _serial = STREAM_APPEND_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let stale_append_gate = DeterministicFaultGate::new(STALE_STREAM_APPEND_AFTER_PREPARE_TOKEN);
+    let _stale_append_release = stale_append_gate.release_on_drop();
+    let stale_append_gate_hook = Arc::clone(&stale_append_gate);
+    let _hook = admin.install_stream_append_test_hooks(StreamAppendTestHooks {
+        target: Some((stale_session.as_str().to_owned(), 0)),
+        after_prepare: Some(Arc::new(move || {
+            stale_append_gate_hook.wait_at(STALE_STREAM_APPEND_AFTER_PREPARE_TOKEN);
+        })),
+    });
+
+    let stale_session_for_writer = stale_session.clone();
+    let stale_thread = std::thread::spawn(move || {
+        stale_writer.append_plaintext_stream_segment_for_test(
+            "bucket",
+            "key",
+            &stale_session_for_writer,
+            0,
+            b"stale payload",
+        )
+    });
+    stale_append_gate.wait_until_arrived(Duration::from_secs(2));
+
+    admin
+        .abort_stream_put("bucket", "key", &stale_session)
+        .unwrap();
+
+    let retry_session = begin_stream_put_test(&retry_writer, "bucket", "key").unwrap();
+    let retry_payload = b"retry payload";
+    retry_writer
+        .append_plaintext_stream_segment_for_test("bucket", "key", &retry_session, 0, retry_payload)
+        .unwrap();
+    let retry_snapshot = admin
+        .storage_node()
+        .test_capture_stream_upload_payload(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            &retry_session,
+        )
+        .unwrap();
+    assert_eq!(retry_snapshot.segment_count(), 1, "{invariant}");
+
+    stale_append_gate.release();
+    let stale_result = stale_thread.join().unwrap();
+    assert!(
+        matches!(stale_result, Err(ServerError::StreamUpload(ref error)) if
+            error.kind() == storage::StreamUploadFailureKind::SessionNotFound),
+        "{invariant}: stale append should lose its aborted session, got {stale_result:?}"
+    );
+    assert!(
+        admin
+            .storage_node()
+            .test_stream_upload_payload_snapshot_is_fully_present(&retry_snapshot)
+            .unwrap(),
+        "{invariant}: stale append changed the retry's staged shard set"
+    );
+
+    retry_writer
+        .finalize_stream_put(&FinalizeStreamPutRequest {
+            object: object_request("bucket", "key", test_requester()),
+            session_id: &retry_session,
+            crc64: checksum::crc64::checksum(retry_payload),
+            total_size: retry_payload.len() as u64,
+            metadata_blob: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            write_encryption: ActiveWriteEncryptionRef::None,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            requested_object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+    let object = admin
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request("bucket", "key", None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        read_all_body(object.body).unwrap(),
+        retry_payload,
+        "{invariant}"
+    );
 }
 
 #[test]

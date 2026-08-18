@@ -172,18 +172,14 @@ impl SharedStorageNode {
             &request.session_id,
             request.segment_index,
         )?;
-        let (segment_okh, segment_vid, data_pg_id) = match session.target {
+        let segment_okh =
+            crate::stream_segment_key_hash(&request.session_id, request.segment_index);
+        let (segment_vid, data_pg_id) = match session.target {
             StreamUploadTarget::PutObject => {
                 let generation_id =
                     pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
                 let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
                 (
-                    crate::segment_key_hash(
-                        bucket.as_str(),
-                        key.as_str(),
-                        generation_id,
-                        request.segment_index,
-                    ),
                     segment_vid,
                     self.pg_topology
                         .object_generation_segment_data_pg(
@@ -204,7 +200,6 @@ impl SharedStorageNode {
                 )?;
                 let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
                 (
-                    request.segment_okh,
                     segment_vid,
                     self.pg_topology
                         .object_generation_multipart_part_segment_data_pg(

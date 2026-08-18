@@ -659,7 +659,6 @@ fn put_prepare_stream_segment_append_req(
     put_u64(out, request.size);
     put_u64(out, request.segment_crc64);
     put_u64(out, request.payload_crc64);
-    put_bytes(out, &request.segment_okh);
 }
 
 fn put_stream_upload_target(out: &mut Vec<u8>, target: &StreamUploadTarget) {

@@ -404,6 +404,12 @@ pub mod test_support {
             snapshot: &TestObjectPayloadSnapshot,
         ) -> Result<bool, TestStorageFailure>;
 
+        fn test_object_payload_snapshot_uses_stream_session_layout(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+            session_id: &SessionId,
+        ) -> Result<bool, TestStorageFailure>;
+
         fn test_object_payload_snapshot_uses_transient_direct_put_layout(
             &self,
             snapshot: &TestObjectPayloadSnapshot,
@@ -547,6 +553,17 @@ pub mod test_support {
         ) -> Result<bool, TestStorageFailure> {
             StorageCluster::test_object_payload_snapshot_uses_generation_layout(self, snapshot)
                 .map_err(TestStorageFailure::from_store)
+        }
+
+        fn test_object_payload_snapshot_uses_stream_session_layout(
+            &self,
+            snapshot: &TestObjectPayloadSnapshot,
+            session_id: &SessionId,
+        ) -> Result<bool, TestStorageFailure> {
+            StorageCluster::test_object_payload_snapshot_uses_stream_session_layout(
+                self, snapshot, session_id,
+            )
+            .map_err(TestStorageFailure::from_store)
         }
 
         fn test_object_payload_snapshot_uses_transient_direct_put_layout(

@@ -5456,7 +5456,6 @@ impl StorageCluster {
                 })
                 .map_err(E::from)? as u64
         };
-        let segment_okh = crate::stream_segment_key_hash(input.session_id, input.segment_index);
         let (target, segment_record) = self
             .prepare_stream_segment_append_with_route_validation(
                 route,
@@ -5466,7 +5465,6 @@ impl StorageCluster {
                     size: logical_size,
                     segment_crc64: checksum::crc64::checksum(input.storage_bytes),
                     payload_crc64: input.payload_crc64,
-                    segment_okh,
                 },
                 &mut require_valid_route,
             )

@@ -853,7 +853,6 @@ fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
                     size: 16,
                     segment_crc64: 1,
                     payload_crc64: 1,
-                    segment_okh: [0x73; 16],
                 },
             )
             .unwrap();
@@ -878,7 +877,6 @@ fn stream_segment_vid_allocation_survives_reopen_without_runtime_state() {
                 size: 32,
                 segment_crc64: 2,
                 payload_crc64: 2,
-                segment_okh: [0x74; 16],
             },
         )
         .unwrap();
@@ -932,7 +930,6 @@ fn stream_segment_vid_allocation_is_visible_to_already_open_handle() {
                 size: 16,
                 segment_crc64: 1,
                 payload_crc64: 1,
-                segment_okh: [0x74; 16],
             },
         )
         .unwrap();
@@ -946,7 +943,6 @@ fn stream_segment_vid_allocation_is_visible_to_already_open_handle() {
                 size: 32,
                 segment_crc64: 2,
                 payload_crc64: 2,
-                segment_okh: [0x75; 16],
             },
         )
         .unwrap();

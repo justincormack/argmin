@@ -924,7 +924,6 @@ fn multipart_completion_command_publishes_streamed_part_segments_to_all_acting_n
         )
         .unwrap();
     let replacement_payload = b"replacement stream session";
-    let replacement_okh = [0x52; 16];
     let (_target, replacement_segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -935,7 +934,6 @@ fn multipart_completion_command_publishes_streamed_part_segments_to_all_acting_n
                 size: replacement_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(replacement_payload),
                 payload_crc64: checksum::crc64::checksum(replacement_payload),
-                segment_okh: replacement_okh,
             },
         )
         .unwrap();
@@ -2046,7 +2044,6 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
         .unwrap();
 
     let payload = b"streamed multipart command part";
-    let segment_okh = [0x43; 16];
     let (_target, segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -2057,7 +2054,6 @@ fn stream_upload_part_staging_and_finalize_use_object_metadata_commands() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh,
             },
         )
         .unwrap();

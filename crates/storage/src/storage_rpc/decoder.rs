@@ -1336,7 +1336,6 @@ impl<'a> StorageRpcDecoder<'a> {
             size: self.read_u64()?,
             segment_crc64: self.read_u64()?,
             payload_crc64: self.read_u64()?,
-            segment_okh: self.read_fixed_16_bytes("stream segment append OKH")?,
         })
     }
 

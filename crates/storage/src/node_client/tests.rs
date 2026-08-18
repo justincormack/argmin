@@ -3365,7 +3365,6 @@ fn local_stream_session_route_binds_pg_object_and_session_before_effects() {
         size: 12,
         segment_crc64: 41,
         payload_crc64: 41,
-        segment_okh: [0x41; 16],
     };
     let (_, prepared) = route
         .prepare_segment_append(

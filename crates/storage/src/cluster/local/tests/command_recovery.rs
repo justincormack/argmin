@@ -3172,7 +3172,6 @@ fn stale_duplicate_stream_append_index_is_reissued_before_apply() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x65; 16],
             },
         )
         .unwrap();

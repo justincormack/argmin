@@ -4763,7 +4763,6 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
                 size: 11,
                 segment_crc64: 123,
                 payload_crc64: 123,
-                segment_okh: [7; 16],
             },
             AdmittedRouteEffectFence::unbounded(ClusterEpoch::INITIAL),
         )
@@ -4775,12 +4774,7 @@ fn frontend_unix_object_mutation_stream_append_reads_route_to_storage_node() {
     assert_eq!(segment.segment_crc64, 123);
     assert_eq!(
         segment.segment_okh,
-        crate::segment_key_hash(
-            bucket.as_str(),
-            key.as_str(),
-            GenerationId::new(1).unwrap(),
-            0
-        )
+        crate::stream_segment_key_hash(&loaded.session_id, 0)
     );
 }
 
@@ -8557,7 +8551,6 @@ fn control_plane_peering_unix_upload_part_finalize_old_primary_preserves_remote_
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xf5; 16],
             },
         )
         .unwrap();
@@ -9001,7 +8994,6 @@ fn control_plane_peering_unix_stream_put_finalize_old_primary_preserves_remote_s
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xf7; 16],
             },
         )
         .unwrap();
@@ -9464,15 +9456,9 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
         .unwrap();
 
     let mut staged = Vec::new();
-    for (segment_index, (payload, segment_okh)) in [
-        (
-            b"peering unix copied source segment one".as_slice(),
-            [0xc1; 16],
-        ),
-        (
-            b"peering unix copied source segment two".as_slice(),
-            [0xc2; 16],
-        ),
+    for (segment_index, payload) in [
+        b"peering unix copied source segment one".as_slice(),
+        b"peering unix copied source segment two".as_slice(),
     ]
     .into_iter()
     .enumerate()
@@ -9488,7 +9474,6 @@ fn control_plane_peering_unix_upload_part_copy_finalize_old_primary_preserves_re
                     size: payload.len() as u64,
                     segment_crc64: payload_crc64,
                     payload_crc64,
-                    segment_okh,
                 },
             )
             .unwrap();
@@ -9930,7 +9915,6 @@ fn non_current_epoch_unix_stream_append_commit_fails_closed_and_cleans_remote_st
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xc7; 16],
             },
         )
         .unwrap();
@@ -10354,7 +10338,6 @@ fn non_current_epoch_unix_upload_part_stream_finalize_fails_closed_without_remot
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xd7; 16],
             },
         )
         .unwrap();
@@ -10622,15 +10605,9 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
         .unwrap();
 
     let mut staged = Vec::new();
-    for (segment_index, (payload, segment_okh)) in [
-        (
-            b"stale unix copied source segment one".as_slice(),
-            [0xe1; 16],
-        ),
-        (
-            b"stale unix copied source segment two".as_slice(),
-            [0xe2; 16],
-        ),
+    for (segment_index, payload) in [
+        b"stale unix copied source segment one".as_slice(),
+        b"stale unix copied source segment two".as_slice(),
     ]
     .into_iter()
     .enumerate()
@@ -10646,7 +10623,6 @@ fn non_current_epoch_unix_upload_part_copy_finalize_preserves_copied_staging() {
                     size: payload.len() as u64,
                     segment_crc64: payload_crc64,
                     payload_crc64,
-                    segment_okh,
                 },
             )
             .unwrap();

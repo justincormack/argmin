@@ -543,8 +543,9 @@ Phase 3 implementation notes:
    - direct PUT uses the reserved generation for the segment shard key and data
      PG selection before metadata commit
    - streaming PutObject sessions reserve the final object generation at session
-     creation, and staged segments use generation-derived segment hashes and
-     bounded object-local data PG selection
+     creation; segment hashes remain session-scoped so delayed writes from an
+     aborted attempt cannot alias a retry that reuses the generation, while data
+     PG selection remains generation-derived and object-local
    - streaming staged segments keep a per-append `segment_vid` so concurrent
      duplicate appends do not collide on identical shard file names before the
      metadata conflict is detected

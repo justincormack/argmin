@@ -379,7 +379,6 @@ fn upload_copied_test_multipart_part(
                     size: payload.len() as u64,
                     segment_crc64: checksum::crc64::checksum(payload),
                     payload_crc64: checksum::crc64::checksum(payload),
-                    segment_okh,
                 },
             )
             .unwrap();

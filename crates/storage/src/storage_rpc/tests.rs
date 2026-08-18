@@ -228,6 +228,11 @@ mod tests {
             114, 112, 99, 45, 102, 114, 97, 109, 101, 20, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
             0, 0, 0, 131, 63, 63, 253, 160, 197, 35, 90, 97, 98, 99,
         ];
+        const V21_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 21, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
+            0, 0, 0, 146, 204, 0, 105, 155, 117, 90, 173, 97, 98, 99,
+        ];
         let bytes = encode_storage_rpc_frame(
             0x0102_0304_0506_0708,
             StorageRpcMessageKind::ShardWrite,
@@ -235,7 +240,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bytes, V20_FRAME);
+        assert_eq!(bytes, V21_FRAME);
         assert_eq!(
             decode_storage_rpc_frame(V17_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(17))
@@ -247,6 +252,10 @@ mod tests {
         assert_eq!(
             decode_storage_rpc_frame(V19_FRAME),
             Err(StorageRpcFrameError::UnsupportedVersion(19))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(V20_FRAME),
+            Err(StorageRpcFrameError::UnsupportedVersion(20))
         );
     }
 
@@ -311,6 +320,44 @@ mod tests {
     }
 
     #[test]
+    fn storage_rpc_v21_stream_segment_append_prepare_payload_is_stable() {
+        const V21_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD: &[u8] = b"\
+            \x07\x00\x00\x00\x03\x00\x00\x00\x00\x00\x00\x00\x0b\x00\x00\x00\
+            \x06\x00\x00\x00bucket\x03\x00\x00\x00key\
+            \x20\x00\x00\x000123456789abcdef0123456789abcdef\
+            \x05\x00\x00\x00\x06\x00\x00\x00\x00\x00\x00\x00\
+            \x07\x00\x00\x00\x00\x00\x00\x00\x08\x00\x00\x00\x00\x00\x00\x00\
+            \x00";
+        let request = StorageRpcStreamSegmentAppendPrepareRequest {
+            object: StorageRpcObjectRequest {
+                node_id: NodeId::new(7),
+                cluster_epoch: ClusterEpoch::new(3).unwrap(),
+                pg_id: PgId::new(11),
+                bucket: BucketName::try_from("bucket").unwrap(),
+                key: ObjectKey::try_from("key").unwrap(),
+            },
+            request: PrepareStreamUploadSegmentAppendReq {
+                session_id: SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap(),
+                segment_index: 5,
+                size: 6,
+                segment_crc64: 7,
+                payload_crc64: 8,
+            },
+            effect_deadline: None,
+        };
+        let payload = encode_stream_segment_append_prepare_request(&request);
+
+        assert_eq!(payload, V21_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD);
+        assert_eq!(
+            decode_stream_segment_append_prepare_request(
+                V21_STREAM_SEGMENT_APPEND_PREPARE_PAYLOAD
+            )
+            .unwrap(),
+            request
+        );
+    }
+
+    #[test]
     fn storage_rpc_frame_rejects_resealed_old_and_new_version_fixtures() {
         assert_eq!(
             decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(16)),
@@ -329,8 +376,12 @@ mod tests {
             Err(StorageRpcFrameError::UnsupportedVersion(19))
         );
         assert_eq!(
-            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(21)),
-            Err(StorageRpcFrameError::UnsupportedVersion(21))
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(20)),
+            Err(StorageRpcFrameError::UnsupportedVersion(20))
+        );
+        assert_eq!(
+            decode_storage_rpc_frame(&raw_storage_rpc_frame_with_version(22)),
+            Err(StorageRpcFrameError::UnsupportedVersion(22))
         );
     }
 
@@ -5021,7 +5072,6 @@ mod tests {
                 size: u64::MAX,
                 segment_crc64: u64::MAX,
                 payload_crc64: u64::MAX,
-                segment_okh: [u8::MAX; 16],
             },
             effect_deadline: Some(StorageRpcAdmittedRouteEffectDeadline {
                 authority_valid_until_ms: u64::MAX,

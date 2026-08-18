@@ -14,7 +14,6 @@ struct StreamPayloadCleanupFixture {
     bucket: BucketName,
     key: ObjectKey,
     data_pg: u32,
-    generation_id: GenerationId,
     ec: EcShape,
     session_id: crate::SessionId,
 }
@@ -62,7 +61,6 @@ fn stream_payload_cleanup_fixture(session_byte: &str) -> StreamPayloadCleanupFix
         bucket,
         key,
         data_pg,
-        generation_id,
         ec,
         session_id,
     }
@@ -73,12 +71,7 @@ fn assert_stream_payload_shard_state(
     expect_ack: bool,
     expect_file: bool,
 ) {
-    let segment_okh = crate::segment_key_hash(
-        fixture.bucket.as_str(),
-        fixture.key.as_str(),
-        fixture.generation_id,
-        0,
-    );
+    let segment_okh = crate::stream_segment_key_hash(&fixture.session_id, 0);
     let segment_vid = GenerationId::MIN;
     for shard_index in 0..fixture.ec.k + fixture.ec.m {
         let shard_key = ShardKey::new(&segment_okh, segment_vid.get(), shard_index);
@@ -990,7 +983,6 @@ fn stream_put_append_published_log_gap_keeps_payload_for_pending_retry() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [89; 16],
             },
         )
         .unwrap();
@@ -1209,7 +1201,6 @@ fn stream_append_publish_validation_fails_closed_when_acknowledged_shard_file_is
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0xd4; 16],
             },
         )
         .unwrap();
@@ -1320,7 +1311,6 @@ fn stream_put_append_command_id_race_drains_winner_before_ack_publish() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [98; 16],
             },
         )
         .unwrap();
@@ -1431,7 +1421,6 @@ fn stream_append_yields_after_one_pending_drain_before_budget_recheck() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x70; 16],
             },
         )
         .unwrap();
@@ -1535,7 +1524,6 @@ fn stream_append_budget_exhaustion_after_competing_publish_preserves_payload() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [99; 16],
             },
         )
         .unwrap();
@@ -1703,7 +1691,6 @@ fn stream_append_install_collision_after_competing_publish_preserves_payload() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [100; 16],
             },
         )
         .unwrap();
@@ -1873,7 +1860,6 @@ fn stream_append_log_conflict_drain_failure_cleans_unreferenced_payload() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [104; 16],
             },
         )
         .unwrap();
@@ -2070,7 +2056,6 @@ fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
                 size: published_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(published_payload),
                 payload_crc64: checksum::crc64::checksum(published_payload),
-                segment_okh: [101; 16],
             },
         )
         .unwrap();
@@ -2085,7 +2070,6 @@ fn stream_append_unrelated_pending_duplicate_cleans_staged_payload() {
                 size: conflicting_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(conflicting_payload),
                 payload_crc64: checksum::crc64::checksum(conflicting_payload),
-                segment_okh: [102; 16],
             },
         )
         .unwrap();
@@ -2255,7 +2239,6 @@ fn stream_append_unrelated_install_contention_cleans_staged_payload() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [103; 16],
             },
         )
         .unwrap();
@@ -2402,7 +2385,6 @@ fn stream_abort_pending_drain_cleans_terminal_stream_session() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x45; 16],
             },
         )
         .unwrap();
@@ -2518,7 +2500,6 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                 size: first_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(first_payload),
                 payload_crc64: checksum::crc64::checksum(first_payload),
-                segment_okh: [0x4b; 16],
             },
         )
         .unwrap();
@@ -2551,7 +2532,6 @@ fn stream_abort_pending_install_race_rebuilds_staged_segments() {
                 size: second_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(second_payload),
                 payload_crc64: checksum::crc64::checksum(second_payload),
-                segment_okh: [0x4c; 16],
             },
         )
         .unwrap();
@@ -2802,7 +2782,6 @@ fn stream_put_finalize_pending_drain_cleans_terminal_stream_session() {
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0x49; 16],
             },
         )
         .unwrap();
@@ -3239,7 +3218,6 @@ fn control_plane_peering_stream_put_finalize_old_primary_fails_closed_and_preser
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xd1; 16],
             },
         )
         .unwrap();
@@ -3881,7 +3859,6 @@ fn stream_put_finalize_rejects_unencrypted_etag_crc64_mismatch() {
                     size: payload.len() as u64,
                     segment_crc64,
                     payload_crc64: segment_crc64,
-                    segment_okh: [0x80 + segment_index as u8; 16],
                 },
             )
             .unwrap();
@@ -3983,7 +3960,6 @@ fn stream_put_finalize_rejects_encrypted_payload_crc64_mismatch() {
                 size: payload.len() as u64,
                 segment_crc64,
                 payload_crc64,
-                segment_okh: [0x91; 16],
             },
         )
         .unwrap();
@@ -4105,7 +4081,6 @@ fn stream_part_finalize_rejects_staged_payload_crc64_mismatch() {
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0x92; 16],
             },
         )
         .unwrap();
@@ -4230,7 +4205,6 @@ fn stream_part_finalize_abandons_expired_install_then_retries_transported_conten
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xb2; 16],
             },
         )
         .unwrap();
@@ -4441,7 +4415,6 @@ fn multipart_payload_snapshot_does_not_treat_shard_rows_without_files_as_absent(
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0x93; 16],
             },
         )
         .unwrap();
@@ -4563,7 +4536,6 @@ fn stream_put_finalize_matching_pending_install_race_returns_success() {
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0x4c; 16],
             },
         )
         .unwrap();
@@ -4751,7 +4723,6 @@ fn versioned_stream_put_finalize_reserves_object_version_through_command_stream(
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0x76; 16],
             },
         )
         .unwrap();
@@ -5039,7 +5010,6 @@ fn stream_part_finalize_pending_drain_cleans_terminal_stream_session() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x47; 16],
             },
         )
         .unwrap();
@@ -5239,7 +5209,6 @@ fn stream_part_finalize_matching_pending_install_race_returns_success() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x4b; 16],
             },
         )
         .unwrap();
@@ -5445,7 +5414,6 @@ fn upload_part_stream_finalize_partial_apply_reopens_and_converges() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x4e; 16],
             },
         )
         .unwrap();
@@ -6031,7 +5999,6 @@ fn upload_part_stream_finalize_finishes_terminal_pending_slot() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x4d; 16],
             },
         )
         .unwrap();
@@ -6366,7 +6333,6 @@ fn upload_part_stream_finalize_committed_response_loss_retry_sees_terminal_part(
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x5b; 16],
             },
         )
         .unwrap();
@@ -6617,7 +6583,6 @@ fn upload_part_stream_finalize_pending_install_race_reloads_after_abort() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x59; 16],
             },
         )
         .unwrap();
@@ -6825,7 +6790,6 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 size: first_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(first_payload),
                 payload_crc64: checksum::crc64::checksum(first_payload),
-                segment_okh: [0x5a; 16],
             },
         )
         .unwrap();
@@ -6857,7 +6821,6 @@ fn upload_part_copy_staged_segments_are_cleaned_when_complete_wins_finalize_slot
                 size: second_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(second_payload),
                 payload_crc64: checksum::crc64::checksum(second_payload),
-                segment_okh: [0x5d; 16],
             },
         )
         .unwrap();
@@ -7266,7 +7229,6 @@ fn stream_segment_prepare_uses_durable_session_vid_allocator() {
         size: 16,
         segment_crc64: 1,
         payload_crc64: 1,
-        segment_okh: [42; 16],
     };
 
     let (_target, first) = cluster
@@ -7280,6 +7242,77 @@ fn stream_segment_prepare_uses_durable_session_vid_allocator() {
     assert_eq!(second.segment_vid, crate::GenerationId::new(2).unwrap());
     assert_eq!(first.segment_okh, second.segment_okh);
     assert_eq!(first.segment_index, second.segment_index);
+}
+
+#[test]
+fn upload_part_stream_segment_identity_is_session_scoped() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2, 3], ec_shape).unwrap();
+    let (bucket, key, _object_pg, _data_pg) = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_key_with_distinct_object_and_data_pg(topology)
+    };
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let (completion, _) =
+        seed_streamed_multipart_completion(&cluster, &bucket, &key, "sessionidentity");
+    let upload = cluster
+        .load_in_progress_multipart_upload(&bucket, &key, &completion.upload_id)
+        .unwrap();
+    let authorized_upload = crate::AuthorizedMultipartUploadRecord::assume_authorized(upload);
+    let first_session = crate::SessionId::try_from("81".repeat(16)).unwrap();
+    let second_session = crate::SessionId::try_from("82".repeat(16)).unwrap();
+    for session_id in [&first_session, &second_session] {
+        cluster
+            .create_upload_part_stream_session(&authorized_upload, 2, session_id)
+            .unwrap();
+    }
+
+    let prepare = |session_id: &crate::SessionId| {
+        cluster
+            .prepare_stream_segment_append(
+                &bucket,
+                &key,
+                &crate::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: 16,
+                    segment_crc64: 1,
+                    payload_crc64: 1,
+                },
+            )
+            .unwrap()
+    };
+    let (first_target, first) = prepare(&first_session);
+    let (second_target, second) = prepare(&second_session);
+
+    let expected_target = crate::StreamUploadTarget::UploadPart {
+        upload_id: completion.upload_id,
+        part_number: 2,
+    };
+    assert_eq!(first_target, expected_target);
+    assert_eq!(second_target, expected_target);
+    assert_eq!(first.segment_vid, crate::GenerationId::MIN);
+    assert_eq!(second.segment_vid, crate::GenerationId::MIN);
+    assert_eq!(first.data_pg_id, second.data_pg_id);
+    assert_eq!(
+        first.segment_okh,
+        crate::stream_segment_key_hash(&first_session, 0)
+    );
+    assert_eq!(
+        second.segment_okh,
+        crate::stream_segment_key_hash(&second_session, 0)
+    );
+    assert_ne!(first.segment_okh, second.segment_okh);
 }
 
 #[test]
@@ -7308,7 +7341,6 @@ fn stream_segment_prepare_allocates_vid_after_validation() {
         size: 16,
         segment_crc64: 1,
         payload_crc64: 1,
-        segment_okh: [42; 16],
     };
 
     let err = cluster

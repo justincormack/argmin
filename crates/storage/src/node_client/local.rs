@@ -304,7 +304,9 @@ impl LocalStorageNodeClient {
         validate_stream_upload_session_binding(&session, bucket, key)?;
         reject_duplicate_stream_segment_index(&pg, &request.session_id, request.segment_index)?;
         let pg_topology = self.storage_node.pg_topology();
-        let (segment_okh, segment_vid, data_pg_id) = match session.target {
+        let segment_okh =
+            crate::stream_segment_key_hash(&request.session_id, request.segment_index);
+        let (segment_vid, data_pg_id) = match session.target {
             StreamUploadTarget::PutObject => {
                 let generation_id =
                     pg.get_object_generation_reservation(bucket, key, &request.session_id)?;
@@ -313,12 +315,6 @@ impl LocalStorageNodeClient {
                 }
                 let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
                 (
-                    crate::segment_key_hash(
-                        bucket.as_str(),
-                        key.as_str(),
-                        generation_id,
-                        request.segment_index,
-                    ),
                     segment_vid,
                     pg_topology
                         .object_generation_segment_data_pg(
@@ -341,7 +337,6 @@ impl LocalStorageNodeClient {
                 }
                 let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
                 (
-                    request.segment_okh,
                     segment_vid,
                     pg_topology
                         .object_generation_multipart_part_segment_data_pg(

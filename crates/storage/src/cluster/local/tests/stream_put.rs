@@ -187,7 +187,6 @@ fn stream_put_finalize_pending_install_race_reruns_precondition_action() {
                 size: loser_payload.len() as u64,
                 segment_crc64: loser_crc64,
                 payload_crc64: loser_crc64,
-                segment_okh: [0x93; 16],
             },
         )
         .unwrap();
@@ -744,7 +743,6 @@ fn assert_stream_put_finalize_command_id_race(mode: StreamPutFinalizeCommandIdRa
                 size: stream_payload.len() as u64,
                 segment_crc64: stream_crc64,
                 payload_crc64: stream_crc64,
-                segment_okh: [0x5a; 16],
             },
         )
         .unwrap();
@@ -1045,17 +1043,9 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
     let second_session =
         crate::SessionId::try_from("a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2".to_string()).unwrap();
 
-    for (session_id, payload, segment_okh) in [
-        (
-            &first_session,
-            b"first streamed object".as_slice(),
-            [0xa1; 16],
-        ),
-        (
-            &second_session,
-            b"second streamed object".as_slice(),
-            [0xa2; 16],
-        ),
+    for (session_id, payload) in [
+        (&first_session, b"first streamed object".as_slice()),
+        (&second_session, b"second streamed object".as_slice()),
     ] {
         cluster
             .create_put_object_stream_session_record(
@@ -1076,7 +1066,6 @@ fn successful_streamed_overwrites_do_not_block_bucket_delete_after_object_cleanu
                     size: payload.len() as u64,
                     segment_crc64: crc64,
                     payload_crc64: crc64,
-                    segment_okh,
                 },
             )
             .unwrap();
@@ -1181,7 +1170,6 @@ fn stream_put_finalize_retries_definitive_command_contention_before_publication(
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xb1; 16],
             },
         )
         .unwrap();
@@ -1301,7 +1289,6 @@ fn stream_put_finalize_budget_expiry_after_safe_abandonment_returns_snapshot_con
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xb2; 16],
             },
         )
         .unwrap();
@@ -1425,7 +1412,6 @@ fn stream_put_reissue_confirmation_checks_published_replacement_before_trailing_
                 size: payload.len() as u64,
                 segment_crc64: payload_crc64,
                 payload_crc64,
-                segment_okh: [0xb2; 16],
             },
         )
         .unwrap();

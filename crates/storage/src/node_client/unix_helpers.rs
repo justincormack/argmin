@@ -99,18 +99,12 @@ impl UnixStorageNodeClient {
             || segment.size != request.size
             || segment.segment_crc64 != request.segment_crc64
             || segment.payload_crc64 != request.payload_crc64
+            || segment.segment_okh
+                != crate::stream_segment_key_hash(&request.session_id, request.segment_index)
         {
             return Err(ObjectPgActionError::Store(self.rpc_payload_error(
                 context,
                 "stream segment append response does not match request".to_string(),
-            )));
-        }
-        if matches!(expected_target, StreamUploadTarget::UploadPart { .. })
-            && segment.segment_okh != request.segment_okh
-        {
-            return Err(ObjectPgActionError::Store(self.rpc_payload_error(
-                context,
-                "stream upload-part segment OKH does not match request".to_string(),
             )));
         }
         Ok(())

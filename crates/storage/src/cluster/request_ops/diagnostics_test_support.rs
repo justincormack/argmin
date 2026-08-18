@@ -1100,6 +1100,34 @@ impl super::StorageCluster {
         Ok(true)
     }
 
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn test_object_payload_snapshot_uses_stream_session_layout(
+        &self,
+        snapshot: &crate::TestObjectPayloadSnapshot,
+        session_id: &SessionId,
+    ) -> Result<bool, StoreError> {
+        let generation_id = snapshot.generation_id().ok_or_else(|| StoreError::Io {
+            context: "select stream PUT payload generation",
+            source: std::io::Error::other("captured object payload has no generation"),
+        })?;
+        for segment in snapshot.segments() {
+            let expected_hash = crate::stream_segment_key_hash(session_id, segment.segment_index);
+            let expected_pg = self
+                .local_map
+                .object_generation_segment_data_pg(
+                    &segment.bucket,
+                    &segment.key,
+                    generation_id,
+                    segment.segment_index,
+                )
+                .get();
+            if segment.segment_okh != expected_hash || segment.data_pg_id != expected_pg {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Injects a storage-owned read-route failure into the first segment of an
     /// exact captured payload.
     #[cfg(any(test, feature = "test-hooks"))]

@@ -3300,7 +3300,6 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                 size: first_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(first_payload),
                 payload_crc64: checksum::crc64::checksum(first_payload),
-                segment_okh: [0x38; 16],
             },
         )
         .unwrap();
@@ -3332,7 +3331,6 @@ fn multipart_abort_pending_install_conflict_cleans_upload_part_stream_session_an
                 size: second_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(second_payload),
                 payload_crc64: checksum::crc64::checksum(second_payload),
-                segment_okh: [0x39; 16],
             },
         )
         .unwrap();
@@ -3539,7 +3537,6 @@ fn multipart_abort_pending_install_conflict_cleans_committed_stream_part() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh: [0x3b; 16],
             },
         )
         .unwrap();
@@ -4568,7 +4565,6 @@ fn multipart_abort_zero_apply_leaves_upload_in_progress_before_retry() {
         )
         .unwrap();
     let staged_payload = b"staged upload part segment";
-    let staged_okh = [0xCD; 16];
     let (_target, staged_segment) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -4579,7 +4575,6 @@ fn multipart_abort_zero_apply_leaves_upload_in_progress_before_retry() {
                 size: staged_payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(staged_payload),
                 payload_crc64: checksum::crc64::checksum(staged_payload),
-                segment_okh: staged_okh,
             },
         )
         .unwrap();

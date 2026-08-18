@@ -2644,7 +2644,6 @@ fn unix_stream_metadata_rejects_wrong_object_pg_before_node_access() {
         size: 12,
         segment_crc64: 99,
         payload_crc64: 99,
-        segment_okh: [7; 16],
     };
     let (target, _) = correct_stream_session_route
         .prepare_segment_append(&append, effect_fence)
@@ -5577,7 +5576,6 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         size: 16,
         segment_crc64: 44,
         payload_crc64: 44,
-        segment_okh: [3; 16],
     };
     let segment = StreamUploadSegmentRecord {
         session_id: session_id.clone(),
@@ -5585,7 +5583,7 @@ fn unix_object_mutation_client_rejects_malformed_stream_append_read_responses() 
         size: request.size,
         segment_crc64: request.segment_crc64,
         payload_crc64: request.segment_crc64,
-        segment_okh: request.segment_okh,
+        segment_okh: crate::stream_segment_key_hash(&session_id, request.segment_index),
         segment_vid: GenerationId::new(1).unwrap(),
         data_pg_id: 0,
         placement_cluster_epoch: ClusterEpoch::INITIAL,

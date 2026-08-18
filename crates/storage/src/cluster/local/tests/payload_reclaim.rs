@@ -199,7 +199,6 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
         .unwrap();
 
     let payload = b"stream append payload with routed data acks";
-    let segment_okh = crate::stream_segment_key_hash(&session_id, 0);
     let (_, segment_record) = cluster
         .prepare_stream_segment_append(
             &bucket,
@@ -210,7 +209,6 @@ fn stream_append_registers_payload_acks_on_routed_data_pg_primary() {
                 size: payload.len() as u64,
                 segment_crc64: checksum::crc64::checksum(payload),
                 payload_crc64: checksum::crc64::checksum(payload),
-                segment_okh,
             },
         )
         .unwrap();

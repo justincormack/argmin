@@ -400,7 +400,6 @@
             size: 12,
             segment_crc64: 99,
             payload_crc64: 99,
-            segment_okh: [7; 16],
         };
         crate::clock::with_time_override(1_000, || {
             assert!(primary_route
