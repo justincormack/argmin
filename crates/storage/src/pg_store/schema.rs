@@ -881,7 +881,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), StoreError> {
 
         let user_schema_object_count: u32 = conn
             .query_row(
-                "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+                "SELECT count(*) FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*'",
                 [],
                 |row| row.get(0),
             )
@@ -1203,6 +1203,124 @@ fn create_object_lock_triggers(conn: &Connection) -> Result<(), rusqlite::Error>
 mod tests {
     use super::*;
 
+    struct FrozenPgSchemaManifest {
+        version: u32,
+        catalogue: &'static str,
+    }
+
+    const FROZEN_PG_SCHEMA_MANIFESTS: &[FrozenPgSchemaManifest] = &[
+        FrozenPgSchemaManifest {
+            version: 1,
+            catalogue: include_str!("schema_manifests/pg_schema_v1.catalogue"),
+        },
+        FrozenPgSchemaManifest {
+            version: 2,
+            catalogue: include_str!("schema_manifests/pg_schema_v2.catalogue"),
+        },
+        FrozenPgSchemaManifest {
+            version: 3,
+            catalogue: include_str!("schema_manifests/pg_schema_v3.catalogue"),
+        },
+    ];
+
+    fn canonical_pg_schema_catalogue(conn: &Connection) -> String {
+        use std::fmt::Write as _;
+
+        // sqlite_schema retains the complete normalized CREATE statement for tables,
+        // indexes, views, and triggers. Selecting by the owning table rather than by
+        // object name deliberately retains SQLite-created primary/unique auto-indexes.
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, tbl_name, sql \
+                 FROM sqlite_schema \
+                 WHERE tbl_name NOT GLOB 'sqlite_*' \
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        let objects = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        let mut manifest = format!("object-count={}\n", objects.len());
+        for (object_type, name, table_name, sql) in objects {
+            manifest.push_str("object\n");
+            for (field_name, value) in [
+                ("type", Some(object_type.as_str())),
+                ("name", Some(name.as_str())),
+                ("table", Some(table_name.as_str())),
+                ("sql", sql.as_deref()),
+            ] {
+                write!(manifest, "{field_name}=").unwrap();
+                match value {
+                    Some(value) => {
+                        write!(manifest, "{}:", value.len()).unwrap();
+                        manifest.push_str(value);
+                    }
+                    None => manifest.push('-'),
+                }
+                manifest.push('\n');
+            }
+        }
+        manifest
+    }
+
+    fn validate_frozen_pg_schema_catalogue(catalogue: &str) {
+        fn take_prefix(input: &mut &[u8], prefix: &[u8]) {
+            assert!(
+                input.starts_with(prefix),
+                "invalid frozen PG schema catalogue framing"
+            );
+            *input = &input[prefix.len()..];
+        }
+
+        fn take_decimal(input: &mut &[u8], delimiter: u8) -> usize {
+            let end = input
+                .iter()
+                .position(|byte| *byte == delimiter)
+                .expect("frozen PG schema catalogue field is missing its delimiter");
+            let value = std::str::from_utf8(&input[..end])
+                .expect("frozen PG schema catalogue length is not UTF-8")
+                .parse()
+                .expect("frozen PG schema catalogue length is not decimal");
+            *input = &input[end + 1..];
+            value
+        }
+
+        let mut input = catalogue.as_bytes();
+        take_prefix(&mut input, b"object-count=");
+        let object_count = take_decimal(&mut input, b'\n');
+        for _ in 0..object_count {
+            take_prefix(&mut input, b"object\n");
+            for field in [b"type=".as_slice(), b"name=", b"table=", b"sql="] {
+                take_prefix(&mut input, field);
+                if input.starts_with(b"-") {
+                    take_prefix(&mut input, b"-\n");
+                    continue;
+                }
+                let length = take_decimal(&mut input, b':');
+                assert!(
+                    input.len() >= length,
+                    "frozen PG schema catalogue field is truncated"
+                );
+                input = &input[length..];
+                take_prefix(&mut input, b"\n");
+            }
+        }
+        assert!(
+            input.is_empty(),
+            "frozen PG schema catalogue has trailing data"
+        );
+    }
+
     fn in_memory_schema() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_pg_schema(&conn).unwrap();
@@ -1216,6 +1334,79 @@ mod tests {
         assert_eq!(pg_schema_version(&conn).unwrap(), CURRENT_PG_SCHEMA_VERSION);
 
         init_pg_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn current_pg_schema_matches_frozen_versioned_manifest_and_requires_version_bump() {
+        let conn = in_memory_schema();
+        assert_eq!(pg_schema_version(&conn).unwrap(), CURRENT_PG_SCHEMA_VERSION);
+
+        let frozen_versions = FROZEN_PG_SCHEMA_MANIFESTS
+            .iter()
+            .map(|manifest| manifest.version)
+            .collect::<Vec<_>>();
+        assert_eq!(frozen_versions, [1, 2, 3]);
+        for manifest in FROZEN_PG_SCHEMA_MANIFESTS {
+            validate_frozen_pg_schema_catalogue(manifest.catalogue);
+        }
+        assert_ne!(
+            FROZEN_PG_SCHEMA_MANIFESTS[0].catalogue, FROZEN_PG_SCHEMA_MANIFESTS[1].catalogue,
+            "schema v2 changed ACL defaults and added proof-carrier version columns"
+        );
+        assert_eq!(
+            FROZEN_PG_SCHEMA_MANIFESTS[0]
+                .catalogue
+                .matches("DEFAULT ''")
+                .count(),
+            3
+        );
+        assert!(!FROZEN_PG_SCHEMA_MANIFESTS[0]
+            .catalogue
+            .contains("applied_log_hash_encoding_version"));
+        assert!(!FROZEN_PG_SCHEMA_MANIFESTS[0]
+            .catalogue
+            .contains("state_digest_encoding_version"));
+        assert_eq!(
+            FROZEN_PG_SCHEMA_MANIFESTS[1]
+                .catalogue
+                .matches("ARGMIN-ACL-GRANTS/1")
+                .count(),
+            3
+        );
+        assert!(FROZEN_PG_SCHEMA_MANIFESTS[1]
+            .catalogue
+            .contains("applied_log_hash_encoding_version"));
+        assert!(FROZEN_PG_SCHEMA_MANIFESTS[1]
+            .catalogue
+            .contains("state_digest_encoding_version"));
+
+        let current_manifest = FROZEN_PG_SCHEMA_MANIFESTS
+            .iter()
+            .find(|manifest| manifest.version == CURRENT_PG_SCHEMA_VERSION)
+            .expect("the current PG schema version must have an immutable manifest");
+        assert_eq!(
+            canonical_pg_schema_catalogue(&conn),
+            current_manifest.catalogue,
+            "the physical PG schema changed without advancing CURRENT_PG_SCHEMA_VERSION and appending an immutable manifest"
+        );
+    }
+
+    #[test]
+    fn canonical_pg_schema_catalogue_excludes_only_sqlite_reserved_prefix() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sqliteX_manifest_escape (value INTEGER); \
+             CREATE VIEW sqliteX_manifest_view AS \
+             SELECT value FROM sqliteX_manifest_escape;",
+        )
+        .unwrap();
+
+        let catalogue = canonical_pg_schema_catalogue(&conn);
+        assert!(catalogue.contains("name=23:sqliteX_manifest_escape"));
+        assert!(catalogue.contains("name=21:sqliteX_manifest_view"));
+        assert!(catalogue.contains("table=23:sqliteX_manifest_escape"));
+        assert!(catalogue.contains("table=21:sqliteX_manifest_view"));
+        assert!(catalogue.starts_with("object-count=2\n"));
     }
 
     #[test]
@@ -1255,6 +1446,33 @@ mod tests {
     }
 
     #[test]
+    fn init_pg_schema_rejects_and_preserves_unversioned_sqlitex_objects() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sqliteX_existing_table (value INTEGER); \
+             CREATE VIEW sqliteX_existing_view AS \
+             SELECT value FROM sqliteX_existing_table;",
+        )
+        .unwrap();
+
+        let error = init_pg_schema(&conn).unwrap_err();
+        assert!(matches!(error, StoreError::PgSchemaInvalid { .. }));
+        assert!(error
+            .to_string()
+            .contains("unversioned database contains 2 user schema objects"));
+        assert_eq!(pg_schema_version(&conn).unwrap(), 0);
+        let object_count: u32 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema \
+                 WHERE name IN ('sqliteX_existing_table', 'sqliteX_existing_view')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(object_count, 2, "rejection must preserve both objects");
+    }
+
+    #[test]
     fn init_pg_schema_rejects_an_unsupported_version() {
         for version in [1, 2, 4] {
             let conn = Connection::open_in_memory().unwrap();
@@ -1274,7 +1492,7 @@ mod tests {
         let table_count: u32 = conn
             .query_row(
                 "SELECT count(*) FROM pragma_table_list \
-                 WHERE schema = 'main' AND type = 'table' AND name NOT LIKE 'sqlite_%'",
+                 WHERE schema = 'main' AND type = 'table' AND name NOT GLOB 'sqlite_*'",
                 [],
                 |row| row.get(0),
             )
@@ -1286,7 +1504,7 @@ mod tests {
                 "SELECT name FROM pragma_table_list \
                  WHERE schema = 'main' \
                    AND type = 'table' \
-                   AND name NOT LIKE 'sqlite_%' \
+                   AND name NOT GLOB 'sqlite_*' \
                    AND strict = 0 \
                  ORDER BY name",
             )
