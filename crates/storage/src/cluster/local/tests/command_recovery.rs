@@ -2602,7 +2602,7 @@ fn pending_slot_reissue_deadline_expires_before_pg_lock_and_preserves_slot() {
     force_insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
     let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
-    let _guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let _guard = pg_lock.lock();
     let error = cluster
         .test_reissue_pending_metadata_command_until(
             pg_id,

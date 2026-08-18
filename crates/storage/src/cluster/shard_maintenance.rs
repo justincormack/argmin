@@ -3281,7 +3281,7 @@ impl StorageCluster {
                 .local_map
                 .runtime_state()
                 .metadata_command_pg_lock(object_pg_id);
-            let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+            let _pg_guard = pg_lock.lock();
             let primary = self
                 .local_map
                 .metadata_pg_primary_node(self.operation_epoch(), object_pg_id)?;

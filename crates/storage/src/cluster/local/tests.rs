@@ -23,12 +23,70 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 static METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 static PAYLOAD_CLEANUP_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 static BUCKET_SCOPED_HOOK_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 static STREAMED_MULTIPART_PART_SESSION_NONCE: AtomicU64 = AtomicU64::new(1);
+
+#[test]
+fn metadata_command_pg_lock_admits_waiters_in_arrival_order() {
+    let lock = Arc::new(MetadataCommandPgLock::default());
+    let guard = lock.lock();
+    let acquisition_order = Arc::new(Mutex::new(Vec::new()));
+    let mut threads = Vec::new();
+
+    for waiter in 0..8 {
+        let waiter_lock = Arc::clone(&lock);
+        let waiter_order = Arc::clone(&acquisition_order);
+        threads.push(thread::spawn(move || {
+            let _guard = waiter_lock.lock();
+            waiter_order
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(waiter);
+        }));
+        while lock.waiting_for_test() != waiter + 1 {
+            thread::yield_now();
+        }
+    }
+
+    drop(guard);
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(
+        *acquisition_order
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+        (0..8).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn metadata_command_pg_lock_removes_expired_waiter() {
+    let lock = Arc::new(MetadataCommandPgLock::default());
+    let guard = lock.lock();
+    let waiter_lock = Arc::clone(&lock);
+    let waiter = thread::spawn(move || {
+        waiter_lock
+            .lock_until(Instant::now() + Duration::from_secs(1))
+            .is_some()
+    });
+    let enqueue_deadline = Instant::now() + Duration::from_secs(5);
+    while lock.waiting_for_test() != 1 {
+        assert!(
+            Instant::now() < enqueue_deadline,
+            "deadline waiter was not enqueued"
+        );
+        thread::yield_now();
+    }
+    assert!(!waiter.join().unwrap());
+    assert_eq!(lock.waiting_for_test(), 0);
+    drop(guard);
+    assert!(lock.try_lock().is_some());
+}
 
 fn lock_metadata_command_apply_hook_test() -> std::sync::MutexGuard<'static, ()> {
     METADATA_COMMAND_APPLY_HOOK_TEST_SERIAL

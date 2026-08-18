@@ -1401,11 +1401,120 @@ impl From<&PgRouteSnapshot> for LocalPgRoute {
 pub(crate) struct LocalClusterRuntimeState {
     reclaim_queue: (Mutex<LocalReclaimQueueState>, Condvar),
     placed_segment_shard_repair_queue: (Mutex<LocalPlacedSegmentShardRepairQueueState>, Condvar),
-    metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<Mutex<()>>>>,
+    metadata_command_pg_locks: Mutex<HashMap<PgId, Arc<MetadataCommandPgLock>>>,
     metadata_command_recovery_flights:
         Arc<Mutex<HashMap<MetadataCommandRecoveryKey, Arc<MetadataCommandRecoveryFlight>>>>,
     #[cfg(test)]
     metadata_command_recovery_wait_hook: Mutex<Option<MetadataCommandRecoveryWaitTestHook>>,
+}
+
+/// FIFO serialization for metadata-command mutation and inspection on one PG.
+///
+/// Publication owners must not be starved by a stream of fresh pending-slot
+/// installers; otherwise a durable command can hold the slot until every
+/// waiting S3 request exhausts its work budget.
+#[derive(Debug, Default)]
+pub(crate) struct MetadataCommandPgLock {
+    state: Mutex<MetadataCommandPgLockState>,
+    changed: Condvar,
+}
+
+#[derive(Debug, Default)]
+struct MetadataCommandPgLockState {
+    held: bool,
+    next_ticket: u64,
+    waiters: VecDeque<u64>,
+}
+
+pub(crate) struct MetadataCommandPgGuard<'a> {
+    lock: &'a MetadataCommandPgLock,
+}
+
+impl MetadataCommandPgLock {
+    fn enqueue(&self) -> (std::sync::MutexGuard<'_, MetadataCommandPgLockState>, u64) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let ticket = state.next_ticket;
+        state.next_ticket = state
+            .next_ticket
+            .checked_add(1)
+            .expect("metadata command PG lock ticket space exhausted");
+        state.waiters.push_back(ticket);
+        (state, ticket)
+    }
+
+    pub(crate) fn lock(&self) -> MetadataCommandPgGuard<'_> {
+        let (mut state, ticket) = self.enqueue();
+        loop {
+            if !state.held && state.waiters.front() == Some(&ticket) {
+                state.waiters.pop_front();
+                state.held = true;
+                return MetadataCommandPgGuard { lock: self };
+            }
+            state = self
+                .changed
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    pub(crate) fn lock_until(&self, deadline: Instant) -> Option<MetadataCommandPgGuard<'_>> {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let (mut state, ticket) = self.enqueue();
+        loop {
+            if Instant::now() >= deadline {
+                state.waiters.retain(|waiting| *waiting != ticket);
+                self.changed.notify_all();
+                return None;
+            }
+            if !state.held && state.waiters.front() == Some(&ticket) {
+                state.waiters.pop_front();
+                state.held = true;
+                return Some(MetadataCommandPgGuard { lock: self });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                continue;
+            }
+            let (next_state, _) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|error| error.into_inner());
+            state = next_state;
+        }
+    }
+
+    pub(crate) fn try_lock(&self) -> Option<MetadataCommandPgGuard<'_>> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.held || !state.waiters.is_empty() {
+            return None;
+        }
+        state.held = true;
+        Some(MetadataCommandPgGuard { lock: self })
+    }
+
+    #[cfg(test)]
+    fn waiting_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .waiters
+            .len()
+    }
+}
+
+impl Drop for MetadataCommandPgGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self
+            .lock
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        debug_assert!(state.held);
+        state.held = false;
+        self.lock.changed.notify_all();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1700,7 +1809,7 @@ impl LocalClusterRuntimeState {
         )
     }
 
-    pub(crate) fn metadata_command_pg_lock(&self, pg_id: PgId) -> Arc<Mutex<()>> {
+    pub(crate) fn metadata_command_pg_lock(&self, pg_id: PgId) -> Arc<MetadataCommandPgLock> {
         let mut locks = self
             .metadata_command_pg_locks
             .lock()
@@ -1708,7 +1817,7 @@ impl LocalClusterRuntimeState {
         Arc::clone(
             locks
                 .entry(pg_id)
-                .or_insert_with(|| Arc::new(Mutex::new(()))),
+                .or_insert_with(|| Arc::new(MetadataCommandPgLock::default())),
         )
     }
 

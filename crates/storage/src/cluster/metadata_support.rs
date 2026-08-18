@@ -210,35 +210,10 @@ impl HeldPrimaryMetadataCommandSection {
 }
 
 fn lock_metadata_command_pg_until(
-    lock: &std::sync::Mutex<()>,
+    lock: &local::MetadataCommandPgLock,
     deadline: Instant,
-) -> Option<std::sync::MutexGuard<'_, ()>> {
-    loop {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        match lock.try_lock() {
-            Ok(guard) => {
-                if Instant::now() >= deadline {
-                    drop(guard);
-                    return None;
-                }
-                return Some(guard);
-            }
-            Err(std::sync::TryLockError::Poisoned(error)) => {
-                let guard = error.into_inner();
-                if Instant::now() >= deadline {
-                    drop(guard);
-                    return None;
-                }
-                return Some(guard);
-            }
-            Err(std::sync::TryLockError::WouldBlock) => {
-                let remaining = deadline.checked_duration_since(Instant::now())?;
-                std::thread::sleep(remaining.min(Duration::from_millis(1)));
-            }
-        }
-    }
+) -> Option<local::MetadataCommandPgGuard<'_>> {
+    lock.lock_until(deadline)
 }
 
 #[must_use = "ContenderDrained must restart from a fresh snapshot"]

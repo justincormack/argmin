@@ -2391,6 +2391,90 @@ fn bucket_property_command_retry_reuses_pending_partial_replica_command() {
 }
 
 #[test]
+fn bucket_property_delete_does_not_adopt_pending_put_after_publication() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "property-delete-pending-put-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let public_access_block = crate::PublicAccessBlockConfig {
+        block_public_acls: true,
+        ignore_public_acls: true,
+        block_public_policy: false,
+        restrict_public_buckets: true,
+    };
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let fail_trailing = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let fail_trailing_hook = Arc::clone(&fail_trailing);
+    let hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            if matches!(
+                command.payload(),
+                MetadataCommandPayload::PutBucketProperty(property)
+                    if property.bucket.name == hook_bucket
+                        && property.bucket.public_access_block == Some(public_access_block)
+                        && node_id == NodeId::new(2)
+                        && fail_trailing_hook.load(Ordering::SeqCst)
+            ) {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected trailing bucket-property contention",
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let published = cluster
+        .put_bucket_public_access_block_and_load_info_raw(&bucket, public_access_block)
+        .unwrap();
+    assert_eq!(published.public_access_block, Some(public_access_block));
+    let pending = pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
+        .expect("published property command should remain pending for trailing recovery");
+    assert!(matches!(
+        pending.payload(),
+        MetadataCommandPayload::PutBucketProperty(property)
+            if property.bucket.public_access_block == Some(public_access_block)
+    ));
+
+    fail_trailing.store(false, Ordering::SeqCst);
+    drop(hook_guard);
+    let deleted = cluster
+        .delete_bucket_public_access_block_and_load_info_raw(&bucket)
+        .unwrap();
+    assert_eq!(deleted.public_access_block, None);
+    assert!(
+        deleted.bucket_execution_generation > published.bucket_execution_generation,
+        "DELETE must publish a new property command rather than return the pending PUT receipt"
+    );
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .public_access_block,
+            None,
+            "node {node_id:?} retained the completed PUT property"
+        );
+    }
+}
+
+#[test]
 fn invalid_bucket_property_command_does_not_poison_bucket_command_stream() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

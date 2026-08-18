@@ -1750,7 +1750,7 @@ fn begin_bucket_delete_reissue_waits_for_post_primary_replica_apply_window() {
     let release_primary_for_thread = Arc::clone(&release_primary);
     let occupant_thread = std::thread::spawn(move || {
         let pg_lock = occupant_map.runtime_state().metadata_command_pg_lock(pg_id);
-        let _pg_guard = pg_lock.lock().unwrap();
+        let _pg_guard = pg_lock.lock();
         for node_id in [NodeId::new(1), NodeId::new(2)] {
             let pg = occupant_map
                 .node(node_id)

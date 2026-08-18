@@ -4020,7 +4020,7 @@ fn multipart_completion_inconclusive_post_budget_probe_does_not_publish() {
         start_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("auxiliary cleanup must start the PG-lock holder");
-        let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _pg_guard = pg_lock.lock();
         locked_tx.send(()).unwrap();
         release_rx
             .recv_timeout(Duration::from_secs(5))
@@ -4148,7 +4148,7 @@ fn multipart_completion_inconclusive_probe_preserves_uncertainty_before_budget_e
         },
     ));
     let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
-    let pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let pg_guard = pg_lock.lock();
 
     let result = cluster.complete_multipart_upload_commit_serialized(request);
 
@@ -4214,7 +4214,7 @@ fn multipart_completion_deadline_crossing_preserves_raw_log_conflict() {
     let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(1);
     let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
     let holder = std::thread::spawn(move || {
-        let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _pg_guard = pg_lock.lock();
         locked_tx.send(()).unwrap();
         release_rx
             .recv_timeout(Duration::from_secs(5))

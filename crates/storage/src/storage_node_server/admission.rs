@@ -64,7 +64,33 @@ impl StorageNodeMetadataCommandLocks {
         pg_id: PgId,
         context: Option<StorageNodeMetadataCommandLockContext>,
     ) -> Result<StorageNodeMetadataCommandGuard, StorageRpcErrorResponse> {
-        self.acquire_with_timeout(node_id, pg_id, context, METADATA_COMMAND_LOCK_WAIT_TIMEOUT)
+        #[cfg(test)]
+        let wait_timeout = self
+            .state
+            .wait_timeout_override
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .unwrap_or(METADATA_COMMAND_LOCK_WAIT_TIMEOUT);
+        #[cfg(not(test))]
+        let wait_timeout = METADATA_COMMAND_LOCK_WAIT_TIMEOUT;
+        self.acquire_with_timeout(node_id, pg_id, context, wait_timeout)
+    }
+
+    #[cfg(test)]
+    fn override_wait_timeout_for_test(
+        &self,
+        wait_timeout: Duration,
+    ) -> MetadataCommandLockWaitTimeoutOverrideGuard {
+        let previous = self
+            .state
+            .wait_timeout_override
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .replace(wait_timeout);
+        MetadataCommandLockWaitTimeoutOverrideGuard {
+            locks: self.clone(),
+            previous,
+        }
     }
 
     fn acquire_until(
@@ -110,7 +136,7 @@ impl StorageNodeMetadataCommandLocks {
         let started_at = Instant::now();
         let mut next_diagnostic_at = started_at + METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_AFTER;
         let mut waited = false;
-        let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
+        let mut table = self.state.table.lock().unwrap_or_else(|e| e.into_inner());
         if started_at >= deadline {
             return Err(StorageRpcErrorResponse {
                 code: StorageRpcErrorCode::MetadataCommandContention,
@@ -120,7 +146,34 @@ impl StorageNodeMetadataCommandLocks {
                 ),
             });
         }
-        while let Some(holder) = held.get(&pg_id).copied() {
+        let ticket = table.next_ticket;
+        table.next_ticket = table
+            .next_ticket
+            .checked_add(1)
+            .expect("storage metadata command lock ticket space exhausted");
+        table.waiters.entry(pg_id).or_default().push_back(ticket);
+        loop {
+            let holder = table.held.get(&pg_id).copied();
+            let first_waiter = table
+                .waiters
+                .get(&pg_id)
+                .and_then(|waiters| waiters.front())
+                == Some(&ticket);
+            if holder.is_none() && first_waiter {
+                if require_live_deadline_on_acquire && Instant::now() >= deadline {
+                    remove_metadata_command_lock_waiter(&mut table, pg_id, ticket);
+                    self.state.available.notify_all();
+                    return Err(StorageRpcErrorResponse {
+                        code: StorageRpcErrorCode::MetadataCommandContention,
+                        message: format!(
+                            "metadata command lock deadline for PG {} has expired",
+                            pg_id.get()
+                        ),
+                    });
+                }
+                remove_metadata_command_lock_waiter(&mut table, pg_id, ticket);
+                break;
+            }
             waited = true;
             #[cfg(test)]
             let before_wait_hook = self
@@ -132,15 +185,19 @@ impl StorageNodeMetadataCommandLocks {
             let now = Instant::now();
             let waited_for = now.saturating_duration_since(started_at);
             if now >= deadline {
-                drop(held);
-                emit_metadata_command_lock_wait_diagnostic(
-                    node_id,
-                    pg_id,
-                    context,
-                    holder,
-                    waited_for,
-                    self.lock_wait_stderr_suppressed(),
-                );
+                remove_metadata_command_lock_waiter(&mut table, pg_id, ticket);
+                self.state.available.notify_all();
+                drop(table);
+                if let Some(holder) = holder {
+                    emit_metadata_command_lock_wait_diagnostic(
+                        node_id,
+                        pg_id,
+                        context,
+                        holder,
+                        waited_for,
+                        self.lock_wait_stderr_suppressed(),
+                    );
+                }
                 return Err(StorageRpcErrorResponse {
                     code: StorageRpcErrorCode::MetadataCommandContention,
                     message: format!(
@@ -150,9 +207,9 @@ impl StorageNodeMetadataCommandLocks {
                     ),
                 });
             }
-            if now >= next_diagnostic_at {
+            if let Some(holder) = holder.filter(|_| now >= next_diagnostic_at) {
                 next_diagnostic_at = now + METADATA_COMMAND_LOCK_WAIT_DIAGNOSTIC_INTERVAL;
-                drop(held);
+                drop(table);
                 emit_metadata_command_lock_wait_diagnostic(
                     node_id,
                     pg_id,
@@ -161,38 +218,26 @@ impl StorageNodeMetadataCommandLocks {
                     waited_for,
                     self.lock_wait_stderr_suppressed(),
                 );
-                held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
+                table = self.state.table.lock().unwrap_or_else(|e| e.into_inner());
                 continue;
             }
-            drop(held);
+            drop(table);
             #[cfg(test)]
             if let Some(hook) = before_wait_hook {
                 hook(pg_id);
             }
-            held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
-            if !held.contains_key(&pg_id) {
-                continue;
-            }
+            table = self.state.table.lock().unwrap_or_else(|e| e.into_inner());
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 continue;
             }
             let wait_interval = METADATA_COMMAND_LOCK_WAIT_POLL_INTERVAL.min(remaining);
-            let (next_held, _) = self
+            let (next_table, _) = self
                 .state
                 .available
-                .wait_timeout(held, wait_interval)
+                .wait_timeout(table, wait_interval)
                 .unwrap_or_else(|e| e.into_inner());
-            held = next_held;
-        }
-        if require_live_deadline_on_acquire && Instant::now() >= deadline {
-            return Err(StorageRpcErrorResponse {
-                code: StorageRpcErrorCode::MetadataCommandContention,
-                message: format!(
-                    "metadata command lock deadline for PG {} has expired",
-                    pg_id.get()
-                ),
-            });
+            table = next_table;
         }
         if waited {
             let _ = observability::emit_metadata_command_session_wait(
@@ -204,7 +249,7 @@ impl StorageNodeMetadataCommandLocks {
                 },
             );
         }
-        held.insert(
+        table.held.insert(
             pg_id,
             StorageNodeMetadataCommandLockHolder {
                 acquired_context: context,
@@ -221,18 +266,45 @@ impl StorageNodeMetadataCommandLocks {
     }
 
     fn update_context(&self, pg_id: PgId, context: Option<StorageNodeMetadataCommandLockContext>) {
-        let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(holder) = held.get_mut(&pg_id) {
+        let mut table = self.state.table.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(holder) = table.held.get_mut(&pg_id) {
             holder.current_context = context;
             holder.current_started_at = context.map(|_| Instant::now());
         }
     }
 
     fn release(&self, pg_id: PgId) {
-        let mut held = self.state.held.lock().unwrap_or_else(|e| e.into_inner());
-        if held.remove(&pg_id).is_some() {
+        let mut table = self.state.table.lock().unwrap_or_else(|e| e.into_inner());
+        if table.held.remove(&pg_id).is_some() {
             self.state.available.notify_all();
         }
+    }
+
+    #[cfg(test)]
+    fn waiting_for_test(&self, pg_id: PgId) -> usize {
+        self.state
+            .table
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .waiters
+            .get(&pg_id)
+            .map_or(0, VecDeque::len)
+    }
+}
+
+fn remove_metadata_command_lock_waiter(
+    table: &mut StorageNodeMetadataCommandLockTable,
+    pg_id: PgId,
+    ticket: u64,
+) {
+    let remove_queue = if let Some(waiters) = table.waiters.get_mut(&pg_id) {
+        waiters.retain(|waiting| *waiting != ticket);
+        waiters.is_empty()
+    } else {
+        false
+    };
+    if remove_queue {
+        table.waiters.remove(&pg_id);
     }
 }
 
@@ -295,12 +367,39 @@ fn emit_metadata_command_lock_wait_diagnostic(
 
 #[derive(Default)]
 struct StorageNodeMetadataCommandLockState {
-    held: Mutex<BTreeMap<PgId, StorageNodeMetadataCommandLockHolder>>,
+    table: Mutex<StorageNodeMetadataCommandLockTable>,
     available: Condvar,
+    #[cfg(test)]
+    wait_timeout_override: Mutex<Option<Duration>>,
     #[cfg(test)]
     before_wait_hook: Mutex<Option<MetadataCommandBeforeWaitHook>>,
     #[cfg(test)]
     suppress_lock_wait_stderr: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Default)]
+struct StorageNodeMetadataCommandLockTable {
+    held: BTreeMap<PgId, StorageNodeMetadataCommandLockHolder>,
+    next_ticket: u64,
+    waiters: BTreeMap<PgId, VecDeque<u64>>,
+}
+
+#[cfg(test)]
+struct MetadataCommandLockWaitTimeoutOverrideGuard {
+    locks: StorageNodeMetadataCommandLocks,
+    previous: Option<Duration>,
+}
+
+#[cfg(test)]
+impl Drop for MetadataCommandLockWaitTimeoutOverrideGuard {
+    fn drop(&mut self) {
+        *self
+            .locks
+            .state
+            .wait_timeout_override
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = self.previous;
+    }
 }
 
 #[cfg(test)]

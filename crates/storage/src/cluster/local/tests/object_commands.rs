@@ -4779,7 +4779,7 @@ fn insert_delete_marker_reissue_pg_lock_timeout_is_not_retryable_while_source_is
         start_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("reissue hook must start the PG-lock holder");
-        let _pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _pg_guard = pg_lock.lock();
         locked_tx.send(()).unwrap();
         release_rx
             .recv_timeout(Duration::from_secs(5))
@@ -5520,7 +5520,7 @@ fn witnessed_delete_marker_pending_drain_ignores_expired_reservation() {
     insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
 
     let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
-    let pg_guard = pg_lock.lock().unwrap_or_else(|error| error.into_inner());
+    let pg_guard = pg_lock.lock();
     let (attempt_started_tx, attempt_started_rx) = std::sync::mpsc::sync_channel(1);
     let command_id = command.id();
     let notify_once = Arc::new(AtomicBool::new(true));

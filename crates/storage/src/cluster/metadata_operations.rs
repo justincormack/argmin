@@ -650,11 +650,7 @@ impl StorageCluster {
             .local_map
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
-        let pg_guard = match pg_lock.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        };
+        let pg_guard = pg_lock.try_lock();
         if pg_guard.is_none() {
             let state = self.metadata_command_publication_state_on_acting_set_until_inner(
                 pg_id, command, route_mode, deadline, true, None,
@@ -4375,7 +4371,7 @@ impl StorageCluster {
             .local_map
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
-        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _pg_guard = pg_lock.lock();
         self.try_set_pending_metadata_command_for_bucket_locked_with_effect_fence(
             pg_id,
             bucket,
@@ -4544,7 +4540,7 @@ impl StorageCluster {
             .local_map
             .runtime_state()
             .metadata_command_pg_lock(pg_id);
-        let _pg_guard = pg_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _pg_guard = pg_lock.lock();
         if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
             return Ok(ObjectPgPendingCommandInstall::Pending(command));
         }

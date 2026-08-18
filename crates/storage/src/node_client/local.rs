@@ -1333,6 +1333,9 @@ impl LocalStorageNodeClient {
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
     ) -> Result<bool, BucketSnapshotLoadError> {
+        if !bucket_property_command_matches_mutation(command, bucket, mutation) {
+            return Ok(false);
+        }
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
         pending_bucket_command_matches_current(current, &command.bucket, |record| {

@@ -2712,9 +2712,10 @@
                 let lock_holder = server
                     .metadata_command_locks
                     .state
-                    .held
+                    .table
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .held
                     .get(&PgId::new(0))
                     .copied();
                 panic!(

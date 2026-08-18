@@ -7,10 +7,10 @@ mod deadline_tests {
 
     #[test]
     fn expired_metadata_command_pg_lock_deadline_does_not_acquire_available_lock() {
-        let lock = std::sync::Mutex::new(());
+        let lock = crate::cluster::local::MetadataCommandPgLock::default();
 
         assert!(lock_metadata_command_pg_until(&lock, Instant::now()).is_none());
-        assert!(lock.try_lock().is_ok());
+        assert!(lock.try_lock().is_some());
     }
 }
 

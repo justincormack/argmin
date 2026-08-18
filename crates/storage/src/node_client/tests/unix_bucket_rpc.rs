@@ -3317,6 +3317,88 @@ fn unix_bucket_metadata_client_routes_bucket_control_operations() {
 }
 
 #[test]
+fn unix_bucket_property_pending_match_binds_same_generation_to_requested_mutation() {
+    let tmp = test_util::tempdir();
+    let config = test_config(&tmp);
+    let bucket = crate::tests::bucket_name("bucket-property-pending-match-rpc");
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    {
+        let node = SharedStorageNode::open_with_default_ec_shape(
+            &config.data_dir,
+            &config.pg_ids,
+            config.default_ec_shape,
+        )
+        .unwrap();
+        let pg = node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+    }
+    private_socket_dir(config.socket_path.parent().unwrap());
+    let server = Arc::new(StorageNodeServer::bind(config.clone()).unwrap());
+    let server_threads: Vec<_> = (0..4)
+        .map(|_| {
+            let server = Arc::clone(&server);
+            thread::spawn(move || server.accept_one().unwrap())
+        })
+        .collect();
+    let route_epoch = ClusterEpoch::new(1).unwrap();
+    let client =
+        UnixStorageNodeClient::new(NodeId::new(7), route_epoch, config.socket_path.clone())
+            .with_pg_topology(Arc::new(PgTopology::new(&config.pg_ids).unwrap()));
+    let route = bucket_metadata_route(
+        &client,
+        route_epoch,
+        BucketPgId::new_for_test(PgId::new(0)),
+        &bucket,
+    );
+    let config = crate::PublicAccessBlockConfig {
+        block_public_acls: true,
+        ignore_public_acls: true,
+        block_public_policy: false,
+        restrict_public_buckets: true,
+    };
+    let put = BucketPropertyMutation::PublicAccessBlock(Some(config));
+    let delete = BucketPropertyMutation::PublicAccessBlock(None);
+    let command = route
+        .build_put_bucket_property_command(
+            MetadataCommandId::new(
+                route_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(1).unwrap(),
+            ),
+            &put,
+        )
+        .unwrap();
+    MetadataCommandNodeClient::apply_metadata_command_and_record(&client, PgId::new(0), &command)
+        .unwrap();
+    let MetadataCommandPayload::PutBucketProperty(property) = command.payload() else {
+        panic!("unexpected property command payload")
+    };
+    assert!(route
+        .pending_put_bucket_property_command_matches_current(property, &put)
+        .unwrap());
+    assert!(
+        !route
+            .pending_put_bucket_property_command_matches_current(property, &delete)
+            .unwrap(),
+        "an applied PUT command must not satisfy a same-effect DELETE request"
+    );
+
+    for thread in server_threads {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
 fn unix_bucket_metadata_client_releases_bucket_write_proof_after_route_expiry() {
     let tmp = test_util::tempdir();
     let mut config = test_config(&tmp);

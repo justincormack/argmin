@@ -35,11 +35,11 @@
         FileControlPlaneStore, NodeHeartbeat, NodeMembershipState, SingleAuthorityControlPlane,
     };
     use crate::metadata_command::{
-        BucketWriteReservationProof, CommitDirectPutObjectCommand, CreateBucketCommand,
-        CreateStreamUploadCommand, DeleteObjectVersionCommand, DeleteObjectVersionTarget,
-        InsertDeleteMarkerCommand, MetadataCommandEnvelope, MetadataCommandId,
-        MetadataCommandAcceptance, MetadataCommandLogIndex, MetadataCommandPayload,
-        MetadataTransferCommand,
+        BucketPropertyMutation, BucketWriteReservationProof, CommitDirectPutObjectCommand,
+        CreateBucketCommand, CreateStreamUploadCommand, DeleteObjectVersionCommand,
+        DeleteObjectVersionTarget, InsertDeleteMarkerCommand, MetadataCommandAcceptance,
+        MetadataCommandEnvelope, MetadataCommandId, MetadataCommandLogIndex,
+        MetadataCommandPayload, MetadataTransferCommand,
         PutBucketAclCommand, ReserveObjectGenerationCommand, ReserveObjectVersionCommand,
     };
     use crate::node_runtime::traits::{PgMetadataStore, ShardStore};
@@ -3876,7 +3876,7 @@
     fn metadata_command_lock_wait_times_out_with_contention_error() {
         let locks = StorageNodeMetadataCommandLocks::default();
         let pg_id = PgId::new(0);
-        let _first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
+        let first = locks.acquire(NodeId::new(7), pg_id, None).unwrap();
         let _stderr_guard = locks.suppress_lock_wait_stderr();
         let started = Instant::now();
         let err = match locks.acquire_with_timeout(
@@ -3895,6 +3895,21 @@
         );
         assert_eq!(err.code, StorageRpcErrorCode::MetadataCommandContention);
         assert!(err.message.contains("metadata command lock wait"));
+        assert_eq!(
+            locks.waiting_for_test(pg_id),
+            0,
+            "a timed-out ticket must be removed from the FIFO"
+        );
+
+        drop(first);
+        let _successor = locks
+            .acquire_with_timeout(
+                NodeId::new(7),
+                pg_id,
+                None,
+                Duration::from_millis(250),
+            )
+            .expect("a successor must acquire after the timed-out ticket is removed");
     }
 
     #[test]
@@ -3915,6 +3930,164 @@
         );
         assert_eq!(err.code, StorageRpcErrorCode::MetadataCommandContention);
         assert!(err.message.contains("metadata command lock wait"));
+    }
+
+    #[test]
+    fn authenticated_unix_metadata_command_lock_preserves_first_waiter_across_clients() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        const FIFO_TEST_TIMEOUT: Duration = Duration::from_secs(30);
+        let transport_limits = storage_rpc_test_transport_limits_with_io_timeout(
+            crate::StorageRpcTransportLimits::DEFAULT.max_connections(),
+            FIFO_TEST_TIMEOUT,
+        );
+        let server = Arc::new(
+            PreparedStorageNodeServer::new(config.clone())
+                .with_rpc_auth(
+                    storage_rpc_server_auth(&credential).with_transport_limits(transport_limits),
+                )
+                .bind()
+                .unwrap(),
+        );
+        let _wait_timeout_override = server
+            .metadata_command_locks
+            .override_wait_timeout_for_test(FIFO_TEST_TIMEOUT);
+        let _stderr_guard = server.suppress_metadata_command_lock_wait_stderr();
+        let pg_id = PgId::new(0);
+        let request = StorageRpcMetadataCommandStateRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id,
+        };
+        let payload = encode_metadata_command_state_request(&request);
+        const WAITER_COUNT: usize = 2;
+        let mut accept_threads = Vec::new();
+        for _ in 0..=WAITER_COUNT {
+            let accepting = Arc::clone(&server);
+            accept_threads.push(thread::spawn(move || accepting.accept_one()));
+        }
+        let client_auth: Arc<StorageRpcClientAuthConfig> = Arc::new(
+            crate::FrontendStorageRpcClientCapability::new_with_transport_limits(
+                credential.clone(),
+                9,
+                STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                transport_limits,
+            )
+            .unwrap()
+            .into(),
+        );
+        let new_client = || {
+            UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+                config.node_id,
+                config.cluster_epoch,
+                StorageRpcClientEndpoint::unix(config.socket_path.clone()),
+                LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+                Some(Arc::clone(&client_auth)),
+            )
+        };
+        let owner = new_client();
+        owner
+            .rpc_request(StorageRpcMessageKind::MetadataCommandPgLockAcquire, payload.clone())
+            .unwrap();
+
+        let first_waiter_gate = DeterministicTestGate::new();
+        let _first_waiter_release = first_waiter_gate.release_on_drop();
+        let later_waiter_gate = DeterministicTestGate::new();
+        let _later_waiter_release = later_waiter_gate.release_on_drop();
+        let later_post_release_gate = DeterministicTestGate::new();
+        let _later_post_release = later_post_release_gate.release_on_drop();
+        let first_waiter = Arc::new(AtomicBool::new(true));
+        let later_waiter_before_release = Arc::new(AtomicBool::new(true));
+        let later_waiter_after_release = Arc::new(AtomicBool::new(true));
+        let later_waiter_still_queued = Arc::new(AtomicBool::new(true));
+        let owner_released = Arc::new(AtomicBool::new(false));
+        let first_waiter_gate_hook = Arc::clone(&first_waiter_gate);
+        let later_waiter_gate_hook = Arc::clone(&later_waiter_gate);
+        let later_post_release_gate_hook = Arc::clone(&later_post_release_gate);
+        let owner_released_hook = Arc::clone(&owner_released);
+        let (still_queued_tx, still_queued_rx) = mpsc::sync_channel(1);
+        server.metadata_command_locks.set_before_wait_hook(Arc::new(
+            move |actual_pg_id| {
+                assert_eq!(actual_pg_id, pg_id);
+                if first_waiter.swap(false, Ordering::SeqCst) {
+                    first_waiter_gate_hook.block_until_released();
+                    return;
+                }
+                if !owner_released_hook.load(Ordering::SeqCst) {
+                    if later_waiter_before_release.swap(false, Ordering::SeqCst) {
+                        later_waiter_gate_hook.block_until_released();
+                    }
+                    return;
+                }
+                if later_waiter_after_release.swap(false, Ordering::SeqCst) {
+                    later_post_release_gate_hook.block_until_released();
+                    return;
+                }
+                if later_waiter_still_queued.swap(false, Ordering::SeqCst) {
+                    let _ = still_queued_tx.send(());
+                }
+            },
+        ));
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let mut waiters = Vec::new();
+        for waiter_id in 0..WAITER_COUNT {
+            let waiter = new_client();
+            let waiter_payload = payload.clone();
+            let waiter_acquired = acquired_tx.clone();
+            waiters.push(thread::spawn(move || {
+                waiter
+                    .rpc_request(
+                        StorageRpcMessageKind::MetadataCommandPgLockAcquire,
+                        waiter_payload,
+                    )
+                    .unwrap();
+                waiter_acquired.send(waiter_id).unwrap();
+            }));
+            let queue_deadline = Instant::now() + Duration::from_secs(2);
+            while server.metadata_command_locks.waiting_for_test(pg_id) != waiter_id + 1 {
+                assert!(
+                    Instant::now() < queue_deadline,
+                    "waiter {waiter_id} did not enter the server FIFO"
+                );
+                thread::yield_now();
+            }
+            if waiter_id == 0 {
+                first_waiter_gate.wait_until_arrived(Duration::from_secs(2));
+            } else {
+                later_waiter_gate.wait_until_arrived(Duration::from_secs(2));
+                later_waiter_gate.release();
+            }
+        }
+        drop(acquired_tx);
+
+        owner
+            .rpc_request(StorageRpcMessageKind::MetadataCommandPgLockRelease, payload)
+            .unwrap();
+        owner_released.store(true, Ordering::SeqCst);
+        later_post_release_gate.wait_until_arrived(Duration::from_secs(2));
+        later_post_release_gate.release();
+        still_queued_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the later waiter must remain queued behind the paused first waiter");
+
+        first_waiter_gate.release();
+        let acquired = (0..WAITER_COUNT)
+            .map(|_| acquired_rx.recv_timeout(Duration::from_secs(2)).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(acquired, (0..WAITER_COUNT).collect::<Vec<_>>());
+
+        drop(owner);
+        for waiter in waiters {
+            waiter.join().unwrap();
+        }
+        for accepting in accept_threads {
+            assert!(accepting.join().unwrap().is_ok());
+        }
     }
 
     #[test]
@@ -4005,8 +4178,9 @@
         assert!(record.detail.contains("holder_current_elapsed_us="));
         locks.update_context(pg_id, None);
         {
-            let held = locks.state.held.lock().unwrap_or_else(|e| e.into_inner());
-            let holder = held
+            let table = locks.state.table.lock().unwrap_or_else(|e| e.into_inner());
+            let holder = table
+                .held
                 .get(&pg_id)
                 .expect("holder should still be present before release");
             assert!(holder.current_context.is_none());
@@ -4482,8 +4656,8 @@
         .unwrap();
         drop(pg);
 
-        let gate = Arc::new(MetadataCommandCommitGate::default());
-        let _release = MetadataCommandCommitGateRelease(Arc::clone(&gate));
+        let gate = DeterministicTestGate::new();
+        let _release = gate.release_on_drop();
         let hook_gate = Arc::clone(&gate);
         server.set_metadata_checkpoint_rows_captured_test_hook(Arc::new(move || {
             hook_gate.block_until_released();
@@ -4511,7 +4685,7 @@
             checkpoint_tx.send(response).unwrap();
         });
 
-        gate.wait_until_arrived();
+        gate.wait_until_arrived(Duration::from_secs(5));
         let (read_tx, read_rx) = mpsc::channel();
         let read_handler = handler.clone();
         let read_join = thread::spawn(move || {
@@ -4882,6 +5056,119 @@
     #[test]
     fn authenticated_tls_tcp_bucket_subresource_get_preserves_bucket_not_found() {
         authenticated_bucket_subresource_get_preserves_bucket_not_found(true);
+    }
+
+    fn authenticated_bucket_property_pending_match_binds_requested_mutation(tcp: bool) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let mut prepared = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential));
+        if tcp {
+            prepared = prepared.with_rpc_listeners(vec![
+                StorageNodeRpcListenerConfig::tls_tcp_with_config(
+                    "127.0.0.1:0".parse().unwrap(),
+                    storage_rpc_tls_server_config(),
+                ),
+            ]);
+        }
+        let server = prepared.bind().unwrap();
+        let bucket = crate::tests::bucket_name("authenticated-property-pending-match");
+        let owner = crate::CanonicalUserId::from_principal("owner");
+        let pg = server._node.get_pg(0).unwrap();
+        PgMetadataStore::create_bucket(
+            &*pg,
+            &bucket,
+            "owner",
+            &owner,
+            &crate::AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        pg.refresh_metadata_command_state_digest().unwrap();
+        drop(pg);
+        let endpoint = if tcp {
+            let address = server.tcp_listener_addr_for_test();
+            StorageRpcClientEndpoint::tcp_with_config(
+                format!("tcp://localhost:{}", address.port()),
+                vec![address],
+                "localhost",
+                storage_rpc_tls_client_config(),
+            )
+            .unwrap()
+        } else {
+            StorageRpcClientEndpoint::unix(config.socket_path.clone())
+        };
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            endpoint,
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        )
+        .with_pg_topology(Arc::new(crate::PgTopology::new(&config.pg_ids).unwrap()));
+        let route = client
+            .open_bucket_metadata_route(
+                config.cluster_epoch,
+                crate::BucketPgId::new_for_test(PgId::new(0)),
+                &bucket,
+            )
+            .unwrap();
+        let public_access_block = crate::PublicAccessBlockConfig {
+            block_public_acls: true,
+            ignore_public_acls: true,
+            block_public_policy: false,
+            restrict_public_buckets: true,
+        };
+        let put = BucketPropertyMutation::PublicAccessBlock(Some(public_access_block));
+        let delete = BucketPropertyMutation::PublicAccessBlock(None);
+        let command = route
+            .build_put_bucket_property_command(
+                MetadataCommandId::new(
+                    config.cluster_epoch,
+                    PgId::new(0),
+                    MetadataCommandLogIndex::new(1).unwrap(),
+                ),
+                &put,
+            )
+            .unwrap();
+        MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &client,
+            PgId::new(0),
+            &command,
+        )
+        .unwrap();
+        let MetadataCommandPayload::PutBucketProperty(property) = command.payload() else {
+            panic!("unexpected property command payload")
+        };
+        assert!(route
+            .pending_put_bucket_property_command_matches_current(property, &put)
+            .unwrap());
+        assert!(
+            !route
+                .pending_put_bucket_property_command_matches_current(property, &delete)
+                .unwrap(),
+            "an authenticated applied PUT must not satisfy a same-effect DELETE"
+        );
+
+        drop(route);
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_unix_bucket_property_pending_match_binds_requested_mutation() {
+        authenticated_bucket_property_pending_match_binds_requested_mutation(false);
+    }
+
+    #[test]
+    fn authenticated_tls_bucket_property_pending_match_binds_requested_mutation() {
+        authenticated_bucket_property_pending_match_binds_requested_mutation(true);
     }
 
     fn authenticated_complete_multipart_command_build_preserves_no_such_upload(tcp: bool) {
@@ -6932,12 +7219,16 @@
     }
 
     #[derive(Default)]
-    struct MetadataCommandCommitGate {
+    struct DeterministicTestGate {
         state: Mutex<(bool, bool)>,
         changed: Condvar,
     }
 
-    impl MetadataCommandCommitGate {
+    impl DeterministicTestGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self::default())
+        }
+
         fn block_until_released(&self) {
             let mut state = self
                 .state
@@ -6953,8 +7244,8 @@
             }
         }
 
-        fn wait_until_arrived(&self) {
-            let deadline = Instant::now() + Duration::from_secs(5);
+        fn wait_until_arrived(&self, timeout: Duration) {
+            let deadline = Instant::now() + timeout;
             let mut state = self
                 .state
                 .lock()
@@ -6962,7 +7253,7 @@
             while !state.0 {
                 let remaining = deadline
                     .checked_duration_since(Instant::now())
-                    .expect("metadata command did not reach the witness commit gate");
+                    .expect("operation did not reach the deterministic test gate");
                 let (next, timeout) = self
                     .changed
                     .wait_timeout(state, remaining)
@@ -6970,7 +7261,7 @@
                 state = next;
                 assert!(
                     !timeout.timed_out() || state.0,
-                    "metadata command did not reach the witness commit gate"
+                    "operation did not reach the deterministic test gate"
                 );
             }
         }
@@ -6983,11 +7274,15 @@
             state.1 = true;
             self.changed.notify_all();
         }
+
+        fn release_on_drop(self: &Arc<Self>) -> DeterministicTestGateRelease {
+            DeterministicTestGateRelease(Arc::clone(self))
+        }
     }
 
-    struct MetadataCommandCommitGateRelease(Arc<MetadataCommandCommitGate>);
+    struct DeterministicTestGateRelease(Arc<DeterministicTestGate>);
 
-    impl Drop for MetadataCommandCommitGateRelease {
+    impl Drop for DeterministicTestGateRelease {
         fn drop(&mut self) {
             self.0.release();
         }
@@ -7359,8 +7654,8 @@
             ),
         );
 
-        let gate = Arc::new(MetadataCommandCommitGate::default());
-        let _release = MetadataCommandCommitGateRelease(Arc::clone(&gate));
+        let gate = DeterministicTestGate::new();
+        let _release = gate.release_on_drop();
         let gate_for_hook = Arc::clone(&gate);
         let command_for_hook = command.clone();
         witness.set_metadata_command_before_commit_test_hook(Arc::new(
@@ -7393,7 +7688,7 @@
             let _ = result_tx.send(result);
         });
 
-        gate.wait_until_arrived();
+        gate.wait_until_arrived(Duration::from_secs(5));
         let owner_result = result_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("owner must stop at its publication confirmation deadline");
