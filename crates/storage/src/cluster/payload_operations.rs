@@ -1850,17 +1850,39 @@ impl StorageCluster {
     > {
         let confirmation_deadline =
             Instant::now() + request_ops::METADATA_COMMAND_PUBLICATION_CONFIRM_BUDGET;
-        let publication = match self.metadata_command_publication_state_on_acting_set_until(
-            pg_id,
-            command,
-            MetadataCommandRouteMode::Normal,
-            confirmation_deadline,
-        ) {
-            Ok(publication) => publication,
-            Err(error) => {
-                return Err(Self::direct_put_pending_install_confirmation_error(
-                    command,
-                    bucket_snapshot_error_to_object_pg_action_error(error),
+        let mut observation_retries = 0;
+        let publication = loop {
+            let publication = match self.metadata_command_publication_state_on_acting_set_until(
+                pg_id,
+                command,
+                MetadataCommandRouteMode::Normal,
+                confirmation_deadline,
+            ) {
+                Ok(publication) => publication,
+                Err(error) => {
+                    return Err(Self::direct_put_pending_install_confirmation_error(
+                        command,
+                        bucket_snapshot_error_to_object_pg_action_error(error),
+                    ));
+                }
+            };
+            if publication != MetadataCommandPublicationState::IrrevocableUnconfirmed {
+                break publication;
+            }
+            if !sleep_after_metadata_contention_retry_until(
+                "confirm_direct_put_pending_install",
+                Some(pg_id),
+                "direct PUT pending install publication observation blocked",
+                &mut observation_retries,
+                confirmation_deadline,
+            ) {
+                let id = command.id();
+                return Err(ObjectPgActionError::Store(
+                    StoreError::MetadataCommandOutcomeUnconfirmed {
+                        pg_id: id.pg_id().get(),
+                        cluster_epoch: id.cluster_epoch(),
+                        log_index: id.log_index().get(),
+                    },
                 ));
             }
         };
@@ -1871,11 +1893,20 @@ impl StorageCluster {
             )),
             MetadataCommandPublicationState::PublicationStarted
             | MetadataCommandPublicationState::Witnessed
-            | MetadataCommandPublicationState::PublicationUnconfirmed
-            | MetadataCommandPublicationState::IrrevocableUnconfirmed => {
+            | MetadataCommandPublicationState::PublicationUnconfirmed => {
                 let id = command.id();
                 Err(ObjectPgActionError::Store(
                     StoreError::MetadataCommandIrrevocableConvergencePending {
+                        pg_id: id.pg_id().get(),
+                        cluster_epoch: id.cluster_epoch(),
+                        log_index: id.log_index().get(),
+                    },
+                ))
+            }
+            MetadataCommandPublicationState::IrrevocableUnconfirmed => {
+                let id = command.id();
+                Err(ObjectPgActionError::Store(
+                    StoreError::MetadataCommandOutcomeUnconfirmed {
                         pg_id: id.pg_id().get(),
                         cluster_epoch: id.cluster_epoch(),
                         log_index: id.log_index().get(),

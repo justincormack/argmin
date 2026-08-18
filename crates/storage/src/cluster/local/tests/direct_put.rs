@@ -1225,7 +1225,7 @@ fn direct_put_pending_install_uncertainty_without_durable_command_reinspects() {
     set_route_primary(&mut map, 2, NodeId::new(1));
 
     let map = Arc::new(map);
-    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    let cluster = Arc::new(crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap());
     create_test_bucket(&cluster, &bucket);
 
     let pg_id = PgId::new(2);
@@ -1240,16 +1240,35 @@ fn direct_put_pending_install_uncertainty_without_durable_command_reinspects() {
         )),
     );
 
-    let (outcome, command_owned) = cluster
-        .finish_direct_put_after_pending_install_uncertainty(
+    let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+    let observation_signalled = Arc::new(AtomicBool::new(false));
+    let observation_signalled_for_hook = Arc::clone(&observation_signalled);
+    let _inspection_hook =
+        cluster.test_install_post_budget_metadata_command_inspection_hook(Arc::new(move |_, _| {
+            if !observation_signalled_for_hook.swap(true, Ordering::SeqCst) {
+                observed_tx.send(()).unwrap();
+            }
+            None
+        }));
+    let pg_lock = map.runtime_state().metadata_command_pg_lock(pg_id);
+    let pg_guard = pg_lock.lock();
+    let finish_cluster = Arc::clone(&cluster);
+    let finish_bucket = bucket.clone();
+    let worker = std::thread::spawn(move || {
+        finish_cluster.finish_direct_put_after_pending_install_uncertainty(
             pg_id,
-            &bucket,
+            &finish_bucket,
             &mut command,
             crate::ObjectPgActionError::Store(StoreError::MetadataCommandContention {
                 context: "test pending install uncertainty",
             }),
         )
-        .unwrap();
+    });
+    observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("publication inspection must observe the busy PG serialization boundary");
+    drop(pg_guard);
+    let (outcome, command_owned) = worker.join().unwrap().unwrap();
 
     assert!(!command_owned);
     assert!(matches!(
