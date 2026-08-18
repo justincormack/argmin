@@ -63,6 +63,7 @@
         encode_metadata_command_matching_applied_request, encode_metadata_command_next_id_request,
         encode_metadata_command_pending_slot_cleanup_response,
         encode_metadata_command_pending_slot_request, encode_metadata_command_request,
+        encode_metadata_command_request_with_raw_command_for_test,
         encode_metadata_command_state_request, encode_metadata_command_transfer_adopt_request,
         encode_metadata_command_transfer_checkpoint_base_request,
         encode_metadata_command_transfer_empty_state_request,
@@ -4934,6 +4935,90 @@
                     .unwrap(),
                 state_before,
                 "unsupported checkpoint version {unsupported_version} mutated destination state"
+            );
+        }
+        drop(client);
+        assert!(join.join().unwrap().is_ok());
+    }
+
+    #[test]
+    fn authenticated_storage_rpc_rejects_unsupported_metadata_command_before_mutation_dispatch() {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .bind()
+            .unwrap();
+        let destination_node = Arc::clone(&server._node);
+        let state_before = destination_node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap();
+        let mutation_dispatches = Arc::new(AtomicUsize::new(0));
+        let mutation_dispatches_for_hook = Arc::clone(&mutation_dispatches);
+        server.set_metadata_command_before_commit_test_hook(Arc::new(move |_, _| {
+            mutation_dispatches_for_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one());
+        let client = UnixStorageNodeClient::with_endpoint_rpc_admission_settings_and_auth(
+            config.node_id,
+            config.cluster_epoch,
+            StorageRpcClientEndpoint::unix(socket_path),
+            LocalUnixStorageNodeClientAdmissionSettings::DEFAULT,
+            Some(storage_rpc_client_auth(credential, 9)),
+        );
+        let command = test_metadata_command(0, 1);
+        let request = StorageRpcMetadataCommandRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            command: command.clone(),
+        };
+
+        for unsupported_version in [7_u16, 9] {
+            let command_bytes =
+                command.command_bytes_with_encoding_version_for_test(unsupported_version);
+            let payload = encode_metadata_command_request_with_raw_command_for_test(
+                &request,
+                &command_bytes,
+            );
+            let error = client
+                .rpc_request_result(
+                    StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+                    payload,
+                )
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error.code, StorageRpcErrorCode::PayloadDecode);
+            assert_eq!(error.message, "invalid metadata command envelope");
+            assert_eq!(
+                mutation_dispatches.load(Ordering::SeqCst),
+                0,
+                "unsupported command v{unsupported_version} reached mutation dispatch"
+            );
+            assert_eq!(
+                destination_node
+                    .get_pg(0)
+                    .unwrap()
+                    .metadata_command_replica_state()
+                    .unwrap(),
+                state_before,
+                "unsupported command v{unsupported_version} mutated replica state"
+            );
+            assert_eq!(
+                destination_node
+                    .get_pg(0)
+                    .unwrap()
+                    .max_metadata_command_log_index(config.cluster_epoch)
+                    .unwrap(),
+                0,
+                "unsupported command v{unsupported_version} published a durable log entry"
             );
         }
         drop(client);

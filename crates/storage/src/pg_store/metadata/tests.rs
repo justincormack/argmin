@@ -6382,6 +6382,203 @@ fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutat
 }
 
 #[test]
+fn recovery_rejects_resealed_unsupported_pending_command_versions_before_mutation() {
+    for version in [7_u16, 9] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command = create_bucket_probe_command(
+            1,
+            1,
+            trusted_bucket_name(format!("unsupported-pending-v{version}")),
+            1,
+        );
+        let command_bytes = command.command_bytes_with_encoding_version_for_test(version);
+        let command_checksum = checksum::crc64::checksum(&command_bytes);
+        store
+            .test_insert_raw_pending_metadata_command_slot(
+                command.id(),
+                command_checksum,
+                &command_bytes,
+                Some(command.bucket_name()),
+            )
+            .unwrap();
+
+        let replica_state_before = store.metadata_command_replica_state().unwrap();
+        let state_digest_before = store.metadata_state_digest().unwrap();
+        let pending_row_before = store
+            .conn
+            .query_row(
+                "SELECT cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
+                        publication_started, placed_segment_reference_count, scope_bucket \
+                 FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        let error = store
+            .recover(super::super::PgStoreRecoveryContext::for_node(NodeId::new(
+                0,
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::MetadataCommandLogConflict { .. }),
+            "resealed pending command v{version} must fail as a format conflict, got {error:?}"
+        );
+        assert_eq!(
+            store.metadata_command_replica_state().unwrap(),
+            replica_state_before,
+            "unsupported pending command v{version} must not advance replica state"
+        );
+        assert_eq!(
+            store.metadata_state_digest().unwrap(),
+            state_digest_before,
+            "unsupported pending command v{version} must not mutate materialized state"
+        );
+        let pending_row_after = store
+            .conn
+            .query_row(
+                "SELECT cluster_epoch, pg_id, log_index, command_checksum, command_bytes, \
+                        publication_started, placed_segment_reference_count, scope_bucket \
+                 FROM metadata_command_pending_slot WHERE singleton = 0",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            pending_row_after, pending_row_before,
+            "unsupported pending command v{version} must leave the durable slot unchanged"
+        );
+    }
+}
+
+#[test]
+fn recovery_rejects_resealed_unsupported_applied_command_versions_before_mutation() {
+    for version in [7_u16, 9] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command = create_bucket_probe_command(
+            1,
+            1,
+            trusted_bucket_name(format!("unsupported-applied-v{version}")),
+            1,
+        );
+        store
+            .apply_metadata_command_and_record(0, &command)
+            .unwrap();
+
+        let command_bytes = command.command_bytes_with_encoding_version_for_test(version);
+        let command_checksum = checksum::crc64::checksum(&command_bytes);
+        let log_hash = metadata_command_log_hash(
+            ClusterEpoch::INITIAL,
+            PgId::new(1),
+            command.id().log_index(),
+            0,
+            command_checksum,
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE metadata_command_log \
+                 SET command_checksum = ?1, command_bytes = ?2, log_hash = ?3 \
+                 WHERE cluster_epoch = 1 AND pg_id = 1 AND log_index = 1",
+                params![
+                    command_checksum as i64,
+                    command_bytes,
+                    log_hash.value() as i64,
+                ],
+            )
+            .unwrap();
+        store
+            .test_set_metadata_command_replica_applied_log_hash(log_hash.value())
+            .unwrap();
+
+        let replica_state_before = store.metadata_command_replica_state().unwrap();
+        let state_digest_before = store.metadata_state_digest().unwrap();
+        let log_row_before = store
+            .conn
+            .query_row(
+                "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
+                 FROM metadata_command_log WHERE cluster_epoch = 1 AND pg_id = 1 AND log_index = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        let error = store
+            .recover(super::super::PgStoreRecoveryContext::for_node(NodeId::new(
+                0,
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::MetadataCommandLogConflict { .. }),
+            "resealed applied command v{version} must fail as a format conflict, got {error:?}"
+        );
+        assert_eq!(
+            store.metadata_command_replica_state().unwrap(),
+            replica_state_before,
+            "unsupported applied command v{version} must not advance replica state"
+        );
+        assert_eq!(
+            store.metadata_state_digest().unwrap(),
+            state_digest_before,
+            "unsupported applied command v{version} must not mutate materialized state"
+        );
+        let log_row_after = store
+            .conn
+            .query_row(
+                "SELECT command_checksum, command_bytes, abandoned, previous_log_hash, log_hash \
+                 FROM metadata_command_log WHERE cluster_epoch = 1 AND pg_id = 1 AND log_index = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            log_row_after, log_row_before,
+            "unsupported applied command v{version} must leave the durable log unchanged"
+        );
+    }
+}
+
+#[test]
 fn abandoned_log_tail_preserves_digest_and_rejects_materialized_mutation() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

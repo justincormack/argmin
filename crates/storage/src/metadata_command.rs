@@ -2105,6 +2105,14 @@ impl MetadataCommandEnvelope {
         canonical_command_bytes(self.id, &self.payload)
     }
 
+    #[cfg(test)]
+    pub(crate) fn command_bytes_with_encoding_version_for_test(&self, version: u16) -> Vec<u8> {
+        let mut bytes = self.command_bytes();
+        let version_offset = 4 + METADATA_COMMAND_MAGIC.len();
+        bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_le_bytes());
+        bytes
+    }
+
     pub(crate) fn abandoned_log_bytes(&self) -> Vec<u8> {
         abandoned_command_log_bytes(self.id, self.checksum_crc64)
     }

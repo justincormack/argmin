@@ -70,6 +70,23 @@ pub(crate) fn encode_metadata_command_request(
     Ok(out)
 }
 
+#[cfg(test)]
+pub(crate) fn encode_metadata_command_request_with_raw_command_for_test(
+    request: &StorageRpcMetadataCommandRequest,
+    command_bytes: &[u8],
+) -> Vec<u8> {
+    validate_metadata_command_route(request.cluster_epoch, request.pg_id, request.command.id())
+        .expect("test metadata command route must be valid");
+    assert!(command_bytes.len() <= STORAGE_RPC_MAX_METADATA_COMMAND_BYTES_LEN);
+    let mut out = Vec::new();
+    put_u32(&mut out, request.node_id.as_u32());
+    put_u64(&mut out, request.cluster_epoch.get());
+    put_u32(&mut out, request.pg_id.get());
+    put_u64(&mut out, checksum::crc64::checksum(command_bytes));
+    put_bytes(&mut out, command_bytes);
+    out
+}
+
 pub(crate) fn decode_metadata_command_request(
     bytes: &[u8],
     authority: &MetadataCommandDecodeAuthority,
