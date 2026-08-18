@@ -80,6 +80,45 @@ fn make_dynamic_runtime_map_candidate(candidate: Arc<StorageCluster>) -> Arc<Sto
         .unwrap()
 }
 
+fn leave_published_versioning_command_pending(
+    coord: &Coordinator,
+    storage: &StorageCluster,
+    bucket: &BucketName,
+    requester: Requester,
+) -> u64 {
+    let fail_once = Arc::new(AtomicBool::new(true));
+    let fail_once_for_hook = Arc::clone(&fail_once);
+    let hook = storage.test_install_after_bucket_metadata_command_primary_apply_hook(
+        bucket,
+        Arc::new(move |kind| {
+            if kind == MetadataCommandApplyTestKind::PutBucketVersioning
+                && fail_once_for_hook.swap(false, Ordering::SeqCst)
+            {
+                return Err(storage::test_support::injected_retryable_convergence_failure());
+            }
+            Ok(())
+        }),
+    );
+    coord
+        .put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: bucket_request_with_expected_owner(bucket.as_str(), requester, None),
+            state: BucketVersioningState::Enabled,
+        })
+        .unwrap();
+    drop(hook);
+    assert!(!fail_once.load(Ordering::SeqCst));
+    assert!(
+        storage
+            .test_observe_bucket_delete_progress(bucket)
+            .unwrap()
+            .has_pending_metadata_command,
+        "published versioning command should remain available for request adoption"
+    );
+    let info = storage.head_bucket_info(bucket).unwrap();
+    assert_eq!(info.versioning, BucketVersioningState::Enabled);
+    info.bucket_execution_generation
+}
+
 fn open_dynamic_test_storage_cluster(
     data_dir: &std::path::Path,
     pg_ids: &[u32],
@@ -3459,6 +3498,172 @@ fn bucket_property_versioning_and_acl_mutations_expire_at_pending_install_effect
         .get_bucket_acl_on_admitted_route(&admission, &acl_request.bucket)
         .unwrap();
     assert!(Coordinator::acl_grants_public_read(&updated_acl.acl_grants));
+}
+
+#[test]
+fn pending_bucket_mutation_requires_each_principal_to_be_authorized_before_adoption() {
+    let tmp = test_util::tempdir();
+    let storage = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage),
+    );
+    let owner = AccountIdentity::from_principal("arn:aws:iam::111122223333:user/owner");
+    let allowed = AccountIdentity::from_principal("arn:aws:iam::444455556666:user/allowed");
+    let denied = AccountIdentity::from_principal("arn:aws:iam::777788889999:user/denied");
+    let bucket = trusted_bucket_name("cross-principal-pending-adoption");
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: bucket.clone(),
+            requester: Requester::authenticated(owner.clone()),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutBucketVersioning","Resource":"arn:aws:s3:::{}"}}]}}"#,
+        allowed.principal(),
+        bucket.as_str(),
+    );
+    coord
+        .put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: bucket_request_with_expected_owner(
+                bucket.as_str(),
+                Requester::authenticated(owner.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+        .unwrap();
+
+    let published_generation = leave_published_versioning_command_pending(
+        &coord,
+        &storage,
+        &bucket,
+        Requester::authenticated(owner),
+    );
+    let denied_result = coord.put_bucket_versioning(&PutBucketVersioningRequest {
+        bucket: bucket_request_with_expected_owner(
+            bucket.as_str(),
+            Requester::authenticated(denied),
+            None,
+        ),
+        state: BucketVersioningState::Enabled,
+    });
+    assert!(matches!(denied_result, Err(ServerError::AccessDenied)));
+    assert!(
+        storage
+            .test_observe_bucket_delete_progress(&bucket)
+            .unwrap()
+            .has_pending_metadata_command,
+        "denied requester must not drain or adopt the pending command"
+    );
+    assert_eq!(
+        storage
+            .head_bucket_info(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        published_generation
+    );
+
+    coord
+        .put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: bucket_request_with_expected_owner(
+                bucket.as_str(),
+                Requester::authenticated(allowed),
+                None,
+            ),
+            state: BucketVersioningState::Enabled,
+        })
+        .unwrap();
+    assert!(
+        !storage
+            .test_observe_bucket_delete_progress(&bucket)
+            .unwrap()
+            .has_pending_metadata_command,
+        "independently authorized requester should finish exact pending mutation"
+    );
+    assert_eq!(
+        storage
+            .head_bucket_info(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        published_generation,
+        "adoption must not allocate a second bucket mutation generation"
+    );
+}
+
+#[test]
+fn pending_bucket_mutation_authorizes_each_credential_profile_for_the_same_principal() {
+    let tmp = test_util::tempdir();
+    let storage = open_test_storage_cluster(tmp.path(), &[0, 1, 2]);
+    let coord = setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+        Arc::clone(&storage),
+    );
+    let owner = AccountIdentity::from_principal("arn:aws:iam::111122223333:user/owner");
+    let operator = AccountIdentity::from_principal("arn:aws:iam::111122223333:user/operator");
+    let bucket = trusted_bucket_name("credential-profile-pending-adoption");
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: bucket.clone(),
+            requester: Requester::authenticated(owner.clone()),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            object_lock_enabled: false,
+        })
+        .unwrap();
+
+    let published_generation = leave_published_versioning_command_pending(
+        &coord,
+        &storage,
+        &bucket,
+        Requester::authenticated(owner),
+    );
+    let standard_result = coord.put_bucket_versioning(&PutBucketVersioningRequest {
+        bucket: bucket_request_with_expected_owner(
+            bucket.as_str(),
+            Requester::authenticated(operator.clone()),
+            None,
+        ),
+        state: BucketVersioningState::Enabled,
+    });
+    assert!(matches!(standard_result, Err(ServerError::AccessDenied)));
+    assert!(
+        storage
+            .test_observe_bucket_delete_progress(&bucket)
+            .unwrap()
+            .has_pending_metadata_command,
+        "denied credential profile must not drain or adopt the pending command"
+    );
+
+    coord
+        .put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: bucket_request_with_expected_owner(
+                bucket.as_str(),
+                Requester::authenticated_owner_account_admin(operator),
+                None,
+            ),
+            state: BucketVersioningState::Enabled,
+        })
+        .unwrap();
+    assert!(
+        !storage
+            .test_observe_bucket_delete_progress(&bucket)
+            .unwrap()
+            .has_pending_metadata_command,
+        "authorized credential profile should finish exact pending mutation"
+    );
+    assert_eq!(
+        storage
+            .head_bucket_info(&bucket)
+            .unwrap()
+            .bucket_execution_generation,
+        published_generation,
+        "credential change must not become part of storage mutation identity"
+    );
 }
 
 #[test]
