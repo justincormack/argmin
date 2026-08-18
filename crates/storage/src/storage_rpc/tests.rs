@@ -207,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_frame_encoding_is_stable() {
+    fn current_storage_rpc_frame_matches_frozen_versioned_manifest_and_requires_version_bump() {
         const V17_FRAME: &[u8] = &[
             24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
             114, 112, 99, 45, 102, 114, 97, 109, 101, 17, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3,
@@ -386,6 +386,40 @@ mod tests {
     }
 
     #[test]
+    fn storage_rpc_frame_reports_typed_marker_and_version_failures() {
+        let current = encode_storage_rpc_frame(1, StorageRpcMessageKind::Health, b"").unwrap();
+        let marker_end = 4 + STORAGE_RPC_FRAME_MAGIC.len();
+        for truncated_len in 0..marker_end {
+            assert_eq!(
+                decode_storage_rpc_frame(&current[..truncated_len]),
+                Err(StorageRpcFrameError::Truncated),
+                "marker truncation at byte {truncated_len} was not classified as truncated"
+            );
+        }
+        for truncated_len in marker_end..marker_end + 2 {
+            assert_eq!(
+                decode_storage_rpc_frame(&current[..truncated_len]),
+                Err(StorageRpcFrameError::Truncated),
+                "version truncation at byte {truncated_len} was not classified as truncated"
+            );
+        }
+
+        let mut unknown_magic = current.clone();
+        unknown_magic[4] ^= 0x20;
+        assert_eq!(
+            decode_storage_rpc_frame(&unknown_magic),
+            Err(StorageRpcFrameError::UnknownMagic)
+        );
+
+        let mut oversized_marker = Vec::new();
+        put_u32(&mut oversized_marker, u32::MAX);
+        assert_eq!(
+            decode_storage_rpc_frame(&oversized_marker),
+            Err(StorageRpcFrameError::Truncated)
+        );
+    }
+
+    #[test]
     fn object_payload_reclaim_claim_acquire_round_trips_effect_deadline() {
         let request = StorageRpcObjectPayloadReclaimClaimAcquireRequest {
             object: StorageRpcObjectRequest {
@@ -536,20 +570,12 @@ mod tests {
     }
 
     fn raw_storage_rpc_frame_with_version(version: u16) -> Vec<u8> {
-        let payload = b"old or future version";
-        let kind = StorageRpcMessageKind::Health as u16;
-        let mut bytes = Vec::new();
-        put_bytes(&mut bytes, STORAGE_RPC_FRAME_MAGIC);
-        put_u16(&mut bytes, version);
-        put_u64(&mut bytes, 1);
-        put_u16(&mut bytes, kind);
-        put_u32(&mut bytes, payload.len() as u32);
-        put_u64(
-            &mut bytes,
-            storage_rpc_frame_checksum(version, 1, kind, payload.len() as u32, payload),
-        );
-        bytes.extend_from_slice(payload);
-        bytes
+        encode_storage_rpc_frame_with_version_for_test(
+            1,
+            StorageRpcMessageKind::Health,
+            b"old or future version",
+            version,
+        )
     }
 
     #[test]
@@ -684,6 +710,38 @@ mod tests {
                 len: 4,
                 limit: 3
             })
+        ));
+    }
+
+    #[test]
+    fn storage_rpc_stream_frame_rejects_magic_and_version_before_kind_or_length() {
+        let mut unsupported = Vec::new();
+        put_bytes(&mut unsupported, STORAGE_RPC_FRAME_MAGIC);
+        put_u16(&mut unsupported, STORAGE_RPC_FRAME_ENCODING_VERSION - 1);
+        put_u64(&mut unsupported, 1);
+        put_u16(&mut unsupported, u16::MAX);
+        put_u32(&mut unsupported, u32::MAX);
+        assert!(matches!(
+            read_storage_rpc_frame_from(&mut Cursor::new(unsupported)),
+            Err(StorageRpcStreamError::Frame(
+                StorageRpcFrameError::UnsupportedVersion(version)
+            )) if version == STORAGE_RPC_FRAME_ENCODING_VERSION - 1
+        ));
+
+        let mut unknown_magic = Vec::new();
+        put_u32(&mut unknown_magic, STORAGE_RPC_FRAME_MAGIC.len() as u32);
+        let mut marker = STORAGE_RPC_FRAME_MAGIC.to_vec();
+        marker[0] ^= 0x20;
+        unknown_magic.extend_from_slice(&marker);
+        put_u16(&mut unknown_magic, STORAGE_RPC_FRAME_ENCODING_VERSION - 1);
+        put_u64(&mut unknown_magic, 1);
+        put_u16(&mut unknown_magic, u16::MAX);
+        put_u32(&mut unknown_magic, u32::MAX);
+        assert!(matches!(
+            read_storage_rpc_frame_from(&mut Cursor::new(unknown_magic)),
+            Err(StorageRpcStreamError::Frame(
+                StorageRpcFrameError::UnknownMagic
+            ))
         ));
     }
 

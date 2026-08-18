@@ -47,6 +47,34 @@ pub(crate) fn encode_storage_rpc_frame_with_limit(
     Ok(out)
 }
 
+#[cfg(test)]
+pub(crate) fn encode_storage_rpc_frame_with_version_for_test(
+    request_id: u64,
+    kind: StorageRpcMessageKind,
+    payload: &[u8],
+    version: u16,
+) -> Vec<u8> {
+    let payload_len = u32::try_from(payload.len()).expect("test storage RPC payload fits u32");
+    let mut out = Vec::new();
+    put_bytes(&mut out, STORAGE_RPC_FRAME_MAGIC);
+    put_u16(&mut out, version);
+    put_u64(&mut out, request_id);
+    put_u16(&mut out, kind as u16);
+    put_u32(&mut out, payload_len);
+    put_u64(
+        &mut out,
+        storage_rpc_frame_checksum(
+            version,
+            request_id,
+            kind as u16,
+            payload_len,
+            payload,
+        ),
+    );
+    out.extend_from_slice(payload);
+    out
+}
+
 pub(crate) fn decode_storage_rpc_frame(
     bytes: &[u8],
 ) -> Result<StorageRpcFrame, StorageRpcFrameError> {
@@ -168,8 +196,14 @@ fn read_storage_rpc_frame_from_with_limit_and_caps<R: Read>(
     let mut magic = vec![0; STORAGE_RPC_FRAME_MAGIC.len()];
     reader.read_exact(&mut magic)?;
     bytes.extend_from_slice(&magic);
+    if magic != STORAGE_RPC_FRAME_MAGIC {
+        return Err(StorageRpcFrameError::UnknownMagic.into());
+    }
     let version = read_u16_from(reader)?;
     put_u16(&mut bytes, version);
+    if version != STORAGE_RPC_FRAME_ENCODING_VERSION {
+        return Err(StorageRpcFrameError::UnsupportedVersion(version).into());
+    }
     let request_id = read_u64_from(reader)?;
     put_u64(&mut bytes, request_id);
     let raw_kind = read_u16_from(reader)?;

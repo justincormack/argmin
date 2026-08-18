@@ -873,6 +873,41 @@ pub(crate) fn sign_storage_rpc_request(
         .encode_frame()
 }
 
+#[cfg(test)]
+pub(crate) fn sign_storage_rpc_request_with_encoded_frame_for_test(
+    input: StorageRpcAuthRequestInput<'_>,
+    encoded_frame: &[u8],
+) -> Result<Vec<u8>, ControlPlaneError> {
+    if !principal_allows_operation(input.credential.principal(), input.frame.kind) {
+        return Err(storage_rpc_auth_protocol_error(format!(
+            "principal {:?} is not authorized for {}",
+            input.credential.principal(),
+            input.frame.kind.operation_name()
+        )));
+    }
+    let payload = encode_binding_with_encoded_frame(
+        input.topology_generation,
+        input.topology_digest,
+        input.target_node_id,
+        None,
+        encoded_frame,
+    )?;
+    input
+        .credential
+        .sign_envelope(ControlPlaneAuthSignInput {
+            target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::StorageRpc),
+            operation: ControlPlaneAuthOperation::StorageRpcRequest {
+                message_kind: input.frame.kind as u16,
+            },
+            issued_at_ms: Some(input.issued_at_ms),
+            expires_at_ms: Some(input.expires_at_ms),
+            sequence: Some(input.frame.request_id),
+            nonce: Vec::new(),
+            payload,
+        })?
+        .encode_frame()
+}
+
 pub(crate) struct StorageRpcAuthRequestVerificationInput<'a> {
     pub(crate) verifier: &'a ControlPlaneScopedCredentialStore,
     pub(crate) expected_cluster_id: &'a str,
@@ -1378,9 +1413,25 @@ fn encode_binding(
     request_transcript: Option<&StorageRpcRequestTranscript>,
     frame: &StorageRpcFrame,
 ) -> Result<Vec<u8>, ControlPlaneError> {
-    validate_topology(topology_generation, topology_digest)?;
     let frame = encode_storage_rpc_frame(frame.request_id, frame.kind, &frame.payload)
         .map_err(storage_rpc_frame_protocol_error)?;
+    encode_binding_with_encoded_frame(
+        topology_generation,
+        topology_digest,
+        target_node_id,
+        request_transcript,
+        &frame,
+    )
+}
+
+fn encode_binding_with_encoded_frame(
+    topology_generation: u64,
+    topology_digest: &str,
+    target_node_id: NodeId,
+    request_transcript: Option<&StorageRpcRequestTranscript>,
+    frame: &[u8],
+) -> Result<Vec<u8>, ControlPlaneError> {
+    validate_topology(topology_generation, topology_digest)?;
     let frame_len = u32::try_from(frame.len()).map_err(|_| {
         storage_rpc_auth_protocol_error("encoded storage RPC frame length exceeds u32::MAX")
     })?;
@@ -1399,7 +1450,7 @@ fn encode_binding(
         }
     }
     out.extend_from_slice(&frame_len.to_be_bytes());
-    out.extend_from_slice(&frame);
+    out.extend_from_slice(frame);
     Ok(out)
 }
 
