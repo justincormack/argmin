@@ -43,6 +43,72 @@ const METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command";
 const METADATA_COMMAND_ENCODING_VERSION: u16 = 8;
 const ABANDONED_METADATA_COMMAND_MAGIC: &[u8] = b"argmin-metadata-command-abandoned";
 const ABANDONED_METADATA_COMMAND_ENCODING_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetadataCommandRecordFormat {
+    Applied,
+    Abandoned,
+}
+
+impl MetadataCommandRecordFormat {
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Applied => "metadata command",
+            Self::Abandoned => "abandoned metadata command",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MetadataCommandFormatError {
+    TruncatedMarkerLength,
+    TruncatedMagic,
+    UnknownMagic,
+    TruncatedVersion {
+        format: MetadataCommandRecordFormat,
+    },
+    UnsupportedVersion {
+        format: MetadataCommandRecordFormat,
+        version: u16,
+    },
+    ExpectedAppliedCommand,
+    InvalidPayload(String),
+    TrailingData,
+    NonCanonical,
+}
+
+impl std::fmt::Display for MetadataCommandFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TruncatedMarkerLength | Self::TruncatedMagic | Self::TruncatedVersion { .. } => {
+                formatter.write_str("truncated metadata command log entry")
+            }
+            Self::UnknownMagic => formatter.write_str("unknown metadata command log entry magic"),
+            Self::UnsupportedVersion { format, version } => write!(
+                formatter,
+                "unsupported {} encoding version {version}",
+                format.description()
+            ),
+            Self::ExpectedAppliedCommand => formatter
+                .write_str("pending metadata command slot does not contain an applied command"),
+            Self::InvalidPayload(reason) => formatter.write_str(reason),
+            Self::TrailingData => {
+                formatter.write_str("metadata command log entry has trailing bytes")
+            }
+            Self::NonCanonical => {
+                formatter.write_str("decoded metadata command did not round-trip canonical bytes")
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetadataCommandFormatError {}
+
+impl From<String> for MetadataCommandFormatError {
+    fn from(reason: String) -> Self {
+        Self::InvalidPayload(reason)
+    }
+}
 const METADATA_COMMAND_CREATE_BUCKET: u16 = 1;
 const METADATA_COMMAND_PUT_BUCKET_VERSIONING: u16 = 2;
 const METADATA_COMMAND_PUT_BUCKET_ACL: u16 = 3;
@@ -2152,76 +2218,110 @@ pub(crate) fn abandoned_command_log_bytes(id: MetadataCommandId, command_checksu
     out
 }
 
-pub(crate) fn decode_metadata_command_log_entry_header(
+fn metadata_command_record_format(
     bytes: &[u8],
-) -> Result<MetadataCommandLogEntryHeader, String> {
-    let mut decoder = MetadataCommandLogEntryDecoder::new(bytes);
-    let magic = decoder.read_bytes()?;
-    if magic == METADATA_COMMAND_MAGIC {
-        let version = decoder.read_u16()?;
-        if version != METADATA_COMMAND_ENCODING_VERSION {
-            return Err(format!(
-                "unsupported metadata command encoding version {version}"
-            ));
-        }
-        let id = decoder.read_command_id()?;
-        let payload_kind = decoder.read_u16()?;
-        decoder.skip_metadata_command_payload(payload_kind)?;
-        decoder.finish()?;
-        return Ok(MetadataCommandLogEntryHeader {
-            id,
-            kind: MetadataCommandLogEntryKind::Applied,
-            command_kind_name: metadata_command_payload_kind_name(payload_kind),
-        });
+) -> Result<MetadataCommandRecordFormat, MetadataCommandFormatError> {
+    let marker_length_bytes: [u8; 4] = bytes
+        .get(..4)
+        .ok_or(MetadataCommandFormatError::TruncatedMarkerLength)?
+        .try_into()
+        .expect("four-byte metadata command marker length");
+    let marker_length = u32::from_le_bytes(marker_length_bytes) as usize;
+    let marker_end = 4_usize
+        .checked_add(marker_length)
+        .ok_or(MetadataCommandFormatError::TruncatedMagic)?;
+    let marker = bytes
+        .get(4..marker_end)
+        .ok_or(MetadataCommandFormatError::TruncatedMagic)?;
+    let format = if marker == METADATA_COMMAND_MAGIC {
+        MetadataCommandRecordFormat::Applied
+    } else if marker == ABANDONED_METADATA_COMMAND_MAGIC {
+        MetadataCommandRecordFormat::Abandoned
+    } else {
+        return Err(MetadataCommandFormatError::UnknownMagic);
+    };
+    let version_end = marker_end
+        .checked_add(2)
+        .ok_or(MetadataCommandFormatError::TruncatedVersion { format })?;
+    let version_bytes: [u8; 2] = bytes
+        .get(marker_end..version_end)
+        .ok_or(MetadataCommandFormatError::TruncatedVersion { format })?
+        .try_into()
+        .expect("two-byte metadata command version");
+    let version = u16::from_le_bytes(version_bytes);
+    let current_version = match format {
+        MetadataCommandRecordFormat::Applied => METADATA_COMMAND_ENCODING_VERSION,
+        MetadataCommandRecordFormat::Abandoned => ABANDONED_METADATA_COMMAND_ENCODING_VERSION,
+    };
+    if version != current_version {
+        return Err(MetadataCommandFormatError::UnsupportedVersion { format, version });
     }
-    if magic == ABANDONED_METADATA_COMMAND_MAGIC {
-        let version = decoder.read_u16()?;
-        if version != ABANDONED_METADATA_COMMAND_ENCODING_VERSION {
-            return Err(format!(
-                "unsupported abandoned metadata command encoding version {version}"
-            ));
-        }
-        let id = decoder.read_command_id()?;
-        let original_command_checksum = decoder.read_u64()?;
-        decoder.finish()?;
-        return Ok(MetadataCommandLogEntryHeader {
-            id,
-            kind: MetadataCommandLogEntryKind::Abandoned {
-                original_command_checksum,
-            },
-            command_kind_name: None,
-        });
-    }
-    Err("unknown metadata command log entry magic".to_string())
+    Ok(format)
 }
 
-fn decode_metadata_command_envelope_inner(bytes: &[u8]) -> Result<MetadataCommandEnvelope, String> {
+pub(crate) fn decode_metadata_command_log_entry_header(
+    bytes: &[u8],
+) -> Result<MetadataCommandLogEntryHeader, MetadataCommandFormatError> {
+    let format = metadata_command_record_format(bytes)?;
     let mut decoder = MetadataCommandLogEntryDecoder::new(bytes);
-    let magic = decoder.read_bytes()?;
-    if magic != METADATA_COMMAND_MAGIC {
-        return Err(
-            "pending metadata command slot does not contain an applied command".to_string(),
-        );
+    decoder.read_bytes()?;
+    decoder.read_u16()?;
+    let id = decoder.read_command_id()?;
+    let (kind, command_kind_name) = match format {
+        MetadataCommandRecordFormat::Applied => {
+            let payload_kind = decoder.read_u16()?;
+            decoder.skip_metadata_command_payload(payload_kind)?;
+            (
+                MetadataCommandLogEntryKind::Applied,
+                metadata_command_payload_kind_name(payload_kind),
+            )
+        }
+        MetadataCommandRecordFormat::Abandoned => {
+            let original_command_checksum = decoder.read_u64()?;
+            (
+                MetadataCommandLogEntryKind::Abandoned {
+                    original_command_checksum,
+                },
+                None,
+            )
+        }
+    };
+    if decoder.remaining() != 0 {
+        return Err(MetadataCommandFormatError::TrailingData);
     }
-    let version = decoder.read_u16()?;
-    if version != METADATA_COMMAND_ENCODING_VERSION {
-        return Err(format!(
-            "unsupported metadata command encoding version {version}"
-        ));
+    Ok(MetadataCommandLogEntryHeader {
+        id,
+        kind,
+        command_kind_name,
+    })
+}
+
+fn decode_metadata_command_envelope_inner(
+    bytes: &[u8],
+) -> Result<MetadataCommandEnvelope, MetadataCommandFormatError> {
+    if metadata_command_record_format(bytes)? != MetadataCommandRecordFormat::Applied {
+        return Err(MetadataCommandFormatError::ExpectedAppliedCommand);
     }
+    let mut decoder = MetadataCommandLogEntryDecoder::new(bytes);
+    decoder.read_bytes()?;
+    decoder.read_u16()?;
     let id = decoder.read_command_id()?;
     let payload_kind = decoder.read_u16()?;
     let payload = decoder.read_metadata_command_payload(payload_kind)?;
-    decoder.finish()?;
+    if decoder.remaining() != 0 {
+        return Err(MetadataCommandFormatError::TrailingData);
+    }
     let envelope = MetadataCommandEnvelope::new(id, payload);
     if envelope.command_bytes() != bytes {
-        return Err("decoded metadata command did not round-trip canonical bytes".to_string());
+        return Err(MetadataCommandFormatError::NonCanonical);
     }
     Ok(envelope)
 }
 
 /// Validates canonical command bytes without conferring a typed command.
-pub(crate) fn validate_metadata_command_envelope_bytes(bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn validate_metadata_command_envelope_bytes(
+    bytes: &[u8],
+) -> Result<(), MetadataCommandFormatError> {
     decode_metadata_command_envelope_inner(bytes).map(|_| ())
 }
 
@@ -2229,7 +2329,7 @@ pub(crate) fn validate_metadata_command_envelope_bytes(bytes: &[u8]) -> Result<(
 pub(crate) fn decode_metadata_command_envelope(
     bytes: &[u8],
     _authority: &crate::node_runtime::MetadataCommandDecodeAuthority,
-) -> Result<MetadataCommandEnvelope, String> {
+) -> Result<MetadataCommandEnvelope, MetadataCommandFormatError> {
     decode_metadata_command_envelope_inner(bytes)
 }
 
@@ -4049,14 +4149,6 @@ impl<'a> MetadataCommandLogEntryDecoder<'a> {
             default_retention,
         })
     }
-
-    fn finish(&self) -> Result<(), String> {
-        if self.offset == self.bytes.len() {
-            Ok(())
-        } else {
-            Err("metadata command log entry has trailing bytes".to_string())
-        }
-    }
 }
 
 fn encode_create_bucket(out: &mut Vec<u8>, command: &CreateBucketCommand) {
@@ -4961,7 +5053,7 @@ mod tests {
 
     fn decode_metadata_command_envelope_for_test(
         bytes: &[u8],
-    ) -> Result<MetadataCommandEnvelope, String> {
+    ) -> Result<MetadataCommandEnvelope, MetadataCommandFormatError> {
         decode_metadata_command_envelope(
             bytes,
             &crate::node_runtime::MetadataCommandDecodeAuthority::new_for_test(),
@@ -5694,6 +5786,74 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_metadata_command_v1_encoding_and_format_errors_are_stable() {
+        let id = MetadataCommandId::new(
+            ClusterEpoch::new(0x0102_0304_0506_0708).unwrap(),
+            PgId::new(0x1122_3344),
+            MetadataCommandLogIndex::new(0x1112_1314_1516_1718).unwrap(),
+        );
+        let expected = b"\x21\x00\x00\x00argmin-metadata-command-abandoned\
+            \x01\x00\x08\x07\x06\x05\x04\x03\x02\x01\
+            \x44\x33\x22\x11\x18\x17\x16\x15\x14\x13\x12\x11\
+            \x28\x27\x26\x25\x24\x23\x22\x21";
+        assert_eq!(
+            abandoned_command_log_bytes(id, 0x2122_2324_2526_2728),
+            expected
+        );
+        let header = decode_metadata_command_log_entry_header(expected).unwrap();
+        assert_eq!(header.id(), id);
+        assert_eq!(
+            header.kind(),
+            MetadataCommandLogEntryKind::Abandoned {
+                original_command_checksum: 0x2122_2324_2526_2728,
+            }
+        );
+
+        for truncated in [&[][..], &[0x21][..], &[0x21, 0][..], &[0x21, 0, 0][..]] {
+            assert_eq!(
+                decode_metadata_command_log_entry_header(truncated),
+                Err(MetadataCommandFormatError::TruncatedMarkerLength)
+            );
+        }
+        assert_eq!(
+            decode_metadata_command_log_entry_header(&expected[..4 + 32]),
+            Err(MetadataCommandFormatError::TruncatedMagic)
+        );
+        for truncated_version_length in [4 + 33, 4 + 33 + 1] {
+            assert_eq!(
+                decode_metadata_command_log_entry_header(&expected[..truncated_version_length]),
+                Err(MetadataCommandFormatError::TruncatedVersion {
+                    format: MetadataCommandRecordFormat::Abandoned,
+                })
+            );
+        }
+
+        let mut unknown_magic = expected.to_vec();
+        unknown_magic[4] ^= 1;
+        assert_eq!(
+            decode_metadata_command_log_entry_header(&unknown_magic),
+            Err(MetadataCommandFormatError::UnknownMagic)
+        );
+        for version in [0_u16, 2] {
+            let mut unsupported = expected.to_vec();
+            unsupported[4 + 33..4 + 33 + 2].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(
+                decode_metadata_command_log_entry_header(&unsupported),
+                Err(MetadataCommandFormatError::UnsupportedVersion {
+                    format: MetadataCommandRecordFormat::Abandoned,
+                    version,
+                })
+            );
+        }
+        let mut trailing = expected.to_vec();
+        trailing.push(0);
+        assert_eq!(
+            decode_metadata_command_log_entry_header(&trailing),
+            Err(MetadataCommandFormatError::TrailingData)
+        );
+    }
+
+    #[test]
     fn metadata_command_log_entry_header_decodes_applied_and_abandoned_rows() {
         let owner = CanonicalUserId::from_principal("owner");
         let acl_grants = AclGrants::default();
@@ -5734,7 +5894,10 @@ mod tests {
             let mut unsupported_version = envelope.command_bytes();
             unsupported_version[version_offset..version_offset + 2]
                 .copy_from_slice(&version.to_le_bytes());
-            let expected = format!("unsupported metadata command encoding version {version}");
+            let expected = MetadataCommandFormatError::UnsupportedVersion {
+                format: MetadataCommandRecordFormat::Applied,
+                version,
+            };
             assert_eq!(
                 decode_metadata_command_envelope_for_test(&unsupported_version),
                 Err(expected.clone())
@@ -5779,9 +5942,10 @@ mod tests {
             abandoned[version_offset..version_offset + 2].copy_from_slice(&version.to_le_bytes());
             assert_eq!(
                 decode_metadata_command_log_entry_header(&abandoned),
-                Err(format!(
-                    "unsupported abandoned metadata command encoding version {version}"
-                ))
+                Err(MetadataCommandFormatError::UnsupportedVersion {
+                    format: MetadataCommandRecordFormat::Abandoned,
+                    version,
+                })
             );
         }
     }
@@ -6700,13 +6864,17 @@ mod tests {
         put_str(&mut v7_append, key.as_str());
         encode_stream_upload_segment(&mut v7_append, &stream_segment);
         assert_eq!(checksum::crc64::checksum(&v7_append), 0x90918496a8aa4bc2);
+        let expected_error = MetadataCommandFormatError::UnsupportedVersion {
+            format: MetadataCommandRecordFormat::Applied,
+            version: 7,
+        };
         assert_eq!(
             decode_metadata_command_envelope_for_test(&v7_append),
-            Err("unsupported metadata command encoding version 7".to_string())
+            Err(expected_error.clone())
         );
         assert_eq!(
             decode_metadata_command_log_entry_header(&v7_append),
-            Err("unsupported metadata command encoding version 7".to_string())
+            Err(expected_error)
         );
     }
 }

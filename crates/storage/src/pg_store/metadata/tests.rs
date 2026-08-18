@@ -6290,6 +6290,98 @@ fn abandoned_log_tail_without_pending_slot_recovers_on_validation() {
 }
 
 #[test]
+fn recovery_rejects_resealed_unsupported_abandoned_command_versions_before_mutation() {
+    for version in [0_u16, 2] {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 1).unwrap();
+        let command = create_bucket_probe_command(
+            1,
+            1,
+            trusted_bucket_name(format!("unsupported-abandoned-v{version}")),
+            1,
+        );
+        let mut command_bytes = command.abandoned_log_bytes();
+        let version_offset = 4 + b"argmin-metadata-command-abandoned".len();
+        command_bytes[version_offset..version_offset + 2].copy_from_slice(&version.to_le_bytes());
+        let command_checksum = checksum::crc64::checksum(&command_bytes);
+        store
+            .conn
+            .execute(
+                "INSERT INTO metadata_command_log \
+                 (cluster_epoch, pg_id, log_index, command_checksum, command_bytes, abandoned, previous_log_hash, log_hash) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, NULL, NULL)",
+                params![
+                    ClusterEpoch::INITIAL.get() as i64,
+                    1_i64,
+                    1_i64,
+                    command_checksum as i64,
+                    command_bytes,
+                ],
+            )
+            .unwrap();
+
+        let replica_state_before = store.metadata_command_replica_state().unwrap();
+        let state_digest_before = store.metadata_state_digest().unwrap();
+        let log_row_before = store
+            .conn
+            .query_row(
+                "SELECT command_checksum, command_bytes, previous_log_hash, log_hash \
+                 FROM metadata_command_log WHERE cluster_epoch = 1 AND pg_id = 1 AND log_index = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+
+        let error = store
+            .recover(super::super::PgStoreRecoveryContext::for_node(NodeId::new(
+                0,
+            )))
+            .unwrap_err();
+        assert!(
+            matches!(error, StoreError::MetadataCommandLogConflict { .. }),
+            "resealed abandoned command v{version} must fail as a format conflict, got {error:?}"
+        );
+        assert_eq!(
+            store.metadata_command_replica_state().unwrap(),
+            replica_state_before,
+            "unsupported abandoned command v{version} must not advance replica state"
+        );
+        assert_eq!(
+            store.metadata_state_digest().unwrap(),
+            state_digest_before,
+            "unsupported abandoned command v{version} must not mutate materialized state"
+        );
+        let log_row_after = store
+            .conn
+            .query_row(
+                "SELECT command_checksum, command_bytes, previous_log_hash, log_hash \
+                 FROM metadata_command_log WHERE cluster_epoch = 1 AND pg_id = 1 AND log_index = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            log_row_after, log_row_before,
+            "unsupported abandoned command v{version} must not publish recovery hashes"
+        );
+    }
+}
+
+#[test]
 fn abandoned_log_tail_preserves_digest_and_rejects_materialized_mutation() {
     let tmp = test_util::tempdir();
     let store = PgStore::open(tmp.path(), 1).unwrap();

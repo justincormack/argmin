@@ -1739,7 +1739,7 @@ impl PgStore {
         )
         .map_err(|reason| StoreError::ShardScavengerScanIncomplete {
             context: "decode pending metadata command for shard scavenger references",
-            errors: reason,
+            errors: reason.to_string(),
         })?;
         self.extend_scavenger_command_payload_references(references, command.payload())
     }
