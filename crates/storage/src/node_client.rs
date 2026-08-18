@@ -303,6 +303,7 @@ use crate::types::{
     StreamUploadRecord, StreamUploadRecordPage, StreamUploadSegmentRecord, StreamUploadState,
     StreamUploadTarget, TerminalStreamCleanupRecord, UploadId, UploadState, VersionId, WriteAck,
 };
+use crate::BucketAclSummary;
 use crate::BucketDeleteBeginRoot;
 use crate::DataPgId;
 
@@ -1275,41 +1276,125 @@ fn live_delete_command_target(
     })
 }
 
+/// A retained bucket command paired with the request that proposes to adopt it.
+///
+/// The generation fast paths must not inspect a raw command target: request
+/// identity has to be established first, including when the target is already
+/// the current bucket record.
+enum RequestBoundPendingBucketMutation<'a> {
+    MarkDeleting {
+        bucket: &'a BucketName,
+        command: &'a MarkBucketDeletingCommand,
+    },
+    Versioning {
+        bucket: &'a BucketName,
+        command: &'a PutBucketVersioningCommand,
+        state: BucketVersioningState,
+    },
+    Acl {
+        bucket: &'a BucketName,
+        command: &'a PutBucketAclCommand,
+        acl_grants: &'a AclGrants,
+        summary: BucketAclSummary,
+    },
+    Property {
+        bucket: &'a BucketName,
+        command: &'a PutBucketPropertyCommand,
+        mutation: &'a BucketPropertyMutation,
+    },
+}
+
+impl RequestBoundPendingBucketMutation<'_> {
+    fn target(&self) -> &BucketRecord {
+        match self {
+            Self::MarkDeleting { command, .. } => &command.bucket,
+            Self::Versioning { command, .. } => &command.bucket,
+            Self::Acl { command, .. } => &command.bucket,
+            Self::Property { command, .. } => &command.bucket,
+        }
+    }
+
+    fn command_matches_request(&self) -> bool {
+        match self {
+            Self::MarkDeleting { bucket, command } => command.matches_request(bucket),
+            Self::Versioning {
+                bucket,
+                command,
+                state,
+            } => command.matches_request(bucket, *state),
+            Self::Acl {
+                bucket,
+                command,
+                acl_grants,
+                summary,
+            } => command.matches_request(bucket, acl_grants, *summary),
+            Self::Property {
+                bucket,
+                command,
+                mutation,
+            } => command.matches_request(bucket, mutation),
+        }
+    }
+
+    fn expected_from(&self, record: BucketRecord) -> Result<BucketRecord, BucketSnapshotLoadError> {
+        let generation = self.target().bucket_execution_generation;
+        match self {
+            Self::MarkDeleting { .. } => Ok(MarkBucketDeletingCommand::from_bucket(
+                record.with_execution_generation(generation),
+            )
+            .bucket),
+            Self::Versioning { state, .. } => {
+                if *state == BucketVersioningState::Disabled
+                    && record.versioning != BucketVersioningState::Disabled
+                {
+                    return Err(MetadataError::InvalidVersioningTransition {
+                        from: record.versioning,
+                        to: *state,
+                    }
+                    .into());
+                }
+                Ok(PutBucketVersioningCommand::from_bucket(
+                    record.with_execution_generation(generation),
+                    *state,
+                )
+                .bucket)
+            }
+            Self::Acl {
+                acl_grants,
+                summary,
+                ..
+            } => Ok(PutBucketAclCommand::from_bucket(
+                record.with_execution_generation(generation),
+                (*acl_grants).clone(),
+                *summary,
+            )
+            .bucket),
+            Self::Property { mutation, .. } => {
+                Ok(PutBucketPropertyCommand::from_bucket_and_mutation(
+                    record.with_execution_generation(generation),
+                    (*mutation).clone(),
+                )
+                .bucket)
+            }
+        }
+    }
+}
+
 fn pending_bucket_command_matches_current(
     current: BucketRecord,
-    target: &BucketRecord,
-    build_expected: impl FnOnce(BucketRecord) -> Result<BucketRecord, BucketSnapshotLoadError>,
+    mutation: RequestBoundPendingBucketMutation<'_>,
 ) -> Result<bool, BucketSnapshotLoadError> {
+    if !mutation.command_matches_request() {
+        return Ok(false);
+    }
+    let target = mutation.target();
     if current.bucket_execution_generation == target.bucket_execution_generation {
         return Ok(current.command_metadata_eq(target));
     }
     if current.bucket_execution_generation > target.bucket_execution_generation {
         return Ok(false);
     }
-    Ok(build_expected(current)?.command_metadata_eq(target))
-}
-
-fn bucket_property_command_matches_mutation(
-    command: &PutBucketPropertyCommand,
-    bucket: &BucketName,
-    mutation: &BucketPropertyMutation,
-) -> bool {
-    if command.bucket.name != *bucket || command.effect != mutation.effect() {
-        return false;
-    }
-    match mutation {
-        BucketPropertyMutation::ObjectLock(config) => command.bucket.object_lock == *config,
-        BucketPropertyMutation::Encryption(config) => command.bucket.encryption == *config,
-        BucketPropertyMutation::PublicAccessBlock(config) => {
-            command.bucket.public_access_block == *config
-        }
-        BucketPropertyMutation::OwnershipControls(config) => {
-            command.bucket.ownership_controls == *config
-        }
-        BucketPropertyMutation::AbacEnabled(enabled) => {
-            command.bucket.bucket_abac_enabled == *enabled
-        }
-    }
+    Ok(mutation.expected_from(current)?.command_metadata_eq(target))
 }
 
 #[derive(Clone)]

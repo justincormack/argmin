@@ -2106,23 +2106,18 @@ impl UnixStorageNodeClient {
             (
                 MetadataCommandPayload::PutBucketVersioning(versioning),
                 StorageRpcBucketMetadataControlMutation::Versioning(state),
-            ) => versioning.bucket.name == *bucket && versioning.bucket.versioning == *state,
+            ) => versioning.matches_request(bucket, *state),
             (
                 MetadataCommandPayload::PutBucketAcl(acl),
                 StorageRpcBucketMetadataControlMutation::Acl {
                     acl_grants,
                     summary,
                 },
-            ) => {
-                acl.bucket.name == *bucket
-                    && acl.bucket.acl_grants == *acl_grants
-                    && acl.bucket.public_read == summary.public_read
-                    && acl.bucket.public_write == summary.public_write
-            }
+            ) => acl.matches_request(bucket, acl_grants, *summary),
             (
                 MetadataCommandPayload::PutBucketProperty(property),
                 StorageRpcBucketMetadataControlMutation::Property(mutation),
-            ) => bucket_property_command_matches_mutation(property, bucket, mutation),
+            ) => property.matches_request(bucket, mutation),
             (
                 MetadataCommandPayload::PutBucketSubresource(subresource),
                 StorageRpcBucketMetadataControlMutation::Subresource(mutation),

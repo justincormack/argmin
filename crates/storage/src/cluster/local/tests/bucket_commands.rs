@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::{BucketAclSummary, StorageClusterRouteHandle};
+use s3_types::{AclGrant, AclGrantee, AclPermission};
 
 #[test]
 fn composite_object_listings_fan_out_to_routed_pg_primaries() {
@@ -1833,6 +1834,144 @@ fn put_bucket_acl_command_retry_reuses_pending_partial_replica_command() {
         assert_eq!(
             info.bucket_execution_generation,
             partial_info.bucket_execution_generation
+        );
+    }
+}
+
+#[test]
+fn different_bucket_puts_drain_published_pending_command_before_new_generation() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let ec_shape = EcShape { k: 2, m: 1 };
+    let mut map = LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1, 2], ec_shape).unwrap();
+    let bucket = {
+        let topology = map
+            .nodes
+            .get(&NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, 1, "different-bucket-put-pending-")
+    };
+    set_route_primary(&mut map, 1, NodeId::new(1));
+
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+    let _serial = lock_metadata_command_apply_hook_test();
+    let fail_versioning_trailing = Arc::new(AtomicBool::new(true));
+    let first_acl_grants = crate::AclGrants::new(vec![AclGrant::new(
+        AclGrantee::CanonicalUser(crate::CanonicalUserId::from_principal("first-acl-grantee")),
+        AclPermission::FullControl,
+    )]);
+    let replacement_acl_grants = crate::AclGrants::new(vec![AclGrant::new(
+        AclGrantee::CanonicalUser(crate::CanonicalUserId::from_principal(
+            "replacement-acl-grantee",
+        )),
+        AclPermission::FullControl,
+    )]);
+    let fail_acl_trailing = Arc::new(AtomicBool::new(true));
+    let hook_bucket = bucket.clone();
+    let hook_first_acl_grants = first_acl_grants.clone();
+    let fail_versioning_hook = Arc::clone(&fail_versioning_trailing);
+    let fail_acl_hook = Arc::clone(&fail_acl_trailing);
+    let _hook_guard = cluster.test_install_before_metadata_command_apply_hook(Arc::new(
+        move |node_id, command| {
+            let should_fail = match command.payload() {
+                MetadataCommandPayload::PutBucketVersioning(versioning) => {
+                    versioning.bucket.name == hook_bucket
+                        && versioning.bucket.versioning == crate::BucketVersioningState::Enabled
+                        && node_id == NodeId::new(2)
+                        && fail_versioning_hook.load(Ordering::SeqCst)
+                }
+                MetadataCommandPayload::PutBucketAcl(acl) => {
+                    acl.bucket.name == hook_bucket
+                        && acl.bucket.acl_grants == hook_first_acl_grants
+                        && node_id == NodeId::new(2)
+                        && fail_acl_hook.load(Ordering::SeqCst)
+                }
+                _ => false,
+            };
+            if should_fail {
+                return Err(StoreError::MetadataCommandContention {
+                    context: "injected trailing bucket PUT contention",
+                });
+            }
+            Ok(())
+        },
+    ));
+
+    let enabled = cluster
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Enabled)
+        .unwrap();
+    assert_eq!(enabled.versioning, crate::BucketVersioningState::Enabled);
+    assert!(matches!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
+            .expect("published versioning command should remain pending")
+            .payload(),
+        MetadataCommandPayload::PutBucketVersioning(versioning)
+            if versioning.bucket.versioning == crate::BucketVersioningState::Enabled
+    ));
+
+    fail_versioning_trailing.store(false, Ordering::SeqCst);
+    let suspended = cluster
+        .put_bucket_versioning_and_load_info_raw(&bucket, crate::BucketVersioningState::Suspended)
+        .unwrap();
+    assert_eq!(
+        suspended.versioning,
+        crate::BucketVersioningState::Suspended
+    );
+    assert!(suspended.bucket_execution_generation > enabled.bucket_execution_generation);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+
+    let first_acl = cluster
+        .put_bucket_acl_and_load_info_raw(
+            &bucket,
+            &first_acl_grants,
+            BucketAclSummary {
+                public_read: false,
+                public_write: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(first_acl.acl_grants, first_acl_grants);
+    assert!(!first_acl.public_read);
+    assert!(!first_acl.public_write);
+    assert!(matches!(
+        pending_metadata_command_for_test(&map, PgId::new(1), &bucket)
+            .expect("published ACL command should remain pending")
+            .payload(),
+        MetadataCommandPayload::PutBucketAcl(acl)
+            if acl.bucket.acl_grants == first_acl_grants
+    ));
+
+    fail_acl_trailing.store(false, Ordering::SeqCst);
+    let replacement_acl = cluster
+        .put_bucket_acl_and_load_info_raw(
+            &bucket,
+            &replacement_acl_grants,
+            BucketAclSummary {
+                public_read: false,
+                public_write: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(replacement_acl.acl_grants, replacement_acl_grants);
+    assert!(!replacement_acl.public_read);
+    assert!(!replacement_acl.public_write);
+    assert!(replacement_acl.bucket_execution_generation > first_acl.bucket_execution_generation);
+    assert!(pending_metadata_command_for_test(&map, PgId::new(1), &bucket).is_none());
+
+    for node_id in node_ids {
+        let pg = map.node(node_id).unwrap().storage_node().get_pg(1).unwrap();
+        let info = crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket).unwrap();
+        assert_eq!(info.versioning, crate::BucketVersioningState::Suspended);
+        assert_eq!(info.acl_grants, replacement_acl_grants);
+        assert!(!info.public_read);
+        assert!(!info.public_write);
+        assert_eq!(
+            info.bucket_execution_generation,
+            replacement_acl.bucket_execution_generation
         );
     }
 }

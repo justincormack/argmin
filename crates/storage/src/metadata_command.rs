@@ -951,6 +951,10 @@ impl MarkBucketDeletingCommand {
     pub(crate) fn bucket_name(&self) -> &BucketName {
         &self.bucket.name
     }
+
+    pub(crate) fn matches_request(&self, bucket: &BucketName) -> bool {
+        self.bucket.name == *bucket && self.bucket.state == BucketState::Deleting
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -989,6 +993,14 @@ impl PutBucketVersioningCommand {
     pub(crate) fn bucket_name(&self) -> &BucketName {
         &self.bucket.name
     }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        state: BucketVersioningState,
+    ) -> bool {
+        self.bucket.name == *bucket && self.bucket.versioning == state
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1012,6 +1024,18 @@ impl PutBucketAclCommand {
     pub(crate) fn bucket_name(&self) -> &BucketName {
         &self.bucket.name
     }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        acl_grants: &AclGrants,
+        summary: BucketAclSummary,
+    ) -> bool {
+        self.bucket.name == *bucket
+            && self.bucket.acl_grants == *acl_grants
+            && self.bucket.public_read == summary.public_read
+            && self.bucket.public_write == summary.public_write
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1033,6 +1057,29 @@ impl PutBucketPropertyCommand {
 
     pub(crate) fn bucket_name(&self) -> &BucketName {
         &self.bucket.name
+    }
+
+    pub(crate) fn matches_request(
+        &self,
+        bucket: &BucketName,
+        mutation: &BucketPropertyMutation,
+    ) -> bool {
+        if self.bucket.name != *bucket || self.effect != mutation.effect() {
+            return false;
+        }
+        match mutation {
+            BucketPropertyMutation::ObjectLock(config) => self.bucket.object_lock == *config,
+            BucketPropertyMutation::Encryption(config) => self.bucket.encryption == *config,
+            BucketPropertyMutation::PublicAccessBlock(config) => {
+                self.bucket.public_access_block == *config
+            }
+            BucketPropertyMutation::OwnershipControls(config) => {
+                self.bucket.ownership_controls == *config
+            }
+            BucketPropertyMutation::AbacEnabled(enabled) => {
+                self.bucket.bucket_abac_enabled == *enabled
+            }
+        }
     }
 }
 

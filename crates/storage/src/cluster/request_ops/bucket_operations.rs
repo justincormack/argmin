@@ -161,7 +161,7 @@ impl super::StorageCluster {
                     MetadataCommandPayload::PutBucketVersioning(versioning)
                         if versioning.bucket_name() == bucket =>
                     {
-                        let same_request = versioning.bucket.versioning == state;
+                        let same_request = versioning.matches_request(bucket, state);
                         if !metadata_route.pending_put_bucket_versioning_command_matches_current(
                             versioning, state,
                         )? {
@@ -472,9 +472,7 @@ impl super::StorageCluster {
                 }
                 match command.payload() {
                     MetadataCommandPayload::PutBucketAcl(acl) if acl.bucket_name() == bucket => {
-                        let same_request = acl.bucket.acl_grants == *acl_grants
-                            && acl.bucket.public_read == summary.public_read
-                            && acl.bucket.public_write == summary.public_write;
+                        let same_request = acl.matches_request(bucket, acl_grants, summary);
                         if !metadata_route.pending_put_bucket_acl_command_matches_current(
                             acl, acl_grants, summary,
                         )? {

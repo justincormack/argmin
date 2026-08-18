@@ -1200,12 +1200,10 @@ impl LocalStorageNodeClient {
     ) -> Result<bool, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            Ok(MarkBucketDeletingCommand::from_bucket(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
-            )
-            .bucket)
-        })
+        pending_bucket_command_matches_current(
+            current,
+            RequestBoundPendingBucketMutation::MarkDeleting { bucket, command },
+        )
     }
 
     fn build_mark_bucket_deleting_command(
@@ -1239,22 +1237,14 @@ impl LocalStorageNodeClient {
     ) -> Result<bool, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            if state == BucketVersioningState::Disabled
-                && record.versioning != BucketVersioningState::Disabled
-            {
-                return Err(MetadataError::InvalidVersioningTransition {
-                    from: record.versioning,
-                    to: state,
-                }
-                .into());
-            }
-            Ok(PutBucketVersioningCommand::from_bucket(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
+        pending_bucket_command_matches_current(
+            current,
+            RequestBoundPendingBucketMutation::Versioning {
+                bucket,
+                command,
                 state,
-            )
-            .bucket)
-        })
+            },
+        )
     }
 
     fn build_put_bucket_versioning_command(
@@ -1295,14 +1285,15 @@ impl LocalStorageNodeClient {
     ) -> Result<bool, BucketSnapshotLoadError> {
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            Ok(PutBucketAclCommand::from_bucket(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
-                acl_grants.clone(),
+        pending_bucket_command_matches_current(
+            current,
+            RequestBoundPendingBucketMutation::Acl {
+                bucket,
+                command,
+                acl_grants,
                 summary,
-            )
-            .bucket)
-        })
+            },
+        )
     }
 
     fn build_put_bucket_acl_command(
@@ -1333,18 +1324,16 @@ impl LocalStorageNodeClient {
         command: &PutBucketPropertyCommand,
         mutation: &BucketPropertyMutation,
     ) -> Result<bool, BucketSnapshotLoadError> {
-        if !bucket_property_command_matches_mutation(command, bucket, mutation) {
-            return Ok(false);
-        }
         let pg = self.storage_node.get_pg(pg_id.get())?;
         let current = PgMetadataStore::head_bucket_record_raw(&*pg, bucket)?;
-        pending_bucket_command_matches_current(current, &command.bucket, |record| {
-            Ok(PutBucketPropertyCommand::from_bucket_and_mutation(
-                record.with_execution_generation(command.bucket.bucket_execution_generation),
-                mutation.clone(),
-            )
-            .bucket)
-        })
+        pending_bucket_command_matches_current(
+            current,
+            RequestBoundPendingBucketMutation::Property {
+                bucket,
+                command,
+                mutation,
+            },
+        )
     }
 
     fn build_put_bucket_property_command(

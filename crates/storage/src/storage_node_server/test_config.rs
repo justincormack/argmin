@@ -5058,7 +5058,7 @@
         authenticated_bucket_subresource_get_preserves_bucket_not_found(true);
     }
 
-    fn authenticated_bucket_property_pending_match_binds_requested_mutation(tcp: bool) {
+    fn authenticated_bucket_pending_match_binds_requested_mutation(tcp: bool) {
         let tmp = test_util::tempdir();
         let config = test_config(&tmp);
         private_socket_dir(config.socket_path.parent().unwrap());
@@ -5076,7 +5076,7 @@
             ]);
         }
         let server = prepared.bind().unwrap();
-        let bucket = crate::tests::bucket_name("authenticated-property-pending-match");
+        let bucket = crate::tests::bucket_name("authenticated-bucket-pending-match");
         let owner = crate::CanonicalUserId::from_principal("owner");
         let pg = server._node.get_pg(0).unwrap();
         PgMetadataStore::create_bucket(
@@ -5119,6 +5119,113 @@
                 &bucket,
             )
             .unwrap();
+        let command_id = |log_index| {
+            MetadataCommandId::new(
+                config.cluster_epoch,
+                PgId::new(0),
+                MetadataCommandLogIndex::new(log_index).unwrap(),
+            )
+        };
+
+        let versioning = route
+            .build_put_bucket_versioning_command(
+                command_id(1),
+                crate::BucketVersioningState::Enabled,
+            )
+            .unwrap();
+        MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &client,
+            PgId::new(0),
+            &versioning,
+        )
+        .unwrap();
+        let MetadataCommandPayload::PutBucketVersioning(versioning) = versioning.payload() else {
+            panic!("unexpected versioning command payload")
+        };
+        assert!(route
+            .pending_put_bucket_versioning_command_matches_current(
+                versioning,
+                crate::BucketVersioningState::Enabled,
+            )
+            .unwrap());
+        assert!(
+            !route
+                .pending_put_bucket_versioning_command_matches_current(
+                    versioning,
+                    crate::BucketVersioningState::Suspended,
+                )
+                .unwrap(),
+            "an authenticated applied Enabled command must not satisfy Suspended"
+        );
+
+        let acl_grants = crate::AclGrants::new(vec![s3_types::AclGrant::new(
+            s3_types::AclGrantee::CanonicalUser(crate::CanonicalUserId::from_principal(
+                "authenticated-first-acl-grantee",
+            )),
+            s3_types::AclPermission::FullControl,
+        )]);
+        let different_acl_grants = crate::AclGrants::new(vec![s3_types::AclGrant::new(
+            s3_types::AclGrantee::CanonicalUser(crate::CanonicalUserId::from_principal(
+                "authenticated-different-acl-grantee",
+            )),
+            s3_types::AclPermission::FullControl,
+        )]);
+        let acl_summary = crate::BucketAclSummary {
+            public_read: false,
+            public_write: false,
+        };
+        let acl = route
+            .build_put_bucket_acl_command(command_id(2), &acl_grants, acl_summary)
+            .unwrap();
+        MetadataCommandNodeClient::apply_metadata_command_and_record(
+            &client,
+            PgId::new(0),
+            &acl,
+        )
+        .unwrap();
+        let MetadataCommandPayload::PutBucketAcl(acl) = acl.payload() else {
+            panic!("unexpected ACL command payload")
+        };
+        assert!(route
+            .pending_put_bucket_acl_command_matches_current(acl, &acl_grants, acl_summary)
+            .unwrap());
+        assert!(
+            !route
+                .pending_put_bucket_acl_command_matches_current(
+                    acl,
+                    &different_acl_grants,
+                    acl_summary,
+                )
+                .unwrap(),
+            "an authenticated applied ACL must not satisfy different canonical grants"
+        );
+        assert!(
+            !route
+                .pending_put_bucket_acl_command_matches_current(
+                    acl,
+                    &acl_grants,
+                    crate::BucketAclSummary {
+                        public_read: true,
+                        public_write: false,
+                    },
+                )
+                .unwrap(),
+            "an authenticated applied ACL must not satisfy a different public-read summary"
+        );
+        assert!(
+            !route
+                .pending_put_bucket_acl_command_matches_current(
+                    acl,
+                    &acl_grants,
+                    crate::BucketAclSummary {
+                        public_read: false,
+                        public_write: true,
+                    },
+                )
+                .unwrap(),
+            "an authenticated applied ACL must not satisfy a different public-write summary"
+        );
+
         let public_access_block = crate::PublicAccessBlockConfig {
             block_public_acls: true,
             ignore_public_acls: true,
@@ -5129,11 +5236,7 @@
         let delete = BucketPropertyMutation::PublicAccessBlock(None);
         let command = route
             .build_put_bucket_property_command(
-                MetadataCommandId::new(
-                    config.cluster_epoch,
-                    PgId::new(0),
-                    MetadataCommandLogIndex::new(1).unwrap(),
-                ),
+                command_id(3),
                 &put,
             )
             .unwrap();
@@ -5162,13 +5265,13 @@
     }
 
     #[test]
-    fn authenticated_unix_bucket_property_pending_match_binds_requested_mutation() {
-        authenticated_bucket_property_pending_match_binds_requested_mutation(false);
+    fn authenticated_unix_bucket_pending_match_binds_requested_mutation() {
+        authenticated_bucket_pending_match_binds_requested_mutation(false);
     }
 
     #[test]
-    fn authenticated_tls_bucket_property_pending_match_binds_requested_mutation() {
-        authenticated_bucket_property_pending_match_binds_requested_mutation(true);
+    fn authenticated_tls_bucket_pending_match_binds_requested_mutation() {
+        authenticated_bucket_pending_match_binds_requested_mutation(true);
     }
 
     fn authenticated_complete_multipart_command_build_preserves_no_such_upload(tcp: bool) {
