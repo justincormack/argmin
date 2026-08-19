@@ -26,7 +26,7 @@ pub struct StorageClusterRuntimeMapRefreshLoopStatus {
 pub struct StorageClusterRuntimeMapRefreshLoop {
     stop: Arc<(Mutex<bool>, Condvar)>,
     status: Arc<Mutex<StorageClusterRuntimeMapRefreshLoopStatus>>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -57,13 +57,8 @@ impl StorageClusterRuntimeMapRefreshLoop {
     }
 
     pub fn stop(&mut self) {
-        {
-            let (lock, cvar) = &*self.stop;
-            let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            *stopped = true;
-            cvar.notify_all();
-        }
-        if let Some(handle) = self.handle.take() {
+        stop_runtime_map_workers(&self.stop);
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
     }
@@ -73,6 +68,28 @@ impl Drop for StorageClusterRuntimeMapRefreshLoop {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn stop_runtime_map_workers(stop: &Arc<(Mutex<bool>, Condvar)>) {
+    let (lock, cvar) = &**stop;
+    let mut stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    *stopped = true;
+    cvar.notify_all();
+}
+
+fn wait_for_runtime_map_worker(
+    stop: &Arc<(Mutex<bool>, Condvar)>,
+    interval: Duration,
+) -> bool {
+    let (lock, cvar) = &**stop;
+    let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if *stopped {
+        return true;
+    }
+    let (stopped, _) = cvar
+        .wait_timeout(stopped, interval)
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *stopped
 }
 
 impl StorageClusterRouteHandle {
@@ -482,8 +499,8 @@ impl StorageClusterRouteHandle {
         authority_now_ms: F,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
-        S: ControlPlaneRuntimeMapSource + Send + 'static,
-        F: Fn() -> u64 + Send + 'static,
+        S: ControlPlaneRuntimeMapSource + Send + Sync + 'static,
+        F: Fn() -> u64 + Send + Sync + 'static,
     {
         self.spawn_control_plane_refresh_loop_inner(
             control_plane,
@@ -502,8 +519,8 @@ impl StorageClusterRouteHandle {
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
-        S: ControlPlaneRuntimeMapSource + Send + 'static,
-        F: Fn() -> u64 + Send + 'static,
+        S: ControlPlaneRuntimeMapSource + Send + Sync + 'static,
+        F: Fn() -> u64 + Send + Sync + 'static,
     {
         self.spawn_control_plane_refresh_loop_inner(
             control_plane,
@@ -522,8 +539,8 @@ impl StorageClusterRouteHandle {
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
-        S: ControlPlaneRuntimeMapSource + Send + 'static,
-        F: Fn() -> u64 + Send + 'static,
+        S: ControlPlaneRuntimeMapSource + Send + Sync + 'static,
+        F: Fn() -> u64 + Send + Sync + 'static,
     {
         self.spawn_control_plane_refresh_loop_inner(
             control_plane,
@@ -543,8 +560,8 @@ impl StorageClusterRouteHandle {
         recover_pending_commands: bool,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
-        S: ControlPlaneRuntimeMapSource + Send + 'static,
-        F: Fn() -> u64 + Send + 'static,
+        S: ControlPlaneRuntimeMapSource + Send + Sync + 'static,
+        F: Fn() -> u64 + Send + Sync + 'static,
     {
         if refresh_interval.is_zero() {
             return Err(StorageClusterRuntimeMapRefreshError::RefreshLoopZeroInterval);
@@ -554,89 +571,41 @@ impl StorageClusterRouteHandle {
         let status = Arc::new(Mutex::new(
             StorageClusterRuntimeMapRefreshLoopStatus::default(),
         ));
+        let control_plane = Arc::new(control_plane);
+        let authority_now_ms = Arc::new(authority_now_ms);
+        let recovery_requested = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_status = Arc::clone(&status);
-        let handle = thread::Builder::new()
+        let worker_control_plane = Arc::clone(&control_plane);
+        let worker_authority_now_ms = Arc::clone(&authority_now_ms);
+        let worker_recovery_requested = Arc::clone(&recovery_requested);
+        let refresh_route_handle = self.clone();
+        // Lease renewal must never share a worker with metadata recovery. A
+        // recovery RPC may consume its full retry budget, which can be longer
+        // than the usable route-map lease after the clock-skew reserve.
+        let refresh_handle = thread::Builder::new()
             .name("argmin-storage-cluster-control-plane-refresh".to_string())
             .spawn(move || loop {
-                let discovery_now_ms = authority_now_ms();
-                let discovered_recovery_result = if !recover_pending_commands {
-                    None
-                } else {
-                    match control_plane.pending_metadata_command_recoveries(discovery_now_ms) {
-                    Ok(listing)
-                        if !listing.tasks().is_empty() || !listing.failures().is_empty() => Some(
-                        self.recover_authorized_pending_metadata_commands(
-                            &control_plane,
-                            &authority_now_ms,
-                            admission_settings,
-                            listing,
-                        ),
-                    ),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(
-                        PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
-                    )),
-                    }
-                };
-                let refresh_now_ms = authority_now_ms();
+                let refresh_now_ms = worker_authority_now_ms();
                 let result = match admission_settings {
-                    Some(admission_settings) => self
+                    Some(admission_settings) => refresh_route_handle
                         .refresh_from_control_plane_runtime_map_with_unix_storage_node_clients(
-                            &control_plane,
+                            worker_control_plane.as_ref(),
                             refresh_now_ms,
                             admission_settings,
                         ),
-                    None => {
-                        self.refresh_from_control_plane_runtime_map(&control_plane, refresh_now_ms)
-                    }
+                    None => refresh_route_handle.refresh_from_control_plane_runtime_map(
+                        worker_control_plane.as_ref(),
+                        refresh_now_ms,
+                    ),
                 };
-                let recovery_result = match discovered_recovery_result {
-                    Some(result) => Some(result),
-                    None if !recover_pending_commands => None,
-                    None => match &result {
-                        Ok(_) => None,
-                        Err(error) => {
-                            if runtime_map_refresh_error_requires_current_map_invalidation(error) {
-                                self.expire_same_epoch_generations(refresh_now_ms);
-                            }
-                            Some(match error {
-                                StorageClusterRuntimeMapRefreshError::ControlPlane(
-                                    ControlPlaneError::PgPeeringPendingMetadataCommand {
-                                        pg_id,
-                                        node_id,
-                                        pending,
-                                        ..
-                                    },
-                                ) => self.recover_reported_pending_metadata_command(
-                                    &control_plane,
-                                    authority_now_ms(),
-                                    admission_settings,
-                                    PgId::new(*pg_id),
-                                    NodeId::new(*node_id),
-                                    *pending,
-                                ),
-                                _ => self
-                                    .current()
-                                    .drain_pending_metadata_commands_for_current_map()
-                                    .map_err(PendingMetadataCommandRefreshRecoveryError::Recover),
-                            })
-                        }
-                    },
-                };
-                let failure_kind = result
-                    .as_ref()
-                    .err()
-                    .map(StorageClusterRuntimeMapRefreshError::diagnostic_kind)
-                    .or_else(|| {
-                        recovery_result.as_ref().and_then(|result| {
-                            result
-                                .as_ref()
-                                .err()
-                                .map(PendingMetadataCommandRefreshRecoveryError::diagnostic_kind)
-                        })
-                    });
                 if let Err(error) = &result {
+                    if recover_pending_commands {
+                        worker_recovery_requested.store(true, Ordering::Release);
+                    }
+                    if runtime_map_refresh_error_requires_current_map_invalidation(error) {
+                        refresh_route_handle.expire_same_epoch_generations(refresh_now_ms);
+                    }
                     let _ = observability::emit_flight_event(
                         "storage",
                         "runtime_map_refresh_error",
@@ -645,12 +614,10 @@ impl StorageClusterRouteHandle {
                             error.diagnostic_kind()
                         ),
                     );
-                }
-                if let Some(Err(error)) = &recovery_result {
-                    let _ = observability::emit_flight_event(
+                    let _ = observability::event(
                         "storage",
-                        "pending_metadata_command_recovery_error",
-                        format!("kind={}", error.diagnostic_kind()),
+                        "runtime_map_refresh_error",
+                        Some(format_args!("kind={}", error.diagnostic_kind())),
                     );
                 }
                 {
@@ -658,11 +625,11 @@ impl StorageClusterRouteHandle {
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     status.attempts += 1;
-                    if let Some(kind) = failure_kind {
+                    if let Err(error) = &result {
                         status.last_failure =
                             Some(StorageClusterRuntimeMapRefreshLoopFailure {
                                 attempt: status.attempts,
-                                kind,
+                                kind: error.diagnostic_kind(),
                             });
                     }
                     match result {
@@ -673,51 +640,94 @@ impl StorageClusterRouteHandle {
                                     cluster_epoch: cluster.cluster_epoch(),
                                     route_map_validity: cluster.route_map_validity(),
                                 });
-                            status.last_error = recovery_result.as_ref().and_then(|result| {
-                                result.as_ref().err().map(|error| {
-                                    format!("pending metadata command recovery failed: {error}")
-                                })
-                            });
+                            status.last_error = None;
                         }
                         Err(error) => {
                             status.failures += 1;
-                            let mut error = error.to_string();
-                            match recovery_result {
-                                Some(Ok(drained)) if drained > 0 => {
-                                    error.push_str(&format!(
-                                        "; drained {drained} pending metadata command(s)"
-                                    ));
-                                }
-                                Some(Err(recovery_error)) => {
-                                    error.push_str(&format!(
-                                        "; pending metadata command recovery failed: {recovery_error}"
-                                    ));
-                                }
-                                _ => {}
-                            }
-                            status.last_error = Some(error);
+                            status.last_error = Some(error.to_string());
                         }
                     }
                 }
 
-                let (lock, cvar) = &*worker_stop;
-                let stopped = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                if *stopped {
-                    break;
-                }
-                let (stopped, _) = cvar
-                    .wait_timeout(stopped, refresh_interval)
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if *stopped {
+                if wait_for_runtime_map_worker(&worker_stop, refresh_interval) {
                     break;
                 }
             })
             .map_err(|source| StorageClusterRuntimeMapRefreshError::RefreshLoopSpawn { source })?;
 
+        let mut handles = vec![refresh_handle];
+        if recover_pending_commands {
+            let worker_stop = Arc::clone(&stop);
+            let worker_control_plane = Arc::clone(&control_plane);
+            let worker_authority_now_ms = Arc::clone(&authority_now_ms);
+            let recovery_route_handle = self;
+            // Recovery deliberately uses a separate control-plane call path
+            // and thread so a slow discovery or historical-route operation
+            // cannot prevent the refresh worker from renewing request routes.
+            let recovery_handle = thread::Builder::new()
+                .name("argmin-storage-cluster-pending-command-recovery".to_string())
+                .spawn(move || loop {
+                    let discovery_now_ms = worker_authority_now_ms();
+                    let fallback_requested = recovery_requested.swap(false, Ordering::AcqRel);
+                    let recovery_result = match worker_control_plane
+                        .pending_metadata_command_recoveries(discovery_now_ms)
+                    {
+                        Ok(listing)
+                            if !listing.tasks().is_empty() || !listing.failures().is_empty() => {
+                            recovery_route_handle.recover_authorized_pending_metadata_commands(
+                                worker_control_plane.as_ref(),
+                                worker_authority_now_ms.as_ref(),
+                                admission_settings,
+                                listing,
+                            )
+                        }
+                        Ok(_) if fallback_requested => recovery_route_handle
+                            .current()
+                            .drain_pending_metadata_commands_for_current_map()
+                            .map_err(PendingMetadataCommandRefreshRecoveryError::Recover),
+                        Ok(_) => Ok(0),
+                        Err(error) => Err(
+                            PendingMetadataCommandRefreshRecoveryError::ControlPlane(error),
+                        ),
+                    };
+                    if let Err(error) = &recovery_result {
+                        if fallback_requested {
+                            recovery_requested.store(true, Ordering::Release);
+                        }
+                        let _ = observability::emit_flight_event(
+                            "storage",
+                            "pending_metadata_command_recovery_error",
+                            format!("kind={}", error.diagnostic_kind()),
+                        );
+                        let _ = observability::event(
+                            "storage",
+                            "pending_metadata_command_recovery_error",
+                            Some(format_args!("kind={}", error.diagnostic_kind())),
+                        );
+                    }
+
+                    if wait_for_runtime_map_worker(&worker_stop, refresh_interval) {
+                        break;
+                    }
+                });
+            match recovery_handle {
+                Ok(handle) => handles.push(handle),
+                Err(source) => {
+                    stop_runtime_map_workers(&stop);
+                    for handle in handles {
+                        let _ = handle.join();
+                    }
+                    return Err(StorageClusterRuntimeMapRefreshError::RefreshLoopSpawn {
+                        source,
+                    });
+                }
+            }
+        }
+
         Ok(StorageClusterRuntimeMapRefreshLoop {
             stop,
             status,
-            handle: Some(handle),
+            handles,
         })
     }
 
@@ -937,8 +947,8 @@ impl StorageClusterRuntimeMapHandle {
         authority_now_ms: F,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
-        S: ControlPlaneRuntimeMapSource + Send + 'static,
-        F: Fn() -> u64 + Send + 'static,
+        S: ControlPlaneRuntimeMapSource + Send + Sync + 'static,
+        F: Fn() -> u64 + Send + Sync + 'static,
     {
         self.route_handle.spawn_control_plane_refresh_loop(
             control_plane,
@@ -955,8 +965,8 @@ impl StorageClusterRuntimeMapHandle {
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
-        S: ControlPlaneRuntimeMapSource + Send + 'static,
-        F: Fn() -> u64 + Send + 'static,
+        S: ControlPlaneRuntimeMapSource + Send + Sync + 'static,
+        F: Fn() -> u64 + Send + Sync + 'static,
     {
         self.route_handle
             .spawn_control_plane_refresh_loop_with_unix_storage_node_clients(
@@ -975,8 +985,8 @@ impl StorageClusterRuntimeMapHandle {
         admission_settings: LocalUnixStorageNodeClientAdmissionSettings,
     ) -> Result<StorageClusterRuntimeMapRefreshLoop, StorageClusterRuntimeMapRefreshError>
     where
-        S: ControlPlaneRuntimeMapSource + Send + 'static,
-        F: Fn() -> u64 + Send + 'static,
+        S: ControlPlaneRuntimeMapSource + Send + Sync + 'static,
+        F: Fn() -> u64 + Send + Sync + 'static,
     {
         self.route_handle
             .spawn_control_plane_refresh_only_loop_with_unix_storage_node_clients(

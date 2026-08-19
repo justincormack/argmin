@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::sync::Condvar;
 
 #[test]
 fn complete_pg_peering_command_replays_with_committed_completion_time() {
@@ -2952,7 +2953,160 @@ fn storage_cluster_runtime_map_refresh_loop_installs_current_map() {
 }
 
 #[test]
-fn storage_cluster_runtime_map_refresh_loop_resamples_time_after_discovery() {
+fn storage_cluster_runtime_map_refresh_continues_while_recovery_is_blocked() {
+    struct BlockingRecoveryRuntimeMapSource {
+        runtime_map: ClusterRuntimeMapSnapshot,
+        recovery_gate: Arc<(Mutex<(bool, bool)>, Condvar)>,
+    }
+
+    impl BlockingRecoveryRuntimeMapSource {
+        fn renewed_runtime_map(&self, authority_now_ms: u64) -> ClusterRuntimeMapSnapshot {
+            let mut runtime_map = self.runtime_map.clone();
+            runtime_map.validity =
+                RouteMapValidity::until_ms(authority_now_ms.saturating_add(1_250)).unwrap();
+            runtime_map.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+                authority_incarnation: runtime_map.freshness_proof().authority_incarnation(),
+                issued_at_ms: authority_now_ms,
+            };
+            runtime_map
+        }
+    }
+
+    impl ControlPlaneRuntimeMapSource for BlockingRecoveryRuntimeMapSource {
+        fn runtime_map_snapshot(
+            &self,
+            authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            Ok(self.renewed_runtime_map(authority_now_ms))
+        }
+
+        fn pending_metadata_command_recoveries(
+            &self,
+            _authority_now_ms: u64,
+        ) -> Result<PendingMetadataCommandRecoveryListing, ControlPlaneError> {
+            let (lock, changed) = &*self.recovery_gate;
+            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.0 = true;
+            changed.notify_all();
+            while !state.1 {
+                let (next, timeout) = changed
+                    .wait_timeout(state, Duration::from_secs(2))
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            Ok(PendingMetadataCommandRecoveryListing::new(
+                Vec::new(),
+                Vec::new(),
+            ))
+        }
+
+        fn serving_pg_runtime_map_snapshot(
+            &self,
+            pg_id: PgId,
+            authority_now_ms: u64,
+        ) -> Result<ClusterRuntimeMapSnapshot, ControlPlaneError> {
+            let runtime_map = self.renewed_runtime_map(authority_now_ms);
+            runtime_map
+                .pg_routes()
+                .iter()
+                .any(|route| route.pg_id() == pg_id)
+                .then_some(runtime_map)
+                .ok_or(ControlPlaneError::UnknownPg { pg_id: pg_id.get() })
+        }
+    }
+
+    let base_now_ms = crate::clock::current_time_millis();
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    authority
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    assert!(heartbeat_until_serving(&mut authority, 1, base_now_ms).serving());
+    authority
+        .set_pg_acting_set(PgId::new(31), vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_observation(&mut authority, 1, 31, PgState::Peering, base_now_ms + 1);
+    authority
+        .complete_pg_peering(
+            PgId::new(31),
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            base_now_ms + 2,
+        )
+        .unwrap();
+    heartbeat_with_pg_proof_and_lease_duration(
+        &mut authority,
+        1,
+        31,
+        PgState::Active,
+        PgMetadataProof::empty(),
+        false,
+        (base_now_ms + 3, 10_000),
+    );
+    let mut initial_map = authority.snapshot().runtime_map(base_now_ms + 4).unwrap();
+    initial_map.validity = RouteMapValidity::until_ms(base_now_ms + 1_250).unwrap();
+    initial_map.freshness_proof = RuntimeMapFreshnessProof::SingleAuthority {
+        authority_incarnation: authority.snapshot().authority_incarnation(),
+        issued_at_ms: base_now_ms,
+    };
+    let cluster = crate::StorageCluster::from_runtime_map(
+        NodeId::new(1),
+        &initial_map,
+        crate::EcShape { k: 1, m: 0 },
+    )
+    .unwrap();
+    let handle = crate::StorageClusterRouteHandle::from_authorized_cluster(cluster);
+    let recovery_gate = Arc::new((Mutex::new((false, false)), Condvar::new()));
+    let source = BlockingRecoveryRuntimeMapSource {
+        runtime_map: initial_map,
+        recovery_gate: Arc::clone(&recovery_gate),
+    };
+    let mut refresh_loop = handle
+        .clone()
+        .spawn_control_plane_refresh_loop(
+            source,
+            Duration::from_millis(10),
+            crate::clock::current_time_millis,
+        )
+        .unwrap();
+
+    {
+        let (lock, changed) = &*recovery_gate;
+        let state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (state, timeout) = changed
+            .wait_timeout_while(state, Duration::from_secs(1), |state| !state.0)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            state.0 && !timeout.timed_out(),
+            "recovery worker did not block"
+        );
+    }
+    std::thread::sleep(Duration::from_millis(500));
+
+    assert!(
+        refresh_loop.status().successes >= 10,
+        "route renewal did not continue during blocked recovery: {:?}",
+        refresh_loop.status()
+    );
+    handle
+        .admit_current_route()
+        .expect("blocked pending-command recovery must not expire request routes");
+
+    {
+        let (lock, changed) = &*recovery_gate;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.1 = true;
+        changed.notify_all();
+    }
+    refresh_loop.stop();
+}
+
+#[test]
+fn storage_cluster_runtime_map_workers_resample_time_for_each_operation() {
     struct TimestampRecordingRuntimeMapSource {
         snapshot: ClusterControlSnapshot,
         discovery_now_ms: Arc<AtomicU64>,
@@ -3081,14 +3235,20 @@ fn storage_cluster_runtime_map_refresh_loop_resamples_time_after_discovery() {
     }
     refresh_loop.stop();
 
-    assert_eq!(discovery_now_ms.load(Ordering::SeqCst), 2_001);
-    assert_eq!(
-        *recovery_now_ms
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        vec![8_001, 14_001]
+    let discovery_now_ms = discovery_now_ms.load(Ordering::SeqCst);
+    let recovery_now_ms = recovery_now_ms
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let refresh_now_ms = refresh_now_ms.load(Ordering::SeqCst);
+    assert_ne!(discovery_now_ms, u64::MAX);
+    assert_ne!(refresh_now_ms, u64::MAX);
+    assert_eq!(recovery_now_ms.len(), 2);
+    assert_ne!(discovery_now_ms, refresh_now_ms);
+    assert!(
+        recovery_now_ms.windows(2).all(|times| times[0] < times[1]),
+        "recovery operations did not resample time: {recovery_now_ms:?}"
     );
-    assert_eq!(refresh_now_ms.load(Ordering::SeqCst), 20_001);
 }
 
 #[test]
