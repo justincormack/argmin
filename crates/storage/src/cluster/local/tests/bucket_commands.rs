@@ -3165,6 +3165,108 @@ fn bucket_subresource_reports_contention_when_unrelated_pending_outcome_is_uncon
 }
 
 #[test]
+fn create_bucket_reports_contention_when_same_bucket_delete_mark_outcome_is_unconfirmed() {
+    let tmp = test_util::tempdir();
+    let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
+    let mut map =
+        LocalClusterMap::open(tmp.path(), &node_ids, &[0, 1], EcShape { k: 2, m: 1 }).unwrap();
+    let pg_id = PgId::new(1);
+    let bucket = {
+        let topology = map
+            .node(NodeId::new(0))
+            .unwrap()
+            .storage_node()
+            .pg_topology();
+        bucket_for_pg(topology, pg_id.get(), "create-same-bucket-delete-drain-")
+    };
+    set_route_primary(&mut map, pg_id.get(), NodeId::new(1));
+    let map = Arc::new(map);
+    let cluster = crate::StorageCluster::from_static_local_map(Arc::clone(&map)).unwrap();
+    create_test_bucket(&cluster, &bucket);
+
+    let command_id = cluster.next_bucket_metadata_command_id(pg_id).unwrap();
+    let primary = map
+        .metadata_pg_primary_node(ClusterEpoch::INITIAL, pg_id)
+        .unwrap();
+    let primary_pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
+    let current = crate::PgMetadataStore::head_bucket_record_raw(&*primary_pg, &bucket).unwrap();
+    let command = MetadataCommandEnvelope::new(
+        command_id,
+        MetadataCommandPayload::MarkBucketDeleting(MarkBucketDeletingCommand::from_bucket(
+            current.with_execution_generation(
+                primary_pg
+                    .next_bucket_execution_generation_candidate()
+                    .unwrap(),
+            ),
+        )),
+    );
+    drop(primary_pg);
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &command);
+
+    let _serial = lock_metadata_command_apply_hook_test();
+    let hook_calls = Arc::new(AtomicUsize::new(0));
+    let hook_calls_for_hook = Arc::clone(&hook_calls);
+    let hook_command = command.clone();
+    let _hook =
+        cluster.test_install_metadata_command_apply_attempt_hook(Arc::new(move |candidate| {
+            if candidate == &hook_command {
+                hook_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                let id = candidate.id();
+                return Err(StoreError::MetadataCommandOutcomeUnconfirmed {
+                    pg_id: id.pg_id().get(),
+                    cluster_epoch: id.cluster_epoch(),
+                    log_index: id.log_index().get(),
+                });
+            }
+            Ok(())
+        }));
+
+    let owner = crate::CanonicalUserId::from_principal("owner");
+    let acl_grants = crate::AclGrants::default();
+    let error = cluster
+        .create_bucket_with_config_and_load_info(&crate::CreateBucketConfig {
+            name: bucket.as_str(),
+            owner_principal: "owner",
+            owner_canonical_id: &owner,
+            acl_grants: &acl_grants,
+            public_read: false,
+            public_write: false,
+            versioning: crate::BucketVersioningState::Disabled,
+            object_lock: crate::BucketObjectLockConfig::default(),
+            ownership_controls: crate::BucketOwnershipControls {
+                object_ownership: crate::BucketObjectOwnership::ObjectWriter,
+            },
+        })
+        .expect_err("same-bucket delete-mark uncertainty must be retryable contention");
+
+    assert_eq!(
+        error.kind(),
+        &crate::BucketSnapshotLoadFailureKind::MetadataCommandContention
+    );
+    assert_eq!(hook_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(command),
+        "the uncertain delete mark must remain available for recovery"
+    );
+    for node_id in node_ids {
+        let pg = map
+            .node(node_id)
+            .unwrap()
+            .storage_node()
+            .get_pg(pg_id.get())
+            .unwrap();
+        assert_eq!(
+            crate::PgMetadataStore::head_bucket_raw(&*pg, &bucket)
+                .unwrap()
+                .state,
+            crate::BucketState::Active,
+            "the blocked CreateBucket request must not apply the delete mark"
+        );
+    }
+}
+
+#[test]
 fn invalid_bucket_subresource_command_does_not_poison_bucket_command_stream() {
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];

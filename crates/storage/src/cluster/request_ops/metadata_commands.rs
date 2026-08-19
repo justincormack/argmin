@@ -3060,13 +3060,21 @@ impl super::StorageCluster {
         work_budget: &mut super::RequestWorkBudget,
     ) -> Result<(), BucketSnapshotLoadError> {
         if Self::metadata_command_is_bucket_pg_command(command) {
-            let outcome = self
+            let outcome = match self
                 .finish_pending_metadata_command_to_acting_set_allow_partial_exact_conflict_retry_with_work_budget(
                     pg_id,
                     command,
                     false,
                     work_budget,
-                )?;
+                ) {
+                    Ok(outcome) => outcome,
+                    Err(error) if bucket_snapshot_error_is_deferred_pending_drain(&error) => {
+                        return Err(conflicting_pending_metadata_command(
+                            "blocking pending metadata command convergence deferred",
+                        ));
+                    }
+                    Err(error) => return Err(error),
+                };
             return match outcome {
                 FinishPendingMetadataCommandResult::Applied
                 | FinishPendingMetadataCommandResult::PublishedPendingRecovery

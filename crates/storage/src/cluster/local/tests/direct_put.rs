@@ -1026,6 +1026,18 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
     );
 
     let calls_for_action = Arc::clone(&action_calls);
+    let pending_install_backoffs = || {
+        observability::metadata_command_backoff_dimension_snapshot()
+            .into_iter()
+            .filter(|sample| {
+                sample.pg_id == Some(2)
+                    && sample.operation == "commit_direct_put_metadata"
+                    && sample.context == "direct PUT pending install retry budget exhausted"
+            })
+            .map(|sample| sample.count)
+            .sum::<u64>()
+    };
+    let backoffs_before = pending_install_backoffs();
     let result = first_cluster
         .commit_direct_put_object_from_payload_shards(
             &loser_req,
@@ -1042,6 +1054,11 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
         .unwrap();
     assert!(matches!(result, Err("object already exists")));
     assert!(hook_ran.load(Ordering::SeqCst));
+    assert_eq!(
+        pending_install_backoffs(),
+        backoffs_before,
+        "draining a predecessor is progress and must immediately re-enter FIFO admission"
+    );
     assert_eq!(
         action_calls.load(Ordering::SeqCst),
         2,

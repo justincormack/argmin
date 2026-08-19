@@ -4553,9 +4553,10 @@ impl StorageCluster {
                         }
                     }
                     SnapshotSensitiveInstallOutcome::ContenderDrained => {
-                        sleep_direct_put_before_command_ownership_after_contention!(
-                            "direct PUT pending install retry budget exhausted"
-                        );
+                        // Draining the predecessor is forward progress. Re-enter the FIFO PG
+                        // admission path immediately so maintenance arriving afterward cannot
+                        // repeatedly overtake this request during voluntary backoff. The outer
+                        // loop checks the same absolute work deadline before doing more work.
                         continue;
                     }
                 }
