@@ -4158,6 +4158,7 @@ fn suspended_delete_marker_pending_install_honors_expired_operation_deadline() {
             &command,
             None,
             &mut work_budget,
+            &mut crate::cluster::SnapshotSensitiveRetryPhase::default().snapshot_evaluated(),
         )
         .expect_err("expired operation must not install a new pending command");
 

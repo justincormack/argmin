@@ -145,7 +145,8 @@ impl super::StorageCluster {
                     .map_err(bucket_snapshot_error_to_bucket_write_drain_error)?
                 {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -3769,7 +3770,8 @@ impl super::StorageCluster {
                     super::SnapshotSensitiveInstallOutcome::Installed => {
                         attempt_phase = BucketDeleteAttemptPhase::MarkDeleting;
                     }
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         super::sleep_after_metadata_contention_retry_for(
                             "bucket_delete_begin",
                             Some(pg_id),

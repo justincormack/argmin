@@ -481,48 +481,12 @@ impl StorageCluster {
         )
     }
 
-    fn metadata_command_has_exact_applied_entry_until(
+    fn snapshot_sensitive_candidate_terminal_state_until(
         &self,
         pg_id: PgId,
         command: &MetadataCommandEnvelope,
         deadline: Instant,
-    ) -> Result<bool, BucketSnapshotLoadError> {
-        let nodes = self
-            .local_map
-            .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
-        let mut expected_hashes = None;
-        let mut exact = false;
-        for node in nodes {
-            let hashes = node
-                .metadata_command_inspection_client()
-                .applied_metadata_command_log_entry_hashes_until(pg_id, command, deadline)?;
-            let Some(hashes) = hashes else {
-                continue;
-            };
-            exact = true;
-            match expected_hashes {
-                None => expected_hashes = Some(hashes),
-                Some(expected) if expected == hashes => {}
-                Some(_) => {
-                    return Err(self
-                        .metadata_command_conflict(
-                            node.node_id(),
-                            pg_id,
-                            command.id().log_index().get(),
-                        )
-                        .into());
-                }
-            }
-        }
-        Ok(exact)
-    }
-
-    fn metadata_command_candidate_has_exact_applied_entry_until(
-        &self,
-        pg_id: PgId,
-        command: &MetadataCommandEnvelope,
-        deadline: Instant,
-    ) -> Result<bool, BucketSnapshotLoadError> {
+    ) -> Result<SnapshotSensitiveCandidateTerminalState, BucketSnapshotLoadError> {
         let nodes = self
             .local_map
             .metadata_pg_acting_nodes(command.id().cluster_epoch(), pg_id)?;
@@ -570,7 +534,13 @@ impl StorageCluster {
                 .into());
             }
         }
-        Ok(exact)
+        Ok(if exact {
+            SnapshotSensitiveCandidateTerminalState::Exact
+        } else if different_node_id.is_some() {
+            SnapshotSensitiveCandidateTerminalState::Different
+        } else {
+            SnapshotSensitiveCandidateTerminalState::NotTerminal
+        })
     }
 
     fn metadata_command_is_applied_on_all_acting_nodes_with_route_mode(
@@ -4629,6 +4599,7 @@ impl StorageCluster {
         bucket: &BucketName,
         command: &MetadataCommandEnvelope,
         effect_fence: Option<AdmittedRouteEffectFence>,
+        evaluated_attempt: &mut SnapshotSensitiveEvaluatedAttempt<'_>,
     ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
         let mut work_budget = RequestWorkBudget::new(BUCKET_WRITE_DRAIN_RETRY_BUDGET, None)
             .for_operation("snapshot_sensitive_metadata_command_install")
@@ -4640,9 +4611,11 @@ impl StorageCluster {
             command,
             effect_fence,
             &mut work_budget,
+            evaluated_attempt,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn install_snapshot_sensitive_metadata_command_or_drain_with_work_budget(
         &self,
         publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
@@ -4651,6 +4624,7 @@ impl StorageCluster {
         command: &MetadataCommandEnvelope,
         effect_fence: Option<AdmittedRouteEffectFence>,
         work_budget: &mut RequestWorkBudget,
+        evaluated_attempt: &mut SnapshotSensitiveEvaluatedAttempt<'_>,
     ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
         let mut ignored_may_have_applied = false;
         self.install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
@@ -4661,11 +4635,40 @@ impl StorageCluster {
             effect_fence,
             work_budget,
             &mut ignored_may_have_applied,
+            evaluated_attempt,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified(
+        &self,
+        publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
+        pg_id: PgId,
+        bucket: &BucketName,
+        command: &MetadataCommandEnvelope,
+        effect_fence: Option<AdmittedRouteEffectFence>,
+        work_budget: &mut RequestWorkBudget,
+        install_may_have_applied: &mut bool,
+        evaluated_attempt: &mut SnapshotSensitiveEvaluatedAttempt<'_>,
+    ) -> Result<SnapshotSensitiveInstallOutcome, ObjectPgActionError> {
+        let outcome = self
+            .install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified_inner(
+                publisher,
+                pg_id,
+                bucket,
+                command,
+                effect_fence,
+                work_budget,
+                install_may_have_applied,
+            )?;
+        if outcome == SnapshotSensitiveInstallOutcome::ReinspectSnapshot {
+            evaluated_attempt.require_snapshot_reinspection();
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn install_snapshot_sensitive_metadata_command_or_drain_with_work_budget_classified_inner(
         &self,
         publisher: impl crate::metadata_command::SnapshotSensitiveMetadataCommandPublisher,
         pg_id: PgId,
@@ -4699,12 +4702,13 @@ impl StorageCluster {
                     );
                 }
                 if self
-                    .metadata_command_candidate_has_exact_applied_entry_until(
+                    .snapshot_sensitive_candidate_terminal_state_until(
                         pg_id,
                         command,
                         work_budget.deadline(),
                     )
                     .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                    == SnapshotSensitiveCandidateTerminalState::Exact
                 {
                     return Ok(SnapshotSensitiveInstallOutcome::Installed);
                 }
@@ -4725,25 +4729,28 @@ impl StorageCluster {
                     }
                     return Err(error.into_source().into());
                 }
-                self.drain_one_pending_object_metadata_command_with_work_budget(
-                    publisher,
-                    pg_id,
-                    bucket,
-                    work_budget,
-                )?;
-                Ok(SnapshotSensitiveInstallOutcome::ContenderDrained)
+                // The primary definitively rejected this candidate because its index is
+                // already terminal, and acting-set inspection found no exact replay. The
+                // candidate can never be installed. Return to snapshot reinspection without
+                // draining a newer slot that may now be owned by another request.
+                Ok(SnapshotSensitiveInstallOutcome::ReinspectSnapshot)
             }
             Ok(false) => {
-                if *install_may_have_applied
-                    && self
-                        .metadata_command_has_exact_applied_entry_until(
-                            pg_id,
-                            command,
-                            work_budget.deadline(),
-                        )
-                        .map_err(bucket_snapshot_error_to_object_pg_action_error)?
+                match self
+                    .snapshot_sensitive_candidate_terminal_state_until(
+                        pg_id,
+                        command,
+                        work_budget.deadline(),
+                    )
+                    .map_err(bucket_snapshot_error_to_object_pg_action_error)?
                 {
-                    return Ok(SnapshotSensitiveInstallOutcome::Installed);
+                    SnapshotSensitiveCandidateTerminalState::Exact => {
+                        return Ok(SnapshotSensitiveInstallOutcome::Installed);
+                    }
+                    SnapshotSensitiveCandidateTerminalState::Different => {
+                        return Ok(SnapshotSensitiveInstallOutcome::ReinspectSnapshot);
+                    }
+                    SnapshotSensitiveCandidateTerminalState::NotTerminal => {}
                 }
                 if *install_may_have_applied {
                     if self

@@ -161,6 +161,10 @@ impl<'a> PendingMetadataCommandDrainContext<'a> {
 }
 
 impl CollectedPendingObjectMetadataCommands {
+    fn empty_drained() -> Self {
+        Self::Drained(Vec::new())
+    }
+
     fn commands(&self) -> &[MetadataCommandEnvelope] {
         match self {
             Self::Drained(commands) | Self::PendingRecovery(commands) => commands,
@@ -4033,18 +4037,24 @@ impl StorageCluster {
             }};
         }
 
+        let mut snapshot_retry_phase = SnapshotSensitiveRetryPhase::default();
         let (command, new_pending_command) = loop {
             require_direct_put_route_before_command_ownership!();
             check_direct_put_work_before_command_ownership!(
                 "direct PUT metadata retry budget exhausted"
             );
-            let (mut command, new_pending_command, payload_acks_registered) = loop {
+            let (
+                mut command,
+                new_pending_command,
+                payload_acks_registered,
+                mut evaluated_attempt,
+            ) = loop {
                 require_direct_put_route_before_command_ownership!();
                 check_direct_put_work_before_command_ownership!(
                     "direct PUT metadata pending retry budget exhausted"
                 );
-                let Some(command) =
-                    (match self.pending_metadata_command_for_bucket_until(
+                let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                    match self.pending_metadata_command_for_bucket_until(
                         pg_id,
                         &req.bucket,
                         work_budget.deadline(),
@@ -4056,8 +4066,21 @@ impl StorageCluster {
                                 "direct PUT pending command observation retry budget exhausted"
                             );
                         }
-                    })
+                    }
+                } else {
+                    None
+                };
+                let Some(command) = pending_command
                 else {
+                    #[cfg(test)]
+                    if let Err(error) = request_ops::maybe_run_direct_put_snapshot_read_hook(
+                        self.metadata_command_apply_test_hook_scope_id(),
+                    ) {
+                        retry_direct_put_observation_before_command_ownership!(
+                            error,
+                            "direct PUT commit snapshot retry budget exhausted"
+                        );
+                    }
                     let snapshot = match direct_put_metadata_route
                         .load_direct_put_commit_snapshot_until(
                             &req.generation_reservation_id,
@@ -4097,6 +4120,7 @@ impl StorageCluster {
                             return Ok(Err(error));
                         }
                     }
+                    let evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
 
                     let version_id = if req.versioning == crate::BucketVersioningState::Enabled {
                         match self.reserve_next_object_version_for_completion_with_effect_fence(
@@ -4205,7 +4229,7 @@ impl StorageCluster {
                             );
                         }
                     };
-                    break (command, true, true);
+                    break (command, true, true, Some(evaluated_attempt));
                 };
 
                 let matching_direct_put = match command.payload() {
@@ -4370,7 +4394,7 @@ impl StorageCluster {
                     continue;
                 }
                 if is_matching_direct_put {
-                    break (command, false, false);
+                    break (command, false, false, None);
                 }
                 if let Err(error) = self.drain_pending_object_metadata_command_with_work_budget(
                     publisher,
@@ -4459,6 +4483,9 @@ impl StorageCluster {
                             Some(effect_fence),
                             &mut work_budget,
                             &mut install_may_have_applied,
+                            evaluated_attempt.as_mut().expect(
+                                "new direct PUT command requires an evaluated snapshot attempt",
+                            ),
                         ) {
                         Ok(install) => break install,
                         Err(error) => {
@@ -4551,6 +4578,9 @@ impl StorageCluster {
                                 &mut work_budget,
                             );
                         }
+                    }
+                    SnapshotSensitiveInstallOutcome::ReinspectSnapshot => {
+                        continue;
                     }
                     SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         // Draining the predecessor is forward progress. Re-enter the FIFO PG
@@ -5261,15 +5291,19 @@ impl StorageCluster {
         let object_pg_id = route.object_pg_id;
         let pg_id = object_pg_id.pg_id();
         debug_assert_eq!(request.target, StreamUploadTarget::PutObject);
+        let mut snapshot_retry_phase = SnapshotSensitiveRetryPhase::default();
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             work_budget
                 .check("put object stream create retry budget exhausted")
                 .map_err(ObjectPgActionError::Store)?;
-            let applied_commands = self
-                .drain_pending_object_metadata_commands_for_publisher_collect(
+            let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
+                self.drain_pending_object_metadata_commands_for_publisher_collect(
                     publisher, pg_id, bucket,
-                )?;
+                )?
+            } else {
+                CollectedPendingObjectMetadataCommands::empty_drained()
+            };
             let expected_command = applied_stream_create_command(
                 applied_commands.commands(),
                 &request,
@@ -5288,6 +5322,7 @@ impl StorageCluster {
                 return Ok(BucketWriteReservationDisposition::ReleaseByCaller);
             }
             applied_commands.require_drained_for_unmatched_request()?;
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             self.reserve_put_object_generation_with_route_validation(
                 route,
                 session_id,
@@ -5345,9 +5380,11 @@ impl StorageCluster {
                 bucket,
                 &command,
                 Some(route.effect_fence),
+                &mut evaluated_attempt,
             )? {
                 SnapshotSensitiveInstallOutcome::Installed => {}
-                SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                | SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_object_generation_reservation(bucket, key, session_id)?;
                     work_budget
                         .sleep_after_contention(

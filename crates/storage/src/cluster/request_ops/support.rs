@@ -665,6 +665,9 @@ type StreamPutPendingDrainTestHook =
 type DirectPutPendingDrainTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[cfg(test)]
+type DirectPutSnapshotReadTestHook = Arc<dyn Fn() -> Result<(), ObjectPgActionError> + Send + Sync>;
+
+#[cfg(test)]
 type DirectPutPendingInstallUncertaintyTestHook = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[cfg(test)]
@@ -869,6 +872,11 @@ static STREAM_PUT_PENDING_DRAIN_HOOKS: OnceLock<
 #[cfg(test)]
 static DIRECT_PUT_PENDING_DRAIN_HOOKS: OnceLock<
     Mutex<HashMap<usize, DirectPutPendingDrainTestHook>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static DIRECT_PUT_SNAPSHOT_READ_HOOKS: OnceLock<
+    Mutex<HashMap<usize, DirectPutSnapshotReadTestHook>>,
 > = OnceLock::new();
 
 #[cfg(test)]
@@ -1077,6 +1085,11 @@ pub(crate) struct StreamPutPendingDrainTestHookGuard {
 
 #[cfg(test)]
 pub(crate) struct DirectPutPendingDrainTestHookGuard {
+    scope_id: usize,
+}
+
+#[cfg(test)]
+pub(crate) struct DirectPutSnapshotReadTestHookGuard {
     scope_id: usize,
 }
 
@@ -1344,6 +1357,17 @@ impl Drop for StreamPutPendingDrainTestHookGuard {
 impl Drop for DirectPutPendingDrainTestHookGuard {
     fn drop(&mut self) {
         let hooks = DIRECT_PUT_PENDING_DRAIN_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        hooks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.scope_id);
+    }
+}
+
+#[cfg(test)]
+impl Drop for DirectPutSnapshotReadTestHookGuard {
+    fn drop(&mut self) {
+        let hooks = DIRECT_PUT_SNAPSHOT_READ_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
         hooks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1923,6 +1947,19 @@ pub(super) fn maybe_run_direct_put_pending_drain_hook(
     if expire {
         work_budget.expire_for_test();
     }
+}
+
+#[cfg(test)]
+pub(super) fn maybe_run_direct_put_snapshot_read_hook(
+    scope_id: usize,
+) -> Result<(), ObjectPgActionError> {
+    let hook = DIRECT_PUT_SNAPSHOT_READ_HOOKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&scope_id)
+        .cloned();
+    hook.map_or(Ok(()), |hook| hook())
 }
 
 #[cfg(test)]

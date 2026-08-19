@@ -220,7 +220,8 @@ impl super::StorageCluster {
                     &mut work_budget,
                 )? {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -531,7 +532,8 @@ impl super::StorageCluster {
                     &mut work_budget,
                 )? {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -675,7 +677,8 @@ impl super::StorageCluster {
                     &mut work_budget,
                 )? {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };
@@ -902,7 +905,8 @@ impl super::StorageCluster {
                     &mut work_budget,
                 )? {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 (command, true)
             };

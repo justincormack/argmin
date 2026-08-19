@@ -106,6 +106,19 @@ impl super::StorageCluster {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_install_direct_put_snapshot_read_hook(
+        &self,
+        hook: DirectPutSnapshotReadTestHook,
+    ) -> DirectPutSnapshotReadTestHookGuard {
+        let scope_id = self.metadata_command_apply_test_hook_scope_id();
+        let slot = DIRECT_PUT_SNAPSHOT_READ_HOOKS.get_or_init(|| Mutex::new(HashMap::new()));
+        slot.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope_id, hook);
+        DirectPutSnapshotReadTestHookGuard { scope_id }
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_install_direct_put_pending_install_uncertainty_hook(
         &self,
         hook: DirectPutPendingInstallUncertaintyTestHook,
@@ -224,6 +237,7 @@ impl super::StorageCluster {
             effect_fence,
         } = route;
         let pg_id = object_pg_id.pg_id();
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
 
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
@@ -237,7 +251,12 @@ impl super::StorageCluster {
                 bucket,
                 key,
             )?;
-            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
+            } else {
+                None
+            };
+            if let Some(command) = pending_command {
                 if let MetadataCommandPayload::PutObjectMetadata(update) = command.payload() {
                     if update.object.bucket == *bucket && update.object.key == *key {
                         let snapshot_version_id = match requested_version_id {
@@ -313,9 +332,10 @@ impl super::StorageCluster {
                 }};
             }
 
-            if self
-                .pending_metadata_command_for_bucket(pg_id, bucket)?
-                .is_some()
+            if snapshot_retry_phase.pending_drain_allowed()
+                && self
+                    .pending_metadata_command_for_bucket(pg_id, bucket)?
+                    .is_some()
             {
                 release_bucket_write_proof!()?;
                 continue;
@@ -341,6 +361,7 @@ impl super::StorageCluster {
                     return Ok(Err(error));
                 }
             };
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             if let Err(error) = require_valid_route() {
                 release_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
@@ -381,6 +402,7 @@ impl super::StorageCluster {
                 bucket,
                 &command,
                 Some(effect_fence),
+                &mut evaluated_attempt,
             ) {
                 Ok(install) => install,
                 Err(error) => {
@@ -390,7 +412,8 @@ impl super::StorageCluster {
             };
             match install {
                 super::SnapshotSensitiveInstallOutcome::Installed => {}
-                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     release_bucket_write_proof!()?;
                     continue;
                 }
@@ -1422,11 +1445,17 @@ impl super::StorageCluster {
             });
         };
         let pg_id = object_pg_id.pg_id();
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
 
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let storage_client = self.object_delete_metadata_primary_route(bucket, key)?;
-            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
+            } else {
+                None
+            };
+            if let Some(command) = pending_command {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.matches_request(bucket, key, version_id) {
                         require_valid_route().map_err(ObjectPgActionError::Store)?;
@@ -1495,6 +1524,7 @@ impl super::StorageCluster {
                     deleted: DeletedSpecificObjectVersion::Missing,
                 }));
             }
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             if let Err(error) = require_valid_route() {
                 self.release_bucket_write_proof_for_object_metadata_command(
                     &bucket_write_reservation,
@@ -1555,6 +1585,7 @@ impl super::StorageCluster {
                 bucket,
                 &command,
                 Some(effect_fence),
+                &mut evaluated_attempt,
             ) {
                 Ok(install) => install,
                 Err(error) => {
@@ -1566,7 +1597,8 @@ impl super::StorageCluster {
             };
             match install {
                 super::SnapshotSensitiveInstallOutcome::Installed => {}
-                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -1611,6 +1643,7 @@ impl super::StorageCluster {
         )
         .for_operation("delete_current_object")
         .for_pg(pg_id);
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
 
         loop {
             work_budget
@@ -1618,7 +1651,12 @@ impl super::StorageCluster {
                 .map_err(ObjectPgActionError::Store)?;
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let storage_client = self.object_delete_metadata_primary_route(bucket, key)?;
-            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
+            } else {
+                None
+            };
+            if let Some(command) = pending_command {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
                         require_valid_route().map_err(ObjectPgActionError::Store)?;
@@ -1714,6 +1752,7 @@ impl super::StorageCluster {
                     deleted: DeletedCurrentObject::DeleteMarker,
                 }));
             };
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             if let Err(error) = require_valid_route() {
                 self.release_bucket_write_proof_for_object_metadata_command(
                     &bucket_write_reservation,
@@ -1779,6 +1818,7 @@ impl super::StorageCluster {
                     &command,
                     Some(effect_fence),
                     &mut work_budget,
+                    &mut evaluated_attempt,
                 )
             {
                 Ok(install) => install,
@@ -1791,7 +1831,8 @@ impl super::StorageCluster {
             };
             match install {
                 super::SnapshotSensitiveInstallOutcome::Installed => {}
-                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -1863,6 +1904,7 @@ impl super::StorageCluster {
         )
         .for_operation("insert_current_delete_marker")
         .for_pg(pg_id);
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
         #[cfg(test)]
         let mut abandoned_hook_command = None;
 
@@ -1876,7 +1918,12 @@ impl super::StorageCluster {
             }
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let storage_client = self.object_delete_metadata_primary_route(bucket, key)?;
-            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
+            } else {
+                None
+            };
+            if let Some(command) = pending_command {
                 if let MetadataCommandPayload::InsertDeleteMarker(marker) = command.payload() {
                     if marker.matches_request(bucket, key) {
                         require_valid_route().map_err(ObjectPgActionError::Store)?;
@@ -1980,6 +2027,7 @@ impl super::StorageCluster {
             } else {
                 None
             };
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             let marker_vid = match versioning {
                 BucketVersioningState::Enabled => {
                     match self.reserve_next_object_version_with_effect_fence(
@@ -2088,6 +2136,7 @@ impl super::StorageCluster {
                     Some(effect_fence),
                     &mut work_budget,
                     &mut install_may_have_applied,
+                    &mut evaluated_attempt,
                 ) {
                     Ok(install) => break install,
                     Err(error)
@@ -2126,7 +2175,8 @@ impl super::StorageCluster {
             };
             match install {
                 super::SnapshotSensitiveInstallOutcome::Installed => {}
-                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -2250,8 +2300,14 @@ impl super::StorageCluster {
             bucket_info.owner_principal.clone(),
             bucket_info.owner_canonical_id.clone(),
         );
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
         loop {
-            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
+            } else {
+                None
+            };
+            if let Some(command) = pending_command {
                 match command.payload() {
                     MetadataCommandPayload::DeleteObjectVersion(delete)
                         if delete.matches_request(bucket, key, expected_version_id) =>
@@ -2389,6 +2445,7 @@ impl super::StorageCluster {
                 )?;
                 return Ok(Ok(None));
             }
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
 
             let command = match bucket_info.versioning {
                 BucketVersioningState::Disabled => storage_client
@@ -2472,7 +2529,12 @@ impl super::StorageCluster {
                 _ => unreachable!("lifecycle current expiry command changed payload kind"),
             };
             let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                publisher, pg_id, bucket, &command, None,
+                publisher,
+                pg_id,
+                bucket,
+                &command,
+                None,
+                &mut evaluated_attempt,
             ) {
                 Ok(install) => install,
                 Err(error) => {
@@ -2484,7 +2546,8 @@ impl super::StorageCluster {
             };
             match install {
                 super::SnapshotSensitiveInstallOutcome::Installed => {}
-                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -2541,9 +2604,15 @@ impl super::StorageCluster {
         let pg_id = object_pg_id.pg_id();
         let storage_client = self.object_delete_metadata_primary_route(bucket, key)?;
         let mut completed_reclaimed_generation_ids = Vec::new();
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
 
         'retry: loop {
-            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
+            } else {
+                None
+            };
+            if let Some(command) = pending_command {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.bucket == *bucket && delete.key == *key {
                         if !metadata_command_matches_bucket_incarnation(
@@ -2595,6 +2664,7 @@ impl super::StorageCluster {
             if due_version_ids.is_empty() {
                 return Ok(Ok(completed_reclaimed_generation_ids));
             }
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
 
             let mut delete_targets = Vec::new();
             for stored in &versions {
@@ -2661,7 +2731,12 @@ impl super::StorageCluster {
                     }
                 };
                 let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                    publisher, pg_id, bucket, &command, None,
+                    publisher,
+                    pg_id,
+                    bucket,
+                    &command,
+                    None,
+                    &mut evaluated_attempt,
                 ) {
                     Ok(install) => install,
                     Err(error) => {
@@ -2673,7 +2748,8 @@ impl super::StorageCluster {
                 };
                 match install {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         self.release_bucket_write_proof_for_object_metadata_command(
                             &bucket_write_reservation,
                         )?;
@@ -2738,9 +2814,15 @@ impl super::StorageCluster {
         let object_pg_id = self.object_metadata_pg(bucket, key);
         let pg_id = object_pg_id.pg_id();
         let storage_client = self.object_delete_metadata_primary_route(bucket, key)?;
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
 
         loop {
-            if let Some(command) = self.pending_metadata_command_for_bucket(pg_id, bucket)? {
+            let pending_command = if snapshot_retry_phase.pending_drain_allowed() {
+                self.pending_metadata_command_for_bucket(pg_id, bucket)?
+            } else {
+                None
+            };
+            if let Some(command) = pending_command {
                 if let MetadataCommandPayload::DeleteObjectVersion(delete) = command.payload() {
                     if delete.matches_request(bucket, key, expected_version_id)
                         && matches!(
@@ -2845,6 +2927,7 @@ impl super::StorageCluster {
                         return Err(error);
                     }
                 };
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             let command = storage_client.build_delete_specific_object_version_command(
                 BuildDeleteSpecificObjectVersionCommandReq {
                     version_id: expected_version_id,
@@ -2879,7 +2962,12 @@ impl super::StorageCluster {
                 }
             };
             let install = match self.install_snapshot_sensitive_metadata_command_or_drain(
-                publisher, pg_id, bucket, &command, None,
+                publisher,
+                pg_id,
+                bucket,
+                &command,
+                None,
+                &mut evaluated_attempt,
             ) {
                 Ok(install) => install,
                 Err(error) => {
@@ -2891,7 +2979,8 @@ impl super::StorageCluster {
             };
             match install {
                 super::SnapshotSensitiveInstallOutcome::Installed => {}
-                super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                     self.release_bucket_write_proof_for_object_metadata_command(
                         &bucket_write_reservation,
                     )?;
@@ -3566,6 +3655,7 @@ impl super::StorageCluster {
         let mut reclaim_fence_started = false;
         let mut payload_delete_started = false;
         let mut command_owns_reclaim_claim = false;
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
         let result = (|| -> Result<super::ObjectPayloadReclaimAttempt, ObjectPgActionError> {
             self.maybe_run_after_reclaim_claim_acquired_hook()?;
             if !self.local_map.try_begin_object_payload_reclaim(
@@ -3637,6 +3727,7 @@ impl super::StorageCluster {
                     continue;
                 }
 
+                let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
                 let command = match reclaim_route.build_delete_object_payload_reclaim_command(
                     crate::node_client::BuildDeleteObjectPayloadReclaimCommandReq {
                         payload: &reclaim,
@@ -3659,8 +3750,12 @@ impl super::StorageCluster {
                     bucket,
                     &command,
                     Some(reclaim_effect_fence),
+                    &mut evaluated_attempt,
                 )? {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot => {
+                        return Ok(super::ObjectPayloadReclaimAttempt::Deferred);
+                    }
                     super::SnapshotSensitiveInstallOutcome::ContenderDrained => continue,
                 }
                 command_owns_reclaim_claim = true;

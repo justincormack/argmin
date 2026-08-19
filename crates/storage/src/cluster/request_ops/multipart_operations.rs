@@ -122,13 +122,17 @@ impl super::StorageCluster {
             effect_fence,
         } = route;
         let pg_id = object_pg_id.pg_id();
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
         loop {
             require_valid_route()?;
-            let applied_commands = self
-                .drain_pending_object_metadata_commands_for_publisher_collect(
+            let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
+                self.drain_pending_object_metadata_commands_for_publisher_collect(
                     publisher, pg_id, bucket,
                 )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            } else {
+                super::CollectedPendingObjectMetadataCommands::empty_drained()
+            };
             require_valid_route()?;
             let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
                 bucket,
@@ -207,6 +211,7 @@ impl super::StorageCluster {
                 applied_commands
                     .require_drained_for_unmatched_request()
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
                 self.reserve_put_object_generation_with_route_validation(
                     route,
                     &create.session_id,
@@ -294,6 +299,7 @@ impl super::StorageCluster {
                     bucket,
                     &command,
                     Some(effect_fence),
+                    &mut evaluated_attempt,
                 ) {
                     Ok(install) => install,
                     Err(error) => {
@@ -309,7 +315,8 @@ impl super::StorageCluster {
                 };
                 match install {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         if let Err(cleanup_error) = self.release_object_generation_reservation(
                             bucket,
                             key,
@@ -856,13 +863,17 @@ impl super::StorageCluster {
         } = route;
         let pg_id = object_pg_id.pg_id();
         let mut authorized_issuance = AuthorizedMultipartUploadCreateIssuance::default();
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
         loop {
             require_valid_route()?;
-            let applied_commands = self
-                .drain_pending_object_metadata_commands_for_publisher_collect(
+            let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
+                self.drain_pending_object_metadata_commands_for_publisher_collect(
                     publisher, pg_id, bucket,
                 )
-                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
+            } else {
+                super::CollectedPendingObjectMetadataCommands::empty_drained()
+            };
             require_valid_route()?;
             let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
                 bucket,
@@ -960,6 +971,7 @@ impl super::StorageCluster {
                 applied_commands
                     .require_drained_for_unmatched_request()
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?;
+                let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
 
                 let mut command = match multipart_creation_route
                     .build_create_multipart_upload_command(BuildCreateMultipartUploadCommandReq {
@@ -1008,11 +1020,13 @@ impl super::StorageCluster {
                         bucket,
                         &command,
                         Some(effect_fence),
+                        &mut evaluated_attempt,
                     )
                     .map_err(super::object_pg_action_error_to_bucket_snapshot_error)?
                 {
                     super::SnapshotSensitiveInstallOutcome::Installed => {}
-                    super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained => {
                         return Ok(Ok(Attempt::Retry));
                     }
                 }
@@ -1137,18 +1151,22 @@ impl super::StorageCluster {
                 self.release_bucket_write_reservation_proof(&bucket_write_reservation)
             }};
         }
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
         loop {
-            let applied_commands = match self
-                .drain_pending_object_metadata_commands_for_publisher_collect(
+            let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
+                match self.drain_pending_object_metadata_commands_for_publisher_collect(
                     publisher, pg_id, &bucket,
                 ) {
-                Ok(applied_commands) => applied_commands,
-                Err(error) => {
-                    release_caller_bucket_write_proof!()?;
-                    return Err(super::object_pg_action_error_to_bucket_snapshot_error(
-                        error,
-                    ));
+                    Ok(applied_commands) => applied_commands,
+                    Err(error) => {
+                        release_caller_bucket_write_proof!()?;
+                        return Err(super::object_pg_action_error_to_bucket_snapshot_error(
+                            error,
+                        ));
+                    }
                 }
+            } else {
+                super::CollectedPendingObjectMetadataCommands::empty_drained()
             };
             let upload = match multipart_lookup_route.load_in_progress_multipart_upload(&upload_id)
             {
@@ -1211,6 +1229,7 @@ impl super::StorageCluster {
                     error,
                 ));
             }
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             let command = match stream_creation_route.build_create_stream_upload_command(
                 BuildCreateStreamUploadCommandReq {
                     request: &create,
@@ -1243,11 +1262,19 @@ impl super::StorageCluster {
                 }
             };
             let install_result = self.install_snapshot_sensitive_metadata_command_or_drain(
-                publisher, pg_id, &bucket, &command, None,
+                publisher,
+                pg_id,
+                &bucket,
+                &command,
+                None,
+                &mut evaluated_attempt,
             );
             match install_result {
                 Ok(super::SnapshotSensitiveInstallOutcome::Installed) => {}
-                Ok(super::SnapshotSensitiveInstallOutcome::ContenderDrained) => continue,
+                Ok(
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained,
+                ) => continue,
                 Err(error) => {
                     release_caller_bucket_write_proof!()?;
                     return Err(super::object_pg_action_error_to_bucket_snapshot_error(
@@ -1340,6 +1367,7 @@ impl super::StorageCluster {
             bucket,
             key,
         )?;
+        let mut snapshot_retry_phase = super::SnapshotSensitiveRetryPhase::default();
         loop {
             require_valid_route().map_err(ObjectPgActionError::Store)?;
             let reservation = match self.acquire_durable_bucket_write_reservation_with_effect_fence(
@@ -1371,15 +1399,18 @@ impl super::StorageCluster {
                 release_caller_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
             }
-            let applied_commands = match self
-                .drain_pending_object_metadata_commands_for_publisher_collect(
+            let applied_commands = if snapshot_retry_phase.pending_drain_allowed() {
+                match self.drain_pending_object_metadata_commands_for_publisher_collect(
                     publisher, pg_id, bucket,
                 ) {
-                Ok(applied_commands) => applied_commands,
-                Err(error) => {
-                    release_caller_bucket_write_proof!()?;
-                    return Err(error);
+                    Ok(applied_commands) => applied_commands,
+                    Err(error) => {
+                        release_caller_bucket_write_proof!()?;
+                        return Err(error);
+                    }
                 }
+            } else {
+                super::CollectedPendingObjectMetadataCommands::empty_drained()
             };
             if let Err(error) = require_valid_route() {
                 release_caller_bucket_write_proof!()?;
@@ -1435,6 +1466,7 @@ impl super::StorageCluster {
                 release_caller_bucket_write_proof!()?;
                 return Err(error);
             }
+            let mut evaluated_attempt = snapshot_retry_phase.snapshot_evaluated();
             if let Err(error) = require_valid_route() {
                 release_caller_bucket_write_proof!()?;
                 return Err(ObjectPgActionError::Store(error));
@@ -1477,9 +1509,13 @@ impl super::StorageCluster {
                 bucket,
                 &command,
                 Some(effect_fence),
+                &mut evaluated_attempt,
             ) {
                 Ok(super::SnapshotSensitiveInstallOutcome::Installed) => {}
-                Ok(super::SnapshotSensitiveInstallOutcome::ContenderDrained) => {
+                Ok(
+                    super::SnapshotSensitiveInstallOutcome::ReinspectSnapshot
+                    | super::SnapshotSensitiveInstallOutcome::ContenderDrained,
+                ) => {
                     release_caller_bucket_write_proof!()?;
                     continue;
                 }

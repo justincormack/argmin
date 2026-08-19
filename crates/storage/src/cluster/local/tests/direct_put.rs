@@ -895,7 +895,7 @@ fn direct_put_fanout_rejects_live_crossed_reservation_subjects() {
 }
 
 #[test]
-fn direct_put_pending_install_race_reruns_precondition_action() {
+fn direct_put_terminal_install_conflict_reinspects_before_draining_newer_command() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -909,6 +909,7 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
         .pg_topology();
     let bucket = bucket_for_pg(topology, 1, "direct-put-pending-race-");
     let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    let newer_key = key_for_object_pg(topology, &bucket, 2, "newer-");
     set_route_primary(&mut first_map, 1, NodeId::new(1));
     set_route_primary(&mut first_map, 2, NodeId::new(1));
 
@@ -989,6 +990,9 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
     let hook_bucket = bucket.clone();
     let hook_req = winner_req.clone();
     let hook_written_shards = winner_written.written_shards.clone();
+    let hook_newer_key = newer_key;
+    let newer_command = Arc::new(Mutex::new(None));
+    let newer_command_for_hook = Arc::clone(&newer_command);
     let hook_ran_for_closure = Arc::clone(&hook_ran);
     let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
         Arc::new(move || {
@@ -1016,16 +1020,68 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
                     hook_req.bucket_write_reservation.clone(),
                 )
                 .unwrap();
+            drop(pg);
+            hook_cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(primary.node_id(), &command)
+                .unwrap();
+            let newer = MetadataCommandEnvelope::new(
+                hook_cluster.next_object_metadata_command_id(pg_id).unwrap(),
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        hook_bucket.clone(),
+                        hook_newer_key.clone(),
+                        crate::SessionId::try_from("23".repeat(16)).unwrap(),
+                        GenerationId::new(203).unwrap(),
+                        crate::clock::current_time_millis(),
+                    ),
+                ),
+            );
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
             pg.try_insert_pending_metadata_command_slot(
                 primary.node_id().as_u32(),
-                &command,
+                &newer,
                 Some(&hook_bucket),
             )
             .unwrap();
+            *newer_command_for_hook.lock().unwrap() = Some(newer);
         }),
     );
 
+    let snapshot_read_attempts = Arc::new(AtomicUsize::new(0));
+    let snapshot_read_attempts_for_hook = Arc::clone(&snapshot_read_attempts);
+    let map_for_snapshot_hook = Arc::clone(&first_map);
+    let bucket_for_snapshot_hook = bucket.clone();
+    let newer_command_for_snapshot_hook = Arc::clone(&newer_command);
+    let _snapshot_read_hook = first_cluster.test_install_direct_put_snapshot_read_hook(Arc::new(
+        move || {
+            match snapshot_read_attempts_for_hook.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(()),
+                1 => Err(crate::ObjectPgActionError::Store(
+                    crate::StoreError::MetadataCommandContention {
+                        context: "injected direct PUT snapshot read contention",
+                    },
+                )),
+                2 => {
+                    assert_eq!(
+                        pending_metadata_command_for_test(
+                            &map_for_snapshot_hook,
+                            PgId::new(2),
+                            &bucket_for_snapshot_hook,
+                        ),
+                        newer_command_for_snapshot_hook.lock().unwrap().clone(),
+                        "a transient snapshot read failure must not permit the newer command to be drained",
+                    );
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        },
+    ));
+
     let calls_for_action = Arc::clone(&action_calls);
+    let map_for_action = Arc::clone(&first_map);
+    let bucket_for_action = bucket.clone();
+    let newer_command_for_action = Arc::clone(&newer_command);
     let pending_install_backoffs = || {
         observability::metadata_command_backoff_dimension_snapshot()
             .into_iter()
@@ -1043,7 +1099,18 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
             &loser_req,
             &loser_written.written_shards,
             move |snapshot| {
-                calls_for_action.fetch_add(1, Ordering::SeqCst);
+                let call = calls_for_action.fetch_add(1, Ordering::SeqCst);
+                if call == 1 {
+                    assert_eq!(
+                        pending_metadata_command_for_test(
+                            &map_for_action,
+                            PgId::new(2),
+                            &bucket_for_action,
+                        ),
+                        newer_command_for_action.lock().unwrap().clone(),
+                        "snapshot reinspection must precede draining a newer pending command"
+                    );
+                }
                 if snapshot.existing_etag.is_some() {
                     Err("object already exists")
                 } else {
@@ -1063,6 +1130,11 @@ fn direct_put_pending_install_race_reruns_precondition_action() {
         action_calls.load(Ordering::SeqCst),
         2,
         "direct PUT precondition must be rerun after slot contention changes object state"
+    );
+    assert_eq!(
+        snapshot_read_attempts.load(Ordering::SeqCst),
+        3,
+        "snapshot reinspection must remain latched across one transient read failure"
     );
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
 
@@ -1379,6 +1451,7 @@ fn snapshot_sensitive_install_drains_only_the_observed_contender() {
             &bucket,
             &candidate,
             None,
+            &mut crate::cluster::SnapshotSensitiveRetryPhase::default().snapshot_evaluated(),
         )
         .unwrap();
     assert_eq!(
@@ -1409,6 +1482,7 @@ fn snapshot_sensitive_install_recognizes_its_exact_terminal_command() {
     let key = key_for_object_pg(topology, &bucket, 2, "terminal-");
     let contender_key = key_for_object_pg(topology, &bucket, 2, "contender-");
     let candidate_key = key_for_object_pg(topology, &bucket, 2, "candidate-");
+    let newer_key = key_for_object_pg(topology, &bucket, 2, "newer-");
     set_route_primary(&mut map, 1, NodeId::new(1));
     // Put the primary after the deterministic witness in publication order.
     // Terminal replay must not depend on which actor reports the conflict.
@@ -1467,6 +1541,7 @@ fn snapshot_sensitive_install_recognizes_its_exact_terminal_command() {
             &bucket,
             &command,
             None,
+            &mut crate::cluster::SnapshotSensitiveRetryPhase::default().snapshot_evaluated(),
         )
         .unwrap();
 
@@ -1515,6 +1590,17 @@ fn snapshot_sensitive_install_recognizes_its_exact_terminal_command() {
             crate::clock::current_time_millis(),
         )),
     );
+    let newer = MetadataCommandEnvelope::new(
+        cluster.next_object_metadata_command_id(pg_id).unwrap(),
+        MetadataCommandPayload::ReserveObjectGeneration(ReserveObjectGenerationCommand::new(
+            bucket.clone(),
+            newer_key,
+            crate::SessionId::try_from("67".repeat(16)).unwrap(),
+            GenerationId::new(107).unwrap(),
+            crate::clock::current_time_millis(),
+        )),
+    );
+    insert_pending_metadata_command_for_test(&map, pg_id, &bucket, &newer);
     assert_eq!(
         cluster
             .install_snapshot_sensitive_metadata_command_or_drain(
@@ -1525,11 +1611,20 @@ fn snapshot_sensitive_install_recognizes_its_exact_terminal_command() {
                 &bucket,
                 &candidate,
                 None,
+                &mut crate::cluster::SnapshotSensitiveRetryPhase::default().snapshot_evaluated(),
             )
             .unwrap(),
-        crate::cluster::SnapshotSensitiveInstallOutcome::ContenderDrained,
+        crate::cluster::SnapshotSensitiveInstallOutcome::ReinspectSnapshot,
         "a different terminal command at the candidate index must trigger reinspection"
     );
+    assert_eq!(
+        pending_metadata_command_for_test(&map, pg_id, &bucket),
+        Some(newer),
+        "a stale candidate must not drain a newer command before snapshot reinspection"
+    );
+    cluster
+        .drain_pending_object_metadata_commands_for_bucket(pg_id, &bucket)
+        .unwrap();
     assert_clean_metadata_command_stream(&map, &[2]);
 }
 

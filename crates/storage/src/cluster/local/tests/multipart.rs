@@ -1260,7 +1260,7 @@ fn multipart_upload_lookup_fails_closed_while_metadata_pg_is_peering() {
 }
 
 #[test]
-fn multipart_create_pending_install_race_reruns_authorization_action() {
+fn multipart_create_terminal_install_conflict_reinspects_before_draining_newer_command() {
     let _guard = lock_metadata_command_apply_hook_test();
     let tmp = test_util::tempdir();
     let node_ids = [NodeId::new(0), NodeId::new(1), NodeId::new(2)];
@@ -1274,6 +1274,7 @@ fn multipart_create_pending_install_race_reruns_authorization_action() {
         .pg_topology();
     let bucket = bucket_for_pg(topology, 1, "mpu-create-pending-race-");
     let key = key_for_object_pg(topology, &bucket, 2, "object-");
+    let newer_key = key_for_object_pg(topology, &bucket, 2, "newer-");
     set_route_primary(&mut first_map, 1, NodeId::new(1));
     set_route_primary(&mut first_map, 2, NodeId::new(1));
 
@@ -1325,6 +1326,9 @@ fn multipart_create_pending_install_race_reruns_authorization_action() {
     let hook_bucket = bucket.clone();
     let hook_req = winner_req.clone();
     let hook_written_shards = winner_written.written_shards.clone();
+    let hook_newer_key = newer_key;
+    let newer_command = Arc::new(Mutex::new(None));
+    let newer_command_for_hook = Arc::clone(&newer_command);
     let hook_ran_for_closure = Arc::clone(&hook_ran);
     let _hook_guard = first_cluster.test_install_before_metadata_command_pending_install_hook(
         Arc::new(move || {
@@ -1352,55 +1356,90 @@ fn multipart_create_pending_install_race_reruns_authorization_action() {
                     hook_req.bucket_write_reservation.clone(),
                 )
                 .unwrap();
+            drop(pg);
+            hook_cluster
+                .test_apply_metadata_command_to_acting_set_from_origin(primary.node_id(), &command)
+                .unwrap();
+            let newer = MetadataCommandEnvelope::new(
+                hook_cluster.next_object_metadata_command_id(pg_id).unwrap(),
+                MetadataCommandPayload::ReserveObjectGeneration(
+                    ReserveObjectGenerationCommand::new(
+                        hook_bucket.clone(),
+                        hook_newer_key.clone(),
+                        crate::SessionId::try_from("79".repeat(16)).unwrap(),
+                        GenerationId::new(204).unwrap(),
+                        crate::clock::current_time_millis(),
+                    ),
+                ),
+            );
+            let pg = primary.storage_node().get_pg(pg_id.get()).unwrap();
             pg.try_insert_pending_metadata_command_slot(
                 primary.node_id().as_u32(),
-                &command,
+                &newer,
                 Some(&hook_bucket),
             )
             .unwrap();
+            *newer_command_for_hook.lock().unwrap() = Some(newer);
         }),
     );
 
     let upload_id = upload_id_from_label("mpucreatependingrace");
     let calls_for_action = Arc::clone(&action_calls);
+    let map_for_action = Arc::clone(&first_map);
+    let bucket_for_action = bucket.clone();
+    let newer_command_for_action = Arc::clone(&newer_command);
     let result = first_cluster
         .create_multipart_upload(
             &bucket,
             &key,
             crate::BucketSnapshotRequest::default(),
             |_, existing_object| {
-                calls_for_action.fetch_add(1, Ordering::SeqCst);
-                if existing_object.is_some() {
-                    Err("object already exists")
-                } else {
-                    Ok((
-                        (),
-                        crate::CreateMultipartUploadReq {
-                            upload_id: upload_id.clone(),
-                            bucket: bucket.clone(),
-                            key: key.clone(),
-                            tags: None,
-                            metadata_blob: crate::SerializedMetadataBlob::default(),
-                            system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
-                            initiator: crate::OwnerIdentity::from_principal("initiator"),
-                            owner: crate::OwnerIdentity::from_principal("owner"),
-                            acl_grants: crate::AclGrants::default(),
-                            public_read: false,
-                            object_lock: crate::ObjectLockState::default(),
-                            checksum: None,
-                            encryption: crate::ObjectEncryption::None,
-                        },
-                    ))
+                let call = calls_for_action.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    call < 3,
+                    "multipart creation must not retry after the post-drain snapshot evaluation",
+                );
+                if call == 1 {
+                    assert!(existing_object.is_some());
+                    assert_eq!(
+                        pending_metadata_command_for_test(
+                            &map_for_action,
+                            PgId::new(2),
+                            &bucket_for_action,
+                        ),
+                        newer_command_for_action.lock().unwrap().clone(),
+                        "multipart creation must re-evaluate its snapshot while the newer command remains pending",
+                    );
                 }
+                Ok::<_, ()>((
+                    (),
+                    crate::CreateMultipartUploadReq {
+                        upload_id: upload_id.clone(),
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        tags: None,
+                        metadata_blob: crate::SerializedMetadataBlob::default(),
+                        system_metadata_blob: crate::SerializedSystemMetadataBlob::default(),
+                        initiator: crate::OwnerIdentity::from_principal("initiator"),
+                        owner: crate::OwnerIdentity::from_principal("owner"),
+                        acl_grants: crate::AclGrants::default(),
+                        public_read: false,
+                        object_lock: crate::ObjectLockState::default(),
+                        checksum: None,
+                        encryption: crate::ObjectEncryption::None,
+                    },
+                ))
             },
         )
+        .unwrap()
         .unwrap();
-    assert!(matches!(result, Err("object already exists")));
+    assert_eq!(result.value, ());
+    assert_eq!(result.upload_id, upload_id);
     assert!(hook_ran.load(Ordering::SeqCst));
     assert_eq!(
         action_calls.load(Ordering::SeqCst),
-        2,
-        "multipart create authorization must be rerun after slot contention changes object state"
+        3,
+        "multipart creation must evaluate once initially, once before draining the newer command, and once after draining it"
     );
     assert!(pending_metadata_command_for_test(&first_map, PgId::new(2), &bucket).is_none());
 
@@ -1415,10 +1454,9 @@ fn multipart_create_pending_install_race_reruns_authorization_action() {
         let live = stored.as_live().expect("winner object is live");
         assert_eq!(live.generation_id, winner_generation_id);
         assert_eq!(live.size, winner_payload.len() as u64);
-        assert!(matches!(
-            crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id),
-            Err(crate::MetadataError::NoSuchUpload { .. })
-        ));
+        let upload = crate::PgMetadataStore::get_multipart_upload(&*pg, &upload_id).unwrap();
+        assert_eq!(upload.bucket, bucket);
+        assert_eq!(upload.key, key);
     }
 }
 

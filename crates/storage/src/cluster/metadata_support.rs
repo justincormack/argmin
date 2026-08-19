@@ -216,11 +216,47 @@ fn lock_metadata_command_pg_until(
     lock.lock_until(deadline)
 }
 
-#[must_use = "ContenderDrained must restart from a fresh snapshot"]
+#[must_use = "non-installed outcomes must restart from a fresh snapshot"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotSensitiveInstallOutcome {
     Installed,
+    ReinspectSnapshot,
     ContenderDrained,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotSensitiveCandidateTerminalState {
+    NotTerminal,
+    Exact,
+    Different,
+}
+
+#[derive(Debug, Default)]
+enum SnapshotSensitiveRetryPhase {
+    #[default]
+    PendingDrainAllowed,
+    ReinspectBeforePendingDrain,
+}
+
+impl SnapshotSensitiveRetryPhase {
+    fn pending_drain_allowed(&self) -> bool {
+        matches!(self, Self::PendingDrainAllowed)
+    }
+
+    fn snapshot_evaluated(&mut self) -> SnapshotSensitiveEvaluatedAttempt<'_> {
+        *self = Self::PendingDrainAllowed;
+        SnapshotSensitiveEvaluatedAttempt { retry_phase: self }
+    }
+}
+
+struct SnapshotSensitiveEvaluatedAttempt<'a> {
+    retry_phase: &'a mut SnapshotSensitiveRetryPhase,
+}
+
+impl SnapshotSensitiveEvaluatedAttempt<'_> {
+    fn require_snapshot_reinspection(&mut self) {
+        *self.retry_phase = SnapshotSensitiveRetryPhase::ReinspectBeforePendingDrain;
+    }
 }
 
 #[must_use = "allocator contention outcomes must restart or continue deliberately"]
