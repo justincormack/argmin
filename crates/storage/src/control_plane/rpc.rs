@@ -1497,14 +1497,6 @@ impl UnixControlPlaneClient {
         self.endpoints.len()
     }
 
-    fn send_request(
-        &self,
-        kind: ControlPlaneRpcKind,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, ControlPlaneError> {
-        self.send_request_with_read_timeout(kind, payload, CONTROL_PLANE_RPC_IO_TIMEOUT)
-    }
-
     fn send_request_with_read_timeout(
         &self,
         kind: ControlPlaneRpcKind,
@@ -1520,8 +1512,16 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         read_timeout: Duration,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.send_mutating_request_until(kind, payload, Instant::now() + read_timeout)
+    }
+
+    fn send_mutating_request_until(
+        &self,
+        kind: ControlPlaneRpcKind,
+        payload: &[u8],
+        deadline: Instant,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
         debug_assert!(kind.mutating_admin_operation().is_some());
-        let deadline = Instant::now() + read_timeout;
         let mut last_routing_error = None;
         let mut endpoint_pass = self.endpoint_pass();
         while !endpoint_pass.is_exhausted() {
@@ -1568,6 +1568,11 @@ impl UnixControlPlaneClient {
         payload: &[u8],
         deadline: Instant,
     ) -> Result<Vec<u8>, ControlPlaneError> {
+        if kind.mutating_admin_operation().is_some() {
+            return Err(ControlPlaneError::rpc_protocol(
+                "mutating control-plane RPC requires publication-aware exchange".to_owned(),
+            ));
+        }
         let mut last_routing_error = None;
         let mut endpoint_pass = self.endpoint_pass();
         while !endpoint_pass.is_exhausted() {
@@ -2029,14 +2034,20 @@ impl UnixControlPlaneClient {
     ) -> Result<ClusterEpoch, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_acting_set_request(&mut payload, pg_id, &acting_set)?;
-        let payload = self.send_request(ControlPlaneRpcKind::SetPgActingSet, &payload)?;
-        let mut reader = PayloadReader::new(&payload);
-        let raw_cluster_epoch = reader.read_u64()?;
-        let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
-            ControlPlaneError::rpc_protocol(format!("invalid cluster epoch {raw_cluster_epoch}"))
-        })?;
-        reader.finish()?;
-        Ok(cluster_epoch)
+        let kind = ControlPlaneRpcKind::SetPgActingSet;
+        let payload =
+            self.send_mutating_request_with_read_timeout(kind, &payload, CONTROL_PLANE_RPC_IO_TIMEOUT)?;
+        decode_admin_mutation_success(kind, || {
+            let mut reader = PayloadReader::new(&payload);
+            let raw_cluster_epoch = reader.read_u64()?;
+            let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
+                ControlPlaneError::rpc_protocol(format!(
+                    "invalid cluster epoch {raw_cluster_epoch}"
+                ))
+            })?;
+            reader.finish()?;
+            Ok(cluster_epoch)
+        })
     }
 
     pub fn set_pg_acting_set_checked(
@@ -2097,19 +2108,18 @@ impl UnixControlPlaneClient {
     ) -> Result<FencedPgMetadataTransferRuntimeMap, ControlPlaneError> {
         let mut payload = Vec::new();
         write_pg_id_request(&mut payload, pg_id);
-        let payload = self.send_request_until(
-            ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
-            &payload,
-            deadline,
-        )?;
-        let mut reader = PayloadReader::new(&payload);
-        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
-        let source_primary_lease_deadline_ms = reader.read_option_u64()?;
-        reader.finish()?;
-        Ok(FencedPgMetadataTransferRuntimeMap::new(
-            runtime_map,
-            source_primary_lease_deadline_ms,
-        ))
+        let kind = ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap;
+        let payload = self.send_mutating_request_until(kind, &payload, deadline)?;
+        decode_admin_mutation_success(kind, || {
+            let mut reader = PayloadReader::new(&payload);
+            let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+            let source_primary_lease_deadline_ms = reader.read_option_u64()?;
+            reader.finish()?;
+            Ok(FencedPgMetadataTransferRuntimeMap::new(
+                runtime_map,
+                source_primary_lease_deadline_ms,
+            ))
+        })
     }
 
     pub(crate) fn fence_pg_for_metadata_transfer_runtime_map_with_source_lease_checked(
@@ -2137,17 +2147,20 @@ impl UnixControlPlaneClient {
             transfer,
             expected_destination_epoch,
         )?;
-        let payload = self.send_request(
-            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer,
-            &payload,
-        )?;
-        let mut reader = PayloadReader::new(&payload);
-        let raw_cluster_epoch = reader.read_u64()?;
-        let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
-            ControlPlaneError::rpc_protocol(format!("invalid cluster epoch {raw_cluster_epoch}"))
-        })?;
-        reader.finish()?;
-        Ok(cluster_epoch)
+        let kind = ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer;
+        let payload =
+            self.send_mutating_request_with_read_timeout(kind, &payload, CONTROL_PLANE_RPC_IO_TIMEOUT)?;
+        decode_admin_mutation_success(kind, || {
+            let mut reader = PayloadReader::new(&payload);
+            let raw_cluster_epoch = reader.read_u64()?;
+            let cluster_epoch = ClusterEpoch::new(raw_cluster_epoch).ok_or_else(|| {
+                ControlPlaneError::rpc_protocol(format!(
+                    "invalid cluster epoch {raw_cluster_epoch}"
+                ))
+            })?;
+            reader.finish()?;
+            Ok(cluster_epoch)
+        })
     }
 
     pub(crate) fn set_pg_acting_set_with_metadata_transfer_checked(
@@ -2192,14 +2205,15 @@ impl UnixControlPlaneClient {
             transfer,
             expected_destination_epoch,
         )?;
-        let payload = self.send_request(
-            ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap,
-            &payload,
-        )?;
-        let mut reader = PayloadReader::new(&payload);
-        let runtime_map = read_runtime_map_snapshot(&mut reader)?;
-        reader.finish()?;
-        Ok(runtime_map)
+        let kind = ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap;
+        let payload =
+            self.send_mutating_request_with_read_timeout(kind, &payload, CONTROL_PLANE_RPC_IO_TIMEOUT)?;
+        decode_admin_mutation_success(kind, || {
+            let mut reader = PayloadReader::new(&payload);
+            let runtime_map = read_runtime_map_snapshot(&mut reader)?;
+            reader.finish()?;
+            Ok(runtime_map)
+        })
     }
 
     pub fn pg_runtime_map_snapshot(
@@ -5872,6 +5886,84 @@ enum ControlPlaneRpcKind {
     ServingPgRuntimeMapSnapshot = 17,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRpcFrameFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for ControlPlaneRpcFrameFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("truncated control-plane RPC frame marker"),
+            Self::UnknownMagic => formatter.write_str("invalid control-plane RPC magic"),
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported control-plane RPC version {version}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneRpcFrameFormatError {}
+
+#[cfg(test)]
+fn validate_control_plane_rpc_frame_marker(
+    marker: &[u8],
+) -> Result<(), ControlPlaneRpcFrameFormatError> {
+    let magic = marker
+        .get(..CONTROL_PLANE_RPC_MAGIC.len())
+        .ok_or(ControlPlaneRpcFrameFormatError::Truncated)?;
+    validate_control_plane_rpc_frame_magic(magic)?;
+    let version_start = CONTROL_PLANE_RPC_MAGIC.len();
+    let version_end = version_start + std::mem::size_of::<u16>();
+    validate_control_plane_rpc_frame_version(
+        marker
+            .get(version_start..version_end)
+            .ok_or(ControlPlaneRpcFrameFormatError::Truncated)?,
+    )
+}
+
+fn validate_control_plane_rpc_frame_magic(
+    magic: &[u8],
+) -> Result<(), ControlPlaneRpcFrameFormatError> {
+    if magic != CONTROL_PLANE_RPC_MAGIC {
+        return Err(ControlPlaneRpcFrameFormatError::UnknownMagic);
+    }
+    Ok(())
+}
+
+fn validate_control_plane_rpc_frame_version(
+    version: &[u8],
+) -> Result<(), ControlPlaneRpcFrameFormatError> {
+    let version = u16::from_be_bytes(
+        version
+            .try_into()
+            .map_err(|_| ControlPlaneRpcFrameFormatError::Truncated)?,
+    );
+    if version != CONTROL_PLANE_RPC_VERSION {
+        return Err(ControlPlaneRpcFrameFormatError::UnsupportedVersion(version));
+    }
+    Ok(())
+}
+
+fn control_plane_rpc_frame_format_error(
+    error: ControlPlaneRpcFrameFormatError,
+) -> ControlPlaneError {
+    match error {
+        ControlPlaneRpcFrameFormatError::Truncated => {
+            ControlPlaneError::rpc_protocol_truncated_frame_marker(error.to_string())
+        }
+        ControlPlaneRpcFrameFormatError::UnknownMagic
+        | ControlPlaneRpcFrameFormatError::UnsupportedVersion(_) => {
+            ControlPlaneError::rpc_protocol(error.to_string())
+        }
+    }
+}
+
 impl ControlPlaneRpcKind {
     #[cfg(test)]
     const ALL: [Self; 16] = [
@@ -6878,6 +6970,14 @@ fn encode_control_plane_rpc_frame(
     kind: ControlPlaneRpcKind,
     payload: &[u8],
 ) -> Result<Vec<u8>, ControlPlaneError> {
+    encode_control_plane_rpc_frame_with_version(kind, payload, CONTROL_PLANE_RPC_VERSION)
+}
+
+fn encode_control_plane_rpc_frame_with_version(
+    kind: ControlPlaneRpcKind,
+    payload: &[u8],
+    version: u16,
+) -> Result<Vec<u8>, ControlPlaneError> {
     let payload_len = u32::try_from(payload.len()).map_err(|_| {
         ControlPlaneError::rpc_protocol(format!(
             "control-plane RPC payload too large: {}",
@@ -6886,17 +6986,12 @@ fn encode_control_plane_rpc_frame(
     })?;
     let mut frame = Vec::with_capacity(control_plane_rpc_frame_overhead() + payload.len());
     frame.extend_from_slice(CONTROL_PLANE_RPC_MAGIC);
-    write_u16(&mut frame, CONTROL_PLANE_RPC_VERSION);
+    write_u16(&mut frame, version);
     write_u16(&mut frame, kind as u16);
     write_u32(&mut frame, payload_len);
     write_u64(
         &mut frame,
-        control_plane_rpc_frame_checksum(
-            CONTROL_PLANE_RPC_VERSION,
-            kind as u16,
-            payload_len,
-            payload,
-        ),
+        control_plane_rpc_frame_checksum(version, kind as u16, payload_len, payload),
     );
     frame.extend_from_slice(payload);
     Ok(frame)
@@ -6916,26 +7011,34 @@ fn read_control_plane_rpc_frame_with_reservation<R>(
     stream: &mut impl std::io::Read,
     reserve: impl FnOnce(usize) -> Result<R, ControlPlaneError>,
 ) -> Result<((ControlPlaneRpcKind, Vec<u8>), R), ControlPlaneError> {
-    let mut magic = vec![0; CONTROL_PLANE_RPC_MAGIC.len()];
-    stream
-        .read_exact(&mut magic)
-        .map_err(|source| ControlPlaneError::io("read control-plane RPC magic", source))?;
-    if magic != CONTROL_PLANE_RPC_MAGIC {
-        return Err(ControlPlaneError::rpc_protocol(
-            "invalid control-plane RPC magic".to_owned(),
-        ));
-    }
-    let mut header = [0; 16];
+    let read_marker_part = |stream: &mut dyn std::io::Read,
+                            bytes: &mut [u8],
+                            context: &'static str|
+     -> Result<(), ControlPlaneError> {
+        stream.read_exact(bytes).map_err(|source| {
+            if source.kind() == ErrorKind::UnexpectedEof {
+                control_plane_rpc_frame_format_error(ControlPlaneRpcFrameFormatError::Truncated)
+            } else {
+                ControlPlaneError::io(context, source)
+            }
+        })
+    };
+    let mut magic = [0; CONTROL_PLANE_RPC_MAGIC.len()];
+    read_marker_part(stream, &mut magic, "read control-plane RPC magic")?;
+    validate_control_plane_rpc_frame_magic(&magic).map_err(control_plane_rpc_frame_format_error)?;
+    let mut version = [0; std::mem::size_of::<u16>()];
+    read_marker_part(
+        stream,
+        &mut version,
+        "read control-plane RPC frame version",
+    )?;
+    validate_control_plane_rpc_frame_version(&version)
+        .map_err(control_plane_rpc_frame_format_error)?;
+    let mut header = [0; 14];
     stream
         .read_exact(&mut header)
         .map_err(|source| ControlPlaneError::io("read control-plane RPC header", source))?;
     let mut reader = PayloadReader::new(&header);
-    let version = reader.read_u16()?;
-    if version != CONTROL_PLANE_RPC_VERSION {
-        return Err(ControlPlaneError::rpc_protocol(format!(
-            "unsupported control-plane RPC version {version}"
-        )));
-    }
     let kind = ControlPlaneRpcKind::from_u16(reader.read_u16()?)?;
     let raw_kind = kind as u16;
     let payload_len_u32 = reader.read_u32()?;
@@ -6956,7 +7059,12 @@ fn read_control_plane_rpc_frame_with_reservation<R>(
     stream
         .read_exact(&mut payload)
         .map_err(|source| ControlPlaneError::io("read control-plane RPC payload", source))?;
-    if control_plane_rpc_frame_checksum(version, raw_kind, payload_len_u32, &payload)
+    if control_plane_rpc_frame_checksum(
+        CONTROL_PLANE_RPC_VERSION,
+        raw_kind,
+        payload_len_u32,
+        &payload,
+    )
         != expected_checksum
     {
         return Err(ControlPlaneError::rpc_protocol(

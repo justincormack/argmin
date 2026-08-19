@@ -146,33 +146,62 @@ impl fmt::Display for ControlPlaneIoDiagnostic {
 ///
 /// The wire codec and its owner-local tests may inspect the retained text. Public formatting is
 /// deliberately redacted so callers cannot turn implementation messages back into policy.
-pub struct ControlPlaneRpcDiagnostic(Box<str>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ControlPlaneRpcDiagnosticKind {
+    Generic,
+    TruncatedFrameMarker,
+}
+
+pub struct ControlPlaneRpcDiagnostic {
+    kind: ControlPlaneRpcDiagnosticKind,
+    detail: Box<str>,
+}
 
 impl ControlPlaneRpcDiagnostic {
     fn new(detail: impl Into<Box<str>>) -> Self {
-        Self(detail.into())
+        Self {
+            kind: ControlPlaneRpcDiagnosticKind::Generic,
+            detail: detail.into(),
+        }
+    }
+
+    fn truncated_frame_marker(detail: impl Into<Box<str>>) -> Self {
+        Self {
+            kind: ControlPlaneRpcDiagnosticKind::TruncatedFrameMarker,
+            detail: detail.into(),
+        }
     }
 
     pub(crate) fn as_str(&self) -> &str {
-        &self.0
+        &self.detail
+    }
+
+    pub(crate) fn is_truncated_frame_marker(&self) -> bool {
+        self.kind == ControlPlaneRpcDiagnosticKind::TruncatedFrameMarker
     }
 
     #[cfg(test)]
     pub(crate) fn contains(&self, pattern: &str) -> bool {
-        self.0.contains(pattern)
+        self.detail.contains(pattern)
     }
 }
 
 impl fmt::Debug for ControlPlaneRpcDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(_retained_detail) = self;
+        let Self {
+            kind: _retained_kind,
+            detail: _retained_detail,
+        } = self;
         formatter.write_str("ControlPlaneRpcDiagnostic(<redacted>)")
     }
 }
 
 impl fmt::Display for ControlPlaneRpcDiagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let Self(_retained_detail) = self;
+        let Self {
+            kind: _retained_kind,
+            detail: _retained_detail,
+        } = self;
         formatter.write_str("control-plane RPC diagnostic redacted")
     }
 }
@@ -851,6 +880,15 @@ impl ControlPlaneError {
     }
 
     #[must_use]
+    pub(crate) fn rpc_protocol_truncated_frame_marker(
+        diagnostic: impl Into<Box<str>>,
+    ) -> Self {
+        Self::RpcProtocol {
+            diagnostic: ControlPlaneRpcDiagnostic::truncated_frame_marker(diagnostic),
+        }
+    }
+
+    #[must_use]
     pub(crate) fn rpc_remote(diagnostic: impl Into<Box<str>>) -> Self {
         Self::RpcRemote {
             diagnostic: ControlPlaneRpcDiagnostic::new(diagnostic),
@@ -956,6 +994,12 @@ impl ControlPlaneError {
 
     #[must_use]
     pub fn is_retryable_control_plane_rpc_transport_error(&self) -> bool {
+        if matches!(
+            self,
+            Self::RpcProtocol { diagnostic } if diagnostic.is_truncated_frame_marker()
+        ) {
+            return true;
+        }
         let Self::Io { diagnostic } = self else {
             return false;
         };

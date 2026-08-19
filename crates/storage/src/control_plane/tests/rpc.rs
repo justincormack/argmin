@@ -6375,6 +6375,117 @@ fn unix_control_plane_client_rejects_successful_confirmation_omitting_target_pg(
     assert!(snapshot.pg(pg_id).is_none());
 }
 
+#[derive(Clone, Copy, Debug)]
+enum AppliedPlainMutationResponseFault {
+    InvalidMagic,
+    UnsupportedVersion,
+    BadChecksum,
+    WrongOuterKind,
+    InvalidSuccessPayload,
+}
+
+#[test]
+fn plain_checked_mutation_confirms_every_invalid_post_publication_response() {
+    for fault in [
+        AppliedPlainMutationResponseFault::InvalidMagic,
+        AppliedPlainMutationResponseFault::UnsupportedVersion,
+        AppliedPlainMutationResponseFault::BadChecksum,
+        AppliedPlainMutationResponseFault::WrongOuterKind,
+        AppliedPlainMutationResponseFault::InvalidSuccessPayload,
+    ] {
+        let tmp = test_util::tempdir();
+        let socket_path = tmp.path().join("control-plane.sock");
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        for node_id in [1, 2] {
+            authority
+                .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+                .unwrap();
+            assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+        }
+        authority
+            .set_pg_acting_set(PgId::new(7), vec![NodeId::new(1)])
+            .unwrap();
+        let previous_epoch = authority.snapshot().cluster_epoch();
+        let expected_epoch = ClusterEpoch::new(previous_epoch.get() + 1).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 1_999)
+                .unwrap();
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::SetPgActingSet);
+            let response = build_control_plane_unix_response(&mut authority, request, 2_000)
+                .expect("acting-set update should apply before the invalid response");
+            assert_eq!(authority.snapshot().cluster_epoch(), expected_epoch);
+            let mut frame = match fault {
+                AppliedPlainMutationResponseFault::UnsupportedVersion => {
+                    encode_control_plane_rpc_frame_with_version(
+                        response.kind,
+                        &response.payload,
+                        CONTROL_PLANE_RPC_VERSION - 1,
+                    )
+                    .unwrap()
+                }
+                AppliedPlainMutationResponseFault::WrongOuterKind => {
+                    encode_control_plane_rpc_frame(
+                        ControlPlaneRpcKind::TriggerRaftElection,
+                        &response.payload,
+                    )
+                    .unwrap()
+                }
+                AppliedPlainMutationResponseFault::InvalidSuccessPayload => {
+                    let payload = encode_control_plane_rpc_response(Ok(vec![0xff])).unwrap();
+                    encode_control_plane_rpc_frame(response.kind, &payload).unwrap()
+                }
+                AppliedPlainMutationResponseFault::InvalidMagic
+                | AppliedPlainMutationResponseFault::BadChecksum => {
+                    encode_control_plane_rpc_frame(response.kind, &response.payload).unwrap()
+                }
+            };
+            match fault {
+                AppliedPlainMutationResponseFault::InvalidMagic => frame[0] ^= 1,
+                AppliedPlainMutationResponseFault::BadChecksum => {
+                    let checksum_offset = CONTROL_PLANE_RPC_MAGIC.len()
+                        + std::mem::size_of::<u16>()
+                        + std::mem::size_of::<u16>()
+                        + std::mem::size_of::<u32>();
+                    frame[checksum_offset] ^= 1;
+                }
+                AppliedPlainMutationResponseFault::UnsupportedVersion
+                | AppliedPlainMutationResponseFault::WrongOuterKind
+                | AppliedPlainMutationResponseFault::InvalidSuccessPayload => {}
+            }
+            stream.write_all(&frame).unwrap();
+
+            let (mut stream, _addr) = listener.accept().unwrap();
+            let request = read_control_plane_unix_request(&mut stream).unwrap();
+            assert_eq!(request.kind, ControlPlaneRpcKind::PgRuntimeMapSnapshot);
+            respond_control_plane_unix_request(&mut authority, &mut stream, request, 2_001)
+                .unwrap();
+            authority.snapshot().clone()
+        });
+
+        let client = UnixControlPlaneClient::new(&socket_path);
+        let cluster_epoch = client
+            .set_pg_acting_set_checked(PgId::new(7), vec![NodeId::new(1), NodeId::new(2)])
+            .unwrap_or_else(|error| panic!("{fault:?}: {error}"));
+
+        let snapshot = server.join().unwrap();
+        assert_eq!(cluster_epoch, expected_epoch, "{fault:?}");
+        assert_eq!(snapshot.cluster_epoch(), expected_epoch, "{fault:?}");
+        assert_eq!(
+            snapshot.pg(PgId::new(7)).unwrap().acting_set(),
+            &[NodeId::new(1), NodeId::new(2)],
+            "{fault:?}"
+        );
+    }
+}
+
 #[test]
 fn unix_control_plane_client_uses_check_applied_timeout_for_pg_acting_set_observation() {
     let tmp = test_util::tempdir();
@@ -8057,18 +8168,55 @@ fn control_plane_rpc_rejects_corrupted_payload_checksum() {
 #[test]
 fn control_plane_rpc_rejects_previous_and_future_version_fixtures() {
     for version in [CONTROL_PLANE_RPC_VERSION - 1, CONTROL_PLANE_RPC_VERSION + 1] {
-        let (mut writer, mut reader) = UnixStream::pair().unwrap();
-        writer.write_all(CONTROL_PLANE_RPC_MAGIC).unwrap();
-        write_u16_to_stream(&mut writer, version);
-        writer.write_all(&[0; 14]).unwrap();
-
-        let error = read_control_plane_unix_request(&mut reader).unwrap_err();
+        let frame = encode_control_plane_rpc_frame_with_version(
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            &[],
+            version,
+        )
+        .unwrap();
+        let reservation_calls = Cell::new(0);
+        let error =
+            read_control_plane_rpc_frame_with_reservation(&mut std::io::Cursor::new(frame), |_| {
+                reservation_calls.set(reservation_calls.get() + 1);
+                Ok(())
+            })
+            .unwrap_err();
 
         assert!(matches!(
             error,
             ControlPlaneError::RpcProtocol { diagnostic: message }
                 if message.as_str()
                     == format!("unsupported control-plane RPC version {version}")
+        ));
+        assert_eq!(reservation_calls.get(), 0);
+    }
+}
+
+#[test]
+fn control_plane_rpc_reader_preserves_typed_marker_precedence() {
+    let mut unknown_magic = CONTROL_PLANE_RPC_MAGIC.to_vec();
+    unknown_magic[0] ^= 1;
+    let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(unknown_magic)).unwrap_err();
+    assert!(!error.is_retryable_control_plane_rpc_transport_error());
+    assert!(!error.is_maybe_applied_control_plane_rpc_response_loss());
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "invalid control-plane RPC magic"
+    ));
+
+    for truncated in [
+        Vec::new(),
+        CONTROL_PLANE_RPC_MAGIC[..CONTROL_PLANE_RPC_MAGIC.len() - 1].to_vec(),
+        CONTROL_PLANE_RPC_MAGIC.to_vec(),
+    ] {
+        let error = read_control_plane_rpc_frame(&mut std::io::Cursor::new(truncated)).unwrap_err();
+        assert!(error.is_retryable_control_plane_rpc_transport_error());
+        assert!(!error.is_maybe_applied_control_plane_rpc_response_loss());
+        assert!(matches!(
+            error,
+            ControlPlaneError::RpcProtocol { diagnostic }
+                if diagnostic.as_str() == "truncated control-plane RPC frame marker"
         ));
     }
 }

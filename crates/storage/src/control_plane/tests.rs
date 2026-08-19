@@ -236,6 +236,102 @@ fn control_plane_rpc_v14_frame_encoding_is_exact() {
 }
 
 #[test]
+fn control_plane_rpc_frame_marker_failures_are_typed() {
+    for truncated in [
+        &[][..],
+        &CONTROL_PLANE_RPC_MAGIC[..CONTROL_PLANE_RPC_MAGIC.len() - 1],
+        CONTROL_PLANE_RPC_MAGIC,
+    ] {
+        assert_eq!(
+            validate_control_plane_rpc_frame_marker(truncated),
+            Err(ControlPlaneRpcFrameFormatError::Truncated)
+        );
+    }
+
+    let mut unknown_magic = Vec::from(CONTROL_PLANE_RPC_MAGIC);
+    unknown_magic[0] ^= 1;
+    unknown_magic.extend_from_slice(&CONTROL_PLANE_RPC_VERSION.to_be_bytes());
+    assert_eq!(
+        validate_control_plane_rpc_frame_marker(&unknown_magic),
+        Err(ControlPlaneRpcFrameFormatError::UnknownMagic)
+    );
+
+    for version in [CONTROL_PLANE_RPC_VERSION - 1, CONTROL_PLANE_RPC_VERSION + 1] {
+        let mut unsupported = Vec::from(CONTROL_PLANE_RPC_MAGIC);
+        unsupported.extend_from_slice(&version.to_be_bytes());
+        assert_eq!(
+            validate_control_plane_rpc_frame_marker(&unsupported),
+            Err(ControlPlaneRpcFrameFormatError::UnsupportedVersion(version))
+        );
+    }
+}
+
+#[test]
+fn control_plane_rpc_server_rejects_other_versions_before_admission_or_dispatch() {
+    let directory = test_util::tempdir();
+    let socket_path = directory.path().join("control-plane.sock");
+    let listener = ControlPlaneRpcServerListener::unix(
+        UnixListener::bind(&socket_path).unwrap(),
+        1,
+        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    let confirmation_calls = Arc::new(AtomicUsize::new(0));
+    let confirmation_calls_for_policy = Arc::clone(&confirmation_calls);
+    let policy = ControlPlaneRpcServerPolicy::new(
+        ControlPlaneRpcServerRole::Ordinary,
+        1,
+        CONTROL_PLANE_RPC_MAX_FRAME_BYTES,
+    )
+    .unwrap()
+    .with_authority_confirmation(Arc::new(move || {
+        confirmation_calls_for_policy.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }));
+    let authority = Arc::new(Mutex::new(
+        SingleAuthorityControlPlane::open(FileControlPlaneStore::new(
+            directory.path().join("control.state"),
+        ))
+        .unwrap(),
+    ));
+    authority
+        .lock()
+        .unwrap()
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    let before = authority.lock().unwrap().snapshot().clone();
+    let mut payload = Vec::new();
+    write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+
+    for version in [CONTROL_PLANE_RPC_VERSION - 1, CONTROL_PLANE_RPC_VERSION + 1] {
+        let frame = encode_control_plane_rpc_frame_with_version(
+            ControlPlaneRpcKind::SetPgActingSet,
+            &payload,
+            version,
+        )
+        .unwrap();
+        let socket_path = socket_path.clone();
+        let client = std::thread::spawn(move || {
+            let mut stream = UnixStream::connect(socket_path).unwrap();
+            stream.write_all(&frame).unwrap();
+        });
+
+        listener
+            .accept_one(
+                &|| ControlPlaneRpcServerAuthority::Shared(Arc::clone(&authority)),
+                &policy,
+            )
+            .unwrap();
+        client.join().unwrap();
+        wait_for_control_plane_server_workers_to_finish(&policy);
+
+        assert_eq!(confirmation_calls.load(Ordering::Acquire), 0);
+        assert_eq!(authority.lock().unwrap().snapshot(), &before);
+    }
+}
+
+#[test]
 fn control_plane_rpc_server_response_errors_use_bounded_categories() {
     let classify = |kind| {
         control_plane_rpc_response_write_error_kind(&ControlPlaneError::io(
@@ -1015,7 +1111,11 @@ fn control_plane_tls_endpoint_does_not_fail_over_after_request_publication() {
         )
         .unwrap_err();
 
-    assert!(matches!(error, ControlPlaneError::Io { .. }));
+    assert!(matches!(
+        error,
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "truncated control-plane RPC frame marker"
+    ));
     assert_eq!(ambiguous_server.join().unwrap(), CONTROL_PLANE_RPC_MAGIC[0]);
     unvisited_listener.set_nonblocking(true).unwrap();
     assert!(
@@ -1075,8 +1175,8 @@ fn configured_control_plane_client_fails_over_only_before_request_starts() {
 
     assert!(matches!(
         error,
-        ControlPlaneError::Io { diagnostic: source }
-            if source.kind() == ErrorKind::UnexpectedEof
+        ControlPlaneError::RpcProtocol { diagnostic }
+            if diagnostic.as_str() == "truncated control-plane RPC frame marker"
     ));
     ambiguous_server.join().unwrap();
     unvisited_listener.set_nonblocking(true).unwrap();
