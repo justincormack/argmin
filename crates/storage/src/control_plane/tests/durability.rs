@@ -4,6 +4,83 @@
 use super::*;
 
 #[test]
+fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_requires_version_bump()
+{
+    const EMPTY_STATE_V28: &str = concat!(
+        "version=28\n",
+        "authority_incarnation=1\n",
+        "cluster_epoch=1\n",
+        "initial_topology=-\n",
+        "max_committed_timestamp_ms=-\n",
+        "lease_grant_horizon=-\n",
+    );
+    const SNAPSHOT_SEED: u64 = 0xf8f1_78f8_a5db_b7ba;
+    const FIRST_COMMAND_V15: &[u8] = &[
+        0x41, 0x52, 0x47, 0x43, 0x50, 0x43, 0x4d, 0x44, 0x00, 0x0f, 0x00, 0x02, 0x00, 0x00, 0x00,
+        0x07, 0x02, 0x5d, 0xf8, 0xc2, 0xf9, 0x75, 0x37, 0x8d, 0x2c,
+    ];
+    const FIRST_CHAIN_DIGEST: u64 = 0x1096_0ae6_13f1_ca37;
+    const SECOND_COMMAND_V15: &[u8] = &[
+        0x41, 0x52, 0x47, 0x43, 0x50, 0x43, 0x4d, 0x44, 0x00, 0x0f, 0x00, 0x03, 0x00, 0x00, 0x00,
+        0x09, 0x03, 0x6d, 0x6f, 0x57, 0x14, 0x95, 0x82, 0x61, 0xae,
+    ];
+    const SECOND_CHAIN_DIGEST: u64 = 0xbc55_3777_1bb4_1d01;
+    const COMMAND_RECORD_V2: &[u8] = &[
+        0x41, 0x52, 0x47, 0x43, 0x50, 0x53, 0x4a, 0x52, 0x00, 0x02, 0x00, 0x01, 0x02, 0x03, 0x04,
+        0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13,
+        0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0xf8, 0xf1, 0x78,
+        0xf8, 0xa5, 0xdb, 0xb7, 0xba, 0x10, 0x96, 0x0a, 0xe6, 0x13, 0xf1, 0xca, 0x37, 0x02, 0x00,
+        0x00, 0x00, 0x19, 0x41, 0x52, 0x47, 0x43, 0x50, 0x43, 0x4d, 0x44, 0x00, 0x0f, 0x00, 0x02,
+        0x00, 0x00, 0x00, 0x07, 0x02, 0x5d, 0xf8, 0xc2, 0xf9, 0x75, 0x37, 0x8d, 0x2c, 0x05, 0x39,
+        0x42, 0x43, 0x05, 0x5b, 0x53, 0x20,
+    ];
+
+    let snapshot = ClusterControlSnapshot::empty();
+    assert_eq!(format_snapshot(&snapshot), EMPTY_STATE_V28);
+    assert_eq!(single_authority_snapshot_digest(&snapshot), SNAPSHOT_SEED);
+
+    let first_command = ControlPlaneCommand::SetNodeMembership {
+        node_id: NodeId::new(7),
+        membership: NodeMembershipState::Active,
+    };
+    let encoded_first = encode_control_plane_command(&first_command).unwrap();
+    assert_eq!(encoded_first, FIRST_COMMAND_V15);
+    assert_eq!(
+        single_authority_command_chain_digest(SNAPSHOT_SEED, FIRST_COMMAND_V15),
+        FIRST_CHAIN_DIGEST
+    );
+
+    let second_command = ControlPlaneCommand::MarkNodeAvailability {
+        node_id: NodeId::new(9),
+        availability: NodeAvailabilityState::Unavailable,
+    };
+    let encoded_second = encode_control_plane_command(&second_command).unwrap();
+    assert_eq!(encoded_second, SECOND_COMMAND_V15);
+    assert_eq!(
+        single_authority_command_chain_digest(FIRST_CHAIN_DIGEST, SECOND_COMMAND_V15),
+        SECOND_CHAIN_DIGEST
+    );
+
+    let binding = ControlPlaneAuthorityClockCheckpointBinding([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ]);
+    let record = SingleAuthorityJournalRecord {
+        binding,
+        previous_chain_digest: SNAPSHOT_SEED,
+        resulting_chain_digest: FIRST_CHAIN_DIGEST,
+        command: Some(first_command),
+    };
+    assert_eq!(record.encode().unwrap(), COMMAND_RECORD_V2);
+    let decoded = SingleAuthorityJournalRecord::decode(COMMAND_RECORD_V2).unwrap();
+    assert_eq!(decoded.binding, binding);
+    assert_eq!(decoded.previous_chain_digest, SNAPSHOT_SEED);
+    assert_eq!(decoded.resulting_chain_digest, FIRST_CHAIN_DIGEST);
+    assert_eq!(decoded.command, record.command);
+}
+
+#[test]
 fn file_backed_authority_restarts_with_never_reused_epoch_and_incarnation() {
     let tmp = test_util::tempdir();
     let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
