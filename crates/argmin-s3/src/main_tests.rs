@@ -26,6 +26,7 @@ mod tests {
             "validte",
             "validate-cluster-config",
             "validate-cluster-material",
+            "initialize-cluster-state",
         ] {
             let args = [OsString::from("argmin-s3"), OsString::from(command)];
             assert_eq!(
@@ -34,6 +35,18 @@ mod tests {
                 "command {command} must not fall through to server startup"
             );
         }
+    }
+
+    #[test]
+    fn initialize_rejects_positional_configuration_selection() {
+        let args = [
+            OsString::from("argmin-s3"),
+            OsString::from("initialize"),
+            OsString::from("/etc/argmin/cluster.toml"),
+            OsString::from("control-1"),
+        ];
+
+        assert_eq!(run_control_plane_admin_command(args.into_iter()), Some(2));
     }
 
     fn test_raft_peer_credentials(
@@ -7664,7 +7677,7 @@ mod tests {
             .expect("missing static storage identity must fail before control-plane access");
 
         assert!(error.contains("static storage directory"), "{error}");
-        assert!(error.contains("initialize-cluster-state"), "{error}");
+        assert!(error.contains("initialize"), "{error}");
         assert!(!error.contains("control-plane runtime map"), "{error}");
     }
 

@@ -482,37 +482,13 @@ fn run_control_plane_admin_command(mut args: impl Iterator<Item = OsString>) -> 
             }
         };
     }
-    if command == "initialize-cluster-state" {
-        let Some(path) = args.next() else {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
-            return Some(2);
-        };
-        let Some(process_id) = args.next() else {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
-            return Some(2);
-        };
+    if command == "initialize" {
         if args.next().is_some() {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
+            eprintln!("usage: argmin-s3 {}", command.to_string_lossy());
             return Some(2);
         }
-        let Some(process_id) = process_id.to_str() else {
-            eprintln!("cluster manifest process id must contain valid UTF-8");
-            return Some(2);
-        };
-        return match static_cluster_config::load_static_cluster_manifest(
-            Path::new(&path),
-            process_id,
-        )
-        .and_then(|manifest| manifest.initialize_selected_process_state())
+        return match static_cluster_config::load_static_cluster_manifest_from_environment()
+            .and_then(|manifest| manifest.initialize_selected_process_state())
         {
             Ok(()) => {
                 println!("initialized static cluster process state");

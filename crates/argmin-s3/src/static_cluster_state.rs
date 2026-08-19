@@ -279,7 +279,7 @@ pub(crate) fn bind_static_control_plane_identity(
         )
     } else {
         format!(
-            "static control-plane identity is not initialized beside {}; run initialize-cluster-state before startup",
+            "static control-plane identity is not initialized beside {}; run initialize before startup",
             state_path.display()
         )
     })
@@ -711,7 +711,7 @@ fn lock_and_inspect_static_storage_startup(
         )
     })? {
         return Err(format!(
-            "static storage directory {} is missing; run initialize-cluster-state before startup",
+            "static storage directory {} is missing; run initialize before startup",
             data_dir.display()
         ));
     }
@@ -725,7 +725,7 @@ fn lock_and_inspect_static_storage_startup(
         )
     })? {
         return Err(format!(
-            "static storage identity is missing from {}; run initialize-cluster-state before startup",
+            "static storage identity is missing from {}; run initialize before startup",
             data_dir.display()
         ));
     }
@@ -1265,7 +1265,7 @@ mod tests {
         let expected = identity("control-1", "b");
 
         let error = bind_static_control_plane_identity(&expected, 101, &state_path).unwrap_err();
-        assert!(error.contains("run initialize-cluster-state"));
+        assert!(error.contains("run initialize"));
         initialize_static_control_plane_identity(&expected, 101, &state_path).unwrap();
         assert!(!bind_static_control_plane_identity(&expected, 101, &state_path).unwrap());
 
@@ -1483,7 +1483,7 @@ mod tests {
             lock_and_verify_standalone_storage_startup(&identity("all-1", "b"), 1, &data_dir, &[0])
                 .unwrap_err();
 
-        assert!(error.contains("initialize-cluster-state"));
+        assert!(error.contains("initialize"));
         assert!(!data_dir.exists());
     }
 
@@ -1656,7 +1656,7 @@ mod tests {
         let error =
             lock_and_verify_standalone_storage_startup(&expected, 1, &data_dir, &[0]).unwrap_err();
 
-        assert!(error.contains("initialize-cluster-state"));
+        assert!(error.contains("initialize"));
     }
 
     #[test]

@@ -1620,9 +1620,9 @@ fn static_manifest_tcp_three_authorities_bootstrap_route_admin_and_restart() {
     let manifest_path = write_static_tcp_process_manifest(test_dir.path(), &ports);
     for number in 1..=3_u64 {
         let output = Command::new(&bin)
-            .arg("initialize-cluster-state")
-            .arg(&manifest_path)
-            .arg(format!("control-{number}"))
+            .arg("initialize")
+            .env("ARGMIN_CLUSTER_CONFIG_PATH", &manifest_path)
+            .env("ARGMIN_PROCESS_ID", format!("control-{number}"))
             .output()
             .expect("static control-plane state initializer should run");
         assert!(

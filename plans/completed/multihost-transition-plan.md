@@ -12258,7 +12258,7 @@ Supported deployment modes, replicated topologies, and gating:
   active topology generation, preserve the configured failure-domain
   guarantee throughout learner catch-up or shard repair, and fence the lost
   identity before the replacement can serve. Ordinary startup and
-  `initialize-cluster-state` must continue to reject an empty destination under
+  `initialize` must continue to reject an empty destination under
   an established identity. Replacement, dynamic membership, and storage
   expansion are one topology-lifecycle surface and are deliberately outside
   the completed version-1 static configuration plan.

@@ -2674,19 +2674,66 @@ impl ValidatedStaticClusterManifest {
     }
 }
 
-pub(crate) fn load_server_config_from_environment() -> Result<ServerConfig, String> {
+enum ConfigurationSelection {
+    EnvironmentOnly,
+    Manifest {
+        config_path: PathBuf,
+        process_id: String,
+    },
+}
+
+fn configuration_selection_from_environment() -> Result<ConfigurationSelection, String> {
     let config_path = std::env::var_os("ARGMIN_CLUSTER_CONFIG_PATH");
     let process_id = std::env::var_os("ARGMIN_PROCESS_ID");
-    let config_path = config_path.as_deref().map(Path::new);
     let process_id = process_id
-        .as_deref()
         .map(|value| {
             value
                 .to_str()
+                .map(str::to_owned)
                 .ok_or_else(|| "ARGMIN_PROCESS_ID must contain valid UTF-8".to_string())
         })
         .transpose()?;
-    load_server_config_from_inputs(config_path, process_id, |key| std::env::var(key).ok())
+    match (config_path, process_id) {
+        (None, None) => Ok(ConfigurationSelection::EnvironmentOnly),
+        (Some(_), None) => {
+            Err("ARGMIN_PROCESS_ID is required with ARGMIN_CLUSTER_CONFIG_PATH".to_string())
+        }
+        (None, Some(_)) => {
+            Err("ARGMIN_CLUSTER_CONFIG_PATH is required with ARGMIN_PROCESS_ID".to_string())
+        }
+        (Some(config_path), Some(process_id)) => Ok(ConfigurationSelection::Manifest {
+            config_path: PathBuf::from(config_path),
+            process_id,
+        }),
+    }
+}
+
+pub(crate) fn load_server_config_from_environment() -> Result<ServerConfig, String> {
+    match configuration_selection_from_environment()? {
+        ConfigurationSelection::EnvironmentOnly => {
+            load_server_config_from_inputs(None, None, |key| std::env::var(key).ok())
+        }
+        ConfigurationSelection::Manifest {
+            config_path,
+            process_id,
+        } => load_server_config_from_inputs(Some(&config_path), Some(&process_id), |key| {
+            std::env::var(key).ok()
+        }),
+    }
+}
+
+pub(crate) fn load_static_cluster_manifest_from_environment(
+) -> Result<ValidatedStaticClusterManifest, String> {
+    match configuration_selection_from_environment()? {
+        ConfigurationSelection::EnvironmentOnly => Err(
+            "ARGMIN_CLUSTER_CONFIG_PATH and ARGMIN_PROCESS_ID are required for initialize"
+                .to_string(),
+        ),
+        ConfigurationSelection::Manifest {
+            config_path,
+            process_id,
+        } => load_static_cluster_manifest(&config_path, &process_id),
+    }
 }
 
 fn load_server_config_from_inputs<F>(
@@ -7895,7 +7942,7 @@ transport_profile_id = "internal"
             &state_path,
         )
         .unwrap_err();
-        assert!(error.contains("run initialize-cluster-state"));
+        assert!(error.contains("run initialize"));
 
         manifest.initialize_selected_process_state().unwrap();
         manifest.initialize_selected_process_state().unwrap();
@@ -8061,7 +8108,7 @@ transport_profile_id = "internal"
             Err(error) => error,
         };
 
-        assert!(error.contains("initialize-cluster-state"));
+        assert!(error.contains("initialize"));
         assert!(!disk_path.join("data").exists());
     }
 

@@ -129,7 +129,9 @@ configuration and material checks used by startup.
 Initialize a selected process's durable state before its first startup:
 
 ```bash
-argmin-s3 initialize-cluster-state /etc/argmin/cluster.toml control-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=control-1 \
+  argmin-s3 initialize
 ```
 
 For replicated storage processes this initializes the bound PG state. For a
@@ -729,13 +731,15 @@ selected host. For host 1, for example:
 ```bash
 ./target/release/argmin-s3 validate \
   /etc/argmin/cluster.toml control-1
-./target/release/argmin-s3 initialize-cluster-state \
-  /etc/argmin/cluster.toml control-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=control-1 \
+  ./target/release/argmin-s3 initialize
 
 ./target/release/argmin-s3 validate \
   /etc/argmin/cluster.toml storage-1
-./target/release/argmin-s3 initialize-cluster-state \
-  /etc/argmin/cluster.toml storage-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=storage-1 \
+  ./target/release/argmin-s3 initialize
 
 ./target/release/argmin-s3 validate \
   /etc/argmin/cluster.toml frontend-1

@@ -112,7 +112,9 @@ start listeners.
 Standalone file-mode storage is initialized explicitly:
 
 ```text
-argmin-s3 initialize-cluster-state /etc/argmin/cluster.toml all-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=all-1 \
+argmin-s3 initialize
 ```
 
 The command writes a process-identity-bound initialization marker before
@@ -1012,7 +1014,7 @@ Final status as of 2026-08-05:
   test-maintenance work; that is not part of the completed production contract.
 - Slice 4's standalone storage sub-slice is implemented: file-mode
   `all-in-one` configuration carries the process identity into runtime,
-  `initialize-cluster-state` durably publishes identity only after complete PG
+  `initialize` durably publishes identity only after complete PG
   initialization, each PG database is bound to that identity, and ordinary
   startup uses the shared durable-identity and shard-inventory verifier.
   Standalone requires a complete authoritative inventory; replicated startup
@@ -1024,7 +1026,7 @@ Final status as of 2026-08-05:
   outside durable identity, while empty, partial, wrong-cluster,
   wrong-generation, and wrong-process state is rejected.
 - Slice 4's replicated storage initialization sub-slice is implemented:
-  `initialize-cluster-state` prepares `storage-node` process
+  `initialize` prepares `storage-node` process
   roots through the production storage-node engine, using the manifest's exact
   node id, complete PG set, EC shape, initial epoch, and process identity.
   Initialization is idempotent and crash-resumable under the same durable
@@ -1205,7 +1207,7 @@ Final status as of 2026-08-05:
   completed by the multihost release gate.
 - Slice 4's initial Raft binding sub-slice is implemented. A two-phase,
   no-follow, fsync'd, SHA-256-protected process-identity sidecar is created only
-  by explicit `initialize-cluster-state` while holding the same process state
+  by explicit `initialize` while holding the same process state
   lock used by ordinary startup, checked before listeners open, and marked
   established only after the configured voter set is both effective and
   applied at one exact membership log id, all committed state is applied, and
