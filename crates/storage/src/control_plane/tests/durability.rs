@@ -94,6 +94,53 @@ fn file_backed_authority_rejects_previous_and_future_state_versions() {
 }
 
 #[test]
+fn file_backed_authority_rejects_noncurrent_nested_command_versions_before_replay() {
+    for version in [14, 16] {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(
+            tmp.path()
+                .join(format!("control-plane-command-v{version}.state")),
+        );
+        let authority = SingleAuthorityControlPlane::open(store.clone()).unwrap();
+        let checkpoint_before = std::fs::read(store.path()).unwrap();
+        let binding = load_single_authority_clock_checkpoint_binding(store.path())
+            .unwrap()
+            .unwrap();
+        let published_chain_digest = store
+            .lock_durability()
+            .unwrap()
+            .published_chain_digest
+            .unwrap();
+        let command = ControlPlaneCommand::SetNodeMembership {
+            node_id: NodeId::new(1),
+            membership: NodeMembershipState::Active,
+        };
+        let encoded_command =
+            crate::control_plane_command::encode_control_plane_command_with_version_for_test(
+                &command, version,
+            )
+            .unwrap();
+        let record = SingleAuthorityJournalRecord::encode_command_bytes_for_test(
+            binding,
+            published_chain_digest,
+            &encoded_command,
+        )
+        .unwrap();
+        store.journal.append_frame(&record).unwrap();
+        let journal_before = std::fs::read(store.journal_path()).unwrap();
+        drop(authority);
+
+        assert!(matches!(
+            FileControlPlaneStore::new(store.path()).load(),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message == format!("unsupported control-plane command version {version}")
+        ));
+        assert_eq!(std::fs::read(store.path()).unwrap(), checkpoint_before);
+        assert_eq!(std::fs::read(store.journal_path()).unwrap(), journal_before);
+    }
+}
+
+#[test]
 fn file_backed_authority_rejects_current_state_missing_timestamp_high_water() {
     let tmp = test_util::tempdir();
     let path = tmp.path().join("control-plane.state");

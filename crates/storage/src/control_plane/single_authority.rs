@@ -825,6 +825,10 @@ impl SingleAuthorityJournalRecord {
             ),
             None => (SINGLE_AUTHORITY_JOURNAL_RECORD_CHECKPOINT, Vec::new()),
         };
+        self.encode_parts(kind, &command)
+    }
+
+    fn encode_parts(&self, kind: u8, command: &[u8]) -> Result<Vec<u8>, ControlPlaneError> {
         let command_len =
             u32::try_from(command.len()).map_err(|_| ControlPlaneError::CommandDecode {
                 message: format!(
@@ -849,9 +853,27 @@ impl SingleAuthorityJournalRecord {
         out.extend_from_slice(&self.resulting_chain_digest.to_be_bytes());
         out.push(kind);
         out.extend_from_slice(&command_len.to_be_bytes());
-        out.extend_from_slice(&command);
+        out.extend_from_slice(command);
         out.extend_from_slice(&checksum::crc64::checksum(&out).to_be_bytes());
         Ok(out)
+    }
+
+    #[cfg(test)]
+    fn encode_command_bytes_for_test(
+        binding: ControlPlaneAuthorityClockCheckpointBinding,
+        previous_chain_digest: u64,
+        command: &[u8],
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        let record = Self {
+            binding,
+            previous_chain_digest,
+            resulting_chain_digest: single_authority_command_chain_digest(
+                previous_chain_digest,
+                command,
+            ),
+            command: None,
+        };
+        record.encode_parts(SINGLE_AUTHORITY_JOURNAL_RECORD_COMMAND, command)
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, ControlPlaneError> {

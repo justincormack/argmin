@@ -36,6 +36,57 @@ const CONTROL_PLANE_COMMAND_EXPIRED_NODE_LEASE_MIN_LEN: usize = 12;
 const CONTROL_PLANE_COMMAND_PROMOTED_NODE_LEASE_MIN_LEN: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneCommandFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for ControlPlaneCommandFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("truncated control-plane command payload"),
+            Self::UnknownMagic => formatter.write_str("invalid control-plane command magic"),
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported control-plane command version {version}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneCommandFormatError {}
+
+fn control_plane_command_payload_offset(
+    body: &[u8],
+) -> Result<usize, ControlPlaneCommandFormatError> {
+    let magic = body
+        .get(..CONTROL_PLANE_COMMAND_MAGIC.len())
+        .ok_or(ControlPlaneCommandFormatError::Truncated)?;
+    if magic != CONTROL_PLANE_COMMAND_MAGIC {
+        return Err(ControlPlaneCommandFormatError::UnknownMagic);
+    }
+    let version_start = CONTROL_PLANE_COMMAND_MAGIC.len();
+    let version_end = version_start + std::mem::size_of::<u16>();
+    let version = u16::from_be_bytes(
+        body.get(version_start..version_end)
+            .ok_or(ControlPlaneCommandFormatError::Truncated)?
+            .try_into()
+            .expect("control-plane command version has fixed length"),
+    );
+    if version != CONTROL_PLANE_COMMAND_VERSION {
+        return Err(ControlPlaneCommandFormatError::UnsupportedVersion(version));
+    }
+    Ok(version_end)
+}
+
+fn command_format_error(error: ControlPlaneCommandFormatError) -> ControlPlaneError {
+    command_protocol_error(error.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiredNodeHeartbeatLease {
     pub node_id: NodeId,
     pub lease_deadline_ms: u64,
@@ -522,6 +573,20 @@ pub fn encode_control_plane_command(
     Ok(out)
 }
 
+#[cfg(test)]
+pub(crate) fn encode_control_plane_command_with_version_for_test(
+    command: &ControlPlaneCommand,
+    version: u16,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let mut encoded = encode_control_plane_command(command)?;
+    let version_start = CONTROL_PLANE_COMMAND_MAGIC.len();
+    let version_end = version_start + std::mem::size_of::<u16>();
+    encoded[version_start..version_end].copy_from_slice(&version.to_be_bytes());
+    encoded.truncate(encoded.len() - CONTROL_PLANE_COMMAND_CHECKSUM_LEN);
+    append_control_plane_command_checksum(&mut encoded);
+    Ok(encoded)
+}
+
 pub fn decode_control_plane_command(
     bytes: &[u8],
 ) -> Result<ControlPlaneCommand, ControlPlaneError> {
@@ -530,8 +595,8 @@ pub fn decode_control_plane_command(
         + std::mem::size_of::<u16>()
         + CONTROL_PLANE_COMMAND_CHECKSUM_LEN;
     if bytes.len() < min_len {
-        return Err(command_protocol_error(
-            "truncated control-plane command payload",
+        return Err(command_format_error(
+            ControlPlaneCommandFormatError::Truncated,
         ));
     }
     let (body, checksum_bytes) = bytes.split_at(bytes.len() - CONTROL_PLANE_COMMAND_CHECKSUM_LEN);
@@ -547,18 +612,9 @@ pub fn decode_control_plane_command(
         )));
     }
 
-    let mut reader = PayloadReader::new(body);
-    if reader.read_exact(CONTROL_PLANE_COMMAND_MAGIC.len())? != CONTROL_PLANE_COMMAND_MAGIC {
-        return Err(command_protocol_error(
-            "invalid control-plane command magic",
-        ));
-    }
-    let version = reader.read_u16()?;
-    if version != CONTROL_PLANE_COMMAND_VERSION {
-        return Err(command_protocol_error(format!(
-            "unsupported control-plane command version {version}"
-        )));
-    }
+    let payload_offset =
+        control_plane_command_payload_offset(body).map_err(command_format_error)?;
+    let mut reader = PayloadReader::new(&body[payload_offset..]);
     let command = match reader.read_u16()? {
         1 => {
             let node_count = reader.read_collection_len(
@@ -2375,6 +2431,37 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_command_marker_failures_are_typed() {
+        for truncated in [
+            &[][..],
+            &CONTROL_PLANE_COMMAND_MAGIC[..CONTROL_PLANE_COMMAND_MAGIC.len() - 1],
+            &CONTROL_PLANE_COMMAND_MAGIC[..],
+        ] {
+            assert_eq!(
+                control_plane_command_payload_offset(truncated),
+                Err(ControlPlaneCommandFormatError::Truncated)
+            );
+        }
+
+        let mut unknown_magic = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
+        unknown_magic[0] ^= 1;
+        unknown_magic.extend_from_slice(&CONTROL_PLANE_COMMAND_VERSION.to_be_bytes());
+        assert_eq!(
+            control_plane_command_payload_offset(&unknown_magic),
+            Err(ControlPlaneCommandFormatError::UnknownMagic)
+        );
+
+        for version in [14_u16, 16] {
+            let mut unsupported = Vec::from(CONTROL_PLANE_COMMAND_MAGIC.as_slice());
+            unsupported.extend_from_slice(&version.to_be_bytes());
+            assert_eq!(
+                control_plane_command_payload_offset(&unsupported),
+                Err(ControlPlaneCommandFormatError::UnsupportedVersion(version))
+            );
+        }
+    }
+
+    #[test]
     fn control_plane_command_codec_round_trips_degenerate_values() {
         for command in degenerate_commands() {
             let encoded = encode_control_plane_command(&command).unwrap();
@@ -2387,8 +2474,24 @@ mod tests {
     fn control_plane_command_codec_rejects_incompatible_or_malformed_payloads() {
         assert_decode_error_contains(b"not a command", "truncated");
 
+        let mut bad_magic =
+            encode_control_plane_command(&ControlPlaneCommand::ExpireHeartbeatLeases {
+                expire_at_ms: 1_000,
+            })
+            .unwrap();
+        bad_magic[0] ^= 1;
+        bad_magic.truncate(bad_magic.len() - CONTROL_PLANE_COMMAND_CHECKSUM_LEN);
+        append_control_plane_command_checksum(&mut bad_magic);
+        assert_decode_error_contains(&bad_magic, "invalid control-plane command magic");
+
         for version in [14, 16] {
-            let encoded = command_frame_with_version(version, 5, |body| write_u64(body, 1_000));
+            let encoded = encode_control_plane_command_with_version_for_test(
+                &ControlPlaneCommand::ExpireHeartbeatLeases {
+                    expire_at_ms: 1_000,
+                },
+                version,
+            )
+            .unwrap();
             assert_decode_error_contains(
                 &encoded,
                 &format!("unsupported control-plane command version {version}"),

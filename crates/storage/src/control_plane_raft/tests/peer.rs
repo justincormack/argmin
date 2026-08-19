@@ -32,6 +32,87 @@ fn control_plane_raft_peer_rpc_append_entries_request_frame_round_trips() {
 }
 
 #[test]
+fn control_plane_raft_peer_rpc_rejects_noncurrent_nested_command_versions() {
+    let command = ControlPlaneCommand::SetNodeMembership {
+        node_id: NodeId::new(11),
+        membership: NodeMembershipState::Active,
+    };
+    let request = AppendEntriesRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(3, 7),
+        prev_log_id: Some(raft_log_id(3, 7, 4)),
+        entries: vec![normal_entry(3, 7, 5, command.clone())],
+        leader_commit: Some(raft_log_id(3, 7, 5)),
+    };
+    let encoded = ControlPlaneRaftPeerRpcRequest::AppendEntries(request)
+        .encode_frame()
+        .unwrap();
+    let current_command = encode_control_plane_command(&command).unwrap();
+    let command_offsets = encoded
+        .windows(current_command.len())
+        .enumerate()
+        .filter_map(|(offset, candidate)| {
+            (candidate == current_command.as_slice()).then_some(offset)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        command_offsets.len(),
+        1,
+        "current command must occur exactly once in the peer RPC fixture"
+    );
+    ControlPlaneRaftPeerRpcRequest::decode_frame(&encoded).unwrap();
+
+    let mut unsupported_frames = Vec::new();
+    for version in [14, 16] {
+        let unsupported_command =
+            crate::control_plane_command::encode_control_plane_command_with_version_for_test(
+                &command, version,
+            )
+            .unwrap();
+        assert_eq!(unsupported_command.len(), current_command.len());
+        let mut unsupported_frame = encoded.clone();
+        let command_start = command_offsets[0];
+        unsupported_frame
+            [command_start..command_start + unsupported_command.len()]
+            .copy_from_slice(&unsupported_command);
+        refresh_raft_peer_frame_checksum(&mut unsupported_frame);
+
+        assert!(matches!(
+            ControlPlaneRaftPeerRpcRequest::decode_frame(&unsupported_frame),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message == format!("unsupported control-plane command version {version}")
+        ));
+        unsupported_frames.push((version, unsupported_frame));
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let authority = runtime
+        .block_on(
+            ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                "nested-command-version-peer-dispatch",
+                1,
+            ),
+        )
+        .unwrap();
+    let before = runtime.block_on(authority.status()).unwrap();
+    for (version, unsupported_frame) in unsupported_frames {
+        assert!(matches!(
+            runtime.block_on(handle_control_plane_raft_peer_rpc_frame_with_identity(
+                authority.raft(),
+                &unsupported_frame,
+                None,
+            )),
+            Err(ControlPlaneError::CommandDecode { message })
+                if message == format!("unsupported control-plane command version {version}")
+        ));
+    }
+    assert_eq!(runtime.block_on(authority.status()).unwrap(), before);
+    runtime.block_on(authority.shutdown()).unwrap();
+}
+
+#[test]
 fn control_plane_raft_peer_rpc_vote_request_frames_round_trip() {
     let request = VoteRequest {
         vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 9),
