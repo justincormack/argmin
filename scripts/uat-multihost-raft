@@ -833,17 +833,26 @@ done
 for index in 0 1 2; do
     number=$((index + 1))
     host="${hosts[$index]}"
-    remote_exec "$host" "$remote_run/argmin-s3" validate "$remote_run/cluster.toml" "control-$number"
+    remote_exec "$host" env \
+        "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        "ARGMIN_PROCESS_ID=control-$number" \
+        "$remote_run/argmin-s3" validate
     remote_exec "$host" env \
         "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         "ARGMIN_PROCESS_ID=control-$number" \
         "$remote_run/argmin-s3" initialize
-    remote_exec "$host" "$remote_run/argmin-s3" validate "$remote_run/cluster.toml" "storage-$number"
+    remote_exec "$host" env \
+        "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        "ARGMIN_PROCESS_ID=storage-$number" \
+        "$remote_run/argmin-s3" validate
     remote_exec "$host" env \
         "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
         "ARGMIN_PROCESS_ID=storage-$number" \
         "$remote_run/argmin-s3" initialize
-    remote_exec "$host" "$remote_run/argmin-s3" validate "$remote_run/cluster.toml" "frontend-$number"
+    remote_exec "$host" env \
+        "ARGMIN_CLUSTER_CONFIG_PATH=$remote_run/cluster.toml" \
+        "ARGMIN_PROCESS_ID=frontend-$number" \
+        "$remote_run/argmin-s3" validate
 done
 
 start_authority() {

@@ -431,35 +431,13 @@ fn run_control_plane_admin_command(mut args: impl Iterator<Item = OsString>) -> 
     let _program = args.next();
     let command = args.next()?;
     if command == "validate" {
-        let Some(path) = args.next() else {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
-            return Some(2);
-        };
-        let Some(process_id) = args.next() else {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
-            return Some(2);
-        };
         if args.next().is_some() {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
+            eprintln!("usage: argmin-s3 {}", command.to_string_lossy());
             return Some(2);
         }
-        let Some(process_id) = process_id.to_str() else {
-            eprintln!("cluster manifest process id must contain valid UTF-8");
-            return Some(2);
-        };
-        return match static_cluster_config::validate_static_cluster_configuration(
-            Path::new(&path),
-            process_id,
-        ) {
+        let validation =
+            static_cluster_config::validate_static_cluster_configuration_from_environment();
+        return match validation {
             Ok((manifest, material)) => {
                 println!(
                     "valid cluster configuration cluster_id={} topology_generation={} process_id={} deployment_mode={} topology_digest={} process_identity_digest={} full_config_fingerprint={} auth_credentials={} tls_identities={} tls_trust_bundles={}",
@@ -487,8 +465,10 @@ fn run_control_plane_admin_command(mut args: impl Iterator<Item = OsString>) -> 
             eprintln!("usage: argmin-s3 {}", command.to_string_lossy());
             return Some(2);
         }
-        return match static_cluster_config::load_static_cluster_manifest_from_environment()
-            .and_then(|manifest| manifest.initialize_selected_process_state())
+        return match static_cluster_config::load_static_cluster_manifest_from_environment(
+            "initialize",
+        )
+        .and_then(|manifest| manifest.initialize_selected_process_state())
         {
             Ok(()) => {
                 println!("initialized static cluster process state");
@@ -3342,18 +3322,40 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
     config: &ServerConfig,
     ec_config: &EcConfig,
 ) -> Result<FrontendStorageClusters, String> {
+    let started_at = Instant::now();
+    build_remote_frontend_storage_cluster_with_startup_retry_runtime(
+        config,
+        ec_config,
+        || started_at.elapsed(),
+        tokio::time::sleep,
+        || build_control_plane_frontend_storage_clusters(config, ec_config),
+    )
+    .await
+}
+
+async fn build_remote_frontend_storage_cluster_with_startup_retry_runtime<N, W, F, A>(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+    mut monotonic_elapsed: N,
+    mut wait_before_retry: W,
+    mut attempt_startup: A,
+) -> Result<FrontendStorageClusters, String>
+where
+    N: FnMut() -> Duration,
+    W: FnMut(Duration) -> F,
+    F: std::future::Future<Output = ()>,
+    A: FnMut() -> Result<FrontendStorageClusters, FrontendControlPlaneStartupError>,
+{
     if config.control_plane_socket_path.is_none() {
         let foreground = build_remote_frontend_storage_cluster(config, ec_config)?;
         return Ok(FrontendStorageClusters::static_shared(foreground));
     }
 
-    let retry_deadline = frontend_control_plane_startup_retry_deadline(config);
     let retry_delay = frontend_control_plane_startup_retry_delay(config);
-    let started_at = Instant::now();
     let mut attempts = 0_u32;
     loop {
         attempts = attempts.saturating_add(1);
-        match build_control_plane_frontend_storage_clusters(config, ec_config) {
+        match attempt_startup() {
             Ok(storage_clusters) => {
                 if attempts > 1 {
                     process_info!(
@@ -3363,13 +3365,14 @@ async fn build_remote_frontend_storage_cluster_retrying_startup(
                 }
                 return Ok(storage_clusters);
             }
-            Err(error) if error.is_retryable() && started_at.elapsed() < retry_deadline => {
+            Err(error) if error.is_retryable() => {
+                let elapsed = monotonic_elapsed();
                 if attempts == 1 || attempts.is_multiple_of(10) {
                     eprintln!(
-                        "argmin-s3 frontend waiting for control-plane runtime map during startup: {error}"
+                        "argmin-s3 frontend waiting for control-plane runtime map during startup after {elapsed:?}: {error}"
                     );
                 }
-                tokio::time::sleep(retry_delay).await;
+                wait_before_retry(retry_delay).await;
             }
             Err(error) => return Err(error.to_string()),
         }
@@ -3461,18 +3464,6 @@ impl std::fmt::Display for FrontendControlPlaneStartupError {
             Self::Permanent(message) => formatter.write_str(message),
         }
     }
-}
-
-fn frontend_control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
-    let refresh_budget = config
-        .control_plane_frontend_refresh_interval
-        .saturating_mul(20);
-    let lease_budget = config
-        .control_plane_heartbeat_lease_duration
-        .saturating_mul(2);
-    Duration::from_secs(30)
-        .max(refresh_budget)
-        .max(lease_budget)
 }
 
 fn frontend_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {

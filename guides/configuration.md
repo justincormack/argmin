@@ -113,10 +113,16 @@ keys.
 
 ### Validation and initialization
 
+Both commands use the same `ARGMIN_CLUSTER_CONFIG_PATH` and
+`ARGMIN_PROCESS_ID` selection as normal server startup and accept no positional
+configuration arguments.
+
 Validate the complete selected-process configuration before startup:
 
 ```bash
-argmin-s3 validate /etc/argmin/cluster.toml control-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=control-1 \
+  argmin-s3 validate
 ```
 
 This performs structural, topology, selected-host filesystem, and material
@@ -545,12 +551,15 @@ catches incompatible keys, expired or not-yet-valid certificates, untrusted
 chains, invalid CA constraints, and SAN mismatches before startup:
 
 ```bash
-argmin-s3 validate \
-  /etc/argmin/cluster.toml control-1
-argmin-s3 validate \
-  /etc/argmin/cluster.toml storage-1
-argmin-s3 validate \
-  /etc/argmin/cluster.toml frontend-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=control-1 \
+  argmin-s3 validate
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=storage-1 \
+  argmin-s3 validate
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=frontend-1 \
+  argmin-s3 validate
 ```
 
 ### Filesystem and durable identity
@@ -729,20 +738,23 @@ Before first startup, validate and initialize every stateful process on its
 selected host. For host 1, for example:
 
 ```bash
-./target/release/argmin-s3 validate \
-  /etc/argmin/cluster.toml control-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=control-1 \
+  ./target/release/argmin-s3 validate
 ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
 ARGMIN_PROCESS_ID=control-1 \
   ./target/release/argmin-s3 initialize
 
-./target/release/argmin-s3 validate \
-  /etc/argmin/cluster.toml storage-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=storage-1 \
+  ./target/release/argmin-s3 validate
 ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
 ARGMIN_PROCESS_ID=storage-1 \
   ./target/release/argmin-s3 initialize
 
-./target/release/argmin-s3 validate \
-  /etc/argmin/cluster.toml frontend-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=frontend-1 \
+  ./target/release/argmin-s3 validate
 ```
 
 Run every process with `ARGMIN_CLUSTER_CONFIG_PATH` and its own
@@ -750,6 +762,7 @@ Run every process with `ARGMIN_CLUSTER_CONFIG_PATH` and its own
 validator files only on frontend hosts; control-plane and storage-only
 processes do not resolve them.
 Start all three voters and storage nodes. Initial Raft establishment and a
-storage node waiting on retryable control-plane availability do not impose an
-aggregate deadline, so hosts may be brought up at different times. Permanent
-configuration, authentication, and protocol errors still terminate startup.
+storage node or frontend waiting on retryable control-plane availability do
+not impose an aggregate deadline, so hosts may be brought up at different
+times. Permanent configuration, authentication, and protocol errors still
+terminate startup.

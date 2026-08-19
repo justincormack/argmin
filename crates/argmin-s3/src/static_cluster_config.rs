@@ -18,6 +18,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
 use rustls::sign::CertifiedKey;
 use rustls::RootCertStore;
 use serde::Deserialize;
+use server_core::sse::{ManagedWrappingKeyConfig, SseCustomerValidatorConfig};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::OpenOptions;
@@ -716,26 +717,46 @@ impl ValidatedStaticClusterManifest {
                 )?;
                 String::from_utf8(bytes).map_err(|_| format!("{label} must contain valid UTF-8"))
             };
+            let read_base64_key = |budget: &mut StaticMaterialBudget,
+                                   reference: &str,
+                                   label: &str|
+             -> Result<String, String> {
+                let bytes = budget.read(
+                    reference,
+                    CLUSTER_MANIFEST_MAX_TEXT_SECRET_BYTES,
+                    StaticMaterialFileAccess::Private,
+                    label,
+                )?;
+                normalize_base64_secret_text(bytes, label)
+            };
+            let sse_s3_wrapping_key = read_base64_key(
+                &mut material_budget,
+                &self.manifest.s3.sse_s3_wrapping_key_ref,
+                "SSE-S3 wrapping key",
+            )?;
+            ManagedWrappingKeyConfig::from_base64(1, &sse_s3_wrapping_key)
+                .map_err(|error| format!("invalid SSE-S3 wrapping key: {error}"))?;
+            let sse_c_validator_key = self
+                .manifest
+                .s3
+                .sse_c_validator_key_ref
+                .as_deref()
+                .map(|reference| -> Result<String, String> {
+                    let key =
+                        read_base64_key(&mut material_budget, reference, "SSE-C validator key")?;
+                    SseCustomerValidatorConfig::from_base64(1, &key)
+                        .map_err(|error| format!("invalid SSE-C validator key: {error}"))?;
+                    Ok(key)
+                })
+                .transpose()?;
             Some(ResolvedStaticS3Material {
                 secret_access_key: read_utf8_secret(
                     &mut material_budget,
                     &self.manifest.s3.secret_access_key_ref,
                     "S3 secret access key",
                 )?,
-                sse_s3_wrapping_key: read_utf8_secret(
-                    &mut material_budget,
-                    &self.manifest.s3.sse_s3_wrapping_key_ref,
-                    "SSE-S3 wrapping key",
-                )?,
-                sse_c_validator_key: self
-                    .manifest
-                    .s3
-                    .sse_c_validator_key_ref
-                    .as_deref()
-                    .map(|reference| {
-                        read_utf8_secret(&mut material_budget, reference, "SSE-C validator key")
-                    })
-                    .transpose()?,
+                sse_s3_wrapping_key,
+                sse_c_validator_key,
             })
         } else {
             None
@@ -2723,12 +2744,12 @@ pub(crate) fn load_server_config_from_environment() -> Result<ServerConfig, Stri
 }
 
 pub(crate) fn load_static_cluster_manifest_from_environment(
+    command: &str,
 ) -> Result<ValidatedStaticClusterManifest, String> {
     match configuration_selection_from_environment()? {
-        ConfigurationSelection::EnvironmentOnly => Err(
-            "ARGMIN_CLUSTER_CONFIG_PATH and ARGMIN_PROCESS_ID are required for initialize"
-                .to_string(),
-        ),
+        ConfigurationSelection::EnvironmentOnly => Err(format!(
+            "ARGMIN_CLUSTER_CONFIG_PATH and ARGMIN_PROCESS_ID are required for {command}"
+        )),
         ConfigurationSelection::Manifest {
             config_path,
             process_id,
@@ -3525,17 +3546,14 @@ pub(crate) fn load_static_cluster_manifest(
     Ok(manifest)
 }
 
-pub(crate) fn validate_static_cluster_configuration(
-    path: &Path,
-    process_id: &str,
-) -> Result<
+pub(crate) fn validate_static_cluster_configuration_from_environment() -> Result<
     (
         ValidatedStaticClusterManifest,
         ResolvedStaticClusterMaterial,
     ),
     String,
 > {
-    let manifest = load_static_cluster_manifest(path, process_id)?;
+    let manifest = load_static_cluster_manifest_from_environment("validate")?;
     validate_loaded_static_cluster_configuration(manifest)
 }
 
@@ -6202,6 +6220,26 @@ fn decode_base64_credential_secret(mut encoded_bytes: Vec<u8>) -> Result<Vec<u8>
     Ok(decoded)
 }
 
+fn normalize_base64_secret_text(mut bytes: Vec<u8>, label: &str) -> Result<String, String> {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    bytes.copy_within(start..end, 0);
+    let normalized_len = end - start;
+    bytes[normalized_len..].fill(0);
+    bytes.truncate(normalized_len);
+    String::from_utf8(bytes).map_err(|error| {
+        let mut bytes = error.into_bytes();
+        bytes.fill(0);
+        format!("{label} must contain valid UTF-8 base64 text")
+    })
+}
+
 fn validate_timeout(value: u64, field: &str) -> Result<(), String> {
     if value == 0 || value > CLUSTER_MANIFEST_MAX_TIMEOUT_MS {
         return Err(format!(
@@ -6240,6 +6278,8 @@ mod tests {
     use std::os::unix::fs::symlink;
     use storage::test_support::StaticInitialControlPlaneTopologyTestSupport as _;
 
+    const TEST_SSE_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+
     fn standalone_runtime_environment() -> BTreeMap<&'static str, String> {
         BTreeMap::from([
             ("ARGMIN_ACCOUNT_ID", "111122223333".to_string()),
@@ -6248,10 +6288,7 @@ mod tests {
                 "ARGMIN_SECRET_ACCESS_KEY",
                 "test-secret-access-key".to_string(),
             ),
-            (
-                "ARGMIN_SSE_S3_WRAPPING_KEY",
-                "dGVzdC13cmFwcGluZy1rZXk=".to_string(),
-            ),
+            ("ARGMIN_SSE_S3_WRAPPING_KEY", TEST_SSE_KEY_B64.to_string()),
         ])
     }
 
@@ -6352,7 +6389,7 @@ mod tests {
         );
         write_material_file(
             &material_dir.join("sse-s3-wrapping-key"),
-            b"dGVzdC13cmFwcGluZy1rZXk=",
+            format!("{TEST_SSE_KEY_B64}\n").as_bytes(),
             0o600,
         );
         manifest.replace(
@@ -6408,7 +6445,7 @@ mod tests {
         );
         write_material_file(
             &material_dir.join("sse-s3-wrapping-key"),
-            b"dGVzdC13cmFwcGluZy1rZXk=",
+            format!("{TEST_SSE_KEY_B64}\n").as_bytes(),
             0o600,
         );
         let manifest = manifest
@@ -6666,7 +6703,7 @@ secret_ref = "file:/run/argmin-secrets/{credential_id}.key"
                 .has_frontend()
                 .then(|| ResolvedStaticS3Material {
                     secret_access_key: "test-secret-access-key".to_string(),
-                    sse_s3_wrapping_key: "dGVzdC13cmFwcGluZy1rZXk=".to_string(),
+                    sse_s3_wrapping_key: TEST_SSE_KEY_B64.to_string(),
                     sse_c_validator_key: None,
                 }),
         }
@@ -8167,10 +8204,7 @@ transport_profile_id = "internal"
         assert_eq!((config.ec_k, config.ec_m), (1, 0));
         assert_eq!(config.account_id, "111122223333");
         assert_eq!(config.secret_access_key.as_str(), "test-secret-access-key");
-        assert_eq!(
-            config.sse_s3_wrapping_key_b64.as_str(),
-            "dGVzdC13cmFwcGluZy1rZXk="
-        );
+        assert_eq!(config.sse_s3_wrapping_key_b64.as_str(), TEST_SSE_KEY_B64);
         assert_eq!(config.listen_addr, "127.0.0.1:9000");
         assert_eq!(config.tls_cert_path, None);
         assert_eq!(config.tls_key_path, None);
@@ -9578,6 +9612,91 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
 
         assert!(
             error.contains("open S3 secret access key reference"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn static_cluster_complete_validation_normalizes_base64_sse_key_files() {
+        let manifest_text = replicated_tcp_data_manifest()
+            .replace("tcp://control-2.internal:", "tcp://localhost:")
+            .replace("tcp://control-3.internal:", "tcp://localhost:")
+            .replace("tcp://storage-2.internal:", "tcp://localhost:")
+            .replace("tcp://storage-3.internal:", "tcp://localhost:")
+            .replace(
+                "tls_server_name = \"control-2.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"control-3.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"storage-2.internal\"",
+                "tls_server_name = \"localhost\"",
+            )
+            .replace(
+                "tls_server_name = \"storage-3.internal\"",
+                "tls_server_name = \"localhost\"",
+            );
+        let (dir, mut manifest) =
+            materialized_replicated_manifest_from("frontend-1", manifest_text);
+        let material_dir = dir.path().join("material");
+        write_material_file(
+            &material_dir.join("s3-secret-access-key"),
+            b"test-secret-access-key\n",
+            0o600,
+        );
+        let sse_c_path = material_dir.join("sse-c-validator-key");
+        write_material_file(
+            &sse_c_path,
+            format!(" \n{TEST_SSE_KEY_B64}\r\n").as_bytes(),
+            0o600,
+        );
+        manifest.manifest.s3.sse_c_validator_key_ref =
+            Some(format!("file:{}", sse_c_path.display()));
+
+        let (_, material) = validate_loaded_static_cluster_configuration(manifest).unwrap();
+        let s3 = material.s3.as_ref().unwrap();
+
+        assert_eq!(s3.secret_access_key, "test-secret-access-key\n");
+        assert_eq!(s3.sse_s3_wrapping_key, TEST_SSE_KEY_B64);
+        assert_eq!(s3.sse_c_validator_key.as_deref(), Some(TEST_SSE_KEY_B64));
+    }
+
+    #[test]
+    fn static_cluster_complete_validation_rejects_invalid_sse_keys() {
+        for (contents, expected) in [
+            ("not-base64\n", "invalid base64 in managed wrapping key"),
+            (
+                "AQID\n",
+                "managed wrapping key must decode to exactly 32 bytes",
+            ),
+        ] {
+            let (dir, manifest) =
+                materialized_replicated_manifest_from("frontend-1", replicated_tcp_data_manifest());
+            write_material_file(
+                &dir.path().join("material/sse-s3-wrapping-key"),
+                contents.as_bytes(),
+                0o600,
+            );
+
+            let error = validate_loaded_static_cluster_configuration(manifest).unwrap_err();
+
+            assert!(error.contains(expected), "unexpected error: {error}");
+        }
+
+        let (dir, mut manifest) =
+            materialized_replicated_manifest_from("frontend-1", replicated_tcp_data_manifest());
+        let sse_c_path = dir.path().join("material/sse-c-validator-key");
+        write_material_file(&sse_c_path, b"AQID\n", 0o600);
+        manifest.manifest.s3.sse_c_validator_key_ref =
+            Some(format!("file:{}", sse_c_path.display()));
+
+        let error = validate_loaded_static_cluster_configuration(manifest).unwrap_err();
+
+        assert!(
+            error.contains("ARGMIN_SSE_C_VALIDATOR_KEY must decode to exactly 32 bytes"),
             "unexpected error: {error}"
         );
     }

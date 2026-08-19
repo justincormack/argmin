@@ -1316,7 +1316,10 @@ fn write_static_tcp_process_manifest(test_dir: &Path, ports: &[u16]) -> PathBuf 
     }
     for (name, value) in [
         ("s3-secret-access-key", "process-test-secret"),
-        ("sse-s3-wrapping-key", "dGVzdC13cmFwcGluZy1rZXk="),
+        (
+            "sse-s3-wrapping-key",
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=\n",
+        ),
     ] {
         let path = material_dir.join(name);
         fs::write(&path, value).unwrap();

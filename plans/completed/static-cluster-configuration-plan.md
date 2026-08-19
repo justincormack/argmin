@@ -97,7 +97,9 @@ The schema/parser and material-resolution slices expose one complete validation
 command:
 
 ```text
-argmin-s3 validate /etc/argmin/cluster.toml control-1
+ARGMIN_CLUSTER_CONFIG_PATH=/etc/argmin/cluster.toml \
+ARGMIN_PROCESS_ID=control-1 \
+argmin-s3 validate
 ```
 
 It performs the same bounded parse, reference, role, endpoint, authentication,

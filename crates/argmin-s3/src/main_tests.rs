@@ -38,15 +38,17 @@ mod tests {
     }
 
     #[test]
-    fn initialize_rejects_positional_configuration_selection() {
-        let args = [
-            OsString::from("argmin-s3"),
-            OsString::from("initialize"),
-            OsString::from("/etc/argmin/cluster.toml"),
-            OsString::from("control-1"),
-        ];
+    fn static_manifest_commands_reject_positional_configuration_selection() {
+        for command in ["validate", "initialize"] {
+            let args = [
+                OsString::from("argmin-s3"),
+                OsString::from(command),
+                OsString::from("/etc/argmin/cluster.toml"),
+                OsString::from("control-1"),
+            ];
 
-        assert_eq!(run_control_plane_admin_command(args.into_iter()), Some(2));
+            assert_eq!(run_control_plane_admin_command(args.into_iter()), Some(2));
+        }
     }
 
     fn test_raft_peer_credentials(
@@ -6169,6 +6171,133 @@ mod tests {
             "ARGMIN_STORAGE_CLUSTER_EPOCH must be > 0"
         )
         .is_retryable());
+    }
+
+    #[test]
+    fn frontend_control_plane_startup_waits_beyond_former_deadline() {
+        let tmp = short_unix_socket_test_dir("fbl");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::Frontend;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = None;
+        config.storage_node_socket_path = None;
+        config.storage_node_sockets.clear();
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+        let former_retry_deadline = Duration::from_secs(30)
+            .max(
+                config
+                    .control_plane_frontend_refresh_interval
+                    .saturating_mul(20),
+            )
+            .max(
+                config
+                    .control_plane_heartbeat_lease_duration
+                    .saturating_mul(2),
+            );
+        let beyond_former_deadline = former_retry_deadline + Duration::from_millis(1);
+        let simulated_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sampled_beyond_deadline = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let elapsed_clock = Arc::clone(&simulated_elapsed_ms);
+        let elapsed_sample = Arc::clone(&sampled_beyond_deadline);
+        let wait_clock = Arc::clone(&simulated_elapsed_ms);
+        let (past_deadline_tx, past_deadline_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+
+        let startup = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut retries = 0_u32;
+            let mut attempts = 0_u32;
+            let mut resume_rx = Some(resume_rx);
+            runtime
+                .block_on(
+                    build_remote_frontend_storage_cluster_with_startup_retry_runtime(
+                        &config,
+                        &ec_config,
+                        move || {
+                            let elapsed_ms =
+                                elapsed_clock.load(std::sync::atomic::Ordering::SeqCst);
+                            let elapsed = Duration::from_millis(elapsed_ms);
+                            if elapsed > former_retry_deadline {
+                                elapsed_sample.store(true, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            elapsed
+                        },
+                        move |_| {
+                            retries += 1;
+                            if retries == 1 {
+                                wait_clock.store(
+                                    u64::try_from(beyond_former_deadline.as_millis()).unwrap(),
+                                    std::sync::atomic::Ordering::SeqCst,
+                                );
+                            }
+                            let wait = (retries == 2).then(|| {
+                                (
+                                    past_deadline_tx.clone(),
+                                    resume_rx.take().expect("second retry waits only once"),
+                                )
+                            });
+                            async move {
+                                if let Some((past_deadline_tx, resume_rx)) = wait {
+                                    past_deadline_tx.send(()).unwrap();
+                                    resume_rx.recv().unwrap();
+                                }
+                            }
+                        },
+                        || {
+                            attempts += 1;
+                            if attempts <= 2 {
+                                return Err(
+                                    FrontendControlPlaneStartupError::runtime_map_fetch(
+                                        config.control_plane_socket_path.as_deref().unwrap(),
+                                        ControlPlaneError::PgHasNoServingPrimary {
+                                            pg_id: 0,
+                                            cluster_epoch: ClusterEpoch::INITIAL,
+                                        },
+                                    ),
+                                );
+                            }
+                            build_control_plane_frontend_storage_clusters(&config, &ec_config)
+                        },
+                    ),
+                )
+                .map(|clusters| clusters.foreground.local_node_count())
+        });
+        past_deadline_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("frontend startup should retry beyond its former aggregate deadline");
+        assert!(
+            !startup.is_finished(),
+            "frontend startup must remain live beyond its former aggregate retry deadline"
+        );
+        assert!(
+            sampled_beyond_deadline.load(std::sync::atomic::Ordering::SeqCst),
+            "the retry decision must observe simulated monotonic time beyond the former deadline"
+        );
+
+        let server = serve_one_active_control_plane_runtime_map(
+            socket_path,
+            NodeId::new(0),
+            endpoint.display().to_string(),
+        );
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            startup
+                .join()
+                .expect("frontend startup thread should not panic")
+                .expect("frontend startup should continue once the control plane is available"),
+            1
+        );
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
