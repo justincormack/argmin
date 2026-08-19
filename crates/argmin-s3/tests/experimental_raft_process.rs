@@ -1,6 +1,8 @@
 // Copyright The Argmin Authors.
 // SPDX-License-Identifier: Apache-2.0
 
+#[cfg(target_os = "linux")]
+use base64::Engine as _;
 use std::collections::BTreeSet;
 #[cfg(target_os = "linux")]
 use std::fmt::Write as _;
@@ -1301,7 +1303,14 @@ fn write_static_tcp_process_manifest(test_dir: &Path, ports: &[u16]) -> PathBuf 
     for role in ["raft", "storage", "admin"] {
         for number in 1..=3 {
             let path = material_dir.join(format!("{role}-{number}.key"));
-            fs::write(&path, format!("static-tcp-{role}-{number}-secret")).unwrap();
+            let role_tag: u8 = match role {
+                "raft" => 10,
+                "storage" => 20,
+                "admin" => 30,
+                _ => unreachable!(),
+            };
+            let encoded = base64::engine::general_purpose::STANDARD.encode([role_tag + number; 32]);
+            fs::write(&path, encoded).unwrap();
             fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
         }
     }

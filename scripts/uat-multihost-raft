@@ -503,9 +503,9 @@ declare -A generated_auth_secrets=()
 for role in raft storage admin; do
     for number in 1 2 3; do
         secret_path="$material_dir/$role-$number.key"
-        (umask 077 && openssl rand -hex 32 >"$secret_path")
+        (umask 077 && openssl rand -base64 32 >"$secret_path")
         secret="$(<"$secret_path")"
-        [[ "$secret" =~ ^[0-9a-f]{64}$ ]] ||
+        [[ "$secret" =~ ^[A-Za-z0-9+/]{43}=$ ]] ||
             die "openssl generated malformed $role-$number credential material"
         [[ -z "${generated_auth_secrets[$secret]:-}" ]] ||
             die "openssl generated duplicate credential material for ${generated_auth_secrets[$secret]} and $role-$number"
@@ -519,9 +519,9 @@ for number in 1 2 3; do
             credential+="-$role"
         fi
         secret_path="$material_dir/$credential.key"
-        (umask 077 && openssl rand -hex 32 >"$secret_path")
+        (umask 077 && openssl rand -base64 32 >"$secret_path")
         secret="$(<"$secret_path")"
-        [[ "$secret" =~ ^[0-9a-f]{64}$ ]] ||
+        [[ "$secret" =~ ^[A-Za-z0-9+/]{43}=$ ]] ||
             die "openssl generated malformed $credential credential material"
         [[ -z "${generated_auth_secrets[$secret]:-}" ]] ||
             die "openssl generated duplicate credential material for ${generated_auth_secrets[$secret]} and $credential"

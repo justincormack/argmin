@@ -348,9 +348,43 @@ by the effective service user. Private credential and key files must also be
 inaccessible to group and other users. Certificate and CA files may be group-
 or other-readable but must not be group- or other-writable.
 
-Credential files are limited to 4 KiB, private keys to 64 KiB, and certificate
-chains and trust bundles to 1 MiB each. One selected process may resolve at
-most 256 material files and 16 MiB in total.
+Internal credential files are limited to 64 bytes, other secret files to 4
+KiB, private keys to 64 KiB, and certificate chains and trust bundles to 1 MiB
+each. One selected process may resolve at most 256 material files and 16 MiB in
+total.
+
+#### Internal authentication credentials
+
+`[[auth_credentials]]` entries are symmetric HMAC-SHA256 credentials used to
+authenticate internal Raft, control-plane, and storage RPC messages. They are
+not public S3 access credentials, the SSE-S3 wrapping key, or the SSE-C
+validator key. Generate independent secret material for each internal
+credential; do not reuse any of those other keys.
+
+The `principal` and its `node_id` or `instance_id` identify the internal caller.
+`credential_id` and the nonzero `credential_version` identify a particular
+secret during verification and rotation. An active credential is accepted for
+verification; `use_for_signing = true` also allows its principal to sign new
+messages. `accept_from_ms` is inclusive and `accept_until_ms`, when present, is
+exclusive. Both are Unix timestamps in milliseconds. Each required local
+principal must have exactly one signing credential active when its process
+starts; overlapping verify-only credentials allow a controlled rotation.
+
+Like the SSE-S3 wrapping and SSE-C validator key files, the referenced
+credential file contains a standard base64 encoding of exactly 32 random
+bytes. On a protected provisioning machine, generate one file per credential
+with:
+
+```bash
+umask 077
+openssl rand -base64 32 > raft-1.key
+```
+
+Repeat this with a distinct output file for every credential in the manifest.
+Install the same file, owned by the Argmin service user and with mode `0600`,
+on the process that signs as that principal and on every process that must
+verify it. `validate-cluster-material` checks that the selected process can
+read and decode all credential files it needs.
 
 Certificate files may contain only certificates; private-key files must
 contain exactly one supported private key. Trust anchors must be CA
@@ -497,12 +531,6 @@ argmin-s3 validate-cluster-material \
 argmin-s3 validate-cluster-material \
   /etc/argmin/cluster.toml frontend-1
 ```
-
-Credential identity consists of the principal, principal id, credential id,
-and nonzero version. `accept_from_ms` and optional `accept_until_ms` define the
-startup-static acceptance window. Overlapping verify-only credentials support
-rotation, but each required local principal must have exactly one active
-credential with `use_for_signing = true`.
 
 ### Filesystem and durable identity
 

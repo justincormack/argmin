@@ -60,6 +60,7 @@ name = "argmin-s3"
 version = "0.1.0"
 dependencies = [
  "auth",
+ "base64",
  "ec",
  "libc",
  "observability",

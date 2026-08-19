@@ -9,6 +9,7 @@ use crate::config::{
     ConfiguredStaticClusterIdentity, ConfiguredStorageNodeSocket, ConfiguredTlsCertifiedKey,
     ServerConfig,
 };
+use base64::Engine as _;
 use ec::EcConfig;
 use rustls::client::danger::ServerCertVerifier;
 use rustls::client::WebPkiServerVerifier;
@@ -64,7 +65,8 @@ const CLUSTER_MANIFEST_MAX_RAFT_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 const CLUSTER_MANIFEST_MAX_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 const CLUSTER_MANIFEST_RAFT_APPEND_FIXED_FRAME_OVERHEAD_BYTES: u64 = 64 * 1024;
 const CLUSTER_MANIFEST_RAFT_SNAPSHOT_FIXED_FRAME_OVERHEAD_BYTES: u64 = 64 * 1024;
-const CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES: u64 = 4 * 1024;
+const CLUSTER_MANIFEST_MAX_TEXT_SECRET_BYTES: u64 = 4 * 1024;
+const CLUSTER_MANIFEST_MAX_CREDENTIAL_SECRET_FILE_BYTES: u64 = 64;
 const CLUSTER_MANIFEST_MAX_TLS_CERTIFICATE_BYTES: u64 = 1024 * 1024;
 const CLUSTER_MANIFEST_MAX_TLS_PRIVATE_KEY_BYTES: u64 = 64 * 1024;
 const CLUSTER_MANIFEST_MAX_TLS_TRUST_BUNDLE_BYTES: u64 = 1024 * 1024;
@@ -686,7 +688,7 @@ impl ValidatedStaticClusterManifest {
              -> Result<String, String> {
                 let bytes = budget.read(
                     reference,
-                    CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+                    CLUSTER_MANIFEST_MAX_TEXT_SECRET_BYTES,
                     StaticMaterialFileAccess::Private,
                     label,
                 )?;
@@ -750,12 +752,13 @@ impl ValidatedStaticClusterManifest {
         let auth_credentials = active_credentials
             .into_iter()
             .map(|(credential, principal)| {
-                let secret = material_budget.read(
+                let encoded_secret = material_budget.read(
                     &credential.secret_ref,
-                    CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+                    CLUSTER_MANIFEST_MAX_CREDENTIAL_SECRET_FILE_BYTES,
                     StaticMaterialFileAccess::Private,
                     "credential secret",
                 )?;
+                let secret = decode_base64_credential_secret(encoded_secret)?;
                 Ok(ResolvedStaticAuthCredential {
                     principal,
                     credential_id: credential.credential_id.clone(),
@@ -6104,6 +6107,24 @@ fn validate_identifier(value: &str, max_len: usize, field: &str) -> Result<(), S
     Ok(())
 }
 
+fn decode_base64_credential_secret(mut encoded_bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    let decoded = (|| {
+        let encoded = std::str::from_utf8(&encoded_bytes)
+            .map_err(|_| "credential secret must contain valid UTF-8 base64 text".to_string())?;
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .map_err(|_| "credential secret must contain valid standard base64".to_string())
+    })();
+    encoded_bytes.fill(0);
+
+    let mut decoded = decoded?;
+    if decoded.len() != 32 {
+        decoded.fill(0);
+        return Err("credential secret must decode to exactly 32 bytes".to_string());
+    }
+    Ok(decoded)
+}
+
 fn validate_timeout(value: u64, field: &str) -> Result<(), String> {
     if value == 0 || value > CLUSTER_MANIFEST_MAX_TIMEOUT_MS {
         return Err(format!(
@@ -6213,6 +6234,24 @@ mod tests {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    fn test_credential_secret(credential_id: &str) -> [u8; 32] {
+        let mut secret = [0_u8; 32];
+        if credential_id == "raft-1" {
+            secret[..4].copy_from_slice(&[0, 1, 2, 0xff]);
+        } else {
+            let id = credential_id.as_bytes();
+            secret[..id.len()].copy_from_slice(id);
+        }
+        secret
+    }
+
+    fn write_credential_file(path: &Path, credential_id: &str) {
+        let mut encoded =
+            base64::engine::general_purpose::STANDARD.encode(test_credential_secret(credential_id));
+        encoded.push('\n');
+        write_material_file(path, encoded.as_bytes(), 0o600);
+    }
+
     fn materialized_replicated_manifest(
         selected_process_id: &str,
     ) -> (test_util::TempDir, ValidatedStaticClusterManifest) {
@@ -6269,32 +6308,21 @@ mod tests {
         );
         for principal in ["raft", "storage", "admin"] {
             for number in 1..=3 {
-                let secret = if principal == "raft" && number == 1 {
-                    vec![0, 1, 2, 0xff]
-                } else {
-                    format!("{principal}-{number}-secret").into_bytes()
-                };
-                write_material_file(
+                let credential_id = format!("{principal}-{number}");
+                write_credential_file(
                     &material_dir.join(format!("{principal}-{number}.key")),
-                    &secret,
-                    0o600,
+                    &credential_id,
                 );
             }
         }
-        write_material_file(
-            &material_dir.join("frontend-1.key"),
-            b"frontend-1-secret",
-            0o600,
-        );
-        write_material_file(
+        write_credential_file(&material_dir.join("frontend-1.key"), "frontend-1");
+        write_credential_file(
             &material_dir.join("frontend-1-admin.key"),
-            b"frontend-1-admin-secret",
-            0o600,
+            "frontend-1-admin",
         );
-        write_material_file(
+        write_credential_file(
             &material_dir.join("frontend-1-maintenance.key"),
-            b"frontend-1-maintenance-secret",
-            0o600,
+            "frontend-1-maintenance",
         );
         write_material_file(
             &material_dir.join("s3-secret-access-key"),
@@ -7888,10 +7916,9 @@ transport_profile_id = "internal"
             "admin-2",
             "admin-3",
         ] {
-            write_material_file(
+            write_credential_file(
                 &material_dir.join(format!("{credential_id}.key")),
-                credential_id.as_bytes(),
-                0o600,
+                credential_id,
             );
         }
         let manifest = replicated_unix_manifest()
@@ -7920,7 +7947,7 @@ transport_profile_id = "internal"
                 .unwrap()
                 .secret
                 .as_bytes(),
-            b"raft-1"
+            &test_credential_secret("raft-1")
         );
     }
 
@@ -9131,7 +9158,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
                 .unwrap()
                 .secret
                 .as_slice(),
-            &[0, 1, 2, 0xff]
+            &test_credential_secret("raft-1")
         );
         let debug = format!("{control_material:?}");
         assert!(!debug.contains("raft-1-secret"));
@@ -9149,6 +9176,40 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
             .all(|credential| credential.principal.principal != AuthPrincipal::RaftPeer));
         assert_eq!(storage_material.tls_identity_count(), 1);
         assert_eq!(storage_material.tls_trust_bundle_count(), 1);
+    }
+
+    #[test]
+    fn static_cluster_auth_material_requires_base64_encoded_32_byte_secrets() {
+        let (dir, manifest) = materialized_replicated_manifest("control-1");
+        let credential_path = dir.path().join("material/raft-1.key");
+        let sentinel = b"DO-NOT-LOG-INVALID-CREDENTIAL";
+        write_material_file(&credential_path, sentinel, 0o600);
+
+        let invalid_base64 = manifest
+            .resolve_selected_process_material_at(1)
+            .unwrap_err();
+        assert!(invalid_base64.contains("valid standard base64"));
+        assert!(!invalid_base64.contains(std::str::from_utf8(sentinel).unwrap()));
+
+        let wrong_length = base64::engine::general_purpose::STANDARD.encode([7_u8; 31]);
+        write_material_file(&credential_path, wrong_length.as_bytes(), 0o600);
+        assert!(manifest
+            .resolve_selected_process_material_at(1)
+            .unwrap_err()
+            .contains("decode to exactly 32 bytes"));
+
+        write_credential_file(&credential_path, "raft-1");
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+        assert_eq!(
+            material
+                .auth_credentials
+                .iter()
+                .find(|credential| credential.credential_id == "raft-1")
+                .unwrap()
+                .secret
+                .as_slice(),
+            &test_credential_secret("raft-1")
+        );
     }
 
     #[test]
@@ -9425,7 +9486,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let link_reference = format!("file:{}", link.display());
         assert!(read_static_material_file(
             &link_reference,
-            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            CLUSTER_MANIFEST_MAX_CREDENTIAL_SECRET_FILE_BYTES,
             StaticMaterialFileAccess::Private,
             "credential secret",
         )
@@ -9437,7 +9498,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let permissive_reference = format!("file:{}", permissive.display());
         assert!(read_static_material_file(
             &permissive_reference,
-            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            CLUSTER_MANIFEST_MAX_CREDENTIAL_SECRET_FILE_BYTES,
             StaticMaterialFileAccess::Private,
             "credential secret",
         )
@@ -9449,7 +9510,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let empty_reference = format!("file:{}", empty.display());
         assert!(read_static_material_file(
             &empty_reference,
-            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            CLUSTER_MANIFEST_MAX_CREDENTIAL_SECRET_FILE_BYTES,
             StaticMaterialFileAccess::Private,
             "credential secret",
         )
@@ -9459,13 +9520,13 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let oversized = dir.path().join("oversized");
         write_material_file(
             &oversized,
-            &vec![b'x'; CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES as usize + 1],
+            &vec![b'x'; CLUSTER_MANIFEST_MAX_CREDENTIAL_SECRET_FILE_BYTES as usize + 1],
             0o600,
         );
         let oversized_reference = format!("file:{}", oversized.display());
         assert!(read_static_material_file(
             &oversized_reference,
-            CLUSTER_MANIFEST_MAX_AUTH_SECRET_BYTES,
+            CLUSTER_MANIFEST_MAX_CREDENTIAL_SECRET_FILE_BYTES,
             StaticMaterialFileAccess::Private,
             "credential secret",
         )

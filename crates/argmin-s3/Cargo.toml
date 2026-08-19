@@ -37,6 +37,7 @@ deep-tracing = [
 
 [dependencies]
 auth = { path = "../auth", default-features = false }
+base64 = "0.22"
 ec = { path = "../ec", default-features = false }
 libc = "0.2"
 observability = { path = "../observability" }
