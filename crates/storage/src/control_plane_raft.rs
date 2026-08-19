@@ -76,9 +76,10 @@ use crate::control_plane_auth::{
     ControlPlaneScopedCredential, ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{
-    decode_control_plane_command, encode_control_plane_command, ControlPlaneCommand,
-    ControlPlaneCommandResponse, ControlPlaneCommandStateMachine, ControlPlaneLogId,
-    ControlPlaneSnapshotArtifact, ReplicatedControlPlaneStateMachine,
+    decode_control_plane_command, encode_control_plane_command,
+    validate_control_plane_snapshot_for_install, ControlPlaneCommand, ControlPlaneCommandResponse,
+    ControlPlaneCommandStateMachine, ControlPlaneLogId, ControlPlaneSnapshotArtifact,
+    ReplicatedControlPlaneStateMachine,
 };
 use crate::deadline_io::DeadlineStream;
 use crate::durable_journal::{

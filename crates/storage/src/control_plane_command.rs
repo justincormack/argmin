@@ -87,6 +87,57 @@ fn command_format_error(error: ControlPlaneCommandFormatError) -> ControlPlaneEr
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneSnapshotFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for ControlPlaneSnapshotFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("truncated control-plane snapshot payload"),
+            Self::UnknownMagic => formatter.write_str("invalid control-plane snapshot magic"),
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported control-plane snapshot version {version}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneSnapshotFormatError {}
+
+fn control_plane_snapshot_content_offset(
+    body: &[u8],
+) -> Result<usize, ControlPlaneSnapshotFormatError> {
+    let magic = body
+        .get(..CONTROL_PLANE_SNAPSHOT_MAGIC.len())
+        .ok_or(ControlPlaneSnapshotFormatError::Truncated)?;
+    if magic != CONTROL_PLANE_SNAPSHOT_MAGIC {
+        return Err(ControlPlaneSnapshotFormatError::UnknownMagic);
+    }
+    let version_start = CONTROL_PLANE_SNAPSHOT_MAGIC.len();
+    let version_end = version_start + std::mem::size_of::<u16>();
+    let version = u16::from_be_bytes(
+        body.get(version_start..version_end)
+            .ok_or(ControlPlaneSnapshotFormatError::Truncated)?
+            .try_into()
+            .expect("control-plane snapshot version has fixed length"),
+    );
+    if version != CONTROL_PLANE_SNAPSHOT_VERSION {
+        return Err(ControlPlaneSnapshotFormatError::UnsupportedVersion(version));
+    }
+    Ok(version_end)
+}
+
+fn snapshot_format_error(error: ControlPlaneSnapshotFormatError) -> ControlPlaneError {
+    snapshot_protocol_error(error.to_string())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ExpiredNodeHeartbeatLease {
     pub node_id: NodeId,
     pub lease_deadline_ms: u64,
@@ -921,14 +972,51 @@ pub fn decode_control_plane_snapshot(
     parse_snapshot(decode_control_plane_snapshot_contents(bytes)?)
 }
 
+pub(crate) fn validate_control_plane_snapshot_for_install(
+    bytes: &[u8],
+) -> Result<(), ControlPlaneError> {
+    decode_control_plane_snapshot_for_install(bytes).map(|_| ())
+}
+
+fn decode_control_plane_snapshot_for_install(
+    bytes: &[u8],
+) -> Result<ClusterControlSnapshot, ControlPlaneError> {
+    let snapshot = parse_snapshot_without_publication_validation(
+        decode_control_plane_snapshot_contents(bytes)?,
+    )?;
+    validate_control_plane_snapshot(
+        "attempted to install invalid replicated control-plane snapshot",
+        &snapshot,
+    )?;
+    Ok(snapshot)
+}
+
+#[cfg(test)]
+pub(crate) fn reseal_control_plane_snapshot_version_for_test(
+    current: &[u8],
+    version: u16,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    decode_control_plane_snapshot_contents(current)?;
+    let body_len = current
+        .len()
+        .checked_sub(CONTROL_PLANE_SNAPSHOT_CHECKSUM_LEN)
+        .expect("a decoded snapshot contains its checksum");
+    let mut resealed = current[..body_len].to_vec();
+    let version_start = CONTROL_PLANE_SNAPSHOT_MAGIC.len();
+    let version_end = version_start + std::mem::size_of::<u16>();
+    resealed[version_start..version_end].copy_from_slice(&version.to_be_bytes());
+    append_control_plane_snapshot_checksum(&mut resealed);
+    Ok(resealed)
+}
+
 fn decode_control_plane_snapshot_contents(bytes: &[u8]) -> Result<&str, ControlPlaneError> {
     let min_len = CONTROL_PLANE_SNAPSHOT_MAGIC.len()
         + std::mem::size_of::<u16>()
         + std::mem::size_of::<u32>()
         + CONTROL_PLANE_SNAPSHOT_CHECKSUM_LEN;
     if bytes.len() < min_len {
-        return Err(snapshot_protocol_error(
-            "truncated control-plane snapshot payload",
+        return Err(snapshot_format_error(
+            ControlPlaneSnapshotFormatError::Truncated,
         ));
     }
     let (body, checksum_bytes) = bytes.split_at(bytes.len() - CONTROL_PLANE_SNAPSHOT_CHECKSUM_LEN);
@@ -944,24 +1032,7 @@ fn decode_control_plane_snapshot_contents(bytes: &[u8]) -> Result<&str, ControlP
         )));
     }
 
-    let version_offset = CONTROL_PLANE_SNAPSHOT_MAGIC.len();
-    if body.get(..version_offset) != Some(CONTROL_PLANE_SNAPSHOT_MAGIC) {
-        return Err(snapshot_protocol_error(
-            "invalid control-plane snapshot magic",
-        ));
-    }
-    let version = u16::from_be_bytes(
-        body.get(version_offset..version_offset + std::mem::size_of::<u16>())
-            .expect("snapshot body length already checked")
-            .try_into()
-            .expect("version slice length is fixed"),
-    );
-    if version != CONTROL_PLANE_SNAPSHOT_VERSION {
-        return Err(snapshot_protocol_error(format!(
-            "unsupported control-plane snapshot version {version}"
-        )));
-    }
-    let len_offset = version_offset + std::mem::size_of::<u16>();
+    let len_offset = control_plane_snapshot_content_offset(body).map_err(snapshot_format_error)?;
     let content_offset = len_offset + std::mem::size_of::<u32>();
     let content_len = usize::try_from(u32::from_be_bytes(
         body.get(len_offset..content_offset)
@@ -1311,13 +1382,7 @@ impl ReplicatedControlPlaneStateMachine {
         // The consensus layer must supply a mutually consistent
         // (payload, last_applied) pair. This adapter guards only against
         // rollback relative to the current applied position.
-        let snapshot = parse_snapshot_without_publication_validation(
-            decode_control_plane_snapshot_contents(artifact.payload())?,
-        )?;
-        validate_control_plane_snapshot(
-            "attempted to install invalid replicated control-plane snapshot",
-            &snapshot,
-        )?;
+        let snapshot = decode_control_plane_snapshot_for_install(artifact.payload())?;
         self.snapshot = Arc::new(snapshot);
         self.last_applied = artifact.last_applied();
         self.snapshot_last_applied = artifact.last_applied();
@@ -2796,6 +2861,51 @@ mod tests {
     }
 
     #[test]
+    fn control_plane_snapshot_marker_failures_are_typed() {
+        for truncated in [
+            &b""[..],
+            &CONTROL_PLANE_SNAPSHOT_MAGIC[..CONTROL_PLANE_SNAPSHOT_MAGIC.len() - 1],
+            CONTROL_PLANE_SNAPSHOT_MAGIC.as_slice(),
+            &b"ARGCPSNP\0"[..],
+        ] {
+            assert_eq!(
+                control_plane_snapshot_content_offset(truncated),
+                Err(ControlPlaneSnapshotFormatError::Truncated)
+            );
+        }
+
+        let mut unknown_magic = *CONTROL_PLANE_SNAPSHOT_MAGIC;
+        unknown_magic[0] ^= 1;
+        let mut unknown_magic_header = unknown_magic.to_vec();
+        write_u16(&mut unknown_magic_header, CONTROL_PLANE_SNAPSHOT_VERSION);
+        assert_eq!(
+            control_plane_snapshot_content_offset(&unknown_magic_header),
+            Err(ControlPlaneSnapshotFormatError::UnknownMagic)
+        );
+
+        for version in [0, 2] {
+            let mut header = CONTROL_PLANE_SNAPSHOT_MAGIC.to_vec();
+            write_u16(&mut header, version);
+            assert_eq!(
+                control_plane_snapshot_content_offset(&header),
+                Err(ControlPlaneSnapshotFormatError::UnsupportedVersion(version))
+            );
+        }
+    }
+
+    #[test]
+    fn control_plane_snapshot_v1_encoding_is_stable() {
+        const EXPECTED: &[u8] = b"ARGCPSNP\0\x01\0\0\0yversion=28\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\nmax_committed_timestamp_ms=-\nlease_grant_horizon=-\n\xf9\xf4a\xba\xdc\xc0\xd9\x8a";
+        let encoded = encode_control_plane_snapshot(&ClusterControlSnapshot::empty()).unwrap();
+
+        assert_eq!(encoded, EXPECTED);
+        assert_eq!(
+            decode_control_plane_snapshot(EXPECTED).unwrap(),
+            ClusterControlSnapshot::empty()
+        );
+    }
+
+    #[test]
     fn control_plane_snapshot_codec_round_trips_and_continues_replay() {
         let snapshot = sample_snapshot()
             .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
@@ -2831,11 +2941,25 @@ mod tests {
             Err(ControlPlaneError::SnapshotDecode { message }) if message.contains("truncated")
         ));
 
-        let encoded = snapshot_frame_with_version(2, &format_snapshot(&sample_snapshot()));
+        let current = encode_control_plane_snapshot(&sample_snapshot()).unwrap();
+        for version in [0, 2] {
+            let encoded =
+                reseal_control_plane_snapshot_version_for_test(&current, version).unwrap();
+            assert!(matches!(
+                decode_control_plane_snapshot(&encoded),
+                Err(ControlPlaneError::SnapshotDecode { message })
+                    if message == format!("unsupported control-plane snapshot version {version}")
+            ));
+        }
+
+        let mut invalid_magic = current.clone();
+        invalid_magic.truncate(invalid_magic.len() - CONTROL_PLANE_SNAPSHOT_CHECKSUM_LEN);
+        invalid_magic[0] ^= 1;
+        append_control_plane_snapshot_checksum(&mut invalid_magic);
         assert!(matches!(
-            decode_control_plane_snapshot(&encoded),
+            decode_control_plane_snapshot(&invalid_magic),
             Err(ControlPlaneError::SnapshotDecode { message })
-                if message.contains("unsupported control-plane snapshot version 2")
+                if message == "invalid control-plane snapshot magic"
         ));
 
         let mut encoded = encode_control_plane_snapshot(&sample_snapshot()).unwrap();
@@ -2878,6 +3002,30 @@ mod tests {
             assert_eq!(
                 installed, before,
                 "unsupported state v{version} mutated the replicated state machine"
+            );
+        }
+    }
+
+    #[test]
+    fn replicated_snapshot_install_rejects_noncurrent_envelope_versions_before_mutation() {
+        let current = encode_control_plane_snapshot(&sample_snapshot()).unwrap();
+        for version in [0, 2] {
+            let payload =
+                reseal_control_plane_snapshot_version_for_test(&current, version).unwrap();
+            let mut installed = replay_sample_state_machine();
+            let before = installed.clone();
+
+            assert!(matches!(
+                installed.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                    Some(log_id(2, 4)),
+                    payload,
+                )),
+                Err(ControlPlaneError::SnapshotDecode { message })
+                    if message == format!("unsupported control-plane snapshot version {version}")
+            ));
+            assert_eq!(
+                installed, before,
+                "unsupported snapshot envelope v{version} mutated the replicated state machine"
             );
         }
     }

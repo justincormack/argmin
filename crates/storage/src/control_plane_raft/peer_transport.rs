@@ -307,6 +307,7 @@ impl ControlPlaneRaftPeerSnapshotRequest {
                 let vote = reader.read_vote()?;
                 let snapshot = reader
                     .read_snapshot_limited("raft peer snapshot payload", max_snapshot_bytes)?;
+                validate_control_plane_snapshot_for_install(snapshot.snapshot.get_ref())?;
                 Ok(Self { vote, snapshot })
             },
         )

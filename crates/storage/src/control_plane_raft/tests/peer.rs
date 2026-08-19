@@ -751,6 +751,140 @@ fn control_plane_raft_peer_snapshot_frames_round_trip() {
     assert_eq!(decoded, response);
 }
 
+fn current_peer_snapshot_payload() -> Vec<u8> {
+    let mut state_machine = ControlPlaneRaftStateMachine::empty();
+    state_machine
+        .apply_entry(bootstrap_membership_entry(1))
+        .unwrap();
+    state_machine
+        .build_snapshot()
+        .unwrap()
+        .snapshot
+        .into_inner()
+}
+
+fn assert_peer_server_rejects_snapshot_before_publication(
+    cluster_name: &str,
+    snapshot_payload: Vec<u8>,
+    assert_error: impl Fn(&ControlPlaneError),
+) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let authority = Arc::new(
+        runtime
+            .block_on(
+                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+            )
+            .unwrap(),
+    );
+    let peer_policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+        cluster_name,
+        [(1, "node-1".to_owned())],
+        ControlPlaneRaftPeerTransportLimits::default(),
+    );
+    let checkpoint = Arc::new(RecordingPeerServerCheckpoint::default());
+    let durability = authority
+        .bind_peer_server_durability(checkpoint.clone())
+        .unwrap();
+    let policy = ControlPlaneRaftPeerServerPolicy::new(1, peer_policy, 4096)
+        .unwrap()
+        .with_durability(durability);
+
+    let mut state_machine = ControlPlaneRaftStateMachine::empty();
+    state_machine
+        .apply_entry(bootstrap_membership_entry(1))
+        .unwrap();
+    let mut snapshot = state_machine.build_snapshot().unwrap();
+    snapshot.snapshot = ControlPlaneRaftSnapshotData::new(snapshot_payload);
+    let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 1, 1);
+    let request = ControlPlaneRaftPeerSnapshotRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new_committed(1, 1),
+        snapshot,
+    }
+    .encode_frame_for_peer(&identity)
+    .unwrap();
+    let admission_error = ControlPlaneRaftPeerSnapshotRequest::decode_frame_with_identity(
+        &request,
+        usize::MAX,
+        usize::MAX,
+        Some(&identity),
+    )
+    .unwrap_err();
+    assert_error(&admission_error);
+
+    let mut transport_request = Vec::new();
+    write_control_plane_raft_peer_transport_frame(&mut transport_request, &request).unwrap();
+    let mut stream =
+        RecordingPeerServerStream::new(transport_request, Arc::clone(&checkpoint.events));
+    let before = runtime.block_on(authority.status()).unwrap();
+
+    let error = handle_control_plane_raft_peer_server_request(
+        runtime.handle(),
+        &authority,
+        &mut stream,
+        &policy,
+        Instant::now() + Duration::from_secs(1),
+        Duration::from_secs(1),
+    )
+    .unwrap_err();
+    let ControlPlaneRaftPeerServerWorkerError::PeerRpc(error) = error else {
+        panic!("invalid nested snapshot returned checkpoint error")
+    };
+    assert_error(&error);
+    assert_eq!(runtime.block_on(authority.status()).unwrap(), before);
+    assert!(checkpoint.events.lock().unwrap().is_empty());
+    assert!(stream.response.is_empty());
+    runtime.block_on(authority.shutdown()).unwrap();
+}
+
+#[test]
+fn control_plane_raft_peer_server_rejects_noncurrent_nested_snapshot_versions_before_publication() {
+    let current = current_peer_snapshot_payload();
+    for version in [0, 2] {
+        let unsupported =
+            crate::control_plane_command::reseal_control_plane_snapshot_version_for_test(
+                &current, version,
+            )
+            .unwrap();
+        assert_peer_server_rejects_snapshot_before_publication(
+            &format!("nested-snapshot-version-{version}"),
+            unsupported,
+            |error| {
+                assert!(matches!(
+                    error,
+                    ControlPlaneError::SnapshotDecode { message }
+                        if message == &format!(
+                            "unsupported control-plane snapshot version {version}"
+                        )
+                ));
+            },
+        );
+    }
+}
+
+#[test]
+fn control_plane_raft_peer_server_rejects_invalid_nested_snapshot_state_before_publication() {
+    let invalid = ClusterControlSnapshot::test_invalid_active_without_metadata_proof_epoch(
+        PgId::new(31),
+    );
+    let payload = crate::control_plane_command::encode_control_plane_snapshot(&invalid).unwrap();
+    assert_peer_server_rejects_snapshot_before_publication(
+        "invalid-nested-snapshot-state",
+        payload,
+        |error| {
+            assert!(matches!(
+                error,
+                ControlPlaneError::SnapshotInvariantViolation { context, message }
+                    if *context == "attempted to install invalid replicated control-plane snapshot"
+                        && message.contains("has no metadata proof epoch")
+            ));
+        },
+    );
+}
+
 #[test]
 fn control_plane_raft_peer_snapshot_frames_fail_closed_across_direction() {
     let mut state_machine = ControlPlaneRaftStateMachine::empty();
