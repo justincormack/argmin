@@ -17,6 +17,8 @@
     use crate::storage_rpc_transport::StorageRpcClientEndpoint;
     use crate::storage_rpc::StorageRpcWireErrorCode;
     use crate::storage_rpc_auth::{
+        encode_storage_rpc_auth_transport_frame_with_version_for_test,
+        sign_storage_rpc_request,
         sign_storage_rpc_request_with_binding_version_for_test,
         sign_storage_rpc_request_with_encoded_frame_for_test,
         write_storage_rpc_auth_transport_frame, StorageRpcAuthRequestInput,
@@ -5150,99 +5152,140 @@
         }
     }
 
-    #[test]
-    fn authenticated_storage_rpc_rejects_unsupported_binding_before_mutation_dispatch() {
-        for unsupported_version in [0_u16, 3] {
-            let tmp = test_util::tempdir();
-            let config = test_config(&tmp);
-            private_socket_dir(config.socket_path.parent().unwrap());
-            let credential =
-                storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
-                    instance_id: "frontend-1".to_owned(),
-                });
-            let server = PreparedStorageNodeServer::new(config.clone())
-                .with_rpc_auth(storage_rpc_server_auth(&credential))
-                .bind()
-                .unwrap();
-            let destination_node = Arc::clone(&server._node);
-            let state_before = destination_node
+    fn assert_authenticated_transport_rejected_before_mutation_dispatch(
+        label: &str,
+        expected_server_message: &str,
+        encode_transport: impl FnOnce(
+            &ControlPlaneScopedCredential,
+            NodeId,
+            &StorageRpcFrame,
+        ) -> Vec<u8>,
+    ) {
+        let tmp = test_util::tempdir();
+        let config = test_config(&tmp);
+        private_socket_dir(config.socket_path.parent().unwrap());
+        let credential = storage_rpc_auth_test_credential(ControlPlaneAuthPrincipal::Frontend {
+            instance_id: "frontend-1".to_owned(),
+        });
+        let server = PreparedStorageNodeServer::new(config.clone())
+            .with_rpc_auth(storage_rpc_server_auth(&credential))
+            .bind()
+            .unwrap();
+        let destination_node = Arc::clone(&server._node);
+        let state_before = destination_node
+            .get_pg(0)
+            .unwrap()
+            .metadata_command_replica_state()
+            .unwrap();
+        let mutation_dispatches = Arc::new(AtomicUsize::new(0));
+        let mutation_dispatches_for_hook = Arc::clone(&mutation_dispatches);
+        server.set_metadata_command_before_commit_test_hook(Arc::new(move |_, _| {
+            mutation_dispatches_for_hook.fetch_add(1, Ordering::SeqCst);
+        }));
+        let socket_path = config.socket_path.clone();
+        let join = thread::spawn(move || server.accept_one());
+
+        let command = test_metadata_command(0, 1);
+        let payload = encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
+            node_id: config.node_id,
+            cluster_epoch: config.cluster_epoch,
+            pg_id: PgId::new(0),
+            command,
+        })
+        .unwrap();
+        let frame = StorageRpcFrame {
+            request_id: 1,
+            kind: StorageRpcMessageKind::MetadataCommandApplyAndRecord,
+            payload,
+        };
+        let encoded = encode_transport(&credential, config.node_id, &frame);
+        let mut client = UnixStream::connect(socket_path).unwrap();
+        client.write_all(&encoded).unwrap();
+        drop(client);
+
+        let error = join.join().unwrap().unwrap_err();
+        let message = match error {
+            StorageNodeServerError::RpcStream { message } => message,
+            other => panic!("{label} returned {other:?}"),
+        };
+        assert_eq!(message, expected_server_message, "unexpected {label} error");
+        assert_eq!(
+            mutation_dispatches.load(Ordering::SeqCst),
+            0,
+            "{label} reached mutation dispatch"
+        );
+        assert_eq!(
+            destination_node
                 .get_pg(0)
                 .unwrap()
                 .metadata_command_replica_state()
-                .unwrap();
-            let mutation_dispatches = Arc::new(AtomicUsize::new(0));
-            let mutation_dispatches_for_hook = Arc::clone(&mutation_dispatches);
-            server.set_metadata_command_before_commit_test_hook(Arc::new(move |_, _| {
-                mutation_dispatches_for_hook.fetch_add(1, Ordering::SeqCst);
-            }));
-            let socket_path = config.socket_path.clone();
-            let join = thread::spawn(move || server.accept_one());
+                .unwrap(),
+            state_before,
+            "{label} mutated replica state"
+        );
+        assert_eq!(
+            destination_node
+                .get_pg(0)
+                .unwrap()
+                .max_metadata_command_log_index(config.cluster_epoch)
+                .unwrap(),
+            0,
+            "{label} published a durable log entry"
+        );
+    }
 
-            let command = test_metadata_command(0, 1);
-            let payload = encode_metadata_command_request(&StorageRpcMetadataCommandRequest {
-                node_id: config.node_id,
-                cluster_epoch: config.cluster_epoch,
-                pg_id: PgId::new(0),
-                command,
-            })
-            .unwrap();
-            let frame = StorageRpcFrame {
-                request_id: 1,
-                kind: StorageRpcMessageKind::MetadataCommandApplyAndRecord,
-                payload,
-            };
-            let now_ms = crate::clock::current_time_millis();
-            let envelope = sign_storage_rpc_request_with_binding_version_for_test(
-                StorageRpcAuthRequestInput {
-                    credential: &credential,
-                    target_node_id: config.node_id,
-                    topology_generation: 9,
-                    topology_digest: STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
-                    issued_at_ms: now_ms,
-                    expires_at_ms: now_ms + 5_000,
-                    frame: &frame,
-                },
-                unsupported_version,
-            )
-            .unwrap();
-            let mut client = UnixStream::connect(socket_path).unwrap();
-            write_storage_rpc_auth_transport_frame(&mut client, &envelope).unwrap();
-            drop(client);
-
-            let error = join.join().unwrap().unwrap_err();
-            let message = match error {
-                StorageNodeServerError::RpcStream { message } => message,
-                other => panic!(
-                    "unsupported authentication binding v{unsupported_version} returned {other:?}"
-                ),
-            };
-            assert_eq!(
-                message,
+    #[test]
+    fn authenticated_storage_rpc_rejects_unsupported_binding_before_mutation_dispatch() {
+        for unsupported_version in [0_u16, 3] {
+            assert_authenticated_transport_rejected_before_mutation_dispatch(
+                &format!("authenticator-valid binding v{unsupported_version}"),
                 "storage RPC stream I/O error: storage RPC authentication rejected: Malformed",
-                "authenticator-valid binding v{unsupported_version} was not rejected by binding decoding"
+                |credential, target_node_id, frame| {
+                    let now_ms = crate::clock::current_time_millis();
+                    let envelope = sign_storage_rpc_request_with_binding_version_for_test(
+                        StorageRpcAuthRequestInput {
+                            credential,
+                            target_node_id,
+                            topology_generation: 9,
+                            topology_digest: STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                            issued_at_ms: now_ms,
+                            expires_at_ms: now_ms + 5_000,
+                            frame,
+                        },
+                        unsupported_version,
+                    )
+                    .unwrap();
+                    encode_storage_rpc_auth_transport_frame_with_version_for_test(&envelope, 1)
+                },
             );
-            assert_eq!(
-                mutation_dispatches.load(Ordering::SeqCst),
-                0,
-                "unsupported binding v{unsupported_version} reached mutation dispatch"
-            );
-            assert_eq!(
-                destination_node
-                    .get_pg(0)
-                    .unwrap()
-                    .metadata_command_replica_state()
-                    .unwrap(),
-                state_before,
-                "unsupported binding v{unsupported_version} mutated replica state"
-            );
-            assert_eq!(
-                destination_node
-                    .get_pg(0)
-                    .unwrap()
-                    .max_metadata_command_log_index(config.cluster_epoch)
-                    .unwrap(),
-                0,
-                "unsupported binding v{unsupported_version} published a durable log entry"
+        }
+    }
+
+    #[test]
+    fn authenticated_storage_rpc_rejects_unsupported_transport_before_auth_or_mutation_dispatch() {
+        for unsupported_version in [0_u16, 2] {
+            assert_authenticated_transport_rejected_before_mutation_dispatch(
+                &format!("signed transport v{unsupported_version}"),
+                &format!(
+                    "storage RPC stream I/O error: unsupported authenticated storage RPC transport version {unsupported_version}"
+                ),
+                |credential, target_node_id, frame| {
+                    let now_ms = crate::clock::current_time_millis();
+                    let envelope = sign_storage_rpc_request(StorageRpcAuthRequestInput {
+                        credential,
+                        target_node_id,
+                        topology_generation: 9,
+                        topology_digest: STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                        issued_at_ms: now_ms,
+                        expires_at_ms: now_ms + 5_000,
+                        frame,
+                    })
+                    .unwrap();
+                    encode_storage_rpc_auth_transport_frame_with_version_for_test(
+                        &envelope,
+                        unsupported_version,
+                    )
+                },
             );
         }
     }

@@ -44,6 +44,53 @@ pub const STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN: usize =
     STORAGE_RPC_AUTH_MAX_BINDING_LEN + STORAGE_RPC_AUTH_MAX_ENVELOPE_OVERHEAD;
 const STORAGE_RPC_AUTH_PRE_AUTH_BYTE_BUDGET: usize = STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageRpcAuthTransportFrameField {
+    Magic,
+    Version,
+    Length,
+    LengthComplement,
+    Envelope,
+}
+
+#[derive(Debug)]
+enum StorageRpcAuthTransportFrameError {
+    Truncated(StorageRpcAuthTransportFrameField),
+    UnknownMagic,
+    UnsupportedVersion(u16),
+    LengthCheckFailed,
+    FrameTooLarge,
+    Io(io::Error),
+}
+
+impl StorageRpcAuthTransportFrameError {
+    fn into_io_error(self) -> io::Error {
+        match self {
+            Self::Truncated(field) => io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated authenticated storage RPC transport {field:?}"),
+            ),
+            Self::UnknownMagic => io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid authenticated storage RPC transport magic",
+            ),
+            Self::UnsupportedVersion(version) => io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported authenticated storage RPC transport version {version}"),
+            ),
+            Self::LengthCheckFailed => io::Error::new(
+                io::ErrorKind::InvalidData,
+                "authenticated storage RPC transport length check failed",
+            ),
+            Self::FrameTooLarge => io::Error::new(
+                io::ErrorKind::InvalidData,
+                "authenticated storage RPC frame exceeds the transport limit",
+            ),
+            Self::Io(source) => source,
+        }
+    }
+}
+
 pub const STORAGE_RPC_AUTH_REPLAY_WINDOW_MS: u64 = 5_000;
 pub const STORAGE_RPC_AUTH_ALLOWED_FUTURE_SKEW_MS: u64 = 1_000;
 
@@ -652,6 +699,19 @@ pub(crate) fn write_storage_rpc_auth_transport_frame<W: Write>(
     writer.flush()
 }
 
+#[cfg(test)]
+pub(crate) fn encode_storage_rpc_auth_transport_frame_with_version_for_test(
+    envelope: &[u8],
+    version: u16,
+) -> Vec<u8> {
+    let mut encoded = Vec::new();
+    write_storage_rpc_auth_transport_frame(&mut encoded, envelope)
+        .expect("test auth envelope fits the transport frame");
+    let version_offset = STORAGE_RPC_AUTH_TRANSPORT_MAGIC.len();
+    encoded[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    encoded
+}
+
 pub(crate) fn write_storage_rpc_auth_transport_frame_with_limit<W: Write>(
     writer: &mut W,
     envelope: &[u8],
@@ -670,8 +730,16 @@ pub(crate) fn write_storage_rpc_auth_transport_frame_with_limit<W: Write>(
 pub(crate) fn read_storage_rpc_auth_transport_frame<R: Read>(
     reader: &mut R,
 ) -> io::Result<Vec<u8>> {
-    let len = read_storage_rpc_auth_transport_frame_len(reader)?;
-    read_storage_rpc_auth_transport_frame_body(reader, len)
+    read_storage_rpc_auth_transport_frame_typed(reader)
+        .map_err(StorageRpcAuthTransportFrameError::into_io_error)
+}
+
+#[cfg(test)]
+fn read_storage_rpc_auth_transport_frame_typed<R: Read>(
+    reader: &mut R,
+) -> Result<Vec<u8>, StorageRpcAuthTransportFrameError> {
+    let len = read_storage_rpc_auth_transport_frame_len_typed(reader)?;
+    read_storage_rpc_auth_transport_frame_body_typed(reader, len)
 }
 
 pub(crate) fn read_storage_rpc_auth_transport_frame_with_limit<R: Read>(
@@ -689,50 +757,89 @@ pub(crate) fn read_storage_rpc_auth_transport_frame_with_limit<R: Read>(
 }
 
 fn read_storage_rpc_auth_transport_frame_len<R: Read>(reader: &mut R) -> io::Result<usize> {
+    read_storage_rpc_auth_transport_frame_len_typed(reader)
+        .map_err(StorageRpcAuthTransportFrameError::into_io_error)
+}
+
+fn read_storage_rpc_auth_transport_frame_len_typed<R: Read>(
+    reader: &mut R,
+) -> Result<usize, StorageRpcAuthTransportFrameError> {
     let mut magic = [0_u8; STORAGE_RPC_AUTH_TRANSPORT_MAGIC.len()];
-    reader.read_exact(&mut magic)?;
+    read_storage_rpc_auth_transport_field(
+        reader,
+        &mut magic,
+        StorageRpcAuthTransportFrameField::Magic,
+    )?;
     if magic != *STORAGE_RPC_AUTH_TRANSPORT_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid authenticated storage RPC transport magic",
-        ));
+        return Err(StorageRpcAuthTransportFrameError::UnknownMagic);
     }
     let mut version = [0_u8; 2];
-    reader.read_exact(&mut version)?;
+    read_storage_rpc_auth_transport_field(
+        reader,
+        &mut version,
+        StorageRpcAuthTransportFrameField::Version,
+    )?;
     let version = u16::from_be_bytes(version);
     if version != STORAGE_RPC_AUTH_TRANSPORT_VERSION {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "unsupported authenticated storage RPC transport version",
+        return Err(StorageRpcAuthTransportFrameError::UnsupportedVersion(
+            version,
         ));
     }
     let mut len = [0_u8; 4];
-    reader.read_exact(&mut len)?;
+    read_storage_rpc_auth_transport_field(
+        reader,
+        &mut len,
+        StorageRpcAuthTransportFrameField::Length,
+    )?;
     let len = u32::from_be_bytes(len);
     let mut complement = [0_u8; 4];
-    reader.read_exact(&mut complement)?;
+    read_storage_rpc_auth_transport_field(
+        reader,
+        &mut complement,
+        StorageRpcAuthTransportFrameField::LengthComplement,
+    )?;
     if u32::from_be_bytes(complement) != !len {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "authenticated storage RPC transport length check failed",
-        ));
+        return Err(StorageRpcAuthTransportFrameError::LengthCheckFailed);
     }
     let len = len as usize;
     if len > STORAGE_RPC_AUTH_MAX_ENVELOPE_LEN {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "authenticated storage RPC frame exceeds the transport limit",
-        ));
+        return Err(StorageRpcAuthTransportFrameError::FrameTooLarge);
     }
     Ok(len)
+}
+
+fn read_storage_rpc_auth_transport_field<R: Read>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    field: StorageRpcAuthTransportFrameField,
+) -> Result<(), StorageRpcAuthTransportFrameError> {
+    reader.read_exact(bytes).map_err(|error| {
+        if error.kind() == io::ErrorKind::UnexpectedEof {
+            StorageRpcAuthTransportFrameError::Truncated(field)
+        } else {
+            StorageRpcAuthTransportFrameError::Io(error)
+        }
+    })
 }
 
 fn read_storage_rpc_auth_transport_frame_body<R: Read>(
     reader: &mut R,
     len: usize,
 ) -> io::Result<Vec<u8>> {
+    read_storage_rpc_auth_transport_frame_body_typed(reader, len)
+        .map_err(StorageRpcAuthTransportFrameError::into_io_error)
+}
+
+fn read_storage_rpc_auth_transport_frame_body_typed<R: Read>(
+    reader: &mut R,
+    len: usize,
+) -> Result<Vec<u8>, StorageRpcAuthTransportFrameError> {
     let mut envelope = vec![0_u8; len];
-    reader.read_exact(&mut envelope)?;
+    read_storage_rpc_auth_transport_field(
+        reader,
+        &mut envelope,
+        StorageRpcAuthTransportFrameField::Envelope,
+    )?;
     Ok(envelope)
 }
 
@@ -1807,27 +1914,83 @@ mod tests {
         write_storage_rpc_auth_transport_frame(&mut encoded, envelope).unwrap();
 
         assert_eq!(
+            encoded,
+            b"ARGSRPCA\x00\x01\x00\x00\x00\x19\xff\xff\xff\xe6authenticated-storage-rpc"
+        );
+
+        assert_eq!(
+            read_storage_rpc_auth_transport_frame_typed(&mut Cursor::new(&encoded)).unwrap(),
+            envelope
+        );
+        assert_eq!(
             read_storage_rpc_auth_transport_frame(&mut Cursor::new(encoded)).unwrap(),
             envelope
         );
     }
 
     #[test]
-    fn storage_rpc_auth_transport_rejects_unsupported_versions() {
+    fn storage_rpc_auth_transport_has_typed_marker_and_version_failures() {
+        assert!(matches!(
+            read_storage_rpc_auth_transport_frame_len_typed(&mut Cursor::new(b"")),
+            Err(StorageRpcAuthTransportFrameError::Truncated(
+                StorageRpcAuthTransportFrameField::Magic
+            ))
+        ));
+        assert!(matches!(
+            read_storage_rpc_auth_transport_frame_len_typed(&mut Cursor::new(b"ARGSRPC")),
+            Err(StorageRpcAuthTransportFrameError::Truncated(
+                StorageRpcAuthTransportFrameField::Magic
+            ))
+        ));
+        assert!(matches!(
+            read_storage_rpc_auth_transport_frame_len_typed(&mut Cursor::new(b"XRGSRPCA")),
+            Err(StorageRpcAuthTransportFrameError::UnknownMagic)
+        ));
+        assert!(matches!(
+            read_storage_rpc_auth_transport_frame_len_typed(&mut Cursor::new(
+                STORAGE_RPC_AUTH_TRANSPORT_MAGIC
+            )),
+            Err(StorageRpcAuthTransportFrameError::Truncated(
+                StorageRpcAuthTransportFrameField::Version
+            ))
+        ));
+        let mut truncated_version = STORAGE_RPC_AUTH_TRANSPORT_MAGIC.to_vec();
+        truncated_version.push(0);
+        assert!(matches!(
+            read_storage_rpc_auth_transport_frame_len_typed(&mut Cursor::new(truncated_version)),
+            Err(StorageRpcAuthTransportFrameError::Truncated(
+                StorageRpcAuthTransportFrameField::Version
+            ))
+        ));
         for version in [0, STORAGE_RPC_AUTH_TRANSPORT_VERSION + 1] {
-            let mut encoded = Vec::new();
-            write_storage_rpc_auth_transport_frame(&mut encoded, b"payload").unwrap();
-            let version_offset = STORAGE_RPC_AUTH_TRANSPORT_MAGIC.len();
-            encoded[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+            let encoded =
+                encode_storage_rpc_auth_transport_frame_with_version_for_test(b"payload", version);
+
+            assert!(matches!(
+                read_storage_rpc_auth_transport_frame_len_typed(&mut Cursor::new(&encoded)),
+                Err(StorageRpcAuthTransportFrameError::UnsupportedVersion(
+                    observed
+                )) if observed == version
+            ));
 
             let error =
                 read_storage_rpc_auth_transport_frame(&mut Cursor::new(encoded)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert_eq!(
                 error.to_string(),
-                "unsupported authenticated storage RPC transport version"
+                format!("unsupported authenticated storage RPC transport version {version}")
             );
         }
+
+        let mut truncated_envelope =
+            encode_storage_rpc_auth_transport_frame_with_version_for_test(b"payload", 1);
+        truncated_envelope.pop();
+        assert!(matches!(
+            read_storage_rpc_auth_transport_frame_typed(&mut Cursor::new(truncated_envelope)),
+            Err(StorageRpcAuthTransportFrameError::Truncated(
+                StorageRpcAuthTransportFrameField::Envelope
+            ))
+        ));
     }
 
     #[test]
