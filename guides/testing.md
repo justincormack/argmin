@@ -105,10 +105,14 @@ the environment-shaped split-process topology.
 |---|---|
 | `ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT` | Enables the environment-only Raft path; default `false` |
 | `ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME` | Test cluster identity |
-| `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` | Local nonzero Raft node id; defaults to `1` when enabled |
+| `ARGMIN_CONTROL_PLANE_RAFT_NODE_ID` | Local Raft node id; zero is valid and the value defaults to `1` when enabled |
 | `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH` | Local absolute Raft peer Unix socket |
 | `ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS` | Comma-separated `node_id=/absolute/socket` peer map |
 | `ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS` | `node_id=credential_id:version:secret,...`; required for a multi-node peer map |
+
+The environment-shaped split-process harness derives storage node IDs as the
+dense range `0..ARGMIN_LOCAL_NODE_COUNT`. Use manifest-shaped configuration
+when a test needs sparse storage node IDs.
 
 Use a static cluster manifest for production-shaped replicated configuration.
 

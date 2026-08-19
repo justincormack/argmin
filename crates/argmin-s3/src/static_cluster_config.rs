@@ -4355,9 +4355,7 @@ fn validate_authorities<'a>(
         }
         match (authority.kind, authority.raft_node_id, deployment.mode) {
             (AuthorityKind::Single, None, DeploymentMode::Standalone) => {}
-            (AuthorityKind::RaftVoter, Some(node_id), DeploymentMode::Replicated)
-                if node_id != 0 =>
-            {
+            (AuthorityKind::RaftVoter, Some(node_id), DeploymentMode::Replicated) => {
                 if !raft_node_ids.insert(node_id) {
                     return Err(format!("duplicate Raft node id {node_id}"));
                 }
@@ -4389,7 +4387,6 @@ fn validate_storage_nodes<'a>(
     let mut process_ids = BTreeSet::new();
     let mut host_paths = BTreeSet::new();
     for storage_node in storage_nodes {
-        require_nonzero(storage_node.node_id, "storage node id")?;
         let process = processes
             .get(storage_node.process_id.as_str())
             .ok_or_else(|| {
@@ -5650,7 +5647,6 @@ fn credential_principal_key(
             let node_id = credential.node_id.ok_or_else(|| {
                 format!("credential {} requires node_id", credential.credential_id)
             })?;
-            require_nonzero(node_id, "credential node id")?;
             if credential.instance_id.is_some() {
                 return Err(format!(
                     "credential {} must omit instance_id",
@@ -8323,6 +8319,53 @@ secret_ref = "file:/run/argmin-secrets/storage-1.key"
             acting_set.len() == 3
                 && acting_set.iter().copied().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2, 3])
         }));
+    }
+
+    #[test]
+    fn static_cluster_manifest_accepts_zero_raft_storage_and_credential_node_ids() {
+        let manifest = replace_once(
+            &replicated_unix_manifest(),
+            "raft_node_id = 101",
+            "raft_node_id = 0",
+        );
+        let manifest = replace_once(
+            &manifest,
+            "[[storage_nodes]]\nnode_id = 1",
+            "[[storage_nodes]]\nnode_id = 0",
+        );
+        let manifest = replace_once(
+            &manifest,
+            "principal = \"raft-peer\"\nnode_id = 101",
+            "principal = \"raft-peer\"\nnode_id = 0",
+        );
+        let manifest = replace_once(
+            &manifest,
+            "principal = \"storage-node\"\nnode_id = 1",
+            "principal = \"storage-node\"\nnode_id = 0",
+        );
+        let (_dir, manifest) = materialized_replicated_manifest_from("control-1", manifest);
+        let material = manifest.resolve_selected_process_material_at(1).unwrap();
+        let config = manifest
+            .replicated_unix_control_plane_server_config(&material)
+            .unwrap();
+
+        assert_eq!(config.control_plane_raft_node_id, Some(0));
+        assert!(config
+            .control_plane_raft_auth_credentials
+            .iter()
+            .any(|credential| credential.node_id == 0));
+        assert!(config
+            .control_plane_storage_auth_credentials
+            .iter()
+            .any(|credential| credential.node_id == 0));
+        assert!(config
+            .storage_node_sockets
+            .iter()
+            .any(|storage_node| storage_node.node_id == 0));
+        assert!(manifest
+            .initial_pg_acting_sets()
+            .iter()
+            .all(|acting_set| acting_set.contains(&0)));
     }
 
     #[test]

@@ -961,11 +961,6 @@ impl ServerConfig {
                 );
             }
         }
-        if let Some(node_id) = control_plane_raft_node_id {
-            if node_id == 0 {
-                return Err("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID must be > 0".to_string());
-            }
-        }
         if let Some(peer_socket_path) = &control_plane_raft_peer_socket_path {
             if peer_socket_path.is_empty() {
                 return Err(
@@ -1516,9 +1511,6 @@ fn parse_control_plane_raft_peer_sockets(
         let node_id: u64 = raw_node_id.trim().parse().map_err(|e| {
             format!("invalid ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS node id {raw_node_id:?}: {e}")
         })?;
-        if node_id == 0 {
-            return Err("ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS node id must be > 0".to_string());
-        }
         let socket_path = raw_socket_path.trim();
         if socket_path.is_empty() {
             return Err(format!(
@@ -1587,11 +1579,6 @@ fn parse_control_plane_raft_auth_credentials(
                 "invalid ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS node id in entry {entry_number}: {e}"
             )
         })?;
-        if node_id == 0 {
-            return Err(
-                "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS node id must be > 0".to_string(),
-            );
-        }
         let mut parts = raw_credential.splitn(3, ':');
         let credential_id = parts.next().unwrap_or_default().trim();
         let raw_version = parts.next().unwrap_or_default().trim();
@@ -3214,25 +3201,25 @@ mod tests {
     }
 
     #[test]
-    fn experimental_raft_control_plane_parses_peer_socket_map() {
+    fn experimental_raft_control_plane_parses_peer_socket_map_with_zero_node_id() {
         let cfg = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
             ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
             ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
             ("ARGMIN_CONTROL_PLANE_RAFT_CLUSTER_NAME", "raft-cluster-a"),
-            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "11"),
+            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "0"),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKET_PATH",
-                "/tmp/argmin-cp-raft-11.sock",
+                "/tmp/argmin-cp-raft-0.sock",
             ),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_PEER_SOCKETS",
-                "12=/tmp/argmin-cp-raft-12.sock,11=/tmp/argmin-cp-raft-11.sock",
+                "12=/tmp/argmin-cp-raft-12.sock,0=/tmp/argmin-cp-raft-0.sock",
             ),
             (
                 "ARGMIN_CONTROL_PLANE_RAFT_AUTH_CREDENTIALS",
-                "12=raft-peer:1:peer-12-secret,11=raft-peer:1:peer-11-secret",
+                "12=raft-peer:1:peer-12-secret,0=raft-peer:1:peer-0-secret",
             ),
         ]))
         .unwrap();
@@ -3241,17 +3228,17 @@ mod tests {
             cfg.control_plane_raft_cluster_name.as_deref(),
             Some("raft-cluster-a")
         );
-        assert_eq!(cfg.control_plane_raft_node_id, Some(11));
+        assert_eq!(cfg.control_plane_raft_node_id, Some(0));
         assert_eq!(
             cfg.control_plane_raft_peer_socket_path.as_deref(),
-            Some("/tmp/argmin-cp-raft-11.sock")
+            Some("/tmp/argmin-cp-raft-0.sock")
         );
         assert_eq!(
             cfg.control_plane_raft_peer_sockets,
             vec![
                 ConfiguredControlPlaneRaftPeerSocket {
-                    node_id: 11,
-                    socket_path: "/tmp/argmin-cp-raft-11.sock".to_string(),
+                    node_id: 0,
+                    socket_path: "/tmp/argmin-cp-raft-0.sock".to_string(),
                 },
                 ConfiguredControlPlaneRaftPeerSocket {
                     node_id: 12,
@@ -3344,16 +3331,6 @@ mod tests {
 
     #[test]
     fn experimental_raft_control_plane_rejects_invalid_peer_config() {
-        let err = ServerConfig::from_lookup(make_env(&[
-            ("ARGMIN_PROCESS_ROLE", "control-plane"),
-            ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),
-            ("ARGMIN_CONTROL_PLANE_SOCKET_PATH", "/tmp/argmin-cp.sock"),
-            ("ARGMIN_CONTROL_PLANE_EXPERIMENTAL_RAFT", "true"),
-            ("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID", "0"),
-        ]))
-        .unwrap_err();
-        assert!(err.contains("ARGMIN_CONTROL_PLANE_RAFT_NODE_ID must be > 0"));
-
         let err = ServerConfig::from_lookup(make_env(&[
             ("ARGMIN_PROCESS_ROLE", "control-plane"),
             ("ARGMIN_CONTROL_PLANE_STATE_PATH", "/tmp/argmin-cp.state"),

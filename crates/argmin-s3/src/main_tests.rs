@@ -10,6 +10,7 @@ mod tests {
         ConfiguredControlPlaneRaftPeerSocket, SecretConfigValue,
     };
     use openraft::impls::{BasicNode, Vote};
+    use std::collections::BTreeSet;
     use storage::control_plane::{
         ControlPlaneHeartbeatSink, ControlPlaneRpcClientEndpoint, NodeAvailabilityState,
         NodeHeartbeat, NodeMembershipState, NodePgHeartbeatObservation, PgMetadataProof,
@@ -1432,19 +1433,20 @@ mod tests {
         name: &str,
         state_path: &Path,
     ) -> ExperimentalRaftTestHarness {
-        experimental_raft_durable_test_harness_inner(name, state_path)
+        experimental_raft_durable_test_harness_inner(name, state_path, 1)
     }
 
     fn experimental_raft_durable_wal_test_harness(
         name: &str,
         state_path: &Path,
     ) -> ExperimentalRaftTestHarness {
-        experimental_raft_durable_test_harness_inner(name, state_path)
+        experimental_raft_durable_test_harness_inner(name, state_path, 1)
     }
 
     fn experimental_raft_durable_test_harness_inner(
         name: &str,
         state_path: &Path,
+        node_id: ControlPlaneRaftNodeId,
     ) -> ExperimentalRaftTestHarness {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -1459,7 +1461,7 @@ mod tests {
             let authority =
                 ControlPlaneRaftAuthority::new_experimental_single_node_durable_for_test(
                     cluster_name,
-                    1,
+                    node_id,
                     state_path,
                 )
                 .await
@@ -1480,7 +1482,7 @@ mod tests {
             }
             authority
                 .wait_for_current_leader_for_test(
-                    1,
+                    node_id,
                     Duration::from_secs(1),
                     "durable experimental process test leadership",
                 )
@@ -1508,6 +1510,73 @@ mod tests {
             control_plane,
             _owned_state_dir: None,
         }
+    }
+
+    #[test]
+    fn experimental_raft_node_zero_initializes_leads_and_reloads_durable_state() {
+        let state_dir = short_unix_socket_test_dir("experimental-raft-node-zero-lifecycle");
+        let _ = fs::remove_dir_all(&state_dir);
+        fs::create_dir_all(&state_dir).unwrap();
+        let state_path = state_dir.join("control-plane.state");
+        let mut config = test_server_config();
+        config.storage_node_sockets = vec![config::ConfiguredStorageNodeSocket {
+            node_id: 7,
+            socket_path: "/tmp/argmin-experimental-raft-node-zero-storage-7.sock".to_string(),
+        }];
+        config.storage_pg_ids = vec![11];
+
+        let harness =
+            experimental_raft_durable_test_harness_inner("node-zero-lifecycle", &state_path, 0);
+        let status = harness
+            .control_plane
+            .block_on(harness.authority.status())
+            .expect("node-zero Raft status should read");
+        assert_eq!(status.node_id(), 0);
+        assert_eq!(status.current_leader(), Some(0));
+        assert_eq!(status.effective_voters(), &BTreeSet::from([0]));
+        assert_eq!(status.applied_voters(), &BTreeSet::from([0]));
+        assert!(status.linearized_authority_serving());
+
+        bootstrap_empty_experimental_raft_control_plane(&harness.control_plane, &config)
+            .expect("node-zero Raft control-plane bootstrap should succeed");
+        let before_restart = harness
+            .control_plane
+            .current_snapshot()
+            .expect("node-zero Raft snapshot should read before restart");
+        assert!(before_restart.node(NodeId::new(7)).is_some());
+        assert_eq!(
+            before_restart
+                .pg(PgId::new(11))
+                .expect("node-zero Raft bootstrap should persist PG 11")
+                .acting_set(),
+            &[NodeId::new(7)]
+        );
+        assert!(state_path.exists());
+        harness.shutdown();
+
+        let restarted =
+            experimental_raft_durable_test_harness_inner("node-zero-lifecycle", &state_path, 0);
+        let restarted_status = restarted
+            .control_plane
+            .block_on(restarted.authority.status())
+            .expect("restarted node-zero Raft status should read");
+        assert_eq!(restarted_status.node_id(), 0);
+        assert_eq!(restarted_status.current_leader(), Some(0));
+        assert_eq!(restarted_status.effective_voters(), &BTreeSet::from([0]));
+        assert_eq!(restarted_status.applied_voters(), &BTreeSet::from([0]));
+        assert!(restarted_status.linearized_authority_serving());
+        bootstrap_empty_experimental_raft_control_plane(&restarted.control_plane, &config)
+            .expect("restarted node-zero Raft bootstrap should be a no-op");
+        assert_eq!(
+            restarted
+                .control_plane
+                .current_snapshot()
+                .expect("node-zero Raft snapshot should read after restart"),
+            before_restart
+        );
+
+        restarted.shutdown();
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     fn spawn_experimental_raft_unix_rpc_server(

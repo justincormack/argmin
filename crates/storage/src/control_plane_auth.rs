@@ -39,11 +39,6 @@ pub enum ControlPlaneAuthPrincipal {
 impl ControlPlaneAuthPrincipal {
     fn validate(&self) -> Result<(), ControlPlaneError> {
         match self {
-            Self::RaftPeer { node_id } => {
-                if *node_id == 0 {
-                    return Err(auth_protocol_error("Raft peer principal node id is zero"));
-                }
-            }
             Self::StorageNode { incarnation, .. } => {
                 if *incarnation == 0 {
                     return Err(auth_protocol_error(
@@ -58,7 +53,7 @@ impl ControlPlaneAuthPrincipal {
                     "principal instance id",
                 )?;
             }
-            Self::StorageNodeProcess { .. } => {}
+            Self::RaftPeer { .. } | Self::StorageNodeProcess { .. } => {}
             Self::LocalMaintenance { process_id } => validate_nonempty_string(
                 process_id,
                 CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN,
@@ -1506,23 +1501,28 @@ mod tests {
     }
 
     #[test]
-    fn control_plane_auth_envelope_rejects_invalid_principal_fields() {
+    fn control_plane_auth_envelope_accepts_zero_raft_node_id() {
         assert!(
             ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
                 cluster_id: "cluster-a".to_owned(),
                 credential_id: "credential-a".to_owned(),
                 credential_version: 1,
                 source: ControlPlaneAuthPrincipal::RaftPeer { node_id: 0 },
-                target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::ControlPlane),
+                target: ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 0,
+                }),
                 operation: ControlPlaneAuthOperation::RaftVote,
                 issued_at_ms: None,
                 expires_at_ms: None,
                 sequence: None,
                 nonce: Vec::new(),
             })
-            .is_err()
+            .is_ok()
         );
+    }
 
+    #[test]
+    fn control_plane_auth_envelope_rejects_invalid_principal_fields() {
         assert!(
             ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
                 cluster_id: "cluster-a".to_owned(),

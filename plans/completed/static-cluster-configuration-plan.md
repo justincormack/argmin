@@ -440,13 +440,13 @@ admin instance for internal management operations.
 
 - `single`, valid only in standalone mode and omitting `raft_node_id` and
   Raft peer endpoints; or
-- `raft-voter`, valid only in replicated mode and requiring a nonzero
+- `raft-voter`, valid only in replicated mode and requiring a numeric
   `raft_node_id` plus at least one Raft peer endpoint owned by its process.
 
 Every authority has a stable string `id`. A Raft voter additionally has a
-nonzero numeric `raft_node_id`. An embedded standalone authority still has an
-authority record so its durable identity, state path, and optional separate
-client/recovery endpoints are explicit.
+numeric `raft_node_id`, for which zero is valid. An embedded standalone
+authority still has an authority record so its durable identity, state path,
+and optional separate client/recovery endpoints are explicit.
 
 `endpoints.protocol` is:
 
@@ -992,7 +992,7 @@ Final status as of 2026-08-05:
   changes. The validation command emits the three redacted SHA-256 identities.
 - Slice 3's compatibility mapping is implemented: server startup selects file
   mode only when both `ARGMIN_CLUSTER_CONFIG_PATH` and `ARGMIN_PROCESS_ID` are
-  present, rejects every legacy environment variable that can alter
+  present, rejects every environment-only variable that can alter
   cluster-owned topology or identity, and otherwise retains the env-only
   standalone/test path. A validated standalone `all-in-one` process maps to the
   existing local runtime while preserving the manifest's explicit storage-node
@@ -1002,8 +1002,8 @@ Final status as of 2026-08-05:
   part of the replicated/embedded-service slices. Local listener and
   user-facing S3 settings remain schema-external as specified above. Mapping
   and runtime regressions cover mixed-mode rejection, unchanged env-only
-  behavior, nonzero storage-node identity, exact data-directory use, and the
-  absence of an unserved control-plane refresh path.
+  behavior, explicit storage-node identity including zero, exact data-directory
+  use, and the absence of an unserved control-plane refresh path.
 - Slice 3 now also maps replicated control-plane processes. The
   mapping uses the exact manifest authority state, control-plane,
   clock-recovery, Raft-peer, storage-bootstrap, and routed client endpoints.

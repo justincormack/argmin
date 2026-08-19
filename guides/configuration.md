@@ -217,6 +217,10 @@ Array records use these fields:
 | `[[tls_trust_bundles]]` | `id`, `ca_bundle_ref` | none |
 | `[[auth_credentials]]` | `principal`, `credential_id`, `credential_version`, `use_for_signing`, `accept_from_ms`, `secret_ref` | `node_id` for Raft/storage nodes or `instance_id` for frontend/admin/maintenance; optional `accept_until_ms` |
 
+Within a complete manifest, numeric Raft and storage node IDs are opaque
+unsigned values. Zero is valid, and IDs need not be one-based, contiguous, or
+shared between the separate Raft and storage namespaces.
+
 Every process may also set `trace_enabled`, `trace_filter`, `trace_file`, and
 `trace_sync`. `trace_file`, when present, must be absolute. Advanced process
 tuning fields are `storage_node_rpc_admission_limit`,

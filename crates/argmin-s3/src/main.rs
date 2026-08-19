@@ -714,12 +714,10 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
             );
             return Some(2);
         };
-        let Some(node_id) = args.next().and_then(|arg| {
-            arg.to_string_lossy()
-                .parse::<u64>()
-                .ok()
-                .filter(|node_id| *node_id != 0)
-        }) else {
+        let Some(node_id) = args
+            .next()
+            .and_then(|arg| arg.to_string_lossy().parse::<u64>().ok())
+        else {
             eprintln!(
                 "usage: argmin-s3 {} <socket-path> <raft-node-id>",
                 command.to_string_lossy()
