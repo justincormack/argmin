@@ -375,6 +375,10 @@ by the effective service user. Private credential and key files must also be
 inaccessible to group and other users. Certificate and CA files may be group-
 or other-readable but must not be group- or other-writable.
 
+The S3 secret access key file contains the literal value configured in clients
+as `AWS_SECRET_ACCESS_KEY`; it is not base64-decoded. Surrounding ASCII
+whitespace is ignored, so the file may use the conventional final newline.
+
 Internal credential files are limited to 64 bytes, other secret files to 4
 KiB, private keys to 64 KiB, and certificate chains and trust bundles to 1 MiB
 each. One selected process may resolve at most 256 material files and 16 MiB in

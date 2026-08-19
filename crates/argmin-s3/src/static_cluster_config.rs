@@ -705,7 +705,7 @@ impl ValidatedStaticClusterManifest {
         let mut material_budget = StaticMaterialBudget::new(limits);
         let selected_process = &self.manifest.processes[self.selected_process_index];
         let s3 = if selected_process.kind.has_frontend() {
-            let read_utf8_secret = |budget: &mut StaticMaterialBudget,
+            let read_text_secret = |budget: &mut StaticMaterialBudget,
                                     reference: &str,
                                     label: &str|
              -> Result<String, String> {
@@ -715,7 +715,7 @@ impl ValidatedStaticClusterManifest {
                     StaticMaterialFileAccess::Private,
                     label,
                 )?;
-                String::from_utf8(bytes).map_err(|_| format!("{label} must contain valid UTF-8"))
+                normalize_utf8_secret_text(bytes, label)
             };
             let read_base64_key = |budget: &mut StaticMaterialBudget,
                                    reference: &str,
@@ -750,7 +750,7 @@ impl ValidatedStaticClusterManifest {
                 })
                 .transpose()?;
             Some(ResolvedStaticS3Material {
-                secret_access_key: read_utf8_secret(
+                secret_access_key: read_text_secret(
                     &mut material_budget,
                     &self.manifest.s3.secret_access_key_ref,
                     "S3 secret access key",
@@ -6220,7 +6220,11 @@ fn decode_base64_credential_secret(mut encoded_bytes: Vec<u8>) -> Result<Vec<u8>
     Ok(decoded)
 }
 
-fn normalize_base64_secret_text(mut bytes: Vec<u8>, label: &str) -> Result<String, String> {
+fn normalize_secret_text(
+    mut bytes: Vec<u8>,
+    label: &str,
+    expected_format: &str,
+) -> Result<String, String> {
     let start = bytes
         .iter()
         .position(|byte| !byte.is_ascii_whitespace())
@@ -6236,8 +6240,22 @@ fn normalize_base64_secret_text(mut bytes: Vec<u8>, label: &str) -> Result<Strin
     String::from_utf8(bytes).map_err(|error| {
         let mut bytes = error.into_bytes();
         bytes.fill(0);
-        format!("{label} must contain valid UTF-8 base64 text")
+        format!("{label} must contain {expected_format}")
     })
+}
+
+fn normalize_utf8_secret_text(bytes: Vec<u8>, label: &str) -> Result<String, String> {
+    let secret = normalize_secret_text(bytes, label, "valid UTF-8")?;
+    if secret.is_empty() {
+        return Err(format!(
+            "{label} must not be empty after removing surrounding ASCII whitespace"
+        ));
+    }
+    Ok(secret)
+}
+
+fn normalize_base64_secret_text(bytes: Vec<u8>, label: &str) -> Result<String, String> {
+    normalize_secret_text(bytes, label, "valid UTF-8 base64 text")
 }
 
 fn validate_timeout(value: u64, field: &str) -> Result<(), String> {
@@ -9617,7 +9635,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
     }
 
     #[test]
-    fn static_cluster_complete_validation_normalizes_base64_sse_key_files() {
+    fn static_cluster_complete_validation_normalizes_s3_secret_files() {
         let manifest_text = replicated_tcp_data_manifest()
             .replace("tcp://control-2.internal:", "tcp://localhost:")
             .replace("tcp://control-3.internal:", "tcp://localhost:")
@@ -9644,7 +9662,7 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let material_dir = dir.path().join("material");
         write_material_file(
             &material_dir.join("s3-secret-access-key"),
-            b"test-secret-access-key\n",
+            b" \ntest-secret-access-key\r\n",
             0o600,
         );
         let sse_c_path = material_dir.join("sse-c-validator-key");
@@ -9659,9 +9677,29 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
         let (_, material) = validate_loaded_static_cluster_configuration(manifest).unwrap();
         let s3 = material.s3.as_ref().unwrap();
 
-        assert_eq!(s3.secret_access_key, "test-secret-access-key\n");
+        assert_eq!(s3.secret_access_key, "test-secret-access-key");
         assert_eq!(s3.sse_s3_wrapping_key, TEST_SSE_KEY_B64);
         assert_eq!(s3.sse_c_validator_key.as_deref(), Some(TEST_SSE_KEY_B64));
+    }
+
+    #[test]
+    fn static_cluster_complete_validation_rejects_whitespace_only_s3_secret() {
+        let (dir, manifest) =
+            materialized_replicated_manifest_from("frontend-1", replicated_tcp_data_manifest());
+        write_material_file(
+            &dir.path().join("material/s3-secret-access-key"),
+            b" \r\n\t",
+            0o600,
+        );
+
+        let error = validate_loaded_static_cluster_configuration(manifest).unwrap_err();
+
+        assert!(
+            error.contains(
+                "S3 secret access key must not be empty after removing surrounding ASCII whitespace"
+            ),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
