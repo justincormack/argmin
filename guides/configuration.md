@@ -749,6 +749,7 @@ Run every process with `ARGMIN_CLUSTER_CONFIG_PATH` and its own
 `ARGMIN_PROCESS_ID`. Install the S3 secret, wrapping-key, and optional SSE-C
 validator files only on frontend hosts; control-plane and storage-only
 processes do not resolve them.
-Start all three voters and storage nodes; the initial Raft establishment wait
-does not impose a fixed deadline, so hosts may be brought up at different
-times.
+Start all three voters and storage nodes. Initial Raft establishment and a
+storage node waiting on retryable control-plane availability do not impose an
+aggregate deadline, so hosts may be brought up at different times. Permanent
+configuration, authentication, and protocol errors still terminate startup.

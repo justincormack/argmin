@@ -3071,6 +3071,27 @@ fn build_control_plane_storage_node_process_config(
     ec_config: &EcConfig,
     control_plane_socket_path: &str,
 ) -> Result<BuiltStorageNodeProcessConfig, String> {
+    let started_at = Instant::now();
+    build_control_plane_storage_node_process_config_with_startup_retry_runtime(
+        config,
+        ec_config,
+        control_plane_socket_path,
+        || started_at.elapsed(),
+        thread::sleep,
+    )
+}
+
+fn build_control_plane_storage_node_process_config_with_startup_retry_runtime<N, W>(
+    config: &ServerConfig,
+    ec_config: &EcConfig,
+    control_plane_socket_path: &str,
+    mut monotonic_elapsed: N,
+    mut wait_before_retry: W,
+) -> Result<BuiltStorageNodeProcessConfig, String>
+where
+    N: FnMut() -> Duration,
+    W: FnMut(Duration),
+{
     let node_id = NodeId::new(
         config
             .storage_node_id
@@ -3119,9 +3140,7 @@ fn build_control_plane_storage_node_process_config(
     let node_incarnation = bootstrap.node_incarnation();
     let lease_ms = u64::try_from(config.control_plane_heartbeat_lease_duration.as_millis())
         .map_err(|_| "ARGMIN_CONTROL_PLANE_HEARTBEAT_LEASE_MS is too large".to_string())?;
-    let retry_deadline = storage_node_control_plane_startup_retry_deadline(config);
     let retry_delay = storage_node_control_plane_startup_retry_delay(config);
-    let started_at = Instant::now();
     let mut attempts = 0_u32;
     let refresh = loop {
         attempts = attempts.saturating_add(1);
@@ -3145,16 +3164,14 @@ fn build_control_plane_storage_node_process_config(
                 }
                 break refresh;
             }
-            Err(error)
-                if error.is_retryable_heartbeat_startup_error()
-                    && started_at.elapsed() < retry_deadline =>
-            {
+            Err(error) if error.is_retryable_heartbeat_startup_error() => {
+                let elapsed = monotonic_elapsed();
                 if attempts == 1 || attempts.is_multiple_of(10) {
                     eprintln!(
-                        "argmin-s3 storage-node waiting for control-plane runtime map during startup: {error}"
+                        "argmin-s3 storage-node waiting for control-plane runtime map during startup after {elapsed:?}: {error}"
                     );
                 }
-                thread::sleep(retry_delay);
+                wait_before_retry(retry_delay);
             }
             Err(error) => {
                 return Err(format!(
@@ -3456,13 +3473,6 @@ fn frontend_control_plane_startup_retry_deadline(config: &ServerConfig) -> Durat
     Duration::from_secs(30)
         .max(refresh_budget)
         .max(lease_budget)
-}
-
-fn storage_node_control_plane_startup_retry_deadline(config: &ServerConfig) -> Duration {
-    let lease_budget = config
-        .control_plane_heartbeat_lease_duration
-        .saturating_mul(2);
-    Duration::from_secs(30).max(lease_budget)
 }
 
 fn frontend_control_plane_startup_retry_delay(config: &ServerConfig) -> Duration {

@@ -7823,4 +7823,98 @@ mod tests {
         drop(prepared_server);
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn storage_node_control_plane_startup_waits_for_late_listener() {
+        let tmp = short_unix_socket_test_dir("sbl");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let socket_path = tmp.join("cp.sock");
+        let endpoint = tmp.join("n0.sock");
+        let ec_config = EcConfig::new(1, 0).unwrap();
+        let mut config = test_server_config();
+        config.process_role = ProcessRole::StorageNode;
+        config.pg_count = 1;
+        config.storage_pg_ids = vec![0];
+        config.storage_node_id = Some(0);
+        config.storage_node_data_dir = Some(tmp.join("node-0-data").display().to_string());
+        config.storage_node_socket_path = Some(endpoint.display().to_string());
+        config.control_plane_socket_path = Some(socket_path.display().to_string());
+        let former_retry_deadline = Duration::from_secs(30).max(
+            config
+                .control_plane_heartbeat_lease_duration
+                .saturating_mul(2),
+        );
+        let beyond_former_deadline = former_retry_deadline + Duration::from_millis(1);
+        let simulated_elapsed_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let sampled_beyond_deadline = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let elapsed_clock = Arc::clone(&simulated_elapsed_ms);
+        let elapsed_sample = Arc::clone(&sampled_beyond_deadline);
+        let wait_clock = Arc::clone(&simulated_elapsed_ms);
+        let (past_deadline_tx, past_deadline_rx) = std::sync::mpsc::sync_channel(0);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(0);
+
+        let unavailable_listener = UnixListener::bind(&socket_path).unwrap();
+        let startup = std::thread::spawn(move || {
+            let mut retries = 0_u32;
+            build_control_plane_storage_node_process_config_with_startup_retry_runtime(
+                &config,
+                &ec_config,
+                config.control_plane_socket_path.as_deref().unwrap(),
+                move || {
+                    let elapsed_ms = elapsed_clock.load(std::sync::atomic::Ordering::SeqCst);
+                    let elapsed = Duration::from_millis(elapsed_ms);
+                    if elapsed > former_retry_deadline {
+                        elapsed_sample.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    elapsed
+                },
+                move |_| {
+                    retries += 1;
+                    if retries == 1 {
+                        wait_clock.store(
+                            u64::try_from(beyond_former_deadline.as_millis()).unwrap(),
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                    } else if retries == 2 {
+                        past_deadline_tx.send(()).unwrap();
+                        resume_rx.recv().unwrap();
+                    }
+                },
+            )
+        });
+        let (connection, _) = unavailable_listener
+            .accept()
+            .expect("storage node should attempt its initial control-plane connection");
+        drop(connection);
+        drop(unavailable_listener);
+        std::fs::remove_file(&socket_path).unwrap();
+        past_deadline_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("storage-node startup should retry beyond its former aggregate deadline");
+        assert!(
+            !startup.is_finished(),
+            "storage-node startup must remain live beyond its former aggregate retry deadline"
+        );
+        assert!(
+            sampled_beyond_deadline.load(std::sync::atomic::Ordering::SeqCst),
+            "the retry decision must observe simulated monotonic time beyond the former deadline"
+        );
+
+        let server = serve_control_plane_storage_node_startup_refreshes(
+            socket_path,
+            NodeId::new(0),
+            1,
+        );
+        resume_tx.send(()).unwrap();
+        let built = startup
+            .join()
+            .expect("storage-node startup thread should not panic")
+            .expect("storage-node startup should continue once the control plane is available");
+
+        assert_eq!(built.control_plane_node_incarnation, Some(1));
+        assert_eq!(server.join().unwrap(), vec![1]);
+        drop(built);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
