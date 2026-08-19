@@ -27,6 +27,7 @@ const STAGED_PUT_PREFIX_BYTES: usize = 64 * 1024;
 const STREAMED_READ_BYTES: usize = 4 * 1024 * 1024;
 const RESPONSE_STAGE_WINDOW: Duration = Duration::from_secs(2);
 const ORIGINAL_TIMING_DESTINATION: &[u8] = b"original ObjectWriter timing destination";
+const TIMING_TRANSITION_MAX_ATTEMPTS: usize = 3;
 
 const _: () = assert!(DIRECT_PUT_BYTES <= server_core::coordinator::INTERNAL_SEGMENT_SIZE);
 const _: () =
@@ -52,7 +53,7 @@ enum TimingPutOutcome {
     RetryableContention,
 }
 
-fn is_object_writer_timing_slow_down(status: u16, body: &[u8]) -> bool {
+fn is_timing_slow_down(status: u16, body: &[u8]) -> bool {
     status == 503
         && std::str::from_utf8(body)
             .ok()
@@ -61,13 +62,13 @@ fn is_object_writer_timing_slow_down(status: u16, body: &[u8]) -> bool {
 }
 
 #[test]
-fn object_writer_timing_slow_down_classification_requires_status_and_code() {
+fn timing_slow_down_classification_requires_status_and_code() {
     let slow_down = b"<Error><Code>SlowDown</Code></Error>";
     let operation_aborted = b"<Error><Code>OperationAborted</Code></Error>";
 
-    assert!(is_object_writer_timing_slow_down(503, slow_down));
-    assert!(!is_object_writer_timing_slow_down(409, slow_down));
-    assert!(!is_object_writer_timing_slow_down(503, operation_aborted));
+    assert!(is_timing_slow_down(503, slow_down));
+    assert!(!is_timing_slow_down(409, slow_down));
+    assert!(!is_timing_slow_down(503, operation_aborted));
 }
 
 impl TimingPutEncoding {
@@ -615,7 +616,7 @@ async fn assert_object_writer_timing_put_result(
             }
             TimingPutOutcome::AuthorizationResolved
         }
-        status if is_object_writer_timing_slow_down(status, response.body()) => {
+        status if is_timing_slow_down(status, response.body()) => {
             assert_eq!(
                 current, case.baseline,
                 "{}: slowed object write mutated object version history",
@@ -891,7 +892,7 @@ async fn assert_timing_dependent_put_result(
     key: &str,
     expected_body: &[u8],
     response: &FlushedResponse,
-) {
+) -> TimingPutOutcome {
     match response.status() {
         200 => {
             let object = CTX
@@ -904,6 +905,7 @@ async fn assert_timing_dependent_put_result(
                 .expect("successful timing-dependent PutObject must be readable");
             let body = object.body.collect().await.unwrap().into_bytes();
             assert_eq!(&body[..], expected_body);
+            TimingPutOutcome::AuthorizationResolved
         }
         403 => {
             let response_body = std::str::from_utf8(response.body())
@@ -921,6 +923,22 @@ async fn assert_timing_dependent_put_result(
                 .send()
                 .await;
             assert_eq!(err_status(&head), 404, "{head:?}");
+            TimingPutOutcome::AuthorizationResolved
+        }
+        status if is_timing_slow_down(status, response.body()) => {
+            let head = CTX
+                .client()
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await;
+            assert_eq!(
+                err_status(&head),
+                404,
+                "slowed timing-dependent PutObject mutated destination: {head:?}"
+            );
+            TimingPutOutcome::RetryableContention
         }
         status => panic!("unexpected timing-dependent PutObject status {status}"),
     }
@@ -1106,127 +1124,163 @@ fn test_get_object_stream_uses_existing_tag_snapshot_after_strong_mutation() {
     });
 }
 
+async fn run_boe_inflight_put_policy_revocation_once() -> TimingPutOutcome {
+    let bucket = create_boe_bucket(CTX.client()).await;
+    let client = ordinary_alt_client();
+    let allow_canary = "revocation-allow-canary";
+    let deny_canary = "revocation-deny-canary";
+    let key = "inflight-policy-revocation";
+    let total_bytes = STAGED_PUT_BYTES;
+
+    set_alt_put_policy(&bucket, "Allow").await;
+    wait_for_put_allowed(&client, &bucket, allow_canary, Duration::from_secs(2)).await;
+
+    let body = vec![b'k'; total_bytes];
+    let mut request = open_alt_flushed_put(&bucket, key, &body, STAGED_PUT_PREFIX_BYTES, &[]).await;
+    assert!(
+        request
+            .response_status_within(Duration::from_millis(250))
+            .await
+            .unwrap()
+            .is_none(),
+        "in-flight PutObject completed before policy revocation"
+    );
+
+    set_alt_put_policy(&bucket, "Deny").await;
+    let soak = revocation_soak_duration();
+    let (keepalive_bytes, body_open) = wait_for_put_denied_while_keeping_body_active(
+        &client,
+        &bucket,
+        deny_canary,
+        soak,
+        &mut request,
+    )
+    .await;
+
+    let response_visible = request
+        .response_status_within(RESPONSE_STAGE_WINDOW)
+        .await
+        .unwrap()
+        .is_some();
+    let response = if response_visible || !body_open {
+        request
+            .read_response()
+            .await
+            .expect("read early in-flight PutObject response")
+    } else if request
+        .write_and_flush(&body[STAGED_PUT_PREFIX_BYTES + keepalive_bytes..total_bytes])
+        .await
+        .is_ok()
+    {
+        request
+            .finish_and_read_response()
+            .await
+            .expect("read in-flight PutObject response after body completion")
+    } else {
+        request
+            .read_response()
+            .await
+            .expect("read early in-flight PutObject response")
+    };
+    let status = response.status();
+    println!(
+        "BOE in-flight PutObject after converged policy revocation status: {status}, \
+                 deny soak: {soak:?}"
+    );
+    let outcome = assert_timing_dependent_put_result(&bucket, key, &body, &response).await;
+
+    cleanup_auth_timing_bucket(&bucket, &[allow_canary, deny_canary, key]).await;
+    outcome
+}
+
 #[test]
 fn test_boe_inflight_put_policy_revocation_preserves_latched_outcome_state() {
     s3_tests::run(async {
-        let bucket = create_boe_bucket(CTX.client()).await;
-        let client = ordinary_alt_client();
-        let allow_canary = "revocation-allow-canary";
-        let deny_canary = "revocation-deny-canary";
-        let key = "inflight-policy-revocation";
-        let total_bytes = STAGED_PUT_BYTES;
-
-        set_alt_put_policy(&bucket, "Allow").await;
-        wait_for_put_allowed(&client, &bucket, allow_canary, Duration::from_secs(2)).await;
-
-        let body = vec![b'k'; total_bytes];
-        let mut request =
-            open_alt_flushed_put(&bucket, key, &body, STAGED_PUT_PREFIX_BYTES, &[]).await;
-        assert!(
-            request
-                .response_status_within(Duration::from_millis(250))
-                .await
-                .unwrap()
-                .is_none(),
-            "in-flight PutObject completed before policy revocation"
+        for attempt in 1..=TIMING_TRANSITION_MAX_ATTEMPTS {
+            if run_boe_inflight_put_policy_revocation_once().await
+                == TimingPutOutcome::AuthorizationResolved
+            {
+                return;
+            }
+            if attempt < TIMING_TRANSITION_MAX_ATTEMPTS {
+                println!(
+                    "BOE in-flight PutObject policy revocation attempt {attempt}/{TIMING_TRANSITION_MAX_ATTEMPTS} encountered SlowDown; retrying the complete transition"
+                );
+            }
+        }
+        panic!(
+            "BOE in-flight PutObject policy revocation did not produce an authorization outcome after {TIMING_TRANSITION_MAX_ATTEMPTS} attempts"
         );
-
-        set_alt_put_policy(&bucket, "Deny").await;
-        let soak = revocation_soak_duration();
-        let (keepalive_bytes, body_open) = wait_for_put_denied_while_keeping_body_active(
-            &client,
-            &bucket,
-            deny_canary,
-            soak,
-            &mut request,
-        )
-        .await;
-
-        let response_visible = request
-            .response_status_within(RESPONSE_STAGE_WINDOW)
-            .await
-            .unwrap()
-            .is_some();
-        let response = if response_visible || !body_open {
-            request
-                .read_response()
-                .await
-                .expect("read early in-flight PutObject response")
-        } else if request
-            .write_and_flush(&body[STAGED_PUT_PREFIX_BYTES + keepalive_bytes..total_bytes])
-            .await
-            .is_ok()
-        {
-            request
-                .finish_and_read_response()
-                .await
-                .expect("read in-flight PutObject response after body completion")
-        } else {
-            request
-                .read_response()
-                .await
-                .expect("read early in-flight PutObject response")
-        };
-        let status = response.status();
-        println!(
-            "BOE in-flight PutObject after converged policy revocation status: {status}, \
-                 deny soak: {soak:?}"
-        );
-        assert_timing_dependent_put_result(&bucket, key, &body, &response).await;
-
-        cleanup_auth_timing_bucket(&bucket, &[allow_canary, deny_canary, key]).await;
     });
+}
+
+async fn run_boe_inflight_put_policy_grant_once() -> TimingPutOutcome {
+    let bucket = create_boe_bucket(CTX.client()).await;
+    let client = ordinary_alt_client();
+    let deny_canary = "grant-deny-canary";
+    let allow_canary = "grant-allow-canary";
+    let key = "inflight-policy-grant";
+    let total_bytes = STAGED_PUT_BYTES;
+
+    set_alt_put_policy(&bucket, "Deny").await;
+    wait_for_put_denied(&client, &bucket, deny_canary, Duration::from_secs(2)).await;
+
+    let body = vec![b'g'; total_bytes];
+    let mut request = open_alt_flushed_put(&bucket, key, &body, STAGED_PUT_PREFIX_BYTES, &[]).await;
+    let early_status = request
+        .response_status_within(RESPONSE_STAGE_WINDOW)
+        .await
+        .unwrap();
+
+    set_alt_put_policy(&bucket, "Allow").await;
+    wait_for_put_allowed(&client, &bucket, allow_canary, Duration::from_secs(5)).await;
+
+    let response = if early_status.is_some() {
+        request
+            .read_response()
+            .await
+            .expect("read early policy-denied PutObject response")
+    } else if request
+        .write_and_flush(&body[STAGED_PUT_PREFIX_BYTES..])
+        .await
+        .is_ok()
+    {
+        request
+            .finish_and_read_response()
+            .await
+            .expect("read policy-granted PutObject response")
+    } else {
+        request
+            .read_response()
+            .await
+            .expect("read early policy-denied PutObject response")
+    };
+    let status = response.status();
+    println!("BOE in-flight PutObject after converged policy grant status: {status}");
+    let outcome = assert_timing_dependent_put_result(&bucket, key, &body, &response).await;
+
+    cleanup_auth_timing_bucket(&bucket, &[deny_canary, allow_canary, key]).await;
+    outcome
 }
 
 #[test]
 fn test_boe_inflight_put_policy_grant_preserves_latched_outcome_state() {
     s3_tests::run(async {
-        let bucket = create_boe_bucket(CTX.client()).await;
-        let client = ordinary_alt_client();
-        let deny_canary = "grant-deny-canary";
-        let allow_canary = "grant-allow-canary";
-        let key = "inflight-policy-grant";
-        let total_bytes = STAGED_PUT_BYTES;
-
-        set_alt_put_policy(&bucket, "Deny").await;
-        wait_for_put_denied(&client, &bucket, deny_canary, Duration::from_secs(2)).await;
-
-        let body = vec![b'g'; total_bytes];
-        let mut request =
-            open_alt_flushed_put(&bucket, key, &body, STAGED_PUT_PREFIX_BYTES, &[]).await;
-        let early_status = request
-            .response_status_within(RESPONSE_STAGE_WINDOW)
-            .await
-            .unwrap();
-
-        set_alt_put_policy(&bucket, "Allow").await;
-        wait_for_put_allowed(&client, &bucket, allow_canary, Duration::from_secs(5)).await;
-
-        let response = if early_status.is_some() {
-            request
-                .read_response()
-                .await
-                .expect("read early policy-denied PutObject response")
-        } else if request
-            .write_and_flush(&body[STAGED_PUT_PREFIX_BYTES..])
-            .await
-            .is_ok()
-        {
-            request
-                .finish_and_read_response()
-                .await
-                .expect("read policy-granted PutObject response")
-        } else {
-            request
-                .read_response()
-                .await
-                .expect("read early policy-denied PutObject response")
-        };
-        let status = response.status();
-        println!("BOE in-flight PutObject after converged policy grant status: {status}");
-        assert_timing_dependent_put_result(&bucket, key, &body, &response).await;
-
-        cleanup_auth_timing_bucket(&bucket, &[deny_canary, allow_canary, key]).await;
+        for attempt in 1..=TIMING_TRANSITION_MAX_ATTEMPTS {
+            if run_boe_inflight_put_policy_grant_once().await
+                == TimingPutOutcome::AuthorizationResolved
+            {
+                return;
+            }
+            if attempt < TIMING_TRANSITION_MAX_ATTEMPTS {
+                println!(
+                    "BOE in-flight PutObject policy grant attempt {attempt}/{TIMING_TRANSITION_MAX_ATTEMPTS} encountered SlowDown; retrying the complete transition"
+                );
+            }
+        }
+        panic!(
+            "BOE in-flight PutObject policy grant did not produce an authorization outcome after {TIMING_TRANSITION_MAX_ATTEMPTS} attempts"
+        );
     });
 }
 
@@ -1314,9 +1368,7 @@ async fn run_object_writer_put_policy_transition(
     initial_effect: &str,
     final_effect: &str,
 ) {
-    const MAX_ATTEMPTS: usize = 3;
-
-    for attempt in 1..=MAX_ATTEMPTS {
+    for attempt in 1..=TIMING_TRANSITION_MAX_ATTEMPTS {
         if run_object_writer_put_policy_transition_once(
             encoding,
             transition,
@@ -1327,9 +1379,9 @@ async fn run_object_writer_put_policy_transition(
         {
             return;
         }
-        if attempt < MAX_ATTEMPTS {
+        if attempt < TIMING_TRANSITION_MAX_ATTEMPTS {
             println!(
-                "ObjectWriter {} {transition} attempt {attempt}/{MAX_ATTEMPTS} encountered SlowDown; retrying the complete transition",
+                "ObjectWriter {} {transition} attempt {attempt}/{TIMING_TRANSITION_MAX_ATTEMPTS} encountered SlowDown; retrying the complete transition",
                 encoding.label()
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1337,7 +1389,7 @@ async fn run_object_writer_put_policy_transition(
     }
 
     panic!(
-        "ObjectWriter {} {transition} did not produce complete authorization outcomes after {MAX_ATTEMPTS} attempts",
+        "ObjectWriter {} {transition} did not produce complete authorization outcomes after {TIMING_TRANSITION_MAX_ATTEMPTS} attempts",
         encoding.label()
     );
 }
