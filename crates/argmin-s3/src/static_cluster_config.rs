@@ -3698,7 +3698,7 @@ fn validate_selected_host_durable_path(
                 }
                 if metadata.dev() != mount_device {
                     return Err(format!(
-                        "{label} crosses away from its declared disk device"
+                        "{label} is on a different filesystem from its declared disk mount"
                     ));
                 }
                 validate_selected_host_ancestor_permissions(&metadata, effective_uid, label)?;

@@ -261,6 +261,14 @@ every activated Unix or TLS/TCP internal endpoint. Authentication is derived
 from replicated mode and cannot be disabled. Initial PG placement is calculated
 and checked during validation.
 
+Storage-node and Raft-voter counts are independent. For example, a four-host
+EC 2+1 deployment with `failure_tolerance = 1` may run storage on all four
+hosts while placing Raft authorities on only three. Four Raft voters are also
+valid, but their quorum is three, so they still tolerate only one unavailable
+voter; three voters need a quorum of two and provide the same stated failure
+tolerance with less coordination. Five voters are required to tolerate two
+unavailable voters.
+
 #### Failure domains
 
 `failure_domain` defines which declared topology unit must be independent for
@@ -321,6 +329,14 @@ Unix paths must be absolute.
 `priority` is nonzero and unique for an owner process and protocol. Lower
 values are preferred. Multiple candidates can provide a local Unix route and a
 TLS/TCP fallback; cross-host clients use eligible TCP candidates.
+
+`raft-peer`, `control-plane`, and `authority-clock-recovery` endpoints are
+server listeners owned only by processes that host an authority. They are not
+per-process client declarations. Frontend and storage processes automatically
+derive their control-plane client routes from the authorities' advertised
+endpoints, so a storage-only host must not declare its own control-plane or
+Raft endpoints. A `storage-rpc` endpoint is instead owned by each process that
+hosts a storage node.
 
 Every TCP endpoint requires `tls_identity_id`, `tls_trust_bundle_id`, and
 `tls_server_name`. TLS provides confidentiality and server authentication.
@@ -542,9 +558,37 @@ Authority state paths and storage data directories must be absolute,
 non-overlapping, and contained by the referenced disk mount on that host.
 Filesystem existence, ownership, permissions, and mount boundaries are checked
 only for the selected process's host; remote paths are validated lexically.
-The filesystem root may be declared explicitly. For another mount path, the
-path must identify an actual mount boundary rather than an unmounted leftover
-directory.
+
+A `[[disks]].mount_path` accepts either:
+
+- `/`, when the deployment intentionally stores data on the host's root
+  filesystem; or
+- the exact root of a separately mounted filesystem, such as
+  `/mnt/argmin-disk-1` when a device is mounted at that path.
+
+An ordinary directory is not a valid non-root `mount_path`. For example, if
+`/var/lib/argmin` is merely a directory on the root filesystem, declare
+`mount_path = "/"` and place the storage node beneath it with a path such as
+`data_dir = "/var/lib/argmin/storage-1"`. If a filesystem is mounted at
+`/mnt/argmin-disk-1`, declare that exact path as `mount_path` and use a child
+such as `/mnt/argmin-disk-1/storage-1` as `data_dir`.
+
+An authority's `state_path` and a storage node's `data_dir` must be on the same
+filesystem as their referenced `mount_path`; they cannot pass through a nested
+mount onto another filesystem. Disk layouts may differ between hosts, so each
+host's disk records should use that host's actual mount points rather than a
+path copied unchanged from another machine.
+
+On Linux, check a proposed non-root mount path before validation with:
+
+```bash
+findmnt --mountpoint /mnt/argmin-disk-1
+```
+
+This exact-mount check prevents a missing disk mount from silently redirecting
+durable writes into an unmounted leftover directory on its parent filesystem.
+Directories on one filesystem must not be declared as separate disks or used
+to claim independent `disk` failure domains.
 
 The manifest does not infer whether a filesystem is persistent. Deployment
 and release policy must make that guarantee explicitly; tmpfs runs are useful
