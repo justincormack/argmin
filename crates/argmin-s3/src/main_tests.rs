@@ -20,6 +20,22 @@ mod tests {
         ControlPlaneRaftPeerTransportLimits,
     };
 
+    #[test]
+    fn unknown_positional_commands_are_rejected_before_server_startup() {
+        for command in [
+            "validte",
+            "validate-cluster-config",
+            "validate-cluster-material",
+        ] {
+            let args = [OsString::from("argmin-s3"), OsString::from(command)];
+            assert_eq!(
+                run_control_plane_admin_command(args.into_iter()),
+                Some(2),
+                "command {command} must not fall through to server startup"
+            );
+        }
+    }
+
     fn test_raft_peer_credentials(
         node_ids: impl IntoIterator<Item = ControlPlaneRaftNodeId>,
     ) -> Vec<ControlPlaneRaftPeerAuthCredentialInput> {

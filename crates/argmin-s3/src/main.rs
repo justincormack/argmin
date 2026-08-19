@@ -424,10 +424,13 @@ fn bind_no_control_plane_remote_route_identity(
 }
 
 fn maybe_run_control_plane_admin_command() -> Option<i32> {
-    let mut args = std::env::args_os();
+    run_control_plane_admin_command(std::env::args_os())
+}
+
+fn run_control_plane_admin_command(mut args: impl Iterator<Item = OsString>) -> Option<i32> {
     let _program = args.next();
     let command = args.next()?;
-    if command == "validate-cluster-config" {
+    if command == "validate" {
         let Some(path) = args.next() else {
             eprintln!(
                 "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
@@ -453,70 +456,20 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
             eprintln!("cluster manifest process id must contain valid UTF-8");
             return Some(2);
         };
-        return match static_cluster_config::load_static_cluster_manifest(
+        return match static_cluster_config::validate_static_cluster_configuration(
             Path::new(&path),
             process_id,
         ) {
-            Ok(manifest) => {
+            Ok((manifest, material)) => {
                 println!(
-                    "valid cluster manifest cluster_id={} topology_generation={} process_id={} deployment_mode={} topology_digest={} process_identity_digest={} full_config_fingerprint={}",
+                    "valid cluster configuration cluster_id={} topology_generation={} process_id={} deployment_mode={} topology_digest={} process_identity_digest={} full_config_fingerprint={} auth_credentials={} tls_identities={} tls_trust_bundles={}",
                     manifest.cluster_id(),
                     manifest.topology_generation(),
                     manifest.selected_process_id(),
                     manifest.deployment_mode(),
                     manifest.topology_digest(),
                     manifest.process_identity_digest(),
-                    manifest.full_config_fingerprint()
-                );
-                Some(0)
-            }
-            Err(error) => {
-                eprintln!("cluster manifest validation failed: {error}");
-                Some(1)
-            }
-        };
-    }
-    if command == "validate-cluster-material" {
-        let Some(path) = args.next() else {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
-            return Some(2);
-        };
-        let Some(process_id) = args.next() else {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
-            return Some(2);
-        };
-        if args.next().is_some() {
-            eprintln!(
-                "usage: argmin-s3 {} <absolute-manifest-path> <process-id>",
-                command.to_string_lossy()
-            );
-            return Some(2);
-        }
-        let Some(process_id) = process_id.to_str() else {
-            eprintln!("cluster manifest process id must contain valid UTF-8");
-            return Some(2);
-        };
-        return match static_cluster_config::load_static_cluster_manifest(
-            Path::new(&path),
-            process_id,
-        )
-        .and_then(|manifest| {
-            manifest
-                .resolve_selected_process_material()
-                .map(|material| (manifest, material))
-        }) {
-            Ok((manifest, material)) => {
-                println!(
-                    "valid cluster material cluster_id={} topology_generation={} process_id={} auth_credentials={} tls_identities={} tls_trust_bundles={}",
-                    manifest.cluster_id(),
-                    manifest.topology_generation(),
-                    manifest.selected_process_id(),
+                    manifest.full_config_fingerprint(),
                     material.auth_credential_count(),
                     material.tls_identity_count(),
                     material.tls_trust_bundle_count()
@@ -524,7 +477,7 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
                 Some(0)
             }
             Err(error) => {
-                eprintln!("cluster material validation failed: {error}");
+                eprintln!("cluster configuration validation failed: {error}");
                 Some(1)
             }
         };
@@ -945,7 +898,8 @@ fn maybe_run_control_plane_admin_command() -> Option<i32> {
     } else if command == "control-plane-set-pg-acting-set-live" {
         true
     } else {
-        return None;
+        eprintln!("unknown argmin-s3 command: {}", command.to_string_lossy());
+        return Some(2);
     };
 
     let usage_path = if live { "socket-path" } else { "state-path" };

@@ -93,31 +93,21 @@ construct manifests directly or write temporary files; there is no production
 The file is read once at startup. Reload requires a process restart until an
 explicit dynamic configuration protocol exists.
 
-The schema/parser slice also exposes an offline structural validation command:
+The schema/parser and material-resolution slices expose one complete validation
+command:
 
 ```text
-argmin-s3 validate-cluster-config /etc/argmin/cluster.toml control-1
+argmin-s3 validate /etc/argmin/cluster.toml control-1
 ```
 
 It performs the same bounded parse, reference, role, endpoint, authentication,
-and deployment-policy validation as startup will use, and emits only redacted
-cluster/process identity diagnostics. It does not resolve secret bytes, open
-mutable state, or start listeners.
-
-Operators can separately validate the selected process's referenced material:
-
-```text
-argmin-s3 validate-cluster-material /etc/argmin/cluster.toml control-1
-```
-
-This command first performs the complete structural and selected-host
-filesystem validation, then resolves only the credentials needed for the
-selected process's own principals and listener verification boundaries, its
-local TCP listener identities, and trust bundles needed by its outbound
-protocols. It emits only redacted counts. It never prints resolved bytes,
-private keys, certificate contents, or MAC material. This is deliberately
-separate from `validate-cluster-config`, so offline topology validation does not
-require access to machine-local secrets.
+deployment-policy, and selected-host filesystem validation as startup, then
+resolves the S3/SSE secrets and credentials needed for the selected process's
+own principals and listener verification boundaries, its local TCP listener
+identities, and trust bundles needed by its outbound protocols. It emits only
+redacted identities and counts. It never prints resolved bytes, private keys,
+certificate contents, or MAC material, and it does not open mutable state or
+start listeners.
 
 Standalone file-mode storage is initialized explicitly:
 
@@ -1051,8 +1041,8 @@ Final status as of 2026-08-05:
   scoped, applies startup-static credential rotation windows, enforces exact
   PEM section types, validates CA constraints and signing usage, bounds total
   selected-process material, verifies local listener
-  certificate/key/trust/server-name consistency, and has a separate redacted
-  `validate-cluster-material` preflight command. Replicated control-plane
+  certificate/key/trust/server-name consistency, and is included in the
+  redacted `validate` preflight command. Replicated control-plane
   mapping consumes resolved binary credential bytes directly, keeps verifier
   credentials distinct from the manifest-selected signer during rotation, and
   never converts secrets back into legacy env-style strings. Split-role

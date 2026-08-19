@@ -113,19 +113,18 @@ keys.
 
 ### Validation and initialization
 
-Validate structure and the selected host's filesystem paths without resolving
-secrets:
+Validate the complete selected-process configuration before startup:
 
 ```bash
-argmin-s3 validate-cluster-config /etc/argmin/cluster.toml control-1
+argmin-s3 validate /etc/argmin/cluster.toml control-1
 ```
 
-Validate the selected process's S3 and SSE secret files, internal credential
-files, TLS identities, trust bundles, and certificate relationships:
-
-```bash
-argmin-s3 validate-cluster-material /etc/argmin/cluster.toml control-1
-```
+This performs structural, topology, selected-host filesystem, and material
+validation in one operation. It opens every S3 and SSE secret, internal
+credential, TLS identity, and trust bundle required by the selected process;
+checks permissions and current credential windows; and verifies certificate
+relationships. Success means the selected configuration has passed the same
+configuration and material checks used by startup.
 
 Initialize a selected process's durable state before its first startup:
 
@@ -403,8 +402,8 @@ openssl rand -base64 32 > raft-1.key
 Repeat this with a distinct output file for every credential in the manifest.
 Install the same file, owned by the Argmin service user and with mode `0600`,
 on the process that signs as that principal and on every process that must
-verify it. `validate-cluster-material` checks that the selected process can
-read and decode all credential files it needs.
+verify it. `validate` checks that the selected process can read and decode all
+credential files it needs.
 
 Certificate files may contain only certificates; private-key files must
 contain exactly one supported private key. Trust anchors must be CA
@@ -539,16 +538,16 @@ configured trust bundle contains the trusted CA certificates. Version 1 reads
 material at startup, so certificate renewal requires a controlled process
 restart.
 
-Finally, run material validation for every process identity on its selected
-host. This catches incompatible keys, expired or not-yet-valid certificates,
-untrusted chains, invalid CA constraints, and SAN mismatches before startup:
+Finally, run validation for every process identity on its selected host. This
+catches incompatible keys, expired or not-yet-valid certificates, untrusted
+chains, invalid CA constraints, and SAN mismatches before startup:
 
 ```bash
-argmin-s3 validate-cluster-material \
+argmin-s3 validate \
   /etc/argmin/cluster.toml control-1
-argmin-s3 validate-cluster-material \
+argmin-s3 validate \
   /etc/argmin/cluster.toml storage-1
-argmin-s3 validate-cluster-material \
+argmin-s3 validate \
   /etc/argmin/cluster.toml frontend-1
 ```
 
@@ -728,23 +727,17 @@ Before first startup, validate and initialize every stateful process on its
 selected host. For host 1, for example:
 
 ```bash
-./target/release/argmin-s3 validate-cluster-config \
-  /etc/argmin/cluster.toml control-1
-./target/release/argmin-s3 validate-cluster-material \
+./target/release/argmin-s3 validate \
   /etc/argmin/cluster.toml control-1
 ./target/release/argmin-s3 initialize-cluster-state \
   /etc/argmin/cluster.toml control-1
 
-./target/release/argmin-s3 validate-cluster-config \
-  /etc/argmin/cluster.toml storage-1
-./target/release/argmin-s3 validate-cluster-material \
+./target/release/argmin-s3 validate \
   /etc/argmin/cluster.toml storage-1
 ./target/release/argmin-s3 initialize-cluster-state \
   /etc/argmin/cluster.toml storage-1
 
-./target/release/argmin-s3 validate-cluster-config \
-  /etc/argmin/cluster.toml frontend-1
-./target/release/argmin-s3 validate-cluster-material \
+./target/release/argmin-s3 validate \
   /etc/argmin/cluster.toml frontend-1
 ```
 

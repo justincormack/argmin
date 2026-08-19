@@ -627,6 +627,28 @@ impl ResolvedStaticClusterMaterial {
 }
 
 impl ValidatedStaticClusterManifest {
+    fn selected_process_server_config(
+        &self,
+        material: &ResolvedStaticClusterMaterial,
+    ) -> Result<ServerConfig, String> {
+        match self.manifest.deployment.mode {
+            DeploymentMode::Standalone => self.standalone_server_config(material),
+            DeploymentMode::Replicated => {
+                match self.manifest.processes[self.selected_process_index].kind {
+                    ProcessKind::ControlPlane => {
+                        self.replicated_unix_control_plane_server_config(material)
+                    }
+                    ProcessKind::Frontend | ProcessKind::StorageNode | ProcessKind::Combined => {
+                        self.replicated_data_process_server_config(material)
+                    }
+                    ProcessKind::AllInOne => {
+                        Err("all-in-one process is invalid in replicated mode".to_string())
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn cluster_id(&self) -> &str {
         &self.manifest.cluster.id
     }
@@ -2756,24 +2778,7 @@ where
             let manifest = load_static_cluster_manifest_structural(config_path, process_id)?;
             validate_filesystem(&manifest)?;
             let material = manifest.resolve_selected_process_material()?;
-            match manifest.manifest.deployment.mode {
-                DeploymentMode::Standalone => manifest.standalone_server_config(&material),
-                DeploymentMode::Replicated => {
-                    match manifest.manifest.processes[manifest.selected_process_index].kind {
-                        ProcessKind::ControlPlane => {
-                            manifest.replicated_unix_control_plane_server_config(&material)
-                        }
-                        ProcessKind::Frontend
-                        | ProcessKind::StorageNode
-                        | ProcessKind::Combined => {
-                            manifest.replicated_data_process_server_config(&material)
-                        }
-                        ProcessKind::AllInOne => {
-                            Err("all-in-one process is invalid in replicated mode".to_string())
-                        }
-                    }
-                }
-            }
+            manifest.selected_process_server_config(&material)
         }
     }?;
     config.validate_internal_rpc_auth()?;
@@ -3471,6 +3476,35 @@ pub(crate) fn load_static_cluster_manifest(
     let manifest = load_static_cluster_manifest_structural(path, process_id)?;
     validate_selected_host_filesystem(&manifest)?;
     Ok(manifest)
+}
+
+pub(crate) fn validate_static_cluster_configuration(
+    path: &Path,
+    process_id: &str,
+) -> Result<
+    (
+        ValidatedStaticClusterManifest,
+        ResolvedStaticClusterMaterial,
+    ),
+    String,
+> {
+    let manifest = load_static_cluster_manifest(path, process_id)?;
+    validate_loaded_static_cluster_configuration(manifest)
+}
+
+fn validate_loaded_static_cluster_configuration(
+    manifest: ValidatedStaticClusterManifest,
+) -> Result<
+    (
+        ValidatedStaticClusterManifest,
+        ResolvedStaticClusterMaterial,
+    ),
+    String,
+> {
+    let material = manifest.resolve_selected_process_material()?;
+    let config = manifest.selected_process_server_config(&material)?;
+    config.validate_internal_rpc_auth()?;
+    Ok((manifest, material))
 }
 
 fn load_static_cluster_manifest_structural(
@@ -9485,6 +9519,20 @@ secret_ref = "file:/run/argmin-secrets/duplicate.key"
 
         assert_eq!(material.tls_trust_bundle_count(), 2);
         assert!(material.tls_trust_bundles.contains_key("remote-control-ca"));
+    }
+
+    #[test]
+    fn static_cluster_complete_validation_rejects_missing_frontend_s3_secret() {
+        let (dir, manifest) =
+            materialized_replicated_manifest_from("frontend-1", replicated_tcp_data_manifest());
+        std::fs::remove_file(dir.path().join("material/s3-secret-access-key")).unwrap();
+
+        let error = validate_loaded_static_cluster_configuration(manifest).unwrap_err();
+
+        assert!(
+            error.contains("open S3 secret access key reference"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
