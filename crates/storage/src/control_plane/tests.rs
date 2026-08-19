@@ -2156,7 +2156,25 @@ fn signed_admin_control_plane_request(
     issued_at_ms: Option<u64>,
     expires_at_ms: Option<u64>,
 ) -> ControlPlaneRpcRequest {
-    let payload = write_authenticated_control_plane_rpc_payload(kind, &payload);
+    signed_admin_control_plane_request_with_embedded_kind(
+        kind,
+        kind,
+        signer,
+        payload,
+        issued_at_ms,
+        expires_at_ms,
+    )
+}
+
+fn signed_admin_control_plane_request_with_embedded_kind(
+    outer_kind: ControlPlaneRpcKind,
+    embedded_kind: ControlPlaneRpcKind,
+    signer: &ControlPlaneScopedCredential,
+    payload: Vec<u8>,
+    issued_at_ms: Option<u64>,
+    expires_at_ms: Option<u64>,
+) -> ControlPlaneRpcRequest {
+    let payload = write_authenticated_control_plane_rpc_payload(embedded_kind, &payload);
     let envelope = signer
         .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
             target: ControlPlaneAuthTarget::Service(
@@ -2171,7 +2189,7 @@ fn signed_admin_control_plane_request(
         })
         .expect("test admin control-plane command envelope should sign");
     ControlPlaneRpcRequest {
-        kind,
+        kind: outer_kind,
         payload: envelope.encode_frame().unwrap(),
     }
 }

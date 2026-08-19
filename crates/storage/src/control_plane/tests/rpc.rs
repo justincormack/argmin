@@ -1322,6 +1322,76 @@ fn control_plane_rpc_v14_operation_catalogue_is_exact() {
 }
 
 #[test]
+fn authenticated_control_plane_rpc_v14_auth_v1_payload_binding_is_exact() {
+    assert_eq!(CONTROL_PLANE_RPC_VERSION, 14);
+    let kind = ControlPlaneRpcKind::RuntimeMapStatus;
+    let credential = frontend_auth_credential("auth-cluster", "frontend-1");
+    let verifier = frontend_auth_verifier("auth-cluster", "frontend-1");
+    let request = signed_frontend_runtime_map_request(
+        kind,
+        &credential,
+        Vec::new(),
+        Some(1_000),
+        Some(6_000),
+    );
+    assert!(request.payload.starts_with(b"ARGCPAUT\x00\x01"));
+    let request_envelope =
+        ControlPlaneAuthEnvelope::decode_frame(&request.payload, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+            .unwrap();
+    assert_eq!(request_envelope.payload(), &[0x00, 0x0c]);
+    let request_frame = encode_control_plane_rpc_frame(kind, &request.payload).unwrap();
+    assert!(request_frame.starts_with(b"argmin-control-plane-rpc\x00\x0e"));
+    let verified = verify_control_plane_unix_request(request, Some(&verifier), 1_000).unwrap();
+    assert_eq!(verified.kind, kind);
+    assert!(verified.payload.is_empty());
+    assert!(verified.response_auth.is_some());
+
+    let logical_response = vec![0xa5, 0x5a];
+    let encoded_response = encode_control_plane_rpc_response(Ok(logical_response.clone())).unwrap();
+    let response =
+        signed_runtime_map_response_payload(kind, &credential, logical_response.clone(), 1_001);
+    let response_envelope =
+        ControlPlaneAuthEnvelope::decode_frame(&response, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+            .unwrap();
+    assert_eq!(
+        response_envelope.payload(),
+        &[0x00, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x02, 0xa5, 0x5a]
+    );
+    let client = AuthenticatedUnixControlPlaneClient::new(
+        UnixControlPlaneClient::new("unused-test-socket"),
+        credential,
+    );
+    assert_eq!(
+        client
+            .verify_runtime_map_response(kind, 1_001, &response)
+            .unwrap(),
+        encoded_response
+    );
+    let response_frame = encode_control_plane_rpc_frame(kind, &response).unwrap();
+
+    assert_eq!(
+        (
+            request_frame.len(),
+            hex_encode(&checksum::sha256::digest(&request_frame))
+        ),
+        (
+            182,
+            "8e6ced7925437cef8aae609508634cdcd86e76088d8e4b5816654f77652f4419".to_owned()
+        )
+    );
+    assert_eq!(
+        (
+            response_frame.len(),
+            hex_encode(&checksum::sha256::digest(&response_frame))
+        ),
+        (
+            190,
+            "72f5e379703b62bcd438281d63ac0dcc9c937400004d8c75e4014bb43b1128b7".to_owned()
+        )
+    );
+}
+
+#[test]
 fn unix_control_plane_client_fetches_runtime_map() {
     let tmp = test_util::tempdir();
     let socket_path = tmp.path().join("control-plane.sock");
@@ -2827,6 +2897,103 @@ fn authenticated_control_plane_rejects_frontend_runtime_map_kind_replay() {
     assert_eq!(
         metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongRole),
         1
+    );
+}
+
+#[test]
+fn authenticated_control_plane_rejects_resigned_admin_inner_kind_before_dispatch() {
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    authority
+        .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+        .unwrap();
+    let before = authority.snapshot().clone();
+    let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+    let signer = admin_auth_credential("auth-cluster", "admin-1");
+    let mut payload = Vec::new();
+    write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+    let request = signed_admin_control_plane_request_with_embedded_kind(
+        ControlPlaneRpcKind::SetPgActingSet,
+        ControlPlaneRpcKind::RuntimeMapStatus,
+        &signer,
+        payload,
+        Some(1_999),
+        Some(2_999),
+    );
+
+    let error = build_control_plane_unix_response_with_auth(
+        &mut authority,
+        request,
+        2_000,
+        Some(&verifier),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
+            if message.contains("authenticated RPC kind RuntimeMapStatus did not match outer kind SetPgActingSet")),
+        "unexpected error: {error}"
+    );
+    assert_eq!(authority.snapshot(), &before);
+    let metrics = verifier.metrics_snapshot();
+    assert_eq!(metrics.accepted_total(), 0);
+    assert_eq!(metrics.rejected_total(), 1);
+    assert_eq!(
+        metrics.rejected_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+        1
+    );
+    assert_eq!(
+        metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::WrongRole),
+        1
+    );
+}
+
+#[test]
+fn authenticated_control_plane_rejects_resigned_response_inner_kind_before_acceptance() {
+    let tmp = test_util::tempdir();
+    let socket_path = tmp.path().join("control-plane.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+    let outer_kind = ControlPlaneRpcKind::RuntimeMapStatus;
+    let embedded_kind = ControlPlaneRpcKind::RuntimeMapSnapshot;
+    let frontend = frontend_auth_credential("auth-cluster", "frontend-1");
+    let response_signer = frontend.clone();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _addr) = listener.accept().unwrap();
+        let (kind, request) = read_control_plane_rpc_frame(&mut stream).unwrap();
+        assert_eq!(kind, outer_kind);
+        ControlPlaneAuthEnvelope::decode_frame(&request, CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN)
+            .unwrap();
+        let payload = write_authenticated_control_plane_rpc_payload(embedded_kind, &[]);
+        let response_credential = response_signer
+            .runtime_map_response_credential_for_frontend()
+            .unwrap();
+        let envelope = response_credential
+            .sign_envelope(crate::control_plane_auth::ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Principal(response_signer.principal().clone()),
+                operation: ControlPlaneAuthOperation::RuntimeMapResponse,
+                issued_at_ms: Some(2_000),
+                expires_at_ms: Some(7_000),
+                sequence: None,
+                nonce: Vec::new(),
+                payload,
+            })
+            .unwrap();
+        write_control_plane_rpc_frame(&mut stream, outer_kind, &envelope.encode_frame().unwrap())
+            .unwrap();
+    });
+    let client = AuthenticatedUnixControlPlaneClient::new(
+        UnixControlPlaneClient::new(&socket_path),
+        frontend,
+    );
+
+    let error = client.runtime_map_status(2_000).unwrap_err();
+
+    server.join().unwrap();
+    assert!(
+        matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
+            if message.contains("authenticated RPC kind RuntimeMapSnapshot did not match outer kind RuntimeMapStatus")),
+        "unexpected error: {error}"
     );
 }
 
