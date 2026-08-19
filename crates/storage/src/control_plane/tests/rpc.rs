@@ -2950,6 +2950,57 @@ fn authenticated_control_plane_rejects_resigned_admin_inner_kind_before_dispatch
 }
 
 #[test]
+fn authenticated_control_plane_rejects_resigned_auth_versions_before_dispatch() {
+    for auth_version in [0_u16, 2] {
+        let tmp = test_util::tempdir();
+        let store = FileControlPlaneStore::new(tmp.path().join("control-plane.state"));
+        let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+        authority
+            .set_node_membership(NodeId::new(1), NodeMembershipState::Active)
+            .unwrap();
+        let before = authority.snapshot().clone();
+        let verifier = admin_auth_verifier("auth-cluster", "admin-1");
+        let signer = admin_auth_credential("auth-cluster", "admin-1");
+        let mut payload = Vec::new();
+        write_pg_acting_set_request(&mut payload, PgId::new(7), &[NodeId::new(1)]).unwrap();
+        let request = signed_admin_control_plane_request_with_auth_version(
+            ControlPlaneRpcKind::SetPgActingSet,
+            &signer,
+            payload,
+            Some(1_999),
+            Some(2_999),
+            auth_version,
+        );
+
+        let error = build_control_plane_unix_response_with_auth(
+            &mut authority,
+            request,
+            2_000,
+            Some(&verifier),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
+                if message.as_str() == format!("control-plane auth envelope: unsupported control-plane auth version {auth_version}")),
+            "unexpected auth v{auth_version} error: {error}"
+        );
+        assert_eq!(authority.snapshot(), &before);
+        let metrics = verifier.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_operation(ControlPlaneAuthOperation::AdminControlPlaneCommand),
+            1
+        );
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::UnsupportedVersion),
+            1
+        );
+    }
+}
+
+#[test]
 fn authenticated_control_plane_rejects_resigned_response_inner_kind_before_acceptance() {
     let tmp = test_util::tempdir();
     let socket_path = tmp.path().join("control-plane.sock");

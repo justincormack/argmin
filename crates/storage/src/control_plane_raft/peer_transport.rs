@@ -652,6 +652,36 @@ impl ControlPlaneRaftPeerAuthPolicy {
         envelope.encode_frame()
     }
 
+    #[cfg(test)]
+    pub(crate) fn sign_peer_frame_with_auth_version_for_test(
+        &self,
+        identity: &ControlPlaneRaftPeerFrameIdentity,
+        operation: ControlPlaneAuthOperation,
+        payload: Vec<u8>,
+        auth_version: u16,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.validate_source(identity)?;
+        validate_control_plane_raft_peer_auth_payload_binding(&payload, identity, operation)?;
+        let (issued_at_ms, expires_at_ms) = peer_auth_replay_window_for_sign(operation)?;
+        self.local_credential
+            .sign_envelope_frame_with_version_for_test(
+                ControlPlaneAuthSignInput {
+                    target: ControlPlaneAuthTarget::Principal(
+                        ControlPlaneAuthPrincipal::RaftPeer {
+                            node_id: identity.target,
+                        },
+                    ),
+                    operation,
+                    issued_at_ms,
+                    expires_at_ms,
+                    sequence: None,
+                    nonce: Vec::new(),
+                    payload,
+                },
+                auth_version,
+            )
+    }
+
     pub(crate) fn verify_peer_frame(
         &self,
         envelope_bytes: &[u8],
@@ -659,17 +689,17 @@ impl ControlPlaneRaftPeerAuthPolicy {
         expected_operation: ControlPlaneAuthOperation,
         max_payload_bytes: usize,
     ) -> Result<Vec<u8>, ControlPlaneError> {
-        let envelope =
-            match ControlPlaneAuthEnvelope::decode_frame(envelope_bytes, max_payload_bytes) {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    self.metrics.record_rejected(
-                        expected_operation,
-                        ControlPlaneAuthRejectionReason::Malformed,
-                    );
-                    return Err(error);
-                }
-            };
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame_classified(
+            envelope_bytes,
+            max_payload_bytes,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                self.metrics
+                    .record_rejected(expected_operation, error.rejection_reason());
+                return Err(error.into_control_plane_error());
+            }
+        };
         let decision = self
             .verifier
             .verify_envelope(ControlPlaneAuthVerificationInput {

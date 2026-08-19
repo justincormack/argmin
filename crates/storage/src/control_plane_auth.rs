@@ -15,6 +15,89 @@ const CONTROL_PLANE_AUTH_MAX_NONCE_LEN: usize = 32;
 const CONTROL_PLANE_AUTH_MAX_AUTHENTICATOR_LEN: usize = 128;
 const CONTROL_PLANE_AUTH_MAX_SECRET_LEN: usize = 4096;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlPlaneAuthEnvelopeFormatError {
+    Truncated,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl fmt::Display for ControlPlaneAuthEnvelopeFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Truncated => formatter.write_str("truncated control-plane auth envelope marker"),
+            Self::UnknownMagic => formatter.write_str("invalid control-plane auth magic"),
+            Self::UnsupportedVersion(version) => {
+                write!(
+                    formatter,
+                    "unsupported control-plane auth version {version}"
+                )
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ControlPlaneAuthEnvelopeDecodeError {
+    Format(ControlPlaneAuthEnvelopeFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl ControlPlaneAuthEnvelopeDecodeError {
+    #[must_use]
+    pub(crate) fn rejection_reason(&self) -> ControlPlaneAuthRejectionReason {
+        match self {
+            Self::Format(ControlPlaneAuthEnvelopeFormatError::UnsupportedVersion(_)) => {
+                ControlPlaneAuthRejectionReason::UnsupportedVersion
+            }
+            Self::Format(
+                ControlPlaneAuthEnvelopeFormatError::Truncated
+                | ControlPlaneAuthEnvelopeFormatError::UnknownMagic,
+            )
+            | Self::Invalid(_) => ControlPlaneAuthRejectionReason::Malformed,
+        }
+    }
+
+    pub(crate) fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => auth_protocol_error(error.to_string()),
+            Self::Invalid(error) => error,
+        }
+    }
+}
+
+impl From<ControlPlaneError> for ControlPlaneAuthEnvelopeDecodeError {
+    fn from(error: ControlPlaneError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+fn validate_control_plane_auth_envelope_marker(
+    bytes: &[u8],
+) -> Result<(), ControlPlaneAuthEnvelopeFormatError> {
+    let magic = bytes
+        .get(..CONTROL_PLANE_AUTH_MAGIC.len())
+        .ok_or(ControlPlaneAuthEnvelopeFormatError::Truncated)?;
+    if magic != CONTROL_PLANE_AUTH_MAGIC {
+        return Err(ControlPlaneAuthEnvelopeFormatError::UnknownMagic);
+    }
+    let version_start = CONTROL_PLANE_AUTH_MAGIC.len();
+    let version_end = version_start + std::mem::size_of::<u16>();
+    let version = u16::from_be_bytes(
+        bytes
+            .get(version_start..version_end)
+            .ok_or(ControlPlaneAuthEnvelopeFormatError::Truncated)?
+            .try_into()
+            .expect("control-plane auth envelope version width was checked"),
+    );
+    if version != CONTROL_PLANE_AUTH_VERSION {
+        return Err(ControlPlaneAuthEnvelopeFormatError::UnsupportedVersion(
+            version,
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_control_plane_auth_cluster_id(
     cluster_id: &str,
 ) -> Result<(), ControlPlaneError> {
@@ -341,6 +424,33 @@ impl ControlPlaneScopedCredential {
             payload: input.payload,
             authenticator,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sign_envelope_frame_with_version_for_test(
+        &self,
+        input: ControlPlaneAuthSignInput,
+        version: u16,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
+        self.validate()?;
+        let header = ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
+            cluster_id: self.cluster_id.clone(),
+            credential_id: self.credential_id.clone(),
+            credential_version: self.credential_version,
+            source: self.principal.clone(),
+            target: input.target,
+            operation: input.operation,
+            issued_at_ms: input.issued_at_ms,
+            expires_at_ms: input.expires_at_ms,
+            sequence: input.sequence,
+            nonce: input.nonce,
+        })?;
+        let covered = header.encode_covered_bytes_with_version(&input.payload, version)?;
+        let key = Sha256Key::new(&self.secret);
+        let authenticator = key.sign(&covered);
+        let mut frame = covered;
+        write_bytes(&mut frame, &authenticator)?;
+        Ok(frame)
     }
 
     fn validate(&self) -> Result<(), ControlPlaneError> {
@@ -708,11 +818,19 @@ impl ControlPlaneAuthEnvelopeHeader {
     }
 
     pub fn encode_covered_bytes(&self, payload: &[u8]) -> Result<Vec<u8>, ControlPlaneError> {
+        self.encode_covered_bytes_with_version(payload, CONTROL_PLANE_AUTH_VERSION)
+    }
+
+    fn encode_covered_bytes_with_version(
+        &self,
+        payload: &[u8],
+        version: u16,
+    ) -> Result<Vec<u8>, ControlPlaneError> {
         self.validate()?;
         len_as_u32(payload.len(), "auth payload")?;
         let mut out = Vec::new();
         out.extend_from_slice(CONTROL_PLANE_AUTH_MAGIC);
-        write_u16(&mut out, CONTROL_PLANE_AUTH_VERSION);
+        write_u16(&mut out, version);
         write_string(&mut out, &self.cluster_id)?;
         write_string(&mut out, &self.credential_id)?;
         write_u64(&mut out, self.credential_version);
@@ -814,16 +932,18 @@ impl ControlPlaneAuthEnvelope {
     }
 
     pub fn decode_frame(bytes: &[u8], max_payload_bytes: usize) -> Result<Self, ControlPlaneError> {
-        let mut reader = AuthPayloadReader::new(bytes);
-        if reader.read_exact(CONTROL_PLANE_AUTH_MAGIC.len())? != CONTROL_PLANE_AUTH_MAGIC {
-            return Err(auth_protocol_error("invalid control-plane auth magic"));
-        }
-        let version = reader.read_u16()?;
-        if version != CONTROL_PLANE_AUTH_VERSION {
-            return Err(auth_protocol_error(format!(
-                "unsupported control-plane auth version {version}"
-            )));
-        }
+        Self::decode_frame_classified(bytes, max_payload_bytes)
+            .map_err(ControlPlaneAuthEnvelopeDecodeError::into_control_plane_error)
+    }
+
+    pub(crate) fn decode_frame_classified(
+        bytes: &[u8],
+        max_payload_bytes: usize,
+    ) -> Result<Self, ControlPlaneAuthEnvelopeDecodeError> {
+        validate_control_plane_auth_envelope_marker(bytes)
+            .map_err(ControlPlaneAuthEnvelopeDecodeError::Format)?;
+        let marker_len = CONTROL_PLANE_AUTH_MAGIC.len() + std::mem::size_of::<u16>();
+        let mut reader = AuthPayloadReader::new(&bytes[marker_len..]);
         let cluster_id = reader
             .read_string_bounded(CONTROL_PLANE_AUTH_MAX_CLUSTER_ID_LEN, "auth cluster id")?
             .to_owned();
@@ -853,7 +973,7 @@ impl ControlPlaneAuthEnvelope {
             )?
             .to_vec();
         reader.finish()?;
-        Self::new(ControlPlaneAuthEnvelopeInput {
+        Ok(Self::new(ControlPlaneAuthEnvelopeInput {
             header: ControlPlaneAuthEnvelopeHeader::new(ControlPlaneAuthEnvelopeHeaderInput {
                 cluster_id,
                 credential_id,
@@ -868,7 +988,7 @@ impl ControlPlaneAuthEnvelope {
             })?,
             payload,
             authenticator,
-        })
+        })?)
     }
 
     fn validate(&self) -> Result<(), ControlPlaneError> {
@@ -888,6 +1008,46 @@ impl ControlPlaneAuthEnvelope {
     }
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlPlaneAuthPrincipalTag {
+    RaftPeer = 1,
+    StorageNode = 2,
+    Frontend = 3,
+    Admin = 4,
+    LocalMaintenance = 5,
+    Service = 6,
+    StorageNodeProcess = 7,
+}
+
+impl ControlPlaneAuthPrincipalTag {
+    #[cfg(test)]
+    const ALL: [Self; 7] = [
+        Self::RaftPeer,
+        Self::StorageNode,
+        Self::Frontend,
+        Self::Admin,
+        Self::LocalMaintenance,
+        Self::Service,
+        Self::StorageNodeProcess,
+    ];
+
+    fn from_u8(tag: u8) -> Result<Self, ControlPlaneError> {
+        match tag {
+            1 => Ok(Self::RaftPeer),
+            2 => Ok(Self::StorageNode),
+            3 => Ok(Self::Frontend),
+            4 => Ok(Self::Admin),
+            5 => Ok(Self::LocalMaintenance),
+            6 => Ok(Self::Service),
+            7 => Ok(Self::StorageNodeProcess),
+            _ => Err(auth_protocol_error(format!(
+                "unknown control-plane auth principal tag {tag}"
+            ))),
+        }
+    }
+}
+
 fn write_principal(
     out: &mut Vec<u8>,
     principal: &ControlPlaneAuthPrincipal,
@@ -895,35 +1055,35 @@ fn write_principal(
     principal.validate()?;
     match principal {
         ControlPlaneAuthPrincipal::RaftPeer { node_id } => {
-            write_u8(out, 1);
+            write_u8(out, ControlPlaneAuthPrincipalTag::RaftPeer as u8);
             write_u64(out, *node_id);
         }
         ControlPlaneAuthPrincipal::StorageNode {
             node_id,
             incarnation,
         } => {
-            write_u8(out, 2);
+            write_u8(out, ControlPlaneAuthPrincipalTag::StorageNode as u8);
             write_u32(out, node_id.as_u32());
             write_u64(out, *incarnation);
         }
         ControlPlaneAuthPrincipal::StorageNodeProcess { node_id } => {
-            write_u8(out, 7);
+            write_u8(out, ControlPlaneAuthPrincipalTag::StorageNodeProcess as u8);
             write_u32(out, node_id.as_u32());
         }
         ControlPlaneAuthPrincipal::Frontend { instance_id } => {
-            write_u8(out, 3);
+            write_u8(out, ControlPlaneAuthPrincipalTag::Frontend as u8);
             write_string(out, instance_id)?;
         }
         ControlPlaneAuthPrincipal::Admin { instance_id } => {
-            write_u8(out, 4);
+            write_u8(out, ControlPlaneAuthPrincipalTag::Admin as u8);
             write_string(out, instance_id)?;
         }
         ControlPlaneAuthPrincipal::LocalMaintenance { process_id } => {
-            write_u8(out, 5);
+            write_u8(out, ControlPlaneAuthPrincipalTag::LocalMaintenance as u8);
             write_string(out, process_id)?;
         }
         ControlPlaneAuthPrincipal::Service { service } => {
-            write_u8(out, 6);
+            write_u8(out, ControlPlaneAuthPrincipalTag::Service as u8);
             write_service(out, *service);
         }
     }
@@ -933,15 +1093,15 @@ fn write_principal(
 fn read_principal(
     reader: &mut AuthPayloadReader<'_>,
 ) -> Result<ControlPlaneAuthPrincipal, ControlPlaneError> {
-    let principal = match reader.read_u8()? {
-        1 => ControlPlaneAuthPrincipal::RaftPeer {
+    let principal = match ControlPlaneAuthPrincipalTag::from_u8(reader.read_u8()?)? {
+        ControlPlaneAuthPrincipalTag::RaftPeer => ControlPlaneAuthPrincipal::RaftPeer {
             node_id: reader.read_u64()?,
         },
-        2 => ControlPlaneAuthPrincipal::StorageNode {
+        ControlPlaneAuthPrincipalTag::StorageNode => ControlPlaneAuthPrincipal::StorageNode {
             node_id: NodeId::new(reader.read_u32()?),
             incarnation: reader.read_u64()?,
         },
-        3 => ControlPlaneAuthPrincipal::Frontend {
+        ControlPlaneAuthPrincipalTag::Frontend => ControlPlaneAuthPrincipal::Frontend {
             instance_id: reader
                 .read_string_bounded(
                     CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN,
@@ -949,33 +1109,54 @@ fn read_principal(
                 )?
                 .to_owned(),
         },
-        4 => ControlPlaneAuthPrincipal::Admin {
+        ControlPlaneAuthPrincipalTag::Admin => ControlPlaneAuthPrincipal::Admin {
             instance_id: reader
                 .read_string_bounded(CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN, "admin instance id")?
                 .to_owned(),
         },
-        5 => ControlPlaneAuthPrincipal::LocalMaintenance {
-            process_id: reader
-                .read_string_bounded(
-                    CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN,
-                    "local-maintenance process id",
-                )?
-                .to_owned(),
-        },
-        6 => ControlPlaneAuthPrincipal::Service {
+        ControlPlaneAuthPrincipalTag::LocalMaintenance => {
+            ControlPlaneAuthPrincipal::LocalMaintenance {
+                process_id: reader
+                    .read_string_bounded(
+                        CONTROL_PLANE_AUTH_MAX_INSTANCE_ID_LEN,
+                        "local-maintenance process id",
+                    )?
+                    .to_owned(),
+            }
+        }
+        ControlPlaneAuthPrincipalTag::Service => ControlPlaneAuthPrincipal::Service {
             service: read_service(reader)?,
         },
-        7 => ControlPlaneAuthPrincipal::StorageNodeProcess {
-            node_id: NodeId::new(reader.read_u32()?),
-        },
-        tag => {
-            return Err(auth_protocol_error(format!(
-                "unknown control-plane auth principal tag {tag}"
-            )));
+        ControlPlaneAuthPrincipalTag::StorageNodeProcess => {
+            ControlPlaneAuthPrincipal::StorageNodeProcess {
+                node_id: NodeId::new(reader.read_u32()?),
+            }
         }
     };
     principal.validate()?;
     Ok(principal)
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlPlaneAuthTargetTag {
+    Principal = 1,
+    Service = 2,
+}
+
+impl ControlPlaneAuthTargetTag {
+    #[cfg(test)]
+    const ALL: [Self; 2] = [Self::Principal, Self::Service];
+
+    fn from_u8(tag: u8) -> Result<Self, ControlPlaneError> {
+        match tag {
+            1 => Ok(Self::Principal),
+            2 => Ok(Self::Service),
+            _ => Err(auth_protocol_error(format!(
+                "unknown control-plane auth target tag {tag}"
+            ))),
+        }
+    }
 }
 
 fn write_target(
@@ -985,11 +1166,11 @@ fn write_target(
     target.validate()?;
     match target {
         ControlPlaneAuthTarget::Principal(principal) => {
-            write_u8(out, 1);
+            write_u8(out, ControlPlaneAuthTargetTag::Principal as u8);
             write_principal(out, principal)?;
         }
         ControlPlaneAuthTarget::Service(service) => {
-            write_u8(out, 2);
+            write_u8(out, ControlPlaneAuthTargetTag::Service as u8);
             write_service(out, *service);
         }
     }
@@ -999,61 +1180,167 @@ fn write_target(
 fn read_target(
     reader: &mut AuthPayloadReader<'_>,
 ) -> Result<ControlPlaneAuthTarget, ControlPlaneError> {
-    let target = match reader.read_u8()? {
-        1 => ControlPlaneAuthTarget::Principal(read_principal(reader)?),
-        2 => ControlPlaneAuthTarget::Service(read_service(reader)?),
-        tag => {
-            return Err(auth_protocol_error(format!(
-                "unknown control-plane auth target tag {tag}"
-            )));
+    let target = match ControlPlaneAuthTargetTag::from_u8(reader.read_u8()?)? {
+        ControlPlaneAuthTargetTag::Principal => {
+            ControlPlaneAuthTarget::Principal(read_principal(reader)?)
+        }
+        ControlPlaneAuthTargetTag::Service => {
+            ControlPlaneAuthTarget::Service(read_service(reader)?)
         }
     };
     target.validate()?;
     Ok(target)
 }
 
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlPlaneAuthServiceTag {
+    ControlPlane = 1,
+    RuntimeMap = 3,
+    Admin = 5,
+    StorageRpc = 6,
+}
+
+impl ControlPlaneAuthServiceTag {
+    #[cfg(test)]
+    const ALL: [Self; 4] = [
+        Self::ControlPlane,
+        Self::RuntimeMap,
+        Self::Admin,
+        Self::StorageRpc,
+    ];
+
+    fn from_u8(tag: u8) -> Result<Self, ControlPlaneError> {
+        match tag {
+            1 => Ok(Self::ControlPlane),
+            3 => Ok(Self::RuntimeMap),
+            5 => Ok(Self::Admin),
+            6 => Ok(Self::StorageRpc),
+            _ => Err(auth_protocol_error(format!(
+                "unknown control-plane auth service tag {tag}"
+            ))),
+        }
+    }
+}
+
+fn control_plane_auth_service_tag(service: ControlPlaneAuthService) -> ControlPlaneAuthServiceTag {
+    match service {
+        ControlPlaneAuthService::ControlPlane => ControlPlaneAuthServiceTag::ControlPlane,
+        ControlPlaneAuthService::RuntimeMap => ControlPlaneAuthServiceTag::RuntimeMap,
+        ControlPlaneAuthService::Admin => ControlPlaneAuthServiceTag::Admin,
+        ControlPlaneAuthService::StorageRpc => ControlPlaneAuthServiceTag::StorageRpc,
+    }
+}
+
 fn write_service(out: &mut Vec<u8>, service: ControlPlaneAuthService) {
-    write_u8(
-        out,
-        match service {
-            ControlPlaneAuthService::ControlPlane => 1,
-            ControlPlaneAuthService::RuntimeMap => 3,
-            ControlPlaneAuthService::Admin => 5,
-            ControlPlaneAuthService::StorageRpc => 6,
-        },
-    );
+    write_u8(out, control_plane_auth_service_tag(service) as u8);
 }
 
 fn read_service(
     reader: &mut AuthPayloadReader<'_>,
 ) -> Result<ControlPlaneAuthService, ControlPlaneError> {
-    match reader.read_u8()? {
-        1 => Ok(ControlPlaneAuthService::ControlPlane),
-        3 => Ok(ControlPlaneAuthService::RuntimeMap),
-        5 => Ok(ControlPlaneAuthService::Admin),
-        6 => Ok(ControlPlaneAuthService::StorageRpc),
-        tag => Err(auth_protocol_error(format!(
-            "unknown control-plane auth service tag {tag}"
-        ))),
+    match ControlPlaneAuthServiceTag::from_u8(reader.read_u8()?)? {
+        ControlPlaneAuthServiceTag::ControlPlane => Ok(ControlPlaneAuthService::ControlPlane),
+        ControlPlaneAuthServiceTag::RuntimeMap => Ok(ControlPlaneAuthService::RuntimeMap),
+        ControlPlaneAuthServiceTag::Admin => Ok(ControlPlaneAuthService::Admin),
+        ControlPlaneAuthServiceTag::StorageRpc => Ok(ControlPlaneAuthService::StorageRpc),
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlPlaneAuthOperationTag {
+    RaftAppendEntries = 1,
+    RaftVote = 2,
+    RaftPreVote = 3,
+    RaftSnapshot = 4,
+    RaftTransferLeader = 5,
+    StorageRuntimeMapRefresh = 7,
+    FrontendRuntimeMapRead = 8,
+    AdminControlPlaneCommand = 9,
+    RuntimeMapResponse = 10,
+    AdminControlPlaneResponse = 11,
+    StorageRpcRequest = 12,
+    StorageRpcResponse = 13,
+}
+
+impl ControlPlaneAuthOperationTag {
+    #[cfg(test)]
+    const ALL: [Self; 12] = [
+        Self::RaftAppendEntries,
+        Self::RaftVote,
+        Self::RaftPreVote,
+        Self::RaftSnapshot,
+        Self::RaftTransferLeader,
+        Self::StorageRuntimeMapRefresh,
+        Self::FrontendRuntimeMapRead,
+        Self::AdminControlPlaneCommand,
+        Self::RuntimeMapResponse,
+        Self::AdminControlPlaneResponse,
+        Self::StorageRpcRequest,
+        Self::StorageRpcResponse,
+    ];
+
+    fn from_u8(tag: u8) -> Result<Self, ControlPlaneError> {
+        match tag {
+            1 => Ok(Self::RaftAppendEntries),
+            2 => Ok(Self::RaftVote),
+            3 => Ok(Self::RaftPreVote),
+            4 => Ok(Self::RaftSnapshot),
+            5 => Ok(Self::RaftTransferLeader),
+            7 => Ok(Self::StorageRuntimeMapRefresh),
+            8 => Ok(Self::FrontendRuntimeMapRead),
+            9 => Ok(Self::AdminControlPlaneCommand),
+            10 => Ok(Self::RuntimeMapResponse),
+            11 => Ok(Self::AdminControlPlaneResponse),
+            12 => Ok(Self::StorageRpcRequest),
+            13 => Ok(Self::StorageRpcResponse),
+            _ => Err(auth_protocol_error(format!(
+                "unknown control-plane auth operation tag {tag}"
+            ))),
+        }
+    }
+}
+
+fn control_plane_auth_operation_tag(
+    operation: ControlPlaneAuthOperation,
+) -> ControlPlaneAuthOperationTag {
+    match operation {
+        ControlPlaneAuthOperation::RaftAppendEntries => {
+            ControlPlaneAuthOperationTag::RaftAppendEntries
+        }
+        ControlPlaneAuthOperation::RaftVote => ControlPlaneAuthOperationTag::RaftVote,
+        ControlPlaneAuthOperation::RaftPreVote => ControlPlaneAuthOperationTag::RaftPreVote,
+        ControlPlaneAuthOperation::RaftSnapshot => ControlPlaneAuthOperationTag::RaftSnapshot,
+        ControlPlaneAuthOperation::RaftTransferLeader => {
+            ControlPlaneAuthOperationTag::RaftTransferLeader
+        }
+        ControlPlaneAuthOperation::StorageRuntimeMapRefresh => {
+            ControlPlaneAuthOperationTag::StorageRuntimeMapRefresh
+        }
+        ControlPlaneAuthOperation::FrontendRuntimeMapRead => {
+            ControlPlaneAuthOperationTag::FrontendRuntimeMapRead
+        }
+        ControlPlaneAuthOperation::AdminControlPlaneCommand => {
+            ControlPlaneAuthOperationTag::AdminControlPlaneCommand
+        }
+        ControlPlaneAuthOperation::RuntimeMapResponse => {
+            ControlPlaneAuthOperationTag::RuntimeMapResponse
+        }
+        ControlPlaneAuthOperation::AdminControlPlaneResponse => {
+            ControlPlaneAuthOperationTag::AdminControlPlaneResponse
+        }
+        ControlPlaneAuthOperation::StorageRpcRequest { .. } => {
+            ControlPlaneAuthOperationTag::StorageRpcRequest
+        }
+        ControlPlaneAuthOperation::StorageRpcResponse { .. } => {
+            ControlPlaneAuthOperationTag::StorageRpcResponse
+        }
     }
 }
 
 fn write_operation(out: &mut Vec<u8>, operation: ControlPlaneAuthOperation) {
-    let tag = match operation {
-        ControlPlaneAuthOperation::RaftAppendEntries => 1,
-        ControlPlaneAuthOperation::RaftVote => 2,
-        ControlPlaneAuthOperation::RaftPreVote => 3,
-        ControlPlaneAuthOperation::RaftSnapshot => 4,
-        ControlPlaneAuthOperation::RaftTransferLeader => 5,
-        ControlPlaneAuthOperation::StorageRuntimeMapRefresh => 7,
-        ControlPlaneAuthOperation::FrontendRuntimeMapRead => 8,
-        ControlPlaneAuthOperation::AdminControlPlaneCommand => 9,
-        ControlPlaneAuthOperation::RuntimeMapResponse => 10,
-        ControlPlaneAuthOperation::AdminControlPlaneResponse => 11,
-        ControlPlaneAuthOperation::StorageRpcRequest { .. } => 12,
-        ControlPlaneAuthOperation::StorageRpcResponse { .. } => 13,
-    };
-    write_u8(out, tag);
+    write_u8(out, control_plane_auth_operation_tag(operation) as u8);
     if let ControlPlaneAuthOperation::StorageRpcRequest { message_kind }
     | ControlPlaneAuthOperation::StorageRpcResponse { message_kind } = operation
     {
@@ -1064,26 +1351,41 @@ fn write_operation(out: &mut Vec<u8>, operation: ControlPlaneAuthOperation) {
 fn read_operation(
     reader: &mut AuthPayloadReader<'_>,
 ) -> Result<ControlPlaneAuthOperation, ControlPlaneError> {
-    match reader.read_u8()? {
-        1 => Ok(ControlPlaneAuthOperation::RaftAppendEntries),
-        2 => Ok(ControlPlaneAuthOperation::RaftVote),
-        3 => Ok(ControlPlaneAuthOperation::RaftPreVote),
-        4 => Ok(ControlPlaneAuthOperation::RaftSnapshot),
-        5 => Ok(ControlPlaneAuthOperation::RaftTransferLeader),
-        7 => Ok(ControlPlaneAuthOperation::StorageRuntimeMapRefresh),
-        8 => Ok(ControlPlaneAuthOperation::FrontendRuntimeMapRead),
-        9 => Ok(ControlPlaneAuthOperation::AdminControlPlaneCommand),
-        10 => Ok(ControlPlaneAuthOperation::RuntimeMapResponse),
-        11 => Ok(ControlPlaneAuthOperation::AdminControlPlaneResponse),
-        12 => Ok(ControlPlaneAuthOperation::StorageRpcRequest {
-            message_kind: reader.read_u16()?,
-        }),
-        13 => Ok(ControlPlaneAuthOperation::StorageRpcResponse {
-            message_kind: reader.read_u16()?,
-        }),
-        tag => Err(auth_protocol_error(format!(
-            "unknown control-plane auth operation tag {tag}"
-        ))),
+    match ControlPlaneAuthOperationTag::from_u8(reader.read_u8()?)? {
+        ControlPlaneAuthOperationTag::RaftAppendEntries => {
+            Ok(ControlPlaneAuthOperation::RaftAppendEntries)
+        }
+        ControlPlaneAuthOperationTag::RaftVote => Ok(ControlPlaneAuthOperation::RaftVote),
+        ControlPlaneAuthOperationTag::RaftPreVote => Ok(ControlPlaneAuthOperation::RaftPreVote),
+        ControlPlaneAuthOperationTag::RaftSnapshot => Ok(ControlPlaneAuthOperation::RaftSnapshot),
+        ControlPlaneAuthOperationTag::RaftTransferLeader => {
+            Ok(ControlPlaneAuthOperation::RaftTransferLeader)
+        }
+        ControlPlaneAuthOperationTag::StorageRuntimeMapRefresh => {
+            Ok(ControlPlaneAuthOperation::StorageRuntimeMapRefresh)
+        }
+        ControlPlaneAuthOperationTag::FrontendRuntimeMapRead => {
+            Ok(ControlPlaneAuthOperation::FrontendRuntimeMapRead)
+        }
+        ControlPlaneAuthOperationTag::AdminControlPlaneCommand => {
+            Ok(ControlPlaneAuthOperation::AdminControlPlaneCommand)
+        }
+        ControlPlaneAuthOperationTag::RuntimeMapResponse => {
+            Ok(ControlPlaneAuthOperation::RuntimeMapResponse)
+        }
+        ControlPlaneAuthOperationTag::AdminControlPlaneResponse => {
+            Ok(ControlPlaneAuthOperation::AdminControlPlaneResponse)
+        }
+        ControlPlaneAuthOperationTag::StorageRpcRequest => {
+            Ok(ControlPlaneAuthOperation::StorageRpcRequest {
+                message_kind: reader.read_u16()?,
+            })
+        }
+        ControlPlaneAuthOperationTag::StorageRpcResponse => {
+            Ok(ControlPlaneAuthOperation::StorageRpcResponse {
+                message_kind: reader.read_u16()?,
+            })
+        }
     }
 }
 
@@ -1261,6 +1563,7 @@ impl<'a> AuthPayloadReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     fn timestamp_replay_policy(now_ms: u64) -> ControlPlaneAuthReplayPolicy {
         ControlPlaneAuthReplayPolicy::TimestampWindow {
@@ -1325,6 +1628,148 @@ mod tests {
                 payload: b"raft-payload".to_vec(),
             })
             .unwrap()
+    }
+
+    fn auth_catalogue_services() -> [ControlPlaneAuthService; 4] {
+        [
+            ControlPlaneAuthService::ControlPlane,
+            ControlPlaneAuthService::RuntimeMap,
+            ControlPlaneAuthService::Admin,
+            ControlPlaneAuthService::StorageRpc,
+        ]
+    }
+
+    fn auth_catalogue_principals() -> Vec<ControlPlaneAuthPrincipal> {
+        let mut principals = vec![
+            ControlPlaneAuthPrincipal::RaftPeer { node_id: 11 },
+            ControlPlaneAuthPrincipal::StorageNode {
+                node_id: NodeId::new(12),
+                incarnation: 13,
+            },
+            ControlPlaneAuthPrincipal::Frontend {
+                instance_id: "catalogue-frontend".to_owned(),
+            },
+            ControlPlaneAuthPrincipal::Admin {
+                instance_id: "catalogue-admin".to_owned(),
+            },
+            ControlPlaneAuthPrincipal::LocalMaintenance {
+                process_id: "catalogue-maintenance".to_owned(),
+            },
+        ];
+        principals.extend(
+            auth_catalogue_services().map(|service| ControlPlaneAuthPrincipal::Service { service }),
+        );
+        principals.push(ControlPlaneAuthPrincipal::StorageNodeProcess {
+            node_id: NodeId::new(14),
+        });
+        principals
+    }
+
+    fn auth_catalogue_targets() -> Vec<ControlPlaneAuthTarget> {
+        let mut targets = vec![ControlPlaneAuthTarget::Principal(
+            ControlPlaneAuthPrincipal::RaftPeer { node_id: 21 },
+        )];
+        targets.extend(auth_catalogue_services().map(ControlPlaneAuthTarget::Service));
+        targets
+    }
+
+    fn auth_catalogue_operations() -> [ControlPlaneAuthOperation; 12] {
+        [
+            ControlPlaneAuthOperation::RaftAppendEntries,
+            ControlPlaneAuthOperation::RaftVote,
+            ControlPlaneAuthOperation::RaftPreVote,
+            ControlPlaneAuthOperation::RaftSnapshot,
+            ControlPlaneAuthOperation::RaftTransferLeader,
+            ControlPlaneAuthOperation::StorageRuntimeMapRefresh,
+            ControlPlaneAuthOperation::FrontendRuntimeMapRead,
+            ControlPlaneAuthOperation::AdminControlPlaneCommand,
+            ControlPlaneAuthOperation::RuntimeMapResponse,
+            ControlPlaneAuthOperation::AdminControlPlaneResponse,
+            ControlPlaneAuthOperation::StorageRpcRequest {
+                message_kind: 0x1234,
+            },
+            ControlPlaneAuthOperation::StorageRpcResponse {
+                message_kind: 0xabcd,
+            },
+        ]
+    }
+
+    fn auth_catalogue_hex(bytes: &[u8]) -> String {
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
+
+    fn append_signed_auth_catalogue_case(
+        aggregate: &mut Vec<u8>,
+        case_index: u32,
+        source: ControlPlaneAuthPrincipal,
+        target: ControlPlaneAuthTarget,
+        operation: ControlPlaneAuthOperation,
+        present_options: bool,
+    ) {
+        let credential_id = format!("catalogue-credential-{case_index}");
+        let secret = format!("catalogue-secret-{case_index}").into_bytes();
+        let credential = ControlPlaneScopedCredential::new(ControlPlaneScopedCredentialInput {
+            cluster_id: "catalogue-cluster".to_owned(),
+            credential_id: credential_id.clone(),
+            credential_version: 9,
+            principal: source.clone(),
+            secret,
+        })
+        .unwrap();
+        let (issued_at_ms, expires_at_ms, sequence, nonce, payload) = if present_options {
+            (
+                Some(1_000),
+                Some(2_000),
+                Some(0x0102_0304_0506_0708),
+                vec![0xa5, 0x5a],
+                vec![0xde, 0xad, 0xbe, 0xef],
+            )
+        } else {
+            (None, None, None, Vec::new(), Vec::new())
+        };
+        let envelope = credential
+            .sign_envelope(ControlPlaneAuthSignInput {
+                target: target.clone(),
+                operation,
+                issued_at_ms,
+                expires_at_ms,
+                sequence,
+                nonce,
+                payload,
+            })
+            .unwrap();
+        let covered = envelope
+            .header()
+            .encode_covered_bytes(envelope.payload())
+            .unwrap();
+        let encoded = envelope.encode_frame().unwrap();
+        assert!(encoded.starts_with(&covered));
+        assert_eq!(envelope.authenticator().len(), 32);
+        let decoded = ControlPlaneAuthEnvelope::decode_frame_classified(&encoded, 1024).unwrap();
+        assert_eq!(decoded, envelope);
+        let verifier = ControlPlaneScopedCredentialStore::new(vec![credential]).unwrap();
+        assert_eq!(
+            verifier.verify_envelope(ControlPlaneAuthVerificationInput {
+                envelope: &decoded,
+                expected_cluster_id: "catalogue-cluster",
+                expected_source: &source,
+                expected_target: &target,
+                expected_operation: operation,
+                replay_policy: ControlPlaneAuthReplayPolicy::FencedByPayloadSemantics,
+            }),
+            ControlPlaneAuthDecision::Accepted {
+                credential_id,
+                credential_version: 9,
+            }
+        );
+        write_u32(aggregate, case_index);
+        write_u32(aggregate, u32::try_from(encoded.len()).unwrap());
+        aggregate.extend_from_slice(&encoded);
     }
 
     #[test]
@@ -1399,6 +1844,172 @@ mod tests {
             32_u32.to_be_bytes()
         );
         assert_eq!(&encoded[covered.len() + 4..], envelope.authenticator());
+    }
+
+    #[test]
+    fn control_plane_auth_envelope_v1_catalogue_is_exact() {
+        assert_eq!(CONTROL_PLANE_AUTH_VERSION, 1);
+        assert_eq!(
+            (0..=u8::MAX)
+                .filter_map(|tag| ControlPlaneAuthPrincipalTag::from_u8(tag).ok())
+                .collect::<Vec<_>>(),
+            ControlPlaneAuthPrincipalTag::ALL
+        );
+        assert_eq!(
+            (0..=u8::MAX)
+                .filter_map(|tag| ControlPlaneAuthTargetTag::from_u8(tag).ok())
+                .collect::<Vec<_>>(),
+            ControlPlaneAuthTargetTag::ALL
+        );
+        assert_eq!(
+            (0..=u8::MAX)
+                .filter_map(|tag| ControlPlaneAuthServiceTag::from_u8(tag).ok())
+                .collect::<Vec<_>>(),
+            ControlPlaneAuthServiceTag::ALL
+        );
+        assert_eq!(
+            (0..=u8::MAX)
+                .filter_map(|tag| ControlPlaneAuthOperationTag::from_u8(tag).ok())
+                .collect::<Vec<_>>(),
+            ControlPlaneAuthOperationTag::ALL
+        );
+
+        let principals = auth_catalogue_principals();
+        let encoded_principal_tags = principals
+            .iter()
+            .map(|principal| {
+                let mut encoded = Vec::new();
+                write_principal(&mut encoded, principal).unwrap();
+                ControlPlaneAuthPrincipalTag::from_u8(encoded[0]).unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            encoded_principal_tags,
+            ControlPlaneAuthPrincipalTag::ALL
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+
+        let targets = auth_catalogue_targets();
+        let encoded_target_tags = targets
+            .iter()
+            .map(|target| {
+                let mut encoded = Vec::new();
+                write_target(&mut encoded, target).unwrap();
+                ControlPlaneAuthTargetTag::from_u8(encoded[0]).unwrap()
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            encoded_target_tags,
+            ControlPlaneAuthTargetTag::ALL
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+
+        let services = auth_catalogue_services();
+        assert_eq!(
+            services
+                .into_iter()
+                .map(control_plane_auth_service_tag)
+                .collect::<Vec<_>>(),
+            ControlPlaneAuthServiceTag::ALL
+        );
+        let operations = auth_catalogue_operations();
+        assert_eq!(
+            operations
+                .into_iter()
+                .map(control_plane_auth_operation_tag)
+                .collect::<Vec<_>>(),
+            ControlPlaneAuthOperationTag::ALL
+        );
+
+        let mut aggregate = Vec::new();
+        let mut case_index = 0_u32;
+        for source in principals {
+            append_signed_auth_catalogue_case(
+                &mut aggregate,
+                case_index,
+                source,
+                ControlPlaneAuthTarget::Service(ControlPlaneAuthService::ControlPlane),
+                ControlPlaneAuthOperation::RaftAppendEntries,
+                !case_index.is_multiple_of(2),
+            );
+            case_index += 1;
+        }
+        for target in targets {
+            append_signed_auth_catalogue_case(
+                &mut aggregate,
+                case_index,
+                ControlPlaneAuthPrincipal::RaftPeer { node_id: 31 },
+                target,
+                ControlPlaneAuthOperation::RaftVote,
+                !case_index.is_multiple_of(2),
+            );
+            case_index += 1;
+        }
+        for operation in operations {
+            append_signed_auth_catalogue_case(
+                &mut aggregate,
+                case_index,
+                ControlPlaneAuthPrincipal::RaftPeer { node_id: 41 },
+                ControlPlaneAuthTarget::Principal(ControlPlaneAuthPrincipal::RaftPeer {
+                    node_id: 42,
+                }),
+                operation,
+                !case_index.is_multiple_of(2),
+            );
+            case_index += 1;
+        }
+        assert_eq!(case_index, 27);
+        assert_eq!(
+            (
+                aggregate.len(),
+                auth_catalogue_hex(&checksum::sha256::digest(&aggregate))
+            ),
+            (
+                4_093,
+                "d98b0d064e3d8c3544b338ab0dda0c6967b4353d5df9ab6eaefe484001c5c975".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn control_plane_auth_envelope_marker_failures_are_typed() {
+        let encoded = sample_signed_envelope().encode_frame().unwrap();
+        assert!(matches!(
+            ControlPlaneAuthEnvelope::decode_frame_classified(&encoded[..7], 1024),
+            Err(ControlPlaneAuthEnvelopeDecodeError::Format(
+                ControlPlaneAuthEnvelopeFormatError::Truncated
+            ))
+        ));
+
+        let mut bad_magic = encoded.clone();
+        bad_magic[0] = b'X';
+        assert!(matches!(
+            ControlPlaneAuthEnvelope::decode_frame_classified(&bad_magic, 1024),
+            Err(ControlPlaneAuthEnvelopeDecodeError::Format(
+                ControlPlaneAuthEnvelopeFormatError::UnknownMagic
+            ))
+        ));
+
+        for version in [0_u16, 2] {
+            let mut unsupported = encoded.clone();
+            unsupported[CONTROL_PLANE_AUTH_MAGIC.len()
+                ..CONTROL_PLANE_AUTH_MAGIC.len() + std::mem::size_of::<u16>()]
+                .copy_from_slice(&version.to_be_bytes());
+            let error =
+                ControlPlaneAuthEnvelope::decode_frame_classified(&unsupported, 1024).unwrap_err();
+            assert!(matches!(
+                &error,
+                ControlPlaneAuthEnvelopeDecodeError::Format(
+                    ControlPlaneAuthEnvelopeFormatError::UnsupportedVersion(actual_version)
+                ) if *actual_version == version
+            ));
+            assert_eq!(
+                error.rejection_reason(),
+                ControlPlaneAuthRejectionReason::UnsupportedVersion
+            );
+        }
     }
 
     #[test]

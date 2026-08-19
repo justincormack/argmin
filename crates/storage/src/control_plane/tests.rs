@@ -2194,6 +2194,34 @@ fn signed_admin_control_plane_request_with_embedded_kind(
     }
 }
 
+fn signed_admin_control_plane_request_with_auth_version(
+    kind: ControlPlaneRpcKind,
+    signer: &ControlPlaneScopedCredential,
+    payload: Vec<u8>,
+    issued_at_ms: Option<u64>,
+    expires_at_ms: Option<u64>,
+    auth_version: u16,
+) -> ControlPlaneRpcRequest {
+    let payload = write_authenticated_control_plane_rpc_payload(kind, &payload);
+    let payload = signer
+        .sign_envelope_frame_with_version_for_test(
+            crate::control_plane_auth::ControlPlaneAuthSignInput {
+                target: ControlPlaneAuthTarget::Service(
+                    crate::control_plane_auth::ControlPlaneAuthService::ControlPlane,
+                ),
+                operation: ControlPlaneAuthOperation::AdminControlPlaneCommand,
+                issued_at_ms,
+                expires_at_ms,
+                sequence: None,
+                nonce: Vec::new(),
+                payload,
+            },
+            auth_version,
+        )
+        .expect("test admin control-plane command envelope should sign");
+    ControlPlaneRpcRequest { kind, payload }
+}
+
 fn signed_storage_node_heartbeat_request(
     signer: &ControlPlaneScopedCredential,
     heartbeat: &NodeHeartbeat,

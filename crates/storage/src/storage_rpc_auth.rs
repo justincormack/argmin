@@ -1043,6 +1043,41 @@ pub(crate) fn sign_storage_rpc_request_with_binding_version_for_test(
     sign_storage_rpc_request_binding(input, payload)
 }
 
+#[cfg(test)]
+pub(crate) fn sign_storage_rpc_request_with_auth_envelope_version_for_test(
+    input: StorageRpcAuthRequestInput<'_>,
+    auth_version: u16,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    if !principal_allows_operation(input.credential.principal(), input.frame.kind) {
+        return Err(storage_rpc_auth_protocol_error(format!(
+            "principal {:?} is not authorized for {}",
+            input.credential.principal(),
+            input.frame.kind.operation_name()
+        )));
+    }
+    let payload = encode_binding(
+        input.topology_generation,
+        input.topology_digest,
+        input.target_node_id,
+        None,
+        input.frame,
+    )?;
+    input.credential.sign_envelope_frame_with_version_for_test(
+        ControlPlaneAuthSignInput {
+            target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::StorageRpc),
+            operation: ControlPlaneAuthOperation::StorageRpcRequest {
+                message_kind: input.frame.kind as u16,
+            },
+            issued_at_ms: Some(input.issued_at_ms),
+            expires_at_ms: Some(input.expires_at_ms),
+            sequence: Some(input.frame.request_id),
+            nonce: Vec::new(),
+            payload,
+        },
+        auth_version,
+    )
+}
+
 pub(crate) struct StorageRpcAuthRequestVerificationInput<'a> {
     pub(crate) verifier: &'a ControlPlaneScopedCredentialStore,
     pub(crate) expected_cluster_id: &'a str,
@@ -1058,11 +1093,11 @@ pub(crate) struct StorageRpcAuthRequestVerificationInput<'a> {
 pub(crate) fn verify_storage_rpc_request(
     input: StorageRpcAuthRequestVerificationInput<'_>,
 ) -> Result<VerifiedStorageRpcFrame, StorageRpcAuthRejectionReason> {
-    let envelope = ControlPlaneAuthEnvelope::decode_frame(
+    let envelope = ControlPlaneAuthEnvelope::decode_frame_classified(
         input.envelope_bytes,
         STORAGE_RPC_AUTH_MAX_BINDING_LEN,
     )
-    .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+    .map_err(|error| StorageRpcAuthRejectionReason::Envelope(error.rejection_reason()))?;
     let source = envelope.header().source().clone();
     let operation = envelope.header().operation();
     let ControlPlaneAuthOperation::StorageRpcRequest { message_kind } = operation else {
@@ -1181,11 +1216,11 @@ fn verify_storage_rpc_response(
         .map_err(|_| StorageRpcAuthRejectionReason::UnauthorizedRole)?;
     let verifier = ControlPlaneScopedCredentialStore::new(vec![response_credential.clone()])
         .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
-    let envelope = ControlPlaneAuthEnvelope::decode_frame(
+    let envelope = ControlPlaneAuthEnvelope::decode_frame_classified(
         input.envelope_bytes,
         STORAGE_RPC_AUTH_MAX_BINDING_LEN,
     )
-    .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+    .map_err(|error| StorageRpcAuthRejectionReason::Envelope(error.rejection_reason()))?;
     let operation = ControlPlaneAuthOperation::StorageRpcResponse {
         message_kind: input.expected_kind as u16,
     };

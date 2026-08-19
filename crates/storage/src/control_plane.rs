@@ -20,9 +20,9 @@ use thiserror::Error;
 
 use crate::control_plane_auth::{
     control_plane_auth_payload_has_magic, ControlPlaneAuthDecision, ControlPlaneAuthEnvelope,
-    ControlPlaneAuthOperation, ControlPlaneAuthPrincipal, ControlPlaneAuthRejectionReason,
-    ControlPlaneAuthReplayPolicy, ControlPlaneAuthService, ControlPlaneAuthTarget,
-    ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
+    ControlPlaneAuthEnvelopeDecodeError, ControlPlaneAuthOperation, ControlPlaneAuthPrincipal,
+    ControlPlaneAuthRejectionReason, ControlPlaneAuthReplayPolicy, ControlPlaneAuthService,
+    ControlPlaneAuthTarget, ControlPlaneScopedCredential, ControlPlaneScopedCredentialInput,
     ControlPlaneScopedCredentialStore,
 };
 use crate::control_plane_command::{

@@ -1115,6 +1115,21 @@ fn format_control_plane_auth_rejection(
     )
 }
 
+fn control_plane_auth_envelope_decode_rejection_reason(
+    payload: &[u8],
+    error: &ControlPlaneAuthEnvelopeDecodeError,
+) -> ControlPlaneAuthRejectionReason {
+    match error.rejection_reason() {
+        ControlPlaneAuthRejectionReason::UnsupportedVersion => {
+            ControlPlaneAuthRejectionReason::UnsupportedVersion
+        }
+        _ if control_plane_auth_payload_has_magic(payload) => {
+            ControlPlaneAuthRejectionReason::Malformed
+        }
+        _ => ControlPlaneAuthRejectionReason::Missing,
+    }
+}
+
 impl ControlPlaneUnixAuthMetrics {
     fn record_accepted(&self, operation: ControlPlaneAuthOperation) {
         let mut state = self
@@ -4102,19 +4117,16 @@ impl ControlPlaneUnixAuthVerifier {
         authority_now_ms: u64,
     ) -> Result<VerifiedAdminControlPlaneCommand, ControlPlaneError> {
         let operation = ControlPlaneAuthOperation::AdminControlPlaneCommand;
-        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame_classified(
             payload,
             CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
         ) {
             Ok(envelope) => envelope,
             Err(error) => {
-                let reason = if control_plane_auth_payload_has_magic(payload) {
-                    ControlPlaneAuthRejectionReason::Malformed
-                } else {
-                    ControlPlaneAuthRejectionReason::Missing
-                };
+                let reason =
+                    control_plane_auth_envelope_decode_rejection_reason(payload, &error);
                 self.metrics.record_rejected(operation, reason);
-                return Err(error);
+                return Err(error.into_control_plane_error());
             }
         };
         let expected_source = match envelope.header().source() {
@@ -4238,19 +4250,16 @@ impl ControlPlaneUnixAuthVerifier {
         authority_now_ms: u64,
     ) -> Result<VerifiedFrontendRuntimeMapRead, ControlPlaneError> {
         let operation = ControlPlaneAuthOperation::FrontendRuntimeMapRead;
-        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame_classified(
             payload,
             CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
         ) {
             Ok(envelope) => envelope,
             Err(error) => {
-                let reason = if control_plane_auth_payload_has_magic(payload) {
-                    ControlPlaneAuthRejectionReason::Malformed
-                } else {
-                    ControlPlaneAuthRejectionReason::Missing
-                };
+                let reason =
+                    control_plane_auth_envelope_decode_rejection_reason(payload, &error);
                 self.metrics.record_rejected(operation, reason);
-                return Err(error);
+                return Err(error.into_control_plane_error());
             }
         };
         let expected_source = match envelope.header().source() {
@@ -4357,20 +4366,17 @@ impl ControlPlaneUnixAuthVerifier {
         payload: &[u8],
         authority_now_ms: u64,
     ) -> Result<VerifiedStorageNodeHeartbeatRefresh, ControlPlaneError> {
-        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame_classified(
             payload,
             CONTROL_PLANE_RPC_MAX_PAYLOAD_LEN,
         ) {
             Ok(envelope) => envelope,
             Err(error) => {
-                let reason = if control_plane_auth_payload_has_magic(payload) {
-                    ControlPlaneAuthRejectionReason::Malformed
-                } else {
-                    ControlPlaneAuthRejectionReason::Missing
-                };
+                let reason =
+                    control_plane_auth_envelope_decode_rejection_reason(payload, &error);
                 self.metrics
                     .record_rejected(ControlPlaneAuthOperation::StorageRuntimeMapRefresh, reason);
-                return Err(error);
+                return Err(error.into_control_plane_error());
             }
         };
         let payload = match read_authenticated_control_plane_rpc_payload(

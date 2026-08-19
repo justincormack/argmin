@@ -19,6 +19,7 @@
     use crate::storage_rpc_auth::{
         encode_storage_rpc_auth_transport_frame_with_version_for_test,
         sign_storage_rpc_request,
+        sign_storage_rpc_request_with_auth_envelope_version_for_test,
         sign_storage_rpc_request_with_binding_version_for_test,
         sign_storage_rpc_request_with_encoded_frame_for_test,
         write_storage_rpc_auth_transport_frame, StorageRpcAuthRequestInput,
@@ -5243,6 +5244,33 @@
                 |credential, target_node_id, frame| {
                     let now_ms = crate::clock::current_time_millis();
                     let envelope = sign_storage_rpc_request_with_binding_version_for_test(
+                        StorageRpcAuthRequestInput {
+                            credential,
+                            target_node_id,
+                            topology_generation: 9,
+                            topology_digest: STORAGE_RPC_AUTH_TEST_TOPOLOGY_DIGEST,
+                            issued_at_ms: now_ms,
+                            expires_at_ms: now_ms + 5_000,
+                            frame,
+                        },
+                        unsupported_version,
+                    )
+                    .unwrap();
+                    encode_storage_rpc_auth_transport_frame_with_version_for_test(&envelope, 1)
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_storage_rpc_rejects_unsupported_auth_envelope_before_mutation_dispatch() {
+        for unsupported_version in [0_u16, 2] {
+            assert_authenticated_transport_rejected_before_mutation_dispatch(
+                &format!("authenticator-valid auth envelope v{unsupported_version}"),
+                "storage RPC stream I/O error: storage RPC authentication rejected: Envelope(UnsupportedVersion)",
+                |credential, target_node_id, frame| {
+                    let now_ms = crate::clock::current_time_millis();
+                    let envelope = sign_storage_rpc_request_with_auth_envelope_version_for_test(
                         StorageRpcAuthRequestInput {
                             credential,
                             target_node_id,

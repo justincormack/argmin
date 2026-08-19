@@ -1023,16 +1023,16 @@ pub(super) fn handle_control_plane_raft_peer_server_request(
         )
         .map_err(ControlPlaneRaftPeerServerWorkerError::PeerRpc)?;
     let request_frame = if let Some(auth_policy) = policy.peer_policy.auth_policy() {
-        let envelope = match ControlPlaneAuthEnvelope::decode_frame(
+        let envelope = match ControlPlaneAuthEnvelope::decode_frame_classified(
             &received_frame,
             policy.peer_policy.limits().max_frame_bytes,
         ) {
             Ok(envelope) => envelope,
             Err(error) => {
-                auth_policy.record_peer_frame_rejection_without_operation(
-                    ControlPlaneAuthRejectionReason::Malformed,
-                );
-                return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(error));
+                auth_policy.record_peer_frame_rejection_without_operation(error.rejection_reason());
+                return Err(ControlPlaneRaftPeerServerWorkerError::PeerRpc(
+                    error.into_control_plane_error(),
+                ));
             }
         };
         let operation = envelope.header().operation();

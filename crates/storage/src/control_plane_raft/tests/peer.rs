@@ -1655,6 +1655,92 @@ fn control_plane_raft_peer_server_poison_after_validation_prevents_dispatch() {
 }
 
 #[test]
+fn control_plane_raft_peer_server_rejects_resigned_auth_versions_before_dispatch() {
+    for auth_version in [0_u16, 2] {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cluster_name = "control-plane-raft-peer-transport-test";
+        let authority = Arc::new(
+            runtime
+                .block_on(
+                    ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(
+                        cluster_name,
+                        1,
+                    ),
+                )
+                .unwrap(),
+        );
+        let before = runtime.block_on(authority.status()).unwrap();
+        let server_auth = test_peer_auth_policy(1);
+        let policy = ControlPlaneRaftPeerServerPolicy::new(
+            1,
+            test_peer_transport_policy().with_auth_policy(server_auth.clone()),
+            4096,
+        )
+        .unwrap()
+        .with_durability(
+            authority
+                .bind_peer_server_durability(Arc::new(NoopPeerServerCheckpoint))
+                .unwrap(),
+        );
+        let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 2, 1);
+        let raw_request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+            vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 2),
+            last_log_id: None,
+            leadership_transfer: false,
+        })
+        .encode_frame_for_peer(&identity)
+        .unwrap();
+        let signed = test_peer_auth_policy(2)
+            .sign_peer_frame_with_auth_version_for_test(
+                &identity,
+                ControlPlaneAuthOperation::RaftVote,
+                raw_request,
+                auth_version,
+            )
+            .unwrap();
+        let mut transport_request = Vec::new();
+        write_control_plane_raft_peer_transport_frame(&mut transport_request, &signed).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RecordingPeerServerStream::new(transport_request, Arc::clone(&events));
+
+        let error = handle_control_plane_raft_peer_server_request(
+            runtime.handle(),
+            &authority,
+            &mut stream,
+            &policy,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        let ControlPlaneRaftPeerServerWorkerError::PeerRpc(error) = error else {
+            panic!("auth-envelope version rejection returned checkpoint error")
+        };
+
+        assert!(
+            matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
+                if message.as_str() == format!("control-plane auth envelope: unsupported control-plane auth version {auth_version}")),
+            "unexpected auth v{auth_version} error: {error}"
+        );
+        assert_eq!(runtime.block_on(authority.status()).unwrap(), before);
+        assert!(events.lock().unwrap().is_empty());
+        assert!(stream.response.is_empty());
+        let metrics = server_auth.metrics_snapshot();
+        assert_eq!(metrics.accepted_total(), 0);
+        assert_eq!(metrics.rejected_total(), 1);
+        assert_eq!(metrics.rejected_without_operation_total(), 1);
+        assert_eq!(
+            metrics.rejected_for_reason(ControlPlaneAuthRejectionReason::UnsupportedVersion),
+            1
+        );
+        runtime.block_on(authority.shutdown()).unwrap();
+    }
+}
+
+#[test]
 fn control_plane_raft_peer_server_storage_owned_publication_publishes_once() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
