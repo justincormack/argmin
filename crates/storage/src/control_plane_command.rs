@@ -2754,6 +2754,32 @@ mod tests {
     }
 
     #[test]
+    fn replicated_snapshot_install_rejects_noncurrent_state_versions_before_mutation() {
+        let current_contents = format_snapshot(&sample_snapshot());
+        for version in [27, 29] {
+            let unsupported_contents =
+                current_contents.replacen("version=28\n", &format!("version={version}\n"), 1);
+            let payload =
+                snapshot_frame_with_version(CONTROL_PLANE_SNAPSHOT_VERSION, &unsupported_contents);
+            let mut installed = replay_sample_state_machine();
+            let before = installed.clone();
+
+            assert!(matches!(
+                installed.install_snapshot_artifact(ControlPlaneSnapshotArtifact::new(
+                    Some(log_id(2, 4)),
+                    payload,
+                )),
+                Err(ControlPlaneError::Parse { message, .. })
+                    if message == format!("unsupported control-plane state version {version}")
+            ));
+            assert_eq!(
+                installed, before,
+                "unsupported state v{version} mutated the replicated state machine"
+            );
+        }
+    }
+
+    #[test]
     fn replicated_control_plane_state_machine_replay_matches_direct_apply() {
         let state_machine = replay_sample_state_machine();
         assert_eq!(state_machine.snapshot(), &replay_sample_directly());

@@ -1391,6 +1391,30 @@ fn parse_snapshot_round_trips_canonical_snapshot_bytes() {
 }
 
 #[test]
+fn control_plane_state_version_failures_are_typed_before_state_construction() {
+    assert_eq!(
+        require_current_control_plane_state_version(None),
+        Err(ControlPlaneStateVersionError::Missing)
+    );
+    for version in [27, 29] {
+        assert_eq!(
+            require_current_control_plane_state_version(Some(version)),
+            Err(ControlPlaneStateVersionError::Unsupported(version))
+        );
+    }
+    assert_eq!(
+        require_current_control_plane_state_version(Some(28)),
+        Ok(28)
+    );
+
+    assert!(matches!(
+        parse_snapshot("authority_incarnation=1\ncluster_epoch=1\n"),
+        Err(ControlPlaneError::Parse { line: 0, message })
+            if message == "missing control-plane state version"
+    ));
+}
+
+#[test]
 fn canonical_control_plane_state_v28_text_is_exact() {
     assert_eq!(
         format_snapshot(&canonical_snapshot_with_node()),
@@ -1402,6 +1426,286 @@ fn canonical_control_plane_state_v28_text_is_exact() {
             "max_committed_timestamp_ms=123\n",
             "lease_grant_horizon=-\n",
             "node=1,active,1,healthy,11,1,100,200,6e6f64652d312e736f636b\n",
+        )
+    );
+}
+
+#[test]
+fn canonical_control_plane_state_v28_representative_aggregate_is_stable() {
+    let mut snapshots = vec![canonical_snapshot_with_node()];
+
+    let certified_nodes = vec![
+        (NodeId::new(1), "/tmp/node-1.sock".to_owned()),
+        (NodeId::new(2), "/tmp/node-2.sock".to_owned()),
+        (NodeId::new(3), "/tmp/node-3.sock".to_owned()),
+    ];
+    let certified_pgs = vec![
+        (PgId::new(7), vec![NodeId::new(1), NodeId::new(2)]),
+        (PgId::new(9), vec![NodeId::new(2), NodeId::new(3)]),
+    ];
+    let topology = InitialClusterTopologyCertificate::new_for_bootstrap_map(
+        9,
+        [0x3c; CONTROL_PLANE_TOPOLOGY_DIGEST_LEN],
+        vec![101, 102, 103],
+        &certified_nodes,
+        &certified_pgs,
+    )
+    .unwrap();
+    let certified = ClusterControlSnapshot::empty()
+        .apply_control_plane_command(ControlPlaneCommand::BootstrapCertifiedInitialClusterMap {
+            nodes: certified_nodes,
+            pg_acting_sets: certified_pgs,
+            topology,
+        })
+        .unwrap()
+        .into_snapshot();
+    snapshots.push(certified);
+
+    let with_horizon = canonical_snapshot_with_node()
+        .apply_control_plane_command(ControlPlaneCommand::EstablishLeaseGrantHorizon {
+            authority: LeaseHorizonAuthorityBinding::new(7, Some(11)),
+            authority_now_ms: 500,
+            horizon_duration_ms: 2_000,
+        })
+        .unwrap()
+        .into_snapshot();
+    snapshots.push(with_horizon);
+
+    let tmp = test_util::tempdir();
+    let store = FileControlPlaneStore::new(tmp.path().join("representative.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    for node_id in [1, 2] {
+        authority
+            .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, node_id, 1_000).serving());
+    }
+    let pg_id = PgId::new(24);
+    let source_proof = PgMetadataProof::current(7, 8, 9);
+    authority
+        .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        pg_id.get(),
+        PgState::Peering,
+        source_proof,
+        false,
+        2_000,
+    );
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            2_010,
+        )
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        pg_id.get(),
+        PgState::Active,
+        source_proof,
+        false,
+        2_020,
+    );
+    snapshots.push(authority.snapshot().clone());
+    let source_epoch = authority.snapshot().cluster_epoch();
+    let imported_proof = PgMetadataProof::current(8, 10, 12);
+    authority
+        .set_pg_acting_set_with_metadata_transfer(
+            pg_id,
+            vec![NodeId::new(2)],
+            PgMetadataTransferProof::new_with_imported_metadata_proof(
+                source_epoch,
+                source_proof,
+                imported_proof,
+            ),
+        )
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        2,
+        pg_id.get(),
+        PgState::Peering,
+        imported_proof,
+        false,
+        2_030,
+    );
+    let references = PgClusterMapHistoryRouteReferences::try_from_iter(
+        [
+            PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+            PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+            PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+            PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+        ]
+        .into_iter()
+        .map(|kind| PgClusterMapHistoryRouteReference::new(kind, source_epoch, pg_id)),
+    )
+    .unwrap();
+    let mut referenced_heartbeat =
+        heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 2_040);
+    referenced_heartbeat.cluster_map_history_route_references = references;
+    authority.heartbeat(referenced_heartbeat, 2_040).unwrap();
+    snapshots.push(authority.snapshot().clone());
+
+    let store = FileControlPlaneStore::new(tmp.path().join("pending.state"));
+    let mut authority = SingleAuthorityControlPlane::open(store).unwrap();
+    for node_id in [1, 2] {
+        authority
+            .set_node_membership(NodeId::new(node_id), NodeMembershipState::Active)
+            .unwrap();
+        assert!(heartbeat_until_serving(&mut authority, node_id, 3_000).serving());
+    }
+    let pg_id = PgId::new(25);
+    let proof = PgMetadataProof::current(20, 21, 22);
+    authority
+        .set_pg_acting_set(pg_id, vec![NodeId::new(1)])
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        pg_id.get(),
+        PgState::Peering,
+        proof,
+        false,
+        4_000,
+    );
+    authority
+        .complete_pg_peering(
+            pg_id,
+            NodeId::new(1),
+            node_incarnation(&authority, 1),
+            4_010,
+        )
+        .unwrap();
+    heartbeat_with_pg_proof(
+        &mut authority,
+        1,
+        pg_id.get(),
+        PgState::Active,
+        proof,
+        false,
+        4_020,
+    );
+    let active_epoch = authority.snapshot().cluster_epoch();
+    authority
+        .set_pg_acting_set(pg_id, vec![NodeId::new(1), NodeId::new(2)])
+        .unwrap();
+    let mut pending_heartbeat =
+        heartbeat_from_record(&authority, 1, authority.snapshot().cluster_epoch(), 4_030);
+    pending_heartbeat.pg_observations = vec![NodePgHeartbeatObservation {
+        pg_id,
+        state: PgState::Peering,
+        metadata_proof: proof,
+        pending_metadata_command: Some(test_pending_metadata_command(active_epoch)),
+    }];
+    authority.heartbeat(pending_heartbeat, 4_030).unwrap();
+    snapshots.push(authority.snapshot().clone());
+
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| snapshot.initial_topology.is_some()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| snapshot.initial_topology.is_none()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| snapshot.lease_grant_horizon.is_some()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| snapshot.lease_grant_horizon.is_none()));
+    for (label, projection) in [
+        (
+            "active metadata proof",
+            (|record: &PgControlRecord| record.active_metadata_proof.is_some())
+                as fn(&PgControlRecord) -> bool,
+        ),
+        ("metadata transfer", |record: &PgControlRecord| {
+            record.peering_metadata_transfer.is_some()
+        }),
+        ("previous primary lease", |record: &PgControlRecord| {
+            record.previous_primary_lease.is_some()
+        }),
+    ] {
+        assert!(
+            snapshots
+                .iter()
+                .flat_map(|snapshot| snapshot.pgs.values())
+                .any(projection),
+            "representative aggregate omitted present {label}"
+        );
+        assert!(
+            snapshots
+                .iter()
+                .flat_map(|snapshot| snapshot.pgs.values())
+                .any(|record| !projection(record)),
+            "representative aggregate omitted absent {label}"
+        );
+    }
+    assert!(snapshots
+        .iter()
+        .flat_map(|snapshot| snapshot.nodes.values())
+        .flat_map(|node| node.pg_observations.values())
+        .any(|observation| observation.pending_metadata_command.is_some()));
+    assert!(snapshots
+        .iter()
+        .flat_map(|snapshot| snapshot.nodes.values())
+        .flat_map(|node| node.pg_observations.values())
+        .any(|observation| observation.pending_metadata_command.is_none()));
+    for kind in [
+        PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+        PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+        PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+        PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+        PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+    ] {
+        assert!(snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.nodes.values())
+            .flat_map(|node| node.cluster_map_history_route_references.iter())
+            .any(|reference| reference.kind() == kind));
+    }
+
+    let mut aggregate = Vec::new();
+    let mut aggregate_text = String::new();
+    for snapshot in snapshots {
+        snapshot.validate_current_state_invariants().unwrap();
+        let formatted = format_snapshot(&snapshot);
+        assert_eq!(parse_snapshot(&formatted).unwrap(), snapshot);
+        aggregate.extend_from_slice(&(formatted.len() as u64).to_be_bytes());
+        aggregate.extend_from_slice(formatted.as_bytes());
+        aggregate_text.push_str(&formatted);
+    }
+    for required_record in [
+        "version=28\n",
+        "initial_topology=9,",
+        "lease_grant_horizon=7,11,2500\n",
+        "history=",
+        "history_node=",
+        "history_pg=",
+        "history_pg_absent=",
+        "node=",
+        "node_history_route=",
+        "node_pg=",
+        "pg=",
+    ] {
+        assert!(
+            aggregate_text.contains(required_record),
+            "representative aggregate omitted {required_record:?}"
+        );
+    }
+    assert_eq!(
+        (
+            aggregate.len(),
+            hex_encode(&checksum::sha256::digest(&aggregate))
+        ),
+        (
+            3_596,
+            "4ae025e955d70386a92c8814ed18855f6c7374f62852342feb6814181edbaba4".to_owned()
         )
     );
 }

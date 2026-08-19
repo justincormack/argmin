@@ -7469,6 +7469,39 @@ pub(crate) fn parse_snapshot(contents: &str) -> Result<ClusterControlSnapshot, C
     Ok(snapshot)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneStateVersionError {
+    Missing,
+    Unsupported(u64),
+}
+
+fn require_current_control_plane_state_version(
+    version: Option<u64>,
+) -> Result<u64, ControlPlaneStateVersionError> {
+    match version {
+        None => Err(ControlPlaneStateVersionError::Missing),
+        Some(version) if version != CURRENT_CONTROL_PLANE_STATE_VERSION => {
+            Err(ControlPlaneStateVersionError::Unsupported(version))
+        }
+        Some(version) => Ok(version),
+    }
+}
+
+fn control_plane_state_version_parse_error(
+    line: usize,
+    error: ControlPlaneStateVersionError,
+) -> ControlPlaneError {
+    match error {
+        ControlPlaneStateVersionError::Missing => {
+            parse_error(line, "missing control-plane state version")
+        }
+        ControlPlaneStateVersionError::Unsupported(version) => parse_error(
+            line,
+            &format!("unsupported control-plane state version {version}"),
+        ),
+    }
+}
+
 pub(crate) fn parse_snapshot_without_publication_validation(
     contents: &str,
 ) -> Result<ClusterControlSnapshot, ControlPlaneError> {
@@ -7494,12 +7527,8 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         }
         if let Some(value) = line.strip_prefix("version=") {
             let parsed_version = parse_u64(line_number, value, "version")?;
-            if parsed_version != CURRENT_CONTROL_PLANE_STATE_VERSION {
-                return Err(parse_error(
-                    line_number,
-                    "missing or unsupported control-plane state version",
-                ));
-            }
+            require_current_control_plane_state_version(Some(parsed_version))
+                .map_err(|error| control_plane_state_version_parse_error(line_number, error))?;
             version = Some(parsed_version);
         } else if let Some(value) = line.strip_prefix("authority_incarnation=") {
             authority_incarnation = Some(
@@ -7527,15 +7556,9 @@ pub(crate) fn parse_snapshot_without_publication_validation(
                 ));
             }
             max_committed_timestamp_seen = true;
-            let state_version = version.ok_or_else(|| {
+            version.ok_or_else(|| {
                 parse_error(line_number, "version must precede max committed timestamp")
             })?;
-            if state_version != CURRENT_CONTROL_PLANE_STATE_VERSION {
-                return Err(parse_error(
-                    line_number,
-                    "max committed timestamp requires current control-plane state version",
-                ));
-            }
             max_committed_timestamp_ms =
                 parse_option_u64(line_number, value, "max committed timestamp")?;
         } else if let Some(value) = line.strip_prefix("lease_grant_horizon=") {
@@ -7652,14 +7675,8 @@ pub(crate) fn parse_snapshot_without_publication_validation(
         }
     }
 
-    let version = version
-        .ok_or_else(|| parse_error(0, "missing or unsupported control-plane state version"))?;
-    if version != CURRENT_CONTROL_PLANE_STATE_VERSION {
-        return Err(parse_error(
-            0,
-            "missing or unsupported control-plane state version",
-        ));
-    }
+    require_current_control_plane_state_version(version)
+        .map_err(|error| control_plane_state_version_parse_error(0, error))?;
     if !max_committed_timestamp_seen {
         return Err(parse_error(0, "missing max committed timestamp"));
     }

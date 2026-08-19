@@ -67,7 +67,7 @@ fn file_backed_authority_rejects_pre_v7_state() {
     assert!(matches!(
         SingleAuthorityControlPlane::open(store),
         Err(ControlPlaneError::Parse { message, .. })
-            if message == "missing or unsupported control-plane state version"
+            if message == "unsupported control-plane state version 2"
     ));
 }
 
@@ -76,19 +76,20 @@ fn file_backed_authority_rejects_previous_and_future_state_versions() {
     for version in [27, 29] {
         let tmp = test_util::tempdir();
         let path = tmp.path().join(format!("control-plane-v{version}.state"));
-        std::fs::write(
-            &path,
-            format!(
-                "version={version}\nauthority_incarnation=1\ncluster_epoch=1\ninitial_topology=-\n"
-            ),
-        )
-        .unwrap();
+        let current = format_snapshot(&canonical_snapshot_with_node());
+        let unsupported = current.replacen("version=28\n", &format!("version={version}\n"), 1);
+        std::fs::write(&path, &unsupported).unwrap();
 
         assert!(matches!(
-            FileControlPlaneStore::new(path).load(),
+            SingleAuthorityControlPlane::open(FileControlPlaneStore::new(path.clone())),
             Err(ControlPlaneError::Parse { message, .. })
-                if message == "missing or unsupported control-plane state version"
+                if message == format!("unsupported control-plane state version {version}")
         ));
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            unsupported,
+            "unsupported state v{version} was replaced during authority open"
+        );
     }
 }
 
@@ -1567,7 +1568,7 @@ fn file_backed_authority_rejects_history_for_unsupported_version() {
     assert!(matches!(
         SingleAuthorityControlPlane::open(store),
         Err(ControlPlaneError::Parse { message, .. })
-            if message == "missing or unsupported control-plane state version"
+            if message == "unsupported control-plane state version 5"
     ));
 }
 
@@ -1893,7 +1894,7 @@ fn file_backed_authority_rejects_pg_observations_for_unsupported_version() {
     assert!(matches!(
         SingleAuthorityControlPlane::open(store),
         Err(ControlPlaneError::Parse { message, .. })
-            if message == "missing or unsupported control-plane state version"
+            if message == "unsupported control-plane state version 5"
     ));
 }
 
