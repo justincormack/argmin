@@ -7089,13 +7089,86 @@ fn control_plane_rpc_frame_checksum(
     hasher.finalize()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlPlaneRpcResponseStatus {
+    Success = 0,
+    RemoteFailure = 1,
+    PgPeeringPendingMetadataCommand = 2,
+    PgMetadataMigrationSourceNotReady = 3,
+    PgHasNoServingPrimary = 4,
+    PgPrimaryMissingActiveObservation = 5,
+    PgPrimaryObservationNotActive = 6,
+    PgActingSetChangeNotReady = 7,
+    UnknownPg = 8,
+    OpenRaftOperation = 9,
+    AuthorityNotServing = 10,
+    AuthorityClockNotLocalServingRaftAuthority = 11,
+    UnknownNode = 12,
+    UnknownActingSetNode = 13,
+    AuthorityClockLeadershipChanged = 14,
+    PgMetadataTransferDestinationEpochMismatch = 15,
+}
+
+impl ControlPlaneRpcResponseStatus {
+    #[cfg(test)]
+    const ALL: [Self; 16] = [
+        Self::Success,
+        Self::RemoteFailure,
+        Self::PgPeeringPendingMetadataCommand,
+        Self::PgMetadataMigrationSourceNotReady,
+        Self::PgHasNoServingPrimary,
+        Self::PgPrimaryMissingActiveObservation,
+        Self::PgPrimaryObservationNotActive,
+        Self::PgActingSetChangeNotReady,
+        Self::UnknownPg,
+        Self::OpenRaftOperation,
+        Self::AuthorityNotServing,
+        Self::AuthorityClockNotLocalServingRaftAuthority,
+        Self::UnknownNode,
+        Self::UnknownActingSetNode,
+        Self::AuthorityClockLeadershipChanged,
+        Self::PgMetadataTransferDestinationEpochMismatch,
+    ];
+
+    const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    fn from_u8(status: u8) -> Result<Self, ControlPlaneError> {
+        match status {
+            0 => Ok(Self::Success),
+            1 => Ok(Self::RemoteFailure),
+            2 => Ok(Self::PgPeeringPendingMetadataCommand),
+            3 => Ok(Self::PgMetadataMigrationSourceNotReady),
+            4 => Ok(Self::PgHasNoServingPrimary),
+            5 => Ok(Self::PgPrimaryMissingActiveObservation),
+            6 => Ok(Self::PgPrimaryObservationNotActive),
+            7 => Ok(Self::PgActingSetChangeNotReady),
+            8 => Ok(Self::UnknownPg),
+            9 => Ok(Self::OpenRaftOperation),
+            10 => Ok(Self::AuthorityNotServing),
+            11 => Ok(Self::AuthorityClockNotLocalServingRaftAuthority),
+            12 => Ok(Self::UnknownNode),
+            13 => Ok(Self::UnknownActingSetNode),
+            14 => Ok(Self::AuthorityClockLeadershipChanged),
+            15 => Ok(Self::PgMetadataTransferDestinationEpochMismatch),
+            _ => Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid control-plane RPC response status {status}"
+            ))),
+        }
+    }
+}
+
 fn encode_control_plane_rpc_response(
     response: Result<Vec<u8>, ControlPlaneError>,
 ) -> Result<Vec<u8>, ControlPlaneError> {
     let mut payload = Vec::new();
     match response {
         Ok(response) => {
-            write_u8(&mut payload, 0);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::Success.as_u8(),
+            );
             write_bytes(&mut payload, &response)?;
         }
         Err(ControlPlaneError::PgPeeringPendingMetadataCommand {
@@ -7104,7 +7177,10 @@ fn encode_control_plane_rpc_response(
             cluster_epoch,
             pending,
         }) => {
-            write_u8(&mut payload, 2);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PgPeeringPendingMetadataCommand.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u32(&mut payload, node_id);
             write_u64(&mut payload, cluster_epoch.get());
@@ -7116,7 +7192,10 @@ fn encode_control_plane_rpc_response(
             pg_id,
             cluster_epoch,
         }) => {
-            write_u8(&mut payload, 3);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PgMetadataMigrationSourceNotReady.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u64(&mut payload, cluster_epoch.get());
         }
@@ -7124,7 +7203,10 @@ fn encode_control_plane_rpc_response(
             pg_id,
             cluster_epoch,
         }) => {
-            write_u8(&mut payload, 4);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PgHasNoServingPrimary.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u64(&mut payload, cluster_epoch.get());
         }
@@ -7133,7 +7215,10 @@ fn encode_control_plane_rpc_response(
             node_id,
             cluster_epoch,
         }) => {
-            write_u8(&mut payload, 5);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PgPrimaryMissingActiveObservation.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u32(&mut payload, node_id);
             write_u64(&mut payload, cluster_epoch.get());
@@ -7144,7 +7229,10 @@ fn encode_control_plane_rpc_response(
             cluster_epoch,
             state,
         }) => {
-            write_u8(&mut payload, 6);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PgPrimaryObservationNotActive.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u32(&mut payload, node_id);
             write_u64(&mut payload, cluster_epoch.get());
@@ -7155,32 +7243,53 @@ fn encode_control_plane_rpc_response(
             cluster_epoch,
             state,
         }) => {
-            write_u8(&mut payload, 7);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PgActingSetChangeNotReady.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u64(&mut payload, cluster_epoch.get());
             write_pg_state(&mut payload, state);
         }
         Err(ControlPlaneError::UnknownPg { pg_id }) => {
-            write_u8(&mut payload, 8);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::UnknownPg.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
         }
         Err(ControlPlaneError::OpenRaftOperation { kind, message }) => {
-            write_u8(&mut payload, 9);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::OpenRaftOperation.as_u8(),
+            );
             write_u8(&mut payload, kind.wire_tag());
             write_string(&mut payload, &message)?;
         }
         Err(ControlPlaneError::AuthorityNotServing) => {
-            write_u8(&mut payload, 10);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::AuthorityNotServing.as_u8(),
+            );
         }
         Err(ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority) => {
-            write_u8(&mut payload, 11);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::AuthorityClockNotLocalServingRaftAuthority.as_u8(),
+            );
         }
         Err(ControlPlaneError::UnknownNode { node_id }) => {
-            write_u8(&mut payload, 12);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::UnknownNode.as_u8(),
+            );
             write_u32(&mut payload, node_id);
         }
         Err(ControlPlaneError::UnknownActingSetNode { pg_id, node_id }) => {
-            write_u8(&mut payload, 13);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::UnknownActingSetNode.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u32(&mut payload, node_id);
         }
@@ -7188,7 +7297,10 @@ fn encode_control_plane_rpc_response(
             established_term,
             current_term,
         }) => {
-            write_u8(&mut payload, 14);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::AuthorityClockLeadershipChanged.as_u8(),
+            );
             write_option_u64(&mut payload, established_term);
             write_u64(&mut payload, current_term);
         }
@@ -7197,13 +7309,19 @@ fn encode_control_plane_rpc_response(
             expected_destination_epoch,
             actual_destination_epoch,
         }) => {
-            write_u8(&mut payload, 15);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::PgMetadataTransferDestinationEpochMismatch.as_u8(),
+            );
             write_u32(&mut payload, pg_id);
             write_u64(&mut payload, expected_destination_epoch.get());
             write_u64(&mut payload, actual_destination_epoch.get());
         }
         Err(error) => {
-            write_u8(&mut payload, 1);
+            write_u8(
+                &mut payload,
+                ControlPlaneRpcResponseStatus::RemoteFailure.as_u8(),
+            );
             write_string(&mut payload, &error.rpc_wire_error_message())?;
         }
     }
@@ -7226,21 +7344,21 @@ fn decode_control_plane_rpc_response_frame(
     payload: Vec<u8>,
 ) -> Result<DecodedControlPlaneRpcResponse, ControlPlaneError> {
     let mut reader = PayloadReader::new(&payload);
-    let status = reader.read_u8()?;
+    let status = ControlPlaneRpcResponseStatus::from_u8(reader.read_u8()?)?;
     match status {
-        0 => {
+        ControlPlaneRpcResponseStatus::Success => {
             let response = reader.read_bytes()?.to_vec();
             reader.finish()?;
             Ok(DecodedControlPlaneRpcResponse::Success(response))
         }
-        1 => {
+        ControlPlaneRpcResponseStatus::RemoteFailure => {
             let message = reader.read_string()?.to_owned();
             reader.finish()?;
             Ok(DecodedControlPlaneRpcResponse::Rejection(
                 ControlPlaneError::rpc_remote(message),
             ))
         }
-        2 => {
+        ControlPlaneRpcResponseStatus::PgPeeringPendingMetadataCommand => {
             let pg_id = reader.read_u32()?;
             let node_id = reader.read_u32()?;
             let cluster_epoch = read_cluster_epoch(&mut reader, "pending blocker cluster epoch")?;
@@ -7266,7 +7384,7 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        3 => {
+        ControlPlaneRpcResponseStatus::PgMetadataMigrationSourceNotReady => {
             let pg_id = reader.read_u32()?;
             let cluster_epoch =
                 read_cluster_epoch(&mut reader, "metadata migration source cluster epoch")?;
@@ -7278,7 +7396,7 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        4 => {
+        ControlPlaneRpcResponseStatus::PgHasNoServingPrimary => {
             let pg_id = reader.read_u32()?;
             let cluster_epoch =
                 read_cluster_epoch(&mut reader, "PG serving-primary cluster epoch")?;
@@ -7290,7 +7408,7 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        5 => {
+        ControlPlaneRpcResponseStatus::PgPrimaryMissingActiveObservation => {
             let pg_id = reader.read_u32()?;
             let node_id = reader.read_u32()?;
             let cluster_epoch =
@@ -7304,7 +7422,7 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        6 => {
+        ControlPlaneRpcResponseStatus::PgPrimaryObservationNotActive => {
             let pg_id = reader.read_u32()?;
             let node_id = reader.read_u32()?;
             let cluster_epoch =
@@ -7320,7 +7438,7 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        7 => {
+        ControlPlaneRpcResponseStatus::PgActingSetChangeNotReady => {
             let pg_id = reader.read_u32()?;
             let cluster_epoch =
                 read_cluster_epoch(&mut reader, "PG acting-set readiness cluster epoch")?;
@@ -7334,14 +7452,14 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        8 => {
+        ControlPlaneRpcResponseStatus::UnknownPg => {
             let pg_id = reader.read_u32()?;
             reader.finish()?;
             Ok(DecodedControlPlaneRpcResponse::Rejection(
                 ControlPlaneError::UnknownPg { pg_id },
             ))
         }
-        9 => {
+        ControlPlaneRpcResponseStatus::OpenRaftOperation => {
             let kind = ControlPlaneRaftOperationErrorKind::from_wire_tag(reader.read_u8()?)?;
             let message = reader.read_string()?.to_owned();
             reader.finish()?;
@@ -7349,26 +7467,26 @@ fn decode_control_plane_rpc_response_frame(
                 ControlPlaneError::OpenRaftOperation { kind, message },
             ))
         }
-        10 => {
+        ControlPlaneRpcResponseStatus::AuthorityNotServing => {
             reader.finish()?;
             Ok(DecodedControlPlaneRpcResponse::Rejection(
                 ControlPlaneError::AuthorityNotServing,
             ))
         }
-        11 => {
+        ControlPlaneRpcResponseStatus::AuthorityClockNotLocalServingRaftAuthority => {
             reader.finish()?;
             Ok(DecodedControlPlaneRpcResponse::Rejection(
                 ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority,
             ))
         }
-        12 => {
+        ControlPlaneRpcResponseStatus::UnknownNode => {
             let node_id = reader.read_u32()?;
             reader.finish()?;
             Ok(DecodedControlPlaneRpcResponse::Rejection(
                 ControlPlaneError::UnknownNode { node_id },
             ))
         }
-        13 => {
+        ControlPlaneRpcResponseStatus::UnknownActingSetNode => {
             let pg_id = reader.read_u32()?;
             let node_id = reader.read_u32()?;
             reader.finish()?;
@@ -7376,7 +7494,7 @@ fn decode_control_plane_rpc_response_frame(
                 ControlPlaneError::UnknownActingSetNode { pg_id, node_id },
             ))
         }
-        14 => {
+        ControlPlaneRpcResponseStatus::AuthorityClockLeadershipChanged => {
             let established_term = reader.read_option_u64()?;
             let current_term = reader.read_u64()?;
             reader.finish()?;
@@ -7387,7 +7505,7 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        15 => {
+        ControlPlaneRpcResponseStatus::PgMetadataTransferDestinationEpochMismatch => {
             let pg_id = reader.read_u32()?;
             let expected_destination_epoch =
                 read_cluster_epoch(&mut reader, "expected metadata transfer destination epoch")?;
@@ -7402,9 +7520,6 @@ fn decode_control_plane_rpc_response_frame(
                 },
             ))
         }
-        _ => Err(ControlPlaneError::rpc_protocol(format!(
-            "invalid control-plane RPC response status {status}"
-        ))),
     }
 }
 
@@ -7753,9 +7868,36 @@ fn write_control_plane_runtime_map_diagnostics(
     out: &mut Vec<u8>,
     diagnostics: &ControlPlaneRuntimeMapDiagnosticSnapshot,
 ) -> Result<(), ControlPlaneError> {
+    let runtime_map = diagnostics.runtime_map().clone();
+    let runtime_node_ids = runtime_map
+        .nodes()
+        .iter()
+        .map(|node| node.node_id().as_u32())
+        .collect::<BTreeSet<_>>();
+    let diagnostics = ControlPlaneRuntimeMapDiagnostics {
+        runtime_map,
+        rpc_metrics: observability::control_plane_rpc_metrics_snapshot(),
+        snapshot_metrics: observability::control_plane_snapshot_metrics_snapshot(),
+        journal_metrics: observability::control_plane_journal_metrics_snapshot(),
+        raft_checkpoint_metrics: observability::control_plane_raft_checkpoint_metrics_snapshot(),
+        raft_wal_metrics: observability::control_plane_raft_wal_metrics_snapshot(),
+        raft_command_metrics: observability::control_plane_raft_command_metrics_snapshot(),
+        history_reference_samples: observability::control_plane_history_reference_samples()
+            .into_iter()
+            .filter(|sample| runtime_node_ids.contains(&sample.node_id))
+            .collect(),
+        node_leases: diagnostics.node_leases().to_vec(),
+    };
+    write_control_plane_runtime_map_diagnostics_value(out, &diagnostics)
+}
+
+fn write_control_plane_runtime_map_diagnostics_value(
+    out: &mut Vec<u8>,
+    diagnostics: &ControlPlaneRuntimeMapDiagnostics,
+) -> Result<(), ControlPlaneError> {
     let runtime_map = diagnostics.runtime_map();
     write_runtime_map_snapshot(out, runtime_map)?;
-    let rpc_metrics = observability::control_plane_rpc_metrics_snapshot();
+    let rpc_metrics = diagnostics.rpc_metrics();
     write_u32(
         out,
         len_as_u32(rpc_metrics.len(), "control-plane RPC metric samples")?,
@@ -7775,7 +7917,7 @@ fn write_control_plane_runtime_map_diagnostics(
         write_u64(out, sample.response_write_timeout_total);
         write_u64(out, sample.response_write_other_error_total);
     }
-    let snapshot = observability::control_plane_snapshot_metrics_snapshot();
+    let snapshot = diagnostics.snapshot_metrics();
     write_u64(out, snapshot.serialize_total);
     write_u64(out, snapshot.serialize_us_total);
     write_u64(out, snapshot.serialize_us_max);
@@ -7789,7 +7931,7 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, snapshot.bytes_total);
     write_u64(out, snapshot.bytes_last);
     write_u64(out, snapshot.bytes_max);
-    let journal = observability::control_plane_journal_metrics_snapshot();
+    let journal = diagnostics.journal_metrics();
     write_u64(out, journal.append_total);
     write_u64(out, journal.append_error_total);
     write_u64(out, journal.append_us_total);
@@ -7820,7 +7962,7 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, journal.compaction_directory_sync_total);
     write_u64(out, journal.compaction_directory_sync_us_total);
     write_u64(out, journal.compaction_directory_sync_us_max);
-    let raft_checkpoint = observability::control_plane_raft_checkpoint_metrics_snapshot();
+    let raft_checkpoint = diagnostics.raft_checkpoint_metrics();
     write_u64(out, raft_checkpoint.encode_total);
     write_u64(out, raft_checkpoint.encode_us_total);
     write_u64(out, raft_checkpoint.encode_us_max);
@@ -7841,7 +7983,7 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, raft_checkpoint.compaction_error_total);
     write_u64(out, raft_checkpoint.compaction_us_total);
     write_u64(out, raft_checkpoint.compaction_us_max);
-    let raft_wal = observability::control_plane_raft_wal_metrics_snapshot();
+    let raft_wal = diagnostics.raft_wal_metrics();
     write_u64(out, raft_wal.append_total);
     write_u64(out, raft_wal.append_error_total);
     write_u64(out, raft_wal.append_us_total);
@@ -7865,22 +8007,14 @@ fn write_control_plane_runtime_map_diagnostics(
     write_u64(out, raft_wal.append_accept_us_max);
     write_u64(out, raft_wal.durability_operation_us_total);
     write_u64(out, raft_wal.durability_operation_us_max);
-    let raft_command = observability::control_plane_raft_command_metrics_snapshot();
+    let raft_command = diagnostics.raft_command_metrics();
     write_u64(out, raft_command.submit_total);
     write_u64(out, raft_command.submit_error_total);
     write_u64(out, raft_command.queue_wait_us_total);
     write_u64(out, raft_command.queue_wait_us_max);
     write_u64(out, raft_command.operation_us_total);
     write_u64(out, raft_command.operation_us_max);
-    let runtime_node_ids = runtime_map
-        .nodes()
-        .iter()
-        .map(|node| node.node_id().as_u32())
-        .collect::<BTreeSet<_>>();
-    let history_reference_samples = observability::control_plane_history_reference_samples()
-        .into_iter()
-        .filter(|sample| runtime_node_ids.contains(&sample.node_id))
-        .collect::<Vec<_>>();
+    let history_reference_samples = diagnostics.history_reference_samples();
     write_u32(
         out,
         len_as_u32(
@@ -8419,13 +8553,47 @@ fn write_runtime_map_snapshot(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ControlPlaneRpcRuntimeMapFreshnessProofKind {
+    SingleAuthority,
+    Reconstructed,
+    ReadIndex,
+}
+
+impl ControlPlaneRpcRuntimeMapFreshnessProofKind {
+    #[cfg(test)]
+    const ALL: [Self; 3] = [Self::SingleAuthority, Self::Reconstructed, Self::ReadIndex];
+
+    const fn as_u8(self) -> u8 {
+        match self {
+            Self::SingleAuthority => CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY,
+            Self::Reconstructed => CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED,
+            Self::ReadIndex => CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX,
+        }
+    }
+
+    fn from_u8(tag: u8) -> Result<Self, ControlPlaneError> {
+        match tag {
+            CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY => Ok(Self::SingleAuthority),
+            CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED => Ok(Self::Reconstructed),
+            CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX => Ok(Self::ReadIndex),
+            _ => Err(ControlPlaneError::rpc_protocol(format!(
+                "invalid runtime map freshness proof tag {tag}"
+            ))),
+        }
+    }
+}
+
 fn write_runtime_map_freshness_proof(out: &mut Vec<u8>, proof: &RuntimeMapFreshnessProof) {
     match proof {
         RuntimeMapFreshnessProof::SingleAuthority {
             authority_incarnation,
             issued_at_ms,
         } => {
-            write_u8(out, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY);
+            write_u8(
+                out,
+                ControlPlaneRpcRuntimeMapFreshnessProofKind::SingleAuthority.as_u8(),
+            );
             write_u64(out, authority_incarnation.get());
             write_u64(out, *issued_at_ms);
         }
@@ -8434,7 +8602,10 @@ fn write_runtime_map_freshness_proof(out: &mut Vec<u8>, proof: &RuntimeMapFreshn
             read_index,
             issued_at_ms,
         } => {
-            write_u8(out, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX);
+            write_u8(
+                out,
+                ControlPlaneRpcRuntimeMapFreshnessProofKind::ReadIndex.as_u8(),
+            );
             write_u64(out, authority_incarnation.get());
             write_u64(out, read_index.term());
             write_u64(out, read_index.index());
@@ -8443,7 +8614,10 @@ fn write_runtime_map_freshness_proof(out: &mut Vec<u8>, proof: &RuntimeMapFreshn
         RuntimeMapFreshnessProof::Reconstructed {
             authority_incarnation,
         } => {
-            write_u8(out, CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED);
+            write_u8(
+                out,
+                ControlPlaneRpcRuntimeMapFreshnessProofKind::Reconstructed.as_u8(),
+            );
             write_u64(out, authority_incarnation.get());
         }
     }
@@ -8889,22 +9063,21 @@ fn validate_runtime_map_routes(
 fn read_runtime_map_freshness_proof(
     reader: &mut PayloadReader<'_>,
 ) -> Result<RuntimeMapFreshnessProof, ControlPlaneError> {
-    let tag = reader.read_u8()?;
-    match tag {
-        CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_SINGLE_AUTHORITY => {
+    match ControlPlaneRpcRuntimeMapFreshnessProofKind::from_u8(reader.read_u8()?)? {
+        ControlPlaneRpcRuntimeMapFreshnessProofKind::SingleAuthority => {
             let authority_incarnation = read_runtime_map_proof_authority_incarnation(reader)?;
             Ok(RuntimeMapFreshnessProof::SingleAuthority {
                 authority_incarnation,
                 issued_at_ms: reader.read_u64()?,
             })
         }
-        CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_RECONSTRUCTED => {
+        ControlPlaneRpcRuntimeMapFreshnessProofKind::Reconstructed => {
             let authority_incarnation = read_runtime_map_proof_authority_incarnation(reader)?;
             Ok(RuntimeMapFreshnessProof::Reconstructed {
                 authority_incarnation,
             })
         }
-        CONTROL_PLANE_RPC_RUNTIME_MAP_PROOF_READ_INDEX => {
+        ControlPlaneRpcRuntimeMapFreshnessProofKind::ReadIndex => {
             let authority_incarnation = read_runtime_map_proof_authority_incarnation(reader)?;
             Ok(RuntimeMapFreshnessProof::ReadIndex {
                 authority_incarnation,
@@ -8912,9 +9085,6 @@ fn read_runtime_map_freshness_proof(
                 issued_at_ms: reader.read_u64()?,
             })
         }
-        other => Err(ControlPlaneError::rpc_protocol(format!(
-            "invalid runtime map freshness proof tag {other}"
-        ))),
     }
 }
 

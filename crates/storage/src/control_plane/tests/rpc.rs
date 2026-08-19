@@ -3,6 +3,1324 @@
 
 use super::*;
 
+const CONTROL_PLANE_RPC_CATALOGUE_PG_STATES: [PgState; 5] = [
+    PgState::Active,
+    PgState::Peering,
+    PgState::Degraded,
+    PgState::Backfilling,
+    PgState::Inconsistent,
+];
+const CONTROL_PLANE_RPC_CATALOGUE_HISTORY_KINDS: [PgClusterMapHistoryRouteReferenceKind; 5] = [
+    PgClusterMapHistoryRouteReferenceKind::LivePlacement,
+    PgClusterMapHistoryRouteReferenceKind::DurableBackfillSource,
+    PgClusterMapHistoryRouteReferenceKind::DurableBackfillDesired,
+    PgClusterMapHistoryRouteReferenceKind::PendingMetadataCommand,
+    PgClusterMapHistoryRouteReferenceKind::ObjectPayloadReclaimClaim,
+];
+const CONTROL_PLANE_RPC_CATALOGUE_METRIC_KINDS: [observability::ControlPlaneRpcMetricKind; 17] = {
+    use observability::ControlPlaneRpcMetricKind as Kind;
+    [
+        Kind::RuntimeMapSnapshot,
+        Kind::RefreshNodeHeartbeat,
+        Kind::SetPgActingSet,
+        Kind::SetPgActingSetWithMetadataTransfer,
+        Kind::SetPgActingSetWithMetadataTransferRuntimeMap,
+        Kind::FencePgForMetadataTransferRuntimeMap,
+        Kind::TransferRaftLeadership,
+        Kind::PgRuntimeMapSnapshot,
+        Kind::TriggerRaftSnapshotAndPurge,
+        Kind::TriggerRaftElection,
+        Kind::RuntimeMapStatus,
+        Kind::PendingMetadataCommandRecoveries,
+        Kind::AuthorityClockStatus,
+        Kind::ReestablishAuthorityClock,
+        Kind::RuntimeMapDiagnostics,
+        Kind::Unknown,
+        Kind::ServingPgRuntimeMapSnapshot,
+    ]
+};
+const CONTROL_PLANE_RPC_CATALOGUE_RECOVERY_FAILURE_KINDS:
+    [PendingMetadataCommandRecoveryDiscoveryFailureKind; 3] = [
+    PendingMetadataCommandRecoveryDiscoveryFailureKind::HistoricalRouteInvalid,
+    PendingMetadataCommandRecoveryDiscoveryFailureKind::ReporterNotHistoricalPrimary,
+    PendingMetadataCommandRecoveryDiscoveryFailureKind::ConflictingIdentity,
+];
+const CONTROL_PLANE_RPC_CATALOGUE_OPENRAFT_ERROR_KINDS: [ControlPlaneRaftOperationErrorKind; 4] = [
+    ControlPlaneRaftOperationErrorKind::ForwardToLeader,
+    ControlPlaneRaftOperationErrorKind::QuorumNotEnough,
+    ControlPlaneRaftOperationErrorKind::Fatal,
+    ControlPlaneRaftOperationErrorKind::Rejected,
+];
+const CONTROL_PLANE_RPC_CATALOGUE_BLOCKED_REASONS: [Option<
+    ControlPlaneAuthorityClockBlockedReason,
+>; 8] = [
+    None,
+    Some(ControlPlaneAuthorityClockBlockedReason::InitialTimestampDiscontinuity),
+    Some(ControlPlaneAuthorityClockBlockedReason::RaftLeadershipChanged),
+    Some(ControlPlaneAuthorityClockBlockedReason::ClockSourceUnavailable),
+    Some(ControlPlaneAuthorityClockBlockedReason::ClockHealthRegression),
+    Some(ControlPlaneAuthorityClockBlockedReason::WallClockRegression),
+    Some(ControlPlaneAuthorityClockBlockedReason::WallClockForwardJump),
+    Some(ControlPlaneAuthorityClockBlockedReason::CheckpointPersistenceFailure),
+];
+
+fn control_plane_rpc_catalogue_snapshot() -> ClusterRuntimeMapSnapshot {
+    runtime_map_test_snapshot_with_active_route()
+}
+
+fn control_plane_rpc_catalogue_freshness_kind(
+    proof: &RuntimeMapFreshnessProof,
+) -> ControlPlaneRpcRuntimeMapFreshnessProofKind {
+    match proof {
+        RuntimeMapFreshnessProof::SingleAuthority { .. } => {
+            ControlPlaneRpcRuntimeMapFreshnessProofKind::SingleAuthority
+        }
+        RuntimeMapFreshnessProof::Reconstructed { .. } => {
+            ControlPlaneRpcRuntimeMapFreshnessProofKind::Reconstructed
+        }
+        RuntimeMapFreshnessProof::ReadIndex { .. } => {
+            ControlPlaneRpcRuntimeMapFreshnessProofKind::ReadIndex
+        }
+    }
+}
+
+fn control_plane_rpc_catalogue_transfer_snapshot() -> ClusterRuntimeMapSnapshot {
+    let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+    snapshot.freshness_proof = RuntimeMapFreshnessProof::ReadIndex {
+        authority_incarnation: AuthorityIncarnation::new(2).unwrap(),
+        read_index: ControlPlaneLogId::new(3, 4).unwrap(),
+        issued_at_ms: 5,
+    };
+    snapshot.nodes[0].cluster_map_history_floor_epoch = Some(ClusterEpoch::INITIAL);
+    snapshot.pg_routes[0].metadata_read_route = Some(PgMetadataReadRoute::new(
+        NodeId::new(1),
+        PgMetadataProof::current(6, 7, 8),
+    ));
+    snapshot
+}
+
+fn control_plane_rpc_catalogue_recovery_snapshot() -> ClusterRuntimeMapSnapshot {
+    let mut snapshot = runtime_map_test_snapshot_with_transfer_route(true);
+    snapshot.freshness_proof = RuntimeMapFreshnessProof::Reconstructed {
+        authority_incarnation: AuthorityIncarnation::new(9).unwrap(),
+    };
+    let route = &mut snapshot.pg_routes[0];
+    route.peering_metadata_transfer = None;
+    route.peering_metadata_transfer_destination_epoch = None;
+    route.peering_metadata_transfer_source_route_epoch = None;
+    route.peering_metadata_transfer_source_node_id = None;
+    route.pending_metadata_command_recovery = Some(PendingMetadataCommandRecovery::new(
+        NodeId::new(1),
+        PendingMetadataCommandObservation::new(
+            ClusterEpoch::INITIAL,
+            NonZeroU64::new(10).unwrap(),
+            11,
+        ),
+    ));
+    snapshot
+}
+
+fn control_plane_rpc_catalogue_empty_snapshot() -> ClusterRuntimeMapSnapshot {
+    runtime_map_test_snapshot(RuntimeMapFreshnessProof::Reconstructed {
+        authority_incarnation: AuthorityIncarnation::new(12).unwrap(),
+    })
+}
+
+fn assert_control_plane_rpc_catalogue_runtime_map_branches(
+    snapshots: &[ClusterRuntimeMapSnapshot],
+) {
+    let nodes = snapshots
+        .iter()
+        .flat_map(|snapshot| snapshot.nodes())
+        .collect::<Vec<_>>();
+    assert!(nodes
+        .iter()
+        .any(|node| node.cluster_map_history_floor_epoch().is_none()));
+    assert!(nodes
+        .iter()
+        .any(|node| node.cluster_map_history_floor_epoch().is_some()));
+
+    let routes = snapshots
+        .iter()
+        .flat_map(|snapshot| {
+            snapshot
+                .pg_routes()
+                .iter()
+                .chain(snapshot.historical_pg_routes())
+        })
+        .collect::<Vec<_>>();
+    assert!(routes
+        .iter()
+        .any(|route| route.active_metadata_proof().is_none()));
+    assert!(routes
+        .iter()
+        .any(|route| route.active_metadata_proof().is_some()));
+    assert!(routes
+        .iter()
+        .any(|route| route.metadata_read_route().is_none()));
+    assert!(routes
+        .iter()
+        .any(|route| route.metadata_read_route().is_some()));
+    assert!(routes
+        .iter()
+        .any(|route| route.primary_lease_deadline_ms().is_none()));
+    assert!(routes
+        .iter()
+        .any(|route| route.primary_lease_deadline_ms().is_some()));
+    assert!(routes
+        .iter()
+        .any(|route| route.peering_metadata_transfer().is_none()));
+    assert!(routes
+        .iter()
+        .any(|route| route.peering_metadata_transfer().is_some()));
+    assert!(routes.iter().any(|route| {
+        route
+            .peering_metadata_transfer_destination_epoch()
+            .is_none()
+    }));
+    assert!(routes.iter().any(|route| {
+        route
+            .peering_metadata_transfer_destination_epoch()
+            .is_some()
+    }));
+    assert!(routes.iter().any(|route| {
+        route
+            .peering_metadata_transfer_source_route_epoch()
+            .is_none()
+    }));
+    assert!(routes.iter().any(|route| {
+        route
+            .peering_metadata_transfer_source_route_epoch()
+            .is_some()
+    }));
+    assert!(routes
+        .iter()
+        .any(|route| route.peering_metadata_transfer_source_node_id().is_none()));
+    assert!(routes
+        .iter()
+        .any(|route| route.peering_metadata_transfer_source_node_id().is_some()));
+    assert!(routes
+        .iter()
+        .any(|route| route.pending_metadata_command_recovery().is_none()));
+    assert!(routes
+        .iter()
+        .any(|route| route.pending_metadata_command_recovery().is_some()));
+
+    assert!(snapshots.iter().any(|snapshot| snapshot.nodes().is_empty()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| !snapshot.nodes().is_empty()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| snapshot.pg_routes().is_empty()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| !snapshot.pg_routes().is_empty()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| snapshot.historical_pg_routes().is_empty()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| !snapshot.historical_pg_routes().is_empty()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| snapshot.historical_cluster_epochs().is_empty()));
+    assert!(snapshots
+        .iter()
+        .any(|snapshot| !snapshot.historical_cluster_epochs().is_empty()));
+}
+
+fn control_plane_rpc_catalogue_transfer() -> PgMetadataTransferProof {
+    PgMetadataTransferProof::new_with_imported_metadata_proof(
+        ClusterEpoch::new(9).unwrap(),
+        PgMetadataProof::current(10, 11, 12),
+        PgMetadataProof::current(13, 14, 15),
+    )
+}
+
+fn control_plane_rpc_catalogue_heartbeat() -> NodeHeartbeat {
+    NodeHeartbeat {
+        node_id: NodeId::new(3),
+        node_incarnation: 4,
+        endpoint: "unix:///catalogue-node-3".to_owned(),
+        observed_epoch: ClusterEpoch::new(5).unwrap(),
+        requested_lease_duration_ms: 6_000,
+        cluster_map_history_route_references: PgClusterMapHistoryRouteReferences::try_from_iter(
+            CONTROL_PLANE_RPC_CATALOGUE_HISTORY_KINDS
+                .into_iter()
+                .enumerate()
+                .map(|(index, kind)| {
+                    PgClusterMapHistoryRouteReference::new(
+                        kind,
+                        ClusterEpoch::new(u64::try_from(index).unwrap() + 1).unwrap(),
+                        PgId::new(u32::try_from(index).unwrap() + 20),
+                    )
+                }),
+        )
+        .unwrap(),
+        pg_observations: CONTROL_PLANE_RPC_CATALOGUE_PG_STATES
+            .into_iter()
+            .enumerate()
+            .map(|(index, state)| NodePgHeartbeatObservation {
+                pg_id: PgId::new(u32::try_from(index).unwrap() + 7),
+                state,
+                metadata_proof: PgMetadataProof::current(
+                    u64::try_from(index).unwrap() + 8,
+                    u64::try_from(index).unwrap() + 20,
+                    u64::try_from(index).unwrap() + 30,
+                ),
+                pending_metadata_command: (index % 2 == 0).then(|| {
+                    PendingMetadataCommandObservation::new(
+                        ClusterEpoch::new(u64::try_from(index).unwrap() + 11).unwrap(),
+                        NonZeroU64::new(u64::try_from(index).unwrap() + 12).unwrap(),
+                        u64::try_from(index).unwrap() + 13,
+                    )
+                }),
+            })
+            .collect(),
+    }
+}
+
+fn control_plane_rpc_catalogue_request(
+    kind: ControlPlaneRpcKind,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let mut payload = Vec::new();
+    match kind {
+        ControlPlaneRpcKind::RuntimeMapSnapshot
+        | ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge
+        | ControlPlaneRpcKind::TriggerRaftElection
+        | ControlPlaneRpcKind::RuntimeMapStatus
+        | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
+        | ControlPlaneRpcKind::AuthorityClockStatus
+        | ControlPlaneRpcKind::ReestablishAuthorityClock
+        | ControlPlaneRpcKind::RuntimeMapDiagnostics => {}
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            write_node_heartbeat(&mut payload, &control_plane_rpc_catalogue_heartbeat())?;
+        }
+        ControlPlaneRpcKind::SetPgActingSet => {
+            write_pg_acting_set_request(
+                &mut payload,
+                PgId::new(7),
+                &[NodeId::new(1), NodeId::new(3)],
+            )?;
+        }
+        ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer
+        | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap => {
+            write_pg_acting_set_with_metadata_transfer_request(
+                &mut payload,
+                PgId::new(7),
+                &[NodeId::new(1), NodeId::new(3)],
+                control_plane_rpc_catalogue_transfer(),
+                ClusterEpoch::new(16).unwrap(),
+            )?;
+        }
+        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap
+        | ControlPlaneRpcKind::PgRuntimeMapSnapshot
+        | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
+            write_pg_id_request(&mut payload, PgId::new(7));
+        }
+        ControlPlaneRpcKind::TransferRaftLeadership => write_u64(&mut payload, 17),
+    }
+    Ok(payload)
+}
+
+fn validate_control_plane_rpc_catalogue_request(
+    kind: ControlPlaneRpcKind,
+    payload: &[u8],
+) -> Result<(), ControlPlaneError> {
+    let mut reader = PayloadReader::new(payload);
+    match kind {
+        ControlPlaneRpcKind::RuntimeMapSnapshot
+        | ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge
+        | ControlPlaneRpcKind::TriggerRaftElection
+        | ControlPlaneRpcKind::RuntimeMapStatus
+        | ControlPlaneRpcKind::PendingMetadataCommandRecoveries
+        | ControlPlaneRpcKind::AuthorityClockStatus
+        | ControlPlaneRpcKind::ReestablishAuthorityClock
+        | ControlPlaneRpcKind::RuntimeMapDiagnostics => {}
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            assert_eq!(
+                read_node_heartbeat(&mut reader)?,
+                control_plane_rpc_catalogue_heartbeat()
+            );
+        }
+        ControlPlaneRpcKind::SetPgActingSet => {
+            assert_eq!(
+                read_pg_acting_set_request(&mut reader)?,
+                (PgId::new(7), vec![NodeId::new(1), NodeId::new(3)])
+            );
+        }
+        ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer
+        | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap => {
+            assert_eq!(
+                read_pg_acting_set_with_metadata_transfer_request(&mut reader)?,
+                (
+                    PgId::new(7),
+                    vec![NodeId::new(1), NodeId::new(3)],
+                    control_plane_rpc_catalogue_transfer(),
+                    ClusterEpoch::new(16).unwrap(),
+                )
+            );
+        }
+        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap
+        | ControlPlaneRpcKind::PgRuntimeMapSnapshot
+        | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
+            assert_eq!(read_pg_id_request(&mut reader)?, PgId::new(7));
+        }
+        ControlPlaneRpcKind::TransferRaftLeadership => assert_eq!(reader.read_u64()?, 17),
+    }
+    reader.finish()
+}
+
+fn control_plane_rpc_catalogue_diagnostics() -> ControlPlaneRuntimeMapDiagnostics {
+    let rpc_metrics = CONTROL_PLANE_RPC_CATALOGUE_METRIC_KINDS
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let base = u64::try_from(index).unwrap() * 20;
+            observability::ControlPlaneRpcMetricSample {
+                kind,
+                total: base + 1,
+                lock_wait_us_total: base + 2,
+                lock_wait_us_max: base + 3,
+                operation_us_total: base + 4,
+                operation_us_max: base + 5,
+                response_write_us_total: base + 6,
+                response_write_us_max: base + 7,
+                response_write_error_total: base + 8,
+                response_write_broken_pipe_total: base + 9,
+                response_write_connection_reset_total: base + 10,
+                response_write_timeout_total: base + 11,
+                response_write_other_error_total: base + 12,
+            }
+        })
+        .collect();
+    ControlPlaneRuntimeMapDiagnostics {
+        runtime_map: control_plane_rpc_catalogue_snapshot(),
+        rpc_metrics,
+        snapshot_metrics: observability::ControlPlaneSnapshotMetricSnapshot {
+            serialize_total: 401,
+            serialize_us_total: 402,
+            serialize_us_max: 403,
+            save_total: 404,
+            save_error_total: 405,
+            save_us_total: 406,
+            save_us_max: 407,
+            sync_total: 408,
+            sync_us_total: 409,
+            sync_us_max: 410,
+            bytes_total: 411,
+            bytes_last: 412,
+            bytes_max: 413,
+        },
+        journal_metrics: observability::ControlPlaneJournalMetricSnapshot {
+            append_total: 421,
+            append_error_total: 422,
+            append_us_total: 423,
+            append_us_max: 424,
+            lock_wait_us_total: 425,
+            lock_wait_us_max: 426,
+            frame_bytes_total: 427,
+            frame_bytes_last: 428,
+            frame_bytes_max: 429,
+            file_sync_total: 430,
+            file_sync_us_total: 431,
+            file_sync_us_max: 432,
+            directory_sync_total: 433,
+            directory_sync_us_total: 434,
+            directory_sync_us_max: 435,
+            compaction_total: 436,
+            compaction_error_total: 437,
+            compaction_us_total: 438,
+            compaction_us_max: 439,
+            compaction_lock_wait_us_total: 440,
+            compaction_lock_wait_us_max: 441,
+            compaction_bytes_total: 442,
+            compaction_bytes_last: 443,
+            compaction_bytes_max: 444,
+            compaction_file_sync_total: 445,
+            compaction_file_sync_us_total: 446,
+            compaction_file_sync_us_max: 447,
+            compaction_directory_sync_total: 448,
+            compaction_directory_sync_us_total: 449,
+            compaction_directory_sync_us_max: 450,
+        },
+        raft_checkpoint_metrics: observability::ControlPlaneRaftCheckpointMetricSnapshot {
+            encode_total: 461,
+            encode_us_total: 462,
+            encode_us_max: 463,
+            store_total: 464,
+            store_error_total: 465,
+            store_us_total: 466,
+            store_us_max: 467,
+            file_sync_total: 468,
+            file_sync_us_total: 469,
+            file_sync_us_max: 470,
+            directory_sync_total: 471,
+            directory_sync_us_total: 472,
+            directory_sync_us_max: 473,
+            bytes_total: 474,
+            bytes_last: 475,
+            bytes_max: 476,
+            compaction_total: 477,
+            compaction_error_total: 478,
+            compaction_us_total: 479,
+            compaction_us_max: 480,
+        },
+        raft_wal_metrics: observability::ControlPlaneRaftWalMetricSnapshot {
+            append_total: 491,
+            append_error_total: 492,
+            append_us_total: 493,
+            append_us_max: 494,
+            lock_wait_us_total: 495,
+            lock_wait_us_max: 496,
+            frame_bytes_total: 497,
+            frame_bytes_last: 498,
+            frame_bytes_max: 499,
+            file_sync_total: 500,
+            file_sync_us_total: 501,
+            file_sync_us_max: 502,
+            directory_sync_total: 503,
+            directory_sync_us_total: 504,
+            directory_sync_us_max: 505,
+            durability_queue_depth: 506,
+            durability_queue_depth_max: 507,
+            durability_queue_wait_us_total: 508,
+            durability_queue_wait_us_max: 509,
+            append_accept_us_total: 510,
+            append_accept_us_max: 511,
+            durability_operation_us_total: 512,
+            durability_operation_us_max: 513,
+        },
+        raft_command_metrics: observability::ControlPlaneRaftCommandMetricSnapshot {
+            submit_total: 521,
+            submit_error_total: 522,
+            queue_wait_us_total: 523,
+            queue_wait_us_max: 524,
+            operation_us_total: 525,
+            operation_us_max: 526,
+        },
+        history_reference_samples: vec![observability::ControlPlaneHistoryReferenceSample {
+            node_id: 1,
+            observed_epoch: 1,
+            validation_epoch: 1,
+            observed_at_ms: 531,
+            oldest_live_placement_epoch: Some(1),
+            oldest_durable_backfill_epoch: None,
+            oldest_pending_metadata_command_epoch: Some(1),
+            oldest_object_payload_reclaim_claim_epoch: None,
+        }],
+        node_leases: vec![ControlPlaneRuntimeMapNodeLeaseDiagnostic::new(
+            NodeId::new(1),
+            Some(541),
+        )],
+    }
+}
+
+fn control_plane_rpc_catalogue_diagnostics_alternate_options() -> ControlPlaneRuntimeMapDiagnostics
+{
+    let mut diagnostics = control_plane_rpc_catalogue_diagnostics();
+    diagnostics.history_reference_samples[0] = observability::ControlPlaneHistoryReferenceSample {
+        node_id: 1,
+        observed_epoch: 1,
+        validation_epoch: 1,
+        observed_at_ms: 551,
+        oldest_live_placement_epoch: None,
+        oldest_durable_backfill_epoch: Some(1),
+        oldest_pending_metadata_command_epoch: None,
+        oldest_object_payload_reclaim_claim_epoch: Some(1),
+    };
+    diagnostics.node_leases[0] =
+        ControlPlaneRuntimeMapNodeLeaseDiagnostic::new(NodeId::new(1), None);
+    diagnostics
+}
+
+fn control_plane_rpc_catalogue_recoveries() -> PendingMetadataCommandRecoveryListing {
+    PendingMetadataCommandRecoveryListing::new(
+        vec![PendingMetadataCommandRecoveryTask::new(
+            PgId::new(7),
+            PendingMetadataCommandRecovery::new(
+                NodeId::new(3),
+                PendingMetadataCommandObservation::new(
+                    ClusterEpoch::new(9).unwrap(),
+                    NonZeroU64::new(11).unwrap(),
+                    13,
+                ),
+            ),
+        )],
+        CONTROL_PLANE_RPC_CATALOGUE_RECOVERY_FAILURE_KINDS
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                PendingMetadataCommandRecoveryDiscoveryFailure::new(
+                    PgId::new(u32::try_from(index).unwrap() + 20),
+                    kind,
+                    format!("catalogue failure {index}"),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn control_plane_rpc_catalogue_clock_status() -> ControlPlaneAuthorityClockStatus {
+    ControlPlaneAuthorityClockStatus {
+        generation: 31,
+        established: false,
+        blocked_reason: Some(ControlPlaneAuthorityClockBlockedReason::CheckpointPersistenceFailure),
+        committed_timestamp_high_water_ms: Some(32),
+        bound_raft_leadership_term: None,
+        current_raft_leadership_term: Some(33),
+        local_raft_authority_leader: true,
+        local_raft_authority_serving: false,
+    }
+}
+
+fn control_plane_rpc_catalogue_success(
+    kind: ControlPlaneRpcKind,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    let mut payload = Vec::new();
+    match kind {
+        ControlPlaneRpcKind::RuntimeMapSnapshot
+        | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+        | ControlPlaneRpcKind::PgRuntimeMapSnapshot
+        | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
+            write_runtime_map_snapshot(&mut payload, &control_plane_rpc_catalogue_snapshot())?;
+        }
+        ControlPlaneRpcKind::RuntimeMapDiagnostics => {
+            write_control_plane_runtime_map_diagnostics_value(
+                &mut payload,
+                &control_plane_rpc_catalogue_diagnostics(),
+            )?;
+        }
+        ControlPlaneRpcKind::RuntimeMapStatus => {
+            write_runtime_map_status(
+                &mut payload,
+                ControlPlaneRuntimeMapStatus::from_runtime_map(
+                    &control_plane_rpc_catalogue_snapshot(),
+                ),
+            )?;
+        }
+        ControlPlaneRpcKind::PendingMetadataCommandRecoveries => {
+            write_pending_metadata_command_recovery_listing(
+                &mut payload,
+                &control_plane_rpc_catalogue_recoveries(),
+            )?;
+        }
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            write_heartbeat_lease_summary(
+                &mut payload,
+                &HeartbeatLease {
+                    authority_incarnation: AuthorityIncarnation::new(21).unwrap(),
+                    cluster_epoch: ClusterEpoch::new(22).unwrap(),
+                    node_id: NodeId::new(3),
+                    lease_deadline_ms: 23,
+                    serving: true,
+                    snapshot: ClusterControlSnapshot::empty(),
+                },
+            );
+            write_runtime_map_snapshot(&mut payload, &control_plane_rpc_catalogue_snapshot())?;
+        }
+        ControlPlaneRpcKind::SetPgActingSet
+        | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
+            write_u64(&mut payload, 24);
+        }
+        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap => {
+            write_runtime_map_snapshot(&mut payload, &control_plane_rpc_catalogue_snapshot())?;
+            write_option_u64(&mut payload, Some(25));
+        }
+        ControlPlaneRpcKind::TransferRaftLeadership | ControlPlaneRpcKind::TriggerRaftElection => {}
+        ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge => {
+            write_option_u64(&mut payload, Some(26));
+        }
+        ControlPlaneRpcKind::AuthorityClockStatus
+        | ControlPlaneRpcKind::ReestablishAuthorityClock => {
+            write_authority_clock_status(&mut payload, control_plane_rpc_catalogue_clock_status());
+        }
+    }
+    Ok(payload)
+}
+
+fn validate_control_plane_rpc_catalogue_success(
+    kind: ControlPlaneRpcKind,
+    payload: &[u8],
+) -> Result<(), ControlPlaneError> {
+    let mut reader = PayloadReader::new(payload);
+    match kind {
+        ControlPlaneRpcKind::RuntimeMapSnapshot
+        | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransferRuntimeMap
+        | ControlPlaneRpcKind::PgRuntimeMapSnapshot
+        | ControlPlaneRpcKind::ServingPgRuntimeMapSnapshot => {
+            assert_eq!(
+                read_runtime_map_snapshot(&mut reader)?,
+                control_plane_rpc_catalogue_snapshot()
+            );
+        }
+        ControlPlaneRpcKind::RuntimeMapDiagnostics => {
+            assert_eq!(
+                read_control_plane_runtime_map_diagnostics(&mut reader)?,
+                control_plane_rpc_catalogue_diagnostics()
+            );
+        }
+        ControlPlaneRpcKind::RuntimeMapStatus => {
+            assert_eq!(
+                read_runtime_map_status(&mut reader)?,
+                ControlPlaneRuntimeMapStatus::from_runtime_map(
+                    &control_plane_rpc_catalogue_snapshot()
+                )
+            );
+        }
+        ControlPlaneRpcKind::PendingMetadataCommandRecoveries => {
+            assert_eq!(
+                read_pending_metadata_command_recovery_listing(&mut reader)?,
+                control_plane_rpc_catalogue_recoveries()
+            );
+        }
+        ControlPlaneRpcKind::RefreshNodeHeartbeat => {
+            let lease = read_heartbeat_lease_summary(&mut reader)?;
+            assert_eq!(
+                lease.authority_incarnation(),
+                AuthorityIncarnation::new(21).unwrap()
+            );
+            assert_eq!(lease.cluster_epoch(), ClusterEpoch::new(22).unwrap());
+            assert_eq!(lease.node_id(), NodeId::new(3));
+            assert_eq!(lease.lease_deadline_ms(), 23);
+            assert!(lease.serving());
+            assert_eq!(
+                read_runtime_map_snapshot(&mut reader)?,
+                control_plane_rpc_catalogue_snapshot()
+            );
+        }
+        ControlPlaneRpcKind::SetPgActingSet
+        | ControlPlaneRpcKind::SetPgActingSetWithMetadataTransfer => {
+            assert_eq!(reader.read_u64()?, 24);
+        }
+        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap => {
+            assert_eq!(
+                read_runtime_map_snapshot(&mut reader)?,
+                control_plane_rpc_catalogue_snapshot()
+            );
+            assert_eq!(reader.read_option_u64()?, Some(25));
+        }
+        ControlPlaneRpcKind::TransferRaftLeadership | ControlPlaneRpcKind::TriggerRaftElection => {}
+        ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge => {
+            assert_eq!(reader.read_option_u64()?, Some(26));
+        }
+        ControlPlaneRpcKind::AuthorityClockStatus
+        | ControlPlaneRpcKind::ReestablishAuthorityClock => {
+            assert_eq!(
+                read_authority_clock_status(&mut reader)?,
+                control_plane_rpc_catalogue_clock_status()
+            );
+        }
+    }
+    reader.finish()
+}
+
+fn control_plane_rpc_catalogue_errors() -> Vec<ControlPlaneError> {
+    let mut errors = vec![
+        ControlPlaneError::rpc_protocol("catalogue generic rejection".to_owned()),
+        ControlPlaneError::PgPeeringPendingMetadataCommand {
+            pg_id: 1,
+            node_id: 2,
+            cluster_epoch: ClusterEpoch::new(3).unwrap(),
+            pending: PendingMetadataCommandObservation::new(
+                ClusterEpoch::new(4).unwrap(),
+                NonZeroU64::new(5).unwrap(),
+                6,
+            ),
+        },
+        ControlPlaneError::PgMetadataMigrationSourceNotReady {
+            pg_id: 7,
+            cluster_epoch: ClusterEpoch::new(8).unwrap(),
+        },
+        ControlPlaneError::PgHasNoServingPrimary {
+            pg_id: 9,
+            cluster_epoch: ClusterEpoch::new(10).unwrap(),
+        },
+        ControlPlaneError::PgPrimaryMissingActiveObservation {
+            pg_id: 11,
+            node_id: 12,
+            cluster_epoch: ClusterEpoch::new(13).unwrap(),
+        },
+        ControlPlaneError::PgPrimaryObservationNotActive {
+            pg_id: 14,
+            node_id: 15,
+            cluster_epoch: ClusterEpoch::new(16).unwrap(),
+            state: PgState::Degraded,
+        },
+        ControlPlaneError::PgActingSetChangeNotReady {
+            pg_id: 17,
+            cluster_epoch: ClusterEpoch::new(18).unwrap(),
+            state: PgState::Inconsistent,
+        },
+        ControlPlaneError::UnknownPg { pg_id: 19 },
+        ControlPlaneError::AuthorityNotServing,
+        ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority,
+        ControlPlaneError::UnknownNode { node_id: 20 },
+        ControlPlaneError::UnknownActingSetNode {
+            pg_id: 21,
+            node_id: 22,
+        },
+        ControlPlaneError::AuthorityClockLeadershipChanged {
+            established_term: None,
+            current_term: 23,
+        },
+        ControlPlaneError::AuthorityClockLeadershipChanged {
+            established_term: Some(24),
+            current_term: 25,
+        },
+        ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+            pg_id: 26,
+            expected_destination_epoch: ClusterEpoch::new(27).unwrap(),
+            actual_destination_epoch: ClusterEpoch::new(28).unwrap(),
+        },
+    ];
+    errors.extend(
+        CONTROL_PLANE_RPC_CATALOGUE_OPENRAFT_ERROR_KINDS
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| ControlPlaneError::OpenRaftOperation {
+                kind,
+                message: format!("catalogue OpenRaft rejection {index}"),
+            }),
+    );
+    errors
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ControlPlaneRpcCatalogueRejection {
+    Remote(String),
+    PendingMetadataCommand {
+        pg_id: u32,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        pending: PendingMetadataCommandObservation,
+    },
+    MetadataMigrationSourceNotReady {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+    NoServingPrimary {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+    PrimaryMissingActiveObservation {
+        pg_id: u32,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+    },
+    PrimaryObservationNotActive {
+        pg_id: u32,
+        node_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+    ActingSetChangeNotReady {
+        pg_id: u32,
+        cluster_epoch: ClusterEpoch,
+        state: PgState,
+    },
+    UnknownPg(u32),
+    OpenRaft {
+        kind: ControlPlaneRaftOperationErrorKind,
+        message: String,
+    },
+    AuthorityNotServing,
+    AuthorityClockNotLocalServingRaftAuthority,
+    UnknownNode(u32),
+    UnknownActingSetNode {
+        pg_id: u32,
+        node_id: u32,
+    },
+    AuthorityClockLeadershipChanged {
+        established_term: Option<u64>,
+        current_term: u64,
+    },
+    MetadataTransferDestinationEpochMismatch {
+        pg_id: u32,
+        expected_destination_epoch: ClusterEpoch,
+        actual_destination_epoch: ClusterEpoch,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ControlPlaneRpcCatalogueRejectionSide {
+    Expected,
+    Decoded,
+}
+
+fn control_plane_rpc_catalogue_rejection(
+    side: ControlPlaneRpcCatalogueRejectionSide,
+    error: &ControlPlaneError,
+) -> ControlPlaneRpcCatalogueRejection {
+    match (side, error) {
+        (
+            ControlPlaneRpcCatalogueRejectionSide::Expected,
+            ControlPlaneError::RpcProtocol { .. },
+        ) => ControlPlaneRpcCatalogueRejection::Remote(error.retained_diagnostic_message()),
+        (
+            ControlPlaneRpcCatalogueRejectionSide::Decoded,
+            ControlPlaneError::RpcRemote { diagnostic },
+        ) => ControlPlaneRpcCatalogueRejection::Remote(diagnostic.as_str().to_owned()),
+        (
+            _,
+            ControlPlaneError::PgPeeringPendingMetadataCommand {
+                pg_id,
+                node_id,
+                cluster_epoch,
+                pending,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::PendingMetadataCommand {
+            pg_id: *pg_id,
+            node_id: *node_id,
+            cluster_epoch: *cluster_epoch,
+            pending: *pending,
+        },
+        (
+            _,
+            ControlPlaneError::PgMetadataMigrationSourceNotReady {
+                pg_id,
+                cluster_epoch,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::MetadataMigrationSourceNotReady {
+            pg_id: *pg_id,
+            cluster_epoch: *cluster_epoch,
+        },
+        (
+            _,
+            ControlPlaneError::PgHasNoServingPrimary {
+                pg_id,
+                cluster_epoch,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::NoServingPrimary {
+            pg_id: *pg_id,
+            cluster_epoch: *cluster_epoch,
+        },
+        (
+            _,
+            ControlPlaneError::PgPrimaryMissingActiveObservation {
+                pg_id,
+                node_id,
+                cluster_epoch,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::PrimaryMissingActiveObservation {
+            pg_id: *pg_id,
+            node_id: *node_id,
+            cluster_epoch: *cluster_epoch,
+        },
+        (
+            _,
+            ControlPlaneError::PgPrimaryObservationNotActive {
+                pg_id,
+                node_id,
+                cluster_epoch,
+                state,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::PrimaryObservationNotActive {
+            pg_id: *pg_id,
+            node_id: *node_id,
+            cluster_epoch: *cluster_epoch,
+            state: *state,
+        },
+        (
+            _,
+            ControlPlaneError::PgActingSetChangeNotReady {
+                pg_id,
+                cluster_epoch,
+                state,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::ActingSetChangeNotReady {
+            pg_id: *pg_id,
+            cluster_epoch: *cluster_epoch,
+            state: *state,
+        },
+        (_, ControlPlaneError::UnknownPg { pg_id }) => {
+            ControlPlaneRpcCatalogueRejection::UnknownPg(*pg_id)
+        }
+        (_, ControlPlaneError::OpenRaftOperation { kind, message }) => {
+            ControlPlaneRpcCatalogueRejection::OpenRaft {
+                kind: *kind,
+                message: message.clone(),
+            }
+        }
+        (_, ControlPlaneError::AuthorityNotServing) => {
+            ControlPlaneRpcCatalogueRejection::AuthorityNotServing
+        }
+        (_, ControlPlaneError::AuthorityClockNotLocalServingRaftAuthority) => {
+            ControlPlaneRpcCatalogueRejection::AuthorityClockNotLocalServingRaftAuthority
+        }
+        (_, ControlPlaneError::UnknownNode { node_id }) => {
+            ControlPlaneRpcCatalogueRejection::UnknownNode(*node_id)
+        }
+        (_, ControlPlaneError::UnknownActingSetNode { pg_id, node_id }) => {
+            ControlPlaneRpcCatalogueRejection::UnknownActingSetNode {
+                pg_id: *pg_id,
+                node_id: *node_id,
+            }
+        }
+        (
+            _,
+            ControlPlaneError::AuthorityClockLeadershipChanged {
+                established_term,
+                current_term,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::AuthorityClockLeadershipChanged {
+            established_term: *established_term,
+            current_term: *current_term,
+        },
+        (
+            _,
+            ControlPlaneError::PgMetadataTransferDestinationEpochMismatch {
+                pg_id,
+                expected_destination_epoch,
+                actual_destination_epoch,
+            },
+        ) => ControlPlaneRpcCatalogueRejection::MetadataTransferDestinationEpochMismatch {
+            pg_id: *pg_id,
+            expected_destination_epoch: *expected_destination_epoch,
+            actual_destination_epoch: *actual_destination_epoch,
+        },
+        (side, error) => panic!(
+            "unexpected {side} control-plane RPC catalogue rejection: {error:?}",
+            side = match side {
+                ControlPlaneRpcCatalogueRejectionSide::Expected => "expected",
+                ControlPlaneRpcCatalogueRejectionSide::Decoded => "decoded",
+            }
+        ),
+    }
+}
+
+fn assert_control_plane_rpc_catalogue_registries_are_complete() {
+    let response_statuses = (0..=u8::MAX)
+        .filter_map(|tag| ControlPlaneRpcResponseStatus::from_u8(tag).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(response_statuses, ControlPlaneRpcResponseStatus::ALL);
+
+    let freshness_proof_kinds = (0..=u8::MAX)
+        .filter_map(|tag| ControlPlaneRpcRuntimeMapFreshnessProofKind::from_u8(tag).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        freshness_proof_kinds,
+        ControlPlaneRpcRuntimeMapFreshnessProofKind::ALL
+    );
+
+    let pg_states = (0..=u8::MAX)
+        .filter_map(|tag| {
+            let bytes = [tag];
+            let mut reader = PayloadReader::new(&bytes);
+            read_pg_state(&mut reader).ok()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(pg_states, CONTROL_PLANE_RPC_CATALOGUE_PG_STATES);
+
+    let history_kinds = (0..=u8::MAX)
+        .filter_map(|tag| {
+            let bytes = [tag];
+            let mut reader = PayloadReader::new(&bytes);
+            read_cluster_map_history_route_reference_kind(&mut reader).ok()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(history_kinds, CONTROL_PLANE_RPC_CATALOGUE_HISTORY_KINDS);
+
+    let metric_kinds = (0..=u8::MAX)
+        .filter_map(|tag| read_control_plane_rpc_metric_kind(tag).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(metric_kinds, CONTROL_PLANE_RPC_CATALOGUE_METRIC_KINDS);
+
+    let recovery_failure_kinds = (0..=u8::MAX)
+        .filter_map(|tag| PendingMetadataCommandRecoveryDiscoveryFailureKind::from_u8(tag).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        recovery_failure_kinds,
+        CONTROL_PLANE_RPC_CATALOGUE_RECOVERY_FAILURE_KINDS
+    );
+
+    let openraft_error_kinds = (0..=u8::MAX)
+        .filter_map(|tag| ControlPlaneRaftOperationErrorKind::from_wire_tag(tag).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        openraft_error_kinds,
+        CONTROL_PLANE_RPC_CATALOGUE_OPENRAFT_ERROR_KINDS
+    );
+
+    let blocked_reasons = (0..=u8::MAX)
+        .filter_map(|tag| {
+            let bytes = [tag];
+            let mut reader = PayloadReader::new(&bytes);
+            read_authority_clock_blocked_reason(&mut reader).ok()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(blocked_reasons, CONTROL_PLANE_RPC_CATALOGUE_BLOCKED_REASONS);
+}
+
+fn append_control_plane_rpc_catalogue_frame(
+    aggregate: &mut Vec<u8>,
+    section: u8,
+    kind: ControlPlaneRpcKind,
+    payload: &[u8],
+) {
+    let frame = encode_control_plane_rpc_frame(kind, payload).unwrap();
+    write_u8(aggregate, section);
+    write_u32(aggregate, u32::try_from(frame.len()).unwrap());
+    aggregate.extend_from_slice(&frame);
+}
+
+fn append_control_plane_rpc_catalogue_success(
+    aggregate: &mut Vec<u8>,
+    kind: ControlPlaneRpcKind,
+    success: Vec<u8>,
+) {
+    let response = encode_control_plane_rpc_response(Ok(success.clone())).unwrap();
+    assert_eq!(
+        decode_control_plane_rpc_response(response.clone()).unwrap(),
+        success
+    );
+    append_control_plane_rpc_catalogue_frame(aggregate, 2, kind, &response);
+}
+
+fn append_control_plane_rpc_catalogue_invalid_runtime_map(
+    aggregate: &mut Vec<u8>,
+    snapshot: &ClusterRuntimeMapSnapshot,
+    expected_diagnostic: &str,
+) {
+    let mut payload = Vec::new();
+    write_runtime_map_snapshot(&mut payload, snapshot).unwrap();
+    let mut reader = PayloadReader::new(&payload);
+    let error = read_runtime_map_snapshot(&mut reader).unwrap_err();
+    assert!(
+        error
+            .retained_diagnostic_message()
+            .contains(expected_diagnostic),
+        "unexpected invalid runtime-map diagnostic: {error:?}"
+    );
+    let response = encode_control_plane_rpc_response(Ok(payload)).unwrap();
+    append_control_plane_rpc_catalogue_frame(
+        aggregate,
+        4,
+        ControlPlaneRpcKind::RuntimeMapSnapshot,
+        &response,
+    );
+}
+
+#[test]
+fn control_plane_rpc_v14_operation_catalogue_is_exact() {
+    assert_control_plane_rpc_catalogue_registries_are_complete();
+    let decoded_kinds = (0..=u16::MAX)
+        .filter_map(|raw| ControlPlaneRpcKind::from_u16(raw).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(decoded_kinds, ControlPlaneRpcKind::ALL);
+    let runtime_map_snapshots = [
+        control_plane_rpc_catalogue_snapshot(),
+        control_plane_rpc_catalogue_transfer_snapshot(),
+        control_plane_rpc_catalogue_recovery_snapshot(),
+        control_plane_rpc_catalogue_empty_snapshot(),
+    ];
+    assert_control_plane_rpc_catalogue_runtime_map_branches(&runtime_map_snapshots);
+    assert_eq!(
+        runtime_map_snapshots
+            .iter()
+            .map(|snapshot| control_plane_rpc_catalogue_freshness_kind(snapshot.freshness_proof()))
+            .collect::<BTreeSet<_>>(),
+        ControlPlaneRpcRuntimeMapFreshnessProofKind::ALL
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+
+    let mut aggregate = Vec::new();
+    let mut response_statuses = BTreeSet::new();
+    for kind in ControlPlaneRpcKind::ALL {
+        let request = control_plane_rpc_catalogue_request(kind).unwrap();
+        validate_control_plane_rpc_catalogue_request(kind, &request).unwrap();
+        append_control_plane_rpc_catalogue_frame(&mut aggregate, 1, kind, &request);
+
+        let success = control_plane_rpc_catalogue_success(kind).unwrap();
+        validate_control_plane_rpc_catalogue_success(kind, &success).unwrap();
+        response_statuses.insert(ControlPlaneRpcResponseStatus::Success.as_u8());
+        append_control_plane_rpc_catalogue_success(&mut aggregate, kind, success);
+    }
+
+    for snapshot in &runtime_map_snapshots[1..] {
+        let mut payload = Vec::new();
+        write_runtime_map_snapshot(&mut payload, snapshot).unwrap();
+        let mut reader = PayloadReader::new(&payload);
+        assert_eq!(read_runtime_map_snapshot(&mut reader).unwrap(), *snapshot);
+        reader.finish().unwrap();
+        append_control_plane_rpc_catalogue_success(
+            &mut aggregate,
+            ControlPlaneRpcKind::RuntimeMapSnapshot,
+            payload,
+        );
+    }
+
+    let mut unbounded = control_plane_rpc_catalogue_snapshot();
+    unbounded.validity = RouteMapValidity::Forever;
+    append_control_plane_rpc_catalogue_invalid_runtime_map(
+        &mut aggregate,
+        &unbounded,
+        "validity must be bounded",
+    );
+
+    for (missing_field, expected_diagnostic) in [
+        (0, "missing its destination epoch"),
+        (1, "incomplete metadata transfer source route"),
+        (2, "incomplete metadata transfer source route"),
+    ] {
+        let mut incomplete_transfer = control_plane_rpc_catalogue_transfer_snapshot();
+        match missing_field {
+            0 => {
+                incomplete_transfer.pg_routes[0].peering_metadata_transfer_destination_epoch = None;
+            }
+            1 => {
+                incomplete_transfer.pg_routes[0].peering_metadata_transfer_source_route_epoch =
+                    None;
+            }
+            2 => {
+                incomplete_transfer.pg_routes[0].peering_metadata_transfer_source_node_id = None;
+            }
+            _ => unreachable!(),
+        }
+        append_control_plane_rpc_catalogue_invalid_runtime_map(
+            &mut aggregate,
+            &incomplete_transfer,
+            expected_diagnostic,
+        );
+    }
+
+    let alternate_diagnostics = control_plane_rpc_catalogue_diagnostics_alternate_options();
+    let mut alternate_diagnostics_payload = Vec::new();
+    write_control_plane_runtime_map_diagnostics_value(
+        &mut alternate_diagnostics_payload,
+        &alternate_diagnostics,
+    )
+    .unwrap();
+    let mut reader = PayloadReader::new(&alternate_diagnostics_payload);
+    assert_eq!(
+        read_control_plane_runtime_map_diagnostics(&mut reader).unwrap(),
+        alternate_diagnostics
+    );
+    reader.finish().unwrap();
+    append_control_plane_rpc_catalogue_success(
+        &mut aggregate,
+        ControlPlaneRpcKind::RuntimeMapDiagnostics,
+        alternate_diagnostics_payload,
+    );
+
+    let mut no_snapshot_index = Vec::new();
+    write_option_u64(&mut no_snapshot_index, None);
+    let mut reader = PayloadReader::new(&no_snapshot_index);
+    assert_eq!(reader.read_option_u64().unwrap(), None);
+    reader.finish().unwrap();
+    append_control_plane_rpc_catalogue_success(
+        &mut aggregate,
+        ControlPlaneRpcKind::TriggerRaftSnapshotAndPurge,
+        no_snapshot_index,
+    );
+
+    let mut no_source_lease = Vec::new();
+    write_runtime_map_snapshot(
+        &mut no_source_lease,
+        &control_plane_rpc_catalogue_snapshot(),
+    )
+    .unwrap();
+    write_option_u64(&mut no_source_lease, None);
+    let mut reader = PayloadReader::new(&no_source_lease);
+    assert_eq!(
+        read_runtime_map_snapshot(&mut reader).unwrap(),
+        control_plane_rpc_catalogue_snapshot()
+    );
+    assert_eq!(reader.read_option_u64().unwrap(), None);
+    reader.finish().unwrap();
+    append_control_plane_rpc_catalogue_success(
+        &mut aggregate,
+        ControlPlaneRpcKind::FencePgForMetadataTransferRuntimeMap,
+        no_source_lease,
+    );
+
+    let no_lease_renewal =
+        ControlPlaneRuntimeMapStatus::new(ClusterEpoch::new(61).unwrap(), 62, 63);
+    let mut status_payload = Vec::new();
+    write_runtime_map_status(&mut status_payload, no_lease_renewal).unwrap();
+    let mut reader = PayloadReader::new(&status_payload);
+    assert_eq!(
+        read_runtime_map_status(&mut reader).unwrap(),
+        no_lease_renewal
+    );
+    reader.finish().unwrap();
+    append_control_plane_rpc_catalogue_success(
+        &mut aggregate,
+        ControlPlaneRpcKind::RuntimeMapStatus,
+        status_payload,
+    );
+
+    for (index, blocked_reason) in CONTROL_PLANE_RPC_CATALOGUE_BLOCKED_REASONS
+        .into_iter()
+        .enumerate()
+    {
+        let index = u64::try_from(index).unwrap();
+        let status = ControlPlaneAuthorityClockStatus {
+            generation: 70 + index,
+            established: blocked_reason.is_none(),
+            blocked_reason,
+            committed_timestamp_high_water_ms: (index % 2 == 0).then_some(80 + index),
+            bound_raft_leadership_term: (index % 2 != 0).then_some(90 + index),
+            current_raft_leadership_term: (index % 3 == 0).then_some(100 + index),
+            local_raft_authority_leader: index % 2 == 0,
+            local_raft_authority_serving: index % 2 != 0,
+        };
+        let mut payload = Vec::new();
+        write_authority_clock_status(&mut payload, status);
+        let mut reader = PayloadReader::new(&payload);
+        assert_eq!(read_authority_clock_status(&mut reader).unwrap(), status);
+        reader.finish().unwrap();
+        append_control_plane_rpc_catalogue_success(
+            &mut aggregate,
+            ControlPlaneRpcKind::AuthorityClockStatus,
+            payload,
+        );
+    }
+
+    for error in control_plane_rpc_catalogue_errors() {
+        let expected = control_plane_rpc_catalogue_rejection(
+            ControlPlaneRpcCatalogueRejectionSide::Expected,
+            &error,
+        );
+        let response = encode_control_plane_rpc_response(Err(error)).unwrap();
+        response_statuses.insert(response[0]);
+        let decoded = decode_control_plane_rpc_response(response.clone()).unwrap_err();
+        assert_eq!(
+            control_plane_rpc_catalogue_rejection(
+                ControlPlaneRpcCatalogueRejectionSide::Decoded,
+                &decoded,
+            ),
+            expected
+        );
+        append_control_plane_rpc_catalogue_frame(
+            &mut aggregate,
+            3,
+            ControlPlaneRpcKind::RuntimeMapStatus,
+            &response,
+        );
+    }
+    assert_eq!(
+        response_statuses.into_iter().collect::<Vec<_>>(),
+        ControlPlaneRpcResponseStatus::ALL
+            .into_iter()
+            .map(ControlPlaneRpcResponseStatus::as_u8)
+            .collect::<Vec<_>>()
+    );
+
+    assert_eq!(
+        (
+            aggregate.len(),
+            hex_encode(&checksum::sha256::digest(&aggregate))
+        ),
+        (
+            12_786,
+            "f100f7b2f763b0c40cc70ad8d52bf54e853bb4fb67fb20f98f86302f6cca07cc".to_owned()
+        )
+    );
+}
+
 #[test]
 fn unix_control_plane_client_fetches_runtime_map() {
     let tmp = test_util::tempdir();
