@@ -822,12 +822,22 @@ impl Drop for StorageRpcPreAuthByteReservation {
     }
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
 struct StorageRpcAuthBinding {
     topology_generation: u64,
     topology_digest: String,
     target_node_id: NodeId,
     request_transcript: Option<StorageRpcRequestTranscript>,
     frame: StorageRpcFrame,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StorageRpcAuthBindingError {
+    TruncatedMagic,
+    UnknownMagic,
+    TruncatedVersion,
+    UnsupportedVersion(u16),
+    Malformed,
 }
 
 pub(crate) struct StorageRpcAuthRequestInput<'a> {
@@ -857,6 +867,13 @@ pub(crate) fn sign_storage_rpc_request(
         None,
         input.frame,
     )?;
+    sign_storage_rpc_request_binding(input, payload)
+}
+
+fn sign_storage_rpc_request_binding(
+    input: StorageRpcAuthRequestInput<'_>,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, ControlPlaneError> {
     input
         .credential
         .sign_envelope(ControlPlaneAuthSignInput {
@@ -892,20 +909,31 @@ pub(crate) fn sign_storage_rpc_request_with_encoded_frame_for_test(
         None,
         encoded_frame,
     )?;
-    input
-        .credential
-        .sign_envelope(ControlPlaneAuthSignInput {
-            target: ControlPlaneAuthTarget::Service(ControlPlaneAuthService::StorageRpc),
-            operation: ControlPlaneAuthOperation::StorageRpcRequest {
-                message_kind: input.frame.kind as u16,
-            },
-            issued_at_ms: Some(input.issued_at_ms),
-            expires_at_ms: Some(input.expires_at_ms),
-            sequence: Some(input.frame.request_id),
-            nonce: Vec::new(),
-            payload,
-        })?
-        .encode_frame()
+    sign_storage_rpc_request_binding(input, payload)
+}
+
+#[cfg(test)]
+pub(crate) fn sign_storage_rpc_request_with_binding_version_for_test(
+    input: StorageRpcAuthRequestInput<'_>,
+    version: u16,
+) -> Result<Vec<u8>, ControlPlaneError> {
+    if !principal_allows_operation(input.credential.principal(), input.frame.kind) {
+        return Err(storage_rpc_auth_protocol_error(format!(
+            "principal {:?} is not authorized for {}",
+            input.credential.principal(),
+            input.frame.kind.operation_name()
+        )));
+    }
+    let mut payload = encode_binding(
+        input.topology_generation,
+        input.topology_digest,
+        input.target_node_id,
+        None,
+        input.frame,
+    )?;
+    let version_offset = STORAGE_RPC_AUTH_BINDING_MAGIC.len();
+    payload[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    sign_storage_rpc_request_binding(input, payload)
 }
 
 pub(crate) struct StorageRpcAuthRequestVerificationInput<'a> {
@@ -960,7 +988,8 @@ pub(crate) fn verify_storage_rpc_request(
         })
         .cloned()
         .ok_or(StorageRpcAuthRejectionReason::Malformed)?;
-    let binding = decode_binding(envelope.payload())?;
+    let binding =
+        decode_binding(envelope.payload()).map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
     validate_binding(
         &binding,
         input.expected_target_node_id,
@@ -1071,7 +1100,8 @@ fn verify_storage_rpc_response(
         },
     });
     let (credential_id, credential_version) = accepted_credential(decision)?;
-    let binding = decode_binding(envelope.payload())?;
+    let binding =
+        decode_binding(envelope.payload()).map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
     validate_binding(
         &binding,
         input.expected_target_node_id,
@@ -1454,27 +1484,34 @@ fn encode_binding_with_encoded_frame(
     Ok(out)
 }
 
-fn decode_binding(bytes: &[u8]) -> Result<StorageRpcAuthBinding, StorageRpcAuthRejectionReason> {
+fn decode_binding(bytes: &[u8]) -> Result<StorageRpcAuthBinding, StorageRpcAuthBindingError> {
     if bytes.len() > STORAGE_RPC_AUTH_MAX_BINDING_LEN {
-        return Err(StorageRpcAuthRejectionReason::Malformed);
+        return Err(StorageRpcAuthBindingError::Malformed);
+    }
+    if bytes.len() < STORAGE_RPC_AUTH_BINDING_MAGIC.len() {
+        return Err(StorageRpcAuthBindingError::TruncatedMagic);
     }
     let mut reader = BindingReader::new(bytes);
     if reader.read_exact(STORAGE_RPC_AUTH_BINDING_MAGIC.len())? != STORAGE_RPC_AUTH_BINDING_MAGIC {
-        return Err(StorageRpcAuthRejectionReason::Malformed);
+        return Err(StorageRpcAuthBindingError::UnknownMagic);
     }
-    if reader.read_u16()? != STORAGE_RPC_AUTH_BINDING_VERSION {
-        return Err(StorageRpcAuthRejectionReason::Malformed);
+    if reader.remaining() < 2 {
+        return Err(StorageRpcAuthBindingError::TruncatedVersion);
+    }
+    let version = reader.read_u16()?;
+    if version != STORAGE_RPC_AUTH_BINDING_VERSION {
+        return Err(StorageRpcAuthBindingError::UnsupportedVersion(version));
     }
     let topology_generation = reader.read_u64()?;
     let digest_len = reader.read_u32()? as usize;
     if digest_len != STORAGE_RPC_AUTH_TOPOLOGY_DIGEST_LEN {
-        return Err(StorageRpcAuthRejectionReason::Malformed);
+        return Err(StorageRpcAuthBindingError::Malformed);
     }
     let topology_digest = std::str::from_utf8(reader.read_exact(digest_len)?)
-        .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?
+        .map_err(|_| StorageRpcAuthBindingError::Malformed)?
         .to_owned();
     if validate_topology(topology_generation, &topology_digest).is_err() {
-        return Err(StorageRpcAuthRejectionReason::Malformed);
+        return Err(StorageRpcAuthBindingError::Malformed);
     }
     let target_node_id = NodeId::new(reader.read_u32()?);
     let request_transcript = match reader.read_u8()? {
@@ -1483,17 +1520,17 @@ fn decode_binding(bytes: &[u8]) -> Result<StorageRpcAuthBinding, StorageRpcAuthR
             let bytes = reader
                 .read_exact(STORAGE_RPC_AUTH_REQUEST_TRANSCRIPT_LEN)?
                 .try_into()
-                .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+                .map_err(|_| StorageRpcAuthBindingError::Malformed)?;
             Some(StorageRpcRequestTranscript(bytes))
         }
-        _ => return Err(StorageRpcAuthRejectionReason::Malformed),
+        _ => return Err(StorageRpcAuthBindingError::Malformed),
     };
     let frame_len = reader.read_u32()? as usize;
     if frame_len > STORAGE_RPC_MAX_FRAME_LEN {
-        return Err(StorageRpcAuthRejectionReason::Malformed);
+        return Err(StorageRpcAuthBindingError::Malformed);
     }
     let frame = decode_storage_rpc_frame(reader.read_exact(frame_len)?)
-        .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+        .map_err(|_| StorageRpcAuthBindingError::Malformed)?;
     reader.finish()?;
     Ok(StorageRpcAuthBinding {
         topology_generation,
@@ -1543,52 +1580,56 @@ impl<'a> BindingReader<'a> {
         Self { bytes, offset: 0 }
     }
 
-    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], StorageRpcAuthRejectionReason> {
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    fn read_exact(&mut self, len: usize) -> Result<&'a [u8], StorageRpcAuthBindingError> {
         let end = self
             .offset
             .checked_add(len)
-            .ok_or(StorageRpcAuthRejectionReason::Malformed)?;
+            .ok_or(StorageRpcAuthBindingError::Malformed)?;
         let value = self
             .bytes
             .get(self.offset..end)
-            .ok_or(StorageRpcAuthRejectionReason::Malformed)?;
+            .ok_or(StorageRpcAuthBindingError::Malformed)?;
         self.offset = end;
         Ok(value)
     }
 
-    fn read_u16(&mut self) -> Result<u16, StorageRpcAuthRejectionReason> {
+    fn read_u16(&mut self) -> Result<u16, StorageRpcAuthBindingError> {
         let bytes: [u8; 2] = self
             .read_exact(2)?
             .try_into()
-            .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+            .map_err(|_| StorageRpcAuthBindingError::Malformed)?;
         Ok(u16::from_be_bytes(bytes))
     }
 
-    fn read_u8(&mut self) -> Result<u8, StorageRpcAuthRejectionReason> {
+    fn read_u8(&mut self) -> Result<u8, StorageRpcAuthBindingError> {
         Ok(self.read_exact(1)?[0])
     }
 
-    fn read_u32(&mut self) -> Result<u32, StorageRpcAuthRejectionReason> {
+    fn read_u32(&mut self) -> Result<u32, StorageRpcAuthBindingError> {
         let bytes: [u8; 4] = self
             .read_exact(4)?
             .try_into()
-            .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+            .map_err(|_| StorageRpcAuthBindingError::Malformed)?;
         Ok(u32::from_be_bytes(bytes))
     }
 
-    fn read_u64(&mut self) -> Result<u64, StorageRpcAuthRejectionReason> {
+    fn read_u64(&mut self) -> Result<u64, StorageRpcAuthBindingError> {
         let bytes: [u8; 8] = self
             .read_exact(8)?
             .try_into()
-            .map_err(|_| StorageRpcAuthRejectionReason::Malformed)?;
+            .map_err(|_| StorageRpcAuthBindingError::Malformed)?;
         Ok(u64::from_be_bytes(bytes))
     }
 
-    fn finish(self) -> Result<(), StorageRpcAuthRejectionReason> {
+    fn finish(self) -> Result<(), StorageRpcAuthBindingError> {
         if self.offset == self.bytes.len() {
             Ok(())
         } else {
-            Err(StorageRpcAuthRejectionReason::Malformed)
+            Err(StorageRpcAuthBindingError::Malformed)
         }
     }
 }
@@ -1616,6 +1657,16 @@ mod tests {
 
     const TOPOLOGY_DIGEST: &str =
         "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+
+        let mut encoded = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(&mut encoded, "{byte:02x}").unwrap();
+        }
+        encoded
+    }
 
     const ROUTINE_CHECKPOINT_MAINTENANCE_WORKFLOW: &[StorageRpcMessageKind] = &[
         StorageRpcMessageKind::MetadataCommandReplicaState,
@@ -1780,7 +1831,100 @@ mod tests {
     }
 
     #[test]
-    fn storage_rpc_auth_binding_rejects_unsupported_versions() {
+    fn storage_rpc_auth_binding_has_typed_marker_and_version_failures() {
+        assert_eq!(
+            decode_binding(b""),
+            Err(StorageRpcAuthBindingError::TruncatedMagic)
+        );
+        assert_eq!(
+            decode_binding(b"ARGSRPC"),
+            Err(StorageRpcAuthBindingError::TruncatedMagic)
+        );
+        assert_eq!(
+            decode_binding(b"XRGSRPCB"),
+            Err(StorageRpcAuthBindingError::UnknownMagic)
+        );
+        assert_eq!(
+            decode_binding(STORAGE_RPC_AUTH_BINDING_MAGIC),
+            Err(StorageRpcAuthBindingError::TruncatedVersion)
+        );
+        let mut truncated_version = STORAGE_RPC_AUTH_BINDING_MAGIC.to_vec();
+        truncated_version.push(0);
+        assert_eq!(
+            decode_binding(&truncated_version),
+            Err(StorageRpcAuthBindingError::TruncatedVersion)
+        );
+        for version in [0, STORAGE_RPC_AUTH_BINDING_VERSION + 1] {
+            let mut encoded = STORAGE_RPC_AUTH_BINDING_MAGIC.to_vec();
+            encoded.extend_from_slice(&version.to_be_bytes());
+            assert_eq!(
+                decode_binding(&encoded),
+                Err(StorageRpcAuthBindingError::UnsupportedVersion(version))
+            );
+        }
+    }
+
+    #[test]
+    fn storage_rpc_auth_binding_matches_frozen_v2_request_response_and_transcript() {
+        const V21_FRAME: &[u8] = &[
+            24, 0, 0, 0, 97, 114, 103, 109, 105, 110, 45, 115, 116, 111, 114, 97, 103, 101, 45,
+            114, 112, 99, 45, 102, 114, 97, 109, 101, 21, 0, 8, 7, 6, 5, 4, 3, 2, 1, 3, 0, 3, 0, 0,
+            0, 146, 204, 0, 105, 155, 117, 90, 173, 97, 98, 99,
+        ];
+        let request = encode_binding_with_encoded_frame(
+            0x0102_0304_0506_0708,
+            TOPOLOGY_DIGEST,
+            NodeId::new(0x1122_3344),
+            None,
+            V21_FRAME,
+        )
+        .unwrap();
+        assert_eq!(
+            hex_bytes(&request),
+            concat!(
+                "4152475352504342000201020304050607080000004030313233343536373839",
+                "6162636465663031323334353637383961626364656630313233343536373839",
+                "6162636465663031323334353637383961626364656611223344000000003718",
+                "0000006172676d696e2d73746f726167652d7270632d6672616d651500080706",
+                "050403020103000300000092cc00699b755aad616263"
+            )
+        );
+
+        let transcript = storage_rpc_request_transcript(b"fixed authenticated request envelope");
+        assert_eq!(
+            hex_bytes(&transcript.0),
+            "673e6f836a950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f1"
+        );
+        let response = encode_binding_with_encoded_frame(
+            0x0102_0304_0506_0708,
+            TOPOLOGY_DIGEST,
+            NodeId::new(0x1122_3344),
+            Some(&transcript),
+            V21_FRAME,
+        )
+        .unwrap();
+        assert_eq!(
+            hex_bytes(&response),
+            concat!(
+                "4152475352504342000201020304050607080000004030313233343536373839",
+                "6162636465663031323334353637383961626364656630313233343536373839",
+                "616263646566303132333435363738396162636465661122334401673e6f836a",
+                "950c4b2f304c2e1dd16de07e4ff6972e497106e064deeb34e434f100000037",
+                "180000006172676d696e2d73746f726167652d7270632d6672616d6515000807",
+                "06050403020103000300000092cc00699b755aad616263"
+            )
+        );
+
+        let decoded_request = decode_binding(&request).unwrap();
+        assert!(decoded_request.request_transcript.is_none());
+        assert_eq!(decoded_request.frame.payload, b"abc");
+        let decoded_response = decode_binding(&response).unwrap();
+        assert_eq!(decoded_response.request_transcript, Some(transcript));
+        assert_eq!(decoded_response.frame.payload, b"abc");
+    }
+
+    #[test]
+    fn authenticator_valid_storage_rpc_auth_binding_rejects_unsupported_versions() {
         let credential = credential(ControlPlaneAuthPrincipal::Frontend {
             instance_id: "frontend-1".to_owned(),
         });
