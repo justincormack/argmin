@@ -6602,6 +6602,156 @@ fn reclaim_worker_pool_executes_distinct_roots_concurrently() {
 }
 
 #[test]
+fn reclaim_worker_pool_executes_shared_deferred_roots_concurrently() {
+    const HOLD_FIRST_WORKER: DeterministicFaultToken =
+        DeterministicFaultToken::new("reclaim-shared-deferred-hold-first-worker");
+
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let independent = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    let buckets = [
+        trusted_bucket_name("shared-deferred-finalize-first"),
+        trusted_bucket_name("shared-deferred-finalize-second"),
+    ];
+    initial
+        .test_seed_missing_bucket_finalize_work(&trusted_bucket_name(
+            "shared-deferred-worker-blocker",
+        ))
+        .unwrap();
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&initial));
+
+    let first_worker_gate = DeterministicFaultGate::new(HOLD_FIRST_WORKER);
+    let first_worker_gate_for_hook = Arc::clone(&first_worker_gate);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let runtime_handle_for_hook = runtime_handle.clone();
+    let independent_for_hook = Arc::clone(&independent);
+    let retry_phase = Arc::new(AtomicBool::new(false));
+    let retry_phase_for_hook = Arc::clone(&retry_phase);
+    let retry_gates_remaining = Arc::new(AtomicUsize::new(2));
+    let retry_gates_remaining_for_hook = Arc::clone(&retry_gates_remaining);
+    let (deferred_tx, deferred_rx) = mpsc::channel();
+    let (retry_arrived_tx, retry_arrived_rx) = mpsc::channel();
+    let (retry_release_tx, retry_release_rx) = mpsc::channel();
+    let retry_release_rx = Arc::new(Mutex::new(retry_release_rx));
+    let retry_release_rx_for_hook = Arc::clone(&retry_release_rx);
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        reclaim_worker_parallelism_override: Some(2),
+        before_reclaim_work_execute: Some(Arc::new(move |_execution_cluster| {
+            let call = calls_for_hook.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                first_worker_gate_for_hook.wait_at(HOLD_FIRST_WORKER);
+            } else if call == 1 {
+                let valid_until = storage::clock::wall_time_millis().saturating_add(250);
+                let expiring = process_local_cluster_with_route_map_validity(
+                    &independent_for_hook,
+                    RouteMapValidity::until_ms(valid_until).unwrap(),
+                );
+                runtime_handle_for_hook.install(expiring).unwrap();
+                while storage::clock::wall_time_millis() <= valid_until {
+                    thread::sleep(Duration::from_millis(5));
+                }
+            } else if retry_phase_for_hook.load(Ordering::SeqCst)
+                && retry_gates_remaining_for_hook
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                retry_arrived_tx.send(()).unwrap();
+                retry_release_rx_for_hook
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .recv_timeout(TEST_EVENT_TIMEOUT)
+                    .expect("test must release every deferred reclaim worker");
+            }
+        })),
+        after_reclaim_work_deferred: Some(Arc::new(move || {
+            deferred_tx.send(()).unwrap();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&initial));
+    let _first_worker_release_guard = first_worker_gate.release_on_drop();
+    first_worker_gate.wait_until_arrived(TEST_EVENT_TIMEOUT);
+
+    for bucket in &buckets {
+        direct_coord
+            .create_bucket_for_owner("default-owner", bucket.as_str(), false)
+            .unwrap();
+        initial.test_begin_current_bucket_delete(bucket).unwrap();
+    }
+    independent
+        .test_seed_current_bucket_finalize_work(&buckets[1])
+        .unwrap();
+    initial
+        .test_seed_current_bucket_finalize_work(&buckets[0])
+        .unwrap();
+    drop(direct_coord);
+
+    deferred_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("one worker must defer the first finalizer root");
+    deferred_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("the same worker must remain available to defer the second finalizer root");
+
+    retry_phase.store(true, Ordering::SeqCst);
+    runtime_handle.install(Arc::clone(&replacement)).unwrap();
+    first_worker_gate.release();
+
+    retry_arrived_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("one worker must execute a shared deferred root");
+    retry_arrived_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("another worker must steal the other deferred root concurrently");
+    retry_release_tx.send(()).unwrap();
+    retry_release_tx.send(()).unwrap();
+
+    for bucket in &buckets {
+        wait_until_bucket_deleting_or_missing(
+            &initial,
+            bucket,
+            "shared deferred bucket finalizer did not converge after route refresh",
+        );
+    }
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while (initial.test_bucket_delete_finalize_outstanding_depth() != 0
+        || independent.test_bucket_delete_finalize_outstanding_depth() != 0
+        || replacement.test_bucket_delete_finalize_outstanding_depth() != 0)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        initial.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "deferred completion must clear the original queue owner's exact capacity records"
+    );
+    assert_eq!(
+        independent.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "deferred completion must clear the independent queue owner's exact capacity records"
+    );
+    assert_eq!(
+        replacement.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "execution against the replacement must not leave queue accounting behind"
+    );
+    drop(worker);
+}
+
+#[test]
 fn reclaim_worker_resamples_runtime_map_after_dequeue() {
     const TOKEN: DeterministicFaultToken =
         DeterministicFaultToken::new("reclaim-work-dequeued-before-route-execution");
@@ -7322,6 +7472,92 @@ fn reclaim_worker_retries_bucket_delete_begin_after_early_route_map_failure() {
             }
         }
     }
+}
+
+#[test]
+fn deferred_bucket_delete_begin_clears_independent_original_queue_owner() {
+    let _serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let tmp = test_util::tempdir();
+    let bucket = trusted_bucket_name("deferred-begin-independent-queue-owner");
+    let initial = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    let direct_coord =
+        setup_same_process_coordinator_with_storage_cluster_without_background_sweepers(
+            Arc::clone(&initial),
+        );
+    direct_coord
+        .create_bucket_for_owner("old-owner", bucket.as_str(), false)
+        .unwrap();
+    let stale_subject = initial
+        .test_capture_bucket_delete_begin_subject(&bucket)
+        .unwrap();
+
+    let expired = process_local_cluster_with_route_map_validity(
+        &initial,
+        RouteMapValidity::until_ms(1).unwrap(),
+    );
+    let replacement = open_dynamic_test_storage_cluster(tmp.path(), &[0, 1]);
+    assert_ne!(
+        initial.process_local_registry_key(),
+        replacement.process_local_registry_key(),
+        "the replacement must own an independent reclaim queue"
+    );
+    let (runtime_handle, handle) = test_dynamic_storage_route_handles(Arc::clone(&expired));
+    let (deferred_tx, deferred_rx) = mpsc::channel();
+    let _hook_guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target_reclaim_worker_registry_key: Some(initial.process_local_registry_key()),
+        after_reclaim_work_deferred: Some(Arc::new(move || {
+            let _ = deferred_tx.send(());
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    let worker = setup_coordinator_with_only_reclaim_worker(handle, Arc::clone(&expired));
+    expired.test_enqueue_bucket_delete_begin_subject(&stale_subject);
+    deferred_rx
+        .recv_timeout(TEST_EVENT_TIMEOUT)
+        .expect("the expired route must defer the original BucketDeleteBegin");
+    assert_eq!(
+        initial.test_bucket_delete_finalize_outstanding_depth(),
+        1,
+        "the original runtime state must retain the deferred begin admission"
+    );
+    assert_eq!(
+        replacement.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "the replacement must not own the deferred begin admission"
+    );
+
+    initial.test_begin_current_bucket_delete(&bucket).unwrap();
+    finalize_deleting_bucket_metadata_for_test(&initial, &bucket);
+    direct_coord
+        .create_bucket_for_owner("new-owner", bucket.as_str(), false)
+        .unwrap();
+    assert!(initial
+        .test_current_bucket_is_distinct_active_incarnation(&stale_subject)
+        .unwrap());
+    runtime_handle.install(Arc::clone(&replacement)).unwrap();
+
+    let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+    while initial.test_bucket_delete_finalize_outstanding_depth() != 0 && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        initial.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "stale deferred begin cleanup must release its original queue owner's capacity"
+    );
+    assert_eq!(
+        replacement.test_bucket_delete_finalize_outstanding_depth(),
+        0,
+        "stale deferred begin cleanup must not create replacement-owner accounting"
+    );
+    assert!(initial
+        .test_current_bucket_is_distinct_active_incarnation(&stale_subject)
+        .unwrap());
+    drop(worker);
 }
 
 #[test]

@@ -18,6 +18,7 @@ pub(super) struct ReclamationTestHooks {
     pub(super) after_reclaim_worker_idle_return: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_reclaim_work_dequeued: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) before_reclaim_work_execute: Option<Arc<dyn Fn(Arc<StorageCluster>) + Send + Sync>>,
+    pub(super) after_reclaim_work_deferred: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
     pub(super) after_abort_multipart_bucket_summary: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -247,6 +248,7 @@ pub(super) fn install_reclamation_test_hooks(
             after_idle_return: hooks.after_reclaim_worker_idle_return.clone(),
             after_work_dequeued: hooks.after_reclaim_work_dequeued.clone(),
             before_work_execute: hooks.before_reclaim_work_execute.clone(),
+            after_work_deferred: hooks.after_reclaim_work_deferred.clone(),
         },
     );
     let slot = RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
