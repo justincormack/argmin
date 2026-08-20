@@ -140,10 +140,12 @@ use peer_transport::{
 };
 #[cfg(test)]
 use peer_transport::{
-    raft_peer_transport_rpc_error, ControlPlaneRaftConfiguredPeerFrameTransport,
-    ControlPlaneRaftPeerFrameExchange, ControlPlaneRaftPeerFrameExchangeError,
-    ControlPlaneRaftPeerFrameTransport, ControlPlaneRaftPeerTransportRejection,
-    ControlPlaneRaftUnixPeerFrameTransport, CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS,
+    raft_peer_transport_rpc_error, read_control_plane_raft_peer_transport_frame_classified,
+    ControlPlaneRaftConfiguredPeerFrameTransport, ControlPlaneRaftPeerFrameExchange,
+    ControlPlaneRaftPeerFrameExchangeError, ControlPlaneRaftPeerFrameTransport,
+    ControlPlaneRaftPeerTransportFrameFormatError, ControlPlaneRaftPeerTransportFrameReadError,
+    ControlPlaneRaftPeerTransportRejection, ControlPlaneRaftUnixPeerFrameTransport,
+    CONTROL_PLANE_RAFT_TRANSFER_LEADER_AUTH_FRESHNESS_MS,
 };
 pub(crate) use peer_transport::{
     ControlPlaneRaftPeerAuthPolicy, ControlPlaneRaftPeerFrameIdentity,

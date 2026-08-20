@@ -2767,6 +2767,11 @@ pub(crate) fn write_control_plane_raft_peer_transport_frame(
     writer: &mut (impl Write + ?Sized),
     frame: &[u8],
 ) -> Result<(), ControlPlaneError> {
+    if frame.is_empty() {
+        return Err(ControlPlaneError::rpc_protocol(
+            "control-plane OpenRaft peer transport frame is empty".to_owned(),
+        ));
+    }
     let frame_len = u32::try_from(frame.len()).map_err(|_| {
         ControlPlaneError::rpc_protocol(format!(
             "control-plane OpenRaft peer transport frame too large: {} bytes",
@@ -2793,35 +2798,139 @@ pub(crate) fn read_control_plane_raft_peer_transport_frame(
     .map(|(frame, ())| frame)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ControlPlaneRaftPeerTransportFrameFormatError {
+    TruncatedHeader,
+    EmptyFrame,
+    LengthDoesNotFitPlatform(u32),
+    FrameTooLarge {
+        frame_len: u32,
+        max_frame_bytes: usize,
+    },
+    TruncatedPayload {
+        frame_len: u32,
+    },
+}
+
+impl fmt::Display for ControlPlaneRaftPeerTransportFrameFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TruncatedHeader => formatter
+                .write_str("truncated control-plane OpenRaft peer transport frame header"),
+            Self::EmptyFrame => {
+                formatter.write_str("control-plane OpenRaft peer transport frame is empty")
+            }
+            Self::LengthDoesNotFitPlatform(frame_len) => write!(
+                formatter,
+                "control-plane OpenRaft peer transport frame length {frame_len} does not fit usize"
+            ),
+            Self::FrameTooLarge {
+                frame_len,
+                max_frame_bytes,
+            } => write!(
+                formatter,
+                "control-plane OpenRaft peer transport frame size {frame_len} bytes exceeds limit {max_frame_bytes}"
+            ),
+            Self::TruncatedPayload { frame_len } => write!(
+                formatter,
+                "truncated control-plane OpenRaft peer transport frame payload declared as {frame_len} bytes"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlPlaneRaftPeerTransportFrameFormatError {}
+
+#[derive(Debug)]
+pub(super) enum ControlPlaneRaftPeerTransportFrameReadError {
+    Format(ControlPlaneRaftPeerTransportFrameFormatError),
+    Io(ControlPlaneError),
+    Reservation(ControlPlaneError),
+}
+
+impl ControlPlaneRaftPeerTransportFrameReadError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(
+                error @ ControlPlaneRaftPeerTransportFrameFormatError::TruncatedHeader,
+            ) => ControlPlaneError::io(
+                "read control-plane OpenRaft peer transport frame header",
+                io::Error::new(io::ErrorKind::UnexpectedEof, error.to_string()),
+            ),
+            Self::Format(
+                error @ ControlPlaneRaftPeerTransportFrameFormatError::TruncatedPayload { .. },
+            ) => ControlPlaneError::io(
+                "read control-plane OpenRaft peer transport frame payload",
+                io::Error::new(io::ErrorKind::UnexpectedEof, error.to_string()),
+            ),
+            Self::Format(error) => ControlPlaneError::rpc_protocol(error.to_string()),
+            Self::Io(error) | Self::Reservation(error) => error,
+        }
+    }
+}
+
+pub(super) fn read_control_plane_raft_peer_transport_frame_classified<Reservation>(
+    reader: &mut (impl Read + ?Sized),
+    max_frame_bytes: usize,
+    reserve: impl FnOnce(usize) -> Result<Reservation, ControlPlaneError>,
+) -> Result<(Vec<u8>, Reservation), ControlPlaneRaftPeerTransportFrameReadError> {
+    let mut header = [0; std::mem::size_of::<u32>()];
+    if let Err(source) = reader.read_exact(&mut header) {
+        return Err(if source.kind() == io::ErrorKind::UnexpectedEof {
+            ControlPlaneRaftPeerTransportFrameReadError::Format(
+                ControlPlaneRaftPeerTransportFrameFormatError::TruncatedHeader,
+            )
+        } else {
+            ControlPlaneRaftPeerTransportFrameReadError::Io(ControlPlaneError::io(
+                "read control-plane OpenRaft peer transport frame header",
+                source,
+            ))
+        });
+    }
+    let wire_frame_len = u32::from_be_bytes(header);
+    if wire_frame_len == 0 {
+        return Err(ControlPlaneRaftPeerTransportFrameReadError::Format(
+            ControlPlaneRaftPeerTransportFrameFormatError::EmptyFrame,
+        ));
+    }
+    let frame_len = usize::try_from(wire_frame_len).map_err(|_| {
+        ControlPlaneRaftPeerTransportFrameReadError::Format(
+            ControlPlaneRaftPeerTransportFrameFormatError::LengthDoesNotFitPlatform(wire_frame_len),
+        )
+    })?;
+    if frame_len > max_frame_bytes {
+        return Err(ControlPlaneRaftPeerTransportFrameReadError::Format(
+            ControlPlaneRaftPeerTransportFrameFormatError::FrameTooLarge {
+                frame_len: wire_frame_len,
+                max_frame_bytes,
+            },
+        ));
+    }
+    let reservation =
+        reserve(frame_len).map_err(ControlPlaneRaftPeerTransportFrameReadError::Reservation)?;
+    let mut frame = vec![0; frame_len];
+    if let Err(source) = reader.read_exact(&mut frame) {
+        return Err(if source.kind() == io::ErrorKind::UnexpectedEof {
+            ControlPlaneRaftPeerTransportFrameReadError::Format(
+                ControlPlaneRaftPeerTransportFrameFormatError::TruncatedPayload {
+                    frame_len: wire_frame_len,
+                },
+            )
+        } else {
+            ControlPlaneRaftPeerTransportFrameReadError::Io(ControlPlaneError::io(
+                "read control-plane OpenRaft peer transport frame payload",
+                source,
+            ))
+        });
+    }
+    Ok((frame, reservation))
+}
+
 pub(crate) fn read_control_plane_raft_peer_transport_frame_with_reservation<Reservation>(
     reader: &mut (impl Read + ?Sized),
     max_frame_bytes: usize,
     reserve: impl FnOnce(usize) -> Result<Reservation, ControlPlaneError>,
 ) -> Result<(Vec<u8>, Reservation), ControlPlaneError> {
-    let mut header = [0; std::mem::size_of::<u32>()];
-    reader.read_exact(&mut header).map_err(|source| {
-        ControlPlaneError::io(
-            "read control-plane OpenRaft peer transport frame header",
-            source,
-        )
-    })?;
-    let frame_len = usize::try_from(u32::from_be_bytes(header)).map_err(|_| {
-        ControlPlaneError::rpc_protocol(
-            "control-plane OpenRaft peer transport frame length does not fit usize".to_string(),
-        )
-    })?;
-    if frame_len > max_frame_bytes {
-        return Err(ControlPlaneError::rpc_protocol(format!(
-                "control-plane OpenRaft peer transport frame size {frame_len} bytes exceeds limit {max_frame_bytes}"
-            )));
-    }
-    let reservation = reserve(frame_len)?;
-    let mut frame = vec![0; frame_len];
-    reader.read_exact(&mut frame).map_err(|source| {
-        ControlPlaneError::io(
-            "read control-plane OpenRaft peer transport frame payload",
-            source,
-        )
-    })?;
-    Ok((frame, reservation))
+    read_control_plane_raft_peer_transport_frame_classified(reader, max_frame_bytes, reserve)
+        .map_err(ControlPlaneRaftPeerTransportFrameReadError::into_control_plane_error)
 }

@@ -1168,6 +1168,11 @@ fn control_plane_raft_peer_transport_frame_round_trips() {
     let frame = request.encode_frame_for_peer(&identity).unwrap();
     let mut transport = Vec::new();
     write_control_plane_raft_peer_transport_frame(&mut transport, &frame).unwrap();
+    assert_eq!(
+        transport.get(..4),
+        Some(u32::try_from(frame.len()).unwrap().to_be_bytes().as_slice())
+    );
+    assert_eq!(&transport[4..], frame);
 
     let mut cursor = Cursor::new(transport);
     let decoded_frame =
@@ -1176,6 +1181,76 @@ fn control_plane_raft_peer_transport_frame_round_trips() {
     let decoded =
         ControlPlaneRaftPeerRpcRequest::decode_frame_for_peer(&decoded_frame, &identity).unwrap();
     assert!(matches!(decoded, ControlPlaneRaftPeerRpcRequest::Vote(_)));
+}
+
+#[test]
+fn control_plane_raft_peer_transport_record_layout_and_format_failures_are_exact() {
+    let mut encoded = Vec::new();
+    write_control_plane_raft_peer_transport_frame(&mut encoded, b"peer").unwrap();
+    assert_eq!(encoded, b"\0\0\0\x04peer");
+    assert!(matches!(
+        write_control_plane_raft_peer_transport_frame(&mut Vec::new(), b""),
+        Err(ControlPlaneError::RpcProtocol { diagnostic })
+            if diagnostic.as_str() == "control-plane OpenRaft peer transport frame is empty"
+    ));
+
+    let cases = [
+        (
+            Vec::new(),
+            4,
+            ControlPlaneRaftPeerTransportFrameFormatError::TruncatedHeader,
+            0,
+        ),
+        (
+            vec![0, 0, 0],
+            4,
+            ControlPlaneRaftPeerTransportFrameFormatError::TruncatedHeader,
+            0,
+        ),
+        (
+            vec![0, 0, 0, 0],
+            4,
+            ControlPlaneRaftPeerTransportFrameFormatError::EmptyFrame,
+            0,
+        ),
+        (
+            vec![0, 0, 0, 5],
+            4,
+            ControlPlaneRaftPeerTransportFrameFormatError::FrameTooLarge {
+                frame_len: 5,
+                max_frame_bytes: 4,
+            },
+            0,
+        ),
+        (
+            vec![0, 0, 0, 4, b'p', b'e', b'e'],
+            4,
+            ControlPlaneRaftPeerTransportFrameFormatError::TruncatedPayload { frame_len: 4 },
+            1,
+        ),
+    ];
+
+    for (bytes, max_frame_bytes, expected, expected_reservations) in cases {
+        let reservations = AtomicUsize::new(0);
+        let error = read_control_plane_raft_peer_transport_frame_classified(
+            &mut Cursor::new(bytes),
+            max_frame_bytes,
+            |_| {
+                reservations.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlPlaneRaftPeerTransportFrameReadError::Format(actual)
+                if actual == expected
+        ));
+        assert_eq!(
+            reservations.load(Ordering::Acquire),
+            expected_reservations
+        );
+    }
 }
 
 #[test]
@@ -1738,6 +1813,120 @@ fn control_plane_raft_peer_server_rejects_resigned_auth_versions_before_dispatch
         );
         runtime.block_on(authority.shutdown()).unwrap();
     }
+}
+
+#[test]
+fn control_plane_raft_peer_server_rejects_malformed_transport_before_auth_or_dispatch() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let cluster_name = "control-plane-raft-peer-transport-test";
+    let authority = Arc::new(
+        runtime
+            .block_on(
+                ControlPlaneRaftAuthority::new_experimental_single_node_in_memory(cluster_name, 1),
+            )
+            .unwrap(),
+    );
+    let before = runtime.block_on(authority.status()).unwrap();
+    let server_auth = test_peer_auth_policy(1);
+    let max_frame_bytes = 4096usize;
+    let checkpoint = Arc::new(RecordingPeerServerCheckpoint::default());
+    let policy = ControlPlaneRaftPeerServerPolicy::new(
+        1,
+        test_peer_transport_policy().with_auth_policy(server_auth.clone()),
+        max_frame_bytes,
+    )
+    .unwrap()
+    .with_durability(
+        authority
+            .bind_peer_server_durability(checkpoint.clone())
+            .unwrap(),
+    );
+    let identity = ControlPlaneRaftPeerFrameIdentity::new(cluster_name, 2, 1);
+    let raw_request = ControlPlaneRaftPeerRpcRequest::Vote(VoteRequest {
+        vote: Vote::<ControlPlaneRaftLeaderId>::new(4, 2),
+        last_log_id: None,
+        leadership_transfer: false,
+    })
+    .encode_frame_for_peer(&identity)
+    .unwrap();
+    let signed = test_peer_auth_policy(2)
+        .sign_peer_frame(
+            &identity,
+            ControlPlaneAuthOperation::RaftVote,
+            raw_request,
+        )
+        .unwrap();
+    let mut truncated_payload = u32::try_from(signed.len()).unwrap().to_be_bytes().to_vec();
+    truncated_payload.extend_from_slice(&signed[..signed.len() - 1]);
+
+    let malformed = [
+        ("missing header", Vec::new()),
+        ("truncated header", vec![0, 0, 0]),
+        ("empty frame", vec![0, 0, 0, 0]),
+        (
+            "oversized frame",
+            u32::try_from(max_frame_bytes + 1)
+                .unwrap()
+                .to_be_bytes()
+                .to_vec(),
+        ),
+        ("truncated payload", truncated_payload),
+    ];
+
+    for (case, transport_request) in malformed {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RecordingPeerServerStream::new(transport_request, Arc::clone(&events));
+        let error = handle_control_plane_raft_peer_server_request(
+            runtime.handle(),
+            &authority,
+            &mut stream,
+            &policy,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
+        let ControlPlaneRaftPeerServerWorkerError::PeerRpc(error) = error else {
+            panic!("{case}: malformed transport returned checkpoint error")
+        };
+        match case {
+            "missing header" | "truncated header" | "truncated payload" => assert!(
+                matches!(error, ControlPlaneError::Io { diagnostic: ref source }
+                    if source.kind() == io::ErrorKind::UnexpectedEof),
+                "{case}: unexpected error: {error}"
+            ),
+            "empty frame" => assert!(
+                matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
+                    if message.as_str() == "control-plane OpenRaft peer transport frame is empty"),
+                "{case}: unexpected error: {error}"
+            ),
+            "oversized frame" => assert!(
+                matches!(error, ControlPlaneError::RpcProtocol { diagnostic: ref message }
+                    if message.contains("peer transport frame size 4097 bytes exceeds limit 4096")),
+                "{case}: unexpected error: {error}"
+            ),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            runtime.block_on(authority.status()).unwrap(),
+            before,
+            "{case}: malformed transport reached OpenRaft dispatch"
+        );
+        assert!(events.lock().unwrap().is_empty());
+        assert!(
+            checkpoint.events.lock().unwrap().is_empty(),
+            "{case}: malformed transport reached checkpoint publication"
+        );
+        assert!(stream.response.is_empty());
+    }
+    let metrics = server_auth.metrics_snapshot();
+    assert_eq!(metrics.accepted_total(), 0);
+    assert_eq!(metrics.rejected_total(), 0);
+    assert_eq!(metrics.rejected_without_operation_total(), 0);
+    runtime.block_on(authority.shutdown()).unwrap();
 }
 
 #[test]
