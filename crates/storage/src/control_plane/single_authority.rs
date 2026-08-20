@@ -492,6 +492,7 @@ fn single_authority_initialized_tmp_path(path: &Path) -> PathBuf {
 
 enum FixedControlPlaneSidecarReadError {
     Truncated,
+    InvalidLength(ControlPlaneError),
     Invalid(ControlPlaneError),
 }
 
@@ -512,13 +513,13 @@ fn read_fixed_control_plane_sidecar<const N: usize>(
         return Err(FixedControlPlaneSidecarReadError::Truncated);
     }
     if metadata.len() > N as u64 {
-        return Err(FixedControlPlaneSidecarReadError::Invalid(
+        return Err(FixedControlPlaneSidecarReadError::InvalidLength(
             ControlPlaneError::AuthorityClockCheckpoint {
-            message: format!(
-                "{} length {} does not match required fixed length {N}",
-                path.display(),
-                metadata.len()
-            ),
+                message: format!(
+                    "{} length {} does not match required fixed length {N}",
+                    path.display(),
+                    metadata.len()
+                ),
             },
         ));
     }
@@ -543,7 +544,7 @@ fn read_fixed_control_plane_sidecar<const N: usize>(
         })?
         != 0
     {
-        return Err(FixedControlPlaneSidecarReadError::Invalid(
+        return Err(FixedControlPlaneSidecarReadError::InvalidLength(
             ControlPlaneError::AuthorityClockCheckpoint {
                 message: format!("{} grew while it was being read", path.display()),
             },
@@ -689,7 +690,8 @@ fn load_single_authority_clock_checkpoint_binding_classified(
         FixedControlPlaneSidecarReadError::Truncated => SingleAuthorityIdentityDecodeError::Format(
             SingleAuthorityIdentityFormatError::Truncated,
         ),
-        FixedControlPlaneSidecarReadError::Invalid(error) => {
+        FixedControlPlaneSidecarReadError::InvalidLength(error)
+        | FixedControlPlaneSidecarReadError::Invalid(error) => {
             SingleAuthorityIdentityDecodeError::Invalid(error)
         }
     })?
@@ -736,25 +738,65 @@ fn store_single_authority_clock_checkpoint_binding(
     )
 }
 
-fn load_single_authority_initialized_binding(
-    durable_state_path: &Path,
-) -> Result<Option<ControlPlaneAuthorityClockCheckpointBinding>, ControlPlaneError> {
-    let initialized_path = single_authority_initialized_path(durable_state_path);
-    let Some(bytes) = read_fixed_control_plane_sidecar::<SINGLE_AUTHORITY_INITIALIZED_LEN>(
-        &initialized_path,
-        "load single-authority control-plane initialization marker",
-    )
-    .map_err(|error| match error {
-        FixedControlPlaneSidecarReadError::Truncated => {
-            ControlPlaneError::AuthorityClockCheckpoint {
-                message: "single-authority initialization marker is truncated".to_owned(),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SingleAuthorityInitializationMarkerFormatError {
+    Truncated,
+    InvalidLength,
+    UnknownMagic,
+    UnsupportedVersion(u16),
+}
+
+impl std::fmt::Display for SingleAuthorityInitializationMarkerFormatError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => {
+                formatter.write_str("single-authority initialization marker is truncated")
             }
+            Self::InvalidLength => formatter.write_str(
+                "single-authority initialization marker length does not match required fixed length",
+            ),
+            Self::UnknownMagic => {
+                formatter.write_str("single-authority initialization marker magic mismatch")
+            }
+            Self::UnsupportedVersion(version) => write!(
+                formatter,
+                "unsupported single-authority initialization marker version {version}"
+            ),
         }
-        FixedControlPlaneSidecarReadError::Invalid(error) => error,
-    })?
-    else {
-        return Ok(None);
-    };
+    }
+}
+
+#[derive(Debug)]
+enum SingleAuthorityInitializationMarkerDecodeError {
+    Format(SingleAuthorityInitializationMarkerFormatError),
+    Invalid(ControlPlaneError),
+}
+
+impl SingleAuthorityInitializationMarkerDecodeError {
+    fn into_control_plane_error(self) -> ControlPlaneError {
+        match self {
+            Self::Format(error) => ControlPlaneError::CommandDecode {
+                message: error.to_string(),
+            },
+            Self::Invalid(error) => error,
+        }
+    }
+}
+
+fn decode_single_authority_initialized_binding(
+    bytes: &[u8],
+) -> Result<ControlPlaneAuthorityClockCheckpointBinding, SingleAuthorityInitializationMarkerDecodeError>
+{
+    if bytes.len() < SINGLE_AUTHORITY_INITIALIZED_LEN {
+        return Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::Truncated,
+        ));
+    }
+    if bytes.len() != SINGLE_AUTHORITY_INITIALIZED_LEN {
+        return Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::InvalidLength,
+        ));
+    }
     let (body, checksum_bytes) = bytes.split_at(SINGLE_AUTHORITY_INITIALIZED_LEN - 8);
     if checksum::crc64::checksum(body)
         != u64::from_be_bytes(
@@ -763,41 +805,88 @@ fn load_single_authority_initialized_binding(
                 .expect("initialization marker checksum has fixed length"),
         )
     {
-        return Err(ControlPlaneError::CommandDecode {
-            message: "single-authority initialization marker checksum mismatch".to_owned(),
-        });
+        return Err(SingleAuthorityInitializationMarkerDecodeError::Invalid(
+            ControlPlaneError::CommandDecode {
+                message: "single-authority initialization marker checksum mismatch".to_owned(),
+            },
+        ));
     }
-    if &body[..8] != SINGLE_AUTHORITY_INITIALIZED_MAGIC {
-        return Err(ControlPlaneError::CommandDecode {
-            message: "single-authority initialization marker magic mismatch".to_owned(),
-        });
+    if &body[..SINGLE_AUTHORITY_INITIALIZED_MAGIC.len()] != SINGLE_AUTHORITY_INITIALIZED_MAGIC {
+        return Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::UnknownMagic,
+        ));
     }
+    let version_offset = SINGLE_AUTHORITY_INITIALIZED_MAGIC.len();
     let version = u16::from_be_bytes(
-        body[8..10]
+        body[version_offset..version_offset + 2]
             .try_into()
             .expect("initialization marker version has fixed length"),
     );
     if version != SINGLE_AUTHORITY_INITIALIZED_VERSION {
-        return Err(ControlPlaneError::CommandDecode {
-            message: format!(
-                "unsupported single-authority initialization marker version {version}"
-            ),
-        });
+        return Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::UnsupportedVersion(version),
+        ));
     }
     let mut binding = [0; CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN];
-    binding.copy_from_slice(&body[10..]);
-    Ok(Some(ControlPlaneAuthorityClockCheckpointBinding(binding)))
+    binding.copy_from_slice(&body[version_offset + 2..]);
+    Ok(ControlPlaneAuthorityClockCheckpointBinding(binding))
+}
+
+fn load_single_authority_initialized_binding_classified(
+    durable_state_path: &Path,
+) -> Result<
+    Option<ControlPlaneAuthorityClockCheckpointBinding>,
+    SingleAuthorityInitializationMarkerDecodeError,
+> {
+    let initialized_path = single_authority_initialized_path(durable_state_path);
+    let Some(bytes) = read_fixed_control_plane_sidecar::<SINGLE_AUTHORITY_INITIALIZED_LEN>(
+        &initialized_path,
+        "load single-authority control-plane initialization marker",
+    )
+    .map_err(|error| match error {
+        FixedControlPlaneSidecarReadError::Truncated => {
+            SingleAuthorityInitializationMarkerDecodeError::Format(
+                SingleAuthorityInitializationMarkerFormatError::Truncated,
+            )
+        }
+        FixedControlPlaneSidecarReadError::InvalidLength(_) => {
+            SingleAuthorityInitializationMarkerDecodeError::Format(
+                SingleAuthorityInitializationMarkerFormatError::InvalidLength,
+            )
+        }
+        FixedControlPlaneSidecarReadError::Invalid(error) => {
+            SingleAuthorityInitializationMarkerDecodeError::Invalid(error)
+        }
+    })?
+    else {
+        return Ok(None);
+    };
+    decode_single_authority_initialized_binding(&bytes).map(Some)
+}
+
+fn load_single_authority_initialized_binding(
+    durable_state_path: &Path,
+) -> Result<Option<ControlPlaneAuthorityClockCheckpointBinding>, ControlPlaneError> {
+    load_single_authority_initialized_binding_classified(durable_state_path)
+        .map_err(SingleAuthorityInitializationMarkerDecodeError::into_control_plane_error)
+}
+
+fn encode_single_authority_initialized_binding(
+    binding: ControlPlaneAuthorityClockCheckpointBinding,
+) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(SINGLE_AUTHORITY_INITIALIZED_LEN);
+    bytes.extend_from_slice(SINGLE_AUTHORITY_INITIALIZED_MAGIC);
+    bytes.extend_from_slice(&SINGLE_AUTHORITY_INITIALIZED_VERSION.to_be_bytes());
+    bytes.extend_from_slice(&binding.0);
+    bytes.extend_from_slice(&checksum::crc64::checksum(&bytes).to_be_bytes());
+    bytes
 }
 
 fn store_single_authority_initialized_binding(
     durable_state_path: &Path,
     binding: ControlPlaneAuthorityClockCheckpointBinding,
 ) -> Result<(), ControlPlaneError> {
-    let mut bytes = Vec::with_capacity(SINGLE_AUTHORITY_INITIALIZED_LEN);
-    bytes.extend_from_slice(SINGLE_AUTHORITY_INITIALIZED_MAGIC);
-    bytes.extend_from_slice(&SINGLE_AUTHORITY_INITIALIZED_VERSION.to_be_bytes());
-    bytes.extend_from_slice(&binding.0);
-    bytes.extend_from_slice(&checksum::crc64::checksum(&bytes).to_be_bytes());
+    let bytes = encode_single_authority_initialized_binding(binding);
     store_control_plane_sidecar(
         &single_authority_initialized_path(durable_state_path),
         &single_authority_initialized_tmp_path(durable_state_path),
@@ -838,7 +927,8 @@ fn load_authority_clock_restart_checkpoint_classified(
                 ControlPlaneAuthorityClockRestartCheckpointFormatError::Truncated,
             )
         }
-        FixedControlPlaneSidecarReadError::Invalid(error) => {
+        FixedControlPlaneSidecarReadError::InvalidLength(error)
+        | FixedControlPlaneSidecarReadError::Invalid(error) => {
             ControlPlaneAuthorityClockRestartCheckpointDecodeError::Invalid(error)
         }
     })?
@@ -1109,6 +1199,89 @@ pub(crate) fn prepare_unsupported_single_authority_identity_restart_for_test(
     file.sync_all().map_err(|source| {
         ControlPlaneError::io(
             "sync single-authority identity for unsupported-version test",
+            source,
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn prepare_unsupported_single_authority_initialization_restart_for_test(
+    durable_state_path: &Path,
+    version: u16,
+) -> Result<(), ControlPlaneError> {
+    if !matches!(version, 0 | 2) {
+        return Err(ControlPlaneError::CommandDecode {
+            message:
+                "test initialization-marker version must be one of the retained adjacent fixtures"
+                    .to_owned(),
+        });
+    }
+
+    let initialized_path = single_authority_initialized_path(durable_state_path);
+    let mut marker = std::fs::read(&initialized_path).map_err(|source| {
+        ControlPlaneError::io(
+            "read single-authority initialization marker for unsupported-version test",
+            source,
+        )
+    })?;
+    if marker.len() != SINGLE_AUTHORITY_INITIALIZED_LEN {
+        return Err(ControlPlaneError::AuthorityClockCheckpoint {
+            message: format!(
+                "test initialization-marker length {} does not match required fixed length {SINGLE_AUTHORITY_INITIALIZED_LEN}",
+                marker.len()
+            ),
+        });
+    }
+    let version_offset = SINGLE_AUTHORITY_INITIALIZED_MAGIC.len();
+    marker[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+    let checksum_offset = marker.len() - std::mem::size_of::<u64>();
+    let checksum = checksum::crc64::checksum(&marker[..checksum_offset]);
+    marker[checksum_offset..].copy_from_slice(&checksum.to_be_bytes());
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&initialized_path)
+            .map_err(|source| {
+                ControlPlaneError::io(
+                    "open single-authority initialization marker for unsupported-version test",
+                    source,
+                )
+            })?;
+        file.write_all(&marker).map_err(|source| {
+            ControlPlaneError::io(
+                "write single-authority initialization marker for unsupported-version test",
+                source,
+            )
+        })?;
+        file.sync_all().map_err(|source| {
+            ControlPlaneError::io(
+                "sync single-authority initialization marker for unsupported-version test",
+                source,
+            )
+        })?;
+    }
+
+    let journal_path = single_authority_journal_path(durable_state_path);
+    let mut journal = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .map_err(|source| {
+            ControlPlaneError::io(
+                "open single-authority journal for initialization-marker ordering test",
+                source,
+            )
+        })?;
+    journal.write_all(&[0xa3, 0xc1]).map_err(|source| {
+        ControlPlaneError::io(
+            "append recoverable single-authority journal tail for initialization-marker ordering test",
+            source,
+        )
+    })?;
+    journal.sync_all().map_err(|source| {
+        ControlPlaneError::io(
+            "sync recoverable single-authority journal tail for initialization-marker ordering test",
             source,
         )
     })?;

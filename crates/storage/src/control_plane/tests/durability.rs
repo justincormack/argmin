@@ -139,6 +139,143 @@ fn single_authority_durable_identity_v1_layout_and_format_failures_are_exact() {
 }
 
 #[test]
+fn single_authority_initialization_marker_v1_layout_and_format_failures_are_exact() {
+    let binding = ControlPlaneAuthorityClockCheckpointBinding([
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ]);
+    let current = encode_single_authority_initialized_binding(binding);
+    assert_eq!(
+        hex_encode(&current),
+        "4152474350494e490001000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f5cc8caa13fc3b183"
+    );
+    assert_eq!(
+        decode_single_authority_initialized_binding(&current).unwrap(),
+        binding
+    );
+
+    for truncated_len in [0, 7, 8, 9, SINGLE_AUTHORITY_INITIALIZED_LEN - 1] {
+        assert!(matches!(
+            decode_single_authority_initialized_binding(&current[..truncated_len]),
+            Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+                SingleAuthorityInitializationMarkerFormatError::Truncated
+            ))
+        ));
+    }
+
+    let mut oversized = current.clone();
+    oversized.push(0);
+    assert!(matches!(
+        decode_single_authority_initialized_binding(&oversized),
+        Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::InvalidLength
+        ))
+    ));
+
+    let mut bad_checksum = current.clone();
+    *bad_checksum.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        decode_single_authority_initialized_binding(&bad_checksum),
+        Err(SingleAuthorityInitializationMarkerDecodeError::Invalid(
+            ControlPlaneError::CommandDecode { message }
+        )) if message == "single-authority initialization marker checksum mismatch"
+    ));
+
+    let mut bad_magic = current.clone();
+    bad_magic[0] ^= 0xff;
+    reseal_crc64_suffix(&mut bad_magic);
+    assert!(matches!(
+        decode_single_authority_initialized_binding(&bad_magic),
+        Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::UnknownMagic
+        ))
+    ));
+
+    for version in [0u16, 2] {
+        let mut unsupported = current.clone();
+        let version_offset = SINGLE_AUTHORITY_INITIALIZED_MAGIC.len();
+        unsupported[version_offset..version_offset + 2].copy_from_slice(&version.to_be_bytes());
+        reseal_crc64_suffix(&mut unsupported);
+        assert!(matches!(
+            decode_single_authority_initialized_binding(&unsupported),
+            Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+                SingleAuthorityInitializationMarkerFormatError::UnsupportedVersion(actual)
+            )) if actual == version
+        ));
+    }
+
+    let tmp = test_util::tempdir();
+    let state_path = tmp.path().join("control-plane.state");
+    assert!(
+        load_single_authority_initialized_binding_classified(&state_path)
+            .unwrap()
+            .is_none()
+    );
+    let marker_path = single_authority_initialized_path(&state_path);
+    std::fs::write(&marker_path, &current[..9]).unwrap();
+    assert!(matches!(
+        load_single_authority_initialized_binding_classified(&state_path),
+        Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::Truncated
+        ))
+    ));
+    std::fs::write(&marker_path, &oversized).unwrap();
+    assert!(matches!(
+        load_single_authority_initialized_binding_classified(&state_path),
+        Err(SingleAuthorityInitializationMarkerDecodeError::Format(
+            SingleAuthorityInitializationMarkerFormatError::InvalidLength
+        ))
+    ));
+    assert!(matches!(
+        load_single_authority_initialized_binding(&state_path),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message == "single-authority initialization marker length does not match required fixed length"
+    ));
+}
+
+#[test]
+fn single_authority_initialization_marker_binding_mismatch_fails_before_journal_replay() {
+    let tmp = test_util::tempdir();
+    let state_path = tmp.path().join("control-plane.state");
+    drop(SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)).unwrap());
+
+    store_single_authority_initialized_binding(
+        &state_path,
+        ControlPlaneAuthorityClockCheckpointBinding([0x7b; 32]),
+    )
+    .unwrap();
+    let journal_path = single_authority_journal_path(&state_path);
+    let mut journal = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .unwrap();
+    journal.write_all(&[0xa3, 0xc1]).unwrap();
+    journal.sync_all().unwrap();
+    drop(journal);
+    let snapshot_before = std::fs::read(&state_path).unwrap();
+    let identity_before = std::fs::read(single_authority_identity_path(&state_path)).unwrap();
+    let marker_before = std::fs::read(single_authority_initialized_path(&state_path)).unwrap();
+    let journal_before = std::fs::read(&journal_path).unwrap();
+
+    assert!(matches!(
+        SingleAuthorityControlPlane::open(FileControlPlaneStore::new(&state_path)),
+        Err(ControlPlaneError::CommandDecode { message })
+            if message == "single-authority initialization marker identity does not match durable state"
+    ));
+    assert_eq!(std::fs::read(&state_path).unwrap(), snapshot_before);
+    assert_eq!(
+        std::fs::read(single_authority_identity_path(&state_path)).unwrap(),
+        identity_before
+    );
+    assert_eq!(
+        std::fs::read(single_authority_initialized_path(&state_path)).unwrap(),
+        marker_before
+    );
+    assert_eq!(std::fs::read(&journal_path).unwrap(), journal_before);
+}
+
+#[test]
 fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_requires_version_bump()
 {
     const EMPTY_STATE_V28: &str = concat!(
