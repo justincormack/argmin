@@ -4,6 +4,57 @@
 use super::*;
 
 #[test]
+fn authority_clock_durable_state_binding_matches_frozen_versioned_vectors() {
+    const SINGLE_AUTHORITY_BINDING: [u8; 32] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f,
+    ];
+    const RAFT_BINDING: [u8; 32] = [
+        0x91, 0xe1, 0xa6, 0x75, 0x3f, 0x6c, 0x53, 0xb3, 0xb4, 0x8f, 0x00, 0xc9, 0xfc, 0x59, 0x00,
+        0xfd, 0x68, 0xf2, 0x5b, 0x4b, 0xe2, 0x6b, 0xda, 0xa7, 0x68, 0x61, 0x52, 0x19, 0x81, 0xec,
+        0x4a, 0x5f,
+    ];
+    const BINDING_OFFSET: usize = 8 + 2;
+    const BINDING_END: usize = BINDING_OFFSET + 32;
+
+    assert_eq!(CONTROL_PLANE_CLOCK_CHECKPOINT_BINDING_LEN, 32);
+    assert_eq!(CONTROL_PLANE_STATE_IDENTITY_VERSION, 1);
+    assert_eq!(SINGLE_AUTHORITY_INITIALIZED_VERSION, 1);
+    assert_eq!(CONTROL_PLANE_CLOCK_CHECKPOINT_VERSION, 2);
+    assert_eq!(SINGLE_AUTHORITY_JOURNAL_RECORD_VERSION, 2);
+    assert_eq!(
+        ControlPlaneAuthorityClockCheckpointBinding::for_raft("test-clustér", 1),
+        ControlPlaneAuthorityClockCheckpointBinding(RAFT_BINDING)
+    );
+
+    let tmp = test_util::tempdir();
+    let state_path = tmp.path().join("control-plane.state");
+    let binding = ControlPlaneAuthorityClockCheckpointBinding(SINGLE_AUTHORITY_BINDING);
+    store_single_authority_clock_checkpoint_binding(&state_path, binding).unwrap();
+    store_single_authority_initialized_binding(&state_path, binding).unwrap();
+    let identity = std::fs::read(single_authority_identity_path(&state_path)).unwrap();
+    let initialized = std::fs::read(single_authority_initialized_path(&state_path)).unwrap();
+    let checkpoint =
+        ControlPlaneAuthorityClockRestartCheckpoint::new(binding, 1, Some(2), 3, 4).encode();
+    let journal_record = SingleAuthorityJournalRecord {
+        binding,
+        previous_chain_digest: 5,
+        resulting_chain_digest: 5,
+        command: None,
+    }
+    .encode()
+    .unwrap();
+
+    for encoded in [&identity, &initialized, &checkpoint, &journal_record] {
+        assert_eq!(
+            &encoded[BINDING_OFFSET..BINDING_END],
+            &SINGLE_AUTHORITY_BINDING
+        );
+    }
+}
+
+#[test]
 fn current_single_authority_journal_hash_chain_matches_frozen_v2_vectors_and_requires_version_bump()
 {
     const EMPTY_STATE_V28: &str = concat!(
