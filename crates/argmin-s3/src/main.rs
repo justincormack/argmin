@@ -1942,7 +1942,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         ),
     )
     .unwrap_or_else(|error| {
-        eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+        eprintln!("failed to prepare experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
     // Durable replay and authority validation must finish before the process
@@ -1963,7 +1963,7 @@ fn run_experimental_raft_control_plane_process(config: &ServerConfig) -> ! {
         ),
     )
     .unwrap_or_else(|error| {
-        eprintln!("failed to initialize experimental OpenRaft control-plane: {error}");
+        eprintln!("failed to start experimental OpenRaft control-plane: {error}");
         std::process::exit(1);
     });
     let multi_node_raft_peer_mode = authority_service.is_multi_node();

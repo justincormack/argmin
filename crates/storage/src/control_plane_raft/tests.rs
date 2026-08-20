@@ -18,7 +18,7 @@ use std::time::Duration;
 use super::*;
 use futures_util::stream;
 use openraft::errors::{
-    Fatal, NetworkError, RPCError, ReplicationClosed, StreamingError, Unreachable,
+    Fatal, NetworkError, NotInMembers, RPCError, ReplicationClosed, StreamingError, Unreachable,
 };
 use openraft::network::{RPCOption, RaftNetworkFactory, RaftNetworkV2};
 use openraft::raft::{
@@ -95,6 +95,96 @@ fn openraft_linearizable_fatal_error_remains_non_retryable() {
         }
     ));
     assert!(!error.is_retryable_openraft_leadership_error());
+}
+
+#[test]
+fn configured_membership_initialization_waits_when_raft_state_wins_the_check_race() {
+    ControlPlaneRaftTypeConfig::run(async {
+        let tmp = test_util::tempdir();
+        let cluster_name = "configured-membership-initialization-race";
+        let node_id = 1;
+        let policy = ControlPlaneRaftPeerTransportPolicy::from_peer_endpoints(
+            cluster_name,
+            [(
+                node_id,
+                tmp.path().join("peer.sock").to_string_lossy().into_owned(),
+            )],
+            ControlPlaneRaftPeerTransportLimits::default(),
+        );
+        let configured_members = policy.peers();
+        let authority = Arc::new(
+            ControlPlaneRaftAuthority::new_experimental_unix_peer_durable(
+                cluster_name,
+                node_id,
+                &tmp.path().join("authority.state"),
+                policy,
+                Duration::from_millis(100),
+            )
+            .await
+            .expect("test authority should open"),
+        );
+        let gate = Arc::new(tokio::sync::Barrier::new(2));
+        authority.set_membership_initialization_after_check_gate_for_test(Arc::clone(&gate));
+
+        let initialization = {
+            let authority = Arc::clone(&authority);
+            tokio::spawn(async move {
+                authority
+                    .initialize_configured_membership_if_needed_for_test()
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), gate.wait())
+            .await
+            .expect("configured initialization should reach the post-check gate");
+
+        authority
+            .initialize_membership(configured_members)
+            .await
+            .expect("concurrent initialization should advance real Raft state");
+        gate.wait().await;
+
+        let initialized_by_racing_call = initialization
+            .await
+            .expect("configured initialization task should join")
+            .expect("NotAllowed should defer to membership convergence");
+        assert!(!initialized_by_racing_call);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            authority.wait_for_static_initial_membership(),
+        )
+        .await
+        .expect("configured membership should converge")
+        .expect("configured membership should be valid");
+        authority.shutdown().await.unwrap();
+    });
+}
+
+#[test]
+fn configured_membership_initialization_does_not_hide_fatal_raft_failure() {
+    let error =
+        classify_configured_membership_initialization(Err(RaftError::Fatal(Fatal::Stopped)))
+            .expect_err("a stopped Raft core must remain a fatal startup failure");
+
+    assert!(matches!(error, ControlPlaneError::RpcRemote { .. }));
+}
+
+#[test]
+fn configured_membership_initialization_rejects_missing_local_node() {
+    let membership: Membership<ControlPlaneRaftNodeId, BasicNode> =
+        Membership::new_with_defaults(vec![BTreeSet::from([2])], [2]);
+    let error = classify_configured_membership_initialization(Err(RaftError::APIError(
+        InitializeError::NotInMembers(NotInMembers {
+            node_id: 1,
+            membership,
+        }),
+    )))
+    .expect_err("a configured membership without the local node must fail closed");
+
+    assert!(matches!(
+        error,
+        ControlPlaneError::StaticTopologyFailure { .. }
+    ));
 }
 
 fn raft_peer_test_tls_roots() -> rustls::RootCertStore {

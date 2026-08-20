@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt};
 use openraft::errors::{
-    ClientWriteError, LinearizableReadError, NetworkError, RPCError, RaftError, ReplicationClosed,
-    StreamingError, Unreachable,
+    ClientWriteError, InitializeError, LinearizableReadError, NetworkError, RPCError, RaftError,
+    ReplicationClosed, StreamingError, Unreachable,
 };
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::impls::BasicNode;
@@ -444,6 +444,8 @@ pub struct ControlPlaneRaftAuthority {
     proposal_lease_retry_count: AtomicUsize,
     #[cfg(test)]
     proposal_changed_tip_rejection_count: AtomicUsize,
+    #[cfg(test)]
+    membership_initialization_after_check_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 #[derive(Clone, Copy)]
@@ -2794,6 +2796,8 @@ impl ControlPlaneRaftAuthority {
             proposal_lease_retry_count: AtomicUsize::new(0),
             #[cfg(test)]
             proposal_changed_tip_rejection_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            membership_initialization_after_check_gate: Mutex::new(None),
         }
     }
 
@@ -2830,6 +2834,8 @@ impl ControlPlaneRaftAuthority {
             proposal_lease_retry_count: AtomicUsize::new(0),
             #[cfg(test)]
             proposal_changed_tip_rejection_count: AtomicUsize::new(0),
+            #[cfg(test)]
+            membership_initialization_after_check_gate: Mutex::new(None),
         }
     }
 
@@ -3060,6 +3066,17 @@ impl ControlPlaneRaftAuthority {
         if self.is_initialized().await? {
             return Ok(false);
         }
+        #[cfg(test)]
+        let membership_initialization_after_check_gate = self
+            .membership_initialization_after_check_gate
+            .lock()
+            .expect("membership initialization test gate should not be poisoned")
+            .take();
+        #[cfg(test)]
+        if let Some(gate) = membership_initialization_after_check_gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
         let Some(policy) = &self.static_peer_policy else {
             self.initialize_single_node_membership(self.node_id).await?;
             return Ok(true);
@@ -3068,8 +3085,7 @@ impl ControlPlaneRaftAuthority {
         if peers.len() > 1 && peers.keys().next().copied() != Some(self.node_id) {
             return Ok(false);
         }
-        self.initialize_membership(peers).await?;
-        Ok(true)
+        classify_configured_membership_initialization(self.raft.initialize(peers).await)
     }
 
     #[cfg(any(test, feature = "test-hooks"))]
@@ -3077,6 +3093,22 @@ impl ControlPlaneRaftAuthority {
         &self,
     ) -> Result<bool, ControlPlaneError> {
         self.initialize_configured_membership_if_needed().await
+    }
+
+    #[cfg(test)]
+    fn set_membership_initialization_after_check_gate_for_test(
+        &self,
+        gate: Arc<tokio::sync::Barrier>,
+    ) {
+        let previous = self
+            .membership_initialization_after_check_gate
+            .lock()
+            .expect("membership initialization test gate should not be poisoned")
+            .replace(gate);
+        assert!(
+            previous.is_none(),
+            "membership initialization test gate already set"
+        );
     }
 
     pub async fn is_initialized(&self) -> Result<bool, ControlPlaneError> {
@@ -5088,6 +5120,28 @@ impl ControlPlaneRaftAuthority {
             .shutdown()
             .await
             .map_err(|error| openraft_remote_error("shutdown", error))
+    }
+}
+
+fn classify_configured_membership_initialization(
+    result: Result<
+        (),
+        RaftError<ControlPlaneRaftTypeConfig, InitializeError<ControlPlaneRaftTypeConfig>>,
+    >,
+) -> Result<bool, ControlPlaneError> {
+    match result {
+        Ok(()) => Ok(true),
+        // Raft state may advance after is_initialized() and before initialize() is
+        // handled. OpenRaft documents NotAllowed as safe to ignore in this race:
+        // cluster formation is already in motion, and startup must wait for the
+        // configured membership instead of terminating the process.
+        Err(RaftError::APIError(InitializeError::NotAllowed(_))) => Ok(false),
+        Err(RaftError::APIError(InitializeError::NotInMembers(error))) => {
+            Err(ControlPlaneError::static_topology_failure(format!(
+                "configured OpenRaft initial membership rejected the local node: {error}"
+            )))
+        }
+        Err(RaftError::Fatal(error)) => Err(openraft_remote_error("initialize", error)),
     }
 }
 
